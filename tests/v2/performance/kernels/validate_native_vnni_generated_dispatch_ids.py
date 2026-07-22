@@ -14,7 +14,10 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from native_vnni_codebooks import CODEBOOK_TO_FORMAT  # noqa: E402
 
-ROCM_DECODE_GRAPH_SAFE_KB_CAP = 16
+# The persistent ROCm small-M workspace owns one partial-output slot for every
+# K partition and is sized for 64 partitions.  Do not confuse this independent
+# launch axis with the grouped verifier's M=2..16 row extent.
+ROCM_DECODE_GRAPH_SAFE_KB_CAP = 64
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +38,7 @@ def _extract_codebooks(text: str) -> set[int]:
     patterns = [
         r"\bCB\s*==\s*(\d+)\b",
         r"\bCB=(\d+)\b",
+        r"\bcodebook\s*==\s*(\d+)\b",
         r"\bselectTuning_CB(\d+)\s*\(",
     ]
     for pattern in patterns:
@@ -46,6 +50,153 @@ def _extract_codebooks(text: str) -> set[int]:
         ):
             ids.add((int(match.group(1), 16) >> 56) & 0xFF)
     return ids
+
+
+def _validate_cpu_verifier_packed_tables(path: Path, text: str) -> set[int]:
+    """Validate compact grouped-verifier exact keys and policy arrays.
+
+    The grouped verifier packs ``codebook/M/K/N`` as 8/8/24/24 bits. Each
+    runtime surface owns a strictly sorted key array and one policy byte per
+    key. ABI v2's historical Pairwise/WideRows bitset remains readable while a
+    checked-in corpus is upgraded; ABI v3 requires the byte array so every
+    registered grouped family has an unambiguous exact-overlay identity. The
+    validator decodes the generated data itself so compact binary-search tables
+    cannot weaken codebook, geometry, ordering, or cardinality checks.
+    """
+
+    if "packCPUNativeVNNIVerifierRowsPolicyKey" not in text:
+        return set()
+
+    keys_pattern = re.compile(
+        r"inline\s+constexpr\s+uint64_t\s+"
+        r"kCPUNativeVNNIVerifierExact(?P<surface>[A-Za-z0-9]+)Keys\[\]\s*=\s*"
+        r"\{(?P<body>.*?)\n\};",
+        re.DOTALL,
+    )
+    mask_pattern = re.compile(
+        r"inline\s+constexpr\s+uint64_t\s+"
+        r"kCPUNativeVNNIVerifierExact(?P<surface>[A-Za-z0-9]+)WideRowsMask\[\]\s*=\s*"
+        r"\{(?P<body>.*?)\n\};",
+        re.DOTALL,
+    )
+    policies_pattern = re.compile(
+        r"inline\s+constexpr\s+uint8_t\s+"
+        r"kCPUNativeVNNIVerifierExact(?P<surface>[A-Za-z0-9]+)Policies\[\]\s*=\s*"
+        r"\{(?P<body>.*?)\n\};",
+        re.DOTALL,
+    )
+    key_tables = {
+        match.group("surface"): [
+            int(raw, 16)
+            for raw in re.findall(
+                r"\b0x([0-9a-fA-F]{16})ULL\b", match.group("body")
+            )
+        ]
+        for match in keys_pattern.finditer(text)
+    }
+    mask_tables = {
+        match.group("surface"): [
+            int(raw, 16)
+            for raw in re.findall(
+                r"\b0x([0-9a-fA-F]{16})ULL\b", match.group("body")
+            )
+        ]
+        for match in mask_pattern.finditer(text)
+    }
+    policy_tables = {
+        match.group("surface"): [
+            int(raw)
+            for raw in re.findall(r"\b(\d+)\b", match.group("body"))
+        ]
+        for match in policies_pattern.finditer(text)
+    }
+    if not key_tables:
+        raise SystemExit(
+            f"{path}: CPU verifier selector has no packed exact-key tables"
+        )
+    abi_match = re.search(
+        r"#define\s+LLAMINAR_CPU_NVNNI_VERIFIER_POLICY_ABI\s+(\d+)", text
+    )
+    abi = int(abi_match.group(1)) if abi_match else 0
+    expected_tables = policy_tables if abi >= 3 else mask_tables
+    expected_name = "policy arrays" if abi >= 3 else "legacy policy masks"
+    if set(key_tables) != set(expected_tables):
+        missing = sorted(set(key_tables) - set(expected_tables))
+        orphan = sorted(set(expected_tables) - set(key_tables))
+        raise SystemExit(
+            f"{path}: CPU verifier exact table pairing is incomplete "
+            f"representation={expected_name} missing={missing} orphan={orphan}"
+        )
+    enum_match = re.search(
+        r"enum\s+class\s+CPUNativeVNNIVerifierRowsPolicy\s*:\s*uint8_t\s*"
+        r"\{(?P<body>.*?)\};",
+        text,
+        re.DOTALL,
+    )
+    policy_ordinals = {
+        int(raw)
+        for raw in re.findall(
+            r"[A-Za-z0-9_]+\s*=\s*(\d+)",
+            enum_match.group("body") if enum_match else "",
+        )
+    }
+    if abi >= 3 and not policy_ordinals:
+        raise SystemExit(f"{path}: CPU verifier ABI v3 has no policy enum values")
+
+    codebooks: set[int] = set()
+    for surface, keys in sorted(key_tables.items()):
+        if not keys:
+            raise SystemExit(
+                f"{path}: CPU verifier exact table {surface} is empty"
+            )
+        for left, right in zip(keys, keys[1:]):
+            if left >= right:
+                raise SystemExit(
+                    f"{path}: CPU verifier exact table {surface} is not strictly "
+                    f"sorted (0x{left:016x} before 0x{right:016x})"
+                )
+        for key in keys:
+            codebook = (key >> 56) & 0xFF
+            m = (key >> 48) & 0xFF
+            k = (key >> 24) & 0xFFFFFF
+            n = key & 0xFFFFFF
+            if codebook not in CODEBOOK_TO_FORMAT:
+                raise SystemExit(
+                    f"{path}: CPU verifier key references unknown codebook {codebook}"
+                )
+            if m < 2 or n == 0 or k == 0:
+                raise SystemExit(
+                    f"{path}: malformed CPU verifier key M={m} N={n} K={k}"
+                )
+            codebooks.add(codebook)
+
+        if abi >= 3:
+            policies = policy_tables[surface]
+            if len(policies) != len(keys):
+                raise SystemExit(
+                    f"{path}: CPU verifier exact table {surface} has "
+                    f"{len(policies)} policies for {len(keys)} keys"
+                )
+            unknown = sorted(set(policies) - policy_ordinals)
+            if unknown:
+                raise SystemExit(
+                    f"{path}: CPU verifier exact table {surface} contains "
+                    f"unknown policy ordinals {unknown}"
+                )
+        else:
+            masks = mask_tables[surface]
+            required_words = (len(keys) + 63) // 64
+            if len(masks) != required_words:
+                raise SystemExit(
+                    f"{path}: CPU verifier exact table {surface} has {len(masks)} "
+                    f"policy words for {len(keys)} keys; expected {required_words}"
+                )
+            used_bits = len(keys) % 64
+            if used_bits and masks[-1] >> used_bits:
+                raise SystemExit(
+                    f"{path}: CPU verifier exact table {surface} sets unused policy bits"
+                )
+    return codebooks
 
 
 def _validate_cpu_prefill_packed_keys(path: Path, text: str) -> None:
@@ -164,6 +315,7 @@ def validate_file(path: Path) -> int:
 
     text = path.read_text()
     codebooks = _extract_codebooks(text)
+    codebooks.update(_validate_cpu_verifier_packed_tables(path, text))
     if not codebooks:
         raise SystemExit(f"{path}: found no generated codebook dispatch branches")
 

@@ -226,6 +226,10 @@ def main() -> int:
         scorer.close()
 
     warm_stats = _stats_delta(after_cold, after_warm)
+    expanded_candidates = warm_stats["expanded_candidate_count"]
+    structurally_unique_candidates = warm_stats[
+        "structurally_unique_candidate_count"
+    ]
     forbidden_warm_activity = {
         field: warm_stats[field]
         for field in (
@@ -268,6 +272,10 @@ def main() -> int:
         "warm_median_seconds": statistics.median(warm_seconds),
         "cold_stats": _stats_delta(before, after_cold),
         "warm_stats": warm_stats,
+        "structurally_unique_fraction": (
+            structurally_unique_candidates / expanded_candidates
+            if expanded_candidates else 0.0
+        ),
         "scratch_high_water_bytes": after_warm.tree_scratch_high_water_bytes,
         "last_expansion_capacity": after_warm.last_expansion_capacity,
     }, indent=2, sort_keys=True))

@@ -27,8 +27,11 @@ from typing import Iterable, Mapping
 
 from .candidate_observation import read_observation_csv
 from .profiler_model import (
+    PhysicalCandidateKey,
     ProfilerCandidateDescriptor,
     ProfilerFeatureCatalog,
+    _auxiliary_metric_reliability_weight,
+    _is_anchor_dynamic_profiler_feature,
     load_profiler_feature_catalog,
 )
 
@@ -111,10 +114,181 @@ def _metric_report(
     }
 
 
+def _metric_expected_direction(name: str) -> str:
+    """Describe the reviewed economy direction for one normalized feature."""
+
+    lower_is_better = (
+        "registers_per_thread",
+        "shared_memory_bytes",
+        "local_memory_bytes",
+        "scratch_bytes",
+        "spill",
+        "warp_cycles_per_issued_instruction",
+        "duration_ns_per_",
+        "fetch_to_expected_byte_ratio",
+        "write_to_output_byte_ratio",
+    )
+    higher_is_better = (
+        "occupancy_pct",
+        "throughput_pct_of_peak",
+        "pipe_utilization_pct",
+        "executed_ipc_active",
+        "effective_gbytes_per_second",
+        "effective_gops",
+        "observed_fetch_gbytes_per_second",
+        "cache_hit_pct",
+    )
+    if any(token in name for token in lower_is_better):
+        return "lower_is_better"
+    if any(token in name for token in higher_is_better):
+        return "higher_is_better"
+    return "unreviewed"
+
+
+def _metric_signal_class(name: str) -> str:
+    """Separate causal counters from direct profiler-duration proxies."""
+
+    if any(token in name for token in (
+        "effective_gbytes_per_second",
+        "effective_gops",
+        "duration_ns_per_",
+        "observed_fetch_gbytes_per_second",
+    )):
+        return "profiler_duration_proxy"
+    if any(token in name for token in (
+        "registers_per_thread",
+        "shared_memory_bytes",
+        "local_memory_bytes",
+        "vgpr_count",
+        "sgpr_count",
+        "lds_bytes",
+        "scratch_bytes",
+        "theoretical_occupancy_pct",
+    )):
+        return "static_resource"
+    return "dynamic_hardware_counter"
+
+
+def _performance_signal_report(
+    descriptors: tuple[ProfilerCandidateDescriptor, ...],
+    contests: Mapping[
+        tuple[str, ...], tuple[ProfilerCandidateDescriptor, ...]
+    ],
+    timing_us_by_key: Mapping[PhysicalCandidateKey, float],
+    *,
+    minimum_slowdown_ratio: float,
+) -> dict[str, object]:
+    """Compare profiler features between canonical fast and slow candidates.
+
+    Every comparison holds the complete physical work point fixed. Canonical
+    repeated timing chooses the endpoints; the discrete profiler launch only
+    supplies explanatory metrics and never becomes the performance label.
+    """
+
+    if minimum_slowdown_ratio <= 1.0:
+        raise ValueError("minimum slowdown ratio must be greater than one")
+    metric_names = _metric_names(descriptors)
+    comparisons: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
+    eligible_contests = 0
+    clear_contests = 0
+    slowdown_ratios: list[float] = []
+    for rows in contests.values():
+        timed = tuple(
+            row for row in rows if row.key in timing_us_by_key
+        )
+        if len(timed) < 2:
+            continue
+        eligible_contests += 1
+        fastest = min(timed, key=lambda row: timing_us_by_key[row.key])
+        slowest = max(timed, key=lambda row: timing_us_by_key[row.key])
+        fastest_us = timing_us_by_key[fastest.key]
+        slowest_us = timing_us_by_key[slowest.key]
+        if fastest_us <= 0.0 or slowest_us / fastest_us < minimum_slowdown_ratio:
+            continue
+        clear_contests += 1
+        slowdown_ratios.append(slowest_us / fastest_us)
+        for name in metric_names:
+            if name not in fastest.features or name not in slowest.features:
+                continue
+            fast_value = float(fastest.features[name])
+            slow_value = float(slowest.features[name])
+            scale = max(abs(fast_value), abs(slow_value), 1.0e-12)
+            comparisons[name].append((
+                fast_value,
+                slow_value,
+                (fast_value - slow_value) / scale,
+            ))
+
+    metric_reports = {}
+    for name in metric_names:
+        pairs = comparisons.get(name, ())
+        direction = _metric_expected_direction(name)
+        dynamic = _is_anchor_dynamic_profiler_feature(name)
+        auxiliary_weight = (
+            _auxiliary_metric_reliability_weight(name) if dynamic else 0.0
+        )
+        learner_role = (
+            "auxiliary_target"
+            if auxiliary_weight > 0.0
+            else "diagnostic_only"
+            if dynamic
+            else "runtime_static_input"
+        )
+        matches = 0
+        ties = 0
+        for fast_value, slow_value, _relative_delta in pairs:
+            if math.isclose(fast_value, slow_value, rel_tol=1.0e-12, abs_tol=1.0e-12):
+                ties += 1
+            elif (
+                direction == "higher_is_better" and fast_value > slow_value
+            ) or (
+                direction == "lower_is_better" and fast_value < slow_value
+            ):
+                matches += 1
+        reviewed = direction != "unreviewed"
+        non_ties = len(pairs) - ties
+        relative_deltas = [pair[2] for pair in pairs]
+        metric_reports[name] = {
+            "signal_class": _metric_signal_class(name),
+            "learner_role": learner_role,
+            "auxiliary_reliability_weight": auxiliary_weight,
+            "expected_direction": direction,
+            "paired_fast_slow_contests": len(pairs),
+            "paired_fast_slow_contest_rate": (
+                len(pairs) / clear_contests if clear_contests else 0.0
+            ),
+            "directional_matches": matches if reviewed else None,
+            "directional_non_ties": non_ties if reviewed else None,
+            "directional_match_rate": (
+                matches / non_ties if reviewed and non_ties else None
+            ),
+            "tie_rate": ties / len(pairs) if pairs else 0.0,
+            "median_fast_minus_slow_relative": (
+                statistics.median(relative_deltas)
+                if relative_deltas else 0.0
+            ),
+            "median_absolute_fast_slow_relative_gap": (
+                statistics.median(abs(value) for value in relative_deltas)
+                if relative_deltas else 0.0
+            ),
+        }
+    return {
+        "minimum_slowdown_ratio": minimum_slowdown_ratio,
+        "timed_multi_candidate_contests": eligible_contests,
+        "clear_fast_slow_contests": clear_contests,
+        "median_slowest_over_fastest": (
+            statistics.median(slowdown_ratios) if slowdown_ratios else 1.0
+        ),
+        "metrics": metric_reports,
+    }
+
+
 def diagnose_profiler_catalog(
     catalog: ProfilerFeatureCatalog,
     *,
     source_formats: Iterable[str],
+    timing_us_by_key: Mapping[PhysicalCandidateKey, float] | None = None,
+    minimum_slowdown_ratio: float = 1.05,
 ) -> dict[str, object]:
     """Return a deterministic, JSON-serializable pre-fit diagnostic report."""
 
@@ -151,7 +325,7 @@ def diagnose_profiler_catalog(
         name: _metric_report(name, descriptors, contests)
         for name in _metric_names(descriptors)
     }
-    return {
+    report = {
         "catalog_digest": catalog.digest,
         "catalog_model_digest": catalog.model_digest,
         "descriptor_count": len(descriptors),
@@ -180,6 +354,14 @@ def diagnose_profiler_catalog(
         },
         "metrics": metrics,
     }
+    if timing_us_by_key is not None:
+        report["performance_signal"] = _performance_signal_report(
+            descriptors,
+            contests,
+            timing_us_by_key,
+            minimum_slowdown_ratio=minimum_slowdown_ratio,
+        )
+    return report
 
 
 def _parse_args() -> argparse.Namespace:
@@ -190,6 +372,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--requests", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--minimum-slowdown-ratio",
+        type=float,
+        default=1.05,
+        help=(
+            "minimum canonical slow/fast timing ratio for profiler feature "
+            "calibration (default: 1.05)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -203,9 +394,20 @@ def main() -> int:
         args.requests,
         args.evidence,
     )
+    timing_values: dict[PhysicalCandidateKey, list[float]] = defaultdict(list)
+    for observation in observations:
+        timing_values[catalog.descriptor_for(observation).key].append(
+            observation.median_us
+        )
+    timing_us_by_key = {
+        key: statistics.median(values)
+        for key, values in timing_values.items()
+    }
     report = diagnose_profiler_catalog(
         catalog,
         source_formats=(row.source_format for row in observations),
+        timing_us_by_key=timing_us_by_key,
+        minimum_slowdown_ratio=args.minimum_slowdown_ratio,
     )
     encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output is not None:

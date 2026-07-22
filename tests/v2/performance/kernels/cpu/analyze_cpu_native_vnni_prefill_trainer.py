@@ -97,7 +97,7 @@ from native_vnni_dispatch.cpu_prefill_burned_seal import (  # noqa: E402
 )
 from native_vnni_dispatch.exact_oracle import build_exact_winners  # noqa: E402
 from native_vnni_dispatch.prefill_matrix import (  # noqa: E402
-    PREFILL_M_BUCKETS,
+    CPU_PREFILL_M_BUCKETS,
     cpu_prefill_measurements,
 )
 from native_vnni_dispatch.profiles import MeasurementProfile  # noqa: E402
@@ -1192,7 +1192,7 @@ def validate_total_policy(
     malformed: list[tuple[object, ...]] = []
     for build, runtime, threads in sorted(groups):
         for codebook in codebooks:
-            for m in PREFILL_M_BUCKETS:
+            for m in CPU_PREFILL_M_BUCKETS:
                 for bundle_signature in sorted(CPU_PREFILL_ROUTE_BUNDLES):
                     key = (
                         build,
@@ -1249,14 +1249,6 @@ def _pack_key(codebook: int, m: int, n: int, k: int) -> int:
     )
 
 
-def _ceiling_conditions(maximum_m: int) -> list[tuple[int, int]]:
-    return sorted({
-        (measurement.shape.n, measurement.shape.k)
-        for measurement in cpu_prefill_measurements()
-        if measurement.maximum_m == maximum_m
-    })
-
-
 def generate_include(
     entries: list[PrefillPolicyEntry],
     generic_rules: list[CPUPrefillGenericRule],
@@ -1308,29 +1300,16 @@ def generate_include(
         "",
         "inline constexpr int bucketCPUNativeVNNIPrefillM(int m, int n, int k)",
         "{",
-        "    int maximum_m = 16384;",
+        "    (void)n;",
+        "    (void)k;",
     ]
-    for maximum_m in (1024, 4096):
-        conditions = _ceiling_conditions(maximum_m)
-        joined = " ||\n        ".join(
-            f"(n == {n} && k == {k})" for n, k in conditions
-        )
-        keyword = "if" if maximum_m == 1024 else "else if"
-        lines.extend([
-            f"    {keyword} ({joined})",
-            f"        maximum_m = {maximum_m};",
-        ])
-    lines.extend([
-        "    if (m > maximum_m)",
-        "        m = maximum_m;",
-    ])
-    for bucket in PREFILL_M_BUCKETS:
+    for bucket in CPU_PREFILL_M_BUCKETS:
         lines.extend([
             f"    if (m <= {bucket})",
             f"        return {bucket};",
         ])
     lines.extend([
-        "    return 16384;",
+        f"    return {CPU_PREFILL_M_BUCKETS[-1]};",
         "}",
         "",
         "inline constexpr uint64_t packCPUNativeVNNIPrefillPolicyKey(",

@@ -22,7 +22,11 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1]
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from native_vnni_codebooks import CODEBOOK_TO_FORMAT, FORMAT_TO_CODEBOOK  # noqa: E402
+from native_vnni_codebooks import (  # noqa: E402
+    CODEBOOK_TO_FORMAT,
+    FORMAT_TO_CODEBOOK,
+    GPU_FORMAT_TO_EXECUTION_CODEBOOK,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 DEFAULT_POLICY_HEADER = REPO_ROOT / "src/v2/utils/PrefillGraphBucketDefaults.h"
@@ -181,12 +185,15 @@ def load_prefill_rows(paths: list[str], m_policy: list[int], include_off_policy_
                 if expected_codebook is None:
                     raise SystemExit(f"{path}:{row_index}: unknown format {fmt!r}")
 
-                codebook = _to_int(path, row_index, "codebook", row.get("codebook", ""))
-                if codebook != expected_codebook:
+                source_codebook = _to_int(
+                    path, row_index, "codebook", row.get("codebook", "")
+                )
+                if source_codebook != expected_codebook:
                     raise SystemExit(
                         f"{path}:{row_index}: codebook mismatch for {fmt}: "
-                        f"expected {expected_codebook}, found {codebook}"
+                        f"expected {expected_codebook}, found {source_codebook}"
                     )
+                codebook = GPU_FORMAT_TO_EXECUTION_CODEBOOK[fmt]
 
                 m = _to_int(path, row_index, "m", row.get("m", ""))
                 if m <= 1:

@@ -20,6 +20,8 @@ struct GeneratedDispatchTuning
     int force_two_phase = 0;
     // Exact KB is part of the batch-invariant arithmetic identity.
     int exact_kb = 0;
+    // Grouped-only decoded-weight row reuse; zero for public M1.
+    int grouped_rows = 0;
 };
 
 struct GeneratedDispatchEntry

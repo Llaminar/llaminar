@@ -4083,10 +4083,8 @@ namespace llaminar2
              * declares large-M prefill scratch can otherwise leave the later
              * canonical decode GEMV with no reduction arena.
              */
-            const int gemv_workspace_m = std::clamp(
-                m,
-                1,
-                kDefaultNativeVNNIVerifierRowCapacity);
+            const int gemv_workspace_m =
+                nativeVNNIBatchInvariantTileRows(m, n, k);
             if (gemv_workspace_m > 0)
             {
                 const int k_groups = (k + 31) / 32;

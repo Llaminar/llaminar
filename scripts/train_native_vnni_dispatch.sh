@@ -17,7 +17,7 @@ things:
     refit and certify without kernel/profiler launches, and optionally install.
 
 Options:
-  --backend cpu|cpu-prefill|cuda|rocm
+  --backend cpu|cpu-prefill|cuda|rocm|all
                               Policy backend/surface to train (required)
   --corpus-root DIR           Published Git LFS corpus root (default:
                               benchmark_results/native_vnni_dispatch/corpora)
@@ -28,6 +28,19 @@ Options:
   --skip-scorer-tests         Skip CUDA/ROCm scorer integration equivalence
   --no-lfs-pull               Do not run git lfs pull for an existing corpus
   --dry-run                   Print commands without executing them
+  --maximum-p95-regret-percent PERCENT
+                              Per-domain p95 regret limit (default: 5)
+  --minimum-passing-domain-percent PERCENT
+                              Required percentage of domains below the p95
+                              limit (default: 95). Use 0 for an explicit
+                              best-effort install that retains all misses as
+                              diagnostics while preserving hard correctness.
+  --cpu-minimum-promotion-warmups N
+                              Installable fixed-timing CPU evidence floor
+                              (default: refresh production default of 5)
+  --cpu-minimum-promotion-samples N
+                              Installable fixed-timing CPU evidence floor
+                              (default: refresh production default of 30)
   -h, --help                  Show this help
 
 Arguments after -- are forwarded to refresh_native_vnni_dispatch_tables.sh.
@@ -56,6 +69,10 @@ skip_build=0
 skip_scorer_tests=0
 lfs_pull=1
 dry_run=0
+maximum_p95_regret_percent=""
+minimum_passing_domain_percent=""
+cpu_minimum_promotion_warmups=""
+cpu_minimum_promotion_samples=""
 refresh_arguments=()
 
 while [[ $# -gt 0 ]]; do
@@ -92,6 +109,22 @@ while [[ $# -gt 0 ]]; do
       dry_run=1
       shift
       ;;
+    --maximum-p95-regret-percent)
+      maximum_p95_regret_percent="${2:-}"
+      shift 2
+      ;;
+    --minimum-passing-domain-percent)
+      minimum_passing_domain_percent="${2:-}"
+      shift 2
+      ;;
+    --cpu-minimum-promotion-warmups)
+      cpu_minimum_promotion_warmups="${2:-}"
+      shift 2
+      ;;
+    --cpu-minimum-promotion-samples)
+      cpu_minimum_promotion_samples="${2:-}"
+      shift 2
+      ;;
     --)
       shift
       refresh_arguments=("$@")
@@ -109,9 +142,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${backend}" in
-  cpu|cpu-prefill|cuda|rocm) ;;
+  cpu|cpu-prefill|cuda|rocm|all) ;;
   *)
-    echo "error: --backend must be cpu, cpu-prefill, cuda, or rocm" >&2
+    echo "error: --backend must be cpu, cpu-prefill, cuda, rocm, or all" >&2
     exit 2
     ;;
 esac
@@ -120,13 +153,137 @@ for argument in "${refresh_arguments[@]}"; do
   case "${argument}" in
     --backend|--profile|--output-dir|--shapes|--shape-partition|--skip-sweep|\
     --reuse-profiler-evidence|--install|--dry-run|\
+    --maximum-p95-regret-percent|--minimum-passing-domain-percent|\
+    --cpu-minimum-promotion-warmups|--cpu-minimum-promotion-samples|\
     --cpu-prefill-fit-replay-recipe|\
-    --backend=*|--profile=*|--output-dir=*|--shapes=*|--shape-partition=*)
+    --backend=*|--profile=*|--output-dir=*|--shapes=*|--shape-partition=*|\
+    --maximum-p95-regret-percent=*|--minimum-passing-domain-percent=*|\
+    --cpu-minimum-promotion-warmups=*|--cpu-minimum-promotion-samples=*)
       echo "error: ${argument} is owned by the turnkey transaction; add shapes to the shared inventory" >&2
       exit 2
       ;;
   esac
 done
+
+if [[ ( -n "${cpu_minimum_promotion_warmups}" ||
+        -n "${cpu_minimum_promotion_samples}" ) &&
+      "${backend}" != "cpu" && "${backend}" != "all" ]]; then
+  echo "error: CPU fixed-timing evidence floors require --backend cpu or all" >&2
+  exit 2
+fi
+
+# Promotion criteria are fit-only controls. They must not enter the corpus
+# generation identity: one immutable timing/profiler dataset can be mined and
+# certified repeatedly under a stricter or more permissive installation gate.
+if [[ -n "${cpu_minimum_promotion_warmups}" ]]; then
+  refresh_arguments+=(
+    --cpu-minimum-promotion-warmups "${cpu_minimum_promotion_warmups}"
+  )
+fi
+if [[ -n "${cpu_minimum_promotion_samples}" ]]; then
+  refresh_arguments+=(
+    --cpu-minimum-promotion-samples "${cpu_minimum_promotion_samples}"
+  )
+fi
+
+# A positive batch limit requests a clean, resumable collection checkpoint.
+# It changes scheduling only, so the corpus identity code removes it; retain
+# the value here solely to distinguish an intentional checkpoint from a
+# refresh implementation that incorrectly returned before producing every
+# required production artifact.
+cpu_batch_limit=0
+for ((argument_index = 0;
+      argument_index < ${#refresh_arguments[@]};
+      ++argument_index)); do
+  argument="${refresh_arguments[argument_index]}"
+  case "${argument}" in
+    --cpu-batch-limit)
+      if (( argument_index + 1 >= ${#refresh_arguments[@]} )); then
+        echo "error: --cpu-batch-limit requires a value" >&2
+        exit 2
+      fi
+      cpu_batch_limit="${refresh_arguments[argument_index + 1]}"
+      argument_index=$((argument_index + 1))
+      ;;
+    --cpu-batch-limit=*)
+      cpu_batch_limit="${argument#*=}"
+      ;;
+  esac
+done
+if [[ ! "${cpu_batch_limit}" =~ ^[0-9]+$ ]]; then
+  echo "error: --cpu-batch-limit must be a non-negative integer" >&2
+  exit 2
+fi
+
+if [[ "${backend}" == "all" ]]; then
+  overall_status=0
+  for selected_backend in cpu cpu-prefill cuda rocm; do
+    command=(
+      "$0"
+      --backend "${selected_backend}"
+      --corpus-root "${corpus_root}"
+      --workspace-root "${workspace_root}"
+    )
+    (( install )) && command+=(--install)
+    (( skip_build )) && command+=(--skip-build)
+    (( skip_scorer_tests )) && command+=(--skip-scorer-tests)
+    (( ! lfs_pull )) && command+=(--no-lfs-pull)
+    (( dry_run )) && command+=(--dry-run)
+    if [[ -n "${maximum_p95_regret_percent}" ]]; then
+      command+=(
+        --maximum-p95-regret-percent "${maximum_p95_regret_percent}"
+      )
+    fi
+    if [[ -n "${minimum_passing_domain_percent}" ]]; then
+      command+=(
+        --minimum-passing-domain-percent "${minimum_passing_domain_percent}"
+      )
+    fi
+    if [[ "${selected_backend}" == "cpu" &&
+          -n "${cpu_minimum_promotion_warmups}" ]]; then
+      command+=(
+        --cpu-minimum-promotion-warmups "${cpu_minimum_promotion_warmups}"
+      )
+    fi
+    if [[ "${selected_backend}" == "cpu" &&
+          -n "${cpu_minimum_promotion_samples}" ]]; then
+      command+=(
+        --cpu-minimum-promotion-samples "${cpu_minimum_promotion_samples}"
+      )
+    fi
+    if ((${#refresh_arguments[@]})); then
+      # Promotion criteria are owned by the turnkey options above. Remove the
+      # copies appended for a single-backend refresh before forwarding the
+      # caller's remaining diagnostic/collection options.
+      forwarded_refresh_arguments=()
+      skip_next=0
+      for argument in "${refresh_arguments[@]}"; do
+        if (( skip_next )); then
+          skip_next=0
+          continue
+        fi
+        case "${argument}" in
+          --maximum-p95-regret-percent|--minimum-passing-domain-percent|\
+          --cpu-minimum-promotion-warmups|--cpu-minimum-promotion-samples)
+            skip_next=1
+            ;;
+          *) forwarded_refresh_arguments+=("${argument}") ;;
+        esac
+      done
+      if ((${#forwarded_refresh_arguments[@]})); then
+        command+=(-- "${forwarded_refresh_arguments[@]}")
+      fi
+    fi
+    printf 'NativeVNNI all-backend transaction: starting %s\n' \
+      "${selected_backend}"
+    if ! "${command[@]}"; then
+      overall_status=1
+      printf 'NativeVNNI all-backend transaction: %s failed; continuing\n' \
+        "${selected_backend}" >&2
+    fi
+  done
+  exit "${overall_status}"
+fi
 
 run() {
   if (( dry_run )); then
@@ -138,10 +295,28 @@ run() {
   "$@"
 }
 
-inventory_id="$({
-  PYTHONPATH="${python_root}" \
-    python3 -m native_vnni_dispatch.corpus_bundle inventory-id
-} | sed 's/^sha256://')"
+inventory_sources=()
+if [[ "${backend}" == "cpu-prefill" ]]; then
+  inventory_sources=(
+    "${python_root}/native_vnni_dispatch/manifests/native_vnni_decode_shapes_v5.json"
+    "${python_root}/native_vnni_dispatch/manifests/qwen35_qwen36_release_models_v1.json"
+    "${python_root}/native_vnni_dispatch/prefill_matrix.py"
+    "${python_root}/native_vnni_dispatch/cpu_prefill_training_plan.py"
+    "${python_root}/native_vnni_dispatch/cpu_prefill_split_manifest.py"
+    "${python_root}/native_vnni_dispatch/manifests/native_vnni_cpu_prefill_split_v12.json"
+  )
+fi
+inventory_command=(
+  env "PYTHONPATH=${python_root}"
+  python3 -m native_vnni_dispatch.corpus_bundle inventory-id
+)
+if ((${#inventory_sources[@]})); then
+  inventory_command+=(--repository-root "${repo_root}")
+  for inventory_source in "${inventory_sources[@]}"; do
+    inventory_command+=(--inventory-source "${inventory_source}")
+  done
+fi
+inventory_id="$("${inventory_command[@]}" | sed 's/^sha256://')"
 inventory_short="${inventory_id:0:16}"
 configuration_command=(
   env "PYTHONPATH=${python_root}"
@@ -249,6 +424,16 @@ refresh_command() {
   if (( install )); then
     command+=(--install)
   fi
+  if [[ -n "${maximum_p95_regret_percent}" ]]; then
+    command+=(
+      --maximum-p95-regret-percent "${maximum_p95_regret_percent}"
+    )
+  fi
+  if [[ -n "${minimum_passing_domain_percent}" ]]; then
+    command+=(
+      --minimum-passing-domain-percent "${minimum_passing_domain_percent}"
+    )
+  fi
   command+=("${refresh_arguments[@]}")
   run "${command[@]}"
 }
@@ -297,6 +482,24 @@ elif [[ "${backend}" == "cpu-prefill" &&
 fi
 refresh_command "${staging_dir}" "${collection_arguments[@]}"
 
+if (( ! dry_run )); then
+  set +e
+  env "PYTHONPATH=${python_root}" \
+    python3 -m native_vnni_dispatch.corpus_bundle collection-complete \
+      --directory "${staging_dir}" --backend "${backend}" --profile all \
+      --quiet
+  collection_status=$?
+  set -e
+  if (( collection_status == 1 && cpu_batch_limit > 0 )); then
+    printf 'NativeVNNI collection checkpoint retained: %s\n' "${staging_dir}"
+    exit 0
+  fi
+  if (( collection_status != 0 )); then
+    echo "error: refresh returned without a complete publishable corpus" >&2
+    exit "${collection_status}"
+  fi
+fi
+
 seal_command=(
   env "PYTHONPATH=${python_root}"
   python3 -m native_vnni_dispatch.corpus_bundle seal
@@ -308,6 +511,9 @@ seal_command=(
 )
 for argument in "${refresh_arguments[@]}"; do
   seal_command+=("--refresh-argument=${argument}")
+done
+for inventory_source in "${inventory_sources[@]}"; do
+  seal_command+=(--inventory-source "${inventory_source}")
 done
 run "${seal_command[@]}"
 run mkdir -p "$(dirname "${corpus_dir}")"

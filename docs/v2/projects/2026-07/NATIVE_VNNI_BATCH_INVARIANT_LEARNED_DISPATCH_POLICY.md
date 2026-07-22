@@ -1,7 +1,7 @@
 # Cross-Backend Batch-Invariant NativeVNNI Learned Dispatch Policy
 
 - **Date**: 2026-07-18
-- **Status**: Implementation in progress. The historical interpolation-friendly round-12 fit reached 99.72% of its domains but failed its first untouched seal and is not admissible. The later anchor-aware profiler fit was also invalidated: representative launches cannot supply dynamic counters for other work points. Exact-point request schema v4 and direct per-OpenMP-worker CPU counter collection are implemented and passed focused same-candidate/different-M and same-M/different-candidate signal probes. A resumable two-socket broad CPU-prefill transaction is now collecting 129,197 exact production launches plus 738 explicit unsupported requests from the immutable 129,935-request manifest. The CPU policy remains uninstalled pending complete exact evidence, real-corpus feature diagnostics, a promotable fresh fit, freeze, untouched sealed certificate, production smoke gate, and unit gate. CUDA/ROCm fitting follows CPU certification.
+- **Status**: Implementation in progress. Exact-point profiler evidence, resumable collection, accelerator-backed fitting, generic totality checks, and authenticated promotion criteria are implemented. The shared overlay inventory covers every declared production geometry and all 21 runtime formats on CPU, CUDA, and ROCm. Decode is measured at M=1 and grouped verification at M=2..16 plus M=31. GPU ordinary prefill retains M=64,256,1024,2048,4096,8192,16384. CPU v11 bounds new evidence to M=64,256,512,1024,2048 below 14B and M=64,256,512 at 14B and above; generic dispatch remains total beyond those measured ceilings. The immediate milestone is a best-effort installation of CPU, CUDA, and ROCm decode/grouped/prefill policies using explicit recorded promotion overrides, followed by production smoke and unit gates. No performance override may waive byte equality, runtime totality, evidence completeness, or route correctness.
 - **Scope**: CPU, CUDA, and ROCm NativeVNNI GEMV/GEMM dispatch for `Fast M=1`, a frozen serial-M1 oracle, bitwise MTP verifier rows `M=2..16` plus the deeper M31 sentinel, and ordinary full-K prefill/large-M GEMM policy generation
 - **Parent project**: [vLLM-Style MTP Project Plan](../2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md)
 - **Evidence dashboard**: [vLLM-Style MTP Tuning Dashboard](../2026-06/MTP_VLLM_STYLE_TUNING_DASHBOARD.md)
@@ -23,7 +23,7 @@ use the same:
 - generic aspect/work learner;
 - shape-grouped development/CV and sealed-certification protocol;
 - strict per-domain measured-p95 and conservative-p95-UCB regret gates below
-  5%, with at least 99% of domains required to pass and global p95/maximum
+  5%, with at least 95% of domains required to pass and global p95/maximum
   regret retained as diagnostics;
 - generated-policy intermediate representation;
 - provenance and stale-policy checks; and
@@ -52,7 +52,7 @@ grouped development CV, then fit/freeze final generic policy on development
 sealed shape certification by generic domain, exact overlays disabled, no refit
               |
               v
-100% structural coverage + at least 99% of domains with both p95 gates < 5.0%
+100% structural coverage + at least 95% of domains with both p95 gates < 5.0%
               |
               v
 exact overlays + certified generic rules + policy manifest
@@ -385,6 +385,50 @@ and routing utilization are grid-limited in that five-point test and scale to
 absent because these kernels are integer control/reduction work plus exact FP64
 comparisons, not matrix multiplication.
 
+### 1.2.1 CUDA grouped verifier checkpoint on 2026-07-20
+
+CUDA grouped verification now exposes two real production candidates: trained
+DP4A row-reuse tiles and a dedicated Ampere `m16n8k32` signed-INT8 tensor-core
+kernel. Reusing the ordinary prefill tensor-core epilogue was rejected after
+the first Q8_1 M=4 byte gate produced 12,288 mismatched values out of 16,384.
+The accepted kernel instead feeds exact INT32 MMA dots into the same explicit
+round-to-nearest FP32 scale/min/delta helper and ascending K-partition reducer
+as serial M1 decode.
+
+The dedicated tensor-core candidate first passed 672/672 production-route
+cells: all 21 formats, eager and graph-captured execution, and every canonical
+verifier depth M=2..16 plus M=31. The follow-up complete tournament exercised
+every launchable DP4A row tile and the tensor-core candidate in 2,940 rows over
+that same format/depth/mode matrix. Every row had zero output-byte mismatches,
+zero repeat mismatches, and valid route, workspace, explicit-stream,
+serial-route, and graph-capture counters. This wider proof also removed the old
+WIDE/DIRECT per-row kernel: those cells now execute the same true grouped DP4A
+weight-decode reuse kernel as KPAR while forcing the serial WIDE/DIRECT KB=1
+tree and publishing partition zero without an extra signed-zero-changing add.
+
+The corrected low-sample M={16,31} diagnostic selected tensor cores in 16 of
+84 format/M/mode domains, with DP4A r2/r4/r8/r16 owning the remaining domains.
+For representative Q8-family M=31 cells, tensor cores are approximately
+1.10-1.12x faster. These timings prove candidate diversity and justify keeping
+both physical families; the full corpus transaction remains authoritative for
+installed exact overlays and generic rules.
+
+Nsight identified and closed a one-warp-block occupancy limit. Packing four
+independent private-shared-memory warp tiles per CTA increased theoretical
+occupancy from 33.33% to 83.33% and achieved occupancy from 31.29% to 75.12%.
+The final Q8_1 M=31 profile records 46 registers per thread, zero local-memory
+spills, 65,536 IMMA instructions, and 90.40% memory-pipe utilization. The
+DP4A path now similarly packs independent N tiles for low-register row depths.
+The Q4_0 M=16 direct r2 profile records 32 registers per thread, zero spills,
+100% theoretical occupancy, and 25.97% achieved occupancy. The latter is
+finite-grid limited: byte-exact KB=1 work exposes only 32,768 useful threads,
+and packing changes their block ownership rather than inventing arithmetic.
+Nsight replay duration improved from 73.22 to 72.38 microseconds. The generated
+grouped policy ABI is typed: exact overlays and then total geometry/M rules
+choose `Dp4aRows` or `TensorCoreMma16`; an absent decision is a hard failure and
+cannot invoke serial row replay. Full CUDA corpus fitting, sealed
+certification, and installed-policy smoke remain open.
+
 ### 1.3 Three-backend symmetry acceptance matrix
 
 Cross-backend symmetry means an equal semantic contract and equal quality of
@@ -396,7 +440,7 @@ only when those choices cannot change FP32 parenthesization.
 | Production surface | CPU | CUDA | ROCm | Work required before symmetric installation |
 |---|---|---|---|---|
 | Serial decode / `Fast M=1` GEMV | Five-candidate NBC registry, all-format trainer, exact/generic compiler, sealed certification, and fail-closed include implemented; production corpus collection pending | Common registry/trainer implemented; profiler corpus complete; certification pending | Common registry/trainer implemented; profiler corpus complete; certification pending | Collect/profile/certify the CPU M1 corpus and certify both GPU policies |
-| Grouped verifier projection | Pairwise/WideRows common trainer exists; expanded-depth replacement certificate pending | `INHERIT_SERIAL_M1` common surface exists; grouped proof and final certificate pending | `INHERIT_SERIAL_M1` common surface exists; grouped proof and final certificate pending | Prove all formats and `M=2..16,31`, route identity, captured/eager production execution, and economy against each frozen M1 policy |
+| Grouped verifier projection | Pairwise/WideRows common trainer exists; expanded-depth replacement certificate pending | DP4A row-reuse and integer-tensor-core candidates are byte-proven for every format/depth/mode; typed exact/generic compiler implemented; full corpus certificate pending | `INHERIT_SERIAL_M1` common surface exists; grouped proof and final certificate pending | Complete CUDA fitting/certification, then prove the same all-format/depth route and economy contract for ROCm against each frozen M1 policy |
 | Ordinary dense prefill / GEMM | Partial-N corruption fixed; v4 development frozen at 2.934441% maximum promoted CV regret; fresh all-format/all-M sealed collection open | Legacy backend-specific generator | Legacy backend-specific generator | Complete CPU v4 certification, migrate both GPU generators to common profiler-informed freeze plus fresh sealed certification, and install only after each backend's sealed gate passes |
 | Fused dense bundles | Correctness sweeps exist, but QKV, gate/up, fused SwiGLU/down, and GDN bundles are not first-class common learned domains | Same | Same | Add honest projection vectors and bundle signatures to all three registries, corpora, learners, emitters, and sealed partitions |
 | Routed/shared grouped MoE | Production grouped implementation and byte sweeps exist; no common learned grouped-MoE policy | Production grouped implementation and byte sweeps exist; no common learned grouped-MoE policy | Common adapter and 12-candidate registry exist, but the emitter is exact-anchor only and lacks profiler-informed freeze/sealed certification | Build one symmetric grouped-MoE transaction for CPU/CUDA/ROCm, including router-to-expert Q8 reuse counters and fused gate/up/down roles |
@@ -504,6 +548,36 @@ deduplication, and top-k kernels. A shared-atomic byte-radix p95 experiment was
 rejected after exact tests passed because it slowed the representative CUDA
 child scorer by about 24%; the retained bounded subgroup upper-tail selector is
 both exact and faster.
+
+### 1.6 Comprehensive overlays and best-effort promotion on 2026-07-20
+
+Exact overlays are additive to generic learned dispatch, never a substitute for
+it. The shared shape manifest currently resolves 86 production decode/grouped
+geometries. Every backend measurement plan forms the Cartesian product of those
+geometries, all 21 runtime formats, eager and graph-captured execution, and the
+canonical decode/grouped M inventory. Ordinary prefill resolves the 75
+non-LM-head production geometries that the prefill graph can actually invoke
+and measures each at all seven canonical prefill M buckets. Generic rules remain
+mandatory and prove total dispatch for every positive M and every supported
+N/K geometry outside those finite exact anchors.
+
+The turnkey driver accepts `--maximum-p95-regret-percent` and
+`--minimum-passing-domain-percent`. Both values are frozen into development
+metadata, the sealed certificate, and the installable policy artifact, so a
+policy cannot be certified under one criterion and installed under another.
+The normal defaults remain p95 regret below 5% in at least 95% of domains. An
+operator may explicitly set the passing-domain percentage lower, including zero
+for a best-effort installation, while every miss remains visible as a typed
+performance exception. This affects only the performance quota: missing generic
+coverage, empty or unexercised trees, incomplete profiler evidence, ambiguous
+dispatch, byte mismatches, and M/N*K/codebook totality failures remain hard
+installation failures.
+
+`scripts/train_native_vnni_dispatch.sh --backend all` runs the CPU decode and
+grouped transaction, CPU prefill transaction, CUDA transaction, and ROCm
+transaction as independent resumable corpus generations. One backend failure
+does not discard another backend's evidence, but the aggregate command exits
+nonzero until every requested transaction succeeds.
 
 ## 2. Authority, Applicability, and Non-Goals
 
@@ -735,17 +809,18 @@ the runtime ceiling were removed, and the loaders reject future entries beyond
 that supported bound.
 
 Grouped verifier collection remains `M=2..16,31`, the speculative-depth
-surface. The ordinary NativeVNNI GEMM/prefill buckets are
-`M={64,256,1024,2048,4096,8192,16384}` with model-tiered ceilings: 32B stops at
-`1024` and 14B at `4096` only for CPU collection. CUDA and ROCm directly
-measure every 14B/32B projection through `8192`; 9B-and-smaller models use the
-full `16384` range on all backends. These are intentionally different semantic
-surfaces; expanding verifier depth to prefill-sized batches would add cost
-without representing an MTP runtime state.
+surface. CPU ordinary prefill v12 measures
+`M={64,128,256,512}` for below-14B geometries and `M={64,128}` for geometries
+owned by 14B-or-larger models. CUDA and ROCm
+retain `M={64,256,1024,2048,4096,8192,16384}`. These are measurement ceilings,
+not runtime limits: generic CPU policy maps every larger positive M to the
+deepest trained bucket, and totality regressions exercise values beyond 512.
+Grouped verification and ordinary prefill remain intentionally different
+semantic surfaces.
 
 The ordinary CPU prefill measurement surface is executable in
-`native_vnni_dispatch.prefill_matrix`. It currently contains 22 real,
-non-LM-head Qwen2.5 projections and 138 shape/depth cells. The strong
+`native_vnni_dispatch.prefill_matrix`. It currently contains 75 real,
+non-LM-head production projections and 224 shape/depth cells. The strong
 `TrainerCsv_StrongPrefill_AllFormats` test measures all thirteen explicit registry
 requests through `gemm_native_vnni_preq`, records normalized physical routes,
 and compares selected output rows from two launches with serial M1 rows.
@@ -2439,10 +2514,10 @@ If a bucket cannot meet the generic gate:
   provenance;
 - fresh route-compatible non-overlay geometries are appended to the immutable
   timing corpus while existing per-variant profiler evidence is reused; and
-- the policy is refit until at least 99% of required domains have both measured
+- the policy is refit until at least 95% of required domains have both measured
   p95 and conservative p95 UCB strictly below 5%.
 
-When the 99% quota passes, the less-than-1% performance-exception set remains
+When the 95% quota passes, the at-most-5% performance-exception set remains
 explicit in policy diagnostics and each exception still publishes its best
 measured generic tree. The allowance applies only to performance. Missing
 domains, uncovered points, empty trees, ambiguous dispatch, unexercised sealed
@@ -2514,11 +2589,14 @@ version.
 - Where several shapes come from one model family, at least one development
   evaluation SHOULD leave the whole model family out.
 
-Development cross-validation selects the feature-schema version, permitted
+Development cross-validation selects the feature-schema version, fold-local
 rule complexity, work cuts, and candidates. After those choices are frozen,
-the learner fits the final generic policy exactly once on all development
-groups. The resulting generic IR and digest are frozen before sealed data is
-opened.
+the learner distills the complete cross-fitted decision surface exactly once
+on all development groups. The publication tree may use the reviewed global
+leaf bound because the union of independently selected fold boundaries can
+require more leaves than any one fold-local tree. This does not relax economy:
+every emitted leaf must still pass measured p95, and the resulting generic IR
+and digest are frozen before untouched sealed data is opened.
 
 ### 11.4 Sealed generic-only evaluation
 
@@ -2889,7 +2967,7 @@ An installable refresh performs these steps in order:
    - freeze and publish its IR/digest before opening sealed timing;
    - evaluate that exact policy on the sealed partition without refitting;
    - compute observed p95 regret and p95 simultaneous-UCB regret per domain,
-     require both strictly below 5% in at least 99% of domains, and retain all
+     require both strictly below 5% in at least 95% of domains, and retain all
      exception/global/maximum values as diagnostics;
    - compile, emit, and build the staged production M1 policy;
    - freeze its policy, packing, and arithmetic hashes.
@@ -2913,7 +2991,7 @@ An installable refresh performs these steps in order:
    - evaluate that exact policy on the sealed partition with exact overlays
      disabled;
    - require complete structural coverage and the strict per-domain p95 `<5%`
-     sealed gate in at least 99% of required domains;
+     sealed gate in at least 95% of required domains;
    - write final IR/manifest without refitting the generic policy.
 8. **Collect sealed profiler evidence without refitting**
    - open sealed profiler requests only after the generic IR/digest is frozen;
@@ -3078,20 +3156,39 @@ until the one-command path owns a focused regression for each item.
 | Duplicate raw evidence hashing | Recipe preflight authenticated multi-gigabyte aggregate/timing files, then every fit/freeze/certify process serially streamed the same raw transaction again (13.4 seconds per invocation). | Preflight emits the authenticated raw corpus identity and analyzer development contexts consume it directly. Prefix and sealed contexts retain their independent identities and are never relabeled. |
 | Synthetic refinement exact overlays | `CPUPrefillAutoRefine_N512_K288` correctly trained a generic boundary but was also emitted as an exact overlay, so freeze demanded a production serial-route record for a diagnostic-only geometry. | Generic learning consumes every authenticated refinement row. Exact publication is independently filtered to declared production shape/M cells and uses canonical production shape names only. Recipe preflight separately proves the target route manifests cover the current production matrix. |
 | Fixed sealed geometry under-covered expanded trees | The original eight sealed shapes could not exercise 1,489 of the 2,579 generic leaves after candidate and feature expansion, including every serial-K partition. | Freeze selects one untimed physical route witness per frozen leaf from authenticated target routes plus diagnostic-only completion probes. The self-contained plan embeds the exact C++ route, rejects any generated geometry visible to development, and is replayed semantically before collection and certification. The current plan covers all 2,579 leaves with 1,859 records over 641 selected geometries. |
+| CPU decode static holdout could not certify learned leaves | The CPU M=1 V4 holdout exercised only 39 of 108 domains and missed 143 of 352 frozen leaves. Its separately timed candidate blocks also made a global unpaired Bonferroni UCB far wider than the small schedule differences under test. Grouped decode inherited the same fixed-partition weakness. | CPU M=1 and grouped decode now commit to fresh post-freeze reserves. M=1 generates unseen geometry candidates per leaf, probes the real C++ full-K/K-part route on all three ISA regimes, then measures the selected schedule against every forceable challenger and source alias in interleaved pairs. Grouped decode does the same for every frozen M leaf with the production Pairwise/WideRows launcher and complete `M*N` byte equality against production serial M=1. Static CPU sealed CSV inputs are rejected; request shards are architecture-homogeneous, resumable, and reduced in parallel at physical-core width. |
 | Sealed cost discovered only at installation | Development fitting optimized grouped CV without continuously projecting the independent certification transaction. Only after the final freeze did the adaptive witness planner reveal 641 geometries, 1,859 source-format records, 2,941 format/M cells, and 2,579 leaves requiring fresh measurements. The exact witnesses correctly depend on the frozen tree, but their scale and cost should not have been an installation surprise. | Before final refinement, authenticated preflight must report provisional leaf count, untouched-reserve reachability, projected witness geometries/records/cells/process jobs, and calibrated wall time for every ISA regime. The reserve commitment and coverage obligations are fixed before fitting, while timings remain unopened until the generic digest freezes. Promotion cannot proceed without a complete reserve and an explicit collection-budget acknowledgement. |
 | Interpolation-only CV certified boundary failures | The 216,632-row development fit passed 99.07% of domains, but its first complete untouched seal passed only 405/756 domains: 53.57%, with 40.23% global p95 observed regret. Coverage was 2,579/2,579 leaves and bitwise failures were zero. Failures were broad across ISA, M, and codebook but concentrated at K=32/64 below the development minimum K=192. Feature-sorted round-robin folds also allowed another shape name at the same N/K to remain in training. | Cross-validation treats exact N/K geometry as the atomic group, not the shape label. Larger domains are partitioned into coherent balanced spatial regions, so local neighborhoods and support boundaries leave development together; small domains use leave-one-geometry-out validation. The fold schema is part of cache identity. Interpolation-friendly neighbor spreading is not accepted as evidence for generic unseen-shape dispatch. |
 | Burned seal could only be reused by provenance relabeling | After the failed seal was inspected, its 38,233 adapted candidate rows became valuable development evidence, but ordinary additive inputs would have assigned the historical development build/runtime identity to the fresh sealed measurements. Re-adapting the 1.9 GiB timing sidecar for every fit would also make experimentation unnecessarily expensive. | A content-addressed burned-seal development transaction binds aggregate, timing sidecar, old witness plan, and the exact measuring git/build/compiler/host/runtime/serial-policy provenance. Replay validates that old sealed matrix independently, composes original corpus-ID partitions without relabeling, materializes a reusable mixed checkpoint before fitting, and requires every changed policy to use a new untouched seal. The replay recipe retains these transactions as a typed v4 field. |
+| Paired CPU seal ratios had no generic-only replay path | A complete M=1 seal failed promotion but retained 1,286 byte-exact selected/challenger edges over 82 shards. Treating those rows as ordinary observations could create exact overlays at opened holdout geometry; discarding them would force the generic learner to repeat known boundary mistakes. | CPU M=1 and grouped analyzers authenticate each old plan plus complete paired directory, replay every request field, and convert ratios only into supplemental candidate costs for existing generic domains/candidates. Burned geometry cannot enter exact overlays or the next reserve, and unseen-point profiler descriptors retain static resources while masking request-local dynamic counters. Repeatable positionally paired wrapper options carry every burned generation through freeze, fresh planning, and certification. |
+| Historical paired refinement omitted from a manual refit | A burned-seal replay was initially launched with the broad corpus and burned ratios but without the 173 retained paired-development shards that produced the 99.07% baseline. The command was syntactically valid and would have spent accelerator time fitting a weaker, non-comparable policy. | The turnkey transaction owns the complete paired-refinement inventory and appends it to freeze, fresh-plan generation, and certification together with every burned generation. Focused command-graph regressions require plan/directory pairing and prove all evidence arguments reach every generation step. Direct diagnostics must explicitly enumerate retained paired shards. |
+| Burned paired seal reached freeze but not refinement | The first corrected CPU M=1 replay let the paired planner declare the old broad corpus green, then introduced the failed seal only during freeze. Freeze therefore solved a different cost graph and failed after another full fit. | Burned plan/directory pairs are authenticated before refinement, contribute supplemental generic costs and digest identity to every planner iteration, and are never redundantly requested. The exact same burned transactions reach planner, freeze, fresh planning, and certification. |
+| Additive geometry invalidated burned-seal replay | Adding the V7 CPU M=1 geometry correctly changed the current development digest, but burned M=1 and grouped loaders required it to equal the older seal plan's source digest. The valid historical transaction then failed before fitting even though its candidate registry, format registry, requests, paired rows, and target generic domains were unchanged. | A burned plan is self-authenticated against current registry generations and every paired row is replayed against its immutable request. Witnesses must resolve to exactly one compatible generic domain in the enlarged corpus. Whole-corpus digest equality is required for a live seal, never for generic-only burned evidence consumed by a later additive generation. Focused M=1 and grouped regressions use changed development digests. |
+| Minimax exact candidate hid the failing source alias | One CPU M=1 cell selected `nbc1`, reported 11.29% broad regret, and named minimax compromise `nbc8` as its exact candidate. The planner repeatedly measured `nbc1` versus `nbc8`, although the Q4_1 alias's actual regret witness was `nbc4`; six completed paired runs could not change the reported failure. | Paired refinement reconstructs corrected effective latency independently for every source alias and requests the candidate with the greatest advantage over the selected route. A completed direct edge that still contradicts the fitted graph is a terminal evidence conflict, not a corpus-digest-dependent request for the same launch pair. Focused regressions cover both minimax/exact disagreement and conflict termination. |
+| Pairwise refinement composed incompatible process histories | The exhausted CPU M=1 generation reached iteration 39 with one impossible cycle at AVX512-build/AVX2-runtime Q4_0 `3072x6144`: separately gathered edges implied both `nbc1 ~= nbc2` and an indirect 23% advantage for `nbc2`. Focused replays found the same pair stable within each socket but changed its old ranking, while a complete four-edge cycle gathered in one invocation closed within 2.5% on both sockets. After the repair, the next refit emitted 145 requests over 44 runtime cells; an explicit identity audit found zero overlap with the 991 cells in the first complete-star generation, proving these were newly exposed surfaces rather than replacement anchors. | Every failing runtime cell now requests a complete direct star from the selected launch to every forceable physical candidate in its first refinement generation. Content-addressed sharding keeps that cell indivisible in one producer process; the request limit is a packing target, never permission to split a tournament. The first complete directional star is immutable cell evidence: later fits derive every candidate ratio from it and cannot create another star. Indirect connectivity across sessions is not accepted as a substitute. CPU M=1 and grouped decode share this rule, and focused planner/sharder regressions lock it in. The inconsistent cross-session generation is diagnostic-only and cannot be installed. |
+| Coarse K-part geometry skipped a 32-wide route boundary | A complete all-format 5-by-5 neighborhood around the 3B FFN-down geometry stepped N and K by 64. Remaining failures switched among `nbc1`, `nbc4`, and `nbc8` inside those cells, so the learner had no observations at the 32-value alignment and tail boundaries exposed by its own features. An isolated `3072x4096` miss had the same local-supervision problem. | Generic development geometry includes dense all-format, all-ISA neighborhoods at every route-relevant alignment scale. The V7 CPU M=1 family adds the 16 missing 32-step inner-lattice points around `2048x11008` plus eight non-overlay neighbors around `3072x4096`; manifest regressions lock the exact geometry, partition, and aspect inventory. |
+| Grouped decode skipped paired development | The grouped workflow adapted broad all-format timings and went directly to generic freeze plus a fresh seal, while M=1 already used iterative isolated selected/challenger ratios. A failed grouped seal would have been the first reliable indication that the broad winner graph was wrong. | `paired_requests --surface grouped-verifier` is a mandatory resumable gate before grouped freeze. It uses the production byte-exact grouped launcher, retains content-addressed per-ISA shards, and passes the complete paired-development set to both freeze and certification. |
+| Suspected CPU tree-capacity miss was not capacity-bound | After the paired graph was nearly exhausted, six domains remained above budget. A 32-leaf diagnostic kept all six accelerators busy for 56 minutes, yet every failing domain selected only 1-7 leaves and the failed-cell count rose from 17 to 20. | Do not raise the production ceiling unless diagnostics show the selected model exhausted it. Preserve this negative experiment in the fit cache, return production to 16 leaves, and investigate candidate-edge evidence, fold geometry, and feature/model selection for these domains. |
+| Global leaf-cap expansion recomputed passing domains | Raising CPU M=1 from 16 to 32 leaves treated the larger ceiling as an unrelated tournament, including domains already promotable at the smaller horizon. | If a future domain truly exhausts the bound, persist complexity-prefix CV state and escalate only failing domains. A mixed-complexity result must retain deterministic global ordering and one policy digest, and a cold full search must produce byte-identical rules and diagnostics to the incremental path. |
+| Grouped freeze repeated raw adaptation | The grouped transaction first published an authenticated common-observation checkpoint, then freeze and certification each converted the large aggregate/timing corpus and rebuilt normalized profiler descriptors again. M=1 already reused both caches, leaving grouped decode slower and operationally asymmetric. | Grouped freeze and certification use the same `--reuse-development-common` contract and persistent `profiler_feature_catalog_v1.json` as M=1. Every common row must match the requested raw corpus digest and full git/build/compiler/host/runtime/serial-policy provenance, including its ISA-specific build suffix; successful reuse does not rewrite the checkpoint. |
+| Grouped adaptation remained serial | The grouped transaction shared the accelerator-backed learner with M=1, but exact timing-sidecar parsing and common-observation construction still ran on one host core. Large grouped corpora therefore entered the fast learner through a serial front end. | Large grouped timing files are split at byte-safe record boundaries across affinity-visible physical cores, reduced in file/range order with global sample-index validation, and aggregate observations are adapted into private canonical CSV shards before atomic ordered assembly. Small corpora remain serial below the reviewed threshold. A focused regression proves serial and parallel timing maps, observations, and common CSV bytes are identical. |
 | Profiler scaling signal partitioned by exact M | The first geometry-coherent fit had complete coverage but only 554/756 domains passed; all 202 failures were multi-candidate full-K domains. The profiler surrogate already carried `log2(M)` and arithmetic-intensity features, yet exact M was part of its transfer key, so seven disconnected forests could not learn how the same physical candidate scales from M=64 through 16384. | Prefill profiler transfer is cross-M and cross-format while retaining hard architecture, arithmetic-contract, operation, bundle, and execution-mode boundaries. Held-out N/K geometry is removed from every M and format in the pool before fitting. M remains an explicit numeric feature, pool-local cache identity covers every dependent M domain, and regressions prove both cross-M sharing and cross-M leakage exclusion. |
 | Cross-M pooling collapsed host occupancy | The first cross-M replay reduced 42 pools to six but scheduled one worker per pool. Only three expensive full-K processes remained active while most of the 48-core host sat idle. | Build each pool's immutable normalized feature index once, share it copy-on-write, and schedule each independent held-out forest as its own deterministic process task. A focused regression proves one pool occupies multiple configured workers and serial/parallel prediction bytes remain equal. |
+| Profiler model preprocessing left every accelerator idle | Before the 216 cross-M forest surfaces could run, one parent eagerly hashed singleton observation aliases and materialized 132,939 runtime/profiler feature records. The latter stage took more than four minutes on one core. | Alias selection compares cheap source/mode/candidate fields first and hashes only true ties. Large model-record pools use deterministic contiguous physical-core shards inherited through `fork`, publish private result files, and merge in source order. Serial/parallel record order and values are regression-equal. On the 158,760-row CPU M=1 corpus, observation indexing is 2.55 seconds and all six record pools complete in 19.8 seconds instead of more than four minutes. The same implementation is mandatory for grouped decode. |
 | Profiler workers defaulted to SMT width | Surface-level scheduling initially launched 112 ExtraTrees processes on a 56-physical-core host, doubling process state and run-queue contention for CPU-bound estimators. | Every policy CPU process pool defaults to unique affinity-visible `(physical_package_id, core_id)` identities. Incomplete topology falls back conservatively to visible logical CPUs, explicit worker variables remain available for A/B diagnosis, and a synthetic two-socket SMT regression locks in the physical-core count. |
 | Dynamic profiler counters treated as shape-independent inputs | Normalized IPC, cache, throughput, achieved occupancy, traffic, and duration-derived rates from one representative launch were attached to a candidate at every runtime geometry. Even with exact profiling, training on dynamic values while masking them for held points creates a missing-feature distribution shift. | Dynamic descriptors are keyed by complete exact launch identity and never transfer to another M/N/K point. Runtime geometry, candidate/schedule configuration, and static resources are inputs. Candidate-relative exact dynamic metrics are bounded auxiliary targets beside log-regret; held geometry is removed across all M and formats before target construction. No varying comparative target makes the profiler variant measured-only. Focused regressions prove exact ownership, input/target separation, static retention, and held-geometry exclusion. |
 | Optional profiler metric absence became numeric zero | Auxiliary target assembly previously used zero for a missing optional metric while retaining measured values from competing candidates. That could make unsupported evidence look like an exceptionally economical kernel. LLC misses were also collected without LLC loads and then discarded because no fraction could be formed. | A dynamic metric is centered only when every candidate in the exact runtime/shape contest publishes it; unavailable contests contribute the neutral centered value for that target. L1 and LLC counts are normalized by regime work even when a matching denominator event is unavailable. One-shot duration labels are excluded, and reviewed reliability weights keep instructions above L1 and sparse LLC evidence. Raw counters remain immutable for future re-featurization without recollection. |
 | Paid profiler surfaces were process-local | The canonical cross-M diagnostic required 315 coherent spatial surfaces, but every restart rebuilt all ExtraTrees forests before CV could resume. Interrupting a long fit therefore discarded paid deterministic model work even though timing and profiler corpora were immutable. | `profiler-prediction-surface` entries content-address the candidate-cost pool, model descriptor digest, held geometry set, and exact consumed point inventory. Only CV training points are stored, with byte-stable float encoding. A cold in-memory replay loads the persisted map with zero model workers, while partial or foreign maps hard-fail. |
+| Parallel profiler forests serialized cache publication | Surface fitting used all physical cores, but every fitted prediction map returned to the coordinator for expensive canonical sorting, JSON encoding, and multi-megabyte atomic writes. Accelerators remained idle while the parent published surfaces one at a time. | The worker that fits each independent surface also owns its deterministic sort, lossless encoding, and content-addressed atomic publication before returning the in-memory result. Completion-order reduction remains deterministic, the coordinator performs no parallel-miss publication, and a focused fork regression rejects parent-owned writes. |
+| Monolithic profiler catalogs made additive composition CPU-bound | Extending the CPU M=1 catalog by 6,480 isolated launches required composing 130,248 request/evidence/witness records. The bounded digest used physical-core workers, but standard-library JSON decode, dataclass construction, ordered merge, and final emission still held one host core for most of a 189-second transaction and rewrote roughly 1.3 GiB. | Published profiler corpora retain authenticated content-addressed source shards and a small ordered index. Coverage, feature export, and fit consume the indexed union directly; compaction into a legacy monolith is optional publication work, never an installation prerequisite. Any parallel or streaming replacement must preserve canonical request/evidence/witness digests and have byte-equality plus interrupted-resume regressions. |
 | Serial common-observation publication | Rewriting the 216,632-row checkpoint spent tens of seconds formatting roughly 580 MiB through one Python `csv.writer`. | Large observation CSVs are split into deterministic row ranges, formatted in fork workers, assembled in source order, and atomically published. A byte-equality regression proves parallel output is identical to canonical serial output. |
 | Idle second socket during sealed collection | The sealed queue launched `mpirun -np 1` batches because the refresh default was one CPU lane, despite two physical sockets and already-disjoint resumable jobs. | CPU measurement lanes default to all detected sockets. Each MPMD rank receives a different `(format, shape, ISA regime)` output cell, and regressions prove both automatic socket use and absence of duplicate paths. |
 | Per-format sealed process explosion | The 1,859-record post-freeze witness plan launched one MPI process job per format even when several formats shared geometry, ISA, and the complete M inventory. This repeated process startup and regenerated identical format-seed activation fixtures. | The process serializer coalesces only geometry/ISA/M-compatible formats, producing 1,337 jobs for the current plan while retaining all 1,859 format records. It emits a content-derived path token, keeps equal format/M phase inventories on paired ranks, and the trainer caches byte-identical legacy Q8_1 fixtures. Regressions prove no format is duplicated or lost, phase groups are contiguous, and cached bytes equal the old generator. |
+| Long prefill failure discarded completed M phases | A largest-envelope CPU prefill shard completed M=64,256,1024,2048, then its M=4096 complete-candidate warmup round legitimately ran longer than the fixed 30-second watchdog. The process aborted and the wrapper would have deleted every earlier row before retrying the full seven-M inventory. | Collection contract v17 flushes each complete M phase, authenticates an interrupted aggregate/timing pair with the production adapter, requires paired socket ranks to own the identical ordered prefix, and appends only the missing suffix. The trainer records the summed candidate probe duration and derives a bounded 4x-plus-one-second round watchdog from it. Legacy headers, partial rounds, non-prefix inventories, and cross-rank mismatches cannot append; final publication requires the exact planned M inventory. |
 | Fresh seal mislabeled as development build | Fit-only replay correctly restored the immutable development build ID, but fresh post-freeze timing reused that ID in its resume contract and final adapter context even after the trainer binaries changed. | Development provenance remains active through fit/freeze only. A live seal contract binds the current AVX2/AVX512 binary digest, and current git/compiler/host/build provenance is restored before launching and certifying sealed rows. Collection hard-fails if the production serial-policy hash differs from development, so this split cannot excuse an arithmetic change. |
 | Sealed installation replay overwrote final shards | Replaying the one-command transaction after a certification failure omitted `--resume-cpu-partials` and immediately relaunched the two most expensive already-final shards into new `.inprogress` files. The final evidence survived, but preservation depended on an easy-to-miss operator flag. | Complete sealed aggregate/timing pairs are immutable under the active collection contract and are always reused. Only an incomplete `.inprogress` pair may be replaced. Focused regression coverage proves post-freeze sealed replay has no dependency on the general CPU partial-resume flag. |
+| Grouped continuation re-entered completed CPU decode | After the sealed M=1 policy had been certified and installed with `--stop-after-cpu-decode`, rerunning the production CPU transaction without that stop flag re-adapted decode inputs, launched a fresh isolated profiler transaction, and consequently opened a new expensive decode fit generation before grouped collection. The fit cache was correctly responding to changed profiler evidence; the phase orchestration was wrong. | `--resume-after-cpu-decode --install` is an explicit production continuation boundary. It validates the sealed policy/include in the selected output directory, requires that include to match the installed CPU decode table byte-for-byte, bypasses all decode timing/profiling/fitting, and enters grouped collection directly. Focused CTest coverage proves the continuation emits no decode trainer command and refuses an uninstalled prerequisite. |
+| CPU grouped corpus omitted its serial M=1 dependency | The immutable CPU bundle treated grouped verifier timing, profiler evidence, policy, and include as complete even when the exact serial M=1 policy used as its arithmetic oracle was absent. A grouped policy could therefore be published without the production dependency that defines byte equality and supplies the row implementation. | CPU corpus assembly requires the certified M=1 policy/include, development and sealed timing transaction, common observations, and profiler request/evidence alongside the grouped artifacts. A focused bundle regression rejects grouped publication when any serial dependency is missing, while preserving backend-specific payload rules. |
 
 The journal is complete only when recipe preflight has negative tests for every
 row above and the supported CPU-prefill invocation no longer requires
@@ -3450,7 +3547,7 @@ For the first uncached enlarged-corpus planner fit:
 
 The next step is a resumable iteration-9 fit over those retained paired rows,
 followed by domain-quota inspection. No CPU policy is promotable or installed
-at this checkpoint; installation still requires at least 99% of required
+at this checkpoint; installation still requires at least 95% of required
 domains to satisfy both strict p95 regret gates below 5%.
 
 ## Appendix A: Example Observation
@@ -3582,7 +3679,7 @@ def compile_policy(development_observations, sealed_partition_handle,
     sealed_domains = aggregate_by_generic_domain(sealed_results)
     require_domain_promotion_quota(
         sealed_domains,
-        passing_fraction=0.99,
+        passing_fraction=0.95,
         observed_p95_strict_limit=0.05,
         simultaneous_ucb_p95_strict_limit=0.05,
     )

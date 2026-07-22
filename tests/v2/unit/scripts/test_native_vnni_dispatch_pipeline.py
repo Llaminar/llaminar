@@ -82,6 +82,142 @@ def test_turnkey_cpu_prefill_discovers_bundle_replay_recipe() -> None:
     assert "--cpu-prefill-fit-replay-recipe" in source
 
 
+def test_turnkey_cpu_prefill_authenticates_its_measurement_plan(
+    tmp_path: Path,
+) -> None:
+    """CPU prefill plan changes must select a fresh resumable workspace."""
+
+    result = subprocess.run(
+        (
+            str(PIPELINE),
+            "--backend",
+            "cpu-prefill",
+            "--corpus-root",
+            str(tmp_path / "corpora"),
+            "--workspace-root",
+            str(tmp_path / "work"),
+            "--skip-build",
+            "--skip-scorer-tests",
+            "--dry-run",
+        ),
+        cwd=REPOSITORY_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--inventory-source" in result.stdout
+    assert "prefill_matrix.py" in result.stdout
+    assert "native_vnni_cpu_prefill_split_v12.json" in result.stdout
+
+
+def test_fit_threshold_does_not_select_a_new_measurement_corpus(
+    tmp_path: Path,
+) -> None:
+    """Promotion policy may be changed without recollecting kernel evidence."""
+
+    publications = []
+    for passing_percent in ("0", "95"):
+        result = subprocess.run(
+            (
+                str(PIPELINE),
+                "--backend",
+                "cpu-prefill",
+                "--corpus-root",
+                str(tmp_path / "corpora"),
+                "--workspace-root",
+                str(tmp_path / "work"),
+                "--skip-build",
+                "--skip-scorer-tests",
+                "--minimum-passing-domain-percent",
+                passing_percent,
+                "--dry-run",
+            ),
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert (
+            f"--minimum-passing-domain-percent {passing_percent}"
+            in result.stdout
+        )
+        publications.append(next(
+            line.removeprefix("Published NativeVNNI Git LFS corpus: ")
+            for line in result.stdout.splitlines()
+            if line.startswith("Published NativeVNNI Git LFS corpus: ")
+        ))
+
+    assert publications[0] == publications[1]
+
+
+def test_cpu_checkpoint_controls_resume_the_same_turnkey_workspace(
+    tmp_path: Path,
+) -> None:
+    """Bounded and resumed collection must not fork corpus identity."""
+
+    publications = []
+    workspaces = []
+    argument_sets = (
+        (),
+        ("--cpu-batch-limit", "10"),
+        ("--cpu-batch-limit=1", "--resume-cpu-partials"),
+    )
+    for forwarded_arguments in argument_sets:
+        result = subprocess.run(
+            (
+                str(PIPELINE),
+                "--backend",
+                "cpu-prefill",
+                "--corpus-root",
+                str(tmp_path / "corpora"),
+                "--workspace-root",
+                str(tmp_path / "work"),
+                "--skip-build",
+                "--skip-scorer-tests",
+                "--dry-run",
+                "--",
+                *forwarded_arguments,
+            ),
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        publications.append(next(
+            line.removeprefix("Published NativeVNNI Git LFS corpus: ")
+            for line in result.stdout.splitlines()
+            if line.startswith("Published NativeVNNI Git LFS corpus: ")
+        ))
+        mkdir_line = next(
+            line for line in result.stdout.splitlines()
+            if line.startswith("dry-run: mkdir -p ")
+            and "collect-cpu-prefill" in line
+        )
+        workspaces.append(mkdir_line)
+
+    assert len(set(publications)) == 1
+    assert len(set(workspaces)) == 1
+
+
+def test_turnkey_checks_collection_completeness_before_sealing() -> None:
+    """A bounded refresh checkpoint cannot fall through into publication."""
+
+    source = PIPELINE.read_text(encoding="utf-8")
+    refresh_offset = source.index('refresh_command "${staging_dir}"')
+    complete_offset = source.index("corpus_bundle collection-complete")
+    seal_offset = source.index("corpus_bundle seal", complete_offset)
+
+    assert refresh_offset < complete_offset < seal_offset
+    assert "collection_status == 1 && cpu_batch_limit > 0" in source
+
+
 @pytest.mark.parametrize(
     "private_arguments",
     (("--shapes", "PrivateBackendOverlay"), ("--shapes=PrivateBackendOverlay",)),

@@ -1,12 +1,13 @@
 """Atomic frozen and certified NativeVNNI policy artifact handling.
 
-Backend analyzers own only CSV adaptation and C++ emission.  This module owns
+Backend analyzers own only CSV adaptation and C++ emission. This module owns
 the backend-neutral transaction boundary so CUDA, ROCm, and CPU cannot attach
-different meanings to "installable".  A production include is publishable only
-when it is bound to a frozen generic policy and a complete sealed certificate
-whose strict five-percent p95 observed and p95 simultaneous-UCB gates pass in
-at least 99% of generic domains. Worst-cell and global-p95 values remain
-diagnostic metadata.
+different meanings to "installable". A production include is publishable only
+when it is bound to a frozen generic policy and a complete sealed certificate.
+The default criteria are strict five-percent p95 observed/UCB in at least 95%
+of domains; an explicit best-effort transaction may record different criteria
+without weakening correctness or structural gates. Worst-cell and global-p95
+values remain diagnostic metadata.
 """
 
 from __future__ import annotations
@@ -21,11 +22,7 @@ from typing import Mapping
 
 from .compiler import CompiledPolicy, FrozenPolicy
 from .corpus import RuntimeKey
-from .schema import P95_REGRET_BUDGET
 from .segmented_policy import domain_promotion_quota_is_satisfied
-
-
-P95_INSTALLABLE_REGRET = P95_REGRET_BUDGET
 
 
 def _mapping_digest(payload: Mapping[str, object]) -> str:
@@ -73,6 +70,7 @@ def runtime_key_mapping(key: RuntimeKey) -> dict[str, object]:
         "m": key.m,
         "aggregate_n": key.aggregate_n,
         "k": key.k,
+        "launch_k_tiles": key.launch_k_tiles,
     }
 
 
@@ -107,12 +105,19 @@ def certification_mapping(compiled: CompiledPolicy) -> dict[str, object]:
         "unexercised_rule_count": report.unexercised_rule_count,
         "unpromoted_domain_count": report.unpromoted_domain_count,
         "required_domain_count": report.required_domain_count,
+        "p95_regret_budget": report.p95_regret_budget,
+        "minimum_passing_domain_fraction": (
+            report.minimum_passing_domain_fraction
+        ),
         "passing_domain_count": report.passing_domain_count(),
         "passing_domain_fraction": report.passing_domain_fraction,
         "domain_promotion_quota_satisfied": (
             domain_promotion_quota_is_satisfied(
                 report.passing_domain_count(),
                 report.required_domain_count,
+                minimum_passing_fraction=(
+                    report.minimum_passing_domain_fraction
+                ),
             )
         ),
         "max_observed_regret": report.max_observed_regret,
@@ -140,7 +145,7 @@ def certification_mapping(compiled: CompiledPolicy) -> dict[str, object]:
                 "p95_simultaneous_95pct_upper_regret": (
                     item.p95_simultaneous_95pct_upper_regret
                 ),
-                "passes_p95_budget": item.passes(),
+                "passes_p95_budget": item.passes(report.p95_regret_budget),
             }
             for item in report.domain_results
         ],
@@ -245,6 +250,7 @@ def compiled_policy_payload(compiled: CompiledPolicy) -> dict[str, object]:
 def write_compiled_policy(path: Path, compiled: CompiledPolicy) -> None:
     """Atomically write common IR and its generic-only sealed certificate."""
 
+    compiled.certification.require_promotable()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -293,7 +299,6 @@ def validate_installable_policy_artifact(
     path: Path,
     *,
     include_path: Path | None = None,
-    p95_regret: float = P95_INSTALLABLE_REGRET,
 ) -> dict[str, object]:
     """Fail closed unless a staged policy is cryptographically certifiable.
 
@@ -317,6 +322,28 @@ def validate_installable_policy_artifact(
     generic_digest = _mapping_digest(_generic_policy_mapping(policy))
     if payload.get("frozen_generic_policy_digest") != generic_digest:
         raise ValueError("certified generic digest does not match its frozen IR")
+
+    p95_regret = float(certificate.get("p95_regret_budget", float("nan")))
+    minimum_passing_fraction = float(certificate.get(
+        "minimum_passing_domain_fraction", float("nan")
+    ))
+    if not 0.0 < p95_regret <= 1.0:
+        raise ValueError("sealed certificate has an invalid p95 regret budget")
+    if not 0.0 <= minimum_passing_fraction <= 1.0:
+        raise ValueError(
+            "sealed certificate has an invalid passing-domain fraction"
+        )
+    metadata = policy.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("certified policy omits promotion metadata")
+    if (
+        metadata.get("promotion_p95_regret_budget") != p95_regret
+        or metadata.get("promotion_minimum_passing_domain_fraction")
+        != minimum_passing_fraction
+    ):
+        raise ValueError(
+            "sealed certificate promotion criteria differ from the frozen policy"
+        )
 
     sealed = int(certificate.get("sealed_cell_count", -1))
     out_of_scope = int(certificate.get("out_of_scope_cell_count", -1))
@@ -398,13 +425,15 @@ def validate_installable_policy_artifact(
     quota_satisfied = domain_promotion_quota_is_satisfied(
         passing_domains,
         required_domains,
+        minimum_passing_fraction=minimum_passing_fraction,
     )
     if certificate.get("domain_promotion_quota_satisfied") is not quota_satisfied:
         raise ValueError("sealed domain promotion decision is inconsistent")
     if not quota_satisfied:
         raise ValueError(
             "sealed domain promotion quota "
-            f"{passing_domains}/{required_domains} does not reach 99%"
+            f"{passing_domains}/{required_domains} does not reach "
+            f"{100.0 * minimum_passing_fraction:g}%"
         )
 
     cells = certificate.get("cells")

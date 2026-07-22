@@ -125,6 +125,97 @@ TEST(Test__NativeVNNIPairedRequestManifest, ParsesArchitectureQualifiedCPUReques
         "x86_64|build=AVX512|runtime=AVX2|threads=28");
 }
 
+TEST(Test__NativeVNNIPairedRequestManifest, ParsesFrozenM1CertificationEdge)
+{
+    nlohmann::json payload = validManifest();
+    payload["schema_version"] = "native-vnni-paired-request-v2";
+    payload["backend"] = "cpu";
+    payload["requests"][0]["architecture_class"] =
+        "x86_64|build=AVX2|runtime=AVX2|threads=28";
+    payload["requests"][0]["execution_mode"] = "eager";
+    payload["requests"][0]["selected_candidate_id"] =
+        "cpu.nvnni.decode.n_chunk_grid.nbc1";
+    payload["requests"][0]["exact_candidate_id"] =
+        "cpu.nvnni.decode.n_chunk_grid.nbc2";
+    payload["requests"][0]["observed_cv_regret"] = 0.0;
+    payload["requests"][0]["reason"] =
+        "sealed_frozen_leaf_exhaustive_challenger";
+
+    TemporaryManifest file(payload);
+    const auto manifest = loadNativeVnniPairedRequestManifest(file.path());
+    ASSERT_EQ(manifest.requests.size(), 1u);
+    EXPECT_EQ(manifest.requests.front().m, 1);
+}
+
+TEST(Test__NativeVNNIPairedRequestManifest, ParsesFrozenGroupedCertificationEdge)
+{
+    nlohmann::json payload = validManifest();
+    payload["schema_version"] = "native-vnni-paired-request-v2";
+    payload["backend"] = "cpu";
+    payload["requests"][0]["architecture_class"] =
+        "x86_64|build=AVX512|runtime=AVX512|threads=28";
+    payload["requests"][0]["execution_mode"] = "eager";
+    payload["requests"][0]["m"] = 15;
+    payload["requests"][0]["selected_candidate_id"] =
+        "cpu.nvnni.verifier.pairwise";
+    payload["requests"][0]["exact_candidate_id"] =
+        "cpu.nvnni.verifier.wide_rows";
+    payload["requests"][0]["observed_cv_regret"] = 0.0;
+    payload["requests"][0]["reason"] =
+        "grouped_frozen_leaf_exhaustive_challenger";
+
+    TemporaryManifest file(payload);
+    const auto manifest = loadNativeVnniPairedRequestManifest(file.path());
+    ASSERT_EQ(manifest.requests.size(), 1u);
+    EXPECT_EQ(manifest.requests.front().m, 15);
+}
+
+TEST(Test__NativeVNNIPairedRequestManifest, ParsesGroupedSingleCandidateWitness)
+{
+    nlohmann::json payload = validManifest();
+    payload["schema_version"] = "native-vnni-paired-request-v2";
+    payload["backend"] = "cpu";
+    payload["requests"][0]["architecture_class"] =
+        "x86_64|build=AVX2|runtime=AVX2|threads=28";
+    payload["requests"][0]["execution_mode"] = "eager";
+    payload["requests"][0]["m"] = 3;
+    payload["requests"][0]["selected_candidate_id"] =
+        "cpu.nvnni.verifier.pairwise";
+    payload["requests"][0]["exact_candidate_id"] =
+        "cpu.nvnni.verifier.pairwise";
+    payload["requests"][0]["observed_cv_regret"] = 0.0;
+    payload["requests"][0]["reason"] =
+        "grouped_frozen_leaf_single_candidate_witness";
+
+    TemporaryManifest file(payload);
+    const auto manifest = loadNativeVnniPairedRequestManifest(file.path());
+    ASSERT_EQ(manifest.requests.size(), 1u);
+    EXPECT_EQ(
+        manifest.requests.front().selected_candidate_id,
+        manifest.requests.front().exact_candidate_id);
+}
+
+TEST(Test__NativeVNNIPairedRequestManifest, RejectsIdenticalOrdinaryCandidates)
+{
+    nlohmann::json payload = validManifest();
+    payload["requests"][0]["exact_candidate_id"] =
+        payload["requests"][0]["selected_candidate_id"];
+    TemporaryManifest file(payload);
+    EXPECT_THROW(
+        (void)loadNativeVnniPairedRequestManifest(file.path()),
+        std::runtime_error);
+}
+
+TEST(Test__NativeVNNIPairedRequestManifest, RejectsZeroRegretDevelopmentEdge)
+{
+    nlohmann::json payload = validManifest();
+    payload["requests"][0]["observed_cv_regret"] = 0.0;
+    TemporaryManifest file(payload);
+    EXPECT_THROW(
+        (void)loadNativeVnniPairedRequestManifest(file.path()),
+        std::runtime_error);
+}
+
 TEST(Test__NativeVNNIPairedRequestManifest, RejectsUnresolvedFormulaCandidate)
 {
     nlohmann::json payload = validManifest();

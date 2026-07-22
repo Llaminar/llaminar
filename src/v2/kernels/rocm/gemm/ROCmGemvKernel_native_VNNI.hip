@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <string>
 
@@ -44,6 +45,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include "../../../utils/PrefillGraphBucketDefaults.h"
+#include "kernels/common/NativeVNNIDispatchCache.h"
 #include "kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc"
 
 #include <atomic>
@@ -62,44 +64,6 @@ struct NativeVNNIDecodeGeneratedRuntimeConfig
     int kb = -1;
     int target_waves_per_cu = -1;
 };
-
-static int chooseNativeVNNIDivisibleKB(int blocks_per_row, int kb_raw, int kb_max);
-
-static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIQ80DirectRuntimeConfig(
-    uint8_t codebook_id,
-    int n,
-    int k)
-{
-    /*
-     * Q8_0 is not a packed NativeVNNI payload format, so it cannot appear in
-     * the CSV-trained generated table. The runtime launcher still dispatches a
-     * graph-capturable direct-INT8 path for codebook 19; expose that policy
-     * through the query API so decode-equivalent grouped verifier planning does
-     * not misreport this supported path as an untrained shape.
-     */
-    constexpr uint8_t Q8_0_CODEBOOK = 19;
-    if (codebook_id != Q8_0_CODEBOOK || n <= 0 || k <= 0 || (k % 32) != 0)
-        return NativeVNNIDecodeGeneratedRuntimeConfig{};
-
-    constexpr int NUM_CUS = 60;
-    constexpr int TN = 64;
-    constexpr int MIN_BLOCKS_PER_WAVE = 1;
-    constexpr int KB_CAP = 64;
-    constexpr int Q8_0_TARGET_WAVES_PER_CU = 4;
-
-    const int blocks_per_row = k / 32;
-    const int grid_n = (n + TN - 1) / TN;
-    int kb_raw = max(1, ((Q8_0_TARGET_WAVES_PER_CU * NUM_CUS) + grid_n - 1) / grid_n);
-    int kb_max = max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
-    kb_max = min(kb_max, KB_CAP);
-    kb_raw = min(kb_raw, kb_max);
-
-    NativeVNNIDecodeGeneratedRuntimeConfig resolved{};
-    resolved.has_generated = true;
-    resolved.kb = chooseNativeVNNIDivisibleKB(blocks_per_row, kb_raw, kb_max);
-    resolved.target_waves_per_cu = Q8_0_TARGET_WAVES_PER_CU;
-    return resolved;
-}
 
 static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRuntimeConfig(
     uint8_t codebook_id,
@@ -126,17 +90,44 @@ static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRu
             ? 1
             : m;
 
+    /*
+     * Generated policy is immutable for the process lifetime. Preserve each
+     * input as a full-width word so invalid or future geometry cannot alias the
+     * compact exact-overlay ABI. Caching a miss keeps totality checks cheap but
+     * never manufactures a runtime fallback.
+     */
+    using CacheKey = std::array<uint64_t, 4>;
+    using Cache = llaminar2::native_vnni::FixedDispatchCache<
+        CacheKey,
+        NativeVNNIDecodeGeneratedRuntimeConfig,
+        64,
+        llaminar2::native_vnni::DispatchCacheArrayHasher<4>>;
+    static thread_local Cache cache;
+    const CacheKey cache_key = {
+        static_cast<uint64_t>(codebook_id),
+        static_cast<uint64_t>(static_cast<uint32_t>(lookup_m)),
+        static_cast<uint64_t>(static_cast<uint32_t>(n)),
+        static_cast<uint64_t>(static_cast<uint32_t>(k)),
+    };
+    bool cached_selector_found = false;
+    NativeVNNIDecodeGeneratedRuntimeConfig cached{};
+    if (cache.lookup(cache_key, cached_selector_found, cached))
+        return cached;
+
     llaminar2::rocm::generated::ROCmNativeVNNIDecodeDispatchConfig generated_cfg{};
     if (!llaminar2::rocm::generated::selectROCmNativeVNNIDecodeGenerated(
             codebook_id, lookup_m, n, k, generated_cfg))
     {
-        return resolveNativeVNNIQ80DirectRuntimeConfig(codebook_id, n, k);
+        cache.insert(cache_key, false, cached);
+        return cached;
     }
 
-    resolved.has_generated = true;
-    resolved.kb = static_cast<int>(generated_cfg.kb);
-    resolved.target_waves_per_cu = static_cast<int>(generated_cfg.target_waves_per_cu);
-    return resolved;
+    cached.has_generated = true;
+    cached.kb = static_cast<int>(generated_cfg.kb);
+    cached.target_waves_per_cu =
+        static_cast<int>(generated_cfg.target_waves_per_cu);
+    cache.insert(cache_key, true, cached);
+    return cached;
 }
 
 static void recordNativeVNNISmallMLaunch(
@@ -335,121 +326,23 @@ struct NVNNIGroupedMoESupported {
         FMT == NVNNI_Q8_0;
 };
 
-static int chooseNativeVNNIDivisibleKB(int blocks_per_row, int kb_raw, int kb_max)
-{
-    int kb = kb_raw;
-    if (blocks_per_row % kb_raw != 0)
-    {
-        for (int d = 1; d < kb_raw; ++d)
-        {
-            if (kb_raw - d >= 1 && blocks_per_row % (kb_raw - d) == 0)
-            {
-                kb = kb_raw - d;
-                break;
-            }
-            if (kb_raw + d <= kb_max && blocks_per_row % (kb_raw + d) == 0)
-            {
-                kb = kb_raw + d;
-                break;
-            }
-        }
-    }
-    return max(1, kb);
-}
-
-static bool nativeVNNIIsIQGridFormat(uint8_t codebook_id)
-{
-    return codebook_id >= static_cast<uint8_t>(NVNNI_IQ3_S) &&
-           codebook_id <= static_cast<uint8_t>(NVNNI_IQ1_M);
-}
-
 /**
  * @brief Resolve the split-K policy used by the normal serial M=1 decode path.
  *
  * MTP verifier publication compares grouped runtime-M rows against committed
  * serial decode state. The grouped kernels may execute several rows at once,
  * but they must use the same split-K count as serial M=1 so the FP32 reduction
- * order is bitwise-identical. This helper mirrors `rocmGemv_native_vnni_fp32`
- * for policy only; it performs no tensor work and allocates nothing.
+ * order is bitwise-identical. Generated policy is the sole production source
+ * of that arithmetic identity. Returning an empty result on a miss forces the
+ * caller to fail instead of silently reconstructing an obsolete heuristic.
  */
 static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNISerialM1RuntimeConfig(
     uint8_t codebook_id,
     int N,
     int K)
 {
-    NativeVNNIDecodeGeneratedRuntimeConfig generated =
-        resolveNativeVNNIDecodeGeneratedRuntimeConfig(codebook_id, 1, N, K);
-    if (generated.has_generated)
-        return generated;
-
-    NativeVNNIDecodeGeneratedRuntimeConfig resolved{};
-    if (N <= 0 || K <= 0 || (K % 32) != 0)
-        return resolved;
-
-    constexpr int NUM_CUS = 60;
-    constexpr int MIN_BLOCKS_PER_WAVE = 1;
-    constexpr int KB_CAP = 64;
-    const int blocks_per_row = K / 32;
-    const auto& rocm_env = llaminar2::debugEnv().rocm;
-
-    if (nativeVNNIIsIQGridFormat(codebook_id))
-    {
-        constexpr int IQ_LDS_TN = 256;
-        constexpr int IQ_LDS_MIN_N_BLOCKS = NUM_CUS / 2;
-        constexpr float IQ_K_HEAVY_RATIO = 4.0f;
-        constexpr int IQ_K_HEAVY_MIN_GRID_N = NUM_CUS / 10;
-        const int grid_n_lds = (N + IQ_LDS_TN - 1) / IQ_LDS_TN;
-        const bool n_saturated = grid_n_lds >= IQ_LDS_MIN_N_BLOCKS;
-        const bool is_k_heavy = (K >= IQ_K_HEAVY_RATIO * N) &&
-                                (grid_n_lds >= IQ_K_HEAVY_MIN_GRID_N);
-        if (n_saturated || is_k_heavy)
-        {
-            int max_waves_per_cu;
-            if (codebook_id >= static_cast<uint8_t>(NVNNI_IQ1_S))
-                max_waves_per_cu = 16;
-            else if (codebook_id >= static_cast<uint8_t>(NVNNI_IQ2_S) &&
-                     codebook_id <= static_cast<uint8_t>(NVNNI_IQ2_XXS))
-                max_waves_per_cu = 16;
-            else
-                max_waves_per_cu = 40;
-
-            constexpr int IQ_THREADS = 256;
-            constexpr int WAVES_PER_BLOCK = IQ_THREADS / 64;
-            const int target_total_blocks = (max_waves_per_cu * NUM_CUS) / WAVES_PER_BLOCK;
-            int kb_raw = max(1, (target_total_blocks + grid_n_lds - 1) / grid_n_lds);
-            constexpr int IQ_MIN_K_BLOCKS_PER_PART = 8;
-            int kb_max = max(1, blocks_per_row / IQ_MIN_K_BLOCKS_PER_PART);
-            kb_max = min(kb_max, KB_CAP);
-            kb_raw = min(kb_raw, kb_max);
-
-            resolved.has_generated = true;
-            resolved.kb = chooseNativeVNNIDivisibleKB(blocks_per_row, kb_raw, kb_max);
-            resolved.target_waves_per_cu = max_waves_per_cu;
-            return resolved;
-        }
-    }
-
-    constexpr int TN = 64;
-    constexpr int DEFAULT_TARGET_WAVES_PER_CU = 24;
-    constexpr int Q8_0_TARGET_WAVES_PER_CU = 4;
-    const int grid_n = (N + TN - 1) / TN;
-    const int target_waves_per_cu =
-        (codebook_id == static_cast<uint8_t>(NVNNI_Q8_0))
-            ? Q8_0_TARGET_WAVES_PER_CU
-            : DEFAULT_TARGET_WAVES_PER_CU;
-    int kb_raw = max(1, ((target_waves_per_cu * NUM_CUS) + grid_n - 1) / grid_n);
-    int kb_max = max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
-    kb_max = min(kb_max, KB_CAP);
-    kb_raw = min(kb_raw, kb_max);
-
-    int kb = chooseNativeVNNIDivisibleKB(blocks_per_row, kb_raw, kb_max);
-    if (rocm_env.nvnni_q8_direct && codebook_id == static_cast<uint8_t>(NVNNI_Q8_0))
-        kb = 1;
-
-    resolved.has_generated = true;
-    resolved.kb = kb;
-    resolved.target_waves_per_cu = target_waves_per_cu;
-    return resolved;
+    return resolveNativeVNNIDecodeGeneratedRuntimeConfig(
+        codebook_id, 1, N, K);
 }
 
 static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNICommonSerialM1RuntimeConfig(
@@ -525,6 +418,61 @@ extern "C" bool rocmGemv_native_vnni_query_generated_config(
     if (target_waves_per_cu)
         *target_waves_per_cu = cfg.target_waves_per_cu;
     return true;
+}
+
+/**
+ * @brief Measure the in-TU ROCm generated-selector cache without touching HIP.
+ *
+ * The timing loop calls the same static resolver as the production launcher,
+ * avoiding the out-of-line public-query overhead that would otherwise dominate
+ * a nanosecond-scale host measurement. A matched loop-only interval is
+ * subtracted from the result.
+ */
+extern "C" double rocmGemv_native_vnni_measure_generated_config_ns(
+    uint8_t codebook_id,
+    int M,
+    const int *Ns,
+    const int *Ks,
+    int query_count,
+    int iterations,
+    uint64_t *out_checksum)
+{
+    if (!Ns || !Ks || query_count <= 0 || iterations <= 0)
+        return -1.0;
+
+    uint64_t checksum = 0;
+    const auto baseline_begin = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration)
+    {
+        const int index = iteration % query_count;
+        checksum += static_cast<uint64_t>(Ns[index] + Ks[index]);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+    const auto baseline_end = std::chrono::steady_clock::now();
+
+    const auto selector_begin = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration)
+    {
+        const int index = iteration % query_count;
+        const NativeVNNIDecodeGeneratedRuntimeConfig config =
+            resolveNativeVNNIDecodeGeneratedRuntimeConfig(
+                codebook_id, M, Ns[index], Ks[index]);
+        checksum += static_cast<uint64_t>(config.has_generated) |
+                    (static_cast<uint64_t>(config.kb) << 8) |
+                    (static_cast<uint64_t>(config.target_waves_per_cu) << 24);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+    const auto selector_end = std::chrono::steady_clock::now();
+
+    if (out_checksum)
+        *out_checksum = checksum;
+    const double baseline_ns = std::chrono::duration<double, std::nano>(
+        baseline_end - baseline_begin).count();
+    const double selector_ns = std::chrono::duration<double, std::nano>(
+        selector_end - selector_begin).count();
+    return std::max(
+        0.0,
+        (selector_ns - baseline_ns) / static_cast<double>(iterations));
 }
 
 // ============================================================================
@@ -6004,8 +5952,39 @@ bool rocmGemv_native_vnni_fp32(
     const auto& rocm_env = llaminar2::debugEnv().rocm;
     const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
     const bool use_atomic_reduce = !deterministic && rocm_env.nvnni_atomic_reduce;
+    const int api_kb_override =
+        g_native_vnni_kb_override.load(std::memory_order_relaxed);
+    const int api_waves_override =
+        g_native_vnni_target_waves_override.load(std::memory_order_relaxed);
+    const int explicit_kb_override =
+        (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
+    const int explicit_waves_override =
+        (api_waves_override > 0)
+            ? api_waves_override
+            : rocm_env.nvnni_gemv_target_waves;
+    const bool has_explicit_tuning =
+        explicit_kb_override > 0 || explicit_waves_override > 0;
     const NativeVNNIDecodeGeneratedRuntimeConfig generated_cfg =
         resolveNativeVNNIDecodeGeneratedRuntimeConfig(codebook_id, 1, N, K);
+    if (!has_explicit_tuning && !generated_cfg.has_generated)
+    {
+        fprintf(
+            stderr,
+            "[rocmGemv_native_vnni_fp32] generated dispatch miss "
+            "(codebook=%u N=%d K=%d)\n",
+            static_cast<unsigned>(codebook_id),
+            N,
+            K);
+        return false;
+    }
+    const int policy_kb =
+        (explicit_kb_override > 0)
+            ? explicit_kb_override
+            : generated_cfg.kb;
+    const int policy_target_waves =
+        (explicit_waves_override > 0)
+            ? explicit_waves_override
+            : generated_cfg.target_waves_per_cu;
 
     // =========================================================================
     // IQ grid formats: LDS-cached grid kernel with 256-thread workgroups
@@ -6094,8 +6073,8 @@ bool rocmGemv_native_vnni_fp32(
             max_waves_per_cu = 16;
         else                         // IQ3_S, IQ3_XXS (≤2KB LDS, 94 VALU/block)
             max_waves_per_cu = 40;
-        if (generated_cfg.target_waves_per_cu > 0)
-            max_waves_per_cu = generated_cfg.target_waves_per_cu;
+        if (policy_target_waves > 0)
+            max_waves_per_cu = policy_target_waves;
 
         // Each 256-thread block contains 4 wavefronts (wavefront64).
         // Convert wave target to block target before computing KB.
@@ -6120,9 +6099,9 @@ bool rocmGemv_native_vnni_fp32(
                 if (kb_raw + d <= kb_max && blocks_per_row % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
             }
         }
-        if (generated_cfg.kb > 0)
+        if (policy_kb > 0)
         {
-            kb = min(generated_cfg.kb, KB_CAP);
+            kb = min(policy_kb, KB_CAP);
             if (kb > blocks_per_row) kb = blocks_per_row;
         }
         if (kb < 1) kb = 1;
@@ -6215,15 +6194,6 @@ bool rocmGemv_native_vnni_fp32(
 
         const int grid_n = (N + TN - 1) / TN;
 
-        // Check runtime tuning overrides. The explicit C API wins over env so
-        // microbench sweeps can override process-level defaults deterministically.
-        const int api_kb_override = g_native_vnni_kb_override.load(std::memory_order_relaxed);
-        const int api_waves_override = g_native_vnni_target_waves_override.load(std::memory_order_relaxed);
-        const int explicit_kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
-        const int explicit_waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
-        const int kb_override = (explicit_kb_override > 0) ? explicit_kb_override : generated_cfg.kb;
-        const int waves_override = (explicit_waves_override > 0) ? explicit_waves_override : generated_cfg.target_waves_per_cu;
-
         constexpr int DEFAULT_TARGET_WAVES_PER_CU = 24;
 
         // Q8_0 (codebook_id=19) has a trivial decode path (direct INT8 load),
@@ -6234,7 +6204,8 @@ bool rocmGemv_native_vnni_fp32(
                                       ? Q8_0_TARGET_WAVES_PER_CU
                                       : DEFAULT_TARGET_WAVES_PER_CU;
 
-        const int TARGET_WAVES_PER_CU = (waves_override > 0) ? waves_override : default_waves;
+        const int TARGET_WAVES_PER_CU =
+            (policy_target_waves > 0) ? policy_target_waves : default_waves;
         int target_total_waves = TARGET_WAVES_PER_CU * NUM_CUS;
         int kb_raw = max(1, (target_total_waves + grid_n - 1) / grid_n);
         int kb_max = max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
@@ -6252,16 +6223,9 @@ bool rocmGemv_native_vnni_fp32(
         }
         if (kb < 1) kb = 1;
 
-        // Experimental Q8_0 direct mode removes the second reduce launch for
-        // decode projections. It is opt-in while shape-level throughput is
-        // validated against the production split-K heuristic.
-        if (rocm_env.nvnni_q8_direct && codebook_id == static_cast<uint8_t>(NVNNI_Q8_0))
+        if (policy_kb > 0)
         {
-            kb = 1;
-        }
-        else if (kb_override > 0)
-        {
-            kb = min(kb_override, KB_CAP);
+            kb = min(policy_kb, KB_CAP);
             if (kb > blocks_per_row) kb = blocks_per_row;
         }
 

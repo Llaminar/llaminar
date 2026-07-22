@@ -11,6 +11,10 @@ from tests.v2.performance.kernels.native_vnni_dispatch.corpus_bundle import (
     CorpusBundleError,
     LFS_POINTER_PREFIX,
     MANIFEST_NAME,
+    canonical_refresh_arguments,
+    configuration_digest,
+    inventory_generation_digest,
+    missing_required_payloads,
     required_payloads,
     seal_corpus,
     verify_corpus,
@@ -66,6 +70,119 @@ def test_round_trip_authenticates_payload_and_inventory(tmp_path: Path) -> None:
     assert verified["architecture"] == "sm86-rtx3090"
 
 
+def test_backend_measurement_source_changes_inventory_generation(
+    tmp_path: Path,
+) -> None:
+    """A backend plan gets a new workspace without changing shared shapes."""
+
+    source = tmp_path / "cpu_prefill_plan.py"
+    source.write_text("M_VALUES = (64, 256, 512)\n", encoding="utf-8")
+    first = inventory_generation_digest((source,), tmp_path)
+    source.write_text("M_VALUES = (64, 256, 512, 1024)\n", encoding="utf-8")
+    second = inventory_generation_digest((source,), tmp_path)
+
+    assert first != second
+
+
+@pytest.mark.parametrize(
+    "checkpoint_arguments",
+    (
+        ("--cpu-batch-limit", "10"),
+        ("--cpu-batch-limit=10",),
+        ("--resume-cpu-partials",),
+        ("--cpu-batch-limit", "10", "--resume-cpu-partials"),
+    ),
+)
+def test_checkpoint_controls_do_not_change_collection_identity(
+    checkpoint_arguments: tuple[str, ...],
+) -> None:
+    """Changing checkpoint scheduling must resume the same evidence corpus."""
+
+    evidence_arguments = ("--cpu-formats", "Q8_0,Q4_0")
+
+    assert canonical_refresh_arguments(
+        (*evidence_arguments, *checkpoint_arguments)
+    ) == evidence_arguments
+    assert configuration_digest(
+        (*evidence_arguments, *checkpoint_arguments)
+    ) == configuration_digest(evidence_arguments)
+
+
+def test_checkpoint_option_requires_its_value() -> None:
+    """Malformed execution controls fail before selecting a workspace."""
+
+    with pytest.raises(CorpusBundleError, match="missing value"):
+        configuration_digest(("--cpu-batch-limit",))
+
+
+def test_fit_only_evidence_floors_do_not_change_collection_identity() -> None:
+    """Promotion thresholds may mine one immutable timing corpus repeatedly."""
+
+    baseline = ("--cpu-formats", "Q8_0")
+    adjusted = (
+        *baseline,
+        "--cpu-minimum-promotion-warmups",
+        "7",
+        "--cpu-minimum-promotion-samples=50",
+    )
+
+    assert configuration_digest(adjusted) == configuration_digest(baseline)
+
+
+def test_sealed_manifest_omits_checkpoint_controls(tmp_path: Path) -> None:
+    """Published provenance contains semantics, not one run's stop point."""
+
+    (tmp_path / "timing.csv").write_text("shape,median_us\nA,1.0\n")
+    for relative in required_payloads("cuda", "all"):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(f"fixture for {relative}\n", encoding="utf-8")
+    sealed = seal_corpus(
+        tmp_path,
+        backend="cuda",
+        profile="all",
+        architecture="sm86-rtx3090",
+        repository_root=REPOSITORY_ROOT,
+        inventory_sources=INVENTORY_SOURCES,
+        refresh_arguments=(
+            "--cuda-measurement-lanes",
+            "2",
+            "--cpu-batch-limit",
+            "10",
+            "--resume-cpu-partials",
+        ),
+    )
+
+    assert sealed["refresh_arguments"] == ["--cuda-measurement-lanes", "2"]
+
+
+def test_collection_completeness_distinguishes_checkpoint_from_publication(
+    tmp_path: Path,
+) -> None:
+    """Turnkey publication waits for every backend production payload."""
+
+    required = required_payloads("cpu-prefill", "all")
+    for relative in required[:-1]:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"fixture for {relative}\n", encoding="utf-8")
+
+    assert missing_required_payloads(
+        tmp_path,
+        backend="cpu-prefill",
+        profile="all",
+    ) == (required[-1],)
+
+    final_path = tmp_path / required[-1]
+    final_path.write_text("final fixture\n", encoding="utf-8")
+    assert missing_required_payloads(
+        tmp_path,
+        backend="cpu-prefill",
+        profile="all",
+    ) == ()
+
+
 def test_payload_corruption_is_rejected(tmp_path: Path) -> None:
     """Timing evidence cannot change after publication."""
 
@@ -119,6 +236,19 @@ def test_incomplete_production_transaction_cannot_be_sealed(tmp_path: Path) -> N
             repository_root=REPOSITORY_ROOT,
             inventory_sources=INVENTORY_SOURCES,
         )
+
+
+def test_cpu_bundle_requires_decode_dependency_and_grouped_policy() -> None:
+    """A publishable CPU corpus owns both sides of the staged dependency."""
+
+    payloads = set(required_payloads("cpu", "all"))
+
+    assert "CPUNativeVNNIDecodePolicyGenerated.inc" in payloads
+    assert "cpu_decode_m1_policy.json" in payloads
+    assert "cpu_decode_m1_common_observations.csv" in payloads
+    assert "cpu_decode_final_profiler_evidence.json" in payloads
+    assert "CPUNativeVNNIVerifierRowsPolicyGenerated.inc" in payloads
+    assert "cpu_verifier_rows_policy.json" in payloads
 
 
 def test_manifest_identity_cannot_be_rewritten(tmp_path: Path) -> None:

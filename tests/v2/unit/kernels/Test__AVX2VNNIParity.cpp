@@ -224,6 +224,105 @@ TEST(CPUNativeVNNIDecodePolicy, NormalizesGeometryDependentAliases)
 }
 
 /**
+ * @test Prove learned M=1 dispatch is physically total on unseen geometries.
+ *
+ * The generated tree names nominal candidate families learned from measured
+ * shapes.  This sweep crosses every production runtime codebook, both frozen
+ * K-partition regimes, and N boundaries where wider families become physical
+ * aliases.  It therefore catches the grouped-seal failure where IQ4_XS at
+ * N=160 and K=224 selected nominal NBC8 even though its three N chunks have
+ * one physical NBC4 owner.
+ */
+TEST(CPUNativeVNNIDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
+{
+    using generated::CPUNativeVNNIDecodeBuildISA;
+    using generated::CPUNativeVNNIDecodePolicy;
+    using generated::CPUNativeVNNIDecodeRuntimeISA;
+
+    constexpr std::array<uint8_t, 18> codebooks{
+        0, 4, 5, 6, 7, 8, 9, 10, 11,
+        12, 13, 14, 15, 16, 17, 19, 20, 21,
+    };
+    constexpr std::array<int, 23> output_widths{
+        1, 16, 63, 64, 65, 127, 128, 129, 160, 191, 192, 193,
+        255, 256, 257, 511, 512, 513, 816, 880, 2032, 4064, 5120,
+    };
+    constexpr std::array<int, 9> input_widths{
+        32, 224, 256, 800, 992, 2048, 8192, 11216, 16384,
+    };
+
+#if LLAMINAR_COMPILED_WITH_AVX512
+    constexpr std::array runtime_regimes{
+        std::pair{CPUNativeVNNIDecodeBuildISA::AVX512,
+                  CPUNativeVNNIDecodeRuntimeISA::AVX2},
+        std::pair{CPUNativeVNNIDecodeBuildISA::AVX512,
+                  CPUNativeVNNIDecodeRuntimeISA::AVX512},
+    };
+#else
+    constexpr std::array runtime_regimes{
+        std::pair{CPUNativeVNNIDecodeBuildISA::AVX2,
+                  CPUNativeVNNIDecodeRuntimeISA::AVX2},
+    };
+#endif
+
+    for (const auto [build_isa, runtime_isa] : runtime_regimes)
+    {
+        for (const uint8_t codebook : codebooks)
+        {
+            for (const int n : output_widths)
+            {
+                for (const int k : input_widths)
+                {
+                    for (const bool serial_kpart : {false, true})
+                    {
+                        CPUNativeVNNIDecodePolicy nominal{};
+                        ASSERT_TRUE(
+                            generated::selectCPUNativeVNNIDecodeGeneratedPolicy(
+                                build_isa,
+                                runtime_isa,
+                                28,
+                                codebook,
+                                n,
+                                k,
+                                serial_kpart,
+                                serial_kpart ? 2 : 1,
+                                nominal))
+                            << "codebook=" << static_cast<int>(codebook)
+                            << " N=" << n << " K=" << k
+                            << " serial_kpart=" << serial_kpart;
+
+                        const DecodeSchedulePolicy physical =
+                            resolveGeneratedDecodeSchedulePolicy(nominal, n);
+                        EXPECT_EQ(
+                            normalizeDecodeSchedulePolicy(
+                                physical, (n + 63) / 64),
+                            physical)
+                            << "codebook=" << static_cast<int>(codebook)
+                            << " N=" << n << " K=" << k
+                            << " serial_kpart=" << serial_kpart;
+                    }
+                }
+            }
+        }
+    }
+
+    CPUNativeVNNIDecodePolicy iq4_xs_nominal{};
+    ASSERT_TRUE(generated::selectCPUNativeVNNIDecodeGeneratedPolicy(
+        runtime_regimes.front().first,
+        runtime_regimes.front().second,
+        28,
+        4,
+        160,
+        224,
+        false,
+        1,
+        iq4_xs_nominal));
+    EXPECT_EQ(
+        resolveGeneratedDecodeSchedulePolicy(iq4_xs_nominal, 160),
+        DecodeSchedulePolicy::Nbc4);
+}
+
+/**
  * @test Scalar M=1 execution remains an explicit diagnostic oracle only.
  *
  * Production `Auto` and concrete learned schedule requests must never turn an

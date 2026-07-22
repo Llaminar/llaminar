@@ -35,7 +35,8 @@ from typing import Iterable, Mapping, Sequence
 
 
 ERROR_CAPACITY = 2048
-SCORER_ABI_VERSION = 12
+SCORER_ABI_VERSION = 15
+TREE_MAXIMUM_FEATURE_AXES = 72
 UINT32_MAX = (1 << 32) - 1
 TREE_MAXIMUM_POINTS = 512
 TREE_POINT_MASK_WORDS = TREE_MAXIMUM_POINTS // 64
@@ -144,6 +145,12 @@ class TreeThresholdOperation(IntEnum):
     MN_FINAL_PARALLEL_WAVE_UTILIZATION = 11
     N_TILE_ALIGNED = 12
     K_FINAL_TILE = 13
+    KPART_PRODUCER_WAVES = 14
+    KPART_FINAL_PRODUCER_WAVE_UTILIZATION = 15
+    KPART_K_BLOCKS_PER_TILE = 16
+    KPART_FINAL_K_TILE_BLOCKS = 17
+    KPART_FINAL_K_TILE_UTILIZATION = 18
+    KPART_K_TILE_COUNT = 19
 
 
 @dataclass(frozen=True)
@@ -256,6 +263,8 @@ class _TreeRuntimeStatsC(ctypes.Structure):
         ("stream_sync_count", ctypes.c_uint64),
         ("device_sync_count", ctypes.c_uint64),
         ("captured_graph_transfer_count", ctypes.c_uint64),
+        ("expanded_candidate_count", ctypes.c_uint64),
+        ("structurally_unique_candidate_count", ctypes.c_uint64),
         ("last_expansion_capacity", ctypes.c_uint32),
         ("reserved", ctypes.c_uint32),
     ]
@@ -312,6 +321,8 @@ class TreeRuntimeStats:
     stream_sync_count: int
     device_sync_count: int
     captured_graph_transfer_count: int
+    expanded_candidate_count: int
+    structurally_unique_candidate_count: int
     last_expansion_capacity: int
 
 
@@ -546,7 +557,7 @@ def _threshold_descriptor_from_c(
             "device tree returned an unknown threshold operation"
         ) from error
     if (
-        threshold.axis_priority >= 64
+        threshold.axis_priority >= TREE_MAXIMUM_FEATURE_AXES
         or threshold.denominator == 0
         or threshold.parallelism_width == 0
         or threshold.task_multiplier == 0
@@ -575,8 +586,11 @@ def _pack_feature_axes(
     for descriptor in descriptors:
         if not isinstance(descriptor.operation, TreeThresholdOperation):
             raise TypeError("feature-axis operation must be TreeThresholdOperation")
-        if not 0 <= descriptor.axis_priority < 64:
-            raise ValueError("feature-axis priority must be in [0, 64)")
+        if not 0 <= descriptor.axis_priority < TREE_MAXIMUM_FEATURE_AXES:
+            raise ValueError(
+                "feature-axis priority must be in "
+                f"[0, {TREE_MAXIMUM_FEATURE_AXES})"
+            )
         if descriptor.axis_priority in priorities:
             raise ValueError("feature-axis priorities must be unique")
         priorities.add(descriptor.axis_priority)
@@ -727,6 +741,7 @@ class NativeVNNILeafPrimaryScorer:
             ctypes.POINTER(ctypes.c_uint32),
             ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint32),
             ctypes.POINTER(_TreeFeatureAxisC),
             ctypes.c_uint32,
             ctypes.c_uint32,
@@ -746,9 +761,11 @@ class NativeVNNILeafPrimaryScorer:
             ctypes.POINTER(ctypes.c_uint32),
             ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint32),
             ctypes.POINTER(_TreeFeatureAxisC),
             ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint32),
             ctypes.POINTER(ctypes.c_double),
             ctypes.POINTER(ctypes.c_double),
             ctypes.POINTER(ctypes.c_double),
@@ -876,6 +893,9 @@ class NativeVNNILeafPrimaryScorer:
             stream_sync_count=raw.stream_sync_count,
             device_sync_count=raw.device_sync_count,
             captured_graph_transfer_count=raw.captured_graph_transfer_count,
+            expanded_candidate_count=raw.expanded_candidate_count,
+            structurally_unique_candidate_count=
+                raw.structurally_unique_candidate_count,
             last_expansion_capacity=raw.last_expansion_capacity,
         )
 
@@ -1070,6 +1090,7 @@ class NativeVNNILeafPrimaryScorer:
         point_group_ranks: Sequence[int],
         training_aggregate_n: Sequence[int],
         training_k: Sequence[int],
+        training_launch_k_tiles: Sequence[int],
         feature_axes: Sequence[TreeFeatureAxisDescriptor],
         boundary_placement: TreeBoundaryPlacement,
         parallelism_width: int,
@@ -1113,11 +1134,20 @@ class NativeVNNILeafPrimaryScorer:
             raise ValueError("point_group_ranks must contain one value per point")
         if len(training_aggregate_n) != point_count or len(training_k) != point_count:
             raise ValueError("training N/K must contain one value per point")
+        if len(training_launch_k_tiles) != point_count:
+            raise ValueError(
+                "training K-tile geometry must contain one value per point"
+            )
         if any(
             value <= 0 or value > (1 << 64) - 1
             for value in (*training_aggregate_n, *training_k)
         ):
             raise ValueError("training N/K must fit positive uint64")
+        if any(
+            isinstance(value, bool) or not 0 <= value <= UINT32_MAX
+            for value in training_launch_k_tiles
+        ):
+            raise ValueError("training K-tile geometry must fit uint32")
         if any(
             isinstance(rank, bool) or not 0 <= rank < TREE_MAXIMUM_POINTS
             for rank in point_group_ranks
@@ -1154,10 +1184,15 @@ class NativeVNNILeafPrimaryScorer:
         point_rank_buffer = _native_array("I", point_group_ranks)
         training_n_buffer = _native_array("Q", training_aggregate_n)
         training_k_buffer = _native_array("Q", training_k)
+        training_k_tiles_buffer = _native_array(
+            "I", training_launch_k_tiles
+        )
         if point_rank_buffer.itemsize != 4:
             raise RuntimeError("Python array('I') is not a native uint32 buffer")
         if training_n_buffer.itemsize != 8 or training_k_buffer.itemsize != 8:
             raise RuntimeError("Python array('Q') is not a native uint64 buffer")
+        if training_k_tiles_buffer.itemsize != 4:
+            raise RuntimeError("Python array('I') is not a native uint32 buffer")
 
         self._prepare_session(
             double_buffers[0],
@@ -1175,6 +1210,7 @@ class NativeVNNILeafPrimaryScorer:
             _as_pointer(point_rank_buffer, ctypes.c_uint32),
             _as_pointer(training_n_buffer, ctypes.c_uint64),
             _as_pointer(training_k_buffer, ctypes.c_uint64),
+            _as_pointer(training_k_tiles_buffer, ctypes.c_uint32),
             axis_buffer,
             axis_count,
             int(boundary_placement),
@@ -1243,12 +1279,14 @@ class NativeVNNILeafPrimaryScorer:
         point_group_ranks: Sequence[int],
         training_aggregate_n: Sequence[int],
         training_k: Sequence[int],
+        training_launch_k_tiles: Sequence[int],
         feature_axes: Sequence[TreeFeatureAxisDescriptor],
         boundary_placement: TreeBoundaryPlacement,
         parallelism_width: int,
         task_multiplier: int,
         heldout_aggregate_n: Sequence[int],
         heldout_k: Sequence[int],
+        heldout_launch_k_tiles: Sequence[int],
         heldout_measured_p95_regrets: Sequence[float],
         heldout_measured_mean_regrets: Sequence[float],
         heldout_measured_max_regrets: Sequence[float],
@@ -1277,6 +1315,10 @@ class NativeVNNILeafPrimaryScorer:
             )
         if len(heldout_k) != heldout_point_count:
             raise ValueError("heldout K must contain one value per point")
+        if len(heldout_launch_k_tiles) != heldout_point_count:
+            raise ValueError(
+                "heldout K-tile geometry must contain one value per point"
+            )
         if not 1 <= max_leaves <= TREE_MAXIMUM_LEAVES:
             raise ValueError(
                 f"device tree search max_leaves must be in [1, "
@@ -1316,11 +1358,20 @@ class NativeVNNILeafPrimaryScorer:
             raise ValueError("point_group_ranks must contain one value per point")
         if len(training_aggregate_n) != point_count or len(training_k) != point_count:
             raise ValueError("training N/K must contain one value per point")
+        if len(training_launch_k_tiles) != point_count:
+            raise ValueError(
+                "training K-tile geometry must contain one value per point"
+            )
         if any(
             value <= 0 or value > (1 << 64) - 1
             for value in (*training_aggregate_n, *training_k)
         ):
             raise ValueError("training N/K must fit positive uint64")
+        if any(
+            isinstance(value, bool) or not 0 <= value <= UINT32_MAX
+            for value in training_launch_k_tiles
+        ):
+            raise ValueError("training K-tile geometry must fit uint32")
         if any(
             isinstance(rank, bool) or not 0 <= rank < TREE_MAXIMUM_POINTS
             for rank in point_group_ranks
@@ -1382,14 +1433,25 @@ class NativeVNNILeafPrimaryScorer:
             _native_array("Q", heldout_aggregate_n),
             _native_array("Q", heldout_k),
         )
+        uint32_buffers = (
+            _native_array("I", training_launch_k_tiles),
+            _native_array("I", heldout_launch_k_tiles),
+        )
         if point_rank_buffer.itemsize != 4:
             raise RuntimeError("Python array('I') is not a native uint32 buffer")
         if any(buffer.itemsize != 8 for buffer in uint64_buffers):
             raise RuntimeError("Python array('Q') is not a native uint64 buffer")
+        if any(buffer.itemsize != 4 for buffer in uint32_buffers):
+            raise RuntimeError("Python array('I') is not a native uint32 buffer")
         if any(value <= 0 or value > (1 << 64) - 1 for value in heldout_aggregate_n):
             raise ValueError("heldout aggregate N must fit positive uint64")
         if any(value <= 0 or value > (1 << 64) - 1 for value in heldout_k):
             raise ValueError("heldout K must fit positive uint64")
+        if any(
+            isinstance(value, bool) or not 0 <= value <= UINT32_MAX
+            for value in heldout_launch_k_tiles
+        ):
+            raise ValueError("heldout K-tile geometry must fit uint32")
 
         self._prepare_session(
             training_double_buffers[0],
@@ -1409,9 +1471,11 @@ class NativeVNNILeafPrimaryScorer:
             _as_pointer(point_rank_buffer, ctypes.c_uint32),
             _as_pointer(uint64_buffers[0], ctypes.c_uint64),
             _as_pointer(uint64_buffers[1], ctypes.c_uint64),
+            _as_pointer(uint32_buffers[0], ctypes.c_uint32),
             axis_buffer,
             _as_pointer(uint64_buffers[2], ctypes.c_uint64),
             _as_pointer(uint64_buffers[3], ctypes.c_uint64),
+            _as_pointer(uint32_buffers[1], ctypes.c_uint32),
             _as_pointer(heldout_double_buffers[0], ctypes.c_double),
             _as_pointer(heldout_double_buffers[1], ctypes.c_double),
             _as_pointer(heldout_double_buffers[2], ctypes.c_double),

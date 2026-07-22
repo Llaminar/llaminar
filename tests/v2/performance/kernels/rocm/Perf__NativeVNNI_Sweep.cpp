@@ -32,6 +32,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
@@ -41,6 +42,7 @@
 #include "utils/Logger.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../native_vnni_dispatch/NativeVNNIShapeManifest.h"
 #include "fort.hpp"
 
 #ifdef HAVE_ROCM
@@ -106,7 +108,7 @@ namespace
     };
 
     // =========================================================================
-    // Shape definitions (Qwen2.5 0.5B / 3B / 7B)
+    // Canonical exact-overlay shape inventory
     // =========================================================================
 
     struct GEMMShape
@@ -117,47 +119,35 @@ namespace
         int K;
     };
 
-    static const std::vector<GEMMShape> GEMM_SHAPES = {
-        // Qwen3.5/Qwen3.6 MoE expert FFN shapes.
-        {"35BMoE_Expert_GateUp", "MoE", 512, 2048},
-        {"35BMoE_Expert_Down", "MoE", 2048, 512},
-        // Qwen3.6 35B-A3B hybrid GDN projections. These are model-width
-        // prefill GEMMs and must receive direct ROCm measurements alongside
-        // the routed expert matrices and their CUDA/CPU counterparts.
-        {"Qwen36MoE_GDN_QKVProjection", "MoE_GDN", 8192, 2048},
-        {"Qwen36MoE_GDN_ZProjection", "MoE_GDN", 4096, 2048},
-        // Qwen2.5-0.5B (hidden=896, intermediate=4864)
-        {"0.5B_AttnQKV", "Attention", 2688, 896},
-        {"0.5B_AttnOut", "Attention", 896, 896},
-        {"0.5B_FFN_Up", "FFN_Up", 4864, 896},
-        {"0.5B_FFN_Dn", "FFN_Down", 896, 4864},
-        {"0.5B_LM_Head", "LM_Head", 151936, 896},
-        // Qwen2.5-3B (hidden=2048, intermediate=11008)
-        {"3B_AttnQKV", "Attention", 6144, 2048},
-        {"3B_AttnOut", "Attention", 2048, 2048},
-        {"3B_FFN_Up", "FFN_Up", 11008, 2048},
-        {"3B_FFN_Dn", "FFN_Down", 2048, 11008},
-        {"3B_LM_Head", "LM_Head", 151936, 2048},
-        // Qwen2.5-7B (hidden=3584, intermediate=18944)
-        {"7B_AttnQKV", "Attention", 10752, 3584},
-        {"7B_AttnOut", "Attention", 3584, 3584},
-        {"7B_FFN_Up", "FFN_Up", 18944, 3584},
-        {"7B_FFN_Dn", "FFN_Down", 3584, 18944},
-        {"7B_LM_Head", "LM_Head", 151936, 3584},
-        // Qwen3.6 27B dense / hybrid GDN production shapes.
-        {"Qwen36_Attn_Q", "Attention", 5120, 5120},
-        {"Qwen36_Attn_KV", "Attention", 1024, 5120},
-        {"Qwen36_Attn_Wo", "Attention", 5120, 5120},
-        {"Qwen36_FFN_GateUp", "FFN_Up", 17408, 5120},
-        {"Qwen36_FFN_DownProjection", "FFN_Down", 5120, 17408},
-        {"Qwen36_GDN_InnerProjection", "GDN", 10240, 5120},
-        {"Qwen36_GDN_ZProjection", "GDN", 6144, 5120},
-        {"Qwen36_GDN_TimeProjection", "GDN", 1024, 5120},
-        {"Qwen36_GDN_OutputProjection", "GDN", 5120, 6144},
-        {"Qwen36_LM_Head", "LM_Head", 248320, 5120},
-    };
+    /**
+     * @brief Resolve every production exact-overlay geometry from the same
+     * manifest consumed by CPU, CUDA, and the Python matrix planner.
+     *
+     * The refresh transaction passes the ordinary-prefill subset explicitly.
+     * Keeping the complete production inventory here allows those filters to
+     * resolve every released geometry without maintaining a second ROCm-only
+     * model table that can drift out of date.
+     */
+    static const std::vector<GEMMShape> GEMM_SHAPES = []
+    {
+        std::vector<GEMMShape> result;
+        for (const auto &shape :
+             llaminar2::test::native_vnni_dispatch::nativeVnniShapeManifest())
+        {
+            if (shape.role != "production" || !shape.exact_overlay)
+                continue;
+            result.push_back(
+                {shape.name, shape.aspect_bucket, shape.N, shape.K});
+        }
+        if (result.empty())
+            throw std::runtime_error(
+                "ROCm NativeVNNI manifest has no production exact overlays");
+        return result;
+    }();
 
-    static const std::vector<int> M_VALUES = defaultNativeVNNIDispatchTrainingRows();
+    // Decode and grouped verifier depths have dedicated common-trainer
+    // transactions. This legacy harness is restricted to ordinary prefill.
+    static const std::vector<int> M_VALUES = defaultPrefillGraphBucketSizes();
 
     struct FormatSpec
     {
@@ -170,6 +160,8 @@ namespace
          { return TestTensorFactory::createQ4_0Random({N, K}); }},
         {"IQ4_NL", [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_NLRandom({N, K}); }},
+        {"IQ4_XS", [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ4_XSRandom({N, K}); }},
         {"Q4_1", [](size_t N, size_t K)
          { return TestTensorFactory::createQ4_1Random({N, K}); }},
         {"Q4_K", [](size_t N, size_t K)
@@ -200,6 +192,12 @@ namespace
          { return TestTensorFactory::createIQ1_SRandom({N, K}); }},
         {"IQ1_M", [](size_t N, size_t K)
          { return TestTensorFactory::createIQ1_MRandom({N, K}); }},
+        {"Q8_0", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_0Random({N, K}); }},
+        {"Q8_1", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_1Random({N, K}); }},
+        {"Q8_K", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_KRandom({N, K}); }},
     };
 
     static std::string toLower(std::string value)
@@ -283,6 +281,45 @@ namespace
         if (!info)
             throw std::runtime_error("ROCm NativeVNNI sweep format " + format_name + " did not expose vnniFormatInfo()");
         return *info;
+    }
+
+    TEST(NativeVNNISweepOffline, ShapeAndFormatInventoriesAreCanonical)
+    {
+        const std::set<std::string> expected_formats = {
+            "Q4_0", "IQ4_NL", "IQ4_XS", "Q4_1", "Q4_K", "Q5_0", "Q5_1",
+            "Q5_K", "Q6_K", "Q3_K", "Q2_K", "IQ3_S", "IQ3_XXS", "IQ2_S",
+            "IQ2_XS", "IQ2_XXS", "IQ1_S", "IQ1_M", "Q8_0", "Q8_1", "Q8_K"};
+        std::set<std::string> observed_formats;
+        for (const auto &format : NVNNI_FORMATS)
+        {
+            auto weights = format.create(/*N=*/2, /*K=*/256);
+            ASSERT_NE(weights, nullptr) << format.name;
+            (void)requireNativeVnniInfo(weights.get(), format.name);
+            EXPECT_TRUE(observed_formats.insert(format.name).second)
+                << "duplicate ROCm NativeVNNI source format " << format.name;
+        }
+        EXPECT_EQ(observed_formats, expected_formats);
+
+        std::set<std::tuple<std::string, int, int>> expected_shapes;
+        for (const auto &shape :
+             llaminar2::test::native_vnni_dispatch::nativeVnniShapeManifest())
+        {
+            if (shape.role == "production" && shape.exact_overlay)
+                expected_shapes.emplace(shape.name, shape.N, shape.K);
+        }
+        std::set<std::tuple<std::string, int, int>> observed_shapes;
+        for (const auto &shape : GEMM_SHAPES)
+            EXPECT_TRUE(
+                observed_shapes.emplace(shape.name, shape.N, shape.K).second)
+                << "duplicate ROCm NativeVNNI exact geometry " << shape.name;
+        EXPECT_EQ(observed_shapes, expected_shapes);
+
+        EXPECT_EQ(M_VALUES, llaminar2::defaultPrefillGraphBucketSizes());
+        EXPECT_EQ(std::count(M_VALUES.begin(), M_VALUES.end(), 1), 0);
+        for (int m = 2; m <= llaminar2::kDefaultNativeVNNIVerifierRowCapacity;
+             ++m)
+            EXPECT_EQ(std::count(M_VALUES.begin(), M_VALUES.end(), m), 0)
+                << "M=" << m << " belongs to grouped verifier training";
     }
 
     // =========================================================================
@@ -709,7 +746,7 @@ namespace
         const std::set<std::string> variant_filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_SWEEP_VARIANTS");
         const std::vector<int> m_values = getEnvCsvInts(
             "LLAMINAR_ROCM_NVNNI_SWEEP_M",
-            defaultNativeVNNIDispatchTrainingRows());
+            defaultPrefillGraphBucketSizes());
         const int max_cases = std::max(1, getEnvInt("LLAMINAR_ROCM_NVNNI_SWEEP_MAX_CASES").value_or(1));
         const std::string csv_path = getEnvString("LLAMINAR_ROCM_NVNNI_SWEEP_CSV");
 

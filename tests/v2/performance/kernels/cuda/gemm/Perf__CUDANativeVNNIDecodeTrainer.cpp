@@ -40,15 +40,18 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -56,6 +59,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -74,6 +78,8 @@ extern "C"
         int exact_kb,
         int force_two_phase);
     void cudaNativeVNNIGemvSweep_clearConfig();
+    void cudaNativeVNNIGemvSweep_setGroupedRows(int rows_per_tile);
+    void cudaNativeVNNIGroupedVerifier_setTensorCoreOverride(int enabled);
 }
 
 namespace
@@ -336,6 +342,7 @@ namespace
         KPar = 1,
         Direct = 2,
         InheritSerialM1 = 4,
+        TensorCoreMma16 = 5,
     };
 
     /** One normalized forceable candidate from the common registry. */
@@ -350,10 +357,16 @@ namespace
         int max_kb = 0;
         int force_two_phase = 0;
         int exact_kb = 0;
+        int grouped_rows = 0;
 
         [[nodiscard]] bool inheritsSerialM1() const
         {
             return family == CandidateFamily::InheritSerialM1;
+        }
+
+        [[nodiscard]] bool usesTensorCoreMma16() const
+        {
+            return family == CandidateFamily::TensorCoreMma16;
         }
 
         [[nodiscard]] std::string familyName() const
@@ -368,6 +381,8 @@ namespace
                 return "direct";
             case CandidateFamily::InheritSerialM1:
                 return "inherit_serial_m1";
+            case CandidateFamily::TensorCoreMma16:
+                return "tensor_core_mma16";
             }
             return "unknown";
         }
@@ -396,6 +411,7 @@ namespace
         std::string paired_path;
         std::string paired_request_manifest_path;
         std::string profiler_request_id;
+        std::string profiler_batch_path;
         std::vector<
             native_vnni_dispatch::NativeVNNIPairedTimingRequest>
             paired_requests;
@@ -405,6 +421,237 @@ namespace
         {
             return !paired_path.empty() && !paired_request_manifest_path.empty();
         }
+    };
+
+    /**
+     * @brief One immutable exact launch in a process-amortized CUDA profile.
+     *
+     * The batch plan repeats every trainer-visible discriminator. Candidate
+     * identity is the only field allowed to vary inside one exact work cell,
+     * although one process may own several cells to amortize CUDA context and
+     * Nsight report setup. `consumed` is trainer-local accounting and is never
+     * serialized into profiler evidence.
+     */
+    struct CUDAProfilerBatchRequest
+    {
+        std::string request_id;
+        std::string operation_kind;
+        std::string source_format;
+        std::string execution_mode;
+        std::string shape_name;
+        int m = 0;
+        std::string projection_n_vector;
+        int aggregate_n = 0;
+        int k = 0;
+        std::string effective_candidate_id;
+        std::string output_path;
+        bool consumed = false;
+    };
+
+    /**
+     * @brief Load, select, and account for one strict CUDA profiler batch.
+     *
+     * The collector constructs this TSV directly from authenticated profiler
+     * requests. A candidate can be claimed only by a complete exact identity
+     * match, and process success requires every row to be claimed once. This
+     * prevents the trainer's ordinary Cartesian sweep loops from inventing an
+     * unrequested `(shape, M, candidate)` combination while several cells
+     * share one CUDA context.
+     */
+    class CUDAProfilerBatch
+    {
+    public:
+        explicit CUDAProfilerBatch(const std::string &path)
+        {
+            if (path.empty())
+                return;
+            std::ifstream input(path);
+            if (!input)
+                throw std::runtime_error(
+                    "failed to open CUDA profiler batch plan: " + path);
+            std::string line;
+            if (!std::getline(input, line) || line != kHeader)
+                throw std::runtime_error(
+                    "CUDA profiler batch plan has an invalid schema header");
+            std::set<std::string> request_ids;
+            std::set<std::string> output_paths;
+            while (std::getline(input, line))
+            {
+                if (line.empty())
+                    continue;
+                std::vector<std::string> fields;
+                std::stringstream stream(line);
+                std::string field;
+                while (std::getline(stream, field, '\t'))
+                    fields.push_back(field);
+                if (fields.size() != 11)
+                    throw std::runtime_error(
+                        "CUDA profiler batch row must contain eleven TSV fields");
+                CUDAProfilerBatchRequest request{
+                    .request_id = fields[0],
+                    .operation_kind = fields[1],
+                    .source_format = fields[2],
+                    .execution_mode = fields[3],
+                    .shape_name = fields[4],
+                    .m = parsePositive(fields[5], "M"),
+                    .projection_n_vector = fields[6],
+                    .aggregate_n = parsePositive(fields[7], "N"),
+                    .k = parsePositive(fields[8], "K"),
+                    .effective_candidate_id = fields[9],
+                    .output_path = fields[10],
+                };
+                if (request.request_id.empty() ||
+                    request.operation_kind.empty() ||
+                    request.source_format.empty() ||
+                    request.execution_mode.empty() ||
+                    request.shape_name.empty() ||
+                    request.projection_n_vector.empty() ||
+                    request.effective_candidate_id.empty() ||
+                    request.output_path.empty())
+                {
+                    throw std::runtime_error(
+                        "CUDA profiler batch row contains an empty identity field");
+                }
+                if (!request_ids.insert(request.request_id).second)
+                    throw std::runtime_error(
+                        "CUDA profiler batch request IDs must be unique");
+                if (!output_paths.insert(request.output_path).second)
+                    throw std::runtime_error(
+                        "CUDA profiler batch output paths must be unique");
+                requests_.push_back(std::move(request));
+            }
+            if (requests_.empty())
+                throw std::runtime_error("CUDA profiler batch plan is empty");
+        }
+
+        [[nodiscard]] bool enabled() const noexcept
+        {
+            return !requests_.empty();
+        }
+
+        [[nodiscard]] size_t size() const noexcept
+        {
+            return requests_.size();
+        }
+
+        /** Return whether the plan owns any exact cell for one packed weight. */
+        [[nodiscard]] bool containsShape(
+            std::string_view source_format,
+            std::string_view shape_name) const
+        {
+            return std::any_of(
+                requests_.begin(), requests_.end(),
+                [&](const CUDAProfilerBatchRequest &request)
+                {
+                    return request.source_format == source_format &&
+                           request.shape_name == shape_name;
+                });
+        }
+
+        /** Return the exact candidate IDs requested for one physical cell. */
+        [[nodiscard]] std::set<std::string> candidateIds(
+            std::string_view source_format,
+            std::string_view shape_name,
+            std::string_view execution_mode,
+            int m,
+            int n,
+            int k) const
+        {
+            std::set<std::string> result;
+            for (const CUDAProfilerBatchRequest &request : requests_)
+            {
+                if (matchesCell(
+                        request, source_format, shape_name, execution_mode,
+                        m, n, k))
+                {
+                    result.insert(request.effective_candidate_id);
+                }
+            }
+            return result;
+        }
+
+        /** Claim one exact request immediately before its production launch. */
+        CUDAProfilerBatchRequest *claim(
+            std::string_view source_format,
+            std::string_view shape_name,
+            std::string_view execution_mode,
+            int m,
+            int n,
+            int k,
+            std::string_view effective_candidate_id)
+        {
+            CUDAProfilerBatchRequest *result = nullptr;
+            for (CUDAProfilerBatchRequest &request : requests_)
+            {
+                if (!matchesCell(
+                        request, source_format, shape_name, execution_mode,
+                        m, n, k) ||
+                    request.effective_candidate_id != effective_candidate_id)
+                {
+                    continue;
+                }
+                if (result)
+                    throw std::runtime_error(
+                        "CUDA profiler batch has duplicate exact launch identities");
+                result = &request;
+            }
+            if (!result)
+                return nullptr;
+            if (result->consumed)
+                throw std::runtime_error(
+                    "CUDA profiler batch request was claimed more than once: " +
+                    result->request_id);
+            result->consumed = true;
+            return result;
+        }
+
+        /** Fail when a successful trainer process omitted any planned launch. */
+        void requireComplete() const
+        {
+            for (const CUDAProfilerBatchRequest &request : requests_)
+            {
+                if (!request.consumed)
+                    throw std::runtime_error(
+                        "CUDA profiler batch omitted request " +
+                        request.request_id);
+            }
+        }
+
+    private:
+        static constexpr std::string_view kHeader =
+            "request_id\toperation_kind\tsource_format\texecution_mode\t"
+            "shape_name\tm\tprojection_n_vector\taggregate_n\tk\t"
+            "effective_candidate_id\toutput_path";
+
+        static int parsePositive(const std::string &value, const char *name)
+        {
+            size_t consumed = 0;
+            const int parsed = std::stoi(value, &consumed);
+            if (consumed != value.size() || parsed <= 0)
+                throw std::runtime_error(
+                    std::string("CUDA profiler batch has invalid ") + name);
+            return parsed;
+        }
+
+        static bool matchesCell(
+            const CUDAProfilerBatchRequest &request,
+            std::string_view source_format,
+            std::string_view shape_name,
+            std::string_view execution_mode,
+            int m,
+            int n,
+            int k)
+        {
+            return request.operation_kind == "NativeVNNIDecodeProjection" &&
+                   request.source_format == source_format &&
+                   request.execution_mode == execution_mode &&
+                   request.m == m && request.aggregate_n == n &&
+                   request.k == k &&
+                   request.projection_n_vector == std::to_string(n) &&
+                   request.shape_name == shape_name;
+        }
+
+        std::vector<CUDAProfilerBatchRequest> requests_;
     };
 
     std::string trim(std::string value)
@@ -560,6 +807,20 @@ namespace
         }
         config.profiler_request_id =
             native_vnni_dispatch::profilerRequestId();
+        config.profiler_batch_path =
+            native_vnni_dispatch::profilerEnvironment(
+                native_vnni_dispatch::kProfilerBatchPathEnvironment);
+        if (!config.profiler_request_id.empty() &&
+            !config.profiler_batch_path.empty())
+        {
+            throw std::runtime_error(
+                "CUDA profiler request and batch modes are mutually exclusive");
+        }
+        if (!config.profiler_batch_path.empty() && config.pairedConfirmation())
+        {
+            throw std::runtime_error(
+                "batched CUDA profiling cannot run inside paired timing");
+        }
         if (!config.profiler_request_id.empty())
         {
             if (config.pairedConfirmation())
@@ -721,15 +982,36 @@ namespace
     {
         if (m == 1)
             return fastM1Candidates(config, k_groups);
-        Candidate verifier{
-            "cuda.nvnni.decode.verifier.inherit_serial_m1",
-            CandidateFamily::InheritSerialM1};
-        if (!selected(config.candidate_families, verifier.familyName()) ||
-            !selected(config.candidate_ids, verifier.id))
+        std::vector<Candidate> result;
+        const int maximum_useful_rows = std::min(
+            64,
+            static_cast<int>(std::bit_ceil(static_cast<unsigned>(m))));
+        for (const int grouped_rows : {2, 4, 8, 16, 32, 64})
         {
-            return {};
+            // A tile larger than the next power of two cannot remove another
+            // row group for this M and only increases register pressure.
+            if (grouped_rows > maximum_useful_rows)
+                continue;
+            Candidate verifier{
+                "cuda.nvnni.decode.verifier.inherit_serial_m1.r" +
+                    std::to_string(grouped_rows),
+                CandidateFamily::InheritSerialM1};
+            verifier.grouped_rows = grouped_rows;
+            if (selected(config.candidate_families, verifier.familyName()) &&
+                selected(config.candidate_ids, verifier.id))
+            {
+                result.push_back(std::move(verifier));
+            }
         }
-        return {verifier};
+        Candidate tensor_core{
+            "cuda.nvnni.decode.verifier.tensor_core_mma16",
+            CandidateFamily::TensorCoreMma16};
+        if (selected(config.candidate_families, tensor_core.familyName()) &&
+            selected(config.candidate_ids, tensor_core.id))
+        {
+            result.push_back(std::move(tensor_core));
+        }
+        return result;
     }
 
     /**
@@ -794,9 +1076,20 @@ namespace
     {
     public:
         explicit CandidateOverride(const Candidate &candidate)
-            : active_(!candidate.inheritsSerialM1())
+            : active_(!candidate.inheritsSerialM1() ||
+                      candidate.grouped_rows > 0)
         {
-            if (active_)
+            if (candidate.usesTensorCoreMma16())
+            {
+                cudaNativeVNNIGemvSweep_clearConfig();
+                cudaNativeVNNIGroupedVerifier_setTensorCoreOverride(1);
+            }
+            else if (candidate.inheritsSerialM1())
+            {
+                cudaNativeVNNIGemvSweep_setGroupedRows(
+                    candidate.grouped_rows);
+            }
+            else if (active_)
             {
                 cudaNativeVNNIGemvSweep_setConfig(
                     static_cast<int>(candidate.family),
@@ -816,6 +1109,7 @@ namespace
 
         ~CandidateOverride()
         {
+            cudaNativeVNNIGroupedVerifier_setTensorCoreOverride(0);
             cudaNativeVNNIGemvSweep_clearConfig();
         }
 
@@ -1215,7 +1509,7 @@ namespace
         int sample_count,
         int timed_replay_cap,
         uint64_t cell_order_seed,
-        const std::string &profiler_request_id,
+        const std::vector<std::string> &profiler_request_ids,
         DeviceId device)
     {
         InterleavedCandidateBatch result;
@@ -1307,12 +1601,24 @@ namespace
             }
             return kernel->multiply_tensor(input, output.get(), m, n, k);
         };
-        const auto execute_once = [&](PreparedCandidate &state) -> bool
+        const auto execute_once_on_stream = [&] (
+            PreparedCandidate &state,
+            cudaStream_t execution_stream) -> bool
         {
             if (mode == ExecutionMode::GraphCaptured)
-                return state.captured && state.captured->launch(stream);
+            {
+                return state.captured &&
+                       state.captured->launch(execution_stream);
+            }
+            kernel->setGPUStream(execution_stream);
             CandidateOverride override(*state.candidate);
-            return run_once();
+            const bool launched = run_once();
+            kernel->setGPUStream(stream);
+            return launched;
+        };
+        const auto execute_once = [&](PreparedCandidate &state) -> bool
+        {
+            return execute_once_on_stream(state, stream);
         };
 
         prepared.reserve(candidates.size());
@@ -1456,41 +1762,68 @@ namespace
                 return fail("interleaved_warmup_sync");
         }
 
-        if (!profiler_request_id.empty())
+        if (!profiler_request_ids.empty())
         {
-            if (prepared.size() != 1)
-                return fail("profiler_requires_one_candidate");
+            if (profiler_request_ids.size() != prepared.size())
+                return fail("profiler_request_candidate_count");
             /*
              * Nsight Compute starts with collection disabled. Setup, graph
              * capture, correctness launches, route proof, and warmup above are
-             * therefore absent from the profiler report. The only enabled
-             * work is this one production candidate launch (or graph replay)
-             * and its completion synchronization. This launch is not appended
-             * to any canonical timing sample.
+             * therefore absent from the profiler report. Every request owns a
+             * separate start/stop range containing one production operation
+             * (or graph replay). Each request receives a distinct explicit
+             * stream. CUDA's stable stream ID is exported by Nsight for every
+             * physical kernel and gives the offline parser exact ownership
+             * without profiling a synthetic marker or the candidate-independent
+             * activation quantizer. None of these launches is appended to a
+             * canonical timing sample.
              */
-            if (!invokeCudaProfilerControl("cuProfilerStart"))
-                return fail("profiler_start");
-            const bool launch_ok = execute_once(prepared.front());
-            const cudaError_t synchronize_status =
-                cudaStreamSynchronize(stream);
-            const bool stop_ok =
-                invokeCudaProfilerControl("cuProfilerStop");
-            if (!launch_ok || synchronize_status != cudaSuccess ||
-                !stop_ok)
+            for (size_t index = 0; index < prepared.size(); ++index)
             {
-                return fail("profiler_target_launch");
+                cudaStream_t profile_stream = nullptr;
+                unsigned long long profile_stream_id = 0;
+                if (cudaStreamCreateWithFlags(
+                        &profile_stream, cudaStreamNonBlocking) != cudaSuccess ||
+                    cudaStreamGetId(
+                        profile_stream, &profile_stream_id) != cudaSuccess)
+                {
+                    if (profile_stream)
+                        (void)cudaStreamDestroy(profile_stream);
+                    return fail("profiler_stream_create");
+                }
+                if (!invokeCudaProfilerControl("cuProfilerStart"))
+                {
+                    (void)cudaStreamDestroy(profile_stream);
+                    return fail("profiler_start");
+                }
+                const bool launch_ok = execute_once_on_stream(
+                    prepared[index], profile_stream);
+                const cudaError_t synchronize_status =
+                    cudaStreamSynchronize(profile_stream);
+                const bool stop_ok =
+                    invokeCudaProfilerControl("cuProfilerStop");
+                const cudaError_t destroy_status =
+                    cudaStreamDestroy(profile_stream);
+                if (!launch_ok ||
+                    synchronize_status != cudaSuccess || !stop_ok)
+                {
+                    return fail("profiler_target_launch");
+                }
+                if (destroy_status != cudaSuccess)
+                    return fail("profiler_stream_destroy");
+                ++result.isolated_profile_launches;
+                std::fprintf(
+                    stderr,
+                    "[NativeVNNIProfiler][CUDA] request=%s candidate=%s "
+                    "mode=%s M=%d N=%d K=%d stream_id=%llu launches=1\n",
+                    profiler_request_ids[index].c_str(),
+                    prepared[index].candidate->id.c_str(),
+                    executionModeName(mode),
+                    m,
+                    n,
+                    k,
+                    profile_stream_id);
             }
-            result.isolated_profile_launches = 1;
-            std::fprintf(
-                stderr,
-                "[NativeVNNIProfiler][CUDA] request=%s candidate=%s "
-                "mode=%s M=%d N=%d K=%d launches=1\n",
-                profiler_request_id.c_str(),
-                prepared.front().candidate->id.c_str(),
-                executionModeName(mode),
-                m,
-                n,
-                k);
         }
 
         /*
@@ -1822,7 +2155,7 @@ namespace
                 config.samples,
                 config.timed_replay_cap,
                 cell_seed,
-                config.profiler_request_id,
+                {},
                 device);
             ASSERT_TRUE(batch.valid)
                 << request.request_id
@@ -1955,7 +2288,7 @@ namespace
         const auto &comparison = evidence.comparison;
         std::fprintf(
             file,
-            "cuda,decode,%s,%u,%u,%s,%s,%d,%d,%d,%s,%zu,%llu,%s,%s,%d,%d,%d,%d,%d,%d,%d,%zu,%d,%zu,"
+            "cuda,decode,%s,%u,%u,%s,%s,%d,%d,%d,%s,%zu,%llu,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%zu,%d,%zu,"
             "%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%zu,%zu,%.17g,%.17g,%.17g,%.17g,%s,%s,%s,"
             "1,%d,1,1,%d,%s,%s,%d,%d,%d,%s,1,%d,%d,%d\n",
             row.format->name.c_str(),
@@ -1978,6 +2311,7 @@ namespace
             row.candidate.max_kb,
             row.candidate.exact_kb,
             row.candidate.force_two_phase,
+            row.candidate.grouped_rows,
             row.weight_bytes,
             warmups,
             evidence.samples.size(),
@@ -2030,6 +2364,7 @@ namespace
     {
         ScopedPerfStatsEnvironment perf_stats;
         const TrainerConfig config = loadTrainerConfig();
+        CUDAProfilerBatch profiler_batch(config.profiler_batch_path);
         if (config.pairedConfirmation())
         {
             runPairedConfirmation(config, device_);
@@ -2047,7 +2382,7 @@ namespace
         std::fprintf(
             aggregate,
             "backend,phase,source_format,source_codebook,execution_codebook,shape,execution_mode,m,n,k,"
-            "candidate_id,measurement_order,measurement_order_seed,measurement_protocol,family,tile_n,cpt,target_waves,mkg,max_kb,exact_kb,force_two_phase,weight_bytes,warmup_count,"
+            "candidate_id,measurement_order,measurement_order_seed,measurement_protocol,family,tile_n,cpt,target_waves,mkg,max_kb,exact_kb,force_two_phase,grouped_rows,weight_bytes,warmup_count,"
             "sample_count,min_us,median_us,p95_us,mad_us,cv,effective_bandwidth_gbs,bit_mismatches,"
             "first_bit_mismatch,repeat_byte_mismatches,max_abs,relative_l2,cosine,symmetric_kld,"
             "grouped_output_digest,serial_output_digest,timing_sample_digest,supported,graph_capture_ok,"
@@ -2069,6 +2404,11 @@ namespace
             {
                 if (!selected(config.shapes, shape.name))
                     continue;
+                if (profiler_batch.enabled() &&
+                    !profiler_batch.containsShape(format.name, shape.name))
+                {
+                    continue;
+                }
                 if (executed_cases >= config.max_cases)
                     break;
 
@@ -2093,18 +2433,48 @@ namespace
 
                 for (const int m : config.m_values)
                 {
-                    const std::vector<Candidate> candidates = candidatesForM(
-                        m, shape.K / 32, config);
-                    ASSERT_FALSE(candidates.empty())
-                        << "No CUDA candidates selected for M=" << m;
                     auto input = TestTensorFactory::createFP32Random(
                         {static_cast<size_t>(m), static_cast<size_t>(shape.K)},
                         -0.25f,
                         0.25f,
                         0xC0DAu + static_cast<uint32_t>(m));
                     std::vector<MeasuredRow> rows;
+                    std::vector<ExecutionMode> active_modes;
                     for (const ExecutionMode mode : config.execution_modes)
                     {
+                        const std::string mode_name = executionModeName(mode);
+                        const std::set<std::string> requested_candidate_ids =
+                            profiler_batch.enabled()
+                                ? profiler_batch.candidateIds(
+                                      format.name,
+                                      shape.name,
+                                      mode_name,
+                                      m,
+                                      shape.N,
+                                      shape.K)
+                                : std::set<std::string>{};
+                        if (profiler_batch.enabled() &&
+                            requested_candidate_ids.empty())
+                        {
+                            continue;
+                        }
+                        std::vector<Candidate> candidates = candidatesForM(
+                            m, shape.K / 32, config);
+                        if (profiler_batch.enabled())
+                        {
+                            std::erase_if(
+                                candidates,
+                                [&](const Candidate &candidate)
+                                {
+                                    return !requested_candidate_ids.contains(
+                                        candidate.id);
+                                });
+                        }
+                        ASSERT_FALSE(candidates.empty())
+                            << "No CUDA candidates selected for "
+                            << format.name << " " << shape.name
+                            << " M=" << m << " mode=" << mode_name;
+                        active_modes.push_back(mode);
                         const SerialEvidence serial = runSerialRows(
                             prepared.kernel,
                             input.get(),
@@ -2128,6 +2498,35 @@ namespace
                             ordered_candidates.begin(),
                             ordered_candidates.end(),
                             order_engine);
+                        std::vector<std::string> profiler_request_ids;
+                        if (!config.profiler_request_id.empty())
+                        {
+                            ASSERT_EQ(ordered_candidates.size(), 1u);
+                            profiler_request_ids.push_back(
+                                config.profiler_request_id);
+                        }
+                        else if (profiler_batch.enabled())
+                        {
+                            profiler_request_ids.reserve(
+                                ordered_candidates.size());
+                            for (const Candidate &candidate : ordered_candidates)
+                            {
+                                CUDAProfilerBatchRequest *request =
+                                    profiler_batch.claim(
+                                        format.name,
+                                        shape.name,
+                                        mode_name,
+                                        m,
+                                        shape.N,
+                                        shape.K,
+                                        candidate.id);
+                                ASSERT_NE(request, nullptr)
+                                    << "CUDA profiler batch omitted exact "
+                                    << "candidate " << candidate.id;
+                                profiler_request_ids.push_back(
+                                    request->request_id);
+                            }
+                        }
                         InterleavedCandidateBatch batch =
                             runCandidatesInterleaved(
                                 prepared.kernel,
@@ -2144,7 +2543,7 @@ namespace
                                 config.samples,
                                 config.timed_replay_cap,
                                 order_seed,
-                                config.profiler_request_id,
+                                profiler_request_ids,
                                 device_);
                         ASSERT_TRUE(batch.valid)
                             << format.name << " " << shape.name << " M=" << m
@@ -2195,7 +2594,12 @@ namespace
                         }
                     }
 
-                    for (const ExecutionMode mode : config.execution_modes)
+                    if (rows.empty())
+                        continue;
+
+                    bool every_mode_has_winner = true;
+                    std::string missing_winner_modes;
+                    for (const ExecutionMode mode : active_modes)
                     {
                         auto winner = rows.end();
                         for (auto iterator = rows.begin(); iterator != rows.end(); ++iterator)
@@ -2209,10 +2613,14 @@ namespace
                                 winner = iterator;
                             }
                         }
-                        ASSERT_NE(winner, rows.end())
-                            << format.name << " " << shape.name << " M=" << m
-                            << " mode=" << executionModeName(mode)
-                            << " has no correct candidate";
+                        if (winner == rows.end())
+                        {
+                            every_mode_has_winner = false;
+                            if (!missing_winner_modes.empty())
+                                missing_winner_modes += ",";
+                            missing_winner_modes += executionModeName(mode);
+                            continue;
+                        }
                         winner->is_winner = true;
                     }
 
@@ -2240,6 +2648,12 @@ namespace
                     }
                     std::fflush(aggregate);
                     std::fflush(timing);
+                    ASSERT_TRUE(every_mode_has_winner)
+                        << format.name << " " << shape.name << " M=" << m
+                        << " has no correct candidate for mode(s) "
+                        << missing_winner_modes
+                        << "; failed rows were retained in the aggregate and "
+                           "timing evidence";
                     ++executed_cases;
                 }
             }
@@ -2253,6 +2667,12 @@ namespace
         {
             ASSERT_EQ(isolated_profile_launches, 1)
                 << "each CUDA profiler request must execute one target launch";
+        }
+        else if (profiler_batch.enabled())
+        {
+            EXPECT_NO_THROW(profiler_batch.requireComplete());
+            ASSERT_EQ(isolated_profile_launches, profiler_batch.size())
+                << "every CUDA profiler batch member must execute once";
         }
     }
 } // namespace

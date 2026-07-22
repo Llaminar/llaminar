@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for the two-hour CPU prefill covering plan."""
+"""Regression tests for exhaustive CPU prefill performance evidence."""
 
 from __future__ import annotations
 
@@ -21,8 +21,6 @@ if str(KERNEL_PERF_ROOT) not in sys.path:
 from native_vnni_dispatch.cpu_prefill_training_plan import (  # noqa: E402
     CPUPrefillSourceTrainingRecord,
     ISA_REGIMES,
-    _generic_domain_shape_group_counts,
-    _required_minimum_geometry_anchor_cells,
     _source_record_schedule_key,
     build_cpu_prefill_sealed_witness_plan,
     coalesce_cpu_prefill_source_training_records,
@@ -186,31 +184,48 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
             for regime in ISA_REGIMES
         )
 
-    def test_runtime_covering_array_satisfies_declared_obligations(self) -> None:
+    def test_runtime_plan_is_the_complete_cartesian_inventory(self) -> None:
         cells = cpu_prefill_runtime_training_cells()
+        measurements = cpu_prefill_measurements()
+        codebooks = {
+            spec.cpu_execution_codebook_id for spec in FORMAT_SPECS
+        }
 
         validate_cpu_prefill_runtime_training_cells(cells)
-        self.assertEqual(len(cells), 2818)
+        self.assertEqual(
+            len(cells),
+            len(codebooks)
+            * sum(len(item.m_values) for item in measurements)
+            * len(ISA_REGIMES),
+        )
         self.assertEqual(len(cells), len(set(cells)))
 
-    def test_every_generic_domain_has_enough_lower_geometry_anchors(self) -> None:
-        """Every policy domain must have a lower edge and three shape groups."""
+    def test_every_domain_contains_every_exact_geometry(self) -> None:
+        """No generic domain or exact overlay may rely on pairwise sampling."""
 
         cells = set(cpu_prefill_runtime_training_cells())
-        codebooks = tuple(sorted({cell.runtime_codebook for cell in cells}))
-        required = _required_minimum_geometry_anchor_cells(
-            cpu_prefill_measurements(),
-            codebooks,
-        )
-        counts = _generic_domain_shape_group_counts(
-            cells,
-            cpu_prefill_measurements(),
-        )
-
-        self.assertTrue(required)
-        self.assertTrue(required.issubset(cells))
-        self.assertTrue(counts)
-        self.assertGreaterEqual(min(counts.values()), 3)
+        keys = {
+            (
+                cell.runtime_codebook,
+                cell.shape_name,
+                cell.m,
+                cell.isa_regime,
+            )
+            for cell in cells
+        }
+        for codebook in sorted({cell.runtime_codebook for cell in cells}):
+            for measurement in cpu_prefill_measurements():
+                for m in measurement.m_values:
+                    for regime in ISA_REGIMES:
+                        self.assertIn(
+                            (
+                                codebook,
+                                measurement.shape.name,
+                                m,
+                                regime,
+                            ),
+                            keys,
+                        )
 
     def test_sparse_kpart_domains_receive_generic_route_anchors(self) -> None:
         """A two-production-shape family gains a third measured CV group."""
@@ -594,9 +609,9 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
             {load_cpu_prefill_split_manifest().sealed_m_values},
         )
         self.assertEqual(len(records), 849)
-        self.assertEqual(sum(len(record.m_values) for record in records), 2544)
+        self.assertEqual(sum(len(record.m_values) for record in records), 1734)
 
-    def test_plan_is_balanced_and_far_smaller_than_cartesian_product(self) -> None:
+    def test_source_plan_is_exhaustive_across_formats_shapes_m_and_isa(self) -> None:
         runtime = cpu_prefill_runtime_training_cells()
         records = cpu_prefill_source_training_records()
         source_cells = sum(len(record.m_values) for record in records)
@@ -611,10 +626,9 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
             * len(ISA_REGIMES)
         )
 
-        self.assertEqual(source_cells, 3229)
-        self.assertLessEqual(max(regime_loads.values()) - min(regime_loads.values()), 10)
+        self.assertEqual(source_cells, full_cartesian_cells)
+        self.assertEqual(max(regime_loads.values()), min(regime_loads.values()))
         self.assertEqual(set(regime_loads), set(ISA_REGIMES))
-        self.assertLess(source_cells, full_cartesian_cells // 4)
 
     def test_process_jobs_form_identical_m_inventory_mpmd_groups(self) -> None:
         records = cpu_prefill_source_training_records()
@@ -633,10 +647,18 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
             self.assertEqual(estimated_work, sorted(estimated_work, reverse=True))
             estimated_group_work.append(estimated_work[0])
 
-        self.assertEqual(len(groups), 54)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(
+            {group[0].m_values for group in groups},
+            {
+                (64, 128),
+                (64, 128, 256, 512),
+            },
+        )
+        self.assertEqual(sorted(len(group) for group in groups), [2331, 2394])
         self.assertEqual(
             sum((len(group) + 1) // 2 for group in groups),
-            953,
+            (len(records) + 1) // 2,
         )
         self.assertEqual(
             estimated_group_work,

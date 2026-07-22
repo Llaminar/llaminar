@@ -38,6 +38,9 @@ from native_vnni_dispatch.profiles import (  # noqa: E402
 from native_vnni_dispatch.cpu_prefill_split_manifest import (  # noqa: E402
     LEGACY_SCHEMA_VERSION,
     SCHEMA_VERSION,
+    V10_HISTORICAL_ORDER_DIGESTS,
+    V10_SCHEMA_VERSION,
+    V11_SCHEMA_VERSION,
     V9_SCHEMA_VERSION,
     V9_QWEN36_MOE_PRODUCTION_SHAPES,
     load_cpu_prefill_split_manifest,
@@ -632,7 +635,7 @@ class CPUNativeVNNIPrefillTrainerTest(unittest.TestCase):
                 shape_name="FastSealed_Balanced_4096x4096",
                 n=4096,
                 k=4096,
-                m=16384,
+                m=512,
                 latency_us=10.0,
                 mode=ExecutionMode.EAGER,
                 backend=Backend.CPU,
@@ -1145,6 +1148,11 @@ class CPUNativeVNNIPrefillTrainerTest(unittest.TestCase):
         self.assertEqual(manifest.schema_version, SCHEMA_VERSION)
         self.assertTrue(manifest.include_all_production_shapes)
         self.assertTrue(
+            V10_HISTORICAL_ORDER_DIGESTS.isdisjoint(
+                manifest.accepted_digests()
+            )
+        )
+        self.assertTrue(
             V9_QWEN36_MOE_PRODUCTION_SHAPES.issubset(
                 manifest.development_shapes
             )
@@ -1173,7 +1181,7 @@ class CPUNativeVNNIPrefillTrainerTest(unittest.TestCase):
         )
         self.assertEqual(
             manifest.sealed_m_values,
-            (64, 256, 1024, 2048, 4096, 8192, 16384),
+            (64, 128, 256, 512),
         )
 
     def test_v8_split_remains_readable_for_digest_bound_refinement(self) -> None:
@@ -1225,6 +1233,45 @@ class CPUNativeVNNIPrefillTrainerTest(unittest.TestCase):
             len(load_cpu_prefill_split_manifest().development_shapes),
         )
 
+    def test_v10_split_remains_readable_for_digest_bound_refinement(self) -> None:
+        """The tiered v12 plan must not invalidate authenticated v10 work."""
+
+        path = (
+            KERNEL_PERF_ROOT
+            / "native_vnni_dispatch"
+            / "manifests"
+            / "native_vnni_cpu_prefill_split_v10.json"
+        )
+        manifest = load_cpu_prefill_split_manifest(path)
+
+        self.assertEqual(manifest.schema_version, V10_SCHEMA_VERSION)
+        self.assertTrue(manifest.include_all_production_shapes)
+        self.assertTrue(
+            V10_HISTORICAL_ORDER_DIGESTS < manifest.accepted_digests()
+        )
+        self.assertEqual(
+            manifest.sealed_m_values,
+            (64, 256, 1024, 2048, 4096, 8192, 16384),
+        )
+
+    def test_v11_split_remains_readable_for_digest_bound_refinement(self) -> None:
+        """The tiered v12 plan must retain bounded-v11 lineage identity."""
+
+        path = (
+            KERNEL_PERF_ROOT
+            / "native_vnni_dispatch"
+            / "manifests"
+            / "native_vnni_cpu_prefill_split_v11.json"
+        )
+        manifest = load_cpu_prefill_split_manifest(path)
+
+        self.assertEqual(manifest.schema_version, V11_SCHEMA_VERSION)
+        self.assertTrue(manifest.include_all_production_shapes)
+        self.assertEqual(
+            manifest.sealed_m_values,
+            (64, 256, 512, 1024, 2048),
+        )
+
     def test_sealed_plan_reaches_every_frozen_generic_leaf(self) -> None:
         """A timing-free preflight must reject structurally untested rules."""
 
@@ -1256,7 +1303,7 @@ class CPUNativeVNNIPrefillTrainerTest(unittest.TestCase):
             packing_abi="native-vnni-cpu-cb0-v1",
             runtime_codebook_id=0,
             execution_mode=ExecutionMode.EAGER,
-            m=16384,
+            m=512,
             aspect_bucket=AspectBucket.BALANCED,
             all_aspects=True,
         )
@@ -1439,12 +1486,12 @@ class CPUNativeVNNIPrefillTrainerTest(unittest.TestCase):
             generated,
         )
 
-    def test_generated_bucket_clamps_real_32b_ffn_but_not_small_models(self) -> None:
+    def test_generated_bucket_uses_one_total_m_partition_for_every_geometry(self) -> None:
         _, generated = self.run_analyzer()
 
-        self.assertIn("(n == 27648 && k == 5120)", generated)
-        self.assertIn("maximum_m = 1024", generated)
-        self.assertIn("return 16384", generated)
+        self.assertNotIn("maximum_m", generated)
+        self.assertNotIn("n == 27648", generated)
+        self.assertIn("return 512", generated)
 
     def test_generated_bucket_is_total_for_unseen_runtime_m(self) -> None:
         """Compile the emitted resolver at interval and geometry boundaries."""
@@ -1464,21 +1511,20 @@ using llaminar2::cpu::native_vnni::generated::bucketCPUNativeVNNIPrefillM;
 
 static_assert(bucketCPUNativeVNNIPrefillM(1, 896, 896) == 64);
 static_assert(bucketCPUNativeVNNIPrefillM(64, 896, 896) == 64);
-static_assert(bucketCPUNativeVNNIPrefillM(65, 896, 896) == 256);
+static_assert(bucketCPUNativeVNNIPrefillM(65, 896, 896) == 128);
+static_assert(bucketCPUNativeVNNIPrefillM(128, 896, 896) == 128);
+static_assert(bucketCPUNativeVNNIPrefillM(129, 896, 896) == 256);
 static_assert(bucketCPUNativeVNNIPrefillM(256, 896, 896) == 256);
-static_assert(bucketCPUNativeVNNIPrefillM(257, 896, 896) == 1024);
-static_assert(bucketCPUNativeVNNIPrefillM(1024, 896, 896) == 1024);
-static_assert(bucketCPUNativeVNNIPrefillM(1025, 896, 896) == 2048);
-static_assert(bucketCPUNativeVNNIPrefillM(2048, 896, 896) == 2048);
-static_assert(bucketCPUNativeVNNIPrefillM(2049, 896, 896) == 4096);
-static_assert(bucketCPUNativeVNNIPrefillM(4096, 896, 896) == 4096);
-static_assert(bucketCPUNativeVNNIPrefillM(4097, 896, 896) == 8192);
-static_assert(bucketCPUNativeVNNIPrefillM(8192, 896, 896) == 8192);
-static_assert(bucketCPUNativeVNNIPrefillM(8193, 896, 896) == 16384);
-static_assert(bucketCPUNativeVNNIPrefillM(16384, 896, 896) == 16384);
-static_assert(bucketCPUNativeVNNIPrefillM(2147483647, 896, 896) == 16384);
-static_assert(bucketCPUNativeVNNIPrefillM(2048, 27648, 5120) == 1024);
-static_assert(bucketCPUNativeVNNIPrefillM(8192, 5120, 5120) == 4096);
+static_assert(bucketCPUNativeVNNIPrefillM(257, 896, 896) == 512);
+static_assert(bucketCPUNativeVNNIPrefillM(512, 896, 896) == 512);
+static_assert(bucketCPUNativeVNNIPrefillM(513, 896, 896) == 512);
+static_assert(bucketCPUNativeVNNIPrefillM(1024, 896, 896) == 512);
+static_assert(bucketCPUNativeVNNIPrefillM(2048, 896, 896) == 512);
+static_assert(bucketCPUNativeVNNIPrefillM(4096, 896, 896) == 512);
+static_assert(bucketCPUNativeVNNIPrefillM(16384, 896, 896) == 512);
+static_assert(bucketCPUNativeVNNIPrefillM(2147483647, 896, 896) == 512);
+static_assert(bucketCPUNativeVNNIPrefillM(2048, 27648, 5120) == 512);
+static_assert(bucketCPUNativeVNNIPrefillM(8192, 5120, 5120) == 512);
 
 int main() { return 0; }
 """.lstrip(),

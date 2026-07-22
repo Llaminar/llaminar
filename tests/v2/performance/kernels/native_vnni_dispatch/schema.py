@@ -11,7 +11,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, field, fields
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import cached_property
 from typing import Any, Mapping
@@ -21,8 +23,54 @@ from .format_registry import format_spec
 
 SCHEMA_VERSION = 1
 POLICY_ABI = 2
-P95_REGRET_BUDGET = 0.05
-LEARNER_VERSION = "native-vnni-bounded-tree-beam-regret-v20"
+DEFAULT_P95_REGRET_PERCENT = Decimal("5")
+DEFAULT_MINIMUM_PASSING_DOMAIN_PERCENT = Decimal("95")
+
+
+def _promotion_percent(
+    environment_name: str,
+    default: Decimal,
+    *,
+    allow_zero: bool,
+) -> Decimal:
+    """Parse one process-wide promotion percentage without silent clipping.
+
+    The turnkey shell transaction exports these values before launching any
+    fitter, seal collector, artifact writer, or artifact validator. Keeping
+    the parser here gives every backend exactly one interpretation of a manual
+    best-effort threshold while leaving timing, correctness, coverage, and
+    bitwise-verifier gates untouched.
+    """
+
+    raw = os.environ.get(environment_name, str(default)).strip()
+    try:
+        value = Decimal(raw)
+    except InvalidOperation as error:
+        raise ValueError(
+            f"{environment_name} must be a finite decimal percentage"
+        ) from error
+    lower_bound = Decimal("0") if allow_zero else Decimal("0.000001")
+    if not value.is_finite() or value < lower_bound or value > Decimal("100"):
+        interval = "[0, 100]" if allow_zero else "(0, 100]"
+        raise ValueError(f"{environment_name} must be in {interval}")
+    return value
+
+
+P95_REGRET_PERCENT = _promotion_percent(
+    "LLAMINAR_NATIVE_VNNI_PROMOTION_P95_REGRET_PERCENT",
+    DEFAULT_P95_REGRET_PERCENT,
+    allow_zero=False,
+)
+MINIMUM_PASSING_DOMAIN_PERCENT = _promotion_percent(
+    "LLAMINAR_NATIVE_VNNI_PROMOTION_MIN_PASSING_DOMAIN_PERCENT",
+    DEFAULT_MINIMUM_PASSING_DOMAIN_PERCENT,
+    allow_zero=True,
+)
+P95_REGRET_BUDGET = float(P95_REGRET_PERCENT / Decimal("100"))
+MINIMUM_PASSING_DOMAIN_FRACTION = float(
+    MINIMUM_PASSING_DOMAIN_PERCENT / Decimal("100")
+)
+LEARNER_VERSION = "native-vnni-bounded-tree-beam-regret-v26"
 COMPATIBLE_OBSERVATION_LEARNER_VERSIONS = frozenset((
     "native-vnni-bounded-tree-beam-regret-v8",
     "native-vnni-bounded-tree-beam-regret-v9",
@@ -36,14 +84,21 @@ COMPATIBLE_OBSERVATION_LEARNER_VERSIONS = frozenset((
     "native-vnni-bounded-tree-beam-regret-v17",
     "native-vnni-bounded-tree-beam-regret-v18",
     "native-vnni-bounded-tree-beam-regret-v19",
+    "native-vnni-bounded-tree-beam-regret-v20",
+    "native-vnni-bounded-tree-beam-regret-v21",
+    "native-vnni-bounded-tree-beam-regret-v23",
+    "native-vnni-bounded-tree-beam-regret-v24",
+    "native-vnni-bounded-tree-beam-regret-v25",
     LEARNER_VERSION,
 ))
-FEATURE_SCHEMA_VERSION = "execution-mode-n-k-work-aspect-tile-wave-tree-v9"
+FEATURE_SCHEMA_VERSION = "execution-mode-n-k-work-aspect-tile-wave-tree-v11"
 COMPATIBLE_PROFILER_FEATURE_SCHEMA_VERSIONS = frozenset((
     "execution-mode-n-k-work-aspect-tile-occupancy-tree-v5",
     "execution-mode-n-k-work-aspect-tile-wave-tree-v6",
     "execution-mode-n-k-work-aspect-tile-wave-tree-v7",
     "execution-mode-n-k-work-aspect-tile-wave-tree-v8",
+    "execution-mode-n-k-work-aspect-tile-wave-tree-v9",
+    "execution-mode-n-k-work-aspect-tile-wave-tree-v10",
     FEATURE_SCHEMA_VERSION,
 ))
 
@@ -221,6 +276,8 @@ class NativeVNNIObservation:
 
     # Optional structured proof for reviewed adaptive timing protocols. Empty
     # preserves the original fixed-sample schema and its corpus/request digests.
+    launch_k_tiles: int = 0
+    launch_n_block_chunks: int = 0
     adaptive_timing_evidence: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -258,6 +315,10 @@ class NativeVNNIObservation:
             raise ValueError("observed_candidate_id must name the effective production route")
         if self.m <= 0 or self.aggregate_n <= 0 or self.k <= 0:
             raise ValueError("m, aggregate_n, and k must be positive")
+        if self.launch_k_tiles < 0:
+            raise ValueError("launch_k_tiles must be non-negative")
+        if self.launch_n_block_chunks < 0:
+            raise ValueError("launch_n_block_chunks must be non-negative")
         if not self.projection_n_vector or any(value <= 0 for value in self.projection_n_vector):
             raise ValueError("projection_n_vector must contain positive dimensions")
         if sum(self.projection_n_vector) != self.aggregate_n:
@@ -327,6 +388,10 @@ class NativeVNNIObservation:
         # Empty evidence is the backward-compatible fixed-sample representation.
         # Omitting it from digests keeps pre-extension fixed timing corpora and
         # their profiler request IDs reusable without a migration.
+        if self.launch_k_tiles == 0:
+            result.pop("launch_k_tiles")
+        if self.launch_n_block_chunks == 0:
+            result.pop("launch_n_block_chunks")
         if not self.adaptive_timing_evidence:
             result.pop("adaptive_timing_evidence")
         return result
@@ -377,7 +442,11 @@ class NativeVNNIObservation:
     def from_mapping(cls, raw: Mapping[str, Any]) -> "NativeVNNIObservation":
         """Parse one CSV/JSON mapping and reject every missing required field."""
 
-        optional = {"adaptive_timing_evidence"}
+        optional = {
+            "launch_k_tiles",
+            "launch_n_block_chunks",
+            "adaptive_timing_evidence",
+        }
         missing = [
             name
             for name in cls.__dataclass_fields__
@@ -501,6 +570,10 @@ class NativeVNNIObservation:
             route_counter_ok=_parse_bool("route_counter_ok", raw["route_counter_ok"]),
             workspace_ok=_parse_bool("workspace_ok", raw["workspace_ok"]),
             explicit_stream_ok=_parse_bool("explicit_stream_ok", raw["explicit_stream_ok"]),
+            launch_k_tiles=int(raw.get("launch_k_tiles") or 0),
+            launch_n_block_chunks=int(
+                raw.get("launch_n_block_chunks") or 0
+            ),
             adaptive_timing_evidence=adaptive_timing_evidence,
         )
         observation.validate()

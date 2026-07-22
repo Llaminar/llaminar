@@ -25,6 +25,7 @@ from native_vnni_dispatch.cpu_prefill_replay_recipe import (  # noqa: E402
     authenticate_recipe,
     finalize_checkpoint,
     load_recipe,
+    relocate_recipe,
     set_primary_profiler_transaction,
     shell_records,
 )
@@ -44,6 +45,9 @@ class _FakeSplit:
 
     def digest(self) -> str:
         return self._digest
+
+    def accepted_digests(self) -> frozenset[str]:
+        return frozenset((self._digest,))
 
 
 class _FakePlan:
@@ -458,6 +462,49 @@ class CPUPrefillReplayRecipeTest(unittest.TestCase):
                 return_value="sha256:new-workspace",
             ):
                 self.assertEqual(authenticate_recipe(recipe), "rebase")
+
+    def test_relocate_stages_clean_output_and_preserves_source_artifacts(self) -> None:
+        """A fresh seal directory retains immutable evidence by relative path."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "fresh-seal"
+            source.mkdir()
+            checkpoint_path = source / "checkpoint.csv"
+            checkpoint_path.write_text(
+                "corpus_id\nsha256:" + "a" * 64 + "\n",
+                encoding="utf-8",
+            )
+            recipe_path = self._write_recipe(source, checkpoint={
+                "state": "complete",
+                "path": "checkpoint.csv",
+                "sha256": _sha256(checkpoint_path),
+                "raw_corpus_id": "sha256:" + "a" * 64,
+                "prefix_input_count": None,
+            })
+            output_path = destination / "cpu_prefill_replay_recipe.v1.json"
+
+            with mock.patch(
+                "native_vnni_dispatch.cpu_prefill_replay_recipe."
+                "authenticate_recipe",
+                return_value="complete",
+            ):
+                relocate_recipe(recipe_path, output_path)
+
+            relocated = load_recipe(output_path)
+            self.assertEqual(
+                relocated.primary_profiler_transaction.requests.resolve(output_path),
+                (source / "profiler-requests.json").resolve(),
+            )
+            self.assertEqual(
+                (destination / "checkpoint.csv").read_bytes(),
+                checkpoint_path.read_bytes(),
+            )
+            self.assertNotEqual(
+                relocated.checkpoint_path(),
+                checkpoint_path.resolve(),
+            )
 
     def test_checkpoint_expansion_plan_mismatch_fails_preflight(self) -> None:
         """A complete checkpoint cannot be paired with a convenient later plan."""

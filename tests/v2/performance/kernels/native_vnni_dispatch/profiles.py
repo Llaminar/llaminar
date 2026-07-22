@@ -30,6 +30,8 @@ MIN_PROMOTION_TRANSITION_WARMUP_DURATION_US = 50_000.0
 MIN_PROMOTION_TRANSITION_WARMUP_LATENCY_MULTIPLIER = 60.0
 MIN_PROMOTION_TRANSITION_WARMUP_BUDGET_CEILING_US = 500_000.0
 MAX_PROMOTION_WARMUP_ROUND_TIMEOUT_US = 30_000_000.0
+CPU_PREFILL_DYNAMIC_WATCHDOG_MULTIPLIER = 4.0
+CPU_PREFILL_DYNAMIC_WATCHDOG_PADDING_US = 1_000_000.0
 MIN_PROMOTION_MAXIMUM_SAMPLES = 180
 MIN_PROMOTION_ADAPTIVE_SAMPLES = 5
 MIN_PROMOTION_TIMED_DURATION_US = 100_000.0
@@ -114,6 +116,9 @@ def adaptive_timing_evidence_is_promotable(
         None,
     )
     try:
+        complete_round_probe_duration_us = float(
+            normalized_evidence.pop("complete_round_probe_duration_us", 0.0)
+        )
         timing_protocol = str(normalized_evidence["timing_protocol"])
         expected_fields = (
             ADAPTIVE_PROMOTION_EVIDENCE_FIELDS
@@ -277,6 +282,27 @@ def adaptive_timing_evidence_is_promotable(
                 and float(normalized_evidence["warmup_latency_multiplier"]) == 0.0
                 and float(normalized_evidence["warmup_budget_ceiling_us"]) == 0.0
             )
+        warmup_round_timeout_us = float(
+            normalized_evidence["warmup_round_timeout_us"]
+        )
+        if complete_round_probe_duration_us > 0.0:
+            expected_round_timeout_us = max(
+                MAX_PROMOTION_WARMUP_ROUND_TIMEOUT_US,
+                complete_round_probe_duration_us
+                * CPU_PREFILL_DYNAMIC_WATCHDOG_MULTIPLIER
+                + CPU_PREFILL_DYNAMIC_WATCHDOG_PADDING_US,
+            )
+            watchdog_complete = math.isclose(
+                warmup_round_timeout_us,
+                expected_round_timeout_us,
+                rel_tol=0.0,
+                abs_tol=5.1e-7,
+            )
+        else:
+            watchdog_complete = (
+                warmup_round_timeout_us
+                <= MAX_PROMOTION_WARMUP_ROUND_TIMEOUT_US
+            )
         return (
             warmup_count >= required_warmups
             and (
@@ -301,8 +327,7 @@ def adaptive_timing_evidence_is_promotable(
             and warmup_policy_complete
             and float(normalized_evidence["warmup_duration_us"])
             >= float(normalized_evidence["warmup_budget_us"])
-            and float(normalized_evidence["warmup_round_timeout_us"])
-            <= MAX_PROMOTION_WARMUP_ROUND_TIMEOUT_US
+            and watchdog_complete
             # Current evidence carries an authenticated stationary suffix.  A
             # later policy may therefore raise its admission floor and reuse a
             # shard whose *observed* suffix is already strong enough even when
@@ -350,8 +375,13 @@ class MeasurementProfile(str, Enum):
         return self in {self.PARTIAL_PRODUCTION, self.PRODUCTION}
 
 
-def observation_has_promotion_timing(observation: NativeVNNIObservation) -> bool:
-    """Return whether one row satisfies the default robust timing protocol."""
+def observation_has_promotion_timing(
+    observation: NativeVNNIObservation,
+    *,
+    minimum_warmups: int = MIN_PROMOTION_WARMUPS,
+    minimum_samples: int = MIN_PROMOTION_SAMPLES,
+) -> bool:
+    """Return whether one row satisfies its reviewed timing protocol floor."""
 
     if not observation.timing_sample_hash.strip():
         return False
@@ -362,22 +392,35 @@ def observation_has_promotion_timing(observation: NativeVNNIObservation) -> bool
             sample_count=observation.sample_count,
         )
     return (
-        observation.warmup_count >= MIN_PROMOTION_WARMUPS
-        and observation.sample_count >= MIN_PROMOTION_SAMPLES
+        observation.warmup_count >= minimum_warmups
+        and observation.sample_count >= minimum_samples
     )
 
 
-def require_promotion_timing(corpus: ObservationCorpus, *, label: str) -> None:
+def require_promotion_timing(
+    corpus: ObservationCorpus,
+    *,
+    label: str,
+    minimum_warmups: int = MIN_PROMOTION_WARMUPS,
+    minimum_samples: int = MIN_PROMOTION_SAMPLES,
+) -> None:
     """Reject the first row measured with a smoke-only timing budget."""
+
+    if minimum_warmups < 1 or minimum_samples < 1:
+        raise ValueError("promotion timing floors must be positive")
 
     for observation in corpus:
         if not observation.supported or not observation.forced_route_ok:
             continue
-        if observation_has_promotion_timing(observation):
+        if observation_has_promotion_timing(
+            observation,
+            minimum_warmups=minimum_warmups,
+            minimum_samples=minimum_samples,
+        ):
             continue
         raise ValueError(
             f"{label}: non-promotable timing for {observation.candidate_id} "
             f"at {observation.shape_name}/M={observation.m}: "
             f"warmups={observation.warmup_count} samples={observation.sample_count}; "
-            f"required>={MIN_PROMOTION_WARMUPS}/{MIN_PROMOTION_SAMPLES}"
+            f"required>={minimum_warmups}/{minimum_samples}"
         )

@@ -30,7 +30,6 @@ from native_vnni_dispatch.cpu_prefill_training_plan import (  # noqa: E402
     CPUPrefillSourceTrainingRecord,
 )
 from native_vnni_dispatch.shape_manifest import (  # noqa: E402
-    load_declared_shape_manifest,
     load_shape_manifest,
 )
 
@@ -185,9 +184,7 @@ class CPUNativeVNNIPrefillDevelopmentLineageTest(unittest.TestCase):
             self.assertEqual(restored.digest(), plan.digest())
 
             historical = plan.canonical_mapping()
-            historical["shape_manifest_digest"] = (
-                load_declared_shape_manifest().digest()
-            )
+            historical["shape_manifest_digest"] = "sha256:" + "a" * 64
             output.write_text(
                 json.dumps(historical),
                 encoding="utf-8",
@@ -204,7 +201,7 @@ class CPUNativeVNNIPrefillDevelopmentLineageTest(unittest.TestCase):
             )
             self.assertEqual(
                 restored_historical.shape_manifest_digest,
-                "sha256:253fa231865269283241960b39bc733a141d0ff3a8ca421ca1318db476b28231",
+                historical["shape_manifest_digest"],
             )
 
             timing.write_text("sample\n2\n", encoding="utf-8")

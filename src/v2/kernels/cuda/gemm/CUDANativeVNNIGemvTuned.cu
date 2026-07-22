@@ -27,13 +27,16 @@
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
+#include "kernels/common/NativeVNNIDispatchCache.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 
 #include <cuda_runtime.h>
-#include <cstdint>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <mutex>
 
 static thread_local int g_cuda_native_vnni_decode_equivalent_m1_config = 0;
@@ -121,6 +124,10 @@ namespace
         int force_two_phase = 0; // 0=auto, 1=force 2-phase, 2=force atomic
     };
     static SweepOverride g_sweep;
+    /** Trainer-only grouped row-reuse override; zero selects production policy. */
+    static int g_grouped_rows_override = 0;
+    /** Trainer-only integer tensor-core grouped candidate selector. */
+    static thread_local bool g_grouped_tensor_core_override = false;
     static thread_local int g_last_effective_kb = 1;
 
     // =====================================================================
@@ -138,6 +145,144 @@ namespace
 
 #include "kernels/cuda/gemm/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc"
 
+    /** Complete host identity for one generated CUDA decode lookup. */
+    using CUDAGeneratedDispatchCacheKey = std::array<uint64_t, 4>;
+
+    /** Cached generated result; selector misses remain explicit in the cache. */
+    struct CUDAGeneratedDispatchSelection
+    {
+        NativeGemvShape shape = NativeGemvShape::KPAR;
+        GeneratedDispatchTuning tuning{};
+    };
+
+    /**
+     * @brief Resolve immutable CUDA decode policy through a thread-local cache.
+     *
+     * Keep the untruncated M/N/K values in the key. The generated exact ABI
+     * packs M into seven bits, but an unsupported M outside that range must not
+     * alias a supported exact overlay. The codebook is a template parameter,
+     * so each physical format owns an independent cache without a runtime
+     * branch in the production launcher.
+     */
+    template <uint8_t CB>
+    bool selectCachedGeneratedDispatch(
+        bool graph_captured,
+        int m,
+        int n,
+        int k,
+        NativeGemvShape &shape,
+        GeneratedDispatchTuning &tuning)
+    {
+        const CUDAGeneratedDispatchCacheKey key = {
+            graph_captured ? 1ULL : 0ULL,
+            static_cast<uint64_t>(static_cast<uint32_t>(m)),
+            static_cast<uint64_t>(static_cast<uint32_t>(n)),
+            static_cast<uint64_t>(static_cast<uint32_t>(k)),
+        };
+        using Cache = llaminar2::native_vnni::FixedDispatchCache<
+            CUDAGeneratedDispatchCacheKey,
+            CUDAGeneratedDispatchSelection,
+            64,
+            llaminar2::native_vnni::DispatchCacheArrayHasher<4>>;
+        static thread_local Cache cache;
+
+        bool selected = false;
+        if (const CUDAGeneratedDispatchSelection *cached =
+                cache.lookupValue(key, selected))
+        {
+            shape = cached->shape;
+            tuning = cached->tuning;
+            return selected;
+        }
+
+        CUDAGeneratedDispatchSelection cached{};
+        selected = selectGeneratedDispatch<CB>(
+            graph_captured, m, n, k, cached.shape, cached.tuning);
+        cache.insert(key, selected, cached);
+        shape = cached.shape;
+        tuning = cached.tuning;
+        return selected;
+    }
+
+#if defined(LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2)
+    /**
+     * @brief Resolve the grouped-verifier policy with the same cache contract.
+     */
+    template <uint8_t CB>
+    bool selectCachedGeneratedGroupedTuning(
+        bool graph_captured,
+        int m,
+        int n,
+        int k,
+        GeneratedGroupedTuning &tuning)
+    {
+        const CUDAGeneratedDispatchCacheKey key = {
+            graph_captured ? 1ULL : 0ULL,
+            static_cast<uint64_t>(static_cast<uint32_t>(m)),
+            static_cast<uint64_t>(static_cast<uint32_t>(n)),
+            static_cast<uint64_t>(static_cast<uint32_t>(k)),
+        };
+        using Cache = llaminar2::native_vnni::FixedDispatchCache<
+            CUDAGeneratedDispatchCacheKey,
+            GeneratedGroupedTuning,
+            64,
+            llaminar2::native_vnni::DispatchCacheArrayHasher<4>>;
+        static thread_local Cache cache;
+
+        bool selected = false;
+        GeneratedGroupedTuning cached{};
+        if (cache.lookup(key, selected, cached))
+        {
+            tuning = cached;
+            return selected;
+        }
+
+        selected = selectGeneratedGroupedTuning<CB>(
+            graph_captured, m, n, k, cached);
+        cache.insert(key, selected, cached);
+        tuning = cached;
+        return selected;
+    }
+#endif
+
+    /** @brief Runtime-codebook adapter used by host-only cache perf tests. */
+    bool queryCachedGeneratedDispatch(
+        uint8_t codebook_id,
+        bool graph_captured,
+        int m,
+        int n,
+        int k,
+        NativeGemvShape &shape,
+        GeneratedDispatchTuning &tuning)
+    {
+#define LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(CODEBOOK) \
+        case CODEBOOK: \
+            return selectCachedGeneratedDispatch<CODEBOOK>( \
+                graph_captured, m, n, k, shape, tuning)
+        switch (codebook_id)
+        {
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(0);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(4);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(5);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(6);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(7);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(8);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(9);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(10);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(11);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(12);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(13);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(14);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(15);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(16);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(17);
+            LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK(19);
+        default:
+            return false;
+        }
+#undef LLAMINAR_QUERY_CUDA_NVNNI_CODEBOOK
+    }
+
     /**
      * @brief Accumulate one 32-element native-VNNI weight block exactly once.
      *
@@ -149,9 +294,10 @@ namespace
      * for the per-block FP32 contribution.
      */
     template <uint8_t CB>
-    __device__ __forceinline__ float native_vnni_block_contribution_rn(
+    __device__ __forceinline__ float native_vnni_block_contribution_from_dots_rn(
         const int32_t *__restrict__ a_vals,
-        const int32_t *__restrict__ packed_groups,
+        int dot_lo,
+        int dot_hi,
         const uint8_t *__restrict__ payload,
         const uint16_t *__restrict__ d_scales,
         const uint16_t *__restrict__ d_mins,
@@ -161,15 +307,11 @@ namespace
     {
         if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale)
         {
-            int dot_lo = 0;
-            int dot_hi = 0;
             int sum_lo = 0;
             int sum_hi = 0;
 #pragma unroll
             for (int g = 0; g < 4; ++g)
             {
-                dot_lo = __dp4a(a_vals[g], packed_groups[g], dot_lo);
-                dot_hi = __dp4a(a_vals[g + 4], packed_groups[g + 4], dot_hi);
                 sum_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[g]);
                 sum_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[g + 4]);
             }
@@ -226,19 +368,17 @@ namespace
         }
         else
         {
-            int dot = 0;
             int sum_a = 0;
 #pragma unroll
             for (int g = 0; g < 8; ++g)
             {
-                dot = __dp4a(a_vals[g], packed_groups[g], dot);
                 sum_a += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[g]);
             }
 
             const float scale_b = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales[linear]);
             float contribution = __fmul_rn(
                 __fmul_rn(scale_a, scale_b),
-                static_cast<float>(dot));
+                static_cast<float>(dot_lo));
 
             if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_asymmetric)
             {
@@ -250,6 +390,56 @@ namespace
 
             return contribution;
         }
+    }
+
+    /**
+     * @brief Decode one block with DP4A, then publish through the shared exact
+     *        FP32 contribution contract.
+     *
+     * The grouped tensor-core candidate below supplies mathematically equal
+     * integer dot products to the same helper. Keeping scale, asymmetric-min,
+     * and IQ1 delta arithmetic here prevents the two execution engines from
+     * acquiring different compiler contraction or operand-order behavior.
+     */
+    template <uint8_t CB>
+    __device__ __forceinline__ float native_vnni_block_contribution_rn(
+        const int32_t *__restrict__ a_vals,
+        const int32_t *__restrict__ packed_groups,
+        const uint8_t *__restrict__ payload,
+        const uint16_t *__restrict__ d_scales,
+        const uint16_t *__restrict__ d_mins,
+        const uint32_t *__restrict__ d_emins,
+        size_t linear,
+        float scale_a)
+    {
+        int dot_lo = 0;
+        int dot_hi = 0;
+        if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale)
+        {
+#pragma unroll
+            for (int g = 0; g < 4; ++g)
+            {
+                dot_lo = __dp4a(a_vals[g], packed_groups[g], dot_lo);
+                dot_hi = __dp4a(a_vals[g + 4], packed_groups[g + 4], dot_hi);
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int g = 0; g < 8; ++g)
+                dot_lo = __dp4a(a_vals[g], packed_groups[g], dot_lo);
+        }
+
+        return native_vnni_block_contribution_from_dots_rn<CB>(
+            a_vals,
+            dot_lo,
+            dot_hi,
+            payload,
+            d_scales,
+            d_mins,
+            d_emins,
+            linear,
+            scale_a);
     }
 
     [[maybe_unused]] static __host__ NativeGemvShape classifyShape(int N, int K)
@@ -395,10 +585,23 @@ namespace
         const GeneratedDispatchTuning &tuning,
         int effective_kb,
         int M,
-        bool verifier_serial_m1)
+        bool verifier_serial_m1,
+        int grouped_rows)
     {
         if (verifier_serial_m1 && M >= 2)
-            return "cuda.nvnni.decode.verifier.inherit_serial_m1";
+        {
+            std::string candidate =
+                "cuda.nvnni.decode.verifier.inherit_serial_m1";
+            const int effective_grouped_rows = g_grouped_rows_override > 0
+                                                   ? g_grouped_rows_override
+                                                   : grouped_rows;
+            if (effective_grouped_rows > 0)
+            {
+                candidate += ".r" +
+                             std::to_string(effective_grouped_rows);
+            }
+            return candidate;
+        }
 
         if (M == 1 &&
             (shape == NativeGemvShape::WIDE ||
@@ -429,7 +632,8 @@ namespace
         int cuda_device_id,
         bool graph_captured,
         bool verifier_serial_m1,
-        CUDAGemvContext_ *gemv_ctx)
+        CUDAGemvContext_ *gemv_ctx,
+        int grouped_rows = 0)
     {
         if (!llaminar2::PerfStatsCollector::isEnabled())
             return;
@@ -466,7 +670,8 @@ namespace
                                              : "fast"},
                 {"effective_candidate_id",
                  effectiveCandidateName(
-                     shape, tuning, effective_kb, M, verifier_serial_m1)},
+                     shape, tuning, effective_kb, M, verifier_serial_m1,
+                     grouped_rows)},
                 {"route", shapeName(shape)},
                 {"tile_n", std::to_string(tuning.tile_n)},
                 {"cpt", std::to_string(tuning.cpt)},
@@ -477,6 +682,49 @@ namespace
                 {"exact_kb", std::to_string(tuning.exact_kb)},
                 {"force_two_phase", std::to_string(tuning.force_two_phase)},
                 {"rowmajor_available", rowmajor_available ? "true" : "false"}});
+    }
+
+    /** Record one byte-gated tensor-core verifier candidate invocation. */
+    template <uint8_t CB>
+    static void recordTensorCoreVerifierDispatch(
+        const GeneratedDispatchTuning &serial_tuning,
+        int M,
+        int N,
+        int K,
+        int effective_kb,
+        int cuda_device_id,
+        bool graph_captured)
+    {
+        if (!llaminar2::PerfStatsCollector::isEnabled())
+            return;
+
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_native_vnni_gemv_dispatch",
+            1.0,
+            "decode",
+            "cuda:" + std::to_string(cuda_device_id),
+            llaminar2::PerfStatsCollector::Tags{
+                {"codebook", std::to_string(static_cast<int>(CB))},
+                {"m", std::to_string(M)},
+                {"n", std::to_string(N)},
+                {"k", std::to_string(K)},
+                {"execution_mode", graph_captured
+                                       ? "graph_captured"
+                                       : "eager"},
+                {"semantic_contract", "verifier_serial_m1_bitwise"},
+                {"effective_candidate_id",
+                 "cuda.nvnni.decode.verifier.tensor_core_mma16"},
+                {"route", "tensor_core"},
+                {"tile_n", "8"},
+                {"cpt", "0"},
+                {"effective_kb", std::to_string(effective_kb)},
+                {"target_waves", std::to_string(serial_tuning.target_waves)},
+                {"mkg", std::to_string(serial_tuning.mkg)},
+                {"max_kb", std::to_string(serial_tuning.max_kb)},
+                {"exact_kb", std::to_string(serial_tuning.exact_kb)},
+                {"force_two_phase", "1"},
+                {"rowmajor_available", "false"}});
     }
 
     // =====================================================================
@@ -659,102 +907,6 @@ namespace
                 if (d_bias)
                     out += d_bias[n];
                 d_C[n] = out;
-            }
-        }
-    }
-
-    /**
-     * @brief Grouped verifier equivalent of the serial M=1 WIDE/DIRECT kernel.
-     *
-     * The grid's Y dimension is the verifier row.  That keeps all rows inside one
-     * grouped launch while preserving the row-local arithmetic shape of ordinary
-     * serial decode: one CTA tile loads exactly one row's 32-element activation
-     * block into shared memory, decodes the same column-major payload, and writes
-     * to `[row, n]`.
-     */
-    template <int TILE_N, int CPT, uint8_t CB>
-    __global__ void nativeVnniGemv_wide_small_m_serial_rows(
-        const int8_t *__restrict__ d_A_int8,
-        const uint8_t *__restrict__ d_payload,
-        const uint16_t *__restrict__ d_scales,
-        const uint16_t *__restrict__ d_mins,
-        const uint32_t *__restrict__ d_emins,
-        float *__restrict__ d_C,
-        const float *__restrict__ d_scales_A,
-        int M, int N, int K,
-        float alpha, float beta,
-        const float *__restrict__ d_C_existing,
-        const float *__restrict__ d_bias)
-    {
-        const int row = blockIdx.y;
-        if (row >= M)
-            return;
-
-        const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
-        if (n_base >= N)
-            return;
-
-        const int blocks_per_row = K / BLOCK_K;
-        __shared__ int32_t smem_A[8];
-
-        float acc[CPT];
-#pragma unroll
-        for (int c = 0; c < CPT; ++c)
-            acc[c] = 0.0f;
-
-        for (int blk = 0; blk < blocks_per_row; ++blk)
-        {
-            if (threadIdx.x < 8)
-            {
-                smem_A[threadIdx.x] = *reinterpret_cast<const int32_t *>(
-                    d_A_int8 + static_cast<size_t>(row) * K + blk * BLOCK_K + threadIdx.x * 4);
-            }
-            __syncthreads();
-
-            const float scale_a = d_scales_A[static_cast<size_t>(row) * blocks_per_row + blk];
-
-#pragma unroll
-            for (int c = 0; c < CPT; ++c)
-            {
-                const int n = n_base + c;
-                if (n >= N)
-                    break;
-
-                const size_t linear = static_cast<size_t>(blk) * N + n;
-                const uint8_t *payload = d_payload + linear *
-                                                         llaminar2::cuda_native_vnni::payload_bytes_for_codebook<CB>();
-
-                int32_t packed_groups[8];
-                llaminar2::cuda_native_vnni::decode_groups<CB>(payload, packed_groups);
-
-                const float contribution = native_vnni_block_contribution_rn<CB>(
-                    smem_A,
-                    packed_groups,
-                    payload,
-                    d_scales,
-                    d_mins,
-                    d_emins,
-                    linear,
-                    scale_a);
-                acc[c] = __fadd_rn(acc[c], contribution);
-            }
-
-            __syncthreads();
-        }
-
-#pragma unroll
-        for (int c = 0; c < CPT; ++c)
-        {
-            const int n = n_base + c;
-            if (n < N)
-            {
-                const size_t out_idx = static_cast<size_t>(row) * N + n;
-                float out = __fmul_rn(alpha, acc[c]);
-                if (beta != 0.0f && d_C_existing)
-                    out = __fadd_rn(out, __fmul_rn(beta, d_C_existing[out_idx]));
-                if (d_bias)
-                    out = __fadd_rn(out, d_bias[n]);
-                d_C[out_idx] = out;
             }
         }
     }
@@ -1288,6 +1440,323 @@ namespace
             d_C[n] += d_bias[n];
     }
 
+    /** Return the row owned by one `m16n8k32` accumulator element. */
+    __device__ __forceinline__ int verifierMmaFragmentRow(int lane, int element)
+    {
+        return (element >> 1) * 8 + (lane >> 2);
+    }
+
+    /** Return the column owned by one `m16n8k32` accumulator element. */
+    __device__ __forceinline__ int verifierMmaFragmentColumn(
+        int lane,
+        int element)
+    {
+        return (lane & 3) * 2 + (element & 1);
+    }
+
+    /** Load one row-major 16x32 signed-int8 A fragment from shared memory. */
+    __device__ __forceinline__ void loadVerifierMmaA(
+        uint32_t fragment[4],
+        const int *shared_base,
+        int lane)
+    {
+#if __CUDA_ARCH__ >= 800
+        constexpr int kStrideWords = 8;
+        const int *address = shared_base +
+                             (lane % 16) * kStrideWords +
+                             (lane / 16) * 4;
+        asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+            : "=r"(fragment[0]), "=r"(fragment[1]),
+              "=r"(fragment[2]), "=r"(fragment[3])
+            : "l"(address));
+#else
+        (void)fragment;
+        (void)shared_base;
+        (void)lane;
+#endif
+    }
+
+    /** Load one column-major 32x8 signed-int8 B fragment from shared memory. */
+    __device__ __forceinline__ void loadVerifierMmaB(
+        uint32_t fragment[2],
+        const int *shared_base,
+        int lane)
+    {
+#if __CUDA_ARCH__ >= 800
+        constexpr int kStrideWords = 8;
+        const int *address = shared_base +
+                             (lane % 8) * kStrideWords +
+                             ((lane / 8) * 4) % 8;
+        asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
+            : "=r"(fragment[0]), "=r"(fragment[1])
+            : "l"(address));
+#else
+        (void)fragment;
+        (void)shared_base;
+        (void)lane;
+#endif
+    }
+
+    /** Execute one exact signed-int8 `m16n8k32` integer MMA. */
+    __device__ __forceinline__ void verifierMmaM16N8K32(
+        int32_t accumulator[4],
+        const uint32_t a_fragment[4],
+        const uint32_t b_fragment[2])
+    {
+#if __CUDA_ARCH__ >= 800
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0, %1, %2, %3},"
+            "{%4, %5, %6, %7},"
+            "{%8, %9},"
+            "{%0, %1, %2, %3};\n"
+            : "+r"(accumulator[0]), "+r"(accumulator[1]),
+              "+r"(accumulator[2]), "+r"(accumulator[3])
+            : "r"(a_fragment[0]), "r"(a_fragment[1]),
+              "r"(a_fragment[2]), "r"(a_fragment[3]),
+              "r"(b_fragment[0]), "r"(b_fragment[1]));
+#else
+        (void)accumulator;
+        (void)a_fragment;
+        (void)b_fragment;
+#endif
+    }
+
+    /**
+     * @brief Batch-invariant grouped verifier kernel using integer tensor cores.
+     *
+     * One warp owns a 16-row by 8-column output tile and one public-M1 K
+     * partition. Every 32-value NativeVNNI block is decoded once per output
+     * column, multiplied as exact INT8xINT8->INT32 MMA, and then converted into
+     * FP32 by `native_vnni_block_contribution_from_dots_rn`. Four independent
+     * warps share one CTA only to avoid Ampere's low blocks-per-SM occupancy
+     * ceiling; each warp owns private shared-memory slices and performs no
+     * cross-warp arithmetic or synchronization. That is the same
+     * explicit scale/min/delta and ascending block accumulation contract used
+     * by serial DP4A decode. Runtime M only changes the independent Y-grid tile
+     * count; it cannot alter an accepted row's arithmetic.
+     */
+    template <uint8_t CB>
+    __global__ __launch_bounds__(128, 8) void nativeVnniGemvTensorCoreSmallM(
+        const int8_t *__restrict__ d_A_int8,
+        const uint8_t *__restrict__ d_payload,
+        const uint16_t *__restrict__ d_scales,
+        const uint16_t *__restrict__ d_mins,
+        const uint32_t *__restrict__ d_emins,
+        float *__restrict__ d_partials,
+        const float *__restrict__ d_scales_A,
+        int M,
+        int N,
+        int K,
+        int kb,
+        float alpha)
+    {
+#if __CUDA_ARCH__ >= 800
+        constexpr int kRows = 16;
+        constexpr int kColumns = 8;
+        constexpr int kWarpsPerBlock = 4;
+        constexpr int kWordsPerBlock = BLOCK_K / sizeof(int32_t);
+        const int warp = threadIdx.x / warpSize;
+        const int lane = threadIdx.x % warpSize;
+        const int row_base = blockIdx.y * kRows;
+        const int column_base =
+            (blockIdx.x * kWarpsPerBlock + warp) * kColumns;
+        if (column_base >= N)
+            return;
+        const int split_index = blockIdx.z;
+        const int blocks_per_row = K / BLOCK_K;
+        const int blocks_per_split =
+            (blocks_per_row + kb - 1) / kb;
+        const int block_begin = split_index * blocks_per_split;
+        const int block_end = min(
+            blocks_per_row,
+            block_begin + blocks_per_split);
+
+        __shared__ __align__(16) int8_t
+            shared_a[kWarpsPerBlock][kRows * BLOCK_K];
+        __shared__ __align__(16) int8_t
+            shared_b[kWarpsPerBlock][kColumns * BLOCK_K];
+        int8_t *warp_a = shared_a[warp];
+        int8_t *warp_b = shared_b[warp];
+
+        float accumulator[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int block = block_begin; block < block_end; ++block)
+        {
+            /* Exactly one 16-byte A vector load per lane fills 16x32 bytes. */
+            const int local_row = lane >> 1;
+            const int half = lane & 1;
+            const int global_row = row_base + local_row;
+            int4 activation = make_int4(0, 0, 0, 0);
+            if (global_row < M)
+            {
+                activation = *reinterpret_cast<const int4 *>(
+                    d_A_int8 + static_cast<size_t>(global_row) * K +
+                    block * BLOCK_K + half * sizeof(int4));
+            }
+            *reinterpret_cast<int4 *>(
+                warp_a + local_row * BLOCK_K + half * sizeof(int4)) =
+                activation;
+
+            /* Eight lanes decode the eight output columns once per K block. */
+            if (lane < kColumns)
+            {
+                int32_t packed_groups[kWordsPerBlock];
+                const int column = column_base + lane;
+                if (column < N)
+                {
+                    const size_t linear =
+                        static_cast<size_t>(block) * N + column;
+                    const uint8_t *payload = d_payload +
+                        linear * llaminar2::cuda_native_vnni::
+                                     payload_bytes_for_codebook<CB>();
+                    llaminar2::cuda_native_vnni::decode_groups_vec<CB>(
+                        payload,
+                        packed_groups);
+                }
+                else
+                {
+#pragma unroll
+                    for (int group = 0; group < kWordsPerBlock; ++group)
+                        packed_groups[group] = 0;
+                }
+                *reinterpret_cast<int4 *>(warp_b + lane * BLOCK_K) =
+                    make_int4(
+                        packed_groups[0],
+                        packed_groups[1],
+                        packed_groups[2],
+                        packed_groups[3]);
+                *reinterpret_cast<int4 *>(
+                    warp_b + lane * BLOCK_K + sizeof(int4)) =
+                    make_int4(
+                        packed_groups[4],
+                        packed_groups[5],
+                        packed_groups[6],
+                        packed_groups[7]);
+            }
+            __syncwarp();
+
+            uint32_t a_fragment[4];
+            uint32_t b_fragment[2];
+            loadVerifierMmaA(
+                a_fragment,
+                reinterpret_cast<const int *>(warp_a),
+                lane);
+            loadVerifierMmaB(
+                b_fragment,
+                reinterpret_cast<const int *>(warp_b),
+                lane);
+
+            int32_t dot_lo[4] = {0, 0, 0, 0};
+            int32_t dot_hi[4] = {0, 0, 0, 0};
+            if constexpr (llaminar2::cuda_native_vnni::
+                              CodebookTraits<CB>::is_dual_scale)
+            {
+                const uint32_t b_lo[2] = {b_fragment[0], 0u};
+                const uint32_t b_hi[2] = {0u, b_fragment[1]};
+                verifierMmaM16N8K32(dot_lo, a_fragment, b_lo);
+                verifierMmaM16N8K32(dot_hi, a_fragment, b_hi);
+            }
+            else
+            {
+                verifierMmaM16N8K32(dot_lo, a_fragment, b_fragment);
+            }
+
+#pragma unroll
+            for (int element = 0; element < 4; ++element)
+            {
+                const int row = row_base +
+                    verifierMmaFragmentRow(lane, element);
+                const int column = column_base +
+                    verifierMmaFragmentColumn(lane, element);
+                if (row >= M || column >= N)
+                    continue;
+
+                const int local_fragment_row =
+                    verifierMmaFragmentRow(lane, element);
+                const int32_t *activation_words =
+                    reinterpret_cast<const int32_t *>(
+                        warp_a + local_fragment_row * BLOCK_K);
+                const size_t linear =
+                    static_cast<size_t>(block) * N + column;
+                const uint8_t *payload = d_payload +
+                    linear * llaminar2::cuda_native_vnni::
+                                 payload_bytes_for_codebook<CB>();
+                const float scale_a = d_scales_A[
+                    static_cast<size_t>(row) * blocks_per_row + block];
+                const float contribution =
+                    native_vnni_block_contribution_from_dots_rn<CB>(
+                        activation_words,
+                        dot_lo[element],
+                        dot_hi[element],
+                        payload,
+                        d_scales,
+                        d_mins,
+                        d_emins,
+                        linear,
+                        scale_a);
+                accumulator[element] = __fadd_rn(
+                    accumulator[element],
+                    contribution);
+            }
+            __syncwarp();
+        }
+
+#pragma unroll
+        for (int element = 0; element < 4; ++element)
+        {
+            const int row = row_base +
+                verifierMmaFragmentRow(lane, element);
+            const int column = column_base +
+                verifierMmaFragmentColumn(lane, element);
+            if (row < M && column < N)
+            {
+                d_partials[
+                    (static_cast<size_t>(split_index) * M + row) * N +
+                    column] = __fmul_rn(alpha, accumulator[element]);
+            }
+        }
+#else
+        (void)d_A_int8;
+        (void)d_payload;
+        (void)d_scales;
+        (void)d_mins;
+        (void)d_emins;
+        (void)d_partials;
+        (void)d_scales_A;
+        (void)M;
+        (void)N;
+        (void)K;
+        (void)kb;
+        (void)alpha;
+#endif
+    }
+
+    /**
+     * @brief Compile-time physical launch geometry for grouped DP4A tiles.
+     *
+     * One logical N tile has no shared state or synchronization with another,
+     * so low-register row depths can pack several tiles into one CTA. This
+     * avoids the one-warp-block occupancy ceiling without changing the number,
+     * order, or ownership of any dot product. Deeper row tiles retain smaller
+     * blocks so their larger accumulator arrays remain launchable without
+     * register spilling.
+     */
+    template <int ROWS_PER_TILE, int TILE_N, int CPT>
+    struct GroupedDp4aLaunchGeometry
+    {
+        static constexpr int threads_per_n_tile = TILE_N / CPT;
+        static constexpr int n_tiles_per_block =
+            threads_per_n_tile == 32
+                ? (ROWS_PER_TILE <= 8 ? 4 : (ROWS_PER_TILE <= 16 ? 2 : 1))
+                : (threads_per_n_tile == 64 && ROWS_PER_TILE <= 8 ? 2 : 1);
+        static constexpr int threads_per_block =
+            threads_per_n_tile * n_tiles_per_block;
+        static constexpr int columns_per_block =
+            TILE_N * n_tiles_per_block;
+    };
+
     /**
      * @brief Runtime-row K-parallel verifier kernel with bounded register use.
      *
@@ -1311,7 +1780,15 @@ namespace
         float alpha)
     {
         static_assert(ROWS_PER_TILE > 0, "Verifier row tiles must contain at least one row");
-        const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+        using Geometry = GroupedDp4aLaunchGeometry<ROWS_PER_TILE, TILE_N, CPT>;
+        const int n_tile_in_block =
+            threadIdx.x / Geometry::threads_per_n_tile;
+        const int n_tile_thread =
+            threadIdx.x % Geometry::threads_per_n_tile;
+        const int n_tile =
+            static_cast<int>(blockIdx.x) * Geometry::n_tiles_per_block +
+            n_tile_in_block;
+        const int n_base = n_tile * TILE_N + n_tile_thread * CPT;
         const int split_idx = blockIdx.y;
         const int row_base = blockIdx.z * ROWS_PER_TILE;
         if (n_base >= N)
@@ -1340,56 +1817,77 @@ namespace
 
         for (int blk = blk_begin; blk < blk_end; ++blk)
         {
-            int32_t a_vals[ROWS_PER_TILE][8];
-#pragma unroll
-            for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
-            {
-                const int row = row_base + tile_row;
-                if (row >= M)
-                    continue;
-                const int4 *a_ptr128 = reinterpret_cast<const int4 *>(
-                    d_A_int8 + static_cast<size_t>(row) * K + blk * BLOCK_K);
-                const int4 a_lo = a_ptr128[0];
-                const int4 a_hi = a_ptr128[1];
-                a_vals[tile_row][0] = a_lo.x;
-                a_vals[tile_row][1] = a_lo.y;
-                a_vals[tile_row][2] = a_lo.z;
-                a_vals[tile_row][3] = a_lo.w;
-                a_vals[tile_row][4] = a_hi.x;
-                a_vals[tile_row][5] = a_hi.y;
-                a_vals[tile_row][6] = a_hi.z;
-                a_vals[tile_row][7] = a_hi.w;
-            }
-
+            /*
+             * Decode each owned output column once, then stream verifier rows
+             * through those decoded weights. The previous implementation kept
+             * eight packed activation words for every row live at once. That
+             * consumed 130 registers/thread at eight-row reuse and 231 at
+             * sixteen-row reuse on SM86, collapsing occupancy even though no
+             * values spilled. This transposition keeps only one row's eight
+             * activation words live while retaining weight reuse across every
+             * row and activation reuse across every CPT column.
+             */
+            int32_t packed_groups[CPT][8];
+            const uint8_t *payloads[CPT];
+            size_t linears[CPT];
 #pragma unroll
             for (int c = 0; c < CPT; ++c)
             {
                 const int n = n_base + c;
                 if (n >= N)
                     break;
-
                 const size_t linear = static_cast<size_t>(blk) * N + n;
-                const uint8_t *payload = d_payload + linear *
-                                                         llaminar2::cuda_native_vnni::payload_bytes_for_codebook<CB>();
-
-                int32_t packed_groups[8];
-                llaminar2::cuda_native_vnni::decode_groups_vec<CB>(payload, packed_groups);
+                const uint8_t *payload =
+                    d_payload + linear *
+                                    llaminar2::cuda_native_vnni::
+                                        payload_bytes_for_codebook<CB>();
+                linears[c] = linear;
+                payloads[c] = payload;
+                llaminar2::cuda_native_vnni::decode_groups_vec<CB>(
+                    payload,
+                    packed_groups[c]);
+            }
 
 #pragma unroll
-                for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
+            for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
+            {
+                const int row = row_base + tile_row;
+                if (row >= M)
+                    continue;
+
+                int32_t a_vals[8];
+                const int4 *a_ptr128 = reinterpret_cast<const int4 *>(
+                    d_A_int8 + static_cast<size_t>(row) * K + blk * BLOCK_K);
+                const int4 a_lo = a_ptr128[0];
+                const int4 a_hi = a_ptr128[1];
+                a_vals[0] = a_lo.x;
+                a_vals[1] = a_lo.y;
+                a_vals[2] = a_lo.z;
+                a_vals[3] = a_lo.w;
+                a_vals[4] = a_hi.x;
+                a_vals[5] = a_hi.y;
+                a_vals[6] = a_hi.z;
+                a_vals[7] = a_hi.w;
+
+                const float scale_a =
+                    d_scales_A[static_cast<size_t>(row) *
+                                   blocks_per_row +
+                               blk];
+
+#pragma unroll
+                for (int c = 0; c < CPT; ++c)
                 {
-                    const int row = row_base + tile_row;
-                    if (row >= M)
-                        continue;
-                    const float scale_a = d_scales_A[static_cast<size_t>(row) * blocks_per_row + blk];
+                    const int n = n_base + c;
+                    if (n >= N)
+                        break;
                     const float contribution = native_vnni_block_contribution_rn<CB>(
-                        a_vals[tile_row],
-                        packed_groups,
-                        payload,
+                        a_vals,
+                        packed_groups[c],
+                        payloads[c],
                         d_scales,
                         d_mins,
                         d_emins,
-                        linear,
+                        linears[c],
                         scale_a);
                     acc[tile_row][c] = __fadd_rn(acc[tile_row][c], contribution);
                 }
@@ -1454,6 +1952,36 @@ namespace
         if (d_bias)
             sum += d_bias[n];
         d_C[out_idx] = sum;
+    }
+
+    /**
+     * @brief Publish a grouped WIDE/DIRECT row from its only K partition.
+     *
+     * Serial WIDE/DIRECT decode owns one accumulator spanning K and therefore
+     * does not add that accumulator to an initialized zero during publication.
+     * Loading partition zero directly preserves that exact arithmetic tree and
+     * signed-zero behavior while allowing the preceding grouped DP4A kernel to
+     * decode every weight block once for several verifier rows.
+     */
+    __global__ void nativeVnniGemv_publish_single_partition_small_m(
+        const float *__restrict__ d_partials,
+        float *__restrict__ d_C,
+        const float *__restrict__ d_C_existing,
+        const float *__restrict__ d_bias,
+        int M, int N, float beta)
+    {
+        const int row = blockIdx.y;
+        const int n = blockIdx.x * blockDim.x + threadIdx.x;
+        if (row >= M || n >= N)
+            return;
+
+        const size_t out_idx = static_cast<size_t>(row) * N + n;
+        float out = d_partials[out_idx];
+        if (beta != 0.0f && d_C_existing)
+            out = __fadd_rn(out, __fmul_rn(beta, d_C_existing[out_idx]));
+        if (d_bias)
+            out = __fadd_rn(out, d_bias[n]);
+        d_C[out_idx] = out;
     }
 
     // =====================================================================
@@ -1715,7 +2243,12 @@ namespace
         return cudaGetLastError() == cudaSuccess;
     }
 
-    template <int TILE_N, int CPT, uint8_t CB>
+    template <
+        int TILE_N,
+        int CPT,
+        uint8_t CB,
+        int ROWS_PER_TILE = 2,
+        bool MATCH_WIDE_SERIAL = false>
     bool launchKparSmallMImpl(
         const int8_t *d_A_int8, const uint8_t *d_payload,
         const uint16_t *d_scales, const uint16_t *d_mins,
@@ -1729,15 +2262,26 @@ namespace
         int device_id, cudaStream_t stream,
         CUDAGemvContext_ *gemv_ctx)
     {
-        constexpr int ROWS_PER_TILE = 2;
-        constexpr int THREADS = TILE_N / CPT;
+        static_assert(
+            ROWS_PER_TILE == 2 || ROWS_PER_TILE == 4 ||
+                ROWS_PER_TILE == 8 || ROWS_PER_TILE == 16 ||
+                ROWS_PER_TILE == 32 || ROWS_PER_TILE == 64,
+            "Grouped NativeVNNI row reuse must be a trained instantiation");
+        using Geometry = GroupedDp4aLaunchGeometry<ROWS_PER_TILE, TILE_N, CPT>;
+        constexpr int THREADS = Geometry::threads_per_block;
 
-        const int grid_n = (N + TILE_N - 1) / TILE_N;
+        const int serial_grid_n = (N + TILE_N - 1) / TILE_N;
+        const int launch_grid_n =
+            (N + Geometry::columns_per_block - 1) /
+            Geometry::columns_per_block;
         const int k_groups = K / BLOCK_K;
         const int num_sms = querySmCount(gemv_ctx);
-        const int kb_capped = resolveKparKBlocks(
-            grid_n, k_groups, num_sms,
-            target_waves, min_kgroups_per_cta, max_kb, exact_kb);
+        const int kb_capped = MATCH_WIDE_SERIAL
+                                  ? 1
+                                  : resolveKparKBlocks(
+                                        serial_grid_n, k_groups, num_sms,
+                                        target_waves, min_kgroups_per_cta,
+                                        max_kb, exact_kb);
         if (kb_capped <= 0)
             return false;
         g_last_effective_kb = kb_capped;
@@ -1757,9 +2301,10 @@ namespace
          * still owns multiple rows and reuses one packed-weight traversal; no
          * row is replayed through the scalar public API.
          */
-        const int workspace_tile_rows = std::min(
-            M,
-            llaminar2::kDefaultNativeVNNIVerifierRowCapacity);
+        const int workspace_tile_rows =
+            llaminar2::nativeVNNIBatchInvariantTileRows(M, N, K);
+        if (workspace_tile_rows <= 0)
+            return false;
         float *d_partials = getKparPartials(
             gemv_ctx,
             static_cast<size_t>(kb_capped) * workspace_tile_rows * N);
@@ -1772,7 +2317,7 @@ namespace
             const int tile_m = std::min(workspace_tile_rows, M - row_base);
             const int row_tiles =
                 (tile_m + ROWS_PER_TILE - 1) / ROWS_PER_TILE;
-            const dim3 grid(grid_n, kb_capped, row_tiles);
+            const dim3 grid(launch_grid_n, kb_capped, row_tiles);
 
             const int8_t *tile_a =
                 d_A_int8 + static_cast<size_t>(row_base) * K;
@@ -1795,20 +2340,141 @@ namespace
                 return false;
 
             const int reduction_blocks = (N + 255) / 256;
+            if constexpr (MATCH_WIDE_SERIAL)
+            {
+                nativeVnniGemv_publish_single_partition_small_m<<<
+                    dim3(reduction_blocks, tile_m), 256, 0, stream>>>(
+                    d_partials,
+                    tile_c,
+                    tile_existing,
+                    d_bias,
+                    tile_m,
+                    N,
+                    beta);
+            }
+            else
+            {
+                nativeVnniGemv_reduce_small_m<<<
+                    dim3(reduction_blocks, tile_m), 256, 0, stream>>>(
+                    d_partials,
+                    tile_c,
+                    tile_existing,
+                    d_bias,
+                    tile_m,
+                    N,
+                    kb_capped,
+                    beta);
+            }
+            if (cudaGetLastError() != cudaSuccess)
+                return false;
+        }
+
+        return true;
+    }
+
+    template <uint8_t CB>
+    bool launchTensorCoreSmallMGenerated(
+        NativeGemvShape serial_shape,
+        const GeneratedDispatchTuning &serial_tuning,
+        const int8_t *d_A_int8,
+        const uint8_t *d_payload,
+        const uint16_t *d_scales,
+        const uint16_t *d_mins,
+        const uint32_t *d_emins,
+        float *d_C,
+        const float *d_scales_A,
+        int M,
+        int N,
+        int K,
+        float alpha,
+        float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        CUDAGemvContext_ *gemv_ctx,
+        cudaStream_t stream)
+    {
+        int kb = 1;
+        if (serial_shape == NativeGemvShape::KPAR)
+        {
+            const int serial_grid_n =
+                (N + serial_tuning.tile_n - 1) / serial_tuning.tile_n;
+            kb = resolveKparKBlocks(
+                serial_grid_n,
+                K / BLOCK_K,
+                querySmCount(gemv_ctx),
+                serial_tuning.target_waves,
+                serial_tuning.mkg,
+                serial_tuning.max_kb,
+                serial_tuning.exact_kb);
+        }
+        if (kb <= 0)
+            return false;
+        g_last_effective_kb = kb;
+
+        const int workspace_tile_rows =
+            llaminar2::nativeVNNIBatchInvariantTileRows(M, N, K);
+        if (workspace_tile_rows <= 0)
+            return false;
+        float *partials = getKparPartials(
+            gemv_ctx,
+            static_cast<size_t>(kb) * workspace_tile_rows * N);
+        if (!partials)
+            return false;
+
+        const int activation_blocks_per_row = K / BLOCK_K;
+        for (int row_base = 0; row_base < M;
+             row_base += workspace_tile_rows)
+        {
+            const int tile_m = std::min(
+                workspace_tile_rows,
+                M - row_base);
+            const int8_t *tile_a = d_A_int8 +
+                static_cast<size_t>(row_base) * K;
+            const float *tile_scales = d_scales_A +
+                static_cast<size_t>(row_base) *
+                    activation_blocks_per_row;
+            float *tile_c = d_C +
+                static_cast<size_t>(row_base) * N;
+            const float *tile_existing = d_C_existing
+                ? d_C_existing + static_cast<size_t>(row_base) * N
+                : nullptr;
+
+            nativeVnniGemvTensorCoreSmallM<CB><<<
+                dim3((N + 31) / 32, (tile_m + 15) / 16, kb),
+                128,
+                0,
+                stream>>>(
+                tile_a,
+                d_payload,
+                d_scales,
+                d_mins,
+                d_emins,
+                partials,
+                tile_scales,
+                tile_m,
+                N,
+                K,
+                kb,
+                alpha);
+            if (cudaGetLastError() != cudaSuccess)
+                return false;
+
             nativeVnniGemv_reduce_small_m<<<
-                dim3(reduction_blocks, tile_m), 256, 0, stream>>>(
-                d_partials,
+                dim3((N + 255) / 256, tile_m),
+                256,
+                0,
+                stream>>>(
+                partials,
                 tile_c,
                 tile_existing,
                 d_bias,
                 tile_m,
                 N,
-                kb_capped,
+                kb,
                 beta);
             if (cudaGetLastError() != cudaSuccess)
                 return false;
         }
-
         return true;
     }
 
@@ -2248,91 +2914,8 @@ namespace
         CUDAGemvContext_ *gemv_ctx,
         int device_id, cudaStream_t stream);
 
-    template <uint8_t CB>
-    bool dispatchWideSmallMSerialRowsGenerated(
-        const GeneratedDispatchTuning &tuning,
-        const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
-        const float *d_scales_A, int M, int N, int K,
-        float alpha, float beta,
-        const float *d_C_existing, const float *d_bias,
-        cudaStream_t stream)
-    {
-        g_last_effective_kb = 1;
-        switch (tuning.tile_n * 100 + tuning.cpt)
-        {
-        case 32 * 100 + 1:
-        {
-            const int grid_n = (N + 32 - 1) / 32;
-            nativeVnniGemv_wide_small_m_serial_rows<32, 1, CB><<<dim3(grid_n, M), 32, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
-            return cudaGetLastError() == cudaSuccess;
-        }
-        case 64 * 100 + 1:
-        {
-            const int grid_n = (N + 64 - 1) / 64;
-            nativeVnniGemv_wide_small_m_serial_rows<64, 1, CB><<<dim3(grid_n, M), 64, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
-            return cudaGetLastError() == cudaSuccess;
-        }
-        case 64 * 100 + 2:
-        {
-            const int grid_n = (N + 64 - 1) / 64;
-            nativeVnniGemv_wide_small_m_serial_rows<64, 2, CB><<<dim3(grid_n, M), 32, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
-            return cudaGetLastError() == cudaSuccess;
-        }
-        case 128 * 100 + 1:
-        {
-            const int grid_n = (N + 128 - 1) / 128;
-            nativeVnniGemv_wide_small_m_serial_rows<128, 1, CB><<<dim3(grid_n, M), 128, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
-            return cudaGetLastError() == cudaSuccess;
-        }
-        case 128 * 100 + 2:
-        {
-            const int grid_n = (N + 128 - 1) / 128;
-            nativeVnniGemv_wide_small_m_serial_rows<128, 2, CB><<<dim3(grid_n, M), 64, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
-            return cudaGetLastError() == cudaSuccess;
-        }
-        case 256 * 100 + 2:
-        {
-            const int grid_n = (N + 256 - 1) / 256;
-            nativeVnniGemv_wide_small_m_serial_rows<256, 2, CB><<<dim3(grid_n, M), 128, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
-            return cudaGetLastError() == cudaSuccess;
-        }
-        case 256 * 100 + 4:
-        {
-            const int grid_n = (N + 256 - 1) / 256;
-            nativeVnniGemv_wide_small_m_serial_rows<256, 4, CB><<<dim3(grid_n, M), 64, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
-            return cudaGetLastError() == cudaSuccess;
-        }
-        case 512 * 100 + 4:
-        {
-            const int grid_n = (N + 512 - 1) / 512;
-            nativeVnniGemv_wide_small_m_serial_rows<512, 4, CB><<<dim3(grid_n, M), 128, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
-            return cudaGetLastError() == cudaSuccess;
-        }
-        default:
-            return false;
-        }
-    }
-
-    template <uint8_t CB>
-    bool dispatchKparSmallMGenerated(
+    template <int ROWS_PER_TILE, uint8_t CB, bool MATCH_WIDE_SERIAL = false>
+    bool dispatchKparSmallMGeneratedRows(
         const GeneratedDispatchTuning &tuning,
         const int8_t *d_A_int8, const uint8_t *d_payload,
         const uint16_t *d_scales, const uint16_t *d_mins,
@@ -2346,42 +2929,42 @@ namespace
         switch (tuning.tile_n * 100 + tuning.cpt)
         {
         case 32 * 100 + 1:
-            return launchKparSmallMImpl<32, 1, CB>(
+            return launchKparSmallMImpl<32, 1, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 64 * 100 + 1:
-            return launchKparSmallMImpl<64, 1, CB>(
+            return launchKparSmallMImpl<64, 1, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 64 * 100 + 2:
-            return launchKparSmallMImpl<64, 2, CB>(
+            return launchKparSmallMImpl<64, 2, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 128 * 100 + 1:
-            return launchKparSmallMImpl<128, 1, CB>(
+            return launchKparSmallMImpl<128, 1, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 128 * 100 + 2:
-            return launchKparSmallMImpl<128, 2, CB>(
+            return launchKparSmallMImpl<128, 2, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 256 * 100 + 2:
-            return launchKparSmallMImpl<256, 2, CB>(
+            return launchKparSmallMImpl<256, 2, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
@@ -2395,12 +2978,77 @@ namespace
              * 64-thread tile natively; omitting this dispatch case forced an
              * otherwise valid decode-equivalent projection to fail.
              */
-            return launchKparSmallMImpl<256, 4, CB>(
+            return launchKparSmallMImpl<256, 4, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        case 512 * 100 + 4:
+            return launchKparSmallMImpl<512, 4, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.exact_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        default:
+            return false;
+        }
+    }
+
+    /**
+     * @brief Dispatch one trained grouped row-reuse instantiation.
+     *
+     * The row count only controls how many verifier rows share a decoded
+     * weight block inside one CTA. Each row retains the generated public-M1
+     * tile and exact K-partition schedule, so this parameter cannot alter that
+     * row's reduction tree or publication bytes.
+     */
+    template <uint8_t CB, bool MATCH_WIDE_SERIAL = false>
+    bool dispatchKparSmallMGenerated(
+        const GeneratedDispatchTuning &tuning,
+        int grouped_rows,
+        const int8_t *d_A_int8, const uint8_t *d_payload,
+        const uint16_t *d_scales, const uint16_t *d_mins,
+        const uint32_t *d_emins, float *d_C,
+        const float *d_scales_A, int M, int N, int K,
+        float alpha, float beta,
+        const float *d_C_existing, const float *d_bias,
+        CUDAGemvContext_ *gemv_ctx,
+        int cuda_device_id, cudaStream_t stream)
+    {
+        switch (grouped_rows)
+        {
+        case 4:
+            return dispatchKparSmallMGeneratedRows<4, CB, MATCH_WIDE_SERIAL>(
+                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, M, N, K, alpha, beta,
+                d_C_existing, d_bias, gemv_ctx, cuda_device_id, stream);
+        case 8:
+            return dispatchKparSmallMGeneratedRows<8, CB, MATCH_WIDE_SERIAL>(
+                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, M, N, K, alpha, beta,
+                d_C_existing, d_bias, gemv_ctx, cuda_device_id, stream);
+        case 16:
+            return dispatchKparSmallMGeneratedRows<16, CB, MATCH_WIDE_SERIAL>(
+                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, M, N, K, alpha, beta,
+                d_C_existing, d_bias, gemv_ctx, cuda_device_id, stream);
+        case 32:
+            return dispatchKparSmallMGeneratedRows<32, CB, MATCH_WIDE_SERIAL>(
+                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, M, N, K, alpha, beta,
+                d_C_existing, d_bias, gemv_ctx, cuda_device_id, stream);
+        case 64:
+            return dispatchKparSmallMGeneratedRows<64, CB, MATCH_WIDE_SERIAL>(
+                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, M, N, K, alpha, beta,
+                d_C_existing, d_bias, gemv_ctx, cuda_device_id, stream);
+        case 2:
+            return dispatchKparSmallMGeneratedRows<2, CB, MATCH_WIDE_SERIAL>(
+                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, M, N, K, alpha, beta,
+                d_C_existing, d_bias, gemv_ctx, cuda_device_id, stream);
         default:
             return false;
         }
@@ -2503,7 +3151,7 @@ namespace
          */
         NativeGemvShape shape = NativeGemvShape::KPAR;
         GeneratedDispatchTuning tuning{};
-        if (!selectGeneratedDispatch<CB>(
+        if (!selectCachedGeneratedDispatch<CB>(
                 graph_captured, 1, N, K, shape, tuning))
             return false;
 
@@ -2546,6 +3194,8 @@ namespace
         g_last_effective_kb = 1;
         NativeGemvShape shape = NativeGemvShape::KPAR;
         GeneratedDispatchTuning tuning{};
+        int grouped_rows = 0;
+        bool grouped_tensor_core = false;
 
         if (g_sweep.active)
         {
@@ -2598,14 +3248,93 @@ namespace
             const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
             const int dispatch_m =
                 decode_equivalent_m1 ? 1 : (llaminar2::debugEnv().gemm.deterministic ? 2 : M);
-            if (!selectGeneratedDispatch<CB>(
+            if (!selectCachedGeneratedDispatch<CB>(
                     graph_captured, dispatch_m, N, K, shape, tuning))
             {
                 return false;
             }
+            if (decode_equivalent_m1)
+            {
+                /*
+                 * Row reuse is a separately learned economy axis. It cannot
+                 * alter the public-M1 family, output tile, or exact K
+                 * partition selected above. A production artifact without a
+                 * total grouped policy is incomplete and must remain a hard
+                 * miss instead of silently reverting to the historical
+                 * two-row schedule.
+                 */
+                if (g_grouped_tensor_core_override)
+                {
+                    grouped_tensor_core = true;
+                }
+                else if (g_grouped_rows_override > 0)
+                {
+                    /* Trainer-only candidate forcing; M1 arithmetic remains generated. */
+                    grouped_rows = g_grouped_rows_override;
+                }
+                else
+                {
+#if defined(LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2)
+                    GeneratedGroupedTuning grouped_tuning{};
+                    if (!selectCachedGeneratedGroupedTuning<CB>(
+                            graph_captured, M, N, K, grouped_tuning))
+                        return false;
+                    switch (grouped_tuning.kernel)
+                    {
+                    case GeneratedGroupedKernel::Dp4aRows:
+                        grouped_rows = grouped_tuning.grouped_rows;
+                        if (grouped_rows <= 0)
+                            return false;
+                        break;
+                    case GeneratedGroupedKernel::TensorCoreMma16:
+                        grouped_tensor_core = true;
+                        break;
+                    default:
+                        return false;
+                    }
+#else
+                    return false;
+#endif
+                }
+            }
         }
 
         const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
+        if (grouped_tensor_core)
+        {
+            if (!decode_equivalent_m1 || g_sweep.active)
+                return false;
+            const bool launched = launchTensorCoreSmallMGenerated<CB>(
+                shape,
+                tuning,
+                d_A_int8,
+                d_payload,
+                d_scales,
+                d_mins,
+                d_emins,
+                d_C,
+                d_scales_A,
+                M,
+                N,
+                K,
+                alpha,
+                beta,
+                d_C_existing,
+                d_bias,
+                gemv_ctx,
+                stream);
+            if (!launched)
+                return false;
+            recordTensorCoreVerifierDispatch<CB>(
+                tuning,
+                M,
+                N,
+                K,
+                g_last_effective_kb,
+                cuda_device_id,
+                graph_captured);
+            return true;
+        }
         recordGemvDispatch<CB>(
             shape,
             tuning,
@@ -2616,15 +3345,17 @@ namespace
             cuda_device_id,
             graph_captured,
             decode_equivalent_m1,
-            gemv_ctx);
+            gemv_ctx,
+            grouped_rows);
         if (shape == NativeGemvShape::WIDE || shape == NativeGemvShape::DIRECT)
         {
             if (!decode_equivalent_m1)
                 return false;
-            return dispatchWideSmallMSerialRowsGenerated<CB>(
-                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
-                stream);
+            return dispatchKparSmallMGenerated<CB, true>(
+                tuning, grouped_rows,
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
+                gemv_ctx, cuda_device_id, stream);
         }
 
         if constexpr (CB != 19)
@@ -2656,7 +3387,8 @@ namespace
         if (shape == NativeGemvShape::KPAR)
         {
             return dispatchKparSmallMGenerated<CB>(
-                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                tuning, grouped_rows,
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                 d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 gemv_ctx, cuda_device_id, stream);
         }
@@ -2813,6 +3545,73 @@ namespace
 // =========================================================================
 // Public API — matches original cudaNativeVNNIGemv_fp32 signature
 // =========================================================================
+
+/**
+ * @brief Measure the in-TU cached selector used by a production specialization.
+ *
+ * The public single-query test shim necessarily adds an out-of-line function
+ * call, a runtime codebook switch, and four result stores that production's
+ * templated launcher does not pay. Keep the timing loop beside the selector so
+ * the perf regression measures the inlined path. The loop-only control carries
+ * identical query indexing and compiler fences and is subtracted from the
+ * selector interval.
+ */
+template <uint8_t CB>
+static double measureCachedGeneratedDispatchNs(
+    bool graph_captured,
+    int m,
+    const int *ns,
+    const int *ks,
+    int query_count,
+    int iterations,
+    uint64_t *out_checksum)
+{
+    if (!ns || !ks || query_count <= 0 || iterations <= 0)
+        return -1.0;
+
+    uint64_t checksum = 0;
+    const auto baseline_begin = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration)
+    {
+        const int index = iteration % query_count;
+        checksum += static_cast<uint64_t>(ns[index] + ks[index]);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+    const auto baseline_end = std::chrono::steady_clock::now();
+
+    const auto selector_begin = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration)
+    {
+        const int index = iteration % query_count;
+        NativeGemvShape shape = NativeGemvShape::KPAR;
+        GeneratedDispatchTuning tuning{};
+        const bool selected = selectCachedGeneratedDispatch<CB>(
+            graph_captured,
+            m,
+            ns[index],
+            ks[index],
+            shape,
+            tuning);
+        checksum += static_cast<uint64_t>(selected) |
+                    (static_cast<uint64_t>(static_cast<int>(shape) + 1) << 1) |
+                    (static_cast<uint64_t>(tuning.tile_n) << 8) |
+                    (static_cast<uint64_t>(tuning.cpt) << 20) |
+                    (static_cast<uint64_t>(tuning.exact_kb) << 24);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+    const auto selector_end = std::chrono::steady_clock::now();
+
+    if (out_checksum)
+        *out_checksum = checksum;
+    const double baseline_ns = std::chrono::duration<double, std::nano>(
+        baseline_end - baseline_begin).count();
+    const double selector_ns = std::chrono::duration<double, std::nano>(
+        selector_end - selector_begin).count();
+    return std::max(
+        0.0,
+        (selector_ns - baseline_ns) / static_cast<double>(iterations));
+}
+
 extern "C"
 {
     bool cudaNativeVNNIGemvTuned_supportsCodebook(uint8_t codebook_id)
@@ -2839,6 +3638,93 @@ extern "C"
         default:
             return false;
         }
+    }
+
+    /**
+     * @brief Query cached generated decode policy without touching a device.
+     *
+     * This host-only surface exists for dispatch latency and totality tests.
+     * Production launchers call the same cached template directly.
+     */
+    bool cudaNativeVNNIGemvTuned_queryGeneratedDispatch(
+        uint8_t codebook_id,
+        int graph_captured,
+        int m,
+        int n,
+        int k,
+        int *shape_id,
+        int *tile_n,
+        int *cpt,
+        int *exact_kb)
+    {
+        NativeGemvShape shape = NativeGemvShape::KPAR;
+        GeneratedDispatchTuning tuning{};
+        if (!queryCachedGeneratedDispatch(
+                codebook_id,
+                graph_captured != 0,
+                m,
+                n,
+                k,
+                shape,
+                tuning))
+        {
+            return false;
+        }
+        if (shape_id)
+            *shape_id = static_cast<int>(shape);
+        if (tile_n)
+            *tile_n = tuning.tile_n;
+        if (cpt)
+            *cpt = tuning.cpt;
+        if (exact_kb)
+            *exact_kb = tuning.exact_kb;
+        return true;
+    }
+
+    /**
+     * @brief Host-only perf surface for the inlined generated selector.
+     *
+     * No CUDA API, allocation, transfer, synchronization, or kernel launch is
+     * performed. This function exists solely for the offline dispatch-latency
+     * regression.
+     */
+    double cudaNativeVNNIGemvTuned_measureGeneratedDispatchNs(
+        uint8_t codebook_id,
+        int graph_captured,
+        int m,
+        const int *ns,
+        const int *ks,
+        int query_count,
+        int iterations,
+        uint64_t *out_checksum)
+    {
+#define LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(CODEBOOK) \
+        case CODEBOOK: \
+            return measureCachedGeneratedDispatchNs<CODEBOOK>( \
+                graph_captured != 0, m, ns, ks, query_count, iterations, \
+                out_checksum)
+        switch (codebook_id)
+        {
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(0);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(4);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(5);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(6);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(7);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(8);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(9);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(10);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(11);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(12);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(13);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(14);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(15);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(16);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(17);
+            LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK(19);
+        default:
+            return -1.0;
+        }
+#undef LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK
     }
 
     bool cudaNativeVNNIGemvTuned_fp32(
@@ -2987,6 +3873,34 @@ extern "C"
     void cudaNativeVNNIGemvSweep_clearConfig()
     {
         g_sweep.active = false;
+        g_grouped_rows_override = 0;
+        g_grouped_tensor_core_override = false;
+    }
+
+    /**
+     * @brief Select one trainer-only grouped row-reuse instantiation.
+     * @param rows_per_tile Exact compile-time row tile to benchmark.
+     *
+     * This does not activate the ordinary M1 sweep override: grouped verifier
+     * calls must continue to inherit the generated public-M1 family, tile, and
+     * K-partition schedule while varying only weight reuse across rows.
+     */
+    void cudaNativeVNNIGemvSweep_setGroupedRows(int rows_per_tile)
+    {
+        g_grouped_rows_override = rows_per_tile;
+    }
+
+    /**
+     * @brief Select the integer tensor-core grouped verifier candidate.
+     * @param enabled Non-zero only inside the trainer's candidate scope.
+     *
+     * The low-level dispatcher additionally requires decode-equivalent verifier
+     * mode and rejects an ordinary M1 sweep override. This function therefore
+     * cannot silently alter the production route if a diagnostic scope leaks.
+     */
+    void cudaNativeVNNIGroupedVerifier_setTensorCoreOverride(int enabled)
+    {
+        g_grouped_tensor_core_override = enabled != 0;
     }
 
     bool cudaNativeVNNIGemvSweep_isActive()
@@ -3005,6 +3919,8 @@ extern "C"
         // and KPAR partials are owned by CUDAGemvContext (per-device).
         // Only sweep override needs clearing here.
         g_sweep.active = false;
+        g_grouped_rows_override = 0;
+        g_grouped_tensor_core_override = false;
     }
 
     // =================================================================

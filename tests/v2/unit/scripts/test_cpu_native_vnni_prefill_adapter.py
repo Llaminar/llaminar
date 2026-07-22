@@ -747,6 +747,20 @@ class CPUNativeVNNIPrefillAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "round watchdog"):
             adapt_cpu_prefill_row(row, self.context())
 
+    def test_long_complete_round_uses_probe_derived_watchdog(self) -> None:
+        row = self.row()
+        row.update({
+            "complete_round_probe_duration_us": "10000000",
+            "warmup_round_timeout_us": "41000000",
+        })
+
+        observation = adapt_cpu_prefill_row(row, self.context())
+        self.assertTrue(observation.supported)
+
+        row["warmup_round_timeout_us"] = "41000001"
+        with self.assertRaisesRegex(ValueError, "disagrees with probes"):
+            adapt_cpu_prefill_row(row, self.context())
+
     def test_unstable_cheap_row_cannot_stop_at_the_sample_guard_alone(self) -> None:
         row = self.row()
         row.update({

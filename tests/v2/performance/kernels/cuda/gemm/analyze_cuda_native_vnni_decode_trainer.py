@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Compile strong CUDA NativeVNNI decode evidence through the common policy core.
 
-The CUDA trainer measures explicit public-M1 schedules and the grouped verifier's
-``INHERIT_SERIAL_M1`` implementation on eager and graph-captured production
-surfaces.  This analyzer adapts those rows into the backend-neutral evidence
-schema, chooses mode-specific alias-robust exact winners, learns bounded aspect/work
+The CUDA trainer measures explicit public-M1 schedules and economical grouped
+verifier implementations on eager and graph-captured production surfaces.
+This analyzer adapts those rows into the backend-neutral evidence schema,
+chooses mode-specific alias-robust exact winners, learns bounded aspect/work
 rules, and emits the production CUDA selector ABI.
 
-Only Fast M=1 decisions are emitted.  Grouped verifier M=2..16 and M=31 rows
-certify that the grouped kernel inherits the complete frozen M=1 arithmetic
-identity, including its exact K-partition count; they never publish an
-independently tuned verifier schedule.
+Fast M=1 decisions and grouped-verifier row-reuse schedules are emitted as
+separate policy axes. Grouped verifier M=2..16 and M=31 rows inherit the
+complete frozen M=1 arithmetic identity, including its exact K-partition
+count, while independently selecting DP4A row reuse or integer tensor-core
+execution. Exact grouped overlays precede total geometry/M rules in production.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import hashlib
 import json
 import sys
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -140,6 +142,23 @@ class FastEntry:
     max_cv: float
 
 
+@dataclass(frozen=True, order=True)
+class GroupedEntry:
+    """One exact grouped-verifier kernel and row-reuse decision."""
+
+    codebook: int
+    execution_mode: ExecutionMode
+    m: int
+    n: int
+    k: int
+    kernel: str
+    grouped_rows: int
+    candidate_id: str
+    shape_name: str
+    max_surface_regret: float
+    max_cv: float
+
+
 def pack_shape_key(
     execution_mode: ExecutionMode,
     m: int,
@@ -185,6 +204,37 @@ def _fast_config(candidate_id: str) -> dict[str, object]:
     return config
 
 
+def _grouped_config(candidate_id: str) -> dict[str, object]:
+    """Resolve one forceable grouped kernel into the generated policy ABI.
+
+    Grouped dispatch has two independent economy choices: the physical kernel
+    family and, for the DP4A family, the number of rows sharing each decoded
+    weight block.  Normalize both families here so the emitter never encodes a
+    kernel choice as a magic row count.
+    """
+
+    candidate = cuda_native_vnni_gemv_registry().resolve(candidate_id)
+    if not candidate.supports_contract(
+        SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+    ):
+        raise ValueError(f"{candidate_id} is not a grouped CUDA candidate")
+    config = dict(candidate.config_json)
+    family = str(config.get("family", ""))
+    if family == "inherit_serial_m1":
+        grouped_rows = int(config.get("grouped_rows", 0))
+        if grouped_rows not in {2, 4, 8, 16, 32, 64}:
+            raise ValueError(
+                f"CUDA grouped candidate has invalid row tile {grouped_rows}"
+            )
+        config["kernel"] = "dp4a_rows"
+        return config
+    if family == "tensor_core_mma16":
+        config["kernel"] = "tensor_core_mma16"
+        config["grouped_rows"] = 16
+        return config
+    raise ValueError(f"unsupported CUDA grouped family {family!r}")
+
+
 def select_fast_entries(
     corpus: ObservationCorpus,
     serial_m1_policy_hash: str,
@@ -198,12 +248,7 @@ def select_fast_entries(
     entries = []
     for key, winner in sorted(exact.items()):
         if key.semantic_contract == SemanticContract.VERIFIER_SERIAL_M1_BITWISE:
-            if winner.candidate_id != (
-                "cuda.nvnni.decode.verifier.inherit_serial_m1"
-            ):
-                raise ValueError(
-                    "grouped CUDA verifier winner does not inherit serial M1"
-                )
+            _grouped_config(winner.candidate_id)
             continue
         if key.semantic_contract != SemanticContract.FAST or key.m != 1:
             raise ValueError(f"unsupported CUDA decode exact policy key {key}")
@@ -238,11 +283,55 @@ def select_fast_entries(
     return entries, exact
 
 
+def select_grouped_entries(
+    corpus: ObservationCorpus,
+    serial_m1_policy_hash: str,
+    *,
+    exact: dict[RuntimeKey, ExactWinner] | None = None,
+) -> list[GroupedEntry]:
+    """Encode exact grouped winners without changing their inherited M1 route."""
+
+    winners = exact
+    if winners is None:
+        winners = build_exact_winners(
+            corpus,
+            serial_m1_hashes=_serial_hashes(corpus, serial_m1_policy_hash),
+        )
+    entries = []
+    for key, winner in sorted(winners.items()):
+        if key.semantic_contract != SemanticContract.VERIFIER_SERIAL_M1_BITWISE:
+            continue
+        if len(key.projection_n_vector) != 1:
+            raise ValueError("CUDA grouped exact entry is not one projection")
+        rows = corpus.rows_for_runtime_key(key)
+        shape_names = sorted({row.shape_name for row in rows})
+        if len(shape_names) != 1:
+            raise ValueError(
+                f"multiple shape names collapse onto CUDA grouped key {key}: "
+                f"{shape_names}"
+            )
+        config = _grouped_config(winner.candidate_id)
+        entries.append(GroupedEntry(
+            codebook=key.runtime_codebook_id,
+            execution_mode=key.execution_mode,
+            m=key.m,
+            n=key.aggregate_n,
+            k=key.k,
+            kernel=str(config["kernel"]),
+            grouped_rows=int(config["grouped_rows"]),
+            candidate_id=winner.candidate_id,
+            shape_name=shape_names[0],
+            max_surface_regret=winner.max_surface_regret,
+            max_cv=winner.max_cv,
+        ))
+    return entries
+
+
 def select_fast_generic_rules(
     corpus: ObservationCorpus,
     serial_m1_policy_hash: str,
 ) -> list[GenericDispatchRule]:
-    """Fit the shared bounded-regret learner and retain public-M1 domains."""
+    """Fit shared public-M1 and grouped-verifier geometry policies."""
 
     generic = fit_generic_policy(
         corpus,
@@ -251,9 +340,107 @@ def select_fast_generic_rules(
     return [
         rule
         for rule in generic.rules
-        if rule.domain.semantic_contract == SemanticContract.FAST
-        and rule.domain.m == 1
+        if (
+            rule.domain.semantic_contract == SemanticContract.FAST
+            and rule.domain.m == 1
+        )
+        or rule.domain.semantic_contract
+        == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
     ]
+
+
+def select_grouped_generic_rules(
+    corpus: ObservationCorpus,
+    serial_m1_policy_hash: str,
+) -> list[GenericDispatchRule]:
+    """Fit only grouped-verifier domains after the M1 policy is frozen."""
+
+    verifier_rows = tuple(
+        row
+        for row in corpus
+        if row.semantic_contract
+        == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+    )
+    if not verifier_rows:
+        return []
+    verifier = ObservationCorpus(verifier_rows)
+    generic = fit_generic_policy(
+        verifier,
+        serial_m1_hashes=_serial_hashes(
+            verifier,
+            serial_m1_policy_hash,
+        ),
+    )
+    return list(generic.rules)
+
+
+def append_grouped_dispatch(
+    certified_m1_include: str,
+    grouped_entries: list[GroupedEntry],
+    grouped_rules: list[GenericDispatchRule],
+    *,
+    corpus_digest: str,
+    registry_digest: str,
+    profile: MeasurementProfile,
+) -> str:
+    """Append grouped policy code without regenerating certified M1 bytes."""
+
+    grouped_include = generate_include(
+        [],
+        grouped_rules,
+        grouped_entries=grouped_entries,
+        corpus_digest=corpus_digest,
+        registry_digest=registry_digest,
+        profile=profile,
+    )
+    marker = "#define LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2 1"
+    marker_offset = grouped_include.find(marker)
+    if marker_offset < 0:
+        raise ValueError(
+            "grouped CUDA policy contains neither exact nor generic decisions"
+        )
+    return (
+        certified_m1_include.rstrip()
+        + "\n\n"
+        + grouped_include[marker_offset:]
+    )
+
+
+def validate_grouped_generic_totality(
+    rules: list[GenericDispatchRule],
+) -> None:
+    """Require every supported codebook/mode/depth/aspect generic domain."""
+
+    expected_codebooks = {
+        spec.gpu_execution_codebook_id for spec in FORMAT_SPECS
+    }
+    expected = {
+        (codebook, mode, m, aspect)
+        for codebook in expected_codebooks
+        for mode in (ExecutionMode.EAGER, ExecutionMode.GRAPH_CAPTURED)
+        for m in CANONICAL_VERIFIER_M
+        for aspect in AspectBucket
+    }
+    actual = {
+        (
+            rule.domain.runtime_codebook_id,
+            rule.domain.execution_mode,
+            rule.domain.m,
+            rule.domain.aspect_bucket,
+        )
+        for rule in rules
+        if rule.domain.semantic_contract
+        == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+    }
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing or unexpected:
+        raise ValueError(
+            "CUDA grouped generic policy is not codebook/mode/M/aspect total: "
+            f"missing_count={len(missing)} first_missing={missing[:1]} "
+            f"unexpected_count={len(unexpected)} "
+            f"first_unexpected={unexpected[:1]}"
+        )
 
 
 def _fast_m1_corpus(corpus: ObservationCorpus) -> ObservationCorpus:
@@ -414,6 +601,7 @@ def freeze_fast_policy(
         PairedCellKey, tuple[PairedTimingComparison, ...]
     ] | None = None,
     profiler_feature_catalog: ProfilerFeatureCatalog | None = None,
+    build_change_audit: str | None = None,
 ) -> FrozenPolicy:
     """Fit CUDA Fast M1 from development rows without accepting sealed data."""
 
@@ -441,6 +629,14 @@ def freeze_fast_policy(
             "measurement_plan_digest": measurement_plan.digest(manifest),
             "paired_development_evidence_digest": paired_comparison_digest(
                 paired_development_comparisons or {}
+            ),
+            "development_measurement_context": _measurement_context(
+                development_corpus
+            ),
+            **(
+                {"development_build_change_audit": build_change_audit.strip()}
+                if build_change_audit is not None
+                else {}
             ),
         },
     )
@@ -516,7 +712,38 @@ def certify_fast_policy(
     )
     if filtered.digest(generic_only=True) != frozen.generic_digest:
         raise ValueError("sealed exact filtering changed frozen CUDA policy")
+    filtered = replace(
+        filtered,
+        metadata={
+            **dict(filtered.metadata),
+            "sealed_measurement_context": _measurement_context(sealed_corpus),
+        },
+    )
     return CompiledPolicy(filtered, compiled.certification)
+
+
+def _measurement_context(corpus: ObservationCorpus) -> dict[str, str]:
+    """Return one uniform physical measurement identity for an evidence phase."""
+
+    fields = (
+        "run_id",
+        "git_revision",
+        "build_id",
+        "compiler_id",
+        "architecture_class",
+        "device_name",
+        "driver_runtime",
+        "serial_m1_policy_hash",
+    )
+    context: dict[str, str] = {}
+    for field in fields:
+        values = {str(getattr(row, field)) for row in corpus}
+        if len(values) != 1:
+            raise ValueError(
+                f"CUDA evidence has non-uniform {field}: {sorted(values)[:2]}"
+            )
+        context[field] = next(iter(values))
+    return context
 
 
 def validate_policy_ir_inputs(
@@ -685,6 +912,129 @@ def validate_complete(
             )
 
 
+def validate_grouped_complete(
+    corpus: ObservationCorpus,
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+    *,
+    require_full_inventory: bool,
+) -> None:
+    """Require the complete grouped surface after M1 is independently sealed.
+
+    Final grouped publication receives an authenticated M1 policy/include pair,
+    so reopening raw M1 timing evidence here would create a second and weaker
+    authority for the already-certified serial route. This gate proves every
+    grouped alias, mode, candidate, shape, and verifier depth directly while
+    leaving M1 ownership with its sealed certificate.
+    """
+
+    invalid = [
+        key
+        for key in corpus.runtime_keys()
+        if key.semantic_contract
+        != SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+        or key.m not in CANONICAL_VERIFIER_M
+    ]
+    if invalid:
+        raise ValueError(
+            "standalone CUDA grouped corpus contains a non-verifier key "
+            f"{invalid[0]}"
+        )
+    require_canonical_alias_coverage(
+        corpus,
+        required_execution_modes=(
+            ExecutionMode.EAGER,
+            ExecutionMode.GRAPH_CAPTURED,
+        ),
+    )
+    require_verifier_m_matrix(corpus)
+    require_candidate_matrix_complete(corpus)
+    _require_shape_reachable_candidate_coverage(corpus)
+
+    architecture_classes = {row.architecture_class for row in corpus}
+    if len(architecture_classes) != 1:
+        raise ValueError(
+            "one CUDA grouped artifact must describe exactly one architecture "
+            f"class, got {sorted(architecture_classes)}"
+        )
+
+    by_shape: dict[tuple, set[int]] = {}
+    names_by_shape: dict[tuple, str] = {}
+    for row in corpus:
+        identity = (
+            row.runtime_codebook_id,
+            row.source_format,
+            row.execution_mode,
+            row.shape_group_id,
+        )
+        previous_name = names_by_shape.setdefault(identity, row.shape_name)
+        if previous_name != row.shape_name:
+            raise ValueError(
+                f"CUDA shape group maps to multiple manifest names: {identity}"
+            )
+        by_shape.setdefault(identity, set()).add(row.m)
+
+    required_m = set(CANONICAL_VERIFIER_M)
+    failures = []
+    for identity, represented in by_shape.items():
+        shape_name = names_by_shape[identity]
+        manifest.by_name(shape_name)
+        if not measurement_plan.verifier_shape_applies(
+            manifest,
+            shape_name=shape_name,
+        ):
+            failures.append((identity, [], sorted(represented)))
+            continue
+        missing = sorted(required_m - represented)
+        unexpected = sorted(represented - required_m)
+        if missing or unexpected:
+            failures.append((identity, missing, unexpected))
+    if failures:
+        raise ValueError(
+            "CUDA grouped shape/depth matrix is invalid for "
+            f"{len(failures)} surface(s); first={failures[0]}"
+        )
+
+    if require_full_inventory:
+        expected = {
+            surface
+            for surface in measurement_plan.expected_decode_surfaces(
+                manifest,
+                backend=Backend.CUDA,
+                source_formats=tuple(spec.label for spec in FORMAT_SPECS),
+                execution_modes=(
+                    ExecutionMode.EAGER,
+                    ExecutionMode.GRAPH_CAPTURED,
+                ),
+                verifier_m_values=CANONICAL_VERIFIER_M,
+            )
+            if surface[0]
+            == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+        }
+        actual = {
+            (
+                row.semantic_contract,
+                row.m,
+                row.shape_name,
+                row.source_format,
+                row.execution_mode,
+            )
+            for row in corpus
+        }
+        if actual != expected:
+            order_key = lambda item: (
+                item[2], item[3], item[4].value, item[0].value, item[1]
+            )
+            missing = sorted(expected - actual, key=order_key)
+            unexpected = sorted(actual - expected, key=order_key)
+            raise ValueError(
+                "CUDA production grouped surface inventory is incomplete: "
+                f"missing_count={len(missing)} first_missing={missing[:1]} "
+                f"unexpected_count={len(unexpected)} "
+                f"first_unexpected={unexpected[:1]}"
+            )
+
+
 def validate_fast_m1_complete(corpus: ObservationCorpus) -> None:
     """Require a complete standalone public-M1 candidate matrix.
 
@@ -764,6 +1114,7 @@ def _require_shape_reachable_candidate_coverage(
         )
 
 
+@lru_cache(maxsize=None)
 def _economical_exact_kblocks(k_groups: int) -> frozenset[int]:
     """Return one smallest KB for each distinct partition-width geometry."""
 
@@ -826,6 +1177,73 @@ def _entry_line(entry: FastEntry) -> str:
     )
 
 
+def _grouped_entry_line(entry: GroupedEntry) -> str:
+    """Render one exact grouped-kernel overlay with provenance."""
+
+    return (
+        f"            {{0x{pack_shape_key(entry.execution_mode, entry.m, entry.n, entry.k):016x}ULL, "
+        f"{{{_grouped_kernel_enum(entry.kernel)}, {entry.grouped_rows}}}}}, "
+        f"// CB={entry.codebook} mode={entry.execution_mode.value} "
+        f"M={entry.m} {entry.n}x{entry.k} {entry.candidate_id} "
+        f"{entry.shape_name} max-regret={entry.max_surface_regret:.4%} "
+        f"max-cv={entry.max_cv:.4%}"
+    )
+
+
+def _grouped_kernel_enum(kernel: str) -> str:
+    """Map a normalized trainer family to the strongly typed C++ selector."""
+
+    values = {
+        "dp4a_rows": "GeneratedGroupedKernel::Dp4aRows",
+        "tensor_core_mma16": "GeneratedGroupedKernel::TensorCoreMma16",
+    }
+    try:
+        return values[kernel]
+    except KeyError as error:
+        raise ValueError(f"unsupported normalized grouped kernel {kernel!r}") from error
+
+
+def _grouped_tuning_literal(config: dict[str, object]) -> str:
+    """Render one complete grouped decision without sentinel row values."""
+
+    return (
+        "GeneratedGroupedTuning{"
+        f"{_grouped_kernel_enum(str(config['kernel']))}, "
+        f"{int(config['grouped_rows'])}"
+        "}"
+    )
+
+
+def _grouped_m_upper_bounds(
+    rules: list[GenericDispatchRule],
+) -> dict[tuple[int, ExecutionMode, int], int]:
+    """Return total nearest-depth buckets for each codebook/mode surface.
+
+    The learner fits each measured verifier depth independently. Runtime M is
+    unbounded, so the emitter places boundaries halfway between adjacent
+    measured depths and lets the largest measured depth own the open-ended
+    tail. Exact overlays are checked before these buckets.
+    """
+
+    grouped: dict[tuple[int, ExecutionMode], set[int]] = {}
+    for rule in rules:
+        grouped.setdefault((
+            rule.domain.runtime_codebook_id,
+            rule.domain.execution_mode,
+        ), set()).add(rule.domain.m)
+    bounds: dict[tuple[int, ExecutionMode, int], int] = {}
+    for (codebook, mode), values in grouped.items():
+        ordered = sorted(values)
+        for index, value in enumerate(ordered):
+            upper = (
+                (value + ordered[index + 1]) // 2
+                if index + 1 < len(ordered)
+                else 2_147_483_647
+            )
+            bounds[(codebook, mode, value)] = upper
+    return bounds
+
+
 def _resolved_tuning_lines(config: dict[str, object]) -> list[str]:
     """Render a concrete tuning assignment for a static or formula candidate."""
 
@@ -873,6 +1291,7 @@ def generate_include(
     entries: list[FastEntry],
     generic_rules: list[GenericDispatchRule],
     *,
+    grouped_entries: list[GroupedEntry] | None = None,
     corpus_digest: str,
     registry_digest: str,
     profile: MeasurementProfile,
@@ -884,6 +1303,8 @@ def generate_include(
 ) -> str:
     """Render exact and bounded generic decisions into the CUDA selector ABI."""
 
+    grouped_entries = grouped_entries or []
+
     entries_by_codebook: dict[int, list[FastEntry]] = {}
     for entry in entries:
         entries_by_codebook.setdefault(entry.codebook, []).append(entry)
@@ -892,11 +1313,29 @@ def generate_include(
             item.execution_mode, 1, item.n, item.k
         ))
 
+    grouped_entries_by_codebook: dict[int, list[GroupedEntry]] = {}
+    for entry in grouped_entries:
+        grouped_entries_by_codebook.setdefault(entry.codebook, []).append(entry)
+    for rows in grouped_entries_by_codebook.values():
+        rows.sort(key=lambda item: pack_shape_key(
+            item.execution_mode, item.m, item.n, item.k
+        ))
+
     rules_by_codebook: dict[int, list[GenericDispatchRule]] = {}
+    grouped_rules_by_codebook: dict[int, list[GenericDispatchRule]] = {}
     for rule in generic_rules:
-        rules_by_codebook.setdefault(
-            rule.domain.runtime_codebook_id, []
-        ).append(rule)
+        destination = (
+            grouped_rules_by_codebook
+            if rule.domain.semantic_contract
+            == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+            else rules_by_codebook
+        )
+        destination.setdefault(rule.domain.runtime_codebook_id, []).append(rule)
+    grouped_m_bounds = _grouped_m_upper_bounds([
+        rule
+        for rules in grouped_rules_by_codebook.values()
+        for rule in rules
+    ])
 
     if certification is not None:
         decision_comment = (
@@ -918,7 +1357,7 @@ def generate_include(
     lines = [
         "// Auto-generated by analyze_cuda_native_vnni_decode_trainer.py. DO NOT EDIT.",
         decision_comment,
-        "// Grouped verifier M=2..16 and M=31 inherit this exact public-M1 policy.",
+        "// Grouped verifier rows inherit public-M1 arithmetic and independently select an economical grouped kernel.",
         "// Uncovered runtime keys return false; production has no default route.",
         f"// Measurement profile: {profile.value}",
         f"// Common corpus digest: {corpus_digest}",
@@ -1092,6 +1531,8 @@ def generate_include(
         "{",
         "    if (m != 1)",
         "        return false;",
+        "    const bool exact_key_representable =",
+        "        n <= 0x0FFFFFFF && k <= 0x00FFFFFF;",
         "    const uint64_t key = packGeneratedDispatchKey(",
         "        graph_captured, m, n, k);",
     ]
@@ -1105,7 +1546,8 @@ def generate_include(
         lines.extend(_entry_line(entry) for entry in entries_by_codebook[codebook])
         lines.extend([
             "        };",
-            "        if (findGeneratedDispatchEntry(kTable, key, shape, tuning))",
+            "        if (exact_key_representable &&",
+            "            findGeneratedDispatchEntry(kTable, key, shape, tuning))",
             "            return true;",
             "    }",
         ])
@@ -1173,6 +1615,140 @@ def generate_include(
         "}",
         "",
     ])
+
+    if grouped_entries_by_codebook or grouped_rules_by_codebook:
+        lines.extend([
+            "#define LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2 1",
+            "",
+            "enum class GeneratedGroupedKernel : uint8_t",
+            "{",
+            "    Invalid = 0,",
+            "    Dp4aRows = 1,",
+            "    TensorCoreMma16 = 2,",
+            "};",
+            "",
+            "struct GeneratedGroupedTuning",
+            "{",
+            "    GeneratedGroupedKernel kernel = GeneratedGroupedKernel::Invalid;",
+            "    int grouped_rows = 0;",
+            "};",
+            "",
+            "struct GeneratedGroupedDispatchEntry",
+            "{",
+            "    uint64_t key;",
+            "    GeneratedGroupedTuning tuning;",
+            "};",
+            "",
+            "template <size_t Count>",
+            "inline bool findGeneratedGroupedDispatchEntry(",
+            "    const GeneratedGroupedDispatchEntry (&table)[Count],",
+            "    uint64_t key, GeneratedGroupedTuning &tuning)",
+            "{",
+            "    size_t lo = 0;",
+            "    size_t hi = Count;",
+            "    while (lo < hi)",
+            "    {",
+            "        const size_t mid = lo + ((hi - lo) / 2);",
+            "        if (table[mid].key == key)",
+            "        {",
+            "            tuning = table[mid].tuning;",
+            "            return true;",
+            "        }",
+            "        if (table[mid].key < key)",
+            "            lo = mid + 1;",
+            "        else",
+            "            hi = mid;",
+            "    }",
+            "    return false;",
+            "}",
+            "",
+            "template <uint8_t CB>",
+            "inline bool selectGeneratedGroupedTuning(",
+            "    bool graph_captured, int m, int n, int k,",
+            "    GeneratedGroupedTuning &tuning)",
+            "{",
+            "    if (m < 2 || n <= 0 || k <= 0)",
+            "        return false;",
+            "    tuning = GeneratedGroupedTuning{};",
+            "    const bool exact_key_representable =",
+            "        m <= 0x7F && n <= 0x0FFFFFFF && k <= 0x00FFFFFF;",
+            "    const uint64_t key = packGeneratedDispatchKey(",
+            "        graph_captured, m, n, k);",
+        ])
+        for codebook in sorted(grouped_entries_by_codebook):
+            lines.extend([
+                f"    if constexpr (CB == {codebook})",
+                "    {",
+                "        static constexpr GeneratedGroupedDispatchEntry kTable[] = {",
+            ])
+            lines.extend(
+                _grouped_entry_line(entry)
+                for entry in grouped_entries_by_codebook[codebook]
+            )
+            lines.extend([
+                "        };",
+                "        if (exact_key_representable &&",
+                "            findGeneratedGroupedDispatchEntry(kTable, key, tuning))",
+                "            return true;",
+                "    }",
+            ])
+
+        if grouped_rules_by_codebook:
+            lines.extend([
+                "",
+                "    const long long work_items =",
+                "        static_cast<long long>(n) * static_cast<long long>(k);",
+            ])
+        for codebook in sorted(grouped_rules_by_codebook):
+            lines.extend([
+                f"    if constexpr (CB == {codebook})",
+                "    {",
+            ])
+            for rule in sorted(
+                grouped_rules_by_codebook[codebook],
+                key=lambda item: (
+                    item.domain.execution_mode.value,
+                    item.domain.m,
+                    generic_rule_sort_key(item),
+                ),
+            ):
+                config = _grouped_config(rule.candidate_id)
+                mode_condition = (
+                    "graph_captured"
+                    if rule.domain.execution_mode
+                    == ExecutionMode.GRAPH_CAPTURED
+                    else "!graph_captured"
+                )
+                upper = grouped_m_bounds[(
+                    codebook,
+                    rule.domain.execution_mode,
+                    rule.domain.m,
+                )]
+                conditions = [
+                    mode_condition,
+                    f"m <= {upper}",
+                    aspect_condition(rule.domain.aspect_bucket),
+                    *(
+                        predicate_condition(predicate)
+                        for predicate in rule.predicates
+                    ),
+                ]
+                lines.extend(render_if_header(conditions, indent="        "))
+                lines.extend([
+                    "        {",
+                    (
+                        "            tuning = "
+                        f"{_grouped_tuning_literal(config)};"
+                    ),
+                    "            return true;",
+                    "        }",
+                ])
+            lines.append("    }")
+        lines.extend([
+            "    return false;",
+            "}",
+            "",
+        ])
     return "\n".join(lines)
 
 
@@ -1239,6 +1815,39 @@ def validate_certified_m1_artifacts(
         raise ValueError("certified CUDA M1 policy omits its development digest")
     if not metadata.get("sealed_corpus_digest"):
         raise ValueError("certified CUDA M1 policy omits its sealed digest")
+    required_context_fields = {
+        "run_id",
+        "git_revision",
+        "build_id",
+        "compiler_id",
+        "architecture_class",
+        "device_name",
+        "driver_runtime",
+        "serial_m1_policy_hash",
+    }
+    contexts = {}
+    for phase in ("development", "sealed"):
+        context = metadata.get(f"{phase}_measurement_context")
+        if not isinstance(context, dict) or set(context) != required_context_fields:
+            raise ValueError(
+                f"certified CUDA M1 policy omits its {phase} measurement context"
+            )
+        if not all(isinstance(value, str) and value for value in context.values()):
+            raise ValueError(
+                f"certified CUDA M1 {phase} measurement context is incomplete"
+            )
+        contexts[phase] = context
+    comparable_fields = required_context_fields - {"run_id"}
+    changed = sorted(
+        field
+        for field in comparable_fields
+        if contexts["development"][field] != contexts["sealed"][field]
+    )
+    if changed and not str(metadata.get("development_build_change_audit", "")).strip():
+        raise ValueError(
+            "certified CUDA M1 policy crosses measurement builds without an "
+            f"audit note: changed={changed}"
+        )
 
     include = include_path.read_text(encoding="utf-8")
     required_comments = (
@@ -1299,7 +1908,12 @@ def _context_from_args(
     timing_sidecars: tuple[Path, ...],
     *,
     run_id: str | None = None,
+    git_revision: str | None = None,
     build_id: str | None = None,
+    compiler_id: str | None = None,
+    architecture_class: str | None = None,
+    device_name: str | None = None,
+    driver_runtime: str | None = None,
     serial_m1_policy_hash: str | None = None,
 ) -> CUDADecodeAdapterContext:
     """Build conspicuous smoke provenance or strict installable provenance."""
@@ -1312,12 +1926,22 @@ def _context_from_args(
         profile=profile,
         run_id=run_id if run_id is not None else args.run_id,
         corpus_id=corpus_id,
-        git_revision=args.git_revision,
+        git_revision=(
+            git_revision if git_revision is not None else args.git_revision
+        ),
         build_id=build_id if build_id is not None else args.build_id,
-        compiler_id=args.compiler_id,
-        architecture_class=args.architecture_class,
-        device_name=args.device_name,
-        driver_runtime=args.driver_runtime,
+        compiler_id=(compiler_id if compiler_id is not None else args.compiler_id),
+        architecture_class=(
+            architecture_class
+            if architecture_class is not None
+            else args.architecture_class
+        ),
+        device_name=device_name if device_name is not None else args.device_name,
+        driver_runtime=(
+            driver_runtime
+            if driver_runtime is not None
+            else args.driver_runtime
+        ),
         serial_m1_policy_hash=(
             serial_m1_policy_hash
             if serial_m1_policy_hash is not None
@@ -1341,16 +1965,8 @@ def main() -> int:
         help="Raw timing CSV shard; repeat for every aggregate shard",
     )
     parser.add_argument(
-        "--m1-input", nargs="+", type=Path,
-        help="Frozen first-phase M1 aggregate shard(s) for a final compile",
-    )
-    parser.add_argument(
-        "--m1-timing-sidecar", action="append", type=Path, default=[],
-        help="First-phase M1 timing shard; repeat for every aggregate shard",
-    )
-    parser.add_argument(
         "--verifier-input", nargs="+", type=Path,
-        help="Second-phase verifier aggregate shard(s) for a final compile",
+        help="Verifier aggregate measured against the certified staged M1 policy",
     )
     parser.add_argument(
         "--verifier-timing-sidecar", action="append", type=Path, default=[],
@@ -1481,14 +2097,43 @@ def main() -> int:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--git-revision", default="")
     parser.add_argument("--build-id", default="")
-    parser.add_argument("--m1-build-id", default="")
     parser.add_argument("--compiler-id", default="")
     parser.add_argument("--architecture-class", default="")
     parser.add_argument("--device-name", default="")
     parser.add_argument("--driver-runtime", default="")
     parser.add_argument("--serial-m1-policy-hash", default="")
-    parser.add_argument("--m1-baseline-policy-hash", default="")
+    parser.add_argument(
+        "--development-build-change-audit",
+        default="",
+        help="Reviewed explanation for reusing development evidence across builds",
+    )
+    parser.add_argument("--sealed-run-id", default="")
+    parser.add_argument("--sealed-git-revision", default="")
+    parser.add_argument("--sealed-build-id", default="")
+    parser.add_argument("--sealed-compiler-id", default="")
+    parser.add_argument("--sealed-architecture-class", default="")
+    parser.add_argument("--sealed-device-name", default="")
+    parser.add_argument("--sealed-driver-runtime", default="")
+    parser.add_argument("--sealed-serial-m1-policy-hash", default="")
     args = parser.parse_args()
+
+    sealed_context_values = (
+        args.sealed_run_id,
+        args.sealed_git_revision,
+        args.sealed_build_id,
+        args.sealed_compiler_id,
+        args.sealed_architecture_class,
+        args.sealed_device_name,
+        args.sealed_driver_runtime,
+        args.sealed_serial_m1_policy_hash,
+    )
+    if any(sealed_context_values) and not all(sealed_context_values):
+        parser.error("sealed measurement provenance must be supplied as one unit")
+    if (
+        args.development_build_change_audit
+        and not args.development_build_change_audit.strip()
+    ):
+        parser.error("--development-build-change-audit must not be whitespace")
 
     if args.freeze_generic and args.certify_generic:
         parser.error("--freeze-generic and --certify-generic are mutually exclusive")
@@ -1620,9 +2265,17 @@ def main() -> int:
             measurement_plan,
             paired_development_comparisons=paired_development_comparisons,
             profiler_feature_catalog=profiler_catalog,
+            build_change_audit=(
+                args.development_build_change_audit or None
+            ),
         )
         entries, exact = select_fast_entries(
             corpus, context.serial_m1_policy_hash
+        )
+        grouped_entries = select_grouped_entries(
+            corpus,
+            context.serial_m1_policy_hash,
+            exact=exact,
         )
         exact_overlay_names = {
             shape.name for shape in manifest.shapes if shape.exact_overlay
@@ -1637,6 +2290,7 @@ def main() -> int:
         args.output.write_text(generate_include(
             entries,
             generic_rules,
+            grouped_entries=grouped_entries,
             corpus_digest=corpus.digest(),
             registry_digest=candidate_registry_digest(),
             profile=context.profile,
@@ -1693,6 +2347,9 @@ def main() -> int:
             measurement_plan,
             paired_development_comparisons=paired_development_comparisons,
             profiler_feature_catalog=profiler_catalog,
+            build_change_audit=(
+                args.development_build_change_audit or None
+            ),
         )
         # This comparison happens before the first sealed file is opened.
         validate_frozen_policy_file(args.frozen_policy_json, frozen)
@@ -1703,7 +2360,16 @@ def main() -> int:
             args,
             sealed_inputs,
             sealed_timing,
-            run_id=f"{args.run_id}-sealed",
+            run_id=(args.sealed_run_id or f"{args.run_id}-sealed"),
+            git_revision=args.sealed_git_revision or None,
+            build_id=args.sealed_build_id or None,
+            compiler_id=args.sealed_compiler_id or None,
+            architecture_class=args.sealed_architecture_class or None,
+            device_name=args.sealed_device_name or None,
+            driver_runtime=args.sealed_driver_runtime or None,
+            serial_m1_policy_hash=(
+                args.sealed_serial_m1_policy_hash or None
+            ),
         )
         sealed_corpus = adapt_cuda_decode_csv(
             sealed_inputs,
@@ -1726,6 +2392,11 @@ def main() -> int:
         entries, exact = select_fast_entries(
             corpus, development_context.serial_m1_policy_hash
         )
+        grouped_entries = select_grouped_entries(
+            corpus,
+            development_context.serial_m1_policy_hash,
+            exact=exact,
+        )
         exact_overlay_names = {
             shape.name for shape in manifest.shapes if shape.exact_overlay
         }
@@ -1739,6 +2410,7 @@ def main() -> int:
         args.output.write_text(generate_include(
             entries,
             generic_rules,
+            grouped_entries=grouped_entries,
             corpus_digest=corpus.digest(),
             registry_digest=candidate_registry_digest(),
             profile=development_context.profile,
@@ -1761,34 +2433,17 @@ def main() -> int:
         )
         return 0
 
-    two_phase = bool(args.m1_input or args.verifier_input)
-    if certified_replay and not two_phase:
-        parser.error("certified M1 replay requires the two-phase verifier inputs")
-    if two_phase:
+    grouped_publication = bool(args.verifier_input)
+    if certified_replay and not grouped_publication:
+        parser.error("certified M1 replay requires grouped verifier inputs")
+    if grouped_publication:
         if inputs or args.timing_sidecar:
             parser.error(
-                "two-phase compile cannot mix --m1/--verifier inputs with "
+                "grouped publication cannot mix --verifier-input with "
                 "positional/--input evidence"
             )
-        if not args.m1_input or not args.verifier_input:
-            parser.error("two-phase compile requires both --m1-input and --verifier-input")
-        if not args.m1_build_id or not args.m1_baseline_policy_hash:
-            parser.error(
-                "two-phase compile requires --m1-build-id and "
-                "--m1-baseline-policy-hash"
-            )
-        m1_inputs = tuple(args.m1_input)
         verifier_inputs = tuple(args.verifier_input)
-        m1_timing = tuple(args.m1_timing_sidecar)
         verifier_timing = tuple(args.verifier_timing_sidecar)
-        m1_context = _context_from_args(
-            args,
-            m1_inputs,
-            m1_timing,
-            run_id=f"{args.run_id}-m1",
-            build_id=args.m1_build_id,
-            serial_m1_policy_hash=args.m1_baseline_policy_hash,
-        )
         verifier_context = _context_from_args(
             args,
             verifier_inputs,
@@ -1797,20 +2452,12 @@ def main() -> int:
             build_id=args.build_id,
             serial_m1_policy_hash=args.serial_m1_policy_hash,
         )
-        m1_corpus = adapt_cuda_decode_csv(
-            m1_inputs,
-            m1_context,
-            timing_sidecars=m1_timing,
-        )
         verifier_corpus = adapt_cuda_decode_csv(
             verifier_inputs,
             verifier_context,
             timing_sidecars=verifier_timing,
         )
-        corpus = ObservationCorpus((
-            *m1_corpus.observations,
-            *verifier_corpus.observations,
-        ))
+        corpus = verifier_corpus
         context = verifier_context
     else:
         if not inputs:
@@ -1826,14 +2473,39 @@ def main() -> int:
         corpus,
         context.serial_m1_policy_hash,
     )
-    generic_rules = (
-        []
-        if args.exact_only or certified_replay
-        else select_fast_generic_rules(corpus, context.serial_m1_policy_hash)
+    grouped_entries = select_grouped_entries(
+        corpus,
+        context.serial_m1_policy_hash,
+        exact=exact,
     )
+    if args.exact_only:
+        generic_rules = []
+    elif certified_replay:
+        generic_rules = select_grouped_generic_rules(
+            corpus,
+            context.serial_m1_policy_hash,
+        )
+    else:
+        generic_rules = select_fast_generic_rules(
+            corpus,
+            context.serial_m1_policy_hash,
+        )
     if args.require_fast_m1_complete:
         validate_fast_m1_complete(corpus)
-    if args.require_complete:
+    if args.require_complete and certified_replay:
+        complete_manifest = load_shape_manifest(args.shape_manifest)
+        validate_grouped_complete(
+            corpus,
+            complete_manifest,
+            load_gpu_measurement_plan(
+                args.measurement_plan,
+                manifest=complete_manifest,
+            ),
+            require_full_inventory=(
+                context.profile == MeasurementProfile.PRODUCTION
+            ),
+        )
+    elif args.require_complete:
         complete_manifest = load_shape_manifest(args.shape_manifest)
         validate_complete(
             corpus,
@@ -1860,11 +2532,39 @@ def main() -> int:
             manifest,
             measurement_plan,
         )
-        generated = args.certified_m1_include.read_text(encoding="utf-8")
+        exact_overlay_names = {
+            shape.name for shape in manifest.shapes if shape.exact_overlay
+        }
+        grouped_entries = [
+            entry
+            for entry in grouped_entries
+            if entry.shape_name in exact_overlay_names
+        ]
+        grouped_rules = [
+            rule
+            for rule in generic_rules
+            if rule.domain.semantic_contract
+            == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+        ]
+        if context.profile.installable and not grouped_rules:
+            raise ValueError(
+                "installable CUDA verifier policy has no total generic rules"
+            )
+        if context.profile.installable:
+            validate_grouped_generic_totality(grouped_rules)
+        generated = append_grouped_dispatch(
+            args.certified_m1_include.read_text(encoding="utf-8"),
+            grouped_entries,
+            grouped_rules,
+            corpus_digest=corpus.digest(),
+            registry_digest=candidate_registry_digest(),
+            profile=context.profile,
+        )
     else:
         generated = generate_include(
             entries,
             generic_rules,
+            grouped_entries=grouped_entries,
             corpus_digest=corpus.digest(),
             registry_digest=candidate_registry_digest(),
             profile=context.profile,

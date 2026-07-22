@@ -28,6 +28,18 @@ from native_vnni_dispatch.shape_manifest import (  # noqa: E402
 class NativeVNNIShapeManifestTest(unittest.TestCase):
     """Lock inventory breadth and the MTP regression geometries."""
 
+    def test_shape_name_lookup_builds_one_reusable_index(self) -> None:
+        """Per-observation validation must not rescan the whole manifest."""
+
+        manifest = load_shape_manifest()
+        shape_name = manifest.shapes[-1].name
+        self.assertNotIn("_shapes_by_name", manifest.__dict__)
+        first = manifest.by_name(shape_name)
+        self.assertIn("_shapes_by_name", manifest.__dict__)
+        self.assertIs(first, manifest.by_name(shape_name))
+        with self.assertRaisesRegex(KeyError, "unknown NativeVNNI shape"):
+            manifest.by_name("NotAProductionShape")
+
     def test_every_aspect_has_disjoint_development_and_sealed_breadth(self) -> None:
         """Both semantic surfaces retain independent grouped holdouts."""
 
@@ -66,7 +78,7 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
         """Every spent prefill witness leaves a disjoint fresh holdout pool."""
 
         manifest = load_shape_manifest()
-        self.assertEqual(len(manifest.shapes), 540)
+        self.assertEqual(len(manifest.shapes), 594)
         fast_sealed = [
             shape
             for shape in manifest.shapes
@@ -213,13 +225,13 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
             )
         )
 
-    def test_cpu_measurement_envelope_ends_at_qwen25_32b(self) -> None:
-        """CPU collection includes real 32B shapes and excludes larger work."""
+    def test_cpu_measurement_envelope_includes_every_exact_overlay(self) -> None:
+        """CPU collection must not omit a known production exact geometry."""
 
         manifest = load_shape_manifest()
         self.assertEqual(
             manifest.maximum_cpu_measurement_weight_elements,
-            152064 * 5120,
+            manifest.maximum_supported_weight_elements,
         )
         measured_names = set(manifest.cpu_measurement_names(verifier=True))
         self.assertTrue({
@@ -229,8 +241,12 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
             "32B_FFN_Dn",
             "32B_LM_Head",
         }.issubset(measured_names))
-        self.assertNotIn("Qwen36_LM_Head", measured_names)
-        self.assertEqual(len(measured_names), 345)
+        self.assertIn("Qwen36_LM_Head", measured_names)
+        self.assertTrue({
+            shape.name
+            for shape in manifest.shapes
+            if shape.role == ShapeRole.PRODUCTION and shape.exact_overlay
+        }.issubset(measured_names))
         self.assertEqual(
             max(manifest.by_name(name).work_items for name in measured_names),
             manifest.maximum_cpu_measurement_weight_elements,
@@ -474,6 +490,158 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
                 manifest=manifest,
             )
 
+    def test_fast_m1_kpart_dense_refinement_resolves_narrow_boundaries(self) -> None:
+        """All-format M=1 CV owns 32-value and isolated-miss neighborhoods."""
+
+        manifest = load_shape_manifest()
+        refinement = [
+            shape
+            for shape in manifest.shapes
+            if shape.model_family == "fast-m1-kpart-dense-v7"
+        ]
+        inner_n = {1984, 2016, 2048, 2080, 2112}
+        inner_k = {10944, 10976, 11008, 11040, 11072}
+        prior_grid = {
+            (n, k)
+            for n in {1984, 2048, 2112}
+            for k in {10944, 11008, 11072}
+        }
+        dense_3b = {
+            (n, k) for n in inner_n for k in inner_k
+        } - prior_grid
+        balanced = {
+            (n, k)
+            for n in {3008, 3072, 3136}
+            for k in {4032, 4096, 4160}
+        } - {(3072, 4096)}
+
+        self.assertEqual(len(refinement), 24)
+        self.assertEqual(
+            {(shape.n, shape.k) for shape in refinement},
+            dense_3b | balanced,
+        )
+        self.assertEqual(
+            {
+                bucket: sum(
+                    shape.aspect_bucket == bucket for shape in refinement
+                )
+                for bucket in AspectBucket
+            },
+            {
+                AspectBucket.TALL: 20,
+                AspectBucket.BALANCED: 4,
+                AspectBucket.WIDE: 0,
+                AspectBucket.VERY_WIDE: 0,
+            },
+        )
+        self.assertTrue(
+            all(
+                shape.role == ShapeRole.CERTIFICATION
+                and not shape.exact_overlay
+                and shape.fast_partition == ShapePartition.DEVELOPMENT
+                and shape.verifier_partition is None
+                and shape.prefill_partition is None
+                for shape in refinement
+            )
+        )
+
+    def test_fast_m1_kpart_transition_lattice_is_cartesian_complete(self) -> None:
+        """Coherent CV folds must not inherit holes in the 3B transition grid."""
+
+        manifest = load_shape_manifest()
+        expected_n = {1920, 1984, 2016, 2048, 2080, 2112, 2176}
+        expected_k = {10880, 10944, 10976, 11008, 11040, 11072, 11136}
+        lattice_shapes = [
+            shape
+            for shape in manifest.shapes
+            if shape.n in expected_n
+            and shape.k in expected_k
+        ]
+        lattice = {(shape.n, shape.k) for shape in lattice_shapes}
+        completion = [
+            shape
+            for shape in manifest.shapes
+            if shape.model_family == "fast-m1-kpart-grid-completion-v8"
+        ]
+
+        self.assertEqual(
+            lattice,
+            {(n, k) for n in expected_n for k in expected_k},
+        )
+        self.assertTrue(
+            all(
+                shape.fast_partition == ShapePartition.DEVELOPMENT
+                for shape in lattice_shapes
+            )
+        )
+        self.assertEqual(len(completion), 8)
+        self.assertTrue(
+            all(
+                shape.role == ShapeRole.CERTIFICATION
+                and not shape.exact_overlay
+                and shape.aspect_bucket == AspectBucket.TALL
+                and shape.fast_partition == ShapePartition.DEVELOPMENT
+                and shape.verifier_partition is None
+                and shape.prefill_partition is None
+                for shape in completion
+            )
+        )
+
+    def test_fast_m1_kpart_v9_midk_support_is_all_format_development(self) -> None:
+        """The 2048x8192 miss owns a compact two-dimensional support lattice."""
+
+        manifest = load_shape_manifest()
+        refinement = [
+            shape
+            for shape in manifest.shapes
+            if shape.model_family == "fast-m1-kpart-midk-support-v9"
+        ]
+        expected = {
+            (n, k)
+            for n in (2016, 2032, 2048)
+            for k in (8128, 8192, 8256)
+        } - {(2048, 8192)}
+
+        self.assertEqual({(shape.n, shape.k) for shape in refinement}, expected)
+        self.assertTrue(all(
+            shape.role == ShapeRole.CERTIFICATION
+            and not shape.exact_overlay
+            and shape.aspect_bucket == AspectBucket.TALL
+            and shape.fast_partition == ShapePartition.DEVELOPMENT
+            and shape.verifier_partition is None
+            and shape.prefill_partition is None
+            for shape in refinement
+        ))
+
+    def test_fast_m1_kpart_v9_terminal_support_crosses_both_grids(self) -> None:
+        """Terminal K-part support spans N-chunk and K-partition boundaries."""
+
+        manifest = load_shape_manifest()
+        refinement = [
+            shape
+            for shape in manifest.shapes
+            if shape.model_family == "fast-m1-kpart-terminal-support-v9"
+        ]
+        expected = (
+            {
+                (n, k)
+                for n in (2000, 2032, 2048)
+                for k in (11168, 11200, 11232, 11264)
+            }
+            | {(2016, 11200), (2016, 11264)}
+        )
+
+        self.assertEqual({(shape.n, shape.k) for shape in refinement}, expected)
+        self.assertTrue(all(
+            shape.role == ShapeRole.CERTIFICATION
+            and not shape.exact_overlay
+            and shape.aspect_bucket == AspectBucket.TALL
+            and shape.fast_partition == ShapePartition.DEVELOPMENT
+            and shape.verifier_partition is None
+            and shape.prefill_partition is None
+            for shape in refinement
+        ))
+
     def test_shape_without_any_semantic_surface_is_rejected(self) -> None:
         """Explicit null may scope a shape, but may not orphan it entirely."""
 
@@ -558,19 +726,23 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
             cmake.count("qwen35_qwen36_release_models_v1.json"),
             1,
         )
+        # CUDA and ROCm each have decode and prefill trainers; CPU uses one
+        # executable for both surfaces.  All five must receive the same two
+        # centralized paths instead of naming a backend-private inventory.
+        expected_trainer_targets = 5
         self.assertEqual(
             cmake.count(
                 'LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="'
                 '${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"'
             ),
-            3,
+            expected_trainer_targets,
         )
         self.assertEqual(
             cmake.count(
                 'LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="'
                 '${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}"'
             ),
-            3,
+            expected_trainer_targets,
         )
 
 

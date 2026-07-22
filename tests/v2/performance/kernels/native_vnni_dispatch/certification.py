@@ -17,7 +17,11 @@ from .corpus import (
 )
 from .exact_oracle import build_exact_winner, candidate_is_eligible
 from .policy_ir import PolicyIR
-from .schema import P95_REGRET_BUDGET, SemanticContract
+from .schema import (
+    MINIMUM_PASSING_DOMAIN_FRACTION,
+    P95_REGRET_BUDGET,
+    SemanticContract,
+)
 from .segmented_policy import (
     GenericDispatchRule,
     domain_promotion_quota_is_satisfied,
@@ -93,6 +97,8 @@ class CertificationReport:
     unexercised_rule_count: int
     unpromoted_domain_count: int
     rule_coverage: tuple[CertificationRuleCoverage, ...] = ()
+    p95_regret_budget: float = P95_REGRET_BUDGET
+    minimum_passing_domain_fraction: float = MINIMUM_PASSING_DOMAIN_FRACTION
 
     @property
     def coverage(self) -> float:
@@ -147,11 +153,12 @@ class CertificationReport:
 
     def passing_domain_count(
         self,
-        p95_regret: float = P95_REGRET_BUDGET,
+        p95_regret: float | None = None,
     ) -> int:
         """Count domains whose observed and conservative p95 are in budget."""
 
-        return sum(result.passes(p95_regret) for result in self.domain_results)
+        budget = self.p95_regret_budget if p95_regret is None else p95_regret
+        return sum(result.passes(budget) for result in self.domain_results)
 
     @property
     def required_domain_count(self) -> int:
@@ -171,19 +178,28 @@ class CertificationReport:
 
     @property
     def over_budget_domains(self) -> tuple[CertificationDomainResult, ...]:
-        """Retain every default-budget exception as explicit diagnostics."""
+        """Retain every certificate-budget exception as diagnostics."""
 
         return tuple(
-            result for result in self.domain_results if not result.passes()
+            result
+            for result in self.domain_results
+            if not result.passes(self.p95_regret_budget)
         )
 
     def require_promotable(
         self,
         *,
-        p95_regret: float = P95_REGRET_BUDGET,
+        p95_regret: float | None = None,
+        minimum_passing_fraction: float | None = None,
     ) -> None:
-        """Fail unless hard gates and the 99%-of-domains p95 quota pass."""
+        """Fail unless hard gates and the frozen promotion criteria pass."""
 
+        budget = self.p95_regret_budget if p95_regret is None else p95_regret
+        minimum_fraction = (
+            self.minimum_passing_domain_fraction
+            if minimum_passing_fraction is None
+            else minimum_passing_fraction
+        )
         failures = []
         if self.coverage != 1.0:
             failures.append(
@@ -201,16 +217,17 @@ class CertificationReport:
             failures.append(f"{self.unexercised_rule_count} generic rule(s) lack sealed exercise")
         if self.verifier_bitwise_failures:
             failures.append(f"{self.verifier_bitwise_failures} verifier byte failure(s)")
-        passing_domains = self.passing_domain_count(p95_regret)
+        passing_domains = self.passing_domain_count(budget)
         required_domains = self.required_domain_count
         if not domain_promotion_quota_is_satisfied(
             passing_domains,
             required_domains,
+            minimum_passing_fraction=minimum_fraction,
         ):
             over_budget = tuple(
                 result
                 for result in self.domain_results
-                if not result.passes(p95_regret)
+                if not result.passes(budget)
             )
             worst = max(
                 over_budget,
@@ -231,7 +248,7 @@ class CertificationReport:
             failures.append(
                 "sealed domain promotion quota "
                 f"{passing_domains}/{required_domains} "
-                "does not reach 99%"
+                f"does not reach {100.0 * minimum_fraction:g}%"
                 f"{detail}"
             )
         if failures:
@@ -301,7 +318,12 @@ def certify_generic_policy(
             out_of_scope_count += 1
             continue
         required_count += 1
-        rule = policy.resolve_generic(domain, key.aggregate_n, key.k)
+        rule = policy.resolve_generic(
+            domain,
+            key.aggregate_n,
+            key.k,
+            key.launch_k_tiles,
+        )
         if rule is None:
             continue
         rule_hits[rule.identity()] += 1

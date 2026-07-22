@@ -26,6 +26,8 @@ from ..profiles import (
     ADAPTIVE_TIMING_CEILING_POLICY,
     ADAPTIVE_TIMING_PROTOCOL,
     ADAPTIVE_TIMING_RECOVERY_WINDOW_MULTIPLIER,
+    CPU_PREFILL_DYNAMIC_WATCHDOG_MULTIPLIER,
+    CPU_PREFILL_DYNAMIC_WATCHDOG_PADDING_US,
     CANDIDATE_EXPANSION_TIMING_STOP_REASON,
     LEGACY_ADAPTIVE_TIMING_CEILING_POLICY,
     SUPPORTED_ADAPTIVE_TIMING_PROTOCOLS,
@@ -479,6 +481,9 @@ def adapt_cpu_prefill_row(
     warmup_max_round_duration_us = float(
         raw["warmup_max_round_duration_us"]
     )
+    complete_round_probe_duration_us = float(
+        raw.get("complete_round_probe_duration_us", "0") or "0"
+    )
     warmup_round_timeout_us = float(raw["warmup_round_timeout_us"])
     timing_order_seed = int(raw["timing_order_seed"])
     global_timing_rounds = int(raw["global_timing_round_count"])
@@ -543,7 +548,7 @@ def adapt_cpu_prefill_row(
         warmup_latency_multiplier, warmup_budget_ceiling_us,
         warmup_budget_us, warmup_duration_us, timing_budget_us,
         warmup_wall_duration_us, warmup_max_round_duration_us,
-        warmup_round_timeout_us,
+        complete_round_probe_duration_us, warmup_round_timeout_us,
         timed_duration_us, stationary_duration_us, stability_limit,
     )):
         raise ValueError("CPU prefill adaptive timing thresholds must be finite")
@@ -652,6 +657,26 @@ def adapt_cpu_prefill_row(
         warmup_wall_duration_us < warmup_max_round_duration_us
     ):
         raise ValueError("CPU prefill warmup round watchdog is invalid")
+    if complete_round_probe_duration_us > 0.0:
+        expected_round_timeout_us = max(
+            MAX_PROMOTION_WARMUP_ROUND_TIMEOUT_US,
+            complete_round_probe_duration_us
+            * CPU_PREFILL_DYNAMIC_WATCHDOG_MULTIPLIER
+            + CPU_PREFILL_DYNAMIC_WATCHDOG_PADDING_US,
+        )
+        if not math.isclose(
+            warmup_round_timeout_us,
+            expected_round_timeout_us,
+            rel_tol=0.0,
+            abs_tol=5.1e-7,
+        ):
+            raise ValueError(
+                "CPU prefill dynamic warmup watchdog disagrees with probes"
+            )
+    elif warmup_round_timeout_us > MAX_PROMOTION_WARMUP_ROUND_TIMEOUT_US:
+        raise ValueError(
+            "CPU prefill legacy warmup watchdog exceeds the reviewed bound"
+        )
     if stop_reason not in {
         "elapsed_stable", "stable_sample_floor", "hard_samples_and_elapsed",
         "hard_samples_and_four_elapsed",
@@ -890,8 +915,11 @@ def adapt_cpu_prefill_row(
             >= minimum_transition_us
             and warmup_policy_complete
             and warmup_duration_us >= warmup_budget_us
-            and warmup_round_timeout_us
-            <= MAX_PROMOTION_WARMUP_ROUND_TIMEOUT_US
+            and (
+                complete_round_probe_duration_us > 0.0
+                or warmup_round_timeout_us
+                <= MAX_PROMOTION_WARMUP_ROUND_TIMEOUT_US
+            )
             and adaptive_sample_complete
             and maximum_samples >= minimum_maximum_samples
             and samples >= minimum_samples
@@ -1027,6 +1055,9 @@ def adapt_cpu_prefill_row(
             "warmup_duration_us": warmup_duration_us,
             "warmup_latency_multiplier": warmup_latency_multiplier,
             "warmup_budget_ceiling_us": warmup_budget_ceiling_us,
+            "complete_round_probe_duration_us": (
+                complete_round_probe_duration_us
+            ),
             "warmup_round_timeout_us": warmup_round_timeout_us,
             "timing_protocol": timing_protocol,
             "timing_ceiling_policy": timing_ceiling_policy,
@@ -1086,6 +1117,12 @@ def adapt_cpu_prefill_csv(
                             int(raw["global_warmup_round_count"]),
                             float(raw["warmup_wall_duration_us"]),
                             float(raw["warmup_max_round_duration_us"]),
+                            float(
+                                raw.get(
+                                    "complete_round_probe_duration_us", "0"
+                                )
+                                or "0"
+                            ),
                             float(raw["warmup_round_timeout_us"]),
                             int(raw["timing_order_seed"]),
                             int(raw["global_timing_round_count"]),

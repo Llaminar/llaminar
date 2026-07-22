@@ -144,6 +144,8 @@ class PairedCellEvidence:
     selected_first_count: int
     exact_first_count: int
     request_id: str = ""
+    observed_path: str = ""
+    exact_observed_path: str = ""
 
     @property
     def pair_count(self) -> int:
@@ -292,6 +294,7 @@ class _RawPairRow:
     candidate_role: str
     candidate_id: str
     latency_us: float
+    observed_path: str
 
 
 def _parse_row(
@@ -313,7 +316,14 @@ def _parse_row(
     backend = raw["backend"].strip().lower()
     if backend not in {"cpu", "cuda", "rocm"}:
         raise ValueError(f"{prefix}: unknown paired backend")
-    expected_phase = "decode_m1" if backend == "cpu" else "decode"
+    m = int(raw["m"])
+    expected_phase = (
+        "decode_m1"
+        if backend == "cpu" and m == 1
+        else "verifier_rows"
+        if backend == "cpu"
+        else "decode"
+    )
     if raw["phase"].strip() != expected_phase:
         raise ValueError(f"{prefix}: wrong paired confirmation surface")
     execution_mode = raw["execution_mode"].strip().lower()
@@ -387,10 +397,21 @@ def _parse_row(
         raise ValueError(f"{prefix}: graph paired timing did not capture")
     if int(raw["repeat_byte_mismatches"]) != 0:
         raise ValueError(f"{prefix}: paired candidate is not repeatable")
-    if not raw["grouped_output_digest"].strip() or not raw[
-        "serial_output_digest"
-    ].strip():
+    grouped_output_digest = raw["grouped_output_digest"].strip()
+    serial_output_digest = raw["serial_output_digest"].strip()
+    if not grouped_output_digest or not serial_output_digest:
         raise ValueError(f"{prefix}: paired output digests are missing")
+    if backend == "cpu" and m > 1 and (
+        int(raw["bit_mismatches"]) != 0
+        or grouped_output_digest != serial_output_digest
+    ):
+        raise ValueError(
+            f"{prefix}: grouped CPU candidate is not byte-identical to serial M1"
+        )
+    # Path labels are backend-owned (for example a CUDA tile family versus a
+    # CPU serial-K route). Preserve the exact normalized value here; the
+    # backend-specific certificate validates it against its frozen contract.
+    observed_path = raw["observed_path"].strip().lower()
 
     key = PairedCellKey(
         backend=backend,
@@ -399,7 +420,7 @@ def _parse_row(
         execution_codebook=int(raw["execution_codebook"]),
         shape=raw["shape"].strip(),
         execution_mode=execution_mode,
-        m=int(raw["m"]),
+        m=m,
         n=int(raw["n"]),
         k=int(raw["k"]),
         architecture_class=(
@@ -431,6 +452,7 @@ def _parse_row(
         candidate_role=role,
         candidate_id=candidate_id,
         latency_us=latency,
+        observed_path=observed_path,
     )
 
 
@@ -438,8 +460,15 @@ def read_paired_confirmation_csv(
     paths: Iterable[Path],
     *,
     minimum_pairs: int = 30,
+    allow_identical_request_ids: frozenset[str] = frozenset(),
 ) -> tuple[PairedCellEvidence, ...]:
-    """Read strict paired shards and return complete cells in stable order."""
+    """Read strict paired shards and return complete cells in stable order.
+
+    ``allow_identical_request_ids`` is reserved for sealed one-candidate
+    domains. Those cells exercise one grouped route twice against the serial
+    byte oracle; they are correctness witnesses, not performance comparisons.
+    Every ordinary paired request must still contain distinct candidates.
+    """
 
     if minimum_pairs < 1:
         raise ValueError("minimum_pairs must be positive")
@@ -519,6 +548,11 @@ def read_paired_confirmation_csv(
             )
 
         role_candidates: dict[str, set[str]] = defaultdict(set)
+        paths_by_role: dict[str, set[str]] = defaultdict(set)
+        for row in rows:
+            paths_by_role[row.candidate_role].add(row.observed_path)
+        if any(len(paths) != 1 for paths in paths_by_role.values()):
+            raise ValueError(f"{key}: paired arithmetic path changed within a role")
         selected = []
         exact = []
         first_counts = {"selected": 0, "exact": 0}
@@ -544,7 +578,10 @@ def read_paired_confirmation_csv(
             raise ValueError(f"{key}: candidate identity changed across pairs")
         selected_id = next(iter(role_candidates["selected"]))
         exact_id = next(iter(role_candidates["exact"]))
-        if selected_id == exact_id:
+        if (
+            selected_id == exact_id
+            and request_id not in allow_identical_request_ids
+        ):
             raise ValueError(f"{key}: selected and exact candidates are identical")
         # A deterministic RNG is allowed to be slightly imbalanced, but a
         # protocol that almost always runs one role first is not interleaved.
@@ -561,6 +598,8 @@ def read_paired_confirmation_csv(
             selected_first_count=first_counts["selected"],
             exact_first_count=first_counts["exact"],
             request_id=request_id,
+            observed_path=next(iter(paths_by_role["selected"])),
+            exact_observed_path=next(iter(paths_by_role["exact"])),
         ))
     if not cells:
         raise ValueError("paired confirmation corpus contains no cells")

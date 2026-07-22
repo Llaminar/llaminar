@@ -44,6 +44,24 @@ class NativeVNNIQwenReleaseGeometryTest(unittest.TestCase):
                 "Qwen3.6-35B-A3B",
             },
         )
+        self.assertEqual(
+            {
+                model.release_id: model.parameter_count_billions
+                for model in QWEN_RELEASE_MODELS
+            },
+            {
+                "Qwen3.5-0.8B": 0.8,
+                "Qwen3.5-2B": 2.0,
+                "Qwen3.5-4B": 4.0,
+                "Qwen3.5-9B": 9.0,
+                "Qwen3.5-27B": 27.0,
+                "Qwen3.5-35B-A3B": 35.0,
+                "Qwen3.5-122B-A10B": 122.0,
+                "Qwen3.5-397B-A17B": 397.0,
+                "Qwen3.6-27B": 27.0,
+                "Qwen3.6-35B-A3B": 35.0,
+            },
+        )
 
     def test_large_moe_and_mtp_geometries_match_official_configs(self) -> None:
         """Exercise the easy-to-miss 122B, 397B, and concatenated MTP shapes."""
@@ -76,6 +94,46 @@ class NativeVNNIQwenReleaseGeometryTest(unittest.TestCase):
             projection_maps["Qwen3.6-27B"]["mtp_hidden_embedding"],
             (5_120, 10_240),
         )
+
+    def test_every_qwen36_mtp_sidecar_projection_has_reviewed_dimensions(self) -> None:
+        """Lock the complete dense and MoE NextN matrices seen in local GGUFs."""
+
+        by_release = {model.release_id: model for model in QWEN_RELEASE_MODELS}
+        actual = {
+            release_id: {
+                projection: (n, k)
+                for projection, n, k in model_projection_geometries(
+                    by_release[release_id]
+                )
+            }
+            for release_id in ("Qwen3.6-27B", "Qwen3.6-35B-A3B")
+        }
+        self.assertEqual(actual["Qwen3.6-27B"], {
+            "attention_q_gate": (12_288, 5_120),
+            "attention_kv": (1_024, 5_120),
+            "attention_output": (5_120, 6_144),
+            "gdn_qkv": (10_240, 5_120),
+            "gdn_z": (6_144, 5_120),
+            "gdn_time": (48, 5_120),
+            "gdn_output": (5_120, 6_144),
+            "mtp_hidden_embedding": (5_120, 10_240),
+            "ffn_gate_up": (17_408, 5_120),
+            "ffn_down": (5_120, 17_408),
+            "lm_head": (248_320, 5_120),
+        })
+        self.assertEqual(actual["Qwen3.6-35B-A3B"], {
+            "attention_q_gate": (8_192, 2_048),
+            "attention_kv": (512, 2_048),
+            "attention_output": (2_048, 4_096),
+            "gdn_qkv": (8_192, 2_048),
+            "gdn_z": (4_096, 2_048),
+            "gdn_time": (32, 2_048),
+            "gdn_output": (2_048, 4_096),
+            "mtp_hidden_embedding": (2_048, 4_096),
+            "expert_gate_up": (512, 2_048),
+            "expert_down": (2_048, 512),
+            "lm_head": (248_320, 2_048),
+        })
 
     def test_release_aliases_collapse_to_geometry_only(self) -> None:
         """Qwen 3.5/3.6 aliases must not duplicate generated dispatch keys."""

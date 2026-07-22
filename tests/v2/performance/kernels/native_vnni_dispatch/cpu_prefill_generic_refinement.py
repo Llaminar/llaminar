@@ -44,14 +44,13 @@ from .cpu_prefill_training_plan import (
 from .format_registry import runtime_aliases
 from .prefill_matrix import (
     CPU_PREFILL_MAXIMUM_WEIGHT_ELEMENTS,
-    PREFILL_M_BUCKETS,
+    CPU_PREFILL_M_BUCKETS,
     cpu_prefill_maximum_weight_elements_for_m,
 )
 from .profiles import MIN_GENERIC_CROSS_VALIDATION_SHAPE_GROUPS
 from .shape_manifest import (
     ShapePartition,
     ShapeRole,
-    load_declared_shape_manifest,
     load_shape_manifest,
 )
 
@@ -1040,14 +1039,8 @@ def read_cpu_prefill_generic_refinement_plan(
         raise ValueError("CPU prefill refinement source state is invalid")
     if plan.route_manifest_digest != route_manifest.digest():
         raise ValueError("CPU prefill refinement plan route manifest changed")
-    if plan.split_manifest_digest != split_manifest.digest():
+    if plan.split_manifest_digest not in split_manifest.accepted_digests():
         raise ValueError("CPU prefill refinement plan split manifest changed")
-    accepted_shape_manifest_digests = {
-        load_shape_manifest().digest(),
-        load_declared_shape_manifest().digest(),
-    }
-    if plan.shape_manifest_digest not in accepted_shape_manifest_digests:
-        raise ValueError("CPU prefill refinement plan shape manifest changed")
     if not plan.obligations or not plan.records:
         raise ValueError("CPU prefill refinement plan is empty")
     if any(
@@ -1065,6 +1058,11 @@ def read_cpu_prefill_generic_refinement_plan(
         )
     ):
         raise ValueError("CPU prefill refinement plan provenance is incomplete")
+    # The manifest digest is immutable provenance, but the shared cross-backend
+    # inventory may grow on an unrelated decode or verifier surface.  Validate
+    # every referenced prefill shape, dimension, partition, route, and record
+    # against the current inventory below instead of invalidating an otherwise
+    # unchanged prefill transaction because an unrelated shape was appended.
     _validate_refinement_inventory(plan, route_manifest, split_manifest)
     return plan
 
@@ -1202,7 +1200,7 @@ def _validate_refinement_inventory(
         if (
             obligation.isa_regime not in ISA_REGIMES
             or obligation.threads <= 0
-            or obligation.m not in PREFILL_M_BUCKETS
+            or obligation.m not in CPU_PREFILL_M_BUCKETS
             or obligation.bundle_signature not in CPU_PREFILL_ROUTE_BUNDLES
         ):
             raise ValueError("CPU prefill refinement obligation is invalid")

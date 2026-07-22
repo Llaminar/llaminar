@@ -366,36 +366,111 @@ def cpu_native_vnni_decode_registry() -> CandidateRegistry:
 
 @lru_cache(maxsize=1)
 def cpu_native_vnni_verifier_registry() -> CandidateRegistry:
-    """Return the two currently forceable CPU grouped verifier schedules."""
+    """Return every economical, serial-row-exact CPU verifier schedule.
 
-    return CandidateRegistry((
+    Pairwise and WideRows preserve the production serial-M1 K partition and
+    therefore remain available for long-K domains.  The full-K families reuse
+    packed-weight decode across rows when serial M1 owns one K tile.  Their
+    distinct task grids and N-block widths are real runtime identities: the
+    all-format admission sweep found winners in every family retained here.
+    """
+
+    common = {
+        "backend": Backend.CPU,
+        "surface": CPU_NATIVE_VNNI_VERIFIER_ROWS,
+        "arithmetic": "serial-M1-shaped ordered dot-product per row-v1",
+        "contracts": (SemanticContract.VERIFIER_SERIAL_M1_BITWISE,),
+        "graph_capture": False,
+        "resources": (
+            "native_vnni_prepared_weights",
+            "prequantized_q8_1_rows",
+        ),
+        "workspace": "cpu-thread-local-accumulators-v1",
+    }
+    entries = [
         _candidate(
-            backend=Backend.CPU,
-            surface=CPU_NATIVE_VNNI_VERIFIER_ROWS,
+            **common,
             candidate_id="cpu.nvnni.verifier.pairwise",
             aliases=("Pairwise", "verifier_rows_pairwise_policy"),
             family="cpu_pairwise_rows",
-            config={"policy": "Pairwise"},
-            arithmetic="serial-M1-shaped ordered dot-product per row-v1",
+            config={
+                "policy": "Pairwise",
+                "route": "decode_equivalent_kpart_rows",
+                "row_tile": 2,
+                "k_tile_policy": "inherit_serial_m1",
+            },
             schedule="cpu-avx512-vnni-pairwise-workshare-v1",
-            contracts=(SemanticContract.VERIFIER_SERIAL_M1_BITWISE,),
-            graph_capture=False,
-            workspace="cpu-thread-local-accumulators-v1",
         ),
         _candidate(
-            backend=Backend.CPU,
-            surface=CPU_NATIVE_VNNI_VERIFIER_ROWS,
+            **common,
             candidate_id="cpu.nvnni.verifier.wide_rows",
             aliases=("WideRows", "verifier_rows_wide_policy"),
             family="cpu_wide_rows",
-            config={"policy": "WideRows"},
-            arithmetic="serial-M1-shaped ordered dot-product per row-v1",
+            config={
+                "policy": "WideRows",
+                "route": "decode_equivalent_kpart_rows",
+                "row_tile": 4,
+                "k_tile_policy": "inherit_serial_m1",
+            },
             schedule="cpu-avx512-vnni-wide-row-workshare-v1",
-            contracts=(SemanticContract.VERIFIER_SERIAL_M1_BITWISE,),
-            graph_capture=False,
-            workspace="cpu-thread-local-accumulators-v1",
         ),
-    ))
+        _candidate(
+            **common,
+            candidate_id="cpu.nvnni.verifier.full_k.row_chunk_grid",
+            aliases=("FullKRowChunkGrid",),
+            family="cpu_native_vnni_grouped_full_k_row_chunk_grid",
+            config={
+                "policy": "FullKRowChunkGrid",
+                "route": "row_chunk_grid",
+                "row_tile": 1,
+                "k_tile_policy": "full_k",
+            },
+            schedule="cpu-native-vnni-grouped-row-chunk-grid-full-k-v1",
+        ),
+    ]
+    for n_block_chunks in (1, 2):
+        entries.append(_candidate(
+            **common,
+            candidate_id=(
+                "cpu.nvnni.verifier.full_k.two_row_n_major."
+                f"nbc{n_block_chunks}"
+            ),
+            aliases=(f"FullKTwoRowNbc{n_block_chunks}",),
+            family="cpu_native_vnni_grouped_full_k_two_row_n_major",
+            config={
+                "policy": f"FullKTwoRowNbc{n_block_chunks}",
+                "route": "two_row_n_major",
+                "row_tile": 2,
+                "n_block_chunks": n_block_chunks,
+                "k_tile_policy": "full_k",
+            },
+            schedule=(
+                "cpu-native-vnni-grouped-two-row-n-major-"
+                f"nbc{n_block_chunks}-full-k-v1"
+            ),
+        ))
+    for n_block_chunks in (1, 2, 4, 8):
+        entries.append(_candidate(
+            **common,
+            candidate_id=(
+                "cpu.nvnni.verifier.full_k.two_row_pair_grid."
+                f"nbc{n_block_chunks}"
+            ),
+            aliases=(f"FullKTwoRowPairGridNbc{n_block_chunks}",),
+            family="cpu_native_vnni_grouped_full_k_two_row_pair_grid",
+            config={
+                "policy": f"FullKTwoRowPairGridNbc{n_block_chunks}",
+                "route": "two_row_pair_grid",
+                "row_tile": 2,
+                "n_block_chunks": n_block_chunks,
+                "k_tile_policy": "full_k",
+            },
+            schedule=(
+                "cpu-native-vnni-grouped-two-row-pair-grid-"
+                f"nbc{n_block_chunks}-full-k-v1"
+            ),
+        ))
+    return CandidateRegistry(entries)
 
 
 @lru_cache(maxsize=1)
@@ -716,20 +791,54 @@ def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
                 workspace="CUDANativeVNNIKPartWorkspace-v2",
             ))
 
+    for grouped_rows in (2, 4, 8, 16, 32, 64):
+        entries.append(_candidate(
+            backend=Backend.CUDA,
+            surface=CUDA_NATIVE_VNNI_GEMV,
+            candidate_id=(
+                "cuda.nvnni.decode.verifier.inherit_serial_m1."
+                f"r{grouped_rows}"
+            ),
+            aliases=(),
+            family="cuda_native_vnni_grouped_rows",
+            config={
+                "family": "inherit_serial_m1",
+                "grouped_rows": grouped_rows,
+            },
+            arithmetic=(
+                "grouped row-dimension decode with frozen public-M1 family, "
+                "tile, exact K partition, and ascending per-row FP32 "
+                "publication-v4"
+            ),
+            schedule=(
+                "cuda-native-vnni-grouped-rows-inherit-serial-m1-"
+                f"r{grouped_rows}-v4"
+            ),
+            contracts=(SemanticContract.VERIFIER_SERIAL_M1_BITWISE,),
+            resources=(
+                "native_vnni_prepared_weights",
+                "ordered_kpart_partials",
+            ),
+            workspace="CUDANativeVNNIKPartWorkspace-v2",
+        ))
     entries.append(_candidate(
         backend=Backend.CUDA,
         surface=CUDA_NATIVE_VNNI_GEMV,
-        candidate_id="cuda.nvnni.decode.verifier.inherit_serial_m1",
-        aliases=("INHERIT_SERIAL_M1", "inherit_serial_m1", "serial_m1"),
-        family="cuda_native_vnni_grouped_rows",
-        config={"family": "inherit_serial_m1"},
+        candidate_id="cuda.nvnni.decode.verifier.tensor_core_mma16",
+        aliases=(),
+        family="cuda_native_vnni_grouped_tensor_core",
+        config={"family": "tensor_core_mma16", "warps_per_block": 4},
         arithmetic=(
-            "grouped row-dimension decode with frozen public-M1 family, tile, "
-            "exact K partition, and ascending per-row FP32 publication-v3"
+            "integer m16n8k32 MMA dot products with production NativeVNNI "
+            "all-format correction, private per-warp tiles, and FP32 "
+            "publication"
         ),
-        schedule="cuda-native-vnni-grouped-rows-inherit-serial-m1-v3",
+        schedule="cuda-native-vnni-grouped-tensor-core-mma16-w4-v2",
         contracts=(SemanticContract.VERIFIER_SERIAL_M1_BITWISE,),
-        resources=("native_vnni_prepared_weights", "ordered_kpart_partials"),
+        resources=(
+            "native_vnni_prepared_weights",
+            "ordered_kpart_partials",
+        ),
         workspace="CUDANativeVNNIKPartWorkspace-v2",
     ))
     return CandidateRegistry(entries)

@@ -2674,7 +2674,6 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_REPACK_STREAMS=<n>` - Stream count hint for startup GPU repack pipeline
      * - `LLAMINAR_ROCM_NVNNI_GEMV_KB=<n>` - Force native-VNNI GEMV K partitions (`-1` = auto)
      * - `LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES=<n>` - Force native-VNNI GEMV target waves per CU (`-1` = auto)
-     * - `LLAMINAR_ROCM_NVNNI_Q8_DIRECT=1` - Force Q8_0 native-VNNI GEMV direct path (KB=1, no reduce kernel)
      * - `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1` - Disable generated ROCm NativeVNNI dispatch tables during trainer sweeps
      * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=0` - Disable multi-stream GDN decode projection GEMVs (default: on outside deterministic mode)
      * - `LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER=0` - Disable grouped MoE decode router logits path (default: on)
@@ -2746,7 +2745,6 @@ namespace llaminar2
         bool nvnni_force_n128 = false;             ///< Force N128 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N128)
         int nvnni_gemv_kb = -1;                    ///< Native-VNNI GEMV K-partition override (-1=auto, 1..64) (LLAMINAR_ROCM_NVNNI_GEMV_KB)
         int nvnni_gemv_target_waves = -1;          ///< Native-VNNI GEMV target waves/CU override (-1=auto) (LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES)
-        bool nvnni_q8_direct = false;              ///< Force Q8_0 native-VNNI GEMV KB=1 direct path (LLAMINAR_ROCM_NVNNI_Q8_DIRECT)
         bool nvnni_atomic_reduce = false;          ///< Fuse GEMV reduce via atomicAdd (eliminates reduce kernel) (LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE)
         bool nvnni_disable_generated = false;      ///< Disable generated ROCm NativeVNNI dispatch tables for trainer sweeps (LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED)
         int ratio_prefill_variant = -1;            ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
@@ -2834,7 +2832,6 @@ namespace llaminar2
             nvnni_force_n128 = false;
             nvnni_gemv_kb = -1;
             nvnni_gemv_target_waves = -1;
-            nvnni_q8_direct = false;
             nvnni_atomic_reduce = false;
             nvnni_disable_generated = false;
             ratio_prefill_variant = -1;
@@ -3131,12 +3128,6 @@ namespace llaminar2
             if (nvnni_gemv_target_waves_env)
             {
                 nvnni_gemv_target_waves = std::clamp(std::atoi(nvnni_gemv_target_waves_env), -1, 64);
-            }
-
-            const char *nvnni_q8_direct_env = std::getenv("LLAMINAR_ROCM_NVNNI_Q8_DIRECT");
-            if (nvnni_q8_direct_env)
-            {
-                nvnni_q8_direct = (std::atoi(nvnni_q8_direct_env) != 0);
             }
 
             const char *nvnni_atomic_reduce_env = std::getenv("LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE");

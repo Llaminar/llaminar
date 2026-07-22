@@ -102,6 +102,76 @@ class NativeVNNIProfilerDiagnosticsTest(unittest.TestCase):
         self.assertEqual(report["cpu_duration_reliability"]["reliable"], 1)
         self.assertEqual(report["cpu_duration_reliability"]["unreliable"], 1)
 
+    def test_fast_slow_contests_calibrate_profiler_feature_direction(self) -> None:
+        """Canonical timing labels useful metric movement without leakage."""
+
+        fast = _descriptor(
+            "candidate-fast",
+            complete_metric=1.0,
+            partial_metric=None,
+            duration_reliable=True,
+        )
+        slow = _descriptor(
+            "candidate-slow",
+            complete_metric=1.5,
+            partial_metric=None,
+            duration_reliable=True,
+        )
+        fast.features.update({
+            "metric.gpu.achieved_occupancy_pct.fraction_mean": 0.80,
+            "metric.gpu.registers_per_thread.maximum_log1p": 3.50,
+            "metric.gpu.decode.effective_gbytes_per_second_log1p": 5.00,
+        })
+        slow.features.update({
+            "metric.gpu.achieved_occupancy_pct.fraction_mean": 0.40,
+            "metric.gpu.registers_per_thread.maximum_log1p": 4.00,
+            "metric.gpu.decode.effective_gbytes_per_second_log1p": 4.00,
+        })
+        catalog = ProfilerFeatureCatalog(
+            corpus_digest="sha256:corpus",
+            request_manifest_digest="sha256:requests",
+            evidence_manifest_digest="sha256:evidence",
+            descriptors={fast.key: fast, slow.key: slow},
+        )
+
+        report = diagnose_profiler_catalog(
+            catalog,
+            source_formats=("Q4_0", "Q4_0"),
+            timing_us_by_key={fast.key: 10.0, slow.key: 20.0},
+        )
+        signal = report["performance_signal"]
+        self.assertEqual(signal["clear_fast_slow_contests"], 1)
+        self.assertEqual(signal["median_slowest_over_fastest"], 2.0)
+        metrics = signal["metrics"]
+        occupancy = metrics[
+            "metric.gpu.achieved_occupancy_pct.fraction_mean"
+        ]
+        self.assertEqual(occupancy["expected_direction"], "higher_is_better")
+        self.assertEqual(occupancy["directional_match_rate"], 1.0)
+        registers = metrics[
+            "metric.gpu.registers_per_thread.maximum_log1p"
+        ]
+        self.assertEqual(registers["expected_direction"], "lower_is_better")
+        self.assertEqual(registers["directional_match_rate"], 1.0)
+        throughput = metrics[
+            "metric.gpu.decode.effective_gbytes_per_second_log1p"
+        ]
+        self.assertEqual(throughput["signal_class"], "profiler_duration_proxy")
+        self.assertEqual(throughput["learner_role"], "diagnostic_only")
+        self.assertEqual(throughput["auxiliary_reliability_weight"], 0.0)
+        self.assertEqual(occupancy["learner_role"], "auxiliary_target")
+        self.assertGreater(occupancy["auxiliary_reliability_weight"], 0.0)
+        self.assertEqual(registers["learner_role"], "runtime_static_input")
+
+        noisy = diagnose_profiler_catalog(
+            catalog,
+            source_formats=("Q4_0", "Q4_0"),
+            timing_us_by_key={fast.key: 10.0, slow.key: 10.2},
+        )
+        self.assertEqual(
+            noisy["performance_signal"]["clear_fast_slow_contests"], 0
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

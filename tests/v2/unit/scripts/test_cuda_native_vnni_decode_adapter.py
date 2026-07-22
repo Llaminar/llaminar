@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tests.v2.performance.kernels.native_vnni_dispatch.adapters.cuda_decode import (  # noqa: E402
     CUDADecodeAdapterContext,
+    adapt_cuda_decode_csv,
     adapt_cuda_decode_row,
     read_cuda_decode_timing_sidecars,
 )
@@ -98,9 +99,13 @@ class CUDANativeVNNIDecodeAdapterTest(unittest.TestCase):
     @classmethod
     def verifier_row(cls) -> dict[str, str]:
         row = cls.fast_row()
+        grouped_candidate = (
+            "cuda.nvnni.decode.verifier.inherit_serial_m1.r4"
+        )
         row.update({
-            "candidate_id": "INHERIT_SERIAL_M1",
+            "candidate_id": grouped_candidate,
             "family": "inherit_serial_m1",
+            "grouped_rows": "4",
             "tile_n": "0",
             "cpt": "0",
             "target_waves": "0",
@@ -109,7 +114,7 @@ class CUDANativeVNNIDecodeAdapterTest(unittest.TestCase):
             "exact_kb": "0",
             "force_two_phase": "0",
             "m": "3",
-            "observed_candidate_id": "INHERIT_SERIAL_M1",
+            "observed_candidate_id": grouped_candidate,
         })
         return row
 
@@ -134,6 +139,11 @@ class CUDANativeVNNIDecodeAdapterTest(unittest.TestCase):
     def test_sixteen_row_verifier_uses_same_bitwise_contract(self) -> None:
         row = self.verifier_row()
         row["m"] = "16"
+        row["grouped_rows"] = "16"
+        row["candidate_id"] = (
+            "cuda.nvnni.decode.verifier.inherit_serial_m1.r16"
+        )
+        row["observed_candidate_id"] = row["candidate_id"]
         observation = adapt_cuda_decode_row(row, self.context())
         self.assertEqual(observation.m, 16)
         self.assertTrue(observation.bitwise_equal)
@@ -141,6 +151,37 @@ class CUDANativeVNNIDecodeAdapterTest(unittest.TestCase):
             observation,
             self.context().serial_m1_policy_hash,
         ))
+
+    def test_parallel_aggregate_adaptation_matches_serial_order(self) -> None:
+        """Byte-range workers must preserve every adapted row and its order."""
+
+        rows = []
+        for index in range(40):
+            row = self.fast_row()
+            row["shape"] = f"StrongSmoke{index:03d}"
+            row["n"] = str(128 + index)
+            rows.append(row)
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "aggregate.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=tuple(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+
+            serial = adapt_cuda_decode_csv(
+                (path,),
+                self.context(),
+                workers=1,
+                parallel_threshold_bytes=1,
+            )
+            parallel = adapt_cuda_decode_csv(
+                (path,),
+                self.context(),
+                workers=2,
+                parallel_threshold_bytes=1,
+            )
+
+        self.assertEqual(parallel.observations, serial.observations)
 
     def test_verifier_byte_mismatch_is_ineligible(self) -> None:
         row = self.verifier_row()
@@ -296,6 +337,26 @@ class CUDANativeVNNIDecodeAdapterTest(unittest.TestCase):
                 writer.writerows(rows)
             evidence = read_cuda_decode_timing_sidecars((path,))
             self.assertEqual(len(evidence), 2)
+
+            # Keep the first group larger so the approximate half-file split
+            # lands inside it and must advance to the second group's boundary.
+            second_group = [
+                {
+                    **row,
+                    "shape": "StrongSmokeSecond",
+                    "sample_measurement_order": "0",
+                }
+                for row in rows
+                if row["candidate_id"] == candidates[0]
+            ]
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows((*rows, *second_group))
+            serial = read_cuda_decode_timing_sidecars((path,), workers=1)
+            parallel = read_cuda_decode_timing_sidecars((path,), workers=2)
+            self.assertEqual(parallel, serial)
+            self.assertEqual(len(parallel), 3)
 
             rows[1]["sample_measurement_order"] = "0"
             with path.open("w", newline="", encoding="utf-8") as handle:

@@ -15,6 +15,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from enum import Enum
+from functools import cached_property
 from pathlib import Path
 from typing import Iterable
 
@@ -75,10 +76,29 @@ class NativeVNNIShapeManifest:
     maximum_cpu_measurement_weight_elements: int
     shapes: tuple[NativeVNNIShape, ...]
 
+    @cached_property
+    def _shapes_by_name(self) -> dict[str, tuple[NativeVNNIShape, ...]]:
+        """Index exact names once while retaining duplicate diagnostics.
+
+        Completeness validation visits every observation in a production
+        corpus.  Scanning the complete shape inventory for each row turns that
+        linear validation into quadratic work.  A tuple-valued index preserves
+        the historical ``by_name`` behavior for manually constructed duplicate
+        manifests while making every normal lookup constant-time.
+        """
+
+        indexed: dict[str, list[NativeVNNIShape]] = {}
+        for shape in self.shapes:
+            indexed.setdefault(shape.name, []).append(shape)
+        return {
+            name: tuple(matches)
+            for name, matches in indexed.items()
+        }
+
     def by_name(self, name: str) -> NativeVNNIShape:
         """Resolve one exact case-sensitive trainer shape name."""
 
-        matches = [shape for shape in self.shapes if shape.name == name]
+        matches = self._shapes_by_name.get(name, ())
         if len(matches) != 1:
             raise KeyError(f"unknown NativeVNNI shape {name!r}")
         return matches[0]
@@ -116,9 +136,9 @@ class NativeVNNIShapeManifest:
         """Return shapes inside the bounded canonical CPU timing envelope.
 
         The full manifest remains the runtime support and cross-backend shape
-        inventory. CPU policy fitting deliberately measures no projection
-        larger than Qwen2.5 32B's LM head so a canonical collection completes
-        in minutes rather than monopolizing both sockets for hours.
+        inventory. CPU policy fitting includes the complete supported release
+        envelope so every exact overlay, including the wider-vocabulary Qwen
+        3.6 MTP heads, receives a measured CPU winner.
         """
 
         if partition is not None and verifier is None:

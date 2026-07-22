@@ -26,9 +26,13 @@ five v7 geometries that were never launched, and reserves three fresh V10
 geometries for the first total-generic certificate. Version 9 adds the four
 Qwen 3.6 35B-A3B MoE production projections to development. Version 10 makes
 production ownership declarative: every canonical production geometry is
-resolved into development in stable measurement-plan order. Versions 8 and 9
-remain readable so in-flight, digest-bound refinement rounds can finish
-without rewriting their historical split identities.
+resolved into development in stable measurement-plan order. Version 11 bounds
+new CPU evidence at M=2048, introduces M=512, and caps geometries owned by a
+14B-or-larger model at M=512. Version 12 profiles sub-14B overlays only at
+M={64,128,256,512} and 14B-or-larger overlays only at M={64,128}. Versions 8
+through 11 remain readable so
+in-flight, digest-bound refinement rounds can finish without rewriting their
+historical split identities.
 """
 
 from __future__ import annotations
@@ -41,29 +45,46 @@ from typing import Iterable, Mapping
 
 from .corpus import ObservationCorpus
 from .prefill_matrix import (
+    CPU_PREFILL_M_BUCKETS,
     CPU_PREFILL_MAXIMUM_WEIGHT_ELEMENTS,
-    PREFILL_M_BUCKETS,
+    HISTORICAL_CPU_PREFILL_M_BUCKETS,
     cpu_prefill_measurements,
 )
 from .shape_manifest import ShapePartition, ShapeRole, load_shape_manifest
 
 
 MANIFEST_PATH = Path(__file__).with_name("manifests") / (
-    "native_vnni_cpu_prefill_split_v10.json"
+    "native_vnni_cpu_prefill_split_v12.json"
 )
-SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v10"
+SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v12"
 LEGACY_SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v8"
 V9_SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v9"
+V10_SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v10"
+V11_SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v11"
 SUPPORTED_SCHEMA_VERSIONS = frozenset((
     LEGACY_SCHEMA_VERSION,
     V9_SCHEMA_VERSION,
+    V10_SCHEMA_VERSION,
+    V11_SCHEMA_VERSION,
     SCHEMA_VERSION,
 ))
+V11_CPU_PREFILL_M_BUCKETS = (64, 256, 512, 1024, 2048)
 V9_QWEN36_MOE_PRODUCTION_SHAPES = frozenset((
     "35BMoE_Expert_GateUp",
     "35BMoE_Expert_Down",
     "Qwen36MoE_GDN_QKVProjection",
     "Qwen36MoE_GDN_ZProjection",
+))
+
+# Version 10 originally appended its declaratively owned production geometries
+# in the order returned by the then-current prefill matrix. The later
+# all-exact-overlay refactor retained the identical shape set but changed that
+# append order, after the original order-sensitive digest had entered signed
+# refinement, lineage, and sealed-witness artifacts. Readers accept this one
+# published identity only after ``__post_init__`` has validated the complete
+# current semantic ownership set.
+V10_HISTORICAL_ORDER_DIGESTS = frozenset((
+    "sha256:f12fe2a80463f7e5ed756332b2fe72aa3034f7815c2c2d074c662a61791f2e01",
 ))
 
 
@@ -97,7 +118,11 @@ class CPUPrefillSplitManifest:
             for shape in shape_manifest.shapes
             if shape.prefill_partition == ShapePartition.DEVELOPMENT
         }
-        if self.schema_version == SCHEMA_VERSION:
+        if self.schema_version in {
+            V10_SCHEMA_VERSION,
+            V11_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+        }:
             if not self.include_all_production_shapes:
                 raise ValueError(
                     "current CPU prefill split must include every production "
@@ -137,10 +162,16 @@ class CPUPrefillSplitManifest:
             raise ValueError(
                 "CPU prefill split requires at least eight fresh sealed geometries"
             )
-        if self.sealed_m_values != PREFILL_M_BUCKETS:
+        if self.schema_version == SCHEMA_VERSION:
+            expected_sealed_m_values = CPU_PREFILL_M_BUCKETS
+        elif self.schema_version == V11_SCHEMA_VERSION:
+            expected_sealed_m_values = V11_CPU_PREFILL_M_BUCKETS
+        else:
+            expected_sealed_m_values = HISTORICAL_CPU_PREFILL_M_BUCKETS
+        if self.sealed_m_values != expected_sealed_m_values:
             raise ValueError(
                 "CPU prefill sealed pool must expose every canonical "
-                f"M bucket; expected={PREFILL_M_BUCKETS!r}"
+                f"M bucket; expected={expected_sealed_m_values!r}"
             )
 
         declared_sealed = {
@@ -184,7 +215,11 @@ class CPUPrefillSplitManifest:
         # The declarative ownership flag was introduced by v10. Omitting it
         # from historical payloads preserves the exact v8/v9 identities that
         # authenticate already-collected evidence and refinement plans.
-        if self.schema_version == SCHEMA_VERSION:
+        if self.schema_version in {
+            V10_SCHEMA_VERSION,
+            V11_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+        }:
             payload["include_all_production_shapes"] = (
                 self.include_all_production_shapes
             )
@@ -194,6 +229,16 @@ class CPUPrefillSplitManifest:
             separators=(",", ":"),
         ).encode()
         return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    def accepted_digests(self) -> frozenset[str]:
+        """Return current and published order-only identities for this split."""
+
+        historical = (
+            V10_HISTORICAL_ORDER_DIGESTS
+            if self.schema_version == V10_SCHEMA_VERSION
+            else frozenset()
+        )
+        return frozenset((self.digest(), *historical))
 
     def shape_names(self, *, sealed: bool) -> frozenset[str]:
         """Return one partition's complete logical geometry inventory."""
@@ -311,7 +356,11 @@ def load_cpu_prefill_split_manifest(
         "sealed_shapes",
         "sealed_m_values",
     }
-    if schema_version == SCHEMA_VERSION:
+    if schema_version in {
+        V10_SCHEMA_VERSION,
+        V11_SCHEMA_VERSION,
+        SCHEMA_VERSION,
+    }:
         expected_fields.add("include_all_production_shapes")
     if set(raw) != expected_fields:
         raise ValueError(

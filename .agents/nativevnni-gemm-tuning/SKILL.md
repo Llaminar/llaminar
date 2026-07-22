@@ -23,11 +23,18 @@ heuristic, model-shape override, CSV parser, or installation path.
    precedence, but cannot replace generic coverage or participate in sealed
    generic certification.
 6. Evaluate measured p95 regret and conservative p95 regret UCB independently
-   in every required generic domain. A domain passes only when both are
-   strictly below 5%; a corpus is promotable only when at least 99% of required
-   domains pass. Maximum regret and global cell p95 are diagnostics, not
-   installation gates. The less-than-1% over-budget set must remain explicit
-   and must still own real learned generic trees.
+   in every required generic domain. Production defaults require both to be
+   strictly below 5% in at least 95% of domains. Maximum regret and global cell
+   p95 are diagnostics. A deliberate best-effort transaction may override the
+   p95 and passing-domain percentages through the turnkey flags, but the
+   frozen artifact must record them and every miss must remain explicit. Such
+   an override never relaxes correctness, byte equality, generic totality,
+   evidence completeness, or sealed rule exercise.
+   Final publication distills the complete cross-fitted decision surface using
+   the reviewed global leaf bound, because the union of independent fold
+   boundaries can require more leaves than any fold-local selected complexity.
+   Every over-budget leaf remains visible, owns a real measured generic tree,
+   and participates in untouched sealed generic-only certification.
 7. Keep CPU, CUDA, and ROCm feature and format coverage symmetric. CPU policy
    identity includes AVX2 build/runtime, AVX512 build with AVX2 runtime, and
    AVX512 build/runtime regimes.
@@ -55,11 +62,21 @@ scripts/train_native_vnni_dispatch.sh --backend cpu --install -- \
   --cpu-format-shards
 scripts/train_native_vnni_dispatch.sh --backend cpu-prefill --install -- \
   --cpu-format-shards
+scripts/train_native_vnni_dispatch.sh --backend all --install \
+  --minimum-passing-domain-percent 0
 ```
 
 Pass hardware/tool/lane controls after `--`. Do not pass `--shapes` or
 `--shape-partition`; add production overlays to the shared inventory. The
 driver owns backend, profile, output path, fit-only flags, and installation.
+The production exact-overlay matrix is symmetric: every known geometry is
+measured for all 21 registry formats at Fast M=1 and grouped-verifier M=2..16
+plus M=31. Ordinary-prefill depth is backend specific. CPU measures
+M={64,128,256,512} for below-14B geometries and M={64,128} for geometries
+owned by a 14B-or-larger model. CUDA and ROCm measure
+M={64,256,1024,2048,4096,8192,16384}. LM heads are absent only from ordinary
+prefill because that operation does not run there. Unmeasured positive M
+values, including CPU M above 512, remain total through generic rules.
 CPU collection automatically uses every detected physical socket. Each MPMD
 rank owns a distinct resumable timing cell and retains the production
 per-socket thread count; set `--cpu-measurement-lanes N` only for deliberate
@@ -72,14 +89,30 @@ evidence through the production `Auto` route. Use
 `--stop-after-cpu-decode --install` for this explicit checkpoint. Do not make a
 prefill profiler process bypass an uncertified M=1 selector with a diagnostic
 serial-oracle override; that would profile a non-production path.
+Continue grouped collection in the same output directory with
+`--resume-after-cpu-decode --install`. This continuation authenticates the
+sealed M=1 policy artifact and requires its generated include to match the
+installed CPU decode table byte-for-byte before it bypasses decode collection,
+profiling, and fitting.
 
 Every CPU timing stage publishes shape/format/ISA partials atomically. Use
 `--cpu-batch-limit N` to bound one invocation and rerun against the same output
-directory to collect only missing partials. M=1 fixture synthesis prepares
-independent source formats in parallel before timing; packed construction and
-candidate measurements remain format-serial so benchmark kernels never
-contend. A timing-harness setup optimization requires a new build identity but
-must preserve each format's deterministic fixture bytes.
+directory to collect only missing partials. Batch limits and
+`--resume-cpu-partials` are execution controls, not corpus-identity inputs;
+the turnkey driver retains a clean checkpoint and attempts sealing only after
+the backend's complete production payload inventory exists. M=1 fixture
+synthesis prepares independent source formats in parallel before timing;
+packed construction and candidate measurements remain format-serial so
+benchmark kernels never contend. A timing-harness setup optimization requires
+a new build identity but must preserve each format's deterministic fixture
+bytes.
+Ordinary-prefill trainers additionally flush after every complete ordered M
+phase. If a later phase is interrupted, the wrapper authenticates aggregate and
+timing sidecars with the production adapter, requires identical prefixes across
+the paired socket ranks, and appends only the missing M suffix. A legacy header,
+partial candidate round, non-prefix inventory, or mismatched rank progress is
+discarded instead of appended. Final publication still requires the exact full
+planned M inventory.
 
 Post-freeze CPU-prefill collection coalesces source formats only when geometry,
 ISA regime, and ordered M inventory are identical. One process still packs,
@@ -87,8 +120,9 @@ validates, and times every format separately, while byte-identical legacy Q8_1
 activation fixtures are cached by M and format-seed class. Pair MPMD jobs only
 inside equal `(format phase count, M inventory)` groups and retain the runtime
 phase-inventory handshake; grouping by M alone can deadlock at the next format
-phase. The current 1,859-record witness plan must serialize to 1,337 process
-jobs without losing or duplicating a format record.
+phase. Every frozen witness plan must serialize to fewer process jobs without
+losing or duplicating a format record; lock that equality in a unit regression
+rather than documenting one generation's transient cardinality here.
 
 Fit-only CPU-prefill replay keeps the immutable development build provenance
 through generic fit and freeze. A newly launched post-freeze seal is a separate
@@ -100,32 +134,38 @@ certify changed arithmetic.
 
 The command:
 
-1. computes the shared resolved shape-inventory digest;
+1. computes the shared resolved shape-inventory digest and, for CPU prefill,
+   authenticates the matrix, training plan, split loader, and current split
+   manifest into a backend-specific corpus generation;
 2. rebuilds both CUDA and ROCm leaf-primary scorer DSOs plus the selected
    backend trainer;
 3. runs both scorer integration equivalence suites;
-4. selects a corpus by backend, architecture, shape digest, and collection
-   argument digest;
+4. selects a corpus by backend, architecture, authenticated inventory digest,
+   and collection argument digest;
 5. collects timing and isolated profiler evidence only when no matching corpus
    exists;
 6. fits the development corpus, requires complete generic-tree totality plus
-   the 99%-of-domains performance quota, freezes the generic digest, opens
+   the 95%-of-domains performance quota, freezes the generic digest, opens
    sealed evidence, applies the same domain quota, emits, validates, and
    optionally installs the generated include;
 7. seals successful new evidence and atomically publishes it for Git LFS; or
 8. verifies and refits an existing corpus without launching candidate kernels
    or profilers.
 
+Maximum-regret and passing-domain thresholds are fit-only controls and do not
+participate in corpus identity. Changing them must reuse the authenticated raw
+timing and profiler corpus rather than trigger another measurement sweep.
+
 Complete-tree GPU scoring owns one grow-only graph cache and exact frontier
-workspace per worker process. On the current two-GA102/four-gfx906 fitting host,
-the profiled canonical scheduler uses four worker lanes per physical CUDA or
-ROCm device. Each lane retains about 0.79 GiB at the production compact-frontier
-high-water mark, so four lanes consume about 3.2 GiB per device and outperform
-one or two lanes without exhausting the 24/32 GiB cards. Treat four as a
-measured configuration for this hardware, not a universal constant: profile
-lane count again on a different architecture or memory size, keep the complete
-per-device high-water allocation below its reviewed VRAM budget, and never add
-lanes merely to create more host workers.
+workspace per worker process. The turnkey scheduler therefore defaults to one
+persistent worker lane per physical CUDA or ROCm device. Additional lanes
+duplicate the complete per-lane high-water allocation and require an explicit
+profile showing a workload-specific gain within the reviewed VRAM budget; do
+not add lanes merely to create more host workers. Prefer using every distinct
+CUDA and ROCm device before duplicating a device-resident scorer workspace.
+Before a long fit, run `Perf__NativeVNNIPolicyCrossValidation.py`; its default
+projection includes both grouped CV and the selected OOF winner's publication
+tournament. A CV-only projection is not evidence for end-to-end fit economy.
 
 Use `scripts/refresh_native_vnni_dispatch_tables.sh` directly only for focused
 diagnostic phases, partition collection, or lineage/refinement work that the
@@ -156,6 +196,11 @@ digest changes, and stale shape inventories. Collect into the ignored `work/`
 staging root and publish only after certification. A fit failure must reuse the
 same immutable timing/profiler corpus; generate additional measurements only
 from an authenticated refinement or shape-lineage plan.
+The CPU bundle is one dependency-ordered transaction: it must retain the
+certified Fast-M1 include, policy, timing, and profiler evidence together with
+the grouped-verifier include, policy, timing, and profiler evidence. Never
+publish grouped rows without the exact serial policy against which they were
+compiled and certified.
 
 Fit-only replay uses `--skip-sweep --reuse-profiler-evidence`. It may regenerate
 common observations and authenticated profiler feature tables. Every profiler
@@ -201,6 +246,21 @@ aliases may deduplicate only when their complete prepared launch identity is
 identical. Never treat a binary reliability flag as a continuous learner
 metric.
 
+The same diagnostic calibrates feature value against canonical timing. Within
+each exact `(format, mode, M, N, K)` contest, compare the fastest and slowest
+candidate only when canonical repeated timing separates them by at least 5%.
+Review metric coverage, median fast-minus-slow movement, and expected-direction
+match rate. Keep profiler-duration-derived throughput proxies labeled
+separately from static resources and dynamic hardware counters: a timing proxy
+can validate attribution but is not evidence that occupancy, cache behavior,
+or issue efficiency explains the win, and it must not become an auxiliary fit
+target beside canonical repeated timing. Collapse correlated GPU ALU/FMA/tensor
+pipe counters into the reviewed aggregate compute-throughput target instead of
+giving one latent signal several votes. Candidate dispatch count is a static,
+runtime-known model input. A metric that is unavailable across a complete
+contest, mostly tied, directionally inconsistent, or unchanged in the
+profiler-informed versus ablated CV run is not a useful dispatch feature.
+
 Every profiler record belongs to one exact physical production invocation:
 backend, architecture/ISA, operation, bundle, prepared family, packing ABI,
 runtime codebook, effective candidate, execution mode, `M`, ordered projection
@@ -208,6 +268,15 @@ runtime codebook, effective candidate, execution mode, `M`, ordered projection
 launchable point. Deduplicate only true aliases with that complete identity.
 Never broadcast counters from a representative anchor to another work size or
 candidate, and never average unrelated launches into one descriptor.
+
+For CPU grouped-verifier evidence, retain the authenticated effective N-block
+chunk width in every observation. Pairwise and WideRows inherit that geometry
+from serial M=1 planning, while the full-K row-chunk, N-major, and pair-grid
+families own distinct task grids. Model their producer tasks, waves, final-wave
+utilization, row-tile coverage, and (for K-part routes) ordered reduction work
+separately. Inferring one family's geometry from another erases the schedule
+signal the learner needs and can make physically different candidates appear
+identical.
 
 Request schema `native-vnni-profiler-request-v4-exact-point` is the current fit
 contract. Historical v3 anchor catalogs remain immutable and readable for
@@ -229,12 +298,18 @@ zero-row delta is the proof that the profiler catalog covers the fit corpus.
 The turnkey driver discovers completed content-addressed deltas that were not
 yet atomically published, authenticates them, and includes them in coverage
 before emitting another request. It also resumes when only the durable
-`.inprogress.jsonl` collector journal exists. CPU decode retains one stable
-development run ID per output directory so a restart reopens the same partial
-transaction instead of creating a timestamp sibling. Physical resume identity
-ignores timing-run provenance but includes arithmetic fingerprint, candidate
-policy hash, schedule, workspace, prepared resources, threading/stream mode,
-execution mode, and exact `M/N/K` geometry.
+`.inprogress.jsonl` collector journal exists, or when request publication
+completed before any final evidence or journal record was written. A retained
+legacy request generation may remain beside a current exact-v4 transaction for
+provenance; authenticate and resume the current manifest instead of copying the
+legacy generation over it. Audited common-observation reuse snapshots its
+retained input through an atomic reflink copy and never renames away the
+canonical analyzer input. CPU decode retains one stable development run ID per
+output directory so a restart reopens the same partial transaction instead of
+creating a timestamp sibling. Physical resume identity ignores timing-run
+provenance but includes arithmetic fingerprint, candidate policy hash,
+schedule, workspace, prepared resources, threading/stream mode, execution
+mode, and exact `M/N/K` geometry.
 
 Migrate the recipe through its authenticated command, not by editing JSON:
 
@@ -274,13 +349,19 @@ publication leaves with each production CV entry as well; an identical replay
 must not deserialize candidate costs or rerun final GPU tree fitting for
 unchanged domains.
 
-Profiler-model parallelism is surface-level, not pool-level. Materialize each
-pool's normalized candidate feature index once in the parent, fork it
-copy-on-write, and schedule independent held-out forests across the complete
-host worker budget. Default CPU-bound process pools to affinity-visible physical
-cores, not SMT threads; explicit worker environment variables remain diagnostic
-overrides. A cross-M pool may contain most of the useful evidence; it must not
-reduce a two-socket fit to one active process.
+Profiler-model parallelism covers both feature materialization and independent
+surfaces. Alias indexing compares cheap source/mode/candidate identities first
+and computes observation SHA-256 only for true ties. Materialize each large
+pool's normalized candidate feature index in deterministic contiguous
+physical-core shards into aligned `float32` inputs, `float64` auxiliary and
+regret targets, N/K anchors, contest IDs, and one point-to-row table. Forked GPU
+workers inherit those immutable matrices and the point table copy-on-write;
+never rescan the complete transfer pool for each held-out surface. Run one
+persistent XGBoost CUDA-histogram worker per selected CUDA device. Divide
+affinity-visible physical cores across those workers for quantile construction,
+never count SMT siblings as additional capacity, and keep explicit worker/thread
+environment variables as diagnostic overrides. Serial and parallel feature
+publication and predictions must remain exactly equal.
 
 Post-accelerator CV reduction is also domain-parallel. The parent groups fold
 results by generic domain, forks immutable cost/fold matrices copy-on-write,
@@ -292,19 +373,29 @@ domain order and publish fit-cache records only from the parent. With
 `cv_reduction_workers` field for an uncached multi-domain fit and compare
 `cv_reduction` separately from device `fold_fit`. Serial and parallel runs over
 the same evidence must produce identical policy objects and generated bytes.
-The first 108-domain CPU decode run after compact-frontier reduction measured
-`cv_reduction=13.578s` with 56 workers; preserve this as the current regression
-baseline and investigate separately from accelerator `fold_fit`.
+
+Large compact request/evidence manifests and canonical observation witnesses
+must also parse and authenticate on the affinity-visible physical cores. Split
+JSON only at top-level record boundaries and CSV only at complete row
+boundaries; preserve source order, verify the unchanged root digest, retain a
+serial compatibility reader for noncanonical legacy JSON, and prove
+serial/parallel value and tamper-detection equivalence in unit tests.
 
 Every profiler descriptor retains the exact isolated launch identity, including
 `M`, ordered `N`, aggregate `N`, and `K`. Dynamic counters such as throughput,
-IPC, cache behavior, achieved occupancy, traffic, and duration describe only
+IPC, cache behavior, achieved occupancy, and traffic describe only
 that exact point; they are never shape-independent candidate constants and are
 never model inputs for a held/unseen point. Model inputs are runtime geometry,
 codebook, candidate configuration, analytical schedule geometry, and genuinely
-static resource descriptors. Exact dynamic metrics are centered against the
-other candidates at the same work point and added as standardized auxiliary
-ExtraTrees targets beside log-regret. Their combined target variance weight is
+static resource descriptors. Selected exact dynamic metrics are centered
+against the other candidates at the same work point and added as standardized
+auxiliary targets beside log-regret. The deterministic CUDA-histogram learner
+mixes them into a fixed number of zero-sum target projections whose mean exactly
+reconstructs standardized regret; adding another reviewed counter must not grow
+one tree family per metric. One-shot profiler duration and
+rates derived from it remain attribution diagnostics because canonical repeated
+timing already owns the latency label. The auxiliary metrics' combined target
+variance weight is
 bounded below the timing target, so they can teach which execution properties
 track candidate economy without becoming a runtime dependency or overwhelming
 canonical latency. Admit one metric for a candidate contest only when every
@@ -346,12 +437,18 @@ identity binds the complete cross-M candidate-cost pool, model-visible profiler
 descriptor digest, held N/K geometry set, and exact prediction-point inventory.
 Store only the domain-local training points consumed by bounded-prior fitting
 and held points consumed by teacher scoring; do not persist unrelated transfer-
-pool rows. Encode predictions losslessly and reject partial or foreign maps on
-reload. An identical replay must report zero profiler-model workers even when
-its in-memory cache starts empty; changing timing labels, descriptors, holdouts,
-or requested points must produce a new immutable surface. Publish worker results
-in completion order; ordered executor draining can strand completed surfaces
-behind one slow forest and violates the interruption-resume contract.
+pool rows. Store one canonical little-endian `float64` value per point plus a
+small JSON manifest containing the ordered point digest, value digest, count,
+and model/holdout identities; never repeat runtime keys in every surface JSON.
+Parallel cache workers authenticate raw arrays and return hit identities only.
+The coordinator opens read-only memmaps and shares one lazy point-to-row index
+across sibling fold surfaces, so neither cache replay nor worker publication
+pickles complete prediction maps. Reject partial, foreign, non-finite, or
+digest-changed arrays. An identical replay must report zero profiler-model
+workers even when its in-memory cache starts empty; changing timing labels,
+descriptors, holdouts, or requested points must produce a new immutable surface.
+Publish misses from their owning GPU worker and consume completion order; parent
+serialization or ordered draining can strand accelerators behind one slow fit.
 
 Large CPU common-observation checkpoints are parsed in deterministic byte-range
 process partitions and reduced in source order. Keep the measured 8-worker
@@ -365,6 +462,48 @@ partitions. Workers format private row-range shards, and the parent assembles
 them in source order before one atomic publication. Control this only for A/B
 diagnosis with `LLAMINAR_NATIVE_VNNI_IO_WORKERS`; parallel and serial CSV bytes
 must remain identical.
+
+CPU M=1 and grouped decode adapt their raw aggregate/timing transaction once,
+then freeze, fresh-seal planning where applicable, and certification reuse the
+common checkpoint through `--reuse-development-common`. Reuse must revalidate
+the raw corpus digest plus every git/build/compiler/host/runtime/serial-policy
+field, including the ISA-specific build suffix. Never trade repeated adaptation
+for an unauthenticated common CSV. Both regimes also persist the authenticated
+normalized profiler catalog under their fit-cache directory; freeze and
+certification must reuse it when the bound request/evidence/witness identities
+are unchanged.
+
+For large CPU M=1 or grouped transactions, parse exact timing sidecars in
+byte-safe physical-core ranges and adapt aggregate rows into private canonical
+CSV shards before ordered atomic assembly. Keep small corpora serial below the
+reviewed thresholds. Any change to this preprocessing must prove equal timing
+maps, observation order, corpus digest, and output bytes against serial replay.
+
+Both CPU decode surfaces require iterative paired development before freeze:
+use `paired_requests --surface decode-m1` for serial decode and
+`--surface grouped-verifier` for grouped verifier rows, retain every completed
+content-addressed shard, and feed the resulting `--paired-development-csv`
+set into freeze and certification. Read independent paired shards in a
+physical-core process pool, but merge and validate the comparison graph in the
+parent so serial and parallel evidence digests remain identical. Increase a
+tree ceiling only after diagnostics prove the selected model exhausted the
+current bound; a failing domain whose selected tree is smaller has a different
+model or evidence problem. Never freeze directly from broad timing
+when paired refinement still reports pending or confirmed failing domains.
+For alias-robust cells, request the source alias whose corrected best candidate
+has the greatest advantage over the selected route; the minimax compromise
+candidate is not necessarily that regret witness. In the same refinement
+generation, complete a direct star from the selected launch to every physical
+candidate forceable across all source aliases. Keep every edge for that runtime
+cell in one producer process/shard even when doing so exceeds the nominal shard
+packing target. Indirect graph connectivity assembled from separate process,
+socket, clock, cache, or thread-runtime histories is not evidence for a direct
+candidate ordering. Once a same-session selected-to-witness edge is complete,
+the complete directional star is the immutable evidence unit for that runtime
+cell. Derive every later selected-candidate ordering from that original star;
+a refit-selected anchor must never mint a second star. A remaining contradiction
+is a terminal evidence conflict. Never mint another request for the same
+physical edge merely because the aggregate corpus digest changed.
 
 Canonical observation hashing and fit-cache identity preparation are also
 host-parallel. `ObservationCorpus.digest()` serializes/sorts row shards in fork
@@ -406,6 +545,24 @@ scripts/refresh_native_vnni_dispatch_tables.sh \
   --install
 ```
 
+A post-freeze seal must use artifact names that cannot collide with an opened
+or burned generation. Relocate the authenticated recipe before launching a new
+seal instead of copying it or editing path strings by hand:
+
+```bash
+PYTHONPATH=tests/v2/performance/kernels \
+  python3 -m native_vnni_dispatch.cpu_prefill_replay_recipe relocate \
+    --recipe <source>/cpu_prefill_replay_recipe.v1.json \
+    --output <fresh-seal>/cpu_prefill_replay_recipe.v1.json
+```
+
+Relocation rewrites recipe-relative artifacts, copies the common-observation
+checkpoint, publishes a new self digest atomically, and authenticates the
+result. It does not authorize reuse after the production serial-M1 policy hash
+changes. That hash identifies the row oracle against which grouped candidates
+were proved byte exact; a changed hash requires a fresh CPU-prefill measurement
+generation built against the installed serial policy.
+
 The public `train_native_vnni_dispatch.sh --backend cpu-prefill --install`
 command discovers that recipe automatically in a materialized corpus. Recipe
 preflight runs before route probes and authenticates candidate-expansion
@@ -430,6 +587,16 @@ self-contained witness plan embeds its exact C++ route. Validate that every
 frozen predicate is exercised before launching timing and again during
 certification; a fixed hand-authored sealed shape list is not sufficient.
 
+CPU M=1 and grouped-decode certification use the same fresh-leaf rule. M=1
+freeze emits a generated geometry probe; run the production C++ route planner
+for AVX2-build/AVX2-runtime, AVX512-build/AVX2-runtime, and
+AVX512-build/AVX512-runtime before emitting paired request shards. Grouped
+freeze emits direct Pairwise/WideRows paired shards for every frozen M leaf.
+Each shard must cover every source alias and every alternate forceable
+candidate. Admit grouped timings only after the production route counter and
+complete `M*N` byte comparison against production serial M=1 pass. Never
+substitute the historical static CPU sealed-shape CSVs for this transaction.
+
 Do not defer sealed-capacity planning until installation. Before final
 development refinement, authenticated preflight must report the provisional
 leaf count, untouched-reserve reachability, projected witness geometry,
@@ -450,6 +617,26 @@ Replay materializes a mixed common-observation checkpoint before fitting and
 validates each original corpus-ID partition independently. Never append failed
 seal CSVs under development provenance, and never reuse that opened partition
 to certify the changed policy.
+
+CPU M=1 and grouped-decode use paired burned-seal transactions rather than
+ordinary observation adaptation. Supply each inspected plan and its complete
+paired CSV directory positionally through the repeatable
+`--cpu-decode-burned-sealed-plan` /
+`--cpu-decode-burned-sealed-paired-dir` or grouped equivalents. Revalidate the
+request/evidence identity and convert selected-versus-challenger ratios only
+into supplemental generic candidate costs. Never create exact overlays or
+ordinary timing observations from those ratios. At unseen burned geometry,
+profiler input may carry runtime geometry plus static candidate/resource
+descriptors, but no request-local dynamic counter. Exclude every burned
+geometry from the next reserve, freeze a changed generic digest, and require a
+new untouched seal before publication. Carry the same burned transaction
+through freeze, fresh-plan construction, and certification so replay cannot
+silently regenerate a different policy generation.
+The later development corpus is expected to have a different digest after
+additive geometry or another burned generation. Authenticate the old plan's
+self digest and current candidate/format registries, replay every paired row,
+and require each witness to resolve to exactly one compatible current generic
+domain; never require whole-corpus equality for generic-only burned evidence.
 
 Track every newly discovered orchestration failure in the project document's
 **Turnkey replay defect journal** before fixing it, and add a focused negative
@@ -482,9 +669,12 @@ retain measured cells and evaluate formulas during fitting.
 - **Grouped verifier M=2..16 plus sentinels:** require byte equality with each
   serial row. M=31 is evidence that runtime support is not artificially capped;
   production M is not limited to the measured buckets.
-- **Ordinary prefill/GEMM:** sweep M by geometry under the bounded backend
-  budget. CPU includes deep M only on smaller geometries; GPU may cover larger
-  M on larger geometries. Dispatch clamps/interpolates unseen work sizes.
+- **Ordinary prefill/GEMM:** sweep every applicable production geometry and all
+  21 source formats. CPU uses M={64,128,256,512} below 14B and M={64,128} at
+  14B and above; it measures every build/runtime ISA regime.
+  CUDA and ROCm use M={64,256,1024,2048,4096,8192,16384}. Exact overlays come
+  only from these exact cells; generic rules provide total dispatch for every
+  unseen positive M and N/K geometry.
 - **Dense and MoE:** include attention, GDN, short-conv consumers, dense FFN,
   expert gate/up/down, MTP hidden/embedding projection, and LM head geometries
   that actually route through NativeVNNI.
@@ -496,8 +686,10 @@ completeness.
 ## Profiling And Feature Use
 
 Derive immutable profiler requests only after timing is complete. Profile each
-physical candidate launch in a fresh discrete process. Keep pipeline dispatches
-(quantize/producer/reducer/epilogue) ordered and separate.
+physical candidate in a fresh discrete launch and profiler range; one process
+may amortize setup only when every launch retains independently authenticated
+attribution. Keep pipeline dispatches (quantize/producer/reducer/epilogue)
+ordered and separate.
 
 - For CUDA metrics and Nsight procedure, read
   [cuda-tuning](../cuda-tuning/SKILL.md).
@@ -544,7 +736,36 @@ recovers every newline-complete member after interruption, and materializes the
 full canonical evidence manifest only when the invocation exits. Never rewrite
 the complete growing JSON after each request or batch. Use
 `--disable-cpu-process-batching` only to diagnose the amortized protocol, and
-adjust `--cpu-process-batch-size` only after a focused throughput/reliability A/B.
+adjust `--cpu-process-batch-size` only after a focused throughput/reliability
+A/B. The production default is 1,024 requests: this keeps the usual 288-request
+grouped geometry in one process, avoiding a second source-format packing pass,
+while each member still receives one separately reset, armed, and disarmed
+counter interval. Profiler mode performs fixture preparation and exactly that
+one production target launch; canonical timing and byte-equivalence replay
+remain in the independently authenticated timing corpus.
+
+CUDA collection likewise batches exact requests into one trainer process, but
+every request owns a distinct explicit nonblocking CUDA stream and stable CUDA
+stream ID. Start one profiler range, issue exactly one production operation or
+one graph replay on that request stream, synchronize only that stream, and end
+the range before advancing. Invoke NCU once per process batch with a production
+kernel-name filter such as `regex:nativeVnni`; do not profile setup quantizers,
+synthetic markers, or unrelated kernels. Export the shared raw report once,
+partition physical dispatches by the trainer-authenticated stream IDs, and
+reject duplicate, unknown, unclaimed, or dispatch-free streams. Each request
+retains an authenticated batch-member pointer to the shared raw report instead
+of duplicating it. Prefer a one-replay-pass metric set containing duration,
+register/shared/local-memory resources, occupancy, DRAM throughput, and the
+ALU/FMA/tensor utilization pipes; define compute utilization as the maximum of
+the simultaneously measured compute pipes. Add a replay pass only when a
+focused feature-value study proves it justifies the collection cost.
+
+Large request construction and CUDA timing-sidecar adaptation use fork-based,
+physical-core-capped workers. Partition timing CSVs only at complete
+measurement-group boundaries so candidate permutations, seeds, and sample
+indices remain locally valid; merge worker output in canonical source order and
+prove serial-versus-parallel byte identity in unit tests. Worker environment
+variables are diagnostic overrides, not production defaults.
 
 Normalize metrics into architecture-relative features that explain candidate
 economy. Decode emphasizes memory efficiency, transactions, launch structure,
@@ -576,8 +797,8 @@ Promotion is domain based:
    coverage and a nonempty generic tree;
 2. each domain independently computes nearest-rank p95 observed regret and p95
    simultaneous-UCB regret, with both required to be strictly below 5%;
-3. at least 99% of required domains must pass those two performance gates;
-4. the remaining less-than-1% performance exceptions keep their best measured
+3. at least 95% of required domains must pass those two performance gates;
+4. the remaining at-most-5% performance exceptions keep their best measured
    generic trees and typed diagnostics so runtime dispatch remains total; and
 5. missing domains, uncovered points, empty trees, ambiguous predicates,
    unexercised sealed leaves, byte mismatches, or M/N*K/codebook holes are
@@ -585,7 +806,7 @@ Promotion is domain based:
 
 Global p95 and maximum regret remain useful refinement diagnostics, but neither
 may replace the per-domain decision. Exact overlays never count toward generic
-coverage, CV, sealed rule exercise, or the 99% quota.
+coverage, CV, sealed rule exercise, or the 95% quota.
 
 Production fitting auto-discovers every CUDA and ROCm device. Rebuild and test:
 

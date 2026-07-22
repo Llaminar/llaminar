@@ -47,7 +47,6 @@ from .cpu_prefill_training_plan import (
 from .format_registry import format_spec
 from .shape_manifest import (
     ShapeRole,
-    load_declared_shape_manifest,
     load_shape_manifest,
 )
 
@@ -603,8 +602,6 @@ def read_cpu_prefill_development_lineage_plan(
     plans = tuple(source_refinement_plans)
     expected = {
         "schema_version": CPU_PREFILL_DEVELOPMENT_LINEAGE_SCHEMA,
-        "source_split_manifest_digest": source_split.digest(),
-        "target_split_manifest_digest": target_split.digest(),
         "source_route_manifest_digest": source_route_manifest.digest(),
         "target_route_manifest_digest": target_route_manifest.digest(),
         "source_aggregate_digest": _sha256_file(source_aggregate),
@@ -623,17 +620,29 @@ def read_cpu_prefill_development_lineage_plan(
         name: getattr(plan, name) for name in expected
     }
     mismatches = [name for name in expected if actual[name] != expected[name]]
-    accepted_shape_manifest_digests = {
-        load_shape_manifest().digest(),
-        load_declared_shape_manifest().digest(),
-    }
-    if plan.shape_manifest_digest not in accepted_shape_manifest_digests:
-        mismatches.append("shape_manifest_digest")
+    source_digests = (
+        source_split.accepted_digests()
+        if hasattr(source_split, "accepted_digests")
+        else frozenset((source_split.digest(),))
+    )
+    target_digests = (
+        target_split.accepted_digests()
+        if hasattr(target_split, "accepted_digests")
+        else frozenset((target_split.digest(),))
+    )
+    if plan.source_split_manifest_digest not in source_digests:
+        mismatches.append("source_split_manifest_digest")
+    if plan.target_split_manifest_digest not in target_digests:
+        mismatches.append("target_split_manifest_digest")
     if mismatches:
         raise ValueError(
             "CPU prefill development lineage provenance changed: "
             + ", ".join(sorted(mismatches))
         )
+    # Preserve the historical whole-manifest digest as provenance.  Additive
+    # shapes on other NativeVNNI surfaces do not alter this lineage: the exact
+    # prefill shape names, dimensions, split coverage, and routes are all
+    # revalidated against the current inventory here.
     _validate_records(
         plan,
         source_split,

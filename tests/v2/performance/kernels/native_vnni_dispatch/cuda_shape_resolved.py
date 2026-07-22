@@ -16,7 +16,7 @@ from functools import lru_cache
 from typing import Iterable
 
 from .candidate_registry import CandidateSpec, cuda_native_vnni_gemv_registry
-from .corpus import ObservationCorpus, RuntimeKey, runtime_key
+from .corpus import GenericDomain, ObservationCorpus, RuntimeKey, runtime_key
 from .schema import NativeVNNIObservation, SemanticContract
 
 
@@ -178,6 +178,7 @@ def resolve_cuda_formula_kb(candidate: CandidateSpec, n: int, k: int) -> int:
     raise ValueError(f"unknown CUDA KB formula kind {formula_kind!r}")
 
 
+@lru_cache(maxsize=None)
 def resolve_cuda_concrete_candidate_id(
     candidate: CandidateSpec,
     n: int,
@@ -206,6 +207,8 @@ def resolve_cuda_concrete_candidate_id(
 
 def project_cuda_shape_resolved_candidates(
     corpus: Iterable,
+    *,
+    known_generic_domain: GenericDomain | None = None,
 ) -> ObservationCorpus:
     """Add formula observations backed one-for-one by direct exact evidence.
 
@@ -220,7 +223,11 @@ def project_cuda_shape_resolved_candidates(
     rows_in_corpus = tuple(corpus)
     registry = cuda_native_vnni_gemv_registry()
     formulas = tuple(
-        (candidate, candidate.candidate_policy_hash())
+        (
+            candidate,
+            candidate.candidate_policy_hash(),
+            candidate.config_json,
+        )
         for candidate in registry.entries
         if candidate.config_json.get("family") == "kpar_formula"
     )
@@ -253,7 +260,7 @@ def project_cuda_shape_resolved_candidates(
         for row in rows:
             if row.candidate_id == row.effective_candidate_id:
                 concrete_rows[row.effective_candidate_id].append(row)
-        for formula, candidate_policy_hash in formulas:
+        for formula, candidate_policy_hash, formula_config in formulas:
             resolution_key = (
                 formula.candidate_id,
                 key.aggregate_n,
@@ -270,10 +277,19 @@ def project_cuda_shape_resolved_candidates(
                     source,
                     candidate_id=formula.candidate_id,
                     candidate_family=formula.candidate_family,
-                    config_json=formula.config_json,
+                    config_json=formula_config,
                     generic_eligible=True,
                     arithmetic_fingerprint=formula.arithmetic_fingerprint,
                     candidate_policy_hash=candidate_policy_hash,
                 )
                 projected.append(projection)
-    return ObservationCorpus._from_validated(projected)
+    # Source identities were already proven by their owning corpus. Every new
+    # formula row takes all nominal identity fields from one immutable registry
+    # entry, so a second config-dictionary comparison over millions of aliases
+    # cannot discover new information. Runtime/domain indices are still built
+    # normally and the projection regression validates generated row schemas.
+    return ObservationCorpus._from_validated(
+        projected,
+        revalidate_candidate_identities=False,
+        known_generic_domain=known_generic_domain,
+    )

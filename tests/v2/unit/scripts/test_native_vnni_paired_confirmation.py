@@ -137,6 +137,38 @@ class NativeVNNIPairedConfirmationTest(unittest.TestCase):
         ))
         report.require_promotable()
 
+    def test_candidates_may_use_distinct_stable_arithmetic_paths(self) -> None:
+        """A tournament compares routes; only per-role route drift is invalid."""
+
+        rows = self._rows(request_id="cuda-pair-distinct-routes")
+        for row in rows:
+            if row["candidate_role"] == "exact":
+                row.update({
+                    "observed_path": "direct",
+                    "observed_tile_n": "64",
+                    "observed_cpt": "1",
+                    "observed_effective_kb": "0",
+                })
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "distinct-routes.csv"
+            self._write(path, rows)
+            cells = read_paired_confirmation_csv((path,))
+
+        self.assertEqual(cells[0].observed_path, "kpar")
+        self.assertEqual(cells[0].exact_observed_path, "direct")
+
+    def test_arithmetic_path_drift_within_one_role_fails_closed(self) -> None:
+        """Repeated pairs must execute one stable route for each candidate."""
+
+        rows = self._rows(request_id="cuda-pair-route-drift")
+        exact_rows = [row for row in rows if row["candidate_role"] == "exact"]
+        exact_rows[0]["observed_path"] = "direct"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "route-drift.csv"
+            self._write(path, rows)
+            with self.assertRaisesRegex(ValueError, "changed within a role"):
+                read_paired_confirmation_csv((path,))
+
     def test_vectorized_bootstrap_is_invariant_to_worker_count(self) -> None:
         """Parallel partitioning cannot alter a retained certificate."""
 
@@ -189,6 +221,32 @@ class NativeVNNIPairedConfirmationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "order is incomplete"):
                 read_paired_confirmation_csv((path,))
 
+    def test_identical_candidates_require_an_explicit_sealed_witness_id(
+        self,
+    ) -> None:
+        """Ordinary tournaments cannot silently compare one route to itself."""
+
+        request_id = "cpu-single-forceable-witness"
+        rows = self._rows(request_id=request_id)
+        for row in rows:
+            row["candidate_id"] = "cpu.nvnni.verifier.pairwise"
+            row["observed_candidate_id"] = row["candidate_id"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "identical.csv"
+            self._write(path, rows)
+            with self.assertRaisesRegex(ValueError, "are identical"):
+                read_paired_confirmation_csv((path,))
+            cells = read_paired_confirmation_csv(
+                (path,),
+                allow_identical_request_ids=frozenset({request_id}),
+            )
+
+        self.assertEqual(len(cells), 1)
+        self.assertEqual(
+            cells[0].selected_candidate_id,
+            cells[0].exact_candidate_id,
+        )
+
     def test_unobserved_forced_route_blocks_confirmation(self) -> None:
         """Timing a dispatcher substitute cannot certify the named schedule."""
 
@@ -198,6 +256,59 @@ class NativeVNNIPairedConfirmationTest(unittest.TestCase):
             path = Path(directory) / "route.csv"
             self._write(path, rows)
             with self.assertRaisesRegex(ValueError, "did not execute"):
+                read_paired_confirmation_csv((path,))
+
+    def test_grouped_cpu_pairs_require_serial_byte_identity(self) -> None:
+        """M>1 CPU evidence must independently prove complete-row equality."""
+
+        rows = self._rows(request_id="cpu-grouped-pair-unit")
+        for row in rows:
+            role = row["candidate_role"]
+            candidate = f"cpu.nvnni.verifier.{role}"
+            row.update({
+                "backend": "cpu",
+                "architecture_class": (
+                    "test|build=AVX512|runtime=AVX512|threads=28"
+                ),
+                "phase": "verifier_rows",
+                "m": "15",
+                "candidate_id": candidate,
+                "observed_candidate_id": candidate,
+                "observed_path": "grouped-verifier-rows",
+                "grouped_output_digest": "fnv1a64:1111111111111111",
+                "serial_output_digest": "fnv1a64:1111111111111111",
+            })
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grouped.csv"
+            self._write(path, rows)
+            cells = read_paired_confirmation_csv((path,))
+
+        self.assertEqual(len(cells), 1)
+        self.assertEqual(cells[0].key.m, 15)
+        self.assertEqual(cells[0].observed_path, "grouped-verifier-rows")
+
+    def test_grouped_cpu_digest_mismatch_blocks_confirmation(self) -> None:
+        """A producer pass flag cannot conceal non-identical grouped bytes."""
+
+        rows = self._rows(request_id="cpu-grouped-byte-failure")
+        for row in rows:
+            role = row["candidate_role"]
+            candidate = f"cpu.nvnni.verifier.{role}"
+            row.update({
+                "backend": "cpu",
+                "architecture_class": (
+                    "test|build=AVX512|runtime=AVX512|threads=28"
+                ),
+                "phase": "verifier_rows",
+                "m": "15",
+                "candidate_id": candidate,
+                "observed_candidate_id": candidate,
+                "observed_path": "grouped-verifier-rows",
+            })
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grouped-mismatch.csv"
+            self._write(path, rows)
+            with self.assertRaisesRegex(ValueError, "not byte-identical"):
                 read_paired_confirmation_csv((path,))
 
     def test_high_regret_fails_the_simultaneous_gate(self) -> None:

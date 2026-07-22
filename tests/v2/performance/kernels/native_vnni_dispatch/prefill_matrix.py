@@ -2,11 +2,11 @@
 
 Ordinary prefill does not project every prompt row through the LM head, so LM
 head geometries belong to decode/GEMV training but are intentionally absent
-here. Every released Qwen 3.5/3.6 dense and MoE text-backbone projection is an
-explicit production anchor on every backend. CPU timing keeps dense 27B and
-the very large 122B/397B MoE releases at M=1024, while smaller dense releases
-and the actively used 35B-A3B MoE retain deeper coverage. CUDA and ROCm extend
-large-release evidence through M=8192 because those launches remain economical.
+here. Every non-LM-head production exact geometry is an explicit anchor on
+every backend. CPU uses model-tiered depth ceilings to keep expensive evidence
+collection finite, while GPU retains the broader launch inventory. Generic
+geometry rules continue to own every positive M that is not an exact measured
+cell, including values beyond the largest measurement bucket.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import argparse
 from dataclasses import dataclass
 from functools import lru_cache
 
-from .qwen_release_geometry import qwen_release_geometries
+from .qwen_release_geometry import QWEN_RELEASE_MODELS, qwen_release_geometries
 from .shape_manifest import (
     NativeVNNIShape,
     NativeVNNIShapeManifest,
@@ -24,38 +24,40 @@ from .shape_manifest import (
 )
 
 
-PREFILL_M_BUCKETS = (64, 256, 1024, 2048, 4096, 8192, 16384)
+# The generic CPU policy owns the union of both model-tier inventories. Small
+# models are economical enough to characterize the true prefill regime, while
+# 14B-and-larger projections are intentionally sampled only at short prompts.
+# Keeping the union explicit is important: runtime bucketing, generic-tree
+# totality, and sealed certification must still cover every positive M even
+# though large-model exact overlays intentionally stop after the second anchor.
+CPU_SMALL_MODEL_PREFILL_M_BUCKETS = (64, 128, 256, 512)
+CPU_LARGE_MODEL_PREFILL_M_BUCKETS = (64, 128)
+CPU_PREFILL_M_BUCKETS = tuple(sorted(set(
+    CPU_SMALL_MODEL_PREFILL_M_BUCKETS
+    + CPU_LARGE_MODEL_PREFILL_M_BUCKETS
+)))
+GPU_PREFILL_M_BUCKETS = (64, 256, 1024, 2048, 4096, 8192, 16384)
+
+# Historical CPU certificates legitimately contain these older buckets.  They
+# remain readable as immutable evidence, but new CPU collection and generated
+# runtime bucketing use ``CPU_PREFILL_M_BUCKETS`` exclusively.
+HISTORICAL_CPU_PREFILL_M_BUCKETS = GPU_PREFILL_M_BUCKETS
+SUPPORTED_CPU_PREFILL_M_BUCKETS = tuple(sorted(set(
+    CPU_PREFILL_M_BUCKETS + HISTORICAL_CPU_PREFILL_M_BUCKETS
+)))
+CPU_LARGE_MODEL_THRESHOLD_BILLIONS = 14.0
 
 # Ordinary prefill never projects through the vocabulary-sized LM head.  This
 # separate ceiling therefore ends at Qwen2.5 32B's largest FFN projection while
 # the shared CPU shape manifest remains broad enough to train decode/GEMV.
 CPU_PREFILL_MAXIMUM_WEIGHT_ELEMENTS = 27648 * 5120
 
-SMALL_MODEL_SHAPES = (
-    "0.5B_AttnOut", "0.5B_QKV", "0.5B_FFN_Up", "0.5B_FFN_Dn",
-    "1.5B_AttnOut", "1.5B_QKV", "1.5B_FFN_Up", "1.5B_FFN_Dn",
-    "3B_AttnOut", "3B_QKV", "3B_FFN_Up", "3B_FFN_Dn",
-    "7B_AttnOut", "7B_QKV", "7B_FFN_Up", "7B_FFN_Dn",
-)
-
-MID_MODEL_SHAPES = (
-    "14B_FFN_Up",
-    "14B_FFN_Dn",
-    # Qwen2.5 14B and 32B share d_model/head geometry.
-    "32B_AttnOut",
-    "32B_QKV",
-)
-
-LARGE_MODEL_SHAPES = (
-    "32B_FFN_Up",
-    "32B_FFN_Dn",
-)
-
 # These are the exact NativeVNNI projections exercised by the actively used
 # Qwen 3.6 35B-A3B MoE model. Expert matrices are small because each routed
 # expert has a narrow intermediate width; the recurrent GDN projections carry
 # the model-width work. All remain below the small-model economy envelope, so
-# measuring the complete M inventory is both useful and affordable.
+# these projections belong to a 35B release and therefore use the deliberately
+# short large-model inventory despite their individually modest dimensions.
 QWEN36_35B_MOE_SHAPES = (
     "35BMoE_Expert_GateUp",
     "35BMoE_Expert_Down",
@@ -64,23 +66,39 @@ QWEN36_35B_MOE_SHAPES = (
 )
 
 
-CPU_QWEN_RELEASE_MAXIMUM_M = {
-    "Qwen3.5-0.8B": 16384,
-    "Qwen3.5-2B": 16384,
-    "Qwen3.5-4B": 16384,
-    "Qwen3.5-9B": 16384,
-    "Qwen3.5-27B": 1024,
-    "Qwen3.5-35B-A3B": 16384,
-    "Qwen3.5-122B-A10B": 1024,
-    "Qwen3.5-397B-A17B": 1024,
-    "Qwen3.6-27B": 1024,
-    "Qwen3.6-35B-A3B": 16384,
-}
+@lru_cache(maxsize=1)
+def _large_release_dimensions() -> frozenset[tuple[int, int]]:
+    """Return geometries used by at least one 14B-or-larger Qwen release."""
 
-GPU_QWEN_RELEASE_MAXIMUM_M = {
-    release_id: (16384 if maximum_m == 16384 else 8192)
-    for release_id, maximum_m in CPU_QWEN_RELEASE_MAXIMUM_M.items()
-}
+    large_release_ids = {
+        model.release_id
+        for model in QWEN_RELEASE_MODELS
+        if model.parameter_count_billions
+        >= CPU_LARGE_MODEL_THRESHOLD_BILLIONS
+    }
+    return frozenset(
+        (geometry.n, geometry.k)
+        for geometry in qwen_release_geometries()
+        if any(use.release_id in large_release_ids for use in geometry.uses)
+    )
+
+
+def _is_large_model_shape(shape: NativeVNNIShape) -> bool:
+    """Classify evidence geometry without introducing model-aware dispatch."""
+
+    if shape.model_family in {"qwen36-dense", "qwen36-moe"}:
+        return True
+    if shape.model_family.startswith("qwen25-"):
+        size_text = shape.model_family.removeprefix("qwen25-").removesuffix("b")
+        try:
+            return float(size_text) >= CPU_LARGE_MODEL_THRESHOLD_BILLIONS
+        except ValueError as error:
+            raise ValueError(
+                f"{shape.name}: malformed Qwen2.5 model-family size"
+            ) from error
+    if shape.model_family == "qwen35-qwen36-release-geometries":
+        return (shape.n, shape.k) in _large_release_dimensions()
+    return False
 
 
 @dataclass(frozen=True)
@@ -97,58 +115,36 @@ class CPUPrefillMeasurement:
         return self.m_values[-1]
 
 
-def _through(maximum_m: int) -> tuple[int, ...]:
-    values = tuple(m for m in PREFILL_M_BUCKETS if m <= maximum_m)
-    if not values or values[-1] != maximum_m:
-        raise ValueError(f"prefill maximum M={maximum_m} is not a bucket")
-    return values
-
-
-def _qwen_release_prefill_requests(
+def _ordinary_prefill_exact_shapes(
     manifest: NativeVNNIShapeManifest,
-    maximum_m_by_release: dict[str, int],
-) -> tuple[tuple[str, int], ...]:
-    """Resolve deduplicated released-model GEMM geometries to shape names.
+) -> tuple[NativeVNNIShape, ...]:
+    """Return every exact production geometry used by ordinary prefill.
 
-    A geometry can be shared by several releases and projection roles. The
-    broadest approved M range wins because runtime dispatch is geometry-only.
-    LM-head-only geometries are omitted: ordinary prefill does not materialize
-    logits for every prompt row.
+    A release-catalog geometry may have several model/projection aliases. It
+    remains prefill-applicable when at least one alias is not an LM head. The
+    manually declared Qwen2.5/Qwen3.6 LM-head rows are excluded by name for the
+    same semantic reason. Backend-specific planning applies the CPU model-size
+    tier only after this shared geometry inventory has been resolved.
     """
 
-    production_by_dimensions = {
-        (shape.n, shape.k): shape
-        for shape in manifest.shapes
-        if shape.role == ShapeRole.PRODUCTION and shape.exact_overlay
+    release_prefill_dimensions = {
+        (geometry.n, geometry.k)
+        for geometry in qwen_release_geometries()
+        if any(use.projection != "lm_head" for use in geometry.uses)
     }
-    requested = []
-    for geometry in qwen_release_geometries():
-        prefill_uses = tuple(
-            use for use in geometry.uses if use.projection != "lm_head"
-        )
-        if not prefill_uses:
+    result = []
+    for shape in manifest.shapes:
+        if shape.role != ShapeRole.PRODUCTION or not shape.exact_overlay:
             continue
-        shape = production_by_dimensions[(geometry.n, geometry.k)]
-        maximum_m = max(
-            maximum_m_by_release[use.release_id] for use in prefill_uses
-        )
-        requested.append((shape.name, maximum_m))
-    return tuple(requested)
-
-
-def _merge_requests(
-    *groups: tuple[tuple[str, int], ...],
-) -> tuple[tuple[str, int], ...]:
-    """Merge stable shape requests while retaining the greatest M ceiling."""
-
-    maximum_by_name: dict[str, int] = {}
-    for group in groups:
-        for name, maximum_m in group:
-            maximum_by_name[name] = max(
-                maximum_m,
-                maximum_by_name.get(name, 0),
-            )
-    return tuple(maximum_by_name.items())
+        if "LM_Head" in shape.name:
+            continue
+        if (
+            shape.model_family == "qwen35-qwen36-release-geometries"
+            and (shape.n, shape.k) not in release_prefill_dimensions
+        ):
+            continue
+        result.append(shape)
+    return tuple(result)
 
 
 @lru_cache(maxsize=1)
@@ -156,47 +152,36 @@ def cpu_prefill_measurements() -> tuple[CPUPrefillMeasurement, ...]:
     """Resolve and validate the complete checked-in CPU prefill matrix."""
 
     manifest = load_shape_manifest()
-    base_requested = (
-        *((name, 16384) for name in SMALL_MODEL_SHAPES),
-        *((name, 16384) for name in QWEN36_35B_MOE_SHAPES),
-        *((name, 4096) for name in MID_MODEL_SHAPES),
-        *((name, 1024) for name in LARGE_MODEL_SHAPES),
-    )
-    requested = _merge_requests(
-        base_requested,
-        _qwen_release_prefill_requests(
-            manifest,
-            CPU_QWEN_RELEASE_MAXIMUM_M,
-        ),
-    )
-    names = [name for name, _ in requested]
+    requested = _ordinary_prefill_exact_shapes(manifest)
+    names = [shape.name for shape in requested]
     if len(names) != len(set(names)):
         raise ValueError("CPU prefill matrix contains duplicate shape names")
 
     measurements = []
-    for name, maximum_m in requested:
-        shape = manifest.by_name(name)
+    for shape in requested:
+        name = shape.name
         if shape.role != ShapeRole.PRODUCTION or not shape.exact_overlay:
             raise ValueError(f"{name}: prefill shape must be a production overlay")
         if "LM_Head" in name:
             raise ValueError(f"{name}: LM heads are not ordinary prefill GEMMs")
         if shape.work_items > CPU_PREFILL_MAXIMUM_WEIGHT_ELEMENTS:
             raise ValueError(f"{name}: exceeds the CPU measurement envelope")
-        measurements.append(CPUPrefillMeasurement(shape, _through(maximum_m)))
+        m_values = (
+            CPU_LARGE_MODEL_PREFILL_M_BUCKETS
+            if _is_large_model_shape(shape)
+            else CPU_SMALL_MODEL_PREFILL_M_BUCKETS
+        )
+        measurements.append(CPUPrefillMeasurement(shape, m_values))
     return tuple(measurements)
 
 
-@lru_cache(maxsize=len(PREFILL_M_BUCKETS))
+@lru_cache(maxsize=len(CPU_PREFILL_M_BUCKETS))
 def cpu_prefill_maximum_weight_elements_for_m(m: int) -> int:
     """Return the largest CPU projection that may be freshly timed at ``m``.
 
-    Adaptive refinement must obey the same economy contract as the reviewed
-    production matrix.  In particular, a synthetic geometry below the global
-    Qwen2.5 32B weight-size ceiling is not permission to launch a 32B-class
-    GEMM at M=16384.  Deriving this limit from the checked-in matrix keeps the
-    policy in one place: small-model depths extend through M=16384, 14B and
-    shared 32B attention depths extend through M=4096, and the largest 32B FFN
-    projections stop at M=1024.
+    Adaptive refinement obeys the same model-tiered exact-overlay envelope as
+    the reviewed production matrix. M=64/128 may use the largest model
+    geometries, while M=256/512 is bounded by the largest sub-14B projection.
 
     Args:
         m: One exact canonical prefill row-count bucket.
@@ -209,7 +194,7 @@ def cpu_prefill_maximum_weight_elements_for_m(m: int) -> int:
         ValueError: If ``m`` is not one of the canonical prefill buckets.
     """
 
-    if m not in PREFILL_M_BUCKETS:
+    if m not in CPU_PREFILL_M_BUCKETS:
         raise ValueError(f"M={m} is not a canonical CPU prefill bucket")
     eligible = tuple(
         measurement.shape.work_items
@@ -225,39 +210,25 @@ def cpu_prefill_maximum_weight_elements_for_m(m: int) -> int:
 def gpu_prefill_measurements() -> tuple[CPUPrefillMeasurement, ...]:
     """Resolve the shared CUDA/ROCm prefill matrix.
 
-    GPU collection measures every 14B and 32B production projection through
-    M=8192. Smaller models retain M=16384 so dispatch sees the large-batch
-    transition where arithmetic intensity and occupancy can change.
+    CUDA and ROCm consume the same comprehensive exact-overlay matrix as CPU.
     """
 
     manifest = load_shape_manifest()
-    base_requested = (
-        *((name, 16384) for name in SMALL_MODEL_SHAPES),
-        *((name, 16384) for name in QWEN36_35B_MOE_SHAPES),
-        *((name, 8192) for name in MID_MODEL_SHAPES),
-        *((name, 8192) for name in LARGE_MODEL_SHAPES),
-    )
-    requested = _merge_requests(
-        base_requested,
-        _qwen_release_prefill_requests(
-            manifest,
-            GPU_QWEN_RELEASE_MAXIMUM_M,
-        ),
-    )
-    names = [name for name, _ in requested]
+    requested = _ordinary_prefill_exact_shapes(manifest)
+    names = [shape.name for shape in requested]
     if len(names) != len(set(names)):
         raise ValueError("GPU prefill matrix contains duplicate shape names")
 
     measurements = []
-    for name, maximum_m in requested:
-        shape = manifest.by_name(name)
+    for shape in requested:
+        name = shape.name
         if shape.role != ShapeRole.PRODUCTION or not shape.exact_overlay:
             raise ValueError(f"{name}: prefill shape must be a production overlay")
         if "LM_Head" in name:
             raise ValueError(f"{name}: LM heads are not ordinary prefill GEMMs")
         if shape.work_items > manifest.maximum_supported_weight_elements:
             raise ValueError(f"{name}: exceeds the supported runtime envelope")
-        measurements.append(CPUPrefillMeasurement(shape, _through(maximum_m)))
+        measurements.append(CPUPrefillMeasurement(shape, GPU_PREFILL_M_BUCKETS))
     return tuple(measurements)
 
 

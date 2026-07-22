@@ -59,7 +59,7 @@ extern "C" {
 struct LlaminarNativeVNNILeafPrimaryScorerSession;
 
 /** ABI version required by the Python binding in this source tree. */
-constexpr std::uint32_t kLlaminarNativeVNNILeafPrimaryScorerAbiVersion = 12;
+constexpr std::uint32_t kLlaminarNativeVNNILeafPrimaryScorerAbiVersion = 15;
 constexpr std::uint32_t kLlaminarNativeVNNITreeMaximumPoints = 512;
 constexpr std::uint32_t kLlaminarNativeVNNITreePointMaskWords =
     kLlaminarNativeVNNITreeMaximumPoints / 64;
@@ -96,6 +96,12 @@ enum LlaminarNativeVNNITreeThresholdOperation : std::uint32_t {
     kLlaminarNativeVNNITreeThresholdMNFinalParallelWaveUtilization = 11,
     kLlaminarNativeVNNITreeThresholdNTileAligned = 12,
     kLlaminarNativeVNNITreeThresholdKFinalTile = 13,
+    kLlaminarNativeVNNITreeThresholdKPartProducerWaves = 14,
+    kLlaminarNativeVNNITreeThresholdKPartFinalProducerWaveUtilization = 15,
+    kLlaminarNativeVNNITreeThresholdKPartKBlocksPerTile = 16,
+    kLlaminarNativeVNNITreeThresholdKPartFinalKTileBlocks = 17,
+    kLlaminarNativeVNNITreeThresholdKPartFinalKTileUtilization = 18,
+    kLlaminarNativeVNNITreeThresholdKPartKTileCount = 19,
 };
 
 /** Exact integer description of one policy-tree split threshold. */
@@ -181,6 +187,10 @@ struct LlaminarNativeVNNITreeRuntimeStats {
     std::uint64_t stream_sync_count;
     std::uint64_t device_sync_count;
     std::uint64_t captured_graph_transfer_count;
+    /** Expanded split descriptors examined by completed tree transactions. */
+    std::uint64_t expanded_candidate_count;
+    /** Exact structural representatives scored by completed transactions. */
+    std::uint64_t structurally_unique_candidate_count;
     std::uint32_t last_expansion_capacity;
     std::uint32_t reserved;
 };
@@ -329,6 +339,7 @@ int llaminarNativeVNNITreeSearch(
     const std::uint32_t* point_group_ranks,
     const std::uint64_t* training_aggregate_n,
     const std::uint64_t* training_k,
+    const std::uint32_t* training_launch_k_tiles,
     const LlaminarNativeVNNITreeFeatureAxis* feature_axes,
     std::uint32_t axis_count,
     std::uint32_t boundary_placement,
@@ -374,9 +385,11 @@ int llaminarNativeVNNITreeSearchAndEvaluate(
     const std::uint32_t* point_group_ranks,
     const std::uint64_t* training_aggregate_n,
     const std::uint64_t* training_k,
+    const std::uint32_t* training_launch_k_tiles,
     const LlaminarNativeVNNITreeFeatureAxis* feature_axes,
     const std::uint64_t* heldout_aggregate_n,
     const std::uint64_t* heldout_k,
+    const std::uint32_t* heldout_launch_k_tiles,
     const double* heldout_measured_p95_regrets,
     const double* heldout_measured_mean_regrets,
     const double* heldout_measured_max_regrets,

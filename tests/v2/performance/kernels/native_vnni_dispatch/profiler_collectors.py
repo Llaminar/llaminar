@@ -1,10 +1,13 @@
 """Isolated Linux perf, Nsight Compute, and rocprofiler collectors.
 
 The collector consumes :mod:`profiler_evidence` requests only after canonical
-timing has finished. GPU requests use fresh profiler processes. CPU requests
-may share one trainer process when their build, ISA, operation, and N/K geometry
-match; each batch member still owns a separately reset/armed/disarmed
-``perf_event_open`` interval, exactly one production launch, and one raw report.
+timing has finished. GPU and CPU requests amortize process/runtime setup across
+strict batches. Every CPU member still owns a separately reset/armed/disarmed
+``perf_event_open`` interval. Every CUDA member owns a separate profiler range
+and explicit stream whose stable ID partitions its physical Nsight dispatches.
+Each request therefore retains exactly one production operation and
+independently attributed counters even though setup and the raw tool report are
+shared.
 Raw tool reports are retained and hashed before normalized evidence is emitted.
 
 The command builders and parsers are intentionally ordinary Python with no
@@ -141,16 +144,16 @@ NCU_METRICS = (
     "launch__registers_per_thread",
     "launch__shared_mem_per_block_static",
     "launch__shared_mem_per_block_dynamic",
+    "launch__local_mem_per_thread",
     "sm__maximum_warps_per_active_cycle_pct",
     "sm__warps_active.avg.pct_of_peak_sustained_active",
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
     "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",
-    "l1tex__throughput.avg.pct_of_peak_sustained_active",
-    "lts__throughput.avg.pct_of_peak_sustained_elapsed",
-    "smsp__inst_executed.avg.per_cycle_active",
-    "smsp__average_warp_latency_per_inst_issued.ratio",
-    "l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum",
+    "smsp__inst_executed_pipe_alu.avg.pct_of_peak_sustained_elapsed",
+    "smsp__inst_executed_pipe_fma.avg.pct_of_peak_sustained_elapsed",
+    "smsp__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_elapsed",
 )
+
+CUDA_PRODUCTION_KERNEL_FILTER = "regex:nativeVnni"
 
 
 @dataclass(frozen=True)
@@ -281,6 +284,7 @@ def _write_binary_provenance(
     path: Path,
     request: ProfilerRequest,
     binary: Path,
+    binary_digest: str | None = None,
 ) -> None:
     """Retain the profiling executable identity beside the raw counters.
 
@@ -297,7 +301,7 @@ def _write_binary_provenance(
             {
                 "candidate_policy_hash": request.candidate_policy_hash,
                 "profiler_binary": str(binary.resolve()),
-                "profiler_binary_digest": _sha256_file(binary),
+                "profiler_binary_digest": binary_digest or _sha256_file(binary),
                 "timing_build_id": request.build_id,
             },
             indent=2,
@@ -450,6 +454,110 @@ class CPUProfilerProcessBatch:
             raise ValueError("CPU profiler process batch must not be empty")
 
 
+@dataclass(frozen=True)
+class CUDAProfilerProcessBatch:
+    """Exact CUDA requests sharing one context and Nsight report process."""
+
+    requests: tuple[ProfilerRequest, ...]
+
+    def __post_init__(self) -> None:
+        if not self.requests:
+            raise ValueError("CUDA profiler process batch must not be empty")
+        if any(request.backend != Backend.CUDA for request in self.requests):
+            raise ValueError("CUDA profiler batch cannot contain another backend")
+
+
+def _cuda_process_batch_key(request: ProfilerRequest) -> tuple[object, ...]:
+    """Return immutable context fields that one CUDA process may share.
+
+    Source format remains part of the key. Adjacent shape/M cells therefore
+    reuse one CUDA context and Nsight injection session without forcing the
+    trainer to keep several independently packed codebooks resident at once.
+    Candidate, shape, mode, and work geometry deliberately remain outside this
+    key and are selected exactly by the authenticated TSV plan.
+    """
+
+    if request.backend != Backend.CUDA:
+        raise ValueError("CUDA profiler batch cannot contain another backend")
+    return (
+        request.architecture_class,
+        request.build_id,
+        request.compiler_id,
+        request.device_name,
+        request.driver_runtime,
+        request.threading_or_stream_mode,
+        request.semantic_contract,
+        request.operation_kind,
+        request.bundle_signature,
+        request.source_format,
+        request.source_codebook_id,
+        request.prepared_family_id,
+        request.packing_abi,
+        request.runtime_codebook_id,
+    )
+
+
+def _cuda_cell_key(request: ProfilerRequest) -> tuple[object, ...]:
+    """Return fields that must be kept together when chunking CUDA batches."""
+
+    return (
+        request.shape_group_id,
+        request.shape_name,
+        request.execution_mode,
+        request.m,
+        request.projection_n_vector,
+        request.aggregate_n,
+        request.k,
+    )
+
+
+def _build_cuda_process_batches(
+    requests: Sequence[ProfilerRequest],
+    maximum_size: int,
+) -> tuple[CUDAProfilerProcessBatch, ...]:
+    """Pack complete CUDA work cells into bounded process batches.
+
+    A cell contains every measured candidate for one exact physical geometry.
+    Keeping it intact lets the trainer prepare serial/correctness state once
+    and profile all candidates while that state is resident. Only a cell that
+    individually exceeds the configured process bound is split, preserving
+    totality without creating an unbounded report.
+    """
+
+    if maximum_size <= 0:
+        raise ValueError("CUDA profiler batch size must be positive")
+    grouped: dict[tuple[object, ...], list[ProfilerRequest]] = {}
+    for request in requests:
+        grouped.setdefault(_cuda_process_batch_key(request), []).append(request)
+
+    batches: list[CUDAProfilerProcessBatch] = []
+    for process_key in sorted(grouped, key=repr):
+        cells: dict[tuple[object, ...], list[ProfilerRequest]] = {}
+        for request in grouped[process_key]:
+            cells.setdefault(_cuda_cell_key(request), []).append(request)
+        current: list[ProfilerRequest] = []
+        for cell_key in sorted(cells, key=repr):
+            members = sorted(
+                cells[cell_key],
+                key=lambda item: (
+                    item.effective_candidate_id,
+                    item.request_id,
+                ),
+            )
+            if current and len(current) + len(members) > maximum_size:
+                batches.append(CUDAProfilerProcessBatch(tuple(current)))
+                current = []
+            while len(members) > maximum_size:
+                batches.append(CUDAProfilerProcessBatch(
+                    tuple(members[:maximum_size])
+                ))
+                members = members[maximum_size:]
+            current.extend(members)
+        if current:
+            batches.append(CUDAProfilerProcessBatch(tuple(current)))
+    return tuple(batches)
+
+
 def _cpu_profiler_environment_prefix(operation_kind: str) -> str:
     """Return the trainer environment namespace for one CPU operation."""
 
@@ -600,6 +708,93 @@ def _cpu_batch_environment(
     }))
     environment[f"{prefix}_STRONG_CSV"] = str(batch_raw_dir / "trainer.csv")
     environment[f"{prefix}_TIMING_CSV"] = str(
+        batch_raw_dir / "trainer.timing.csv"
+    )
+    return environment
+
+
+def _write_cuda_batch_plan(
+    path: Path,
+    batch: CUDAProfilerProcessBatch,
+    raw_directories: Mapping[str, Path],
+) -> str:
+    """Write one exact CUDA profiler plan and return its content digest."""
+
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, delimiter="\t", lineterminator="\n")
+    writer.writerow((
+        "request_id",
+        "operation_kind",
+        "source_format",
+        "execution_mode",
+        "shape_name",
+        "m",
+        "projection_n_vector",
+        "aggregate_n",
+        "k",
+        "effective_candidate_id",
+        "output_path",
+    ))
+    for request in batch.requests:
+        fields = (
+            request.request_id,
+            request.operation_kind,
+            request.source_format,
+            request.execution_mode.value,
+            request.shape_name,
+            str(request.m),
+            ",".join(str(value) for value in request.projection_n_vector),
+            str(request.aggregate_n),
+            str(request.k),
+            request.effective_candidate_id,
+            str(raw_directories[request.request_id].resolve()),
+        )
+        if any("\t" in field or "\n" in field or "\r" in field for field in fields):
+            raise ValueError("CUDA profiler batch identity contains a TSV delimiter")
+        writer.writerow(fields)
+    payload = output.getvalue()
+    path.write_text(payload, encoding="utf-8")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cuda_batch_environment(
+    batch: CUDAProfilerProcessBatch,
+    plan_path: Path,
+    plan_digest: str,
+    batch_raw_dir: Path,
+) -> dict[str, str]:
+    """Build one exact-plan CUDA environment without Cartesian aliases."""
+
+    first = batch.requests[0]
+    environment = _profile_environment(first, batch_raw_dir)
+    environment.pop("LLAMINAR_NATIVE_VNNI_PROFILE_REQUEST_ID", None)
+    environment["LLAMINAR_NATIVE_VNNI_PROFILE_BATCH_PATH"] = str(
+        plan_path.resolve()
+    )
+    environment["LLAMINAR_NATIVE_VNNI_PROFILE_BATCH_DIGEST"] = plan_digest
+    environment["LLAMINAR_CUDA_NVNNI_DECODE_FORMATS"] = ",".join(sorted({
+        request.source_format for request in batch.requests
+    }))
+    environment["LLAMINAR_CUDA_NVNNI_DECODE_SHAPES"] = ",".join(sorted({
+        request.shape_name for request in batch.requests
+    }))
+    environment["LLAMINAR_CUDA_NVNNI_DECODE_CANDIDATES"] = ",".join(sorted({
+        request.effective_candidate_id for request in batch.requests
+    }))
+    environment["LLAMINAR_CUDA_NVNNI_DECODE_M"] = ",".join(str(value) for value in sorted({
+        request.m for request in batch.requests
+    }))
+    environment["LLAMINAR_CUDA_NVNNI_DECODE_EXECUTION_MODES"] = ",".join(sorted({
+        request.execution_mode.value for request in batch.requests
+    }))
+    environment["LLAMINAR_CUDA_NVNNI_DECODE_MAX_CASES"] = str(len({
+        (request.source_format, request.shape_name, request.m)
+        for request in batch.requests
+    }))
+    environment["LLAMINAR_CUDA_NVNNI_DECODE_CSV"] = str(
+        batch_raw_dir / "trainer.csv"
+    )
+    environment["LLAMINAR_CUDA_NVNNI_DECODE_TIMING_CSV"] = str(
         batch_raw_dir / "trainer.timing.csv"
     )
     return environment
@@ -847,7 +1042,22 @@ NCU_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
         "l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum",
         "Local Memory Spilling Requests",
     ),
+    "gpu.alu_pipe_utilization_pct": (
+        "smsp__inst_executed_pipe_alu.avg.pct_of_peak_sustained_elapsed",
+    ),
+    "gpu.fma_pipe_utilization_pct": (
+        "smsp__inst_executed_pipe_fma.avg.pct_of_peak_sustained_elapsed",
+    ),
+    "gpu.tensor_pipe_utilization_pct": (
+        "smsp__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_elapsed",
+    ),
 }
+
+NCU_COMPUTE_PIPE_METRIC_IDS = (
+    "gpu.alu_pipe_utilization_pct",
+    "gpu.fma_pipe_utilization_pct",
+    "gpu.tensor_pipe_utilization_pct",
+)
 
 
 def _convert_ncu_value(metric_id: str, value: float, unit: str) -> float:
@@ -870,8 +1080,19 @@ def _convert_ncu_value(metric_id: str, value: float, unit: str) -> float:
     return value
 
 
-def parse_ncu_csv(path: Path, request: ProfilerRequest) -> tuple[ProfiledDispatch, ...]:
-    """Normalize raw-page Nsight Compute CSV into ordered kernel dispatches."""
+@dataclass(frozen=True)
+class _NCUDispatchRecord:
+    """One parsed Nsight dispatch plus its stable CUDA stream identity."""
+
+    stream_id: int
+    dispatch: ProfiledDispatch
+
+
+def _parse_ncu_csv_with_stream_ids(
+    path: Path,
+    request: ProfilerRequest,
+) -> tuple[_NCUDispatchRecord, ...]:
+    """Normalize raw Nsight CSV while retaining request ownership metadata."""
 
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     header = _find_ncu_header(lines)
@@ -889,7 +1110,10 @@ def parse_ncu_csv(path: Path, request: ProfilerRequest) -> tuple[ProfiledDispatc
     else:
         data_rows = parsed_rows[1:]
     reader = (dict(zip(columns, values, strict=False)) for values in data_rows)
-    grouped: dict[tuple[int, str, tuple[int, int, int], tuple[int, int, int]], dict[str, tuple[float, str]]] = {}
+    grouped: dict[
+        tuple[int, int, str, tuple[int, int, int], tuple[int, int, int]],
+        dict[str, tuple[float, str]],
+    ] = {}
     for fallback_index, row in enumerate(reader):
         kernel = (row.get("Kernel Name") or "").strip()
         if not kernel:
@@ -899,9 +1123,16 @@ def parse_ncu_csv(path: Path, request: ProfilerRequest) -> tuple[ProfiledDispatc
             identifier = int(identifier_raw)
         except ValueError:
             identifier = fallback_index
+        stream_raw = (row.get("Stream") or "0").strip()
+        try:
+            stream_id = int(stream_raw)
+        except ValueError as error:
+            raise ValueError(
+                f"invalid Nsight CUDA stream identity {stream_raw!r}"
+            ) from error
         grid = _parse_geometry((row.get("Grid Size") or "1").strip())
         block = _parse_geometry((row.get("Block Size") or "1").strip())
-        key = (identifier, kernel, grid, block)
+        key = (identifier, stream_id, kernel, grid, block)
         metrics = grouped.setdefault(key, {})
         if wide_format:
             for metric_id, aliases in NCU_METRIC_ALIASES.items():
@@ -934,10 +1165,20 @@ def parse_ncu_csv(path: Path, request: ProfilerRequest) -> tuple[ProfiledDispatc
                 metrics[metric_id] = (value, metric_name)
                 break
 
-    dispatches = []
-    for dispatch_index, ((_, kernel, grid, block), values) in enumerate(
+    records = []
+    for dispatch_index, ((_, stream_id, kernel, grid, block), values) in enumerate(
         sorted(grouped.items(), key=lambda item: item[0])
     ):
+        pipe_utilizations = [
+            values[metric_id][0]
+            for metric_id in NCU_COMPUTE_PIPE_METRIC_IDS
+            if metric_id in values
+        ]
+        if pipe_utilizations:
+            values["gpu.compute_throughput_pct_of_peak"] = (
+                max(pipe_utilizations),
+                "derived:max_one_pass_compute_pipe_utilization",
+            )
         metrics = _complete_metric_inventory(
             Backend.CUDA,
             values,
@@ -953,10 +1194,71 @@ def parse_ncu_csv(path: Path, request: ProfilerRequest) -> tuple[ProfiledDispatc
             metrics=metrics,
         )
         dispatch.validate(Backend.CUDA)
-        dispatches.append(dispatch)
-    if not dispatches:
+        records.append(_NCUDispatchRecord(stream_id, dispatch))
+    if not records:
         raise ValueError("Nsight Compute reported no kernels in the target region")
-    return tuple(dispatches)
+    return tuple(records)
+
+
+def parse_ncu_csv(
+    path: Path,
+    request: ProfilerRequest,
+) -> tuple[ProfiledDispatch, ...]:
+    """Normalize raw-page Nsight Compute CSV into ordered kernel dispatches."""
+
+    return tuple(
+        record.dispatch
+        for record in _parse_ncu_csv_with_stream_ids(path, request)
+    )
+
+
+def _partition_cuda_batch_dispatches(
+    dispatches: Sequence[_NCUDispatchRecord],
+    request_streams: Sequence[tuple[str, int]],
+) -> dict[str, tuple[ProfiledDispatch, ...]]:
+    """Partition one Nsight report by its exact per-request CUDA streams.
+
+    The trainer publishes CUDA's stable stream ID beside each exact request.
+    Nsight exports that same ID for every selected production kernel, avoiding
+    synthetic marker launches and any reconstruction from candidate families.
+    Each member's physical operation dispatches are renumbered from zero so the
+    ordinary single-request evidence invariant remains unchanged.
+    """
+
+    if not request_streams:
+        raise ValueError("CUDA profiler batch reported no request streams")
+    request_ids = [request_id for request_id, _ in request_streams]
+    stream_ids = [stream_id for _, stream_id in request_streams]
+    if len(set(request_ids)) != len(request_ids):
+        raise ValueError("CUDA profiler batch request IDs contain duplicates")
+    if len(set(stream_ids)) != len(stream_ids):
+        raise ValueError("CUDA profiler batch stream IDs contain duplicates")
+
+    segments: dict[int, list[ProfiledDispatch]] = {
+        stream_id: [] for stream_id in stream_ids
+    }
+    for record in dispatches:
+        if record.stream_id not in segments:
+            raise ValueError(
+                "Nsight reported a production dispatch on an unclaimed CUDA "
+                f"stream: {record.stream_id}"
+            )
+        segments[record.stream_id].append(record.dispatch)
+
+    result: dict[str, tuple[ProfiledDispatch, ...]] = {}
+    for request_id, stream_id in request_streams:
+        segment = sorted(
+            segments[stream_id], key=lambda item: item.dispatch_index
+        )
+        if not segment:
+            raise ValueError(
+                f"CUDA profiler request {request_id} has no physical dispatch"
+            )
+        result[request_id] = tuple(
+            replace(dispatch, dispatch_index=index)
+            for index, dispatch in enumerate(segment)
+        )
+    return result
 
 
 ROCM_METRIC_ALIASES = {
@@ -1520,6 +1822,8 @@ def _collect_cuda(
         "off",
         "--target-processes",
         "all",
+        "--kernel-name",
+        CUDA_PRODUCTION_KERNEL_FILTER,
         "--metrics",
         ",".join(NCU_METRICS),
         "-o",
@@ -1569,6 +1873,215 @@ def _collect_cuda(
         target_launches_per_profiler_pass=1,
         dispatches=dispatches,
     )
+
+
+def _cuda_request_streams_from_process_log(
+    completed: subprocess.CompletedProcess[str],
+    batch: CUDAProfilerProcessBatch,
+) -> tuple[tuple[str, int], ...]:
+    """Authenticate the trainer's exact request-to-CUDA-stream ownership."""
+
+    pattern = re.compile(
+        r"\[NativeVNNIProfiler\]\[CUDA\] request=([^\s]+) .* "
+        r"stream_id=([0-9]+) launches=1$"
+    )
+    request_streams = tuple(
+        (match.group(1), int(match.group(2)))
+        for line in ((completed.stdout or "") + "\n" + (completed.stderr or "")).splitlines()
+        if (match := pattern.search(line))
+    )
+    expected = {request.request_id for request in batch.requests}
+    observed = {request_id for request_id, _ in request_streams}
+    stream_ids = {stream_id for _, stream_id in request_streams}
+    if (
+        len(request_streams) != len(batch.requests)
+        or observed != expected
+        or len(stream_ids) != len(request_streams)
+    ):
+        raise RuntimeError(
+            "CUDA batch trainer did not report one unique stream per exact "
+            f"request: reported={len(request_streams)} "
+            f"unique_streams={len(stream_ids)} expected={len(batch.requests)}"
+        )
+    return request_streams
+
+
+def _collect_cuda_batch(
+    batch: CUDAProfilerProcessBatch,
+    options: CollectorOptions,
+) -> dict[str, ProfilerEvidence]:
+    """Profile many exact CUDA operations in one setup-amortized process.
+
+    Nsight still records every selected physical kernel independently. The
+    trainer launches each request on a distinct explicit stream and reports
+    its stable CUDA stream ID. This function partitions the raw report by those
+    IDs before publishing member evidence, so one member never inherits
+    counters from its neighbors.
+    """
+
+    selected_binaries = {
+        _binary_for_request(request, options) for request in batch.requests
+    }
+    if len(selected_binaries) != 1:
+        raise ValueError("one CUDA profiler batch selected multiple binaries")
+    selected_binary = next(iter(selected_binaries))
+    if not selected_binary.is_file() or not os.access(selected_binary, os.X_OK):
+        raise RuntimeError(f"trainer binary is unavailable: {selected_binary}")
+
+    batch_identity = hashlib.sha256("\n".join(
+        request.request_id for request in batch.requests
+    ).encode("utf-8")).hexdigest()[:24]
+    batch_raw_dir = _next_attempt_directory(
+        options.raw_directory / "_cuda_process_batches" / batch_identity
+    )
+    request_raw_dirs: dict[str, Path] = {}
+    binary_digest = _sha256_file(selected_binary)
+    for request in batch.requests:
+        raw_dir = _next_attempt_directory(
+            options.raw_directory / request.request_id
+        )
+        request_raw_dirs[request.request_id] = raw_dir
+        _write_binary_provenance(
+            raw_dir / "profiler-binary.json",
+            request,
+            selected_binary,
+            binary_digest,
+        )
+
+    plan_path = batch_raw_dir / "requests.tsv"
+    plan_digest = _write_cuda_batch_plan(
+        plan_path, batch, request_raw_dirs
+    )
+    environment = _cuda_batch_environment(
+        batch, plan_path, plan_digest, batch_raw_dir
+    )
+    _apply_device_placement(environment, options)
+    report = batch_raw_dir / "profile"
+    first = batch.requests[0]
+    command = _tool_command(
+        replace(options, binary=selected_binary),
+        "--profile-from-start",
+        "off",
+        "--target-processes",
+        "all",
+        "--kernel-name",
+        CUDA_PRODUCTION_KERNEL_FILTER,
+        "--metrics",
+        ",".join(NCU_METRICS),
+        "-o",
+        str(report),
+        "-f",
+        str(selected_binary),
+        *_trainer_arguments(first),
+    )
+    completed = _run_command(
+        command,
+        environment,
+        batch_raw_dir / "ncu-process.log",
+        options.timeout_seconds,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"Nsight Compute/CUDA batch trainer exited {completed.returncode}"
+        )
+    request_streams = _cuda_request_streams_from_process_log(completed, batch)
+
+    report_path = report.with_suffix(".ncu-rep")
+    export_command = _tool_command(
+        options,
+        "-i",
+        str(report_path),
+        "--page",
+        "raw",
+        "--csv",
+    )
+    exported = _run_command(
+        export_command,
+        environment,
+        batch_raw_dir / "ncu-export.log",
+        options.timeout_seconds,
+    )
+    if exported.returncode != 0:
+        raise RuntimeError(
+            f"Nsight Compute CUDA batch export exited {exported.returncode}"
+        )
+    csv_path = batch_raw_dir / "ncu-raw.csv"
+    csv_path.write_text(exported.stdout or "", encoding="utf-8")
+    all_dispatches = _parse_ncu_csv_with_stream_ids(csv_path, first)
+    partitioned = _partition_cuda_batch_dispatches(
+        all_dispatches, request_streams
+    )
+    batch_raw_digest = _sha256_files(batch_raw_dir)
+    tool_version = _tool_version(options)
+
+    results: dict[str, ProfilerEvidence] = {}
+    order_index = {
+        request_id: index
+        for index, (request_id, _) in enumerate(request_streams)
+    }
+    stream_by_request = dict(request_streams)
+    for request in batch.requests:
+        raw_dir = request_raw_dirs[request.request_id]
+        dispatches = partitioned[request.request_id]
+        (raw_dir / "batch-member.json").write_text(
+            json.dumps({
+                "batch_plan_digest": plan_digest,
+                "batch_raw_artifact_digest": batch_raw_digest,
+                "physical_dispatch_count": len(dispatches),
+                "request_id": request.request_id,
+                "request_launch_order": order_index[request.request_id],
+                "stream_id": stream_by_request[request.request_id],
+                "target_launches": 1,
+            }, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        evidence = ProfilerEvidence(
+            request_id=request.request_id,
+            observation_digest=request.observation_digest,
+            backend=request.backend,
+            status=ProfilerEvidenceStatus.COMPLETE,
+            status_reason=None,
+            profiler_tool=EXPECTED_PROFILER_TOOL[request.backend],
+            profiler_tool_version=tool_version,
+            metric_set_version=PROFILER_METRIC_SET_VERSION,
+            collector_version=PROFILER_COLLECTOR_VERSION,
+            command_digest=_command_digest(request, command, environment),
+            raw_artifact_digest=_sha256_files(raw_dir),
+            profiler_pass_count=1,
+            target_launches_per_profiler_pass=1,
+            dispatches=dispatches,
+        )
+        evidence.validate(request)
+        results[request.request_id] = evidence
+    return results
+
+
+def collect_cuda_batch(
+    batch: CUDAProfilerProcessBatch,
+    options: CollectorOptions,
+) -> dict[str, ProfilerEvidence]:
+    """Collect one CUDA batch and convert shared failures per request."""
+
+    try:
+        return _collect_cuda_batch(batch, options)
+    except subprocess.TimeoutExpired as error:
+        status = ProfilerEvidenceStatus.LAUNCH_FAILED
+        reason = f"profiler transaction timed out after {error.timeout} seconds"
+    except (OSError, RuntimeError) as error:
+        status = ProfilerEvidenceStatus.LAUNCH_FAILED
+        reason = str(error)
+    except (KeyError, TypeError, ValueError) as error:
+        status = ProfilerEvidenceStatus.PARSE_FAILED
+        reason = str(error)
+    return {
+        request.request_id: _failed_evidence(
+            request,
+            status,
+            reason,
+            EXPECTED_PROFILER_TOOL[request.backend],
+        )
+        for request in batch.requests
+    }
 
 
 def _collect_rocm(
@@ -1961,16 +2474,30 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cpu-process-batch-size",
         type=int,
-        default=256,
+        default=1024,
         help=(
             "maximum exact requests sharing CPU fixture/OpenMP setup; every "
-            "member still owns one isolated counter transaction (default: 256)"
+            "member still owns one isolated counter transaction (default: 1024)"
         ),
     )
     parser.add_argument(
         "--disable-cpu-process-batching",
         action="store_true",
         help="diagnostic only: restore one fresh CPU trainer process per request",
+    )
+    parser.add_argument(
+        "--gpu-process-batch-size",
+        type=int,
+        default=4096,
+        help=(
+            "maximum exact GPU requests sharing one profiler process/report; "
+            "each member retains a distinct controlled range (default: 4096)"
+        ),
+    )
+    parser.add_argument(
+        "--disable-gpu-process-batching",
+        action="store_true",
+        help="diagnostic only: restore one profiler process per GPU request",
     )
     parser.add_argument("--request-id", action="append", default=[])
     parser.add_argument("--limit", type=int)
@@ -2033,6 +2560,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--device-lanes must be positive")
     if args.cpu_process_batch_size <= 0:
         raise ValueError("--cpu-process-batch-size must be positive")
+    if args.gpu_process_batch_size <= 0:
+        raise ValueError("--gpu-process-batch-size must be positive")
     cpu_lane_lists = (
         _parse_cpu_lane_lists(args.cpu_list, args.device_lanes)
         if backend == Backend.CPU
@@ -2113,6 +2642,113 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         track(request, result)
         _append_checkpoint_journal(output, requests, (result,))
+
+    if (
+        backend == Backend.CUDA
+        and not args.disable_gpu_process_batching
+        and pending
+    ):
+        required = [request for request in pending if request.profile_required]
+        terminal = [request for request in pending if not request.profile_required]
+        for index, request in enumerate(terminal, start=1):
+            announce(index, request, 0)
+            track(request, _unsupported_evidence(request))
+        if terminal:
+            _append_checkpoint_journal(
+                output,
+                requests,
+                (records[request.request_id] for request in terminal),
+            )
+
+        batches = _build_cuda_process_batches(
+            required, args.gpu_process_batch_size
+        )
+
+        def announce_cuda_batch(
+            index: int,
+            batch: CUDAProfilerProcessBatch,
+            lane: int,
+        ) -> None:
+            """Report one CUDA process and its independently ranged members."""
+
+            first = batch.requests[0]
+            print(
+                f"[cuda batch {index}/{len(batches)}] lane={lane} "
+                f"requests={len(batch.requests)} "
+                f"format={first.source_format} operation={first.operation_kind}",
+                flush=True,
+            )
+
+        def publish_cuda_batch(
+            batch: CUDAProfilerProcessBatch,
+            results: Mapping[str, ProfilerEvidence],
+        ) -> None:
+            """Atomically journal every exact member of one CUDA process."""
+
+            expected = {request.request_id for request in batch.requests}
+            if set(results) != expected:
+                raise RuntimeError("CUDA profiler batch returned a partial ID set")
+            for request in batch.requests:
+                track(request, results[request.request_id])
+            _append_checkpoint_journal(
+                output,
+                requests,
+                (results[request.request_id] for request in batch.requests),
+            )
+
+        if args.device_lanes == 1:
+            for index, batch in enumerate(batches, start=1):
+                announce_cuda_batch(index, batch, 0)
+                publish_cuda_batch(
+                    batch,
+                    collect_cuda_batch(
+                        batch,
+                        replace(options, device_ordinal=0),
+                    ),
+                )
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=args.device_lanes,
+            ) as executor:
+                indexed_batches = iter(enumerate(batches, start=1))
+                active_batches: dict[
+                    concurrent.futures.Future[dict[str, ProfilerEvidence]],
+                    tuple[CUDAProfilerProcessBatch, int],
+                ] = {}
+
+                def submit_cuda_batch(lane: int) -> bool:
+                    try:
+                        index, batch = next(indexed_batches)
+                    except StopIteration:
+                        return False
+                    announce_cuda_batch(index, batch, lane)
+                    future = executor.submit(
+                        collect_cuda_batch,
+                        batch,
+                        replace(options, device_ordinal=lane),
+                    )
+                    active_batches[future] = (batch, lane)
+                    return True
+
+                for lane in range(args.device_lanes):
+                    if not submit_cuda_batch(lane):
+                        break
+                while active_batches:
+                    done, _ = concurrent.futures.wait(
+                        active_batches,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    for future in done:
+                        batch, lane = active_batches.pop(future)
+                        publish_cuda_batch(batch, future.result())
+                        submit_cuda_batch(lane)
+
+        manifest = _write_checkpoint(output, requests, records)
+        report = validate_profiler_evidence_coverage(
+            requests, manifest, require_complete=args.finalize
+        )
+        print(json.dumps(asdict(report), sort_keys=True))
+        return 1 if failures else 0
 
     if (
         backend == Backend.CPU

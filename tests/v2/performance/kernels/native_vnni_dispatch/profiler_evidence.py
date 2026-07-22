@@ -21,10 +21,14 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
+import mmap
 import multiprocessing
 import os
+import shutil
+import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, fields
 from enum import Enum
@@ -32,7 +36,11 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .candidate_observation import read_observation_csv, write_observation_csv
+from .candidate_observation import (
+    read_observation_csv,
+    read_observation_rows,
+    write_observation_csv,
+)
 from .candidate_registry import (
     CandidateRegistry,
     candidate_registry_digest,
@@ -68,11 +76,13 @@ SUPPORTED_PROFILER_REQUEST_SCHEMA_VERSIONS = frozenset({
 PROFILER_EVIDENCE_SCHEMA_VERSION = "native-vnni-profiler-evidence-v1"
 PROFILER_METRIC_SET_VERSION = "native-vnni-profiler-metrics-v1"
 PROFILER_COLLECTOR_VERSION = (
-    "native-vnni-isolated-profiler-v3-direct-per-tid-batched"
+    "native-vnni-isolated-profiler-v5-direct-per-tid-gpu-stream-batched"
 )
 SUPPORTED_PROFILER_COLLECTOR_VERSIONS = frozenset({
     "native-vnni-isolated-profiler-v1",
     "native-vnni-isolated-profiler-v2",
+    "native-vnni-isolated-profiler-v3-direct-per-tid-batched",
+    "native-vnni-isolated-profiler-v4-direct-per-tid-gpu-batched",
     PROFILER_COLLECTOR_VERSION,
 })
 PROFILE_PROTOCOL = "isolated-production-candidate-launch-v1"
@@ -86,6 +96,187 @@ def _sha256_json(value: Any) -> str:
 
 
 _PARALLEL_MANIFEST_RECORDS: tuple[Any, ...] = ()
+_PARALLEL_REQUEST_VALIDATION_RECORDS: tuple[Any, ...] = ()
+_PARALLEL_COVERAGE_PAIRS: tuple[tuple[Any, Any], ...] = ()
+_PARALLEL_PROFILER_FEATURE_ROWS: tuple[Any, ...] = ()
+_PARALLEL_PROFILER_FEATURE_FIELDNAMES: tuple[str, ...] = ()
+_PARALLEL_PROFILER_FEATURE_METRIC_IDS: tuple[str, ...] = ()
+_PARALLEL_EXPORT_REQUESTS: dict[str, Mapping[str, Any]] = {}
+_PARALLEL_EXPORT_EVIDENCE: tuple[Mapping[str, Any], ...] = ()
+_PARALLEL_EXPORT_OBSERVATIONS: dict[str, NativeVNNIObservation] = {}
+_PARALLEL_EXPORT_OBSERVATION_ROWS: tuple[NativeVNNIObservation, ...] = ()
+_PARALLEL_REQUEST_DECODE_RECORDS: tuple[Mapping[str, Any], ...] = ()
+_PARALLEL_EVIDENCE_DECODE_RECORDS: tuple[Mapping[str, Any], ...] = ()
+_PARALLEL_REQUEST_BUILD_OBSERVATIONS: tuple[NativeVNNIObservation, ...] = ()
+
+
+def _parse_manifest_array_range(
+    task: tuple[Path, int, int],
+) -> tuple[Mapping[str, Any], ...]:
+    """Decode one canonical manifest-array byte range in a worker process."""
+
+    path, begin, end = task
+    with path.open("rb") as handle:
+        with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as document:
+            encoded = document[begin:end].strip(b",")
+    decoded = json.loads(b"[" + encoded + b"]")
+    if not isinstance(decoded, list) or not all(
+        isinstance(record, Mapping) for record in decoded
+    ):
+        raise ValueError("profiler manifest records must be JSON objects")
+    return tuple(decoded)
+
+
+def _read_canonical_manifest_document(
+    path: Path,
+    array_name: str,
+    *,
+    workers: int | None = None,
+    parallel_threshold: int = 4096,
+) -> dict[str, Any] | None:
+    """Parse and authenticate our compact manifest encoding in parallel.
+
+    NativeVNNI manifests are intentionally emitted as compact, key-sorted JSON.
+    That gives the reader two useful properties: the record array has an exact
+    byte delimiter, and deleting the root ``manifest_digest`` member recreates
+    the historical canonical digest payload byte-for-byte. Workers can decode
+    disjoint record ranges while the parent hashes the immutable source bytes.
+
+    Hand-authored or legacy whitespace-rich JSON returns ``None`` and follows
+    the compatible serial semantic parser. The fast path therefore changes no
+    accepted schema or digest semantics.
+    """
+
+    array_prefix = f'"{array_name}":['.encode()
+    with path.open("rb") as handle:
+        with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as document:
+            prefix_offset = document.find(array_prefix)
+            if prefix_offset < 0:
+                return None
+            array_begin = prefix_offset + len(array_prefix)
+            array_end = document.rfind(b'],"')
+            if array_end < array_begin:
+                return None
+
+            # Parse only the small scalar root. Copying the prefix and suffix
+            # is bounded independently of a multi-gigabyte record inventory.
+            scalar_document = (
+                document[:array_begin] + b"]" + document[array_end + 1 :]
+            )
+            try:
+                root = json.loads(scalar_document)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(root, dict) or root.get(array_name) != []:
+                return None
+            declared_count_name = (
+                "request_count" if array_name == "requests" else "evidence_count"
+            )
+            try:
+                declared_count = int(root[declared_count_name])
+                expected_digest = str(root["manifest_digest"])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+            if array_begin == array_end:
+                records: tuple[Mapping[str, Any], ...] = ()
+            else:
+                first_record = document[array_begin : min(array_begin + 256, array_end)]
+                if not first_record.startswith(b'{"'):
+                    return None
+                key_end = first_record.find(b'":')
+                if key_end < 2:
+                    return None
+                record_prefix = b',{"' + first_record[2 : key_end + 2]
+                if workers is None:
+                    worker_count = _offline_worker_count(
+                        declared_count,
+                        environment_name="LLAMINAR_NATIVE_VNNI_IO_WORKERS",
+                    )
+                else:
+                    if workers < 1:
+                        raise ValueError("profiler manifest parse workers must be positive")
+                    worker_count = min(
+                        workers,
+                        _physical_core_count(),
+                        max(1, declared_count),
+                    )
+                if declared_count < parallel_threshold:
+                    worker_count = 1
+
+                boundaries = [array_begin]
+                for worker_index in range(1, worker_count):
+                    target = array_begin + (
+                        (array_end - array_begin) * worker_index // worker_count
+                    )
+                    separator = document.find(record_prefix, target, array_end)
+                    if separator < 0:
+                        return None
+                    boundaries.append(separator + 1)
+                boundaries.append(array_end)
+                boundaries = sorted(set(boundaries))
+                tasks = tuple(
+                    (path, begin, end)
+                    for begin, end in zip(boundaries, boundaries[1:])
+                    if begin < end
+                )
+
+                if len(tasks) == 1:
+                    partitions = (_parse_manifest_array_range(tasks[0]),)
+                else:
+                    with ProcessPoolExecutor(
+                        max_workers=len(tasks),
+                        mp_context=multiprocessing.get_context("fork"),
+                    ) as executor:
+                        partitions = tuple(executor.map(
+                            _parse_manifest_array_range,
+                            tasks,
+                        ))
+                records = tuple(
+                    record for partition in partitions for record in partition
+                )
+
+            if len(records) != declared_count:
+                raise ValueError(
+                    f"profiler {array_name} count does not match inventory"
+                )
+
+            digest_member = (
+                b'"manifest_digest":'
+                + json.dumps(expected_digest, separators=(",", ":")).encode()
+            )
+            digest_offset = document.find(digest_member)
+            if digest_offset < 0:
+                return None
+            remove_begin = digest_offset
+            remove_end = digest_offset + len(digest_member)
+            if remove_begin > 0 and document[remove_begin - 1] == ord(","):
+                remove_begin -= 1
+            elif remove_end < len(document) and document[remove_end] == ord(","):
+                remove_end += 1
+            else:
+                return None
+            document_end = len(document)
+            while document_end and document[document_end - 1] in b"\r\n":
+                document_end -= 1
+            digest = hashlib.sha256()
+            document_view = memoryview(document)
+            try:
+                digest.update(document_view[:remove_begin])
+                digest.update(document_view[remove_end:document_end])
+            finally:
+                document_view.release()
+            actual_digest = "sha256:" + digest.hexdigest()
+            if actual_digest != expected_digest:
+                manifest_label = (
+                    "request" if array_name == "requests" else "evidence"
+                )
+                raise ValueError(
+                    f"profiler {manifest_label} manifest digest does not match contents"
+                )
+
+    root[array_name] = list(records)
+    return root
 
 
 def _physical_core_count() -> int:
@@ -107,18 +298,179 @@ def _physical_core_count() -> int:
     return max(1, len(physical))
 
 
-def _serialize_manifest_record_range(bounds: tuple[int, int]) -> bytes:
-    """Serialize one contiguous record range without changing array order."""
+def _offline_worker_count(
+    record_count: int,
+    *,
+    environment_name: str,
+    records_per_worker: int = 4096,
+) -> int:
+    """Return a physical-core-capped worker count for offline record work."""
+
+    if record_count < 0:
+        raise ValueError("offline record count cannot be negative")
+    if record_count == 0:
+        return 0
+    requested = int(os.environ.get(
+        environment_name,
+        str(_physical_core_count()),
+    ))
+    if requested < 1:
+        raise ValueError(f"{environment_name} must be positive")
+    useful_workers = max(1, record_count // records_per_worker)
+    return min(requested, _physical_core_count(), useful_workers)
+
+
+def _equal_ranges(record_count: int, worker_count: int) -> tuple[tuple[int, int], ...]:
+    """Partition an ordered inventory into contiguous balanced ranges."""
+
+    if record_count < 0 or worker_count < 1 or worker_count > record_count:
+        raise ValueError("invalid ordered range partition")
+    base, remainder = divmod(record_count, worker_count)
+    ranges = []
+    begin = 0
+    for worker_index in range(worker_count):
+        size = base + (1 if worker_index < remainder else 0)
+        ranges.append((begin, begin + size))
+        begin += size
+    return tuple(ranges)
+
+
+def _validate_profiler_request_range(bounds: tuple[int, int]) -> None:
+    """Validate one inherited request range without serializing its records."""
 
     begin, end = bounds
-    return ",".join(
-        json.dumps(
-            _PARALLEL_MANIFEST_RECORDS[index].canonical_mapping(),
-            sort_keys=True,
-            separators=(",", ":"),
+    for index in range(begin, end):
+        _PARALLEL_REQUEST_VALIDATION_RECORDS[index].validate()
+
+
+def _build_profiler_request_range(
+    bounds: tuple[int, int],
+) -> tuple[ProfilerRequest, ...]:
+    """Convert one inherited observation range without pickling its input."""
+
+    begin, end = bounds
+    return tuple(
+        profiler_request_for_observation(
+            _PARALLEL_REQUEST_BUILD_OBSERVATIONS[index]
         )
         for index in range(begin, end)
-    ).encode()
+    )
+
+
+def _validate_coverage_range(
+    bounds: tuple[int, int],
+) -> tuple[int, int, tuple[str, ...]]:
+    """Validate one inherited request/evidence range and reduce status counts."""
+
+    begin, end = bounds
+    return _validate_coverage_pairs_inline(
+        _PARALLEL_COVERAGE_PAIRS[index]
+        for index in range(begin, end)
+    )
+
+
+def _digest_export_observation_range(
+    bounds: tuple[int, int],
+) -> tuple[str, ...]:
+    """Hash one inherited observation range in canonical row order."""
+
+    begin, end = bounds
+    return tuple(
+        _PARALLEL_EXPORT_OBSERVATION_ROWS[index].digest()
+        for index in range(begin, end)
+    )
+
+
+def _parallel_export_observation_digests(
+    observations: tuple[NativeVNNIObservation, ...],
+    *,
+    workers: int,
+) -> tuple[str, ...]:
+    """Compute canonical observation identities across physical cores.
+
+    Exact-point feature export joins every request to its timing witness by the
+    witness's canonical SHA-256 digest. Recomputing more than one hundred
+    thousand JSON-backed row identities on the parent held the GIL for most of
+    a fit-only replay. Fork workers inherit the validated immutable rows
+    copy-on-write and return only compact ordered digest strings. Flattening the
+    range results in submission order preserves the historical join and
+    duplicate-detection semantics exactly.
+    """
+
+    global _PARALLEL_EXPORT_OBSERVATION_ROWS
+
+    if not observations:
+        return ()
+    worker_count = min(workers, len(observations))
+    if worker_count < 1:
+        raise ValueError("profiler observation digest worker count must be positive")
+    if worker_count == 1 or len(observations) < 4096:
+        return tuple(observation.digest() for observation in observations)
+
+    _PARALLEL_EXPORT_OBSERVATION_ROWS = observations
+    try:
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=multiprocessing.get_context("fork"),
+        ) as executor:
+            shards = tuple(executor.map(
+                _digest_export_observation_range,
+                _equal_ranges(len(observations), worker_count),
+            ))
+        return tuple(digest for shard in shards for digest in shard)
+    finally:
+        _PARALLEL_EXPORT_OBSERVATION_ROWS = ()
+
+
+def _validate_coverage_pairs_inline(
+    pairs: Iterable[tuple[Any, Any]],
+) -> tuple[int, int, tuple[str, ...]]:
+    """Validate ordered evidence pairs and return deterministic status totals."""
+
+    complete_count = 0
+    unsupported_count = 0
+    failed = []
+    for request, item in pairs:
+        item.validate(request)
+        expected_status = (
+            ProfilerEvidenceStatus.COMPLETE
+            if request.profile_required
+            else ProfilerEvidenceStatus.CANDIDATE_UNSUPPORTED
+        )
+        if item.status != expected_status:
+            failed.append(item.request_id)
+        elif item.status == ProfilerEvidenceStatus.COMPLETE:
+            complete_count += 1
+        else:
+            unsupported_count += 1
+    return complete_count, unsupported_count, tuple(failed)
+
+
+def _manifest_record_mapping(record: Any) -> Mapping[str, Any]:
+    """Return one canonical object or already decoded immutable JSON record."""
+
+    if isinstance(record, Mapping):
+        return record
+    return record.canonical_mapping()
+
+
+def _serialize_manifest_record_range(
+    task: tuple[int, int, Path],
+) -> Path:
+    """Serialize one ordered record range directly to a private shard."""
+
+    begin, end, output = task
+    with output.open("w", encoding="utf-8") as handle:
+        for index in range(begin, end):
+            if index != begin:
+                handle.write(",")
+            json.dump(
+                _manifest_record_mapping(_PARALLEL_MANIFEST_RECORDS[index]),
+                handle,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+    return output
 
 
 def _sha256_manifest_records(
@@ -142,52 +494,61 @@ def _sha256_manifest_records(
     if requested_workers < 1:
         raise ValueError("manifest digest worker count must be positive")
     worker_count = min(requested_workers, max(1, len(records) // 4096))
+    def reduce_digest(serialized_shards: Iterable[bytes | Path]) -> str:
+        digest = hashlib.sha256()
+        digest.update(b"{")
+        root_names = sorted((*scalar_fields, array_name))
+        for field_index, name in enumerate(root_names):
+            if field_index != 0:
+                digest.update(b",")
+            digest.update(json.dumps(name, separators=(",", ":")).encode())
+            digest.update(b":")
+            if name == array_name:
+                digest.update(b"[")
+                for shard_index, shard in enumerate(serialized_shards):
+                    if shard_index != 0:
+                        digest.update(b",")
+                    if isinstance(shard, bytes):
+                        digest.update(shard)
+                    else:
+                        with shard.open("rb") as handle:
+                            while block := handle.read(1024 * 1024):
+                                digest.update(block)
+                digest.update(b"]")
+            else:
+                digest.update(json.dumps(
+                    scalar_fields[name], sort_keys=True, separators=(",", ":")
+                ).encode())
+        digest.update(b"}")
+        return "sha256:" + digest.hexdigest()
+
     if worker_count == 1:
-        serialized_shards = (_serialize_manifest_records_inline(records),)
-    else:
-        base = len(records) // worker_count
-        remainder = len(records) % worker_count
-        bounds = []
-        begin = 0
-        for worker_index in range(worker_count):
-            size = base + (1 if worker_index < remainder else 0)
-            bounds.append((begin, begin + size))
-            begin += size
-        global _PARALLEL_MANIFEST_RECORDS
-        _PARALLEL_MANIFEST_RECORDS = records
-        try:
+        return reduce_digest((_serialize_manifest_records_inline(records),))
+
+    global _PARALLEL_MANIFEST_RECORDS
+    _PARALLEL_MANIFEST_RECORDS = records
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="native-vnni-manifest-digest-"
+        ) as temporary_directory:
+            root = Path(temporary_directory)
+            tasks = tuple(
+                (begin, end, root / f"part-{index:04d}.json")
+                for index, (begin, end) in enumerate(
+                    _equal_ranges(len(records), worker_count)
+                )
+            )
             with ProcessPoolExecutor(
                 max_workers=worker_count,
                 mp_context=multiprocessing.get_context("fork"),
             ) as executor:
                 serialized_shards = tuple(executor.map(
                     _serialize_manifest_record_range,
-                    bounds,
+                    tasks,
                 ))
-        finally:
-            _PARALLEL_MANIFEST_RECORDS = ()
-
-    digest = hashlib.sha256()
-    digest.update(b"{")
-    root_names = sorted((*scalar_fields, array_name))
-    for field_index, name in enumerate(root_names):
-        if field_index != 0:
-            digest.update(b",")
-        digest.update(json.dumps(name, separators=(",", ":")).encode())
-        digest.update(b":")
-        if name == array_name:
-            digest.update(b"[")
-            for shard_index, shard in enumerate(serialized_shards):
-                if shard_index != 0 and shard:
-                    digest.update(b",")
-                digest.update(shard)
-            digest.update(b"]")
-        else:
-            digest.update(json.dumps(
-                scalar_fields[name], sort_keys=True, separators=(",", ":")
-            ).encode())
-    digest.update(b"}")
-    return "sha256:" + digest.hexdigest()
+            return reduce_digest(serialized_shards)
+    finally:
+        _PARALLEL_MANIFEST_RECORDS = ()
 
 
 def _serialize_manifest_records_inline(records: tuple[Any, ...]) -> bytes:
@@ -195,10 +556,118 @@ def _serialize_manifest_records_inline(records: tuple[Any, ...]) -> bytes:
 
     return ",".join(
         json.dumps(
-            record.canonical_mapping(), sort_keys=True, separators=(",", ":")
+            _manifest_record_mapping(record),
+            sort_keys=True,
+            separators=(",", ":"),
         )
         for record in records
     ).encode()
+
+
+def _write_manifest_records_json(
+    path: Path,
+    scalar_fields: Mapping[str, Any],
+    array_name: str,
+    records: tuple[Any, ...],
+) -> None:
+    """Atomically stream one large manifest without building its JSON tree.
+
+    Request inventories can contain hundreds of thousands of records.  Calling
+    ``json.dumps`` on a root mapping first duplicates every request as a Python
+    dictionary and then allocates the complete encoded document as one string.
+    Besides a multi-gigabyte peak, that final copy is constrained by the GIL.
+
+    Large inventories use the same physical-core-bounded record sharding as
+    manifest hashing.  Workers serialize disjoint ordered ranges, and the
+    parent concatenates those private files into one compact JSON document.
+    Small inventories stream one record at a time in process.  Neither path
+    changes the manifest digest because the digest authenticates canonical
+    field values rather than presentation whitespace.
+    """
+
+    requested_workers = int(os.environ.get(
+        "LLAMINAR_NATIVE_VNNI_MANIFEST_WRITE_WORKERS",
+        str(_physical_core_count()),
+    ))
+    if requested_workers < 1:
+        raise ValueError("manifest writer worker count must be positive")
+    worker_count = min(requested_workers, max(1, len(records) // 4096))
+    staged_path = path.with_name(path.name + ".inprogress")
+    published = False
+
+    def write_root(serialized_shards: Iterable[bytes | Path]) -> None:
+        with staged_path.open("wb") as output:
+            output.write(b"{")
+            root_names = sorted((*scalar_fields, array_name))
+            for field_index, name in enumerate(root_names):
+                if field_index != 0:
+                    output.write(b",")
+                output.write(json.dumps(
+                    name, separators=(",", ":")
+                ).encode())
+                output.write(b":")
+                if name == array_name:
+                    output.write(b"[")
+                    for shard_index, shard in enumerate(serialized_shards):
+                        if shard_index != 0:
+                            output.write(b",")
+                        if isinstance(shard, bytes):
+                            output.write(shard)
+                        else:
+                            with shard.open("rb") as handle:
+                                shutil.copyfileobj(
+                                    handle, output, length=1024 * 1024
+                                )
+                    output.write(b"]")
+                else:
+                    output.write(json.dumps(
+                        scalar_fields[name],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode())
+            output.write(b"}\n")
+
+    try:
+        if worker_count == 1:
+            write_root(
+                json.dumps(
+                    _manifest_record_mapping(record),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                for record in records
+            )
+        else:
+            global _PARALLEL_MANIFEST_RECORDS
+            _PARALLEL_MANIFEST_RECORDS = records
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix=f".{path.name}.parts-",
+                    dir=path.parent,
+                ) as temporary_directory:
+                    root = Path(temporary_directory)
+                    tasks = tuple(
+                        (begin, end, root / f"part-{index:04d}.json")
+                        for index, (begin, end) in enumerate(
+                            _equal_ranges(len(records), worker_count)
+                        )
+                    )
+                    with ProcessPoolExecutor(
+                        max_workers=worker_count,
+                        mp_context=multiprocessing.get_context("fork"),
+                    ) as executor:
+                        serialized_shards = tuple(executor.map(
+                            _serialize_manifest_record_range,
+                            tasks,
+                        ))
+                    write_root(serialized_shards)
+            finally:
+                _PARALLEL_MANIFEST_RECORDS = ()
+        os.replace(staged_path, path)
+        published = True
+    finally:
+        if not published:
+            staged_path.unlink(missing_ok=True)
 
 
 def _is_sha256(value: str) -> bool:
@@ -581,6 +1050,52 @@ def profiler_request_for_observation(
     return result
 
 
+def _profiler_requests_for_observations(
+    observations: Sequence[NativeVNNIObservation],
+    *,
+    workers: int | None = None,
+) -> tuple[ProfilerRequest, ...]:
+    """Convert observations in parallel while preserving their exact order.
+
+    Request construction validates each timing row, resolves registry metadata,
+    and hashes several provenance identities. Those operations are independent
+    and Python-GIL-bound. Fork workers inherit the immutable observation tuple,
+    so the parent sends only balanced index ranges and receives one ordered
+    request partition per physical core.
+    """
+
+    records = tuple(observations)
+    if not records:
+        return ()
+    if workers is None:
+        worker_count = _offline_worker_count(
+            len(records),
+            environment_name="LLAMINAR_NATIVE_VNNI_REQUEST_BUILD_WORKERS",
+            records_per_worker=2048,
+        )
+    else:
+        if workers < 1:
+            raise ValueError("profiler request build workers must be positive")
+        worker_count = min(workers, _physical_core_count(), len(records))
+    if worker_count <= 1:
+        return tuple(profiler_request_for_observation(row) for row in records)
+
+    global _PARALLEL_REQUEST_BUILD_OBSERVATIONS
+    _PARALLEL_REQUEST_BUILD_OBSERVATIONS = records
+    try:
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=multiprocessing.get_context("fork"),
+        ) as executor:
+            partitions = tuple(executor.map(
+                _build_profiler_request_range,
+                _equal_ranges(len(records), worker_count),
+            ))
+    finally:
+        _PARALLEL_REQUEST_BUILD_OBSERVATIONS = ()
+    return tuple(request for partition in partitions for request in partition)
+
+
 @dataclass(frozen=True)
 class ProfilerRequestManifest:
     """Complete profiler obligation inventory for one timing corpus."""
@@ -627,8 +1142,27 @@ class ProfilerRequestManifest:
             raise ValueError("profiler request IDs must be unique")
         if len(set(observation_ids)) != len(observation_ids):
             raise ValueError("one timing observation cannot create two profiler requests")
-        for request in self.requests:
-            request.validate()
+        worker_count = _offline_worker_count(
+            len(self.requests),
+            environment_name="LLAMINAR_NATIVE_VNNI_VALIDATION_WORKERS",
+        )
+        if worker_count <= 1:
+            for request in self.requests:
+                request.validate()
+        else:
+            global _PARALLEL_REQUEST_VALIDATION_RECORDS
+            _PARALLEL_REQUEST_VALIDATION_RECORDS = self.requests
+            try:
+                with ProcessPoolExecutor(
+                    max_workers=worker_count,
+                    mp_context=multiprocessing.get_context("fork"),
+                ) as executor:
+                    tuple(executor.map(
+                        _validate_profiler_request_range,
+                        _equal_ranges(len(self.requests), worker_count),
+                    ))
+            finally:
+                _PARALLEL_REQUEST_VALIDATION_RECORDS = ()
         if self.schema_version == LEGACY_PROFILER_REQUEST_SCHEMA_VERSION:
             _validate_matched_profiler_anchors(self.requests)
         else:
@@ -701,40 +1235,10 @@ def build_profiler_request_manifest(
     no unsupported or non-forceable row can stand in for executable evidence.
     """
 
-    launchable: dict[
-        tuple[object, ...], list[NativeVNNIObservation]
-    ] = {}
-    never_launchable: dict[
-        tuple[object, ...], list[NativeVNNIObservation]
-    ] = {}
-    for row in corpus:
-        candidate_key = (
-            row.backend,
-            row.architecture_class,
-            row.operation_kind,
-            row.bundle_signature,
-            row.prepared_family_id,
-            row.packing_abi,
-            row.runtime_codebook_id,
-            row.effective_candidate_id,
-        )
-        if row.supported and row.forced_route_ok and row.generic_eligible:
-            launch_key = (
-                *candidate_key,
-                row.execution_mode,
-                row.m,
-                row.projection_n_vector,
-                row.aggregate_n,
-                row.k,
-            )
-            launchable.setdefault(launch_key, []).append(row)
-        else:
-            never_launchable.setdefault(candidate_key, []).append(row)
+    launchable, never_launchable = _group_profiler_observations(corpus)
 
     selected: dict[str, NativeVNNIObservation] = {}
-    launchable_candidates = {
-        key[:8] for key in launchable
-    }
+    launchable_candidates = {key[:-5] for key in launchable}
     for rows in launchable.values():
         representative = min(
             rows,
@@ -769,7 +1273,7 @@ def build_profiler_request_manifest(
         selected[representative.digest()] = representative
 
     requests = tuple(sorted(
-        (profiler_request_for_observation(row) for row in selected.values()),
+        _profiler_requests_for_observations(tuple(selected.values())),
         key=lambda request: (
             request.backend.value,
             request.architecture_class,
@@ -792,9 +1296,85 @@ def build_profiler_request_manifest(
     )
 
 
+def _group_profiler_observations(
+    corpus: ObservationCorpus,
+) -> tuple[
+    dict[tuple[object, ...], list[NativeVNNIObservation]],
+    dict[tuple[object, ...], list[NativeVNNIObservation]],
+]:
+    """Group timing rows by the exact profiler identity they represent.
+
+    The grouping key is intentionally the same field sequence returned by
+    :func:`_profiled_exact_launch_key`.  Building it directly from a timing row
+    and its reviewed candidate registry entry lets resume checks compare the
+    current corpus to authenticated coverage before constructing expensive
+    request value objects.  Registry metadata is cached per physical candidate
+    surface because schedule, workspace, and prepared resources do not change
+    with ``M``, ``N``, or ``K``.
+    """
+
+    launchable: dict[
+        tuple[object, ...], list[NativeVNNIObservation]
+    ] = {}
+    never_launchable: dict[
+        tuple[object, ...], list[NativeVNNIObservation]
+    ] = {}
+    physical_keys: dict[tuple[object, ...], tuple[object, ...]] = {}
+    for row in corpus:
+        candidate_identity = (
+            row.backend,
+            row.architecture_class,
+            row.operation_kind,
+            row.bundle_signature,
+            row.prepared_family_id,
+            row.packing_abi,
+            row.runtime_codebook_id,
+            row.effective_candidate_id,
+            row.arithmetic_fingerprint,
+            row.candidate_policy_hash,
+            row.threading_or_stream_mode,
+        )
+        physical_key = physical_keys.get(candidate_identity)
+        if physical_key is None:
+            registry, candidate = _registry_for_observation(row)
+            physical_key = (
+                row.backend,
+                row.architecture_class,
+                row.operation_kind,
+                row.bundle_signature,
+                row.prepared_family_id,
+                row.packing_abi,
+                row.runtime_codebook_id,
+                registry.surface,
+                row.effective_candidate_id,
+                row.arithmetic_fingerprint,
+                row.candidate_policy_hash,
+                candidate.schedule_signature,
+                candidate.workspace_signature,
+                candidate.prepared_resources,
+                row.threading_or_stream_mode,
+            )
+            physical_keys[candidate_identity] = physical_key
+        if row.supported and row.forced_route_ok and row.generic_eligible:
+            launch_key = (
+                *physical_key,
+                row.execution_mode,
+                row.m,
+                row.projection_n_vector,
+                row.aggregate_n,
+                row.k,
+            )
+            launchable.setdefault(launch_key, []).append(row)
+        else:
+            never_launchable.setdefault(physical_key, []).append(row)
+    return launchable, never_launchable
+
+
 def build_missing_profiler_request_transaction(
     corpus: ObservationCorpus,
     covered_manifests: Iterable[ProfilerRequestManifest],
+    *,
+    covered_launch_keys: set[tuple[object, ...]] | None = None,
 ) -> tuple[ObservationCorpus | None, ProfilerRequestManifest | None]:
     """Derive only exact physical launches absent from prior transactions.
 
@@ -812,16 +1392,75 @@ def build_missing_profiler_request_transaction(
     turnkey replay can stop successfully without creating empty manifests.
     """
 
-    complete = build_profiler_request_manifest(corpus)
-    covered_keys = _covered_profiler_launch_keys(covered_manifests)
-
-    missing_requests = tuple(
-        request
-        for request in complete.requests
-        if _profiled_exact_launch_key(request) not in covered_keys
+    covered_manifests = tuple(covered_manifests)
+    if covered_launch_keys is not None and covered_manifests:
+        raise ValueError(
+            "provide covered manifests or preauthenticated launch keys, not both"
+        )
+    covered_keys = (
+        covered_launch_keys
+        if covered_launch_keys is not None
+        else _covered_profiler_launch_keys(covered_manifests)
     )
-    if not missing_requests:
+    launchable, never_launchable = _group_profiler_observations(corpus)
+    launchable_candidates = {key[:-5] for key in launchable}
+
+    selected: dict[str, NativeVNNIObservation] = {}
+    for launch_key, rows in launchable.items():
+        if launch_key in covered_keys:
+            continue
+        representative = min(
+            rows,
+            key=lambda row: (
+                row.source_format,
+                row.source_codebook_id,
+                row.shape_name,
+                row.shape_group_id,
+                row.digest(),
+            ),
+        )
+        selected[representative.digest()] = representative
+
+    # Unsupported capability records are rare, but they remain part of the
+    # immutable manifest contract. Materialize only the representative needed
+    # to compare its geometry-bearing request key with prior coverage.
+    for physical_key, rows in never_launchable.items():
+        if physical_key in launchable_candidates:
+            continue
+        representative = min(
+            rows,
+            key=lambda row: (
+                row.m,
+                row.aggregate_n,
+                row.k,
+                row.source_format,
+                row.shape_name,
+                row.digest(),
+            ),
+        )
+        request = profiler_request_for_observation(representative)
+        if _profiled_exact_launch_key(request) not in covered_keys:
+            selected[representative.digest()] = representative
+
+    if not selected:
         return None, None
+
+    missing_requests = tuple(sorted(
+        (profiler_request_for_observation(row) for row in selected.values()),
+        key=lambda request: (
+            request.backend.value,
+            request.architecture_class,
+            request.semantic_contract.value,
+            request.operation_kind,
+            request.source_format,
+            request.execution_mode.value,
+            request.m,
+            request.aggregate_n,
+            request.k,
+            request.effective_candidate_id,
+            request.observation_digest,
+        ),
+    ))
 
     rows_by_digest = {row.digest(): row for row in corpus}
     missing_rows = []
@@ -835,11 +1474,11 @@ def build_missing_profiler_request_transaction(
     observations = ObservationCorpus._from_validated(missing_rows)
     requests = ProfilerRequestManifest(
         corpus_digest=observations.digest(),
-        candidate_registry_digest=complete.candidate_registry_digest,
+        candidate_registry_digest=candidate_registry_digest(),
         requests=missing_requests,
-        learner_version=complete.learner_version,
-        feature_schema_version=complete.feature_schema_version,
-        schema_version=complete.schema_version,
+        learner_version=LEARNER_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        schema_version=PROFILER_REQUEST_SCHEMA_VERSION,
     )
     return observations, requests
 
@@ -888,16 +1527,42 @@ def write_profiler_request_manifest(
 ) -> None:
     """Write a deterministic request manifest for backend collectors."""
 
-    path.write_text(
-        json.dumps(manifest.canonical_mapping(), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    _write_manifest_records_json(
+        path,
+        {
+            "schema_version": manifest.schema_version,
+            "metric_set_version": PROFILER_METRIC_SET_VERSION,
+            "observation_schema_version": SCHEMA_VERSION,
+            "policy_abi": POLICY_ABI,
+            "learner_version": manifest.learner_version,
+            "feature_schema_version": manifest.feature_schema_version,
+            "corpus_digest": manifest.corpus_digest,
+            "candidate_registry_digest": manifest.candidate_registry_digest,
+            "request_count": len(manifest.requests),
+            "manifest_digest": manifest.digest(),
+        },
+        "requests",
+        manifest.requests,
     )
 
 
-def read_profiler_request_manifest(path: Path) -> ProfilerRequestManifest:
-    """Read and authenticate one exact profiler request document."""
+def _read_profiler_request_document(
+    path: Path,
+    *,
+    workers: int | None = None,
+    parallel_threshold: int = 4096,
+) -> dict[str, Any]:
+    """Read and authenticate raw request JSON without constructing records."""
 
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    canonical_raw = _read_canonical_manifest_document(
+        path,
+        "requests",
+        workers=workers,
+        parallel_threshold=parallel_threshold,
+    )
+    raw = canonical_raw
+    if raw is None:
+        raw = json.loads(path.read_text(encoding="utf-8"))
     root_fields = {
         "schema_version",
         "metric_set_version",
@@ -928,22 +1593,177 @@ def read_profiler_request_manifest(path: Path) -> ProfilerRequestManifest:
             f"{raw['schema_version']!r}; accepted versions are "
             f"{sorted(SUPPORTED_PROFILER_REQUEST_SCHEMA_VERSIONS)!r}"
         )
+    if raw["learner_version"] not in COMPATIBLE_OBSERVATION_LEARNER_VERSIONS:
+        raise ValueError(
+            "unsupported profiler request learner_version="
+            f"{raw['learner_version']!r}"
+        )
+    if (
+        raw["feature_schema_version"]
+        not in COMPATIBLE_PROFILER_FEATURE_SCHEMA_VERSIONS
+    ):
+        raise ValueError(
+            "unsupported profiler request feature_schema_version="
+            f"{raw['feature_schema_version']!r}"
+        )
+    for name in ("corpus_digest", "candidate_registry_digest"):
+        if not _is_sha256(str(raw[name])):
+            raise ValueError(f"profiler request {name} is invalid")
     requests_raw = raw["requests"]
     if not isinstance(requests_raw, list):
         raise ValueError("profiler requests must be a JSON array")
+    if not requests_raw:
+        raise ValueError("profiler request manifest must not be empty")
     if int(raw["request_count"]) != len(requests_raw):
         raise ValueError("profiler request_count does not match request inventory")
+    # Canonical files were authenticated directly from their immutable bytes.
+    # The compatibility parser must recreate the semantic canonical payload.
+    if canonical_raw is None:
+        digest = _sha256_manifest_records(
+            {
+                "schema_version": raw["schema_version"],
+                "metric_set_version": raw["metric_set_version"],
+                "observation_schema_version": raw["observation_schema_version"],
+                "policy_abi": raw["policy_abi"],
+                "learner_version": raw["learner_version"],
+                "feature_schema_version": raw["feature_schema_version"],
+                "corpus_digest": raw["corpus_digest"],
+                "candidate_registry_digest": raw["candidate_registry_digest"],
+                "request_count": len(requests_raw),
+            },
+            "requests",
+            tuple(requests_raw),
+        )
+        if str(raw["manifest_digest"]) != digest:
+            raise ValueError("profiler request manifest digest does not match contents")
+    return raw
+
+
+def _decode_profiler_request_range(
+    bounds: tuple[int, int],
+) -> tuple[ProfilerRequest, ...]:
+    """Construct one inherited range of authenticated request records."""
+
+    begin, end = bounds
+    return tuple(
+        ProfilerRequest.from_mapping(_PARALLEL_REQUEST_DECODE_RECORDS[index])
+        for index in range(begin, end)
+    )
+
+
+def read_profiler_request_manifest(
+    path: Path,
+    *,
+    workers: int | None = None,
+    parallel_threshold: int = 4096,
+) -> ProfilerRequestManifest:
+    """Read and authenticate one exact profiler request document.
+
+    Large exact-point inventories contain six figures of deeply validated
+    records.  Their root digest is authenticated first; fork workers then
+    construct disjoint ranges from the inherited immutable JSON array.  Ordered
+    range assembly keeps the result byte-for-byte equivalent to serial decode
+    while avoiding one GIL-bound CPU core during every cache miss.
+    """
+
+    raw = _read_profiler_request_document(
+        path,
+        workers=workers,
+        parallel_threshold=parallel_threshold,
+    )
+    records = tuple(raw["requests"])
+    if workers is None:
+        worker_count = _offline_worker_count(
+            len(records),
+            environment_name="LLAMINAR_NATIVE_VNNI_IO_WORKERS",
+        )
+    else:
+        if workers < 1:
+            raise ValueError("profiler request decode worker count must be positive")
+        worker_count = min(workers, _physical_core_count(), len(records))
+    if worker_count <= 1 or len(records) < parallel_threshold:
+        requests = tuple(ProfilerRequest.from_mapping(record) for record in records)
+    else:
+        global _PARALLEL_REQUEST_DECODE_RECORDS
+        _PARALLEL_REQUEST_DECODE_RECORDS = records
+        try:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                decoded = tuple(executor.map(
+                    _decode_profiler_request_range,
+                    _equal_ranges(len(records), worker_count),
+                ))
+        finally:
+            _PARALLEL_REQUEST_DECODE_RECORDS = ()
+        requests = tuple(item for partition in decoded for item in partition)
     manifest = ProfilerRequestManifest(
         corpus_digest=str(raw["corpus_digest"]),
         candidate_registry_digest=str(raw["candidate_registry_digest"]),
-        requests=tuple(ProfilerRequest.from_mapping(record) for record in requests_raw),
+        requests=requests,
         learner_version=str(raw["learner_version"]),
         feature_schema_version=str(raw["feature_schema_version"]),
         schema_version=str(raw["schema_version"]),
     )
-    if str(raw["manifest_digest"]) != manifest.digest():
-        raise ValueError("profiler request manifest digest does not match contents")
     return manifest
+
+
+def read_profiler_request_coverage_keys(
+    path: Path,
+) -> set[tuple[object, ...]]:
+    """Authenticate one request manifest and project only coverage identity.
+
+    Resume planning does not consume provenance text, timing hashes, or the
+    collector-facing request value objects. Decoding a six-figure manifest into
+    full dataclasses solely to form a set of physical launch keys held one CPU
+    core for tens of seconds on every fit-only replay. This reader preserves
+    root digest authentication and strict record structure while projecting the
+    exact typed key directly from raw JSON. Legacy anchor manifests retain the
+    ordinary typed reader because their shape-independent coverage semantics are
+    intentionally different and no longer occur in current corpora.
+    """
+
+    raw = _read_profiler_request_document(path)
+    if raw["schema_version"] == LEGACY_PROFILER_REQUEST_SCHEMA_VERSION:
+        return _covered_profiler_launch_keys((
+            read_profiler_request_manifest(path),
+        ))
+
+    request_ids = set()
+    observation_digests = set()
+    required_launch_owners: dict[tuple[object, ...], str] = {}
+    covered_keys: set[tuple[object, ...]] = set()
+    for record in raw["requests"]:
+        _require_exact_keys(
+            record,
+            ProfilerRequest.__dataclass_fields__,
+            "profiler request",
+        )
+        request_id = str(record["request_id"])
+        observation_digest = str(record["observation_digest"])
+        _required_text("request_id", request_id)
+        if not _is_sha256(observation_digest):
+            raise ValueError("observation_digest must be a SHA-256 identity")
+        if request_id in request_ids:
+            raise ValueError("profiler request IDs must be unique")
+        if observation_digest in observation_digests:
+            raise ValueError(
+                "one timing observation cannot create two profiler requests"
+            )
+        request_ids.add(request_id)
+        observation_digests.add(observation_digest)
+
+        key = _typed_raw_exact_profiler_launch_key(record)
+        if _raw_request_profile_required(record):
+            owner = required_launch_owners.setdefault(key, request_id)
+            if owner != request_id:
+                raise ValueError(
+                    "profiler manifest contains duplicate evidence obligations "
+                    f"for exact physical launch {key}: {owner} and {request_id}"
+                )
+        covered_keys.add(key)
+    return covered_keys
 
 
 class MetricCategory(str, Enum):
@@ -996,6 +1816,9 @@ CUDA_METRIC_DEFINITIONS = (
     MetricDefinition("gpu.theoretical_occupancy_pct", MetricCategory.STATIC_RESOURCE, "percent", True),
     MetricDefinition("gpu.achieved_occupancy_pct", MetricCategory.DYNAMIC_COUNTER, "percent", True),
     MetricDefinition("gpu.compute_throughput_pct_of_peak", MetricCategory.DYNAMIC_COUNTER, "percent", True),
+    MetricDefinition("gpu.alu_pipe_utilization_pct", MetricCategory.DYNAMIC_COUNTER, "percent", False),
+    MetricDefinition("gpu.fma_pipe_utilization_pct", MetricCategory.DYNAMIC_COUNTER, "percent", False),
+    MetricDefinition("gpu.tensor_pipe_utilization_pct", MetricCategory.DYNAMIC_COUNTER, "percent", False),
     MetricDefinition("gpu.dram_throughput_pct_of_peak", MetricCategory.DYNAMIC_COUNTER, "percent", True),
     MetricDefinition("gpu.l1_throughput_pct_of_peak", MetricCategory.DYNAMIC_COUNTER, "percent", False),
     MetricDefinition("gpu.l2_throughput_pct_of_peak", MetricCategory.DYNAMIC_COUNTER, "percent", False),
@@ -1405,16 +2228,40 @@ def write_profiler_evidence_manifest(
 ) -> None:
     """Write a deterministic profiler evidence sidecar."""
 
-    path.write_text(
-        json.dumps(manifest.canonical_mapping(), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    _write_manifest_records_json(
+        path,
+        {
+            "schema_version": PROFILER_EVIDENCE_SCHEMA_VERSION,
+            "metric_set_version": PROFILER_METRIC_SET_VERSION,
+            "collector_version": manifest.collector_version,
+            "request_manifest_digest": manifest.request_manifest_digest,
+            "corpus_digest": manifest.corpus_digest,
+            "candidate_registry_digest": manifest.candidate_registry_digest,
+            "evidence_count": len(manifest.evidence),
+            "manifest_digest": manifest.digest(),
+        },
+        "evidence",
+        manifest.evidence,
     )
 
 
-def read_profiler_evidence_manifest(path: Path) -> ProfilerEvidenceManifest:
-    """Read and authenticate an incremental or complete evidence sidecar."""
+def _read_profiler_evidence_document(
+    path: Path,
+    *,
+    workers: int | None = None,
+    parallel_threshold: int = 4096,
+) -> dict[str, Any]:
+    """Read and authenticate raw evidence JSON without constructing records."""
 
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    canonical_raw = _read_canonical_manifest_document(
+        path,
+        "evidence",
+        workers=workers,
+        parallel_threshold=parallel_threshold,
+    )
+    raw = canonical_raw
+    if raw is None:
+        raw = json.loads(path.read_text(encoding="utf-8"))
     root_fields = {
         "schema_version",
         "metric_set_version",
@@ -1433,20 +2280,102 @@ def read_profiler_evidence_manifest(path: Path) -> ProfilerEvidenceManifest:
         raise ValueError("unsupported profiler evidence metric set")
     if raw["collector_version"] not in SUPPORTED_PROFILER_COLLECTOR_VERSIONS:
         raise ValueError("unsupported profiler evidence collector")
+    for name in (
+        "request_manifest_digest",
+        "corpus_digest",
+        "candidate_registry_digest",
+    ):
+        if not _is_sha256(str(raw[name])):
+            raise ValueError(f"profiler evidence {name} is invalid")
     evidence_raw = raw["evidence"]
     if not isinstance(evidence_raw, list):
         raise ValueError("profiler evidence inventory must be a JSON array")
     if int(raw["evidence_count"]) != len(evidence_raw):
         raise ValueError("profiler evidence_count does not match inventory")
+    if canonical_raw is None:
+        digest = _sha256_manifest_records(
+            {
+                "schema_version": raw["schema_version"],
+                "metric_set_version": raw["metric_set_version"],
+                "collector_version": raw["collector_version"],
+                "request_manifest_digest": raw["request_manifest_digest"],
+                "corpus_digest": raw["corpus_digest"],
+                "candidate_registry_digest": raw["candidate_registry_digest"],
+                "evidence_count": len(evidence_raw),
+            },
+            "evidence",
+            tuple(evidence_raw),
+        )
+        if str(raw["manifest_digest"]) != digest:
+            raise ValueError("profiler evidence manifest digest does not match contents")
+    return raw
+
+
+def _decode_profiler_evidence_range(
+    bounds: tuple[int, int],
+) -> tuple[ProfilerEvidence, ...]:
+    """Construct one inherited range of authenticated evidence records."""
+
+    begin, end = bounds
+    return tuple(
+        ProfilerEvidence.from_mapping(_PARALLEL_EVIDENCE_DECODE_RECORDS[index])
+        for index in range(begin, end)
+    )
+
+
+def read_profiler_evidence_manifest(
+    path: Path,
+    *,
+    workers: int | None = None,
+    parallel_threshold: int = 4096,
+) -> ProfilerEvidenceManifest:
+    """Read and authenticate an incremental or complete evidence sidecar.
+
+    Counter records are considerably deeper than request records because every
+    physical dispatch owns a complete metric inventory.  Decode their already
+    authenticated JSON ranges on physical cores in parallel, preserving exact
+    manifest order for deterministic joins and digests.
+    """
+
+    raw = _read_profiler_evidence_document(
+        path,
+        workers=workers,
+        parallel_threshold=parallel_threshold,
+    )
+    records = tuple(raw["evidence"])
+    if workers is None:
+        worker_count = _offline_worker_count(
+            len(records),
+            environment_name="LLAMINAR_NATIVE_VNNI_IO_WORKERS",
+        )
+    else:
+        if workers < 1:
+            raise ValueError("profiler evidence decode worker count must be positive")
+        worker_count = min(workers, _physical_core_count(), len(records))
+    if worker_count <= 1 or len(records) < parallel_threshold:
+        evidence = tuple(ProfilerEvidence.from_mapping(record) for record in records)
+    else:
+        global _PARALLEL_EVIDENCE_DECODE_RECORDS
+        _PARALLEL_EVIDENCE_DECODE_RECORDS = records
+        try:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                decoded = tuple(executor.map(
+                    _decode_profiler_evidence_range,
+                    _equal_ranges(len(records), worker_count),
+                ))
+        finally:
+            _PARALLEL_EVIDENCE_DECODE_RECORDS = ()
+        evidence = tuple(item for partition in decoded for item in partition)
     manifest = ProfilerEvidenceManifest(
         request_manifest_digest=str(raw["request_manifest_digest"]),
         corpus_digest=str(raw["corpus_digest"]),
         candidate_registry_digest=str(raw["candidate_registry_digest"]),
-        evidence=tuple(ProfilerEvidence.from_mapping(item) for item in evidence_raw),
+        evidence=evidence,
         collector_version=str(raw["collector_version"]),
     )
-    if str(raw["manifest_digest"]) != manifest.digest():
-        raise ValueError("profiler evidence manifest digest does not match contents")
     return manifest
 
 
@@ -1500,20 +2429,34 @@ def validate_profiler_evidence_coverage(
     complete_count = 0
     unsupported_count = 0
     required_count = sum(request.profile_required for request in requests.requests)
-    for request_id, item in sorted(evidence_by_id.items()):
-        request = request_by_id[request_id]
-        item.validate(request)
-        expected_status = (
-            ProfilerEvidenceStatus.COMPLETE
-            if request.profile_required
-            else ProfilerEvidenceStatus.CANDIDATE_UNSUPPORTED
-        )
-        if item.status != expected_status:
-            failed.append(request_id)
-        elif item.status == ProfilerEvidenceStatus.COMPLETE:
-            complete_count += 1
-        else:
-            unsupported_count += 1
+    ordered_pairs = tuple(
+        (request_by_id[request_id], item)
+        for request_id, item in sorted(evidence_by_id.items())
+    )
+    worker_count = _offline_worker_count(
+        len(ordered_pairs),
+        environment_name="LLAMINAR_NATIVE_VNNI_VALIDATION_WORKERS",
+    )
+    if worker_count <= 1:
+        reductions = (_validate_coverage_pairs_inline(ordered_pairs),)
+    else:
+        global _PARALLEL_COVERAGE_PAIRS
+        _PARALLEL_COVERAGE_PAIRS = ordered_pairs
+        try:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                reductions = tuple(executor.map(
+                    _validate_coverage_range,
+                    _equal_ranges(len(ordered_pairs), worker_count),
+                ))
+        finally:
+            _PARALLEL_COVERAGE_PAIRS = ()
+    for completed, unsupported, worker_failures in reductions:
+        complete_count += completed
+        unsupported_count += unsupported
+        failed.extend(worker_failures)
 
     report = ProfilerCoverageReport(
         request_count=len(request_by_id),
@@ -1934,6 +2877,226 @@ class ProfilerFeatureRow:
         }
 
 
+def _profiler_feature_csv_mapping(
+    row: ProfilerFeatureRow,
+    metric_ids: tuple[str, ...],
+) -> dict[str, object]:
+    """Flatten one profiler row using the canonical feature-table encoding."""
+
+    mapping = row.observation.canonical_mapping()
+    for name, value in tuple(mapping.items()):
+        if isinstance(value, (dict, list)):
+            mapping[name] = json.dumps(
+                value, sort_keys=True, separators=(",", ":")
+            )
+        elif value is None:
+            mapping[name] = ""
+    mapping.update({
+        "profiler.request_id": row.request_id,
+        "profiler.observation_digest": row.observation_digest,
+        "profiler.candidate_registry_surface": row.candidate_registry_surface,
+        "profiler.schedule_signature": row.schedule_signature,
+        "profiler.workspace_signature": row.workspace_signature,
+        "profiler.dispatch_count": row.dispatch_count,
+        "profiler.dispatch_index": row.dispatch_index,
+        "profiler.dispatch_kind": row.dispatch_kind.value,
+        "profiler.kernel_name": row.kernel_name,
+        "profiler.kernel_fingerprint": row.kernel_fingerprint,
+        "profiler.grid": json.dumps(row.grid, separators=(",", ":")),
+        "profiler.block": json.dumps(row.block, separators=(",", ":")),
+    })
+    for metric_id in metric_ids:
+        value = row.metric_values.get(metric_id)
+        mapping[f"{metric_id}.value"] = "" if value is None else value
+        mapping[f"{metric_id}.availability"] = (
+            row.metric_availability.get(metric_id, "not_applicable")
+        )
+    return mapping
+
+
+def _write_profiler_feature_range(task: tuple[int, int, Path]) -> Path:
+    """Format one inherited feature-row range into an ordered CSV shard."""
+
+    begin, end, output = task
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=_PARALLEL_PROFILER_FEATURE_FIELDNAMES,
+        )
+        for index in range(begin, end):
+            writer.writerow(_profiler_feature_csv_mapping(
+                _PARALLEL_PROFILER_FEATURE_ROWS[index],
+                _PARALLEL_PROFILER_FEATURE_METRIC_IDS,
+            ))
+    return output
+
+
+def _raw_request_profile_required(raw: Mapping[str, Any]) -> bool:
+    """Evaluate the immutable request capability predicate without decoding."""
+
+    return bool(raw["supported"]) and bool(raw["forced_route_ok"]) and (
+        str(raw["execution_mode"]) != ExecutionMode.GRAPH_CAPTURED.value
+        or bool(raw["graph_capture_ok"])
+    )
+
+
+def _raw_exact_profiler_launch_key(
+    raw: Mapping[str, Any],
+) -> tuple[object, ...]:
+    """Project raw authenticated JSON onto exact physical launch identity."""
+
+    return (
+        str(raw["backend"]),
+        str(raw["architecture_class"]),
+        str(raw["operation_kind"]),
+        str(raw["bundle_signature"]),
+        str(raw["prepared_family_id"]),
+        str(raw["packing_abi"]),
+        int(raw["runtime_codebook_id"]),
+        str(raw["candidate_registry_surface"]),
+        str(raw["effective_candidate_id"]),
+        str(raw["arithmetic_fingerprint"]),
+        str(raw["candidate_policy_hash"]),
+        str(raw["schedule_signature"]),
+        str(raw["workspace_signature"]),
+        tuple(str(value) for value in raw["prepared_resources"]),
+        str(raw["threading_or_stream_mode"]),
+        str(raw["execution_mode"]),
+        int(raw["m"]),
+        tuple(int(value) for value in raw["projection_n_vector"]),
+        int(raw["aggregate_n"]),
+        int(raw["k"]),
+    )
+
+
+def _typed_raw_exact_profiler_launch_key(
+    raw: Mapping[str, Any],
+) -> tuple[object, ...]:
+    """Project raw JSON onto the typed key used by in-memory observations."""
+
+    key = list(_raw_exact_profiler_launch_key(raw))
+    key[0] = Backend(str(key[0]))
+    key[15] = ExecutionMode(str(key[15]))
+    return tuple(key)
+
+
+def _write_direct_profiler_export_range(
+    task: tuple[int, int, Path],
+) -> tuple[Path, int, int, tuple[str, ...]]:
+    """Validate and emit one evidence range without returning record objects."""
+
+    begin, end, output = task
+    complete_count = 0
+    unsupported_count = 0
+    failed = []
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=_PARALLEL_PROFILER_FEATURE_FIELDNAMES,
+        )
+        for index in range(begin, end):
+            evidence = ProfilerEvidence.from_mapping(
+                _PARALLEL_EXPORT_EVIDENCE[index]
+            )
+            request = ProfilerRequest.from_mapping(
+                _PARALLEL_EXPORT_REQUESTS[evidence.request_id]
+            )
+            evidence.validate(request)
+            expected_status = (
+                ProfilerEvidenceStatus.COMPLETE
+                if request.profile_required
+                else ProfilerEvidenceStatus.CANDIDATE_UNSUPPORTED
+            )
+            if evidence.status != expected_status:
+                failed.append(request.request_id)
+                continue
+            if evidence.status == ProfilerEvidenceStatus.CANDIDATE_UNSUPPORTED:
+                unsupported_count += 1
+                continue
+
+            try:
+                observation = _PARALLEL_EXPORT_OBSERVATIONS[
+                    request.observation_digest
+                ]
+            except KeyError as error:
+                raise ValueError(
+                    f"{request.request_id}: profiler feature observations "
+                    "omit the exact timing witness"
+                ) from error
+            if profiler_request_for_observation(observation) != request:
+                raise ValueError(
+                    f"{request.request_id}: profiler request is not the exact "
+                    "derivative of its timing observation"
+                )
+
+            for dispatch in sorted(
+                evidence.dispatches,
+                key=lambda record: record.dispatch_index,
+            ):
+                writer.writerow(_profiler_feature_csv_mapping(
+                    ProfilerFeatureRow(
+                        observation=observation,
+                        request_id=request.request_id,
+                        observation_digest=request.observation_digest,
+                        candidate_registry_surface=(
+                            request.candidate_registry_surface
+                        ),
+                        schedule_signature=request.schedule_signature,
+                        workspace_signature=request.workspace_signature,
+                        dispatch_count=len(evidence.dispatches),
+                        dispatch_index=dispatch.dispatch_index,
+                        dispatch_kind=dispatch.dispatch_kind,
+                        kernel_name=dispatch.kernel_name,
+                        kernel_fingerprint=dispatch.kernel_fingerprint,
+                        grid=dispatch.grid,
+                        block=dispatch.block,
+                        metric_values={
+                            metric.metric_id: metric.value
+                            for metric in dispatch.metrics
+                        },
+                        metric_availability={
+                            metric.metric_id: metric.availability.value
+                            for metric in dispatch.metrics
+                        },
+                    ),
+                    _PARALLEL_PROFILER_FEATURE_METRIC_IDS,
+                ))
+            complete_count += 1
+    return output, complete_count, unsupported_count, tuple(failed)
+
+
+def _profiler_feature_csv_schema() -> tuple[
+    tuple[str, ...], tuple[str, ...]
+]:
+    """Return canonical feature-table fields and the union metric inventory."""
+
+    metric_ids = tuple(sorted({
+        definition.metric_id
+        for backend in Backend
+        for definition in metric_definitions(backend)
+    }))
+    profiler_columns = (
+        "profiler.request_id",
+        "profiler.observation_digest",
+        "profiler.candidate_registry_surface",
+        "profiler.schedule_signature",
+        "profiler.workspace_signature",
+        "profiler.dispatch_count",
+        "profiler.dispatch_index",
+        "profiler.dispatch_kind",
+        "profiler.kernel_name",
+        "profiler.kernel_fingerprint",
+        "profiler.grid",
+        "profiler.block",
+    )
+    metric_columns = tuple(
+        column
+        for metric_id in metric_ids
+        for column in (f"{metric_id}.value", f"{metric_id}.availability")
+    )
+    return (*OBSERVATION_COLUMNS, *profiler_columns, *metric_columns), metric_ids
+
+
 def _validate_feature_observation_join(
     observations: ObservationCorpus,
     requests: ProfilerRequestManifest,
@@ -1955,10 +3118,13 @@ def _validate_feature_observation_join(
     }
     if len(observations_by_digest) != len(observations):
         raise ValueError("profiler feature observations contain duplicate rows")
-    request_digests = {request.observation_digest for request in requests.requests}
-    full_corpus_authenticated = observations.digest() == requests.corpus_digest
     exact_request_witnesses = (
         set(observations_by_digest) == required_observation_digests
+    )
+    full_corpus_authenticated = (
+        False
+        if exact_request_witnesses
+        else observations.digest() == requests.corpus_digest
     )
     if not full_corpus_authenticated and not exact_request_witnesses:
         raise ValueError(
@@ -2167,74 +3333,310 @@ def write_profiler_feature_csv(
     evidence: ProfilerEvidenceManifest,
     *,
     require_complete: bool = True,
+    workers: int | None = None,
+    parallel_threshold: int = 4096,
 ) -> None:
-    """Write a flat dispatch-level feature table for offline model training."""
+    """Write a deterministic feature table with parallel row formatting.
+
+    Formatting hundreds of megabytes of nested observation and metric fields is
+    CPU-bound under the Python GIL. Fork workers inherit the validated immutable
+    row inventory, write disjoint contiguous shards, and the parent concatenates
+    those shards in source order. The result is byte-identical to serial CSV
+    emission and is atomically published only after every shard succeeds.
+    """
 
     rows = profiler_feature_rows(
         observations, requests, evidence, require_complete=require_complete
     )
-    metric_ids = tuple(sorted({
-        definition.metric_id
-        for backend in Backend
-        for definition in metric_definitions(backend)
-    }))
-    profiler_columns = (
-        "profiler.request_id",
-        "profiler.observation_digest",
-        "profiler.candidate_registry_surface",
-        "profiler.schedule_signature",
-        "profiler.workspace_signature",
-        "profiler.dispatch_count",
-        "profiler.dispatch_index",
-        "profiler.dispatch_kind",
-        "profiler.kernel_name",
-        "profiler.kernel_fingerprint",
-        "profiler.grid",
-        "profiler.block",
-    )
-    metric_columns = tuple(
-        column
-        for metric_id in metric_ids
-        for column in (f"{metric_id}.value", f"{metric_id}.availability")
-    )
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=(*OBSERVATION_COLUMNS, *profiler_columns, *metric_columns),
+    fieldnames, metric_ids = _profiler_feature_csv_schema()
+    if not rows:
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=fieldnames).writeheader()
+        return
+    if workers is None:
+        workers = _offline_worker_count(
+            len(rows),
+            environment_name="LLAMINAR_NATIVE_VNNI_IO_WORKERS",
         )
-        writer.writeheader()
-        for row in rows:
-            mapping = row.observation.canonical_mapping()
-            for name, value in tuple(mapping.items()):
-                if isinstance(value, (dict, list)):
-                    mapping[name] = json.dumps(
-                        value, sort_keys=True, separators=(",", ":")
-                    )
-                elif value is None:
-                    mapping[name] = ""
-            mapping.update({
-                "profiler.request_id": row.request_id,
-                "profiler.observation_digest": row.observation_digest,
-                "profiler.candidate_registry_surface": (
-                    row.candidate_registry_surface
-                ),
-                "profiler.schedule_signature": row.schedule_signature,
-                "profiler.workspace_signature": row.workspace_signature,
-                "profiler.dispatch_count": row.dispatch_count,
-                "profiler.dispatch_index": row.dispatch_index,
-                "profiler.dispatch_kind": row.dispatch_kind.value,
-                "profiler.kernel_name": row.kernel_name,
-                "profiler.kernel_fingerprint": row.kernel_fingerprint,
-                "profiler.grid": json.dumps(row.grid, separators=(",", ":")),
-                "profiler.block": json.dumps(row.block, separators=(",", ":")),
-            })
-            for metric_id in metric_ids:
-                value = row.metric_values.get(metric_id)
-                mapping[f"{metric_id}.value"] = "" if value is None else value
-                mapping[f"{metric_id}.availability"] = (
-                    row.metric_availability.get(metric_id, "not_applicable")
+    if workers < 1:
+        raise ValueError("profiler feature CSV worker count must be positive")
+    worker_count = min(workers, len(rows))
+    if worker_count <= 1 or len(rows) < parallel_threshold:
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(_profiler_feature_csv_mapping(row, metric_ids))
+        return
+
+    global _PARALLEL_PROFILER_FEATURE_ROWS
+    global _PARALLEL_PROFILER_FEATURE_FIELDNAMES
+    global _PARALLEL_PROFILER_FEATURE_METRIC_IDS
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{path.name}.parts-",
+        dir=path.parent,
+    ) as temporary_directory:
+        temporary_root = Path(temporary_directory)
+        ranges = _equal_ranges(len(rows), worker_count)
+        tasks = tuple(
+            (begin, end, temporary_root / f"part-{index:04d}.csv")
+            for index, (begin, end) in enumerate(ranges)
+        )
+        _PARALLEL_PROFILER_FEATURE_ROWS = rows
+        _PARALLEL_PROFILER_FEATURE_FIELDNAMES = tuple(fieldnames)
+        _PARALLEL_PROFILER_FEATURE_METRIC_IDS = metric_ids
+        try:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                shard_paths = tuple(executor.map(
+                    _write_profiler_feature_range,
+                    tasks,
+                ))
+        finally:
+            _PARALLEL_PROFILER_FEATURE_ROWS = ()
+            _PARALLEL_PROFILER_FEATURE_FIELDNAMES = ()
+            _PARALLEL_PROFILER_FEATURE_METRIC_IDS = ()
+
+        staged_path = temporary_root / "complete.csv"
+        with staged_path.open("wb") as output:
+            header_buffer = io.StringIO(newline="")
+            csv.DictWriter(
+                header_buffer,
+                fieldnames=fieldnames,
+            ).writeheader()
+            output.write(header_buffer.getvalue().encode("utf-8"))
+            for shard_path in shard_paths:
+                with shard_path.open("rb") as shard:
+                    shutil.copyfileobj(shard, output, length=1024 * 1024)
+        os.replace(staged_path, path)
+
+
+def write_profiler_feature_csv_from_files(
+    path: Path,
+    observation_paths: Iterable[Path],
+    request_path: Path,
+    evidence_path: Path,
+    *,
+    workers: int | None = None,
+) -> None:
+    """Authenticate and export a large exact-point transaction in parallel.
+
+    This is the production CLI path. The parent parses the two JSON documents
+    once and authenticates their canonical digests, then fork workers inherit
+    those immutable mappings. Each worker constructs, validates, joins, and
+    formats only its own request/evidence range directly into an ordered file
+    shard. No corpus-sized dataclass inventory is serialized back through a
+    multiprocessing pipe, and the parent performs only small reductions plus
+    byte concatenation.
+    """
+
+    request_document = _read_profiler_request_document(
+        request_path,
+        workers=workers,
+    )
+    evidence_document = _read_profiler_evidence_document(
+        evidence_path,
+        workers=workers,
+    )
+    if (
+        request_document["schema_version"]
+        != PROFILER_REQUEST_SCHEMA_VERSION
+    ):
+        observations = read_observation_csv(observation_paths)
+        write_profiler_feature_csv(
+            path,
+            observations,
+            read_profiler_request_manifest(request_path),
+            read_profiler_evidence_manifest(evidence_path),
+            workers=workers,
+        )
+        return
+
+    if (
+        str(evidence_document["request_manifest_digest"])
+        != str(request_document["manifest_digest"])
+    ):
+        raise ValueError("profiler evidence belongs to another request manifest")
+    for name in ("corpus_digest", "candidate_registry_digest"):
+        if str(evidence_document[name]) != str(request_document[name]):
+            raise ValueError(
+                f"profiler evidence uses another request {name}"
+            )
+
+    request_records = tuple(request_document["requests"])
+    request_by_id: dict[str, Mapping[str, Any]] = {}
+    observation_request_ids = set()
+    exact_launch_owners: dict[tuple[object, ...], str] = {}
+    required_count = 0
+    for raw in request_records:
+        request_id = str(raw["request_id"])
+        if request_id in request_by_id:
+            raise ValueError("profiler request IDs must be unique")
+        request_by_id[request_id] = raw
+        observation_digest = str(raw["observation_digest"])
+        if observation_digest in observation_request_ids:
+            raise ValueError(
+                "one timing observation cannot create two profiler requests"
+            )
+        observation_request_ids.add(observation_digest)
+        if _raw_request_profile_required(raw):
+            required_count += 1
+            launch_key = _raw_exact_profiler_launch_key(raw)
+            owner = exact_launch_owners.setdefault(launch_key, request_id)
+            if owner != request_id:
+                raise ValueError(
+                    "profiler manifest contains duplicate evidence obligations "
+                    f"for exact physical launch {launch_key}: {owner} and "
+                    f"{request_id}"
                 )
-            writer.writerow(mapping)
+
+    evidence_records = tuple(sorted(
+        evidence_document["evidence"],
+        key=lambda raw: str(raw["request_id"]),
+    ))
+    evidence_ids = [str(raw["request_id"]) for raw in evidence_records]
+    if len(evidence_ids) != len(set(evidence_ids)):
+        raise ValueError("profiler evidence contains duplicate request IDs")
+    if any(
+        str(raw["collector_version"])
+        != str(evidence_document["collector_version"])
+        for raw in evidence_records
+    ):
+        raise ValueError("profiler evidence manifest mixes collector generations")
+    extras = sorted(set(evidence_ids).difference(request_by_id))
+    if extras:
+        raise ValueError(f"profiler evidence contains unknown requests: {extras}")
+    missing = sorted(set(request_by_id).difference(evidence_ids))
+    if missing:
+        raise ValueError(
+            "profiler coverage is incomplete: "
+            f"missing={missing} failed=[]"
+        )
+
+    if workers is None:
+        worker_count = _offline_worker_count(
+            len(evidence_records),
+            environment_name="LLAMINAR_NATIVE_VNNI_IO_WORKERS",
+        )
+    else:
+        if workers < 1:
+            raise ValueError("profiler feature CSV worker count must be positive")
+        worker_count = min(
+            workers,
+            _physical_core_count(),
+            len(evidence_records),
+        )
+
+    observations = tuple(read_observation_rows(observation_paths))
+    observation_digests = _parallel_export_observation_digests(
+        observations,
+        workers=worker_count,
+    )
+    observations_by_digest: dict[str, NativeVNNIObservation] = {}
+    for observation, digest in zip(observations, observation_digests):
+        if digest in observations_by_digest:
+            raise ValueError("profiler feature observations contain duplicate rows")
+        observations_by_digest[digest] = observation
+    required_observation_digests = frozenset(
+        str(request_by_id[request_id]["observation_digest"])
+        for request_id, raw in zip(evidence_ids, evidence_records)
+        if str(raw["status"]) == ProfilerEvidenceStatus.COMPLETE.value
+    )
+    exact_request_witnesses = (
+        set(observations_by_digest) == required_observation_digests
+    )
+    if not exact_request_witnesses:
+        full_corpus = ObservationCorpus._from_validated(observations)
+        if full_corpus.digest() != str(request_document["corpus_digest"]):
+            raise ValueError(
+                "profiler feature observations belong to another timing corpus; "
+                "a compact source must contain exactly the request observation "
+                "witnesses"
+            )
+    if not required_observation_digests.issubset(observations_by_digest):
+        raise ValueError(
+            "profiler requests are not an authenticated timing-corpus subset"
+        )
+
+    fieldnames, metric_ids = _profiler_feature_csv_schema()
+    global _PARALLEL_EXPORT_REQUESTS
+    global _PARALLEL_EXPORT_EVIDENCE
+    global _PARALLEL_EXPORT_OBSERVATIONS
+    global _PARALLEL_PROFILER_FEATURE_FIELDNAMES
+    global _PARALLEL_PROFILER_FEATURE_METRIC_IDS
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{path.name}.parts-",
+        dir=path.parent,
+    ) as temporary_directory:
+        root = Path(temporary_directory)
+        tasks = tuple(
+            (begin, end, root / f"part-{index:04d}.csv")
+            for index, (begin, end) in enumerate(
+                _equal_ranges(len(evidence_records), worker_count)
+            )
+        )
+        _PARALLEL_EXPORT_REQUESTS = request_by_id
+        _PARALLEL_EXPORT_EVIDENCE = evidence_records
+        _PARALLEL_EXPORT_OBSERVATIONS = observations_by_digest
+        _PARALLEL_PROFILER_FEATURE_FIELDNAMES = fieldnames
+        _PARALLEL_PROFILER_FEATURE_METRIC_IDS = metric_ids
+        try:
+            if worker_count == 1:
+                reductions = tuple(
+                    _write_direct_profiler_export_range(task) for task in tasks
+                )
+            else:
+                with ProcessPoolExecutor(
+                    max_workers=worker_count,
+                    mp_context=multiprocessing.get_context("fork"),
+                ) as executor:
+                    reductions = tuple(executor.map(
+                        _write_direct_profiler_export_range,
+                        tasks,
+                    ))
+        finally:
+            _PARALLEL_EXPORT_REQUESTS = {}
+            _PARALLEL_EXPORT_EVIDENCE = ()
+            _PARALLEL_EXPORT_OBSERVATIONS = {}
+            _PARALLEL_PROFILER_FEATURE_FIELDNAMES = ()
+            _PARALLEL_PROFILER_FEATURE_METRIC_IDS = ()
+
+        complete_count = sum(item[1] for item in reductions)
+        unsupported_count = sum(item[2] for item in reductions)
+        failed = tuple(
+            request_id
+            for item in reductions
+            for request_id in item[3]
+        )
+        if failed:
+            raise ValueError(
+                "profiler coverage is incomplete: missing=[] "
+                f"failed={list(failed)}"
+            )
+        if complete_count != required_count:
+            raise ValueError(
+                "profiler coverage complete-count mismatch: "
+                f"expected={required_count} actual={complete_count}"
+            )
+        if complete_count + unsupported_count != len(request_records):
+            raise ValueError("profiler coverage terminal-state count mismatch")
+
+        staged_path = root / "complete.csv"
+        with staged_path.open("wb") as output:
+            header_buffer = io.StringIO(newline="")
+            csv.DictWriter(
+                header_buffer,
+                fieldnames=fieldnames,
+            ).writeheader()
+            output.write(header_buffer.getvalue().encode("utf-8"))
+            for shard_path, *_ in reductions:
+                with shard_path.open("rb") as shard:
+                    shutil.copyfileobj(shard, output, length=1024 * 1024)
+        os.replace(staged_path, path)
 
 
 def _emit_requests(args: argparse.Namespace) -> int:
@@ -2242,6 +3644,10 @@ def _emit_requests(args: argparse.Namespace) -> int:
 
     corpus = read_observation_csv(Path(path) for path in args.observation)
     manifest = build_profiler_request_manifest(corpus)
+    # The manifest owns independent immutable request records.  Release the
+    # much larger observation corpus and all of its runtime/domain indices
+    # before the parallel serializer forks or writes its output shards.
+    del corpus
     write_profiler_request_manifest(Path(args.output), manifest)
     print(
         json.dumps(
@@ -2263,13 +3669,13 @@ def _emit_missing_requests(args: argparse.Namespace) -> int:
     """CLI implementation for one resumable exact-point delta transaction."""
 
     corpus = read_observation_csv(Path(path) for path in args.observation)
-    covered = tuple(
-        read_profiler_request_manifest(Path(path))
-        for path in args.covered_requests
-    )
+    covered_keys: set[tuple[object, ...]] = set()
+    for path in args.covered_requests:
+        covered_keys.update(read_profiler_request_coverage_keys(Path(path)))
     observations, requests = build_missing_profiler_request_transaction(
         corpus,
-        covered,
+        (),
+        covered_launch_keys=covered_keys,
     )
     if observations is None or requests is None:
         print(json.dumps({
@@ -2324,17 +3730,25 @@ def _validate_evidence(args: argparse.Namespace) -> int:
 def _export_features(args: argparse.Namespace) -> int:
     """CLI implementation for the dispatch-level offline feature table."""
 
-    observations = read_observation_csv(Path(path) for path in args.observation)
-    requests = read_profiler_request_manifest(Path(args.requests))
-    evidence = read_profiler_evidence_manifest(Path(args.evidence))
     output = Path(args.output)
-    write_profiler_feature_csv(
-        output,
-        observations,
-        requests,
-        evidence,
-        require_complete=not args.allow_incomplete,
-    )
+    if args.allow_incomplete:
+        observations = read_observation_csv(
+            Path(path) for path in args.observation
+        )
+        write_profiler_feature_csv(
+            output,
+            observations,
+            read_profiler_request_manifest(Path(args.requests)),
+            read_profiler_evidence_manifest(Path(args.evidence)),
+            require_complete=False,
+        )
+    else:
+        write_profiler_feature_csv_from_files(
+            output,
+            (Path(path) for path in args.observation),
+            Path(args.requests),
+            Path(args.evidence),
+        )
     print(json.dumps({"output": str(output)}, sort_keys=True))
     return 0
 

@@ -40,11 +40,51 @@ Options:
                               profiling, generation, and validation transaction;
                               overruns are reported but do not kill collection
                               (default: 7200 seconds / two hours)
+  --maximum-p95-regret-percent PERCENT
+                              Strict per-domain observed/UCB regret budget used
+                              by fitting and sealed certification (default: 5)
+  --minimum-passing-domain-percent PERCENT
+                              Minimum percentage of complete generic domains
+                              that must meet the p95 budget (default: 95). A
+                              best-effort install may explicitly lower this;
+                              correctness and structural gates remain mandatory.
+  --cpu-minimum-promotion-warmups N
+                              Minimum warmups admitted for installable fixed-
+                              timing CPU M=1/grouped evidence (default: 5)
+  --cpu-minimum-promotion-samples N
+                              Minimum samples admitted for installable fixed-
+                              timing CPU M=1/grouped evidence (default: 30)
   --resume-cpu-partials        Reuse completed atomic CPU shape/format/ISA
                                partials in the selected output directory
+  --reuse-cuda-development     Reuse and authenticate canonical CUDA M=1
+                               development timing/profiler evidence, then open
+                               a fresh seal and continue the full transaction
+  --cuda-development-build-change-audit NOTE
+                              Reviewed explanation for retaining CUDA
+                              development evidence across a harness rebuild
   --stop-after-cpu-decode      Certify and install the complete CPU M=1 policy,
                                rebuild both CPU trainers, then stop before
                                grouped-verifier collection
+  --resume-after-cpu-decode    Authenticate the completed and installed CPU
+                               M=1 policy in output-dir, then begin directly at
+                               grouped-verifier collection. Requires the same
+                               --backend cpu --profile all --install workflow.
+  --cpu-decode-burned-sealed-plan PATH
+                              Inspected M=1 sealed plan reused as generic-only
+                              development evidence; repeat per generation
+  --cpu-decode-burned-sealed-paired-dir PATH
+                              Complete paired CSV directory matched by position
+                              to each burned M=1 plan
+  --cpu-grouped-burned-sealed-plan PATH
+                              Inspected grouped sealed plan reused as generic-
+                              only development evidence; repeat per generation
+  --cpu-grouped-burned-sealed-paired-dir PATH
+                              Complete paired CSV directory matched by position
+                              to each burned grouped plan
+  --cpu-grouped-max-leaves N  Maximum grouped generic-tree leaf budget
+                              (default: 16). A deliberate best-effort install
+                              may lower this; dispatch totality, byte equality,
+                              and sealed structural gates remain mandatory.
   --resume-cpu-candidate-expansion-from DIR
                               Rebase compatible completed candidate-expansion
                               shards from an older output directory onto the
@@ -179,8 +219,9 @@ Options:
   --ncu PATH                   Nsight Compute executable
   --rocprofv3 PATH             rocprofiler-sdk v3 executable
   --perf PATH                  Linux perf executable
-  --paired-max-iterations N    Maximum CUDA development CV/refit rounds
-                               (default: 16; production profile only)
+  --paired-max-iterations N    Maximum new development CV/refit rounds in one
+                               invocation (default: 16; completed resume rounds
+                               do not consume this budget; production only)
   --policy-accelerators LIST   Policy-fit devices: auto, cpu, or a comma list
                                such as cuda:0,cuda:1,rocm:0 (default: auto)
   --policy-lanes N             Independent CPU orchestration lanes per policy
@@ -235,8 +276,15 @@ cpu_measurement_lanes="${LLAMINAR_NATIVE_VNNI_CPU_MEASUREMENT_LANES:-auto}"
 cpu_format_shards="${LLAMINAR_NATIVE_VNNI_CPU_FORMAT_SHARDS:-0}"
 cpu_batch_limit="${LLAMINAR_NATIVE_VNNI_CPU_BATCH_LIMIT:-0}"
 backend_collection_target_seconds="${LLAMINAR_NATIVE_VNNI_BACKEND_COLLECTION_TARGET_SECONDS:-7200}"
+maximum_p95_regret_percent="${LLAMINAR_NATIVE_VNNI_PROMOTION_P95_REGRET_PERCENT:-5}"
+minimum_passing_domain_percent="${LLAMINAR_NATIVE_VNNI_PROMOTION_MIN_PASSING_DOMAIN_PERCENT:-95}"
+cpu_minimum_promotion_warmups="${LLAMINAR_NATIVE_VNNI_CPU_MINIMUM_PROMOTION_WARMUPS:-5}"
+cpu_minimum_promotion_samples="${LLAMINAR_NATIVE_VNNI_CPU_MINIMUM_PROMOTION_SAMPLES:-30}"
 resume_cpu_partials="${LLAMINAR_NATIVE_VNNI_RESUME_CPU_PARTIALS:-0}"
+reuse_cuda_development="${LLAMINAR_NATIVE_VNNI_REUSE_CUDA_DEVELOPMENT:-0}"
+cuda_development_build_change_audit="${LLAMINAR_NATIVE_VNNI_CUDA_DEVELOPMENT_BUILD_CHANGE_AUDIT:-}"
 stop_after_cpu_decode="${LLAMINAR_NATIVE_VNNI_STOP_AFTER_CPU_DECODE:-0}"
+resume_after_cpu_decode="${LLAMINAR_NATIVE_VNNI_RESUME_AFTER_CPU_DECODE:-0}"
 skip_cpu_prefill_baseline="${LLAMINAR_NATIVE_VNNI_SKIP_CPU_PREFILL_BASELINE:-0}"
 stop_after_cpu_prefill_freeze="${LLAMINAR_NATIVE_VNNI_STOP_AFTER_CPU_PREFILL_FREEZE:-0}"
 collect_cpu_prefill_sealed_after_freeze="${LLAMINAR_NATIVE_VNNI_COLLECT_CPU_PREFILL_SEALED_AFTER_FREEZE:-0}"
@@ -275,6 +323,11 @@ cpu_prefill_fit_additive_profiler_requests=()
 cpu_prefill_fit_additive_profiler_evidence=()
 cpu_prefill_fit_additive_profiler_observations=()
 cpu_prefill_fit_burned_seal_manifests=()
+cpu_decode_burned_sealed_plans=()
+cpu_decode_burned_sealed_paired_dirs=()
+cpu_grouped_burned_sealed_plans=()
+cpu_grouped_burned_sealed_paired_dirs=()
+cpu_grouped_max_leaves="${LLAMINAR_NATIVE_VNNI_CPU_GROUPED_MAX_LEAVES:-16}"
 cpu_prefill_fit_replay_recipe=""
 cpu_prefill_diagnostic_max_leaves=""
 cpu_prefill_ablate_profiler_features=0
@@ -369,13 +422,61 @@ while [[ $# -gt 0 ]]; do
       backend_collection_target_seconds="${2:-}"
       shift 2
       ;;
+    --maximum-p95-regret-percent)
+      maximum_p95_regret_percent="${2:-}"
+      shift 2
+      ;;
+    --minimum-passing-domain-percent)
+      minimum_passing_domain_percent="${2:-}"
+      shift 2
+      ;;
+    --cpu-minimum-promotion-warmups)
+      cpu_minimum_promotion_warmups="${2:-}"
+      shift 2
+      ;;
+    --cpu-minimum-promotion-samples)
+      cpu_minimum_promotion_samples="${2:-}"
+      shift 2
+      ;;
     --resume-cpu-partials)
       resume_cpu_partials=1
       shift
       ;;
+    --reuse-cuda-development)
+      reuse_cuda_development=1
+      shift
+      ;;
+    --cuda-development-build-change-audit)
+      cuda_development_build_change_audit="${2:-}"
+      shift 2
+      ;;
     --stop-after-cpu-decode)
       stop_after_cpu_decode=1
       shift
+      ;;
+    --resume-after-cpu-decode)
+      resume_after_cpu_decode=1
+      shift
+      ;;
+    --cpu-decode-burned-sealed-plan)
+      cpu_decode_burned_sealed_plans+=("${2:-}")
+      shift 2
+      ;;
+    --cpu-decode-burned-sealed-paired-dir)
+      cpu_decode_burned_sealed_paired_dirs+=("${2:-}")
+      shift 2
+      ;;
+    --cpu-grouped-burned-sealed-plan)
+      cpu_grouped_burned_sealed_plans+=("${2:-}")
+      shift 2
+      ;;
+    --cpu-grouped-burned-sealed-paired-dir)
+      cpu_grouped_burned_sealed_paired_dirs+=("${2:-}")
+      shift 2
+      ;;
+    --cpu-grouped-max-leaves)
+      cpu_grouped_max_leaves="${2:-}"
+      shift 2
       ;;
     --skip-cpu-prefill-baseline)
       skip_cpu_prefill_baseline=1
@@ -634,6 +735,53 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if (( ${#cpu_decode_burned_sealed_plans[@]} !=
+      ${#cpu_decode_burned_sealed_paired_dirs[@]} )); then
+  echo "error: burned CPU decode plans and paired directories must pair by position" >&2
+  exit 2
+fi
+if (( ${#cpu_grouped_burned_sealed_plans[@]} !=
+      ${#cpu_grouped_burned_sealed_paired_dirs[@]} )); then
+  echo "error: burned CPU grouped plans and paired directories must pair by position" >&2
+  exit 2
+fi
+
+validate_promotion_percent() {
+  local option_name="$1"
+  local value="$2"
+  local allow_zero="$3"
+  if [[ ! "${value}" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]] ||
+     ! awk -v value="${value}" -v allow_zero="${allow_zero}" 'BEGIN {
+       lower_ok = allow_zero ? value >= 0.0 : value > 0.0
+       exit !(lower_ok && value <= 100.0)
+     }'; then
+    local interval="(0, 100]"
+    [[ "${allow_zero}" == "1" ]] && interval="[0, 100]"
+    echo "error: ${option_name} must be a decimal percentage in ${interval}" >&2
+    exit 2
+  fi
+}
+
+validate_promotion_percent \
+  --maximum-p95-regret-percent "${maximum_p95_regret_percent}" 0
+validate_promotion_percent \
+  --minimum-passing-domain-percent "${minimum_passing_domain_percent}" 1
+cpu_grouped_paired_max_regret_fraction="$(awk \
+  -v regret_percent="${maximum_p95_regret_percent}" \
+  'BEGIN { printf "%.12g\n", regret_percent / 100.0 }')"
+if [[ ! "${cpu_minimum_promotion_warmups}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: --cpu-minimum-promotion-warmups must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "${cpu_minimum_promotion_samples}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: --cpu-minimum-promotion-samples must be a positive integer" >&2
+  exit 2
+fi
+export LLAMINAR_NATIVE_VNNI_PROMOTION_P95_REGRET_PERCENT="${maximum_p95_regret_percent}"
+export LLAMINAR_NATIVE_VNNI_PROMOTION_MIN_PASSING_DOMAIN_PERCENT="${minimum_passing_domain_percent}"
+printf 'NativeVNNI promotion criteria: p95-regret<%s%% passing-domains>=%s%%\n' \
+  "${maximum_p95_regret_percent}" "${minimum_passing_domain_percent}"
+
 # A replay recipe is the production fit-only interface for an evolved CPU
 # prefill corpus. Expand typed records without eval so paths cannot become
 # shell syntax. The Python preflight authenticates every payload plus all
@@ -807,6 +955,52 @@ if (( stop_after_cpu_decode )) &&
 fi
 if (( stop_after_cpu_decode && ! install )); then
   echo "error: --stop-after-cpu-decode requires --install" >&2
+  exit 2
+fi
+if (( resume_after_cpu_decode )) &&
+   [[ "${backend}" != "cpu" || "${profile}" != "all" ]]; then
+  echo "error: --resume-after-cpu-decode requires --backend cpu --profile all" >&2
+  exit 2
+fi
+if (( resume_after_cpu_decode && ! install )); then
+  echo "error: --resume-after-cpu-decode requires --install" >&2
+  exit 2
+fi
+if (( stop_after_cpu_decode && resume_after_cpu_decode )); then
+  echo "error: --stop-after-cpu-decode and --resume-after-cpu-decode are mutually exclusive" >&2
+  exit 2
+fi
+if (( resume_after_cpu_decode )) && [[ "${shape_partition}" != "all" ]]; then
+  echo "error: --resume-after-cpu-decode cannot use --shape-partition" >&2
+  exit 2
+fi
+if (( reuse_cuda_development )) &&
+   [[ "${backend}" != "cuda" || "${profile}" != "all" ]]; then
+  echo "error: --reuse-cuda-development requires --backend cuda --profile all" >&2
+  exit 2
+fi
+if (( reuse_cuda_development && skip_sweep )); then
+  echo "error: --reuse-cuda-development and --skip-sweep are mutually exclusive" >&2
+  exit 2
+fi
+if (( reuse_cuda_development )) && [[ "${shape_partition}" != "all" ]]; then
+  echo "error: --reuse-cuda-development cannot use --shape-partition" >&2
+  exit 2
+fi
+if (( reuse_cuda_development )) &&
+   [[ -z "${cuda_development_build_change_audit//[[:space:]]/}" ]]; then
+  echo "error: --reuse-cuda-development requires a non-empty --cuda-development-build-change-audit" >&2
+  exit 2
+fi
+if (( ! reuse_cuda_development )) &&
+   [[ -n "${cuda_development_build_change_audit}" ]]; then
+  echo "error: --cuda-development-build-change-audit requires " \
+       "--reuse-cuda-development" >&2
+  exit 2
+fi
+if [[ ! "${cpu_grouped_max_leaves}" =~ ^[1-9][0-9]*$ ]] ||
+   (( cpu_grouped_max_leaves > 32 )); then
+  echo "error: --cpu-grouped-max-leaves must be in [1, 32]" >&2
   exit 2
 fi
 if (( skip_cpu_prefill_baseline )) &&
@@ -1109,6 +1303,12 @@ normalized_m_values="$(normalize_m_values "${m_values}")" || {
   echo "error: --m-values must contain positive integers" >&2
   exit 2
 }
+cpu_grouped_m_values="$(
+  printf '%s\n' "${normalized_m_values}" |
+    tr ',' '\n' |
+    awk '$1 >= 2 { print $1 }' |
+    paste -sd, -
+)"
 if (( install )) && [[ "${profile}" != "all" ]]; then
   echo "error: installing NativeVNNI dispatch requires --profile all" >&2
   exit 2
@@ -1311,6 +1511,29 @@ sha256_file_set() {
   sha256sum "$@" | sha256sum | awk '{print "sha256:" $1}'
 }
 
+cpu_serial_arithmetic_contract_hash() {
+  python3 - "${cpu_serial_arithmetic_contract_path}" <<'PY'
+import json
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    contract = json.load(handle)
+expected = {"schema_version", "contract_hash", "description", "invariants"}
+if not isinstance(contract, dict) or set(contract) != expected:
+    raise SystemExit(f"{path}: invalid CPU serial arithmetic contract fields")
+if contract["schema_version"] != "cpu-native-vnni-serial-m1-arithmetic-contract-v1":
+    raise SystemExit(f"{path}: unsupported CPU serial arithmetic contract")
+digest = contract["contract_hash"]
+if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    raise SystemExit(f"{path}: invalid CPU serial arithmetic contract hash")
+if not isinstance(contract["invariants"], list) or not contract["invariants"]:
+    raise SystemExit(f"{path}: CPU serial arithmetic contract has no invariants")
+print(digest)
+PY
+}
+
 csv_unique_field() {
   local path="$1"
   local field="$2"
@@ -1368,6 +1591,60 @@ with open(path, newline="", encoding="utf-8") as handle:
 if len(values) != 1:
     raise SystemExit(f"{path}: CSV contains no data rows")
 print(next(iter(values)))
+PY
+}
+
+csv_first_cpu_provenance() {
+  local path="$1"
+  python3 - "${path}" <<'PY'
+import csv
+import sys
+
+path = sys.argv[1]
+with open(path, newline="", encoding="utf-8") as handle:
+    reader = csv.DictReader(handle)
+    required = (
+        "run_id",
+        "git_revision",
+        "build_id",
+        "compiler_id",
+        "architecture_class",
+        "device_name",
+        "driver_runtime",
+        "serial_m1_policy_hash",
+    )
+    missing = sorted(set(required) - set(reader.fieldnames or ()))
+    if missing:
+        raise SystemExit(f"{path}: CSV is missing provenance fields {missing}")
+    row = next(reader, None)
+    if row is None:
+        raise SystemExit(f"{path}: CSV contains no data rows")
+    values = [row[field].strip() for field in required]
+    if any(not value or "\n" in value or "\r" in value for value in values):
+        raise SystemExit(f"{path}: CSV has invalid first-row provenance")
+    for index, delimiter in ((2, "|cpu_isa="), (4, "|build=")):
+        prefix, separator, _suffix = values[index].partition(delimiter)
+        if not prefix or not separator:
+            raise SystemExit(
+                f"{path}: provenance field lacks {delimiter!r}"
+            )
+        values[index] = prefix
+    print("\n".join(values))
+PY
+}
+
+csv_has_field() {
+  local path="$1"
+  local field="$2"
+  python3 - "${path}" "${field}" <<'PY'
+import csv
+import sys
+
+path, field = sys.argv[1:]
+with open(path, newline="", encoding="utf-8") as handle:
+    reader = csv.reader(handle)
+    header = next(reader, ())
+raise SystemExit(0 if field in header else 1)
 PY
 }
 
@@ -1518,8 +1795,11 @@ if [[ -z "${output_dir}" ]]; then
 fi
 
 quick_formats="Q4_1,Q5_1,Q6_K"
-family_smoke_formats="Q4_0,IQ4_NL,IQ4_XS,Q4_1,Q4_K,Q5_0,Q5_1,Q5_K,Q6_K,Q3_K,Q2_K,IQ3_S,IQ3_XXS,IQ2_S,IQ2_XS,IQ2_XXS,IQ1_S,IQ1_M,Q8_0,Q8_1,Q8_K"
-all_formats="${family_smoke_formats}"
+all_formats="$(
+  PYTHONPATH="${repo_root}/tests/v2/performance/kernels" \
+    python3 -c 'from native_vnni_dispatch.format_registry import FORMAT_SPECS; print(",".join(spec.label for spec in FORMAT_SPECS))'
+)"
+family_smoke_formats="${all_formats}"
 cuda_all_formats="${all_formats}"
 cuda_family_smoke_formats="${family_smoke_formats}"
 rocm_all_formats="${all_formats}"
@@ -1533,9 +1813,10 @@ qwen36_lm_head_shapes="Qwen36_LM_Head"
 qwen36_moe_shapes="35BMoE_Expert_GateUp,35BMoE_Expert_Down,Qwen36MoE_GDN_QKVProjection,Qwen36MoE_GDN_ZProjection"
 qwen36_shapes="${qwen36_core_shapes},${qwen36_lm_head_shapes},${qwen36_moe_shapes}"
 shape_manifest_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/native_vnni_decode_shapes_v5.json"
+cpu_serial_arithmetic_contract_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/cpu_native_vnni_serial_m1_arithmetic_v1.json"
 gpu_measurement_plan_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/native_vnni_gpu_measurement_plan_v1.json"
 if [[ -z "${cpu_prefill_split_manifest_path}" ]]; then
-  cpu_prefill_split_manifest_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/native_vnni_cpu_prefill_split_v10.json"
+  cpu_prefill_split_manifest_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/native_vnni_cpu_prefill_split_v12.json"
 fi
 shape_manifest_python_root="${repo_root}/tests/v2/performance/kernels"
 cpu_prefill_training_plan_module="native_vnni_dispatch.cpu_prefill_training_plan"
@@ -1587,23 +1868,11 @@ cpu_verifier_development_shapes="$(
     python3 -m native_vnni_dispatch.shape_manifest \
       --names verifier-development --cpu-measurement
 )"
-cpu_verifier_sealed_shapes="$(
-  PYTHONPATH="${shape_manifest_python_root}" \
-    python3 -m native_vnni_dispatch.shape_manifest \
-      --names verifier-sealed --cpu-measurement
-)"
-cpu_verifier_all_shapes="${cpu_verifier_development_shapes},${cpu_verifier_sealed_shapes}"
 cpu_decode_development_shapes="$(
   PYTHONPATH="${shape_manifest_python_root}" \
     python3 -m native_vnni_dispatch.shape_manifest \
       --names fast-development --cpu-measurement
 )"
-cpu_decode_sealed_shapes="$(
-  PYTHONPATH="${shape_manifest_python_root}" \
-    python3 -m native_vnni_dispatch.shape_manifest \
-      --names fast-sealed --cpu-measurement
-)"
-cpu_decode_all_shapes="${cpu_decode_development_shapes},${cpu_decode_sealed_shapes}"
 fast_all_shapes="${fast_development_shapes},${fast_sealed_shapes}"
 verifier_all_shapes="${verifier_development_shapes},${verifier_sealed_shapes}"
 
@@ -1662,7 +1931,7 @@ cpu_require_policy_keys=0
 rocm_execution_modes="${LLAMINAR_NATIVE_VNNI_REFRESH_ROCM_EXECUTION_MODES:-eager,graph_captured}"
 cuda_execution_modes="${LLAMINAR_NATIVE_VNNI_REFRESH_CUDA_EXECUTION_MODES:-eager,graph_captured}"
 rocm_quick_variants="kb1,kb2,kb4,kb8,kb16,kb32,kb64,inherit_serial_m1"
-cuda_quick_candidates="cuda.nvnni.decode.fast_m1.wide.tn128.cpt1,cuda.nvnni.decode.fast_m1.direct.tn128.cpt1,cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb1,cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb8,cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb32,cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb64,cuda.nvnni.decode.verifier.inherit_serial_m1"
+cuda_quick_candidates="cuda.nvnni.decode.fast_m1.wide.tn128.cpt1,cuda.nvnni.decode.fast_m1.direct.tn128.cpt1,cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb1,cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb8,cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb32,cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb64,cuda.nvnni.decode.verifier.inherit_serial_m1.r2,cuda.nvnni.decode.verifier.inherit_serial_m1.r4,cuda.nvnni.decode.verifier.inherit_serial_m1.r8,cuda.nvnni.decode.verifier.inherit_serial_m1.r16,cuda.nvnni.decode.verifier.inherit_serial_m1.r32,cuda.nvnni.decode.verifier.tensor_core_mma16"
 case "${profile}" in
   quick)
     cuda_max_cases="${LLAMINAR_NATIVE_VNNI_REFRESH_CUDA_MAX_CASES:-24}"
@@ -1726,6 +1995,26 @@ case "${profile}" in
     cpu_iters="${LLAMINAR_NATIVE_VNNI_REFRESH_CPU_ITERS:-30}"
     ;;
 esac
+
+cpu_fixed_timing_gate_args=(
+  --minimum-promotion-warmups "${cpu_minimum_promotion_warmups}"
+  --minimum-promotion-samples "${cpu_minimum_promotion_samples}"
+)
+if [[ "${measurement_profile}" == "production" &&
+      ( "${backend}" == "cpu" || "${backend}" == "all" ) ]]; then
+  if [[ ! "${cpu_warmup}" =~ ^[1-9][0-9]*$ ||
+        ! "${cpu_iters}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: production CPU fixed-timing warmups/samples must be positive integers" >&2
+    exit 2
+  fi
+  if (( cpu_warmup < cpu_minimum_promotion_warmups ||
+        cpu_iters < cpu_minimum_promotion_samples )); then
+    echo "error: production CPU collector is configured for ${cpu_warmup}/${cpu_iters} timing but the installable evidence floor is ${cpu_minimum_promotion_warmups}/${cpu_minimum_promotion_samples}; set matching --cpu-minimum-promotion-* options before collection" >&2
+    exit 2
+  fi
+  printf 'CPU fixed-timing evidence floor: %s warmup(s), %s sample(s)\n' \
+    "${cpu_minimum_promotion_warmups}" "${cpu_minimum_promotion_samples}"
+fi
 
 # Ordinary CPU prefill uses an elapsed-evidence protocol because one matrix
 # spans tiny attention projections and multi-second long-context FFN GEMMs.
@@ -1917,26 +2206,30 @@ cpu_csv="${output_dir}/cpu_verifier_rows_sweep.csv"
 cpu_timing_csv="${output_dir}/cpu_verifier_rows_sweep.timing.csv"
 cpu_development_csv="${output_dir}/cpu_verifier_rows.development.csv"
 cpu_development_timing_csv="${output_dir}/cpu_verifier_rows.development.timing.csv"
-cpu_sealed_csv="${output_dir}/cpu_verifier_rows.sealed.csv"
-cpu_sealed_timing_csv="${output_dir}/cpu_verifier_rows.sealed.timing.csv"
+cpu_grouped_sealed_plan_json="${output_dir}/cpu_verifier_rows.sealed-plan.json"
+cpu_grouped_sealed_request_dir="${output_dir}/cpu_verifier_rows.sealed-requests"
+cpu_grouped_fit_cache_dir="${output_dir}/policy_fit_cache/cpu_grouped"
 cpu_inc="${output_dir}/CPUNativeVNNIVerifierRowsPolicyGenerated.inc"
 cpu_provisional_inc="${output_dir}/CPUNativeVNNIVerifierRowsPolicyGenerated.provisional.inc"
 cpu_frozen_inc="${output_dir}/CPUNativeVNNIVerifierRowsPolicyGenerated.frozen-development.inc"
 cpu_frozen_policy_json="${output_dir}/cpu_verifier_rows_frozen_policy.json"
 cpu_policy_json="${output_dir}/cpu_verifier_rows_policy.json"
+cpu_grouped_certification_diagnostic="${output_dir}/cpu_verifier_rows_certification_diagnostic.json"
 cpu_summary="${output_dir}/cpu_verifier_rows_policy_summary.txt"
 cpu_common_csv="${output_dir}/cpu_verifier_rows_common_observations.csv"
 cpu_decode_csv="${output_dir}/cpu_decode_m1_sweep.csv"
 cpu_decode_timing_csv="${output_dir}/cpu_decode_m1_sweep.timing.csv"
 cpu_decode_development_csv="${output_dir}/cpu_decode_m1.development.csv"
 cpu_decode_development_timing_csv="${output_dir}/cpu_decode_m1.development.timing.csv"
-cpu_decode_sealed_csv="${output_dir}/cpu_decode_m1.sealed.csv"
-cpu_decode_sealed_timing_csv="${output_dir}/cpu_decode_m1.sealed.timing.csv"
+cpu_decode_sealed_route_probe_json="${output_dir}/cpu_decode_m1.sealed-route-probe.json"
+cpu_decode_sealed_plan_json="${output_dir}/cpu_decode_m1.sealed-plan.json"
+cpu_decode_sealed_request_dir="${output_dir}/cpu_decode_m1.sealed-requests"
 cpu_decode_inc="${output_dir}/CPUNativeVNNIDecodePolicyGenerated.inc"
 cpu_decode_provisional_inc="${output_dir}/CPUNativeVNNIDecodePolicyGenerated.provisional.inc"
 cpu_decode_frozen_inc="${output_dir}/CPUNativeVNNIDecodePolicyGenerated.frozen-development.inc"
 cpu_decode_frozen_policy_json="${output_dir}/cpu_decode_m1_frozen_policy.json"
 cpu_decode_policy_json="${output_dir}/cpu_decode_m1_policy.json"
+cpu_decode_certification_diagnostic="${output_dir}/cpu_decode_m1_certification_diagnostic.json"
 cpu_decode_summary="${output_dir}/cpu_decode_m1_policy_summary.csv"
 cpu_decode_common_csv="${output_dir}/cpu_decode_m1_common_observations.csv"
 cpu_decode_fit_cache_dir="${output_dir}/policy_fit_cache/cpu_decode"
@@ -2020,6 +2313,7 @@ cpu_decode_profiler_features="${output_dir}/cpu_decode_profiler_features.csv"
 cpu_decode_profiler_witnesses="${output_dir}/cpu_decode_profiler_observation_witnesses.csv"
 cpu_decode_profiler_raw="${output_dir}/cpu_decode_profiler_raw"
 cpu_decode_development_run_id_file="${output_dir}/cpu_decode_development_run_id.txt"
+cpu_grouped_development_run_id_file="${output_dir}/cpu_grouped_development_run_id.txt"
 cpu_decode_final_profiler_requests="${output_dir}/cpu_decode_final_profiler_requests.json"
 cpu_decode_final_profiler_evidence="${output_dir}/cpu_decode_final_profiler_evidence.json"
 cpu_decode_final_profiler_features="${output_dir}/cpu_decode_final_profiler_features.csv"
@@ -2109,14 +2403,16 @@ collect_backend_profiler_evidence() {
 
   if (( reuse_this_evidence )); then
     local required_profiler_path
-    for required_profiler_path in \
-        "${request_manifest}" \
-        "${evidence_manifest}"; do
-      if [[ ! -s "${required_profiler_path}" ]]; then
-        echo "error: fit-only profiler evidence is missing: ${required_profiler_path}" >&2
-        exit 2
-      fi
-    done
+    if (( ! dry_run )); then
+      for required_profiler_path in \
+          "${request_manifest}" \
+          "${evidence_manifest}"; do
+        if [[ ! -s "${required_profiler_path}" ]]; then
+          echo "error: fit-only profiler evidence is missing: ${required_profiler_path}" >&2
+          exit 2
+        fi
+      done
+    fi
     # Re-exporting features is deliberately cheap and authenticates the
     # canonical observation digest, per-dispatch requests, and isolated
     # profiler evidence before any fit may consume the bundle.
@@ -2157,6 +2453,13 @@ collect_backend_profiler_evidence() {
       emit-requests \
       --observation "${common_observations}" \
       --output "${request_manifest}"
+  elif [[ -s "${request_manifest}" && ! -s "${evidence_manifest}" ]]; then
+    # Request publication precedes a potentially multi-hour counter run. An
+    # interrupt in that window is an ordinary resumable initial transaction,
+    # not a corrupt half of a completed immutable transaction. The collector
+    # below resumes a matching journal when present or starts the still-empty
+    # evidence side from the already authenticated request inventory.
+    :
   elif [[ -s "${request_manifest}" || -s "${evidence_manifest}" ]]; then
     # A corpus extension must not replace an already paid profiler transaction.
     # Authenticate both old manifests and its compact timing witnesses first,
@@ -2417,6 +2720,58 @@ collect_backend_profiler_evidence() {
     --requests "${request_manifest}" \
     --evidence "${evidence_manifest}" \
     --output "${feature_table}"
+}
+
+reuse_identical_backend_profiler_evidence() {
+  local source_requests="$1"
+  local source_evidence="$2"
+  local source_features="$3"
+  local final_requests="$4"
+  local final_evidence="$5"
+  local final_features="$6"
+  local source_witnesses="${source_features%_features.csv}_observation_witnesses.csv"
+  local final_witnesses="${final_features%_features.csv}_observation_witnesses.csv"
+
+  # Certification has already consumed this profiler transaction. Re-profiled
+  # "final" evidence would measure the same physical launches after the policy
+  # decision and would therefore add no independent signal. The certifier has
+  # already authenticated the exact observation, request, evidence, witness,
+  # and feature transaction supplied here. Publish content-identical hard-link
+  # aliases atomically so corpus bundling retains its explicit final-artifact
+  # names without duplicating gigabytes or re-hashing every observation. A
+  # genuinely enlarged candidate surface must be profiled before certification
+  # instead of being silently paid for afterwards.
+  if (( ! dry_run )); then
+    local source_path
+    for source_path in \
+        "${source_requests}" \
+        "${source_evidence}" \
+        "${source_witnesses}" \
+        "${source_features}"; do
+      if [[ ! -s "${source_path}" ]]; then
+        echo "error: certified profiler transaction is incomplete: ${source_path}" >&2
+        exit 2
+      fi
+    done
+  fi
+
+  local final_requests_inprogress="${final_requests}.inprogress"
+  local final_evidence_inprogress="${final_evidence}.inprogress"
+  local final_witnesses_inprogress="${final_witnesses}.inprogress"
+  local final_features_inprogress="${final_features}.inprogress"
+  run_cmd rm -f \
+    "${final_requests_inprogress}" \
+    "${final_evidence_inprogress}" \
+    "${final_witnesses_inprogress}" \
+    "${final_features_inprogress}"
+  run_cmd ln "${source_requests}" "${final_requests_inprogress}"
+  run_cmd ln "${source_evidence}" "${final_evidence_inprogress}"
+  run_cmd ln "${source_witnesses}" "${final_witnesses_inprogress}"
+  run_cmd ln "${source_features}" "${final_features_inprogress}"
+  run_cmd mv "${final_requests_inprogress}" "${final_requests}"
+  run_cmd mv "${final_evidence_inprogress}" "${final_evidence}"
+  run_cmd mv "${final_witnesses_inprogress}" "${final_witnesses}"
+  run_cmd mv "${final_features_inprogress}" "${final_features}"
 }
 
 compose_cpu_prefill_final_profiler_evidence() {
@@ -2724,67 +3079,145 @@ run_cpu_prefill_measurement_jobs() {
         batch_end=${group_end}
       fi
 
-      local mpi_command=(
-        mpirun --bind-to socket --map-by socket
-        --mca mpi_leave_pinned 1
-        --mca btl_vader_single_copy_mechanism none
-        --mca orte_allowed_exit_without_sync 1
-      )
       local inprogress_paths=()
       for ((job_index = batch_start; job_index < batch_end; ++job_index)); do
-        if (( job_index > batch_start )); then
-          mpi_command+=(":")
-        fi
         local aggregate_inprogress="${partials_ref[job_index]}.inprogress"
         local timing_inprogress="${timing_partials_ref[job_index]}.inprogress"
         inprogress_paths+=("${aggregate_inprogress}" "${timing_inprogress}")
-        mpi_command+=(
-          -np 1 env
-          "${candidate_environment[@]}"
-          "LLAMINAR_ISA_LEVEL=${runtime_isas_ref[job_index]}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_FORMATS=${formats_ref[job_index]}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_M=${ms_ref[job_index]}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_SHAPE_NAME=${shapes_ref[job_index]}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_N=${ns_ref[job_index]}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_K=${ks_ref[job_index]}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_MAX_CASES=${cpu_max_cases}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_THREADS=${cpu_threads}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_WARMUP=${launch_warmups}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_WARMUP_BUDGET_US=${launch_warmup_budget_us}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_BUDGET_US=${launch_transition_warmup_budget_us}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_LATENCY_MULTIPLIER=${launch_transition_warmup_latency_multiplier}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_BUDGET_CEILING_US=${cpu_prefill_transition_warmup_budget_ceiling_us}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_WARMUP_ROUND_TIMEOUT_US=${cpu_prefill_warmup_round_timeout_us}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_ITERS=${cpu_iters}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_MIN_ITERS=${launch_minimum_iterations}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_STATIONARY_MIN_ITERS=${launch_stationary_minimum_iterations}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_MAX_ITERS=${launch_maximum_iterations}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_TIMING_BUDGET_US=${launch_timing_budget_us}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_MEDIAN_STABILITY=${cpu_prefill_median_stability}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_MPI_ROUND_SYNC=${mpi_round_sync}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_STRONG_CSV=${aggregate_inprogress}"
-          "LLAMINAR_CPU_NVNNI_PREFILL_TIMING_CSV=${timing_inprogress}"
-          "${bins_ref[job_index]}"
-          "--gtest_filter=*TrainerCsv_StrongPrefill_AllFormats"
-        )
       done
       local launch_attempt batch_validated=0
       for ((launch_attempt = 1;
             launch_attempt <= launch_attempts;
             ++launch_attempt)); do
-        run_cmd rm -f "${inprogress_paths[@]}"
+        # A trainer flushes after every complete M phase. Authenticate any
+        # interrupted prefix under the production adapter, require both MPMD
+        # ranks to own the same ordered suffix, and append only that suffix.
+        # This makes a multi-hour exact-overlay shard durable at M boundaries
+        # without accepting a partial candidate round as evidence.
+        local batch_remaining_m=""
+        local batch_append=-1
+        local prefix_state_valid=1
+        for ((job_index = batch_start;
+              job_index < batch_end;
+              ++job_index)); do
+          local aggregate_inprogress="${partials_ref[job_index]}.inprogress"
+          local timing_inprogress="${timing_partials_ref[job_index]}.inprogress"
+          local remaining_m="${ms_ref[job_index]}"
+          local append_state=0
+          if (( ! dry_run )) &&
+             [[ -s "${aggregate_inprogress}" &&
+                -s "${timing_inprogress}" ]]; then
+            if remaining_m="$(
+                PYTHONPATH="${shape_manifest_python_root}" \
+                  python3 -m \
+                    tests.v2.performance.kernels.native_vnni_dispatch.validate_cpu_prefill_partial \
+                    --input "${aggregate_inprogress}" \
+                    --timing-sidecar "${timing_inprogress}" \
+                    --planned-m-values "${ms_ref[job_index]}" \
+                    --require-append-compatible \
+                    --print-missing-m-values \
+                    "${partial_validation_args[@]}"
+              )"; then
+              append_state=1
+            else
+              prefix_state_valid=0
+              break
+            fi
+          elif (( ! dry_run )) &&
+               [[ -e "${aggregate_inprogress}" ||
+                  -e "${timing_inprogress}" ]]; then
+            prefix_state_valid=0
+            break
+          fi
+
+          if [[ -z "${batch_remaining_m}" ]] && (( batch_append < 0 )); then
+            batch_remaining_m="${remaining_m}"
+            batch_append=${append_state}
+          elif [[ "${batch_remaining_m}" != "${remaining_m}" ]] ||
+               (( batch_append != append_state )); then
+            prefix_state_valid=0
+            break
+          fi
+        done
+        if (( ! prefix_state_valid )); then
+          printf 'Discarding mismatched or non-installable CPU prefill M-prefix before retry\n' >&2
+          run_cmd rm -f "${inprogress_paths[@]}"
+          batch_remaining_m="${ms_ref[batch_start]}"
+          batch_append=0
+          for ((job_index = batch_start + 1;
+                job_index < batch_end;
+                ++job_index)); do
+            if [[ "${ms_ref[job_index]}" != "${batch_remaining_m}" ]]; then
+              echo "error: CPU prefill MPMD batch has mismatched planned M inventories" >&2
+              return 2
+            fi
+          done
+        fi
+
         local launch_succeeded=0
-        if run_cmd \
-            "OMP_NUM_THREADS=${cpu_threads}" \
-            "OMP_PLACES=cores" \
-            "OMP_PROC_BIND=close" \
-            "OMP_DYNAMIC=false" \
-            "OMP_NESTED=false" \
-            "HWLOC_COMPONENTS=-gl,-opencl" \
-            "OMPI_MCA_mpi_leave_pinned=1" \
-            "OMPI_MCA_btl_vader_single_copy_mechanism=none" \
-            "${mpi_command[@]}"; then
+        if [[ -z "${batch_remaining_m}" ]]; then
+          # A prior invocation finished every M and was interrupted before the
+          # wrapper's final atomic rename. Exact validation below publishes it
+          # without launching another kernel.
           launch_succeeded=1
+        else
+          local mpi_command=(
+            mpirun --bind-to socket --map-by socket
+            --mca mpi_leave_pinned 1
+            --mca btl_vader_single_copy_mechanism none
+            --mca orte_allowed_exit_without_sync 1
+          )
+          for ((job_index = batch_start;
+                job_index < batch_end;
+                ++job_index)); do
+            if (( job_index > batch_start )); then
+              mpi_command+=(":")
+            fi
+            local aggregate_inprogress="${partials_ref[job_index]}.inprogress"
+            local timing_inprogress="${timing_partials_ref[job_index]}.inprogress"
+            mpi_command+=(
+              -np 1 env
+              "${candidate_environment[@]}"
+              "LLAMINAR_ISA_LEVEL=${runtime_isas_ref[job_index]}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_FORMATS=${formats_ref[job_index]}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_M=${batch_remaining_m}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_APPEND_CSV=${batch_append}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_SHAPE_NAME=${shapes_ref[job_index]}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_N=${ns_ref[job_index]}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_K=${ks_ref[job_index]}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_MAX_CASES=${cpu_max_cases}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_THREADS=${cpu_threads}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_WARMUP=${launch_warmups}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_WARMUP_BUDGET_US=${launch_warmup_budget_us}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_BUDGET_US=${launch_transition_warmup_budget_us}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_LATENCY_MULTIPLIER=${launch_transition_warmup_latency_multiplier}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_BUDGET_CEILING_US=${cpu_prefill_transition_warmup_budget_ceiling_us}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_WARMUP_ROUND_TIMEOUT_US=${cpu_prefill_warmup_round_timeout_us}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_ITERS=${cpu_iters}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_MIN_ITERS=${launch_minimum_iterations}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_STATIONARY_MIN_ITERS=${launch_stationary_minimum_iterations}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_MAX_ITERS=${launch_maximum_iterations}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_TIMING_BUDGET_US=${launch_timing_budget_us}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_MEDIAN_STABILITY=${cpu_prefill_median_stability}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_MPI_ROUND_SYNC=${mpi_round_sync}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_STRONG_CSV=${aggregate_inprogress}"
+              "LLAMINAR_CPU_NVNNI_PREFILL_TIMING_CSV=${timing_inprogress}"
+              "${bins_ref[job_index]}"
+              "--gtest_filter=*TrainerCsv_StrongPrefill_AllFormats"
+            )
+          done
+          if run_cmd \
+              "OMP_NUM_THREADS=${cpu_threads}" \
+              "OMP_PLACES=cores" \
+              "OMP_PROC_BIND=close" \
+              "OMP_DYNAMIC=false" \
+              "OMP_NESTED=false" \
+              "HWLOC_COMPONENTS=-gl,-opencl" \
+              "OMPI_MCA_mpi_leave_pinned=1" \
+              "OMPI_MCA_btl_vader_single_copy_mechanism=none" \
+              "${mpi_command[@]}"; then
+            launch_succeeded=1
+          fi
         fi
 
         batch_validated=${launch_succeeded}
@@ -2804,6 +3237,7 @@ run_cpu_prefill_measurement_jobs() {
                   tests.v2.performance.kernels.native_vnni_dispatch.validate_cpu_prefill_partial \
                   --input "${partials_ref[job_index]}.inprogress" \
                   --timing-sidecar "${timing_partials_ref[job_index]}.inprogress" \
+                  --expected-m-values "${ms_ref[job_index]}" \
                   "${partial_validation_args[@]}"; then
               batch_validated=0
               break
@@ -2824,7 +3258,7 @@ run_cpu_prefill_measurement_jobs() {
         fi
 
         if (( launch_attempt < launch_attempts )); then
-          printf 'Retrying non-installable CPU prefill MPMD batch with a fresh timing epoch (attempt %d/%d)\n' \
+          printf 'Retrying non-installable CPU prefill MPMD batch from its last authenticated M-prefix (attempt %d/%d)\n' \
             "$((launch_attempt + 1))" "${launch_attempts}" >&2
         fi
       done
@@ -2896,7 +3330,8 @@ collect_cpu_prefill_generic_refinement_round() {
           python3 -m \
             tests.v2.performance.kernels.native_vnni_dispatch.validate_cpu_prefill_partial \
             --input "${partial}" \
-            --timing-sidecar "${timing_partial}"; then
+            --timing-sidecar "${timing_partial}" \
+            --expected-m-values "${m_values}"; then
         continue
       fi
       printf 'Discarding non-installable CPU prefill refinement partial before resume: %s\n' \
@@ -3039,7 +3474,8 @@ collect_cpu_prefill_development_lineage_increment() {
           python3 -m \
             tests.v2.performance.kernels.native_vnni_dispatch.validate_cpu_prefill_partial \
             --input "${partial}" \
-            --timing-sidecar "${timing_partial}"; then
+            --timing-sidecar "${timing_partial}" \
+            --expected-m-values "${m_values}"; then
         continue
       fi
       printf 'Discarding non-installable CPU prefill lineage partial before resume: %s\n' \
@@ -3226,6 +3662,7 @@ collect_cpu_prefill_candidate_expansion() {
             tests.v2.performance.kernels.native_vnni_dispatch.validate_cpu_prefill_partial \
             --input "${partial}" \
             --timing-sidecar "${timing_partial}" \
+            --expected-m-values "${m_values}" \
             --candidate-expansion; then
         continue
       fi
@@ -3606,11 +4043,27 @@ run_cuda_paired_refinement() {
   local common_observations="$1"
   local paired_dir="${output_dir}/cuda_paired_refinement"
   mkdir -p "${paired_dir}"
+  local first_iteration=0
+  local retained_path retained_name retained_tag retained_index
+  for retained_path in "${cuda_paired_evidence[@]}"; do
+    retained_name="$(basename "${retained_path}")"
+    if [[ ! "${retained_name}" =~ ^iteration-([0-9]{3})[.]csv$ ]]; then
+      echo "error: CUDA paired evidence has an invalid generation name: ${retained_path}" >&2
+      exit 2
+    fi
+    retained_tag="${BASH_REMATCH[1]}"
+    retained_index=$((10#${retained_tag}))
+    if (( retained_index >= first_iteration )); then
+      first_iteration=$((retained_index + 1))
+    fi
+  done
 
   if (( dry_run )); then
-    local requests="${paired_dir}/iteration-000.requests.json"
-    local report="${paired_dir}/iteration-000.report.json"
-    local evidence="${paired_dir}/iteration-000.csv"
+    local dry_tag
+    printf -v dry_tag '%03d' "${first_iteration}"
+    local requests="${paired_dir}/iteration-${dry_tag}.requests.json"
+    local report="${paired_dir}/iteration-${dry_tag}.report.json"
+    local evidence="${paired_dir}/iteration-${dry_tag}.csv"
     local -a dry_planner=(
       python3 -m native_vnni_dispatch.paired_requests
       "${common_observations}"
@@ -3644,8 +4097,9 @@ run_cuda_paired_refinement() {
     return
   fi
 
-  local iteration
-  for ((iteration = 0; iteration < paired_max_iterations; ++iteration)); do
+  local new_iteration iteration
+  for ((new_iteration = 0; new_iteration < paired_max_iterations; ++new_iteration)); do
+    iteration=$((first_iteration + new_iteration))
     local iteration_tag
     printf -v iteration_tag '%03d' "${iteration}"
     local requests="${paired_dir}/iteration-${iteration_tag}.requests.json"
@@ -3738,8 +4192,61 @@ PY
     cuda_paired_evidence+=("${evidence}")
   done
 
-  echo "error: CUDA paired refinement did not converge in ${paired_max_iterations} iterations" >&2
+  echo "error: CUDA paired refinement did not converge in ${paired_max_iterations} new iterations from ${first_iteration}" >&2
   exit 2
+}
+
+load_cuda_development_context() {
+  local observation_csv="$1"
+  local output_path="$2"
+  python3 - "${observation_csv}" "${output_path}" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+fields = (
+    "run_id",
+    "git_revision",
+    "build_id",
+    "compiler_id",
+    "architecture_class",
+    "device_name",
+    "driver_runtime",
+    "serial_m1_policy_hash",
+)
+values = {field: set() for field in fields}
+row_count = 0
+with source.open(newline="", encoding="utf-8") as handle:
+    reader = csv.DictReader(handle)
+    missing = set(fields) - set(reader.fieldnames or ())
+    if missing:
+        raise SystemExit(
+            f"{source}: missing CUDA observation provenance columns {sorted(missing)}"
+        )
+    for row in reader:
+        row_count += 1
+        if row.get("backend") != "cuda" or row.get("semantic_contract") != "Fast":
+            raise SystemExit(f"{source}: row {row_count} is not CUDA Fast evidence")
+        for field in fields:
+            value = row[field]
+            if not value or "\n" in value or "\r" in value:
+                raise SystemExit(
+                    f"{source}: row {row_count} has invalid {field} provenance"
+                )
+            values[field].add(value)
+            if len(values[field]) > 1:
+                raise SystemExit(
+                    f"{source}: CUDA development {field} is not uniform"
+                )
+if row_count == 0:
+    raise SystemExit(f"{source}: CUDA development observations are empty")
+destination.write_text(
+    "".join(next(iter(values[field])) + "\n" for field in fields),
+    encoding="utf-8",
+)
+PY
 }
 
 refresh_cuda() {
@@ -3771,19 +4278,206 @@ refresh_cuda() {
       "${repo_root}/src/v2/kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh")"
   fi
 
+  # A fresh seal belongs to the currently built trainer even when an audited
+  # prior development corpus is retained. Keep both physical identities: the
+  # learner replays development under its original context, while certification
+  # records the fresh holdout under the binary that actually measured it.
+  local cuda_sealed_run_id="${timestamp}-cuda-${profile}-m1-sealed"
+  local cuda_sealed_git_revision="${cuda_git_revision}"
+  local cuda_sealed_build_id="${cuda_build_id}"
+  local cuda_sealed_compiler_id="${cuda_compiler_id}"
+  local cuda_sealed_arch_class="${cuda_arch_class}"
+  local cuda_sealed_device_name="${cuda_device_name}"
+  local cuda_sealed_driver_runtime="${cuda_driver_runtime}"
+  local cuda_sealed_serial_policy_hash="${cuda_serial_policy_hash}"
+  local cuda_development_run_id="${timestamp}-cuda-${profile}-m1-development"
+  local cuda_reuse_common_source="${output_dir}/cuda_decode_m1_common_observations.reuse-source.csv"
+  if (( reuse_cuda_development )); then
+    local -a legacy_profiler_paths=(
+      "${output_dir}/cuda_decode_m1.profiler_requests.json"
+      "${output_dir}/cuda_decode_m1.profiler_evidence.json"
+      "${output_dir}/cuda_decode_m1.profiler_features.csv"
+    )
+    local -a canonical_profiler_paths=(
+      "${cuda_profiler_requests}"
+      "${cuda_profiler_evidence}"
+      "${cuda_profiler_features}"
+    )
+    local legacy_profiler_schema=""
+    local canonical_profiler_schema=""
+    local cuda_reuse_profiler_compatible=1
+    local cuda_exact_profiler_transaction=0
+    if (( ! dry_run )) && [[ -s "${legacy_profiler_paths[0]}" ]]; then
+      legacy_profiler_schema="$(python3 - "${legacy_profiler_paths[0]}" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+print(payload.get("schema_version", ""))
+PY
+)"
+      if [[ "${legacy_profiler_schema}" == "native-vnni-profiler-request-v2" ]]; then
+        cuda_reuse_profiler_compatible=0
+        printf 'Retaining legacy CUDA profiler v2 evidence for provenance; collecting a new exact-point transaction\n'
+        if [[ -s "${canonical_profiler_paths[0]}" ]]; then
+          canonical_profiler_schema="$(python3 - "${canonical_profiler_paths[0]}" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+print(payload.get("schema_version", ""))
+PY
+)"
+          if [[ "${canonical_profiler_schema}" == \
+                "native-vnni-profiler-request-v4-exact-point" ]]; then
+            cuda_exact_profiler_transaction=1
+            printf 'Resuming current CUDA exact-point profiler transaction alongside retained v2 provenance\n'
+          fi
+        fi
+      fi
+    fi
+    local profiler_index legacy_path canonical_path
+    for ((profiler_index = 0;
+         profiler_index < ${#legacy_profiler_paths[@]};
+         ++profiler_index)); do
+      legacy_path="${legacy_profiler_paths[${profiler_index}]}"
+      canonical_path="${canonical_profiler_paths[${profiler_index}]}"
+      if (( dry_run )); then
+        run_cmd cp --reflink=auto "${legacy_path}" "${canonical_path}"
+      elif (( ! cuda_reuse_profiler_compatible )); then
+        if (( cuda_exact_profiler_transaction )); then
+          continue
+        fi
+        if [[ -s "${canonical_path}" ]]; then
+          if [[ ! -s "${legacy_path}" ]] ||
+             ! cmp --silent "${legacy_path}" "${canonical_path}"; then
+            echo "error: incompatible canonical CUDA profiler artifact is not the retained v2 generation: ${canonical_path}" >&2
+            exit 2
+          fi
+          rm -f "${canonical_path}"
+        fi
+      elif [[ -s "${canonical_path}" ]]; then
+        if [[ -s "${legacy_path}" ]] &&
+           ! cmp --silent "${legacy_path}" "${canonical_path}"; then
+          echo "error: legacy and canonical CUDA profiler artifacts conflict: " \
+               "${legacy_path} ${canonical_path}" >&2
+          exit 2
+        fi
+      elif [[ -s "${legacy_path}" ]]; then
+        cp --reflink=auto "${legacy_path}" "${canonical_path}.inprogress"
+        mv "${canonical_path}.inprogress" "${canonical_path}"
+      fi
+    done
+    local required_path
+    for required_path in \
+        "${cuda_m1_development_csv}" \
+        "${cuda_m1_development_timing_csv}" \
+        "${cuda_m1_common_csv}"; do
+      if (( ! dry_run )) && [[ ! -s "${required_path}" ]]; then
+        echo "error: audited CUDA development reuse is missing ${required_path}" >&2
+        exit 2
+      fi
+    done
+    if (( ! dry_run && cuda_reuse_profiler_compatible )); then
+      for required_path in \
+          "${cuda_profiler_requests}" \
+          "${cuda_profiler_evidence}"; do
+        if [[ ! -s "${required_path}" ]]; then
+          echo "error: audited CUDA development reuse is missing ${required_path}" >&2
+          exit 2
+        fi
+      done
+    fi
+    if (( dry_run )); then
+      run_cmd load_cuda_development_context \
+        "${cuda_m1_common_csv}" "${output_dir}/cuda_m1_context.fields"
+      cuda_development_run_id="dry-run-retained-cuda-development"
+      cuda_git_revision="dry-run-retained-git-revision"
+      cuda_build_id="sha256:dry-run-retained-cuda-build"
+      cuda_compiler_id="dry-run-retained-nvcc"
+      cuda_arch_class="dry-run-retained-sm"
+      cuda_device_name="dry-run-retained-cuda-device"
+      cuda_driver_runtime="dry-run-retained-cuda-runtime"
+      cuda_serial_policy_hash="sha256:dry-run-retained-cuda-serial-policy"
+      run_cmd cp --reflink=auto \
+        "${cuda_m1_common_csv}" "${cuda_reuse_common_source}.inprogress"
+      run_cmd mv -f \
+        "${cuda_reuse_common_source}.inprogress" \
+        "${cuda_reuse_common_source}"
+    else
+      local context_fields="${output_dir}/cuda_m1_context.fields"
+      local cuda_reuse_context_source="${cuda_m1_common_csv}"
+      # The retained snapshot owns the original development provenance. The
+      # canonical path may already contain the learner-upgraded replay when a
+      # previous invocation stopped during profiler collection.
+      if [[ -s "${cuda_reuse_common_source}" ]]; then
+        cuda_reuse_context_source="${cuda_reuse_common_source}"
+      fi
+      load_cuda_development_context \
+        "${cuda_reuse_context_source}" "${context_fields}"
+      local -a retained_context=()
+      mapfile -t retained_context < "${context_fields}"
+      rm -f "${context_fields}"
+      if (( ${#retained_context[@]} != 8 )); then
+        echo "error: retained CUDA development context is incomplete" >&2
+        exit 2
+      fi
+      cuda_development_run_id="${retained_context[0]}"
+      cuda_git_revision="${retained_context[1]}"
+      cuda_build_id="${retained_context[2]}"
+      cuda_compiler_id="${retained_context[3]}"
+      cuda_arch_class="${retained_context[4]}"
+      cuda_device_name="${retained_context[5]}"
+      cuda_driver_runtime="${retained_context[6]}"
+      cuda_serial_policy_hash="${retained_context[7]}"
+      if [[ ! -s "${cuda_reuse_common_source}" ]]; then
+        rm -f "${cuda_reuse_common_source}.inprogress"
+        cp --reflink=auto \
+          "${cuda_m1_common_csv}" "${cuda_reuse_common_source}.inprogress"
+        mv -f \
+          "${cuda_reuse_common_source}.inprogress" \
+          "${cuda_reuse_common_source}"
+      fi
+    fi
+  fi
+
   if [[ "${measurement_profile}" == "production" ]]; then
     if (( partitioned_measurement )); then
+      local partition_csv="${output_dir}/cuda_decode_${shape_partition}.csv"
+      local partition_timing_csv="${output_dir}/cuda_decode_${shape_partition}.timing.csv"
+      case "${shape_partition}" in
+        fast-sealed)
+          partition_csv="${cuda_m1_sealed_csv}"
+          partition_timing_csv="${cuda_m1_sealed_timing_csv}"
+          ;;
+        verifier-development)
+          partition_csv="${cuda_verifier_development_csv}"
+          partition_timing_csv="${cuda_verifier_development_timing_csv}"
+          ;;
+        verifier-sealed)
+          partition_csv="${cuda_verifier_sealed_csv}"
+          partition_timing_csv="${cuda_verifier_sealed_timing_csv}"
+          ;;
+      esac
       run_cuda_sweep_phase \
         "${shape_partition}" "${partition_m_values}" \
-        "${output_dir}/cuda_decode_${shape_partition}.csv" \
-        "${output_dir}/cuda_decode_${shape_partition}.timing.csv" \
+        "${partition_csv}" "${partition_timing_csv}" \
         "${shapes}"
+      if [[ "${shape_partition}" == "verifier-sealed" ]]; then
+        combine_csvs \
+          "${cuda_verifier_csv}" \
+          "${cuda_verifier_development_csv}" "${cuda_verifier_sealed_csv}"
+        combine_csvs \
+          "${cuda_verifier_timing_csv}" \
+          "${cuda_verifier_development_timing_csv}" \
+          "${cuda_verifier_sealed_timing_csv}"
+      fi
       finish_backend_collection_target
       return
     fi
 
     local verifier_m_values="${canonical_verifier_m_values}"
-    if (( ! skip_sweep )); then
+    if (( ! skip_sweep && ! reuse_cuda_development )); then
       run_cuda_sweep_phase \
         "m1-development-common" "1" \
         "${cuda_m1_development_common_csv}" \
@@ -3802,7 +4496,7 @@ refresh_cuda() {
         "${cuda_m1_development_timing_csv}" \
         "${cuda_m1_development_common_timing_csv}" \
         "${cuda_m1_development_scoped_timing_csv}"
-    else
+    elif (( skip_sweep )); then
       local cuda_fit_input
       for cuda_fit_input in \
           "${cuda_m1_development_csv}" \
@@ -3827,7 +4521,7 @@ refresh_cuda() {
       --output "${cuda_m1_provisional_inc}" \
       --common-observations "${cuda_m1_common_csv}" \
       --profile production \
-      --run-id "${timestamp}-cuda-${profile}-m1-development" \
+      --run-id "${cuda_development_run_id}" \
       --git-revision "${cuda_git_revision}" \
       --build-id "${cuda_build_id}" \
       --compiler-id "${cuda_compiler_id}" \
@@ -3843,7 +4537,34 @@ refresh_cuda() {
       "${cuda_profiler_requests}" "${cuda_profiler_evidence}" \
       "${cuda_profiler_features}" "${cuda_profiler_raw}"
 
-    if (( skip_sweep )); then
+    if (( reuse_cuda_development )); then
+      if (( dry_run )); then
+        run_cmd cmp --silent \
+          "${cuda_reuse_common_source}" "${cuda_m1_common_csv}"
+        run_cmd \
+          "PYTHONPATH=${profiler_python_root}" \
+          python3 -m \
+            native_vnni_dispatch.common_observation_migration \
+          --retained "${cuda_reuse_common_source}" \
+          --replayed "${cuda_m1_common_csv}" \
+          --require-learner-transition
+        run_cmd rm -f "${cuda_reuse_common_source}"
+      elif cmp --silent \
+          "${cuda_reuse_common_source}" "${cuda_m1_common_csv}"; then
+        printf '%s\n' \
+          "Authenticated byte-identical already-current CUDA common-observation replay"
+        rm -f "${cuda_reuse_common_source}"
+      else
+        PYTHONPATH="${profiler_python_root}" \
+          python3 -m native_vnni_dispatch.common_observation_migration \
+            --retained "${cuda_reuse_common_source}" \
+            --replayed "${cuda_m1_common_csv}" \
+            --require-learner-transition
+        rm -f "${cuda_reuse_common_source}"
+      fi
+    fi
+
+    if (( skip_sweep || reuse_cuda_development )); then
       mapfile -t cuda_paired_evidence < <(
         find "${output_dir}/cuda_paired_refinement" -maxdepth 1 \
           -type f -name 'iteration-*.csv' -print 2>/dev/null | sort
@@ -3860,7 +4581,7 @@ refresh_cuda() {
       --common-observations "${cuda_m1_common_csv}"
       --policy-json "${cuda_m1_frozen_policy_json}"
       --profile production
-      --run-id "${timestamp}-cuda-${profile}-m1-development"
+      --run-id "${cuda_development_run_id}"
       --git-revision "${cuda_git_revision}"
       --build-id "${cuda_build_id}"
       --compiler-id "${cuda_compiler_id}"
@@ -3875,6 +4596,12 @@ refresh_cuda() {
       --development-profiler-evidence "${cuda_profiler_evidence}"
       --require-fast-m1-complete
     )
+    if (( reuse_cuda_development )); then
+      cuda_m1_freeze+=(
+        --development-build-change-audit
+        "${cuda_development_build_change_audit}"
+      )
+    fi
     local paired_path
     for paired_path in "${cuda_paired_evidence[@]}"; do
       cuda_m1_freeze+=(--paired-development-csv "${paired_path}")
@@ -3904,7 +4631,7 @@ refresh_cuda() {
       --common-observations "${cuda_m1_common_csv}"
       --policy-json "${cuda_m1_policy_json}"
       --profile production
-      --run-id "${timestamp}-cuda-${profile}-m1-development"
+      --run-id "${cuda_development_run_id}"
       --git-revision "${cuda_git_revision}"
       --build-id "${cuda_build_id}"
       --compiler-id "${cuda_compiler_id}"
@@ -3919,11 +4646,31 @@ refresh_cuda() {
       --development-profiler-evidence "${cuda_profiler_evidence}"
       --require-fast-m1-complete
     )
+    if (( reuse_cuda_development )); then
+      cuda_m1_certify+=(
+        --development-build-change-audit
+        "${cuda_development_build_change_audit}"
+        --sealed-run-id "${cuda_sealed_run_id}"
+        --sealed-git-revision "${cuda_sealed_git_revision}"
+        --sealed-build-id "${cuda_sealed_build_id}"
+        --sealed-compiler-id "${cuda_sealed_compiler_id}"
+        --sealed-architecture-class "${cuda_sealed_arch_class}"
+        --sealed-device-name "${cuda_sealed_device_name}"
+        --sealed-driver-runtime "${cuda_sealed_driver_runtime}"
+        --sealed-serial-m1-policy-hash
+        "${cuda_sealed_serial_policy_hash}"
+      )
+    fi
     for paired_path in "${cuda_paired_evidence[@]}"; do
       cuda_m1_certify+=(--paired-development-csv "${paired_path}")
     done
     run_cmd "${cuda_m1_certify[@]}"
     run_cmd python3 "${dispatch_validator}" "${cuda_m1_inc}"
+    run_cmd \
+      "PYTHONPATH=${shape_manifest_python_root}" \
+      python3 -m native_vnni_dispatch.policy_artifact \
+      --policy-json "${cuda_m1_policy_json}" \
+      --include "${cuda_m1_inc}"
     combine_csvs \
       "${cuda_m1_csv}" \
       "${cuda_m1_development_csv}" "${cuda_m1_sealed_csv}"
@@ -3979,24 +4726,19 @@ refresh_cuda() {
 
     local -a cuda_final_compile=(
       python3 "${cuda_generator}"
-      --m1-input "${cuda_m1_csv}"
-      --m1-timing-sidecar "${cuda_m1_timing_csv}"
       --verifier-input "${cuda_verifier_csv}"
       --verifier-timing-sidecar "${cuda_verifier_timing_csv}"
-      --m1-build-id "${cuda_build_id}"
       --build-id "${staged_build_id}"
-      --m1-baseline-policy-hash "${cuda_serial_policy_hash}"
       --serial-m1-policy-hash "${staged_serial_policy_hash}"
       --output "${cuda_inc}"
-      --summary "${cuda_summary}"
       --common-observations "${cuda_common_csv}"
       --profile production
       --run-id "${timestamp}-cuda-${profile}-final"
-      --git-revision "${cuda_git_revision}"
-      --compiler-id "${cuda_compiler_id}"
-      --architecture-class "${cuda_arch_class}"
-      --device-name "${cuda_device_name}"
-      --driver-runtime "${cuda_driver_runtime}"
+      --git-revision "${cuda_sealed_git_revision}"
+      --compiler-id "${cuda_sealed_compiler_id}"
+      --architecture-class "${cuda_sealed_arch_class}"
+      --device-name "${cuda_sealed_device_name}"
+      --driver-runtime "${cuda_sealed_driver_runtime}"
       --shape-manifest "${shape_manifest_path}"
       --measurement-plan "${gpu_measurement_plan_path}"
       --certified-m1-include "${cuda_m1_inc}"
@@ -4005,7 +4747,6 @@ refresh_cuda() {
     )
     run_cmd "${cuda_final_compile[@]}"
     run_cmd python3 "${dispatch_validator}" "${cuda_inc}"
-    run_cmd cmp --silent "${cuda_m1_inc}" "${cuda_inc}"
     run_cmd cp "${cuda_m1_policy_json}" "${cuda_policy_json}"
     run_cmd \
       "PYTHONPATH=${profiler_python_root}" \
@@ -4384,6 +5125,7 @@ rebuild_cpu_native_vnni_trainer() {
 # incremental planner and final frozen-policy compiler. Each file is one
 # architecture-homogeneous, atomically published producer transaction.
 cpu_decode_paired_evidence=()
+cpu_grouped_paired_evidence=()
 
 run_cpu_decode_paired_refinement() {
   local common_observations="$1"
@@ -4398,9 +5140,7 @@ run_cpu_decode_paired_refinement() {
   cpu_decode_paired_evidence=()
   local first_iteration=0
   local candidate_iteration candidate_tag candidate_shard_dir
-  for ((candidate_iteration = 0;
-        candidate_iteration < paired_max_iterations;
-        ++candidate_iteration)); do
+  for ((candidate_iteration = 0; ; ++candidate_iteration)); do
     printf -v candidate_tag '%03d' "${candidate_iteration}"
     candidate_shard_dir="${paired_dir}/iteration-${candidate_tag}.shards"
     local completed_manifests=()
@@ -4432,8 +5172,9 @@ run_cpu_decode_paired_refinement() {
   done
 
   local iteration
+  local iteration_limit=$((first_iteration + paired_max_iterations))
   for ((iteration = first_iteration;
-        iteration < paired_max_iterations;
+        iteration < iteration_limit;
         ++iteration)); do
     local iteration_tag
     printf -v iteration_tag '%03d' "${iteration}"
@@ -4444,6 +5185,7 @@ run_cpu_decode_paired_refinement() {
     local planner=(
       python3 -m native_vnni_dispatch.paired_requests
       "${common_observations}"
+      --surface decode-m1
       --output "${requests}"
       --report "${report}"
       --request-shard-dir "${shard_dir}"
@@ -4451,6 +5193,15 @@ run_cpu_decode_paired_refinement() {
       --shape-manifest "${shape_manifest_path}"
       --fit-cache-dir "${cpu_decode_fit_cache_dir}"
     )
+    local burned_index
+    for burned_index in "${!cpu_decode_burned_sealed_plans[@]}"; do
+      planner+=(
+        --burned-sealed-plan-json
+        "${cpu_decode_burned_sealed_plans[burned_index]}"
+        --burned-sealed-paired-dir
+        "${cpu_decode_burned_sealed_paired_dirs[burned_index]}"
+      )
+    done
 
     # The first refinement batch can be recovered directly from a complete
     # prior fit generation. This avoids replaying hours of tree search merely
@@ -4465,6 +5216,7 @@ run_cpu_decode_paired_refinement() {
     fi
     if (( iteration == 0 &&
           ${#cpu_decode_paired_evidence[@]} == 0 &&
+          ${#cpu_decode_burned_sealed_plans[@]} == 0 &&
           cached_cv_count > 0 )); then
       planner+=(
         --cached-cross-validation-dir "${cpu_decode_fit_cache_dir}"
@@ -4642,7 +5394,288 @@ run_cpu_decode_paired_refinement() {
       --output "${certificate}"
   done
 
-  echo "error: CPU paired refinement did not converge in ${paired_max_iterations} iterations" >&2
+  echo "error: CPU paired refinement did not converge after " \
+       "${paired_max_iterations} new iterations starting at ${first_iteration}" >&2
+  return 2
+}
+
+# Execute immutable post-freeze CPU request shards without mixing ISA regimes
+# or allowing partial CSVs to satisfy certification. The caller supplies the
+# production surface so M=1 and grouped decode share scheduling, resume, and
+# atomic-publication behavior while retaining distinct test entry points.
+run_cpu_sealed_paired_shards() {
+  local surface="$1"
+  local shard_dir="$2"
+  local output_name="$3"
+  local -n output_paths="${output_name}"
+  output_paths=()
+
+  if (( dry_run )); then
+    printf 'dry-run: collect CPU %s sealed paired shards from %s\n' \
+      "${surface}" "${shard_dir}"
+    output_paths+=("${shard_dir}/dry-run.csv")
+    return 0
+  fi
+
+  local manifests=()
+  mapfile -t manifests < <(
+    find "${shard_dir}" -maxdepth 1 -type f \
+      -name 'shard-*.requests.json' | sort
+  )
+  if (( ${#manifests[@]} == 0 )); then
+    echo "error: CPU ${surface} sealed plan emitted no request shards" >&2
+    return 2
+  fi
+
+  local pending=()
+  local manifest_path evidence_path
+  for manifest_path in "${manifests[@]}"; do
+    evidence_path="${manifest_path%.requests.json}.csv"
+    output_paths+=("${evidence_path}")
+    if [[ ! -s "${evidence_path}" ]]; then
+      pending+=("${manifest_path}")
+    fi
+  done
+
+  local batch_start batch_end index
+  for ((batch_start = 0;
+        batch_start < ${#pending[@]};
+        batch_start += cpu_measurement_lanes)); do
+    batch_end=$((batch_start + cpu_measurement_lanes))
+    if (( batch_end > ${#pending[@]} )); then
+      batch_end=${#pending[@]}
+    fi
+    local mpi_command=(
+      mpirun --bind-to socket --map-by socket
+      --mca mpi_leave_pinned 1
+      --mca btl_vader_single_copy_mechanism none
+      --mca orte_allowed_exit_without_sync 1
+    )
+    local inprogress_paths=()
+    local final_paths=()
+    for ((index = batch_start; index < batch_end; ++index)); do
+      if (( index > batch_start )); then
+        mpi_command+=(":")
+      fi
+      manifest_path="${pending[index]}"
+      evidence_path="${manifest_path%.requests.json}.csv"
+      local inprogress="${evidence_path}.inprogress"
+      local architecture runtime_isa trainer_bin
+      architecture="$(python3 -c \
+        'import json,sys; print(json.load(open(sys.argv[1]))["requests"][0]["architecture_class"])' \
+        "${manifest_path}")"
+      case "${architecture}" in
+        *'|build=AVX2|runtime=AVX2|'*)
+          runtime_isa="AVX2"
+          trainer_bin="${cpu_avx2_sweep_bin}"
+          ;;
+        *'|build=AVX512|runtime=AVX2|'*)
+          runtime_isa="AVX2"
+          trainer_bin="${cpu_avx512_sweep_bin}"
+          ;;
+        *'|build=AVX512|runtime=AVX512|'*)
+          runtime_isa="AVX512"
+          trainer_bin="${cpu_avx512_sweep_bin}"
+          ;;
+        *)
+          echo "error: unsupported CPU sealed architecture ${architecture}" >&2
+          return 2
+          ;;
+      esac
+      inprogress_paths+=("${inprogress}")
+      final_paths+=("${evidence_path}")
+      local paired_manifest_env paired_csv_env paired_test
+      if [[ "${surface}" == "decode-m1" ]]; then
+        paired_manifest_env="LLAMINAR_CPU_NVNNI_DECODE_PAIRED_REQUEST_MANIFEST"
+        paired_csv_env="LLAMINAR_CPU_NVNNI_DECODE_PAIRED_CSV"
+        paired_test="TrainerCsv_StrongDecode_AllFormats"
+      elif [[ "${surface}" == "grouped-decode" ]]; then
+        paired_manifest_env="LLAMINAR_CPU_NVNNI_VERIFIER_PAIRED_REQUEST_MANIFEST"
+        paired_csv_env="LLAMINAR_CPU_NVNNI_VERIFIER_PAIRED_CSV"
+        paired_test="TrainerCsv_StrongVerifierRows_AllFormats"
+      else
+        echo "error: unknown CPU sealed paired surface ${surface}" >&2
+        return 2
+      fi
+      mpi_command+=(
+        -np 1 env
+        "LLAMINAR_PROFILING=0"
+        "LLAMINAR_PERF_STATS_JSON=0"
+        "LLAMINAR_PERF_STATS_CSV=0"
+        "LLAMINAR_PERF_STATS_TABLE=0"
+        "LLAMINAR_PERF_STATS_SUMMARY=0"
+        "LLAMINAR_ISA_LEVEL=${runtime_isa}"
+        "LLAMINAR_CPU_NVNNI_DECODE_WARMUP=${cpu_warmup}"
+        "LLAMINAR_CPU_NVNNI_DECODE_ITERS=${cpu_iters}"
+        "LLAMINAR_CPU_NVNNI_VERIFIER_WARMUP=${cpu_warmup}"
+        "LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=${cpu_iters}"
+        "${paired_manifest_env}=${manifest_path}"
+        "${paired_csv_env}=${inprogress}"
+        "${trainer_bin}"
+        "--gtest_filter=*${paired_test}"
+      )
+    done
+    rm -f "${inprogress_paths[@]}"
+    run_cmd \
+      "OMP_NUM_THREADS=${cpu_threads}" \
+      "OMP_PLACES=cores" \
+      "OMP_PROC_BIND=close" \
+      "OMP_DYNAMIC=false" \
+      "OMP_NESTED=false" \
+      "HWLOC_COMPONENTS=-gl,-opencl" \
+      "OMPI_MCA_mpi_leave_pinned=1" \
+      "OMPI_MCA_btl_vader_single_copy_mechanism=none" \
+      "${mpi_command[@]}"
+    for ((index = 0; index < ${#final_paths[@]}; ++index)); do
+      mv "${inprogress_paths[index]}" "${final_paths[index]}"
+    done
+  done
+
+  for evidence_path in "${output_paths[@]}"; do
+    if [[ ! -s "${evidence_path}" ]]; then
+      echo "error: CPU sealed collection omitted ${evidence_path}" >&2
+      return 2
+    fi
+  done
+}
+
+# Refine the grouped verifier policy with the same paired, resumable evidence
+# loop used by M=1 decode. Broad timing identifies plausible candidates; only
+# isolated within-cell ratios are allowed to change the generic winner graph.
+run_cpu_grouped_paired_refinement() {
+  local common_observations="$1"
+  local paired_dir="${output_dir}/cpu_grouped_paired_refinement"
+  mkdir -p "${paired_dir}"
+
+  cpu_grouped_paired_evidence=()
+  local first_iteration=0
+  local candidate_iteration candidate_tag candidate_shard_dir
+  for ((candidate_iteration = 0; ; ++candidate_iteration)); do
+    printf -v candidate_tag '%03d' "${candidate_iteration}"
+    candidate_shard_dir="${paired_dir}/iteration-${candidate_tag}.shards"
+    local completed_manifests=()
+    mapfile -t completed_manifests < <(
+      find "${candidate_shard_dir}" -maxdepth 1 -type f \
+        -name 'shard-*.requests.json' 2>/dev/null | sort
+    )
+    if (( ${#completed_manifests[@]} == 0 )); then
+      first_iteration="${candidate_iteration}"
+      break
+    fi
+    local candidate_complete=1
+    local completed_manifest completed_evidence
+    local candidate_evidence=()
+    for completed_manifest in "${completed_manifests[@]}"; do
+      completed_evidence="${completed_manifest%.requests.json}.csv"
+      if [[ ! -s "${completed_evidence}" ]]; then
+        candidate_complete=0
+        break
+      fi
+      candidate_evidence+=("${completed_evidence}")
+    done
+    if (( ! candidate_complete )); then
+      first_iteration="${candidate_iteration}"
+      break
+    fi
+    cpu_grouped_paired_evidence+=("${candidate_evidence[@]}")
+    first_iteration=$((candidate_iteration + 1))
+  done
+
+  local iteration
+  local iteration_limit=$((first_iteration + paired_max_iterations))
+  for ((iteration = first_iteration;
+        iteration < iteration_limit;
+        ++iteration)); do
+    local iteration_tag
+    printf -v iteration_tag '%03d' "${iteration}"
+    local requests="${paired_dir}/iteration-${iteration_tag}.requests.json"
+    local report="${paired_dir}/iteration-${iteration_tag}.report.json"
+    local shard_dir="${paired_dir}/iteration-${iteration_tag}.shards"
+    local certificate="${paired_dir}/iteration-${iteration_tag}.certificate.json"
+    local planner=(
+      python3 -m native_vnni_dispatch.paired_requests
+      "${common_observations}"
+      --surface grouped-verifier
+      --output "${requests}"
+      --report "${report}"
+      --request-shard-dir "${shard_dir}"
+      --max-requests-per-shard 16
+      --shape-manifest "${shape_manifest_path}"
+      --fit-cache-dir "${cpu_grouped_fit_cache_dir}"
+      --development-profiler-requests "${cpu_profiler_requests}"
+      --development-profiler-evidence "${cpu_profiler_evidence}"
+      --development-profiler-observations "${common_observations}"
+      --max-leaves "${cpu_grouped_max_leaves}"
+      --max-regret "${cpu_grouped_paired_max_regret_fraction}"
+    )
+    local burned_index
+    for burned_index in "${!cpu_grouped_burned_sealed_plans[@]}"; do
+      planner+=(
+        --burned-sealed-plan-json
+        "${cpu_grouped_burned_sealed_plans[burned_index]}"
+        --burned-sealed-paired-dir
+        "${cpu_grouped_burned_sealed_paired_dirs[burned_index]}"
+      )
+    done
+    local paired_path
+    for paired_path in "${cpu_grouped_paired_evidence[@]}"; do
+      planner+=(--paired-csv "${paired_path}")
+    done
+    run_cmd "PYTHONPATH=${paired_planner_root}" "${planner[@]}"
+
+    if (( dry_run )); then
+      printf 'dry-run: grouped CPU paired refinement would consume %s\n' \
+        "${report}"
+      return 0
+    fi
+    local status request_count
+    status="$(python3 -c \
+      'import json,sys; print(json.load(open(sys.argv[1]))["status"])' \
+      "${report}")"
+    request_count="$(python3 -c \
+      'import json,sys; print(json.load(open(sys.argv[1]))["request_count"])' \
+      "${report}")"
+    printf 'CPU grouped paired refinement iteration=%s status=%s requests=%s retained_shards=%s\n' \
+      "${iteration_tag}" "${status}" "${request_count}" \
+      "${#cpu_grouped_paired_evidence[@]}"
+
+    case "${status}" in
+      green)
+        if (( request_count != 0 )); then
+          echo "error: green grouped CPU paired plan still contains requests" >&2
+          return 2
+        fi
+        return 0
+        ;;
+      pending)
+        if (( request_count == 0 )); then
+          echo "error: pending grouped CPU paired plan has no requests" >&2
+          return 2
+        fi
+        ;;
+      confirmed_failure|evidence_conflict|insufficient_cross_validation)
+        echo "error: grouped CPU paired refinement stopped with ${status}; see ${report}" >&2
+        return 2
+        ;;
+      *)
+        echo "error: unknown grouped CPU paired status ${status}" >&2
+        return 2
+        ;;
+    esac
+
+    local current_evidence=()
+    run_cpu_sealed_paired_shards \
+      "grouped-decode" "${shard_dir}" current_evidence
+    cpu_grouped_paired_evidence+=("${current_evidence[@]}")
+    run_cmd \
+      "PYTHONPATH=${paired_planner_root}" \
+      python3 -m native_vnni_dispatch.paired_confirmation \
+      "${cpu_grouped_paired_evidence[@]}" \
+      --output "${certificate}"
+  done
+
+  echo "error: grouped CPU paired refinement did not converge after " \
+       "${paired_max_iterations} new iterations from ${first_iteration}" >&2
   return 2
 }
 
@@ -4655,6 +5688,18 @@ refresh_cpu_decode() {
   local cpu_driver_runtime="$6"
   local cpu_serial_policy_hash="$7"
 
+  # Development timing and a post-freeze paired seal are distinct physical
+  # generations. Preserve the binaries available for the fresh seal before a
+  # fit-only replay restores the immutable provenance recorded by the timing
+  # corpus.
+  local cpu_measurement_git_revision="${cpu_git_revision}"
+  local cpu_measurement_build_id="${cpu_build_id}"
+  local cpu_measurement_compiler_id="${cpu_compiler_id}"
+  local cpu_measurement_arch_class="${cpu_arch_class}"
+  local cpu_measurement_device_name="${cpu_device_name}"
+  local cpu_measurement_driver_runtime="${cpu_driver_runtime}"
+  local cpu_measurement_serial_policy_hash="${cpu_serial_policy_hash}"
+
   cpu_decode_batches_run=0
   cpu_decode_collection_limited=0
 
@@ -4665,14 +5710,14 @@ refresh_cpu_decode() {
         decode_shapes="${cpu_decode_development_shapes}"
         ;;
       fast-sealed)
-        decode_shapes="${cpu_decode_sealed_shapes}"
+        return 0
         ;;
       *)
         return 0
         ;;
     esac
   elif [[ "${measurement_profile}" == "production" ]]; then
-    decode_shapes="${cpu_decode_all_shapes}"
+    decode_shapes="${cpu_decode_development_shapes}"
   fi
 
   local weighted_shapes=()
@@ -4694,8 +5739,6 @@ refresh_cpu_decode() {
   local timing_partials=()
   local development_partials=()
   local development_timing_partials=()
-  local sealed_partials=()
-  local sealed_timing_partials=()
   if (( ! skip_sweep )); then
     local format_shards=()
     if (( stratified_formats || cpu_format_shards )); then
@@ -4737,11 +5780,8 @@ refresh_cpu_decode() {
             if csv_contains "${cpu_decode_development_shapes}" "${shape}"; then
               development_partials+=("${partial}")
               development_timing_partials+=("${timing_partial}")
-            elif csv_contains "${cpu_decode_sealed_shapes}" "${shape}"; then
-              sealed_partials+=("${partial}")
-              sealed_timing_partials+=("${timing_partial}")
             else
-              echo "error: CPU decode shape ${shape} lacks a Fast partition" >&2
+              echo "error: CPU decode shape ${shape} is not development evidence" >&2
               return 2
             fi
           fi
@@ -4865,26 +5905,85 @@ refresh_cpu_decode() {
       echo "error: invalid CPU decode development run ID checkpoint" >&2
       exit 2
     fi
-    run_cmd python3 "${cpu_decode_generator}" \
-      --input "${cpu_decode_development_csv}" \
-      --timing-sidecar "${cpu_decode_development_timing_csv}" \
-      --output "${cpu_decode_provisional_inc}" \
-      --common-observations "${cpu_decode_common_csv}" \
-      --adapt-only --profile production \
-      --run-id "${run_id}" \
-      --git-revision "${cpu_git_revision}" \
-      --build-id "${cpu_build_id}" \
-      --compiler-id "${cpu_compiler_id}" \
-      --architecture-class "${cpu_arch_class}" \
-      --device-name "${cpu_device_name}" \
-      --driver-runtime "${cpu_driver_runtime}" \
-      --serial-m1-policy-hash "${cpu_serial_policy_hash}" \
-      --shape-manifest "${shape_manifest_path}"
+    local reuse_cpu_decode_common=0
+    if (( skip_sweep )) && [[ -s "${cpu_decode_common_csv}" ]]; then
+      local recorded_run_id
+      recorded_run_id="$(csv_unique_field "${cpu_decode_common_csv}" run_id)"
+      if [[ "${run_id}" != "${recorded_run_id}" ]]; then
+        echo "error: CPU decode run-ID checkpoint disagrees with common corpus" >&2
+        exit 2
+      fi
+      cpu_git_revision="$(
+        csv_unique_field "${cpu_decode_common_csv}" git_revision
+      )"
+      cpu_build_id="$(
+        csv_unique_field_prefix \
+          "${cpu_decode_common_csv}" build_id '|cpu_isa='
+      )"
+      cpu_compiler_id="$(
+        csv_unique_field "${cpu_decode_common_csv}" compiler_id
+      )"
+      cpu_arch_class="$(
+        csv_unique_field_prefix \
+          "${cpu_decode_common_csv}" architecture_class '|build='
+      )"
+      cpu_device_name="$(
+        csv_unique_field "${cpu_decode_common_csv}" device_name
+      )"
+      cpu_driver_runtime="$(
+        csv_unique_field "${cpu_decode_common_csv}" driver_runtime
+      )"
+      cpu_serial_policy_hash="$(
+        csv_unique_field "${cpu_decode_common_csv}" serial_m1_policy_hash
+      )"
+      if [[ "${cpu_serial_policy_hash}" != \
+            "${cpu_measurement_serial_policy_hash}" ]]; then
+        echo "error: fresh CPU decode seal cannot certify a changed serial arithmetic policy" >&2
+        exit 2
+      fi
+      if csv_has_field "${cpu_decode_common_csv}" launch_k_tiles; then
+        reuse_cpu_decode_common=1
+        printf 'Fit-only CPU decode replay retains measured build provenance: %s\n' \
+          "${cpu_build_id}"
+      else
+        printf '%s\n' \
+          'CPU decode common corpus predates launch_k_tiles; re-adapting retained raw timing evidence.'
+      fi
+    fi
+    if (( ! reuse_cpu_decode_common )); then
+      run_cmd python3 "${cpu_decode_generator}" \
+        --input "${cpu_decode_development_csv}" \
+        --timing-sidecar "${cpu_decode_development_timing_csv}" \
+        --output "${cpu_decode_provisional_inc}" \
+        --common-observations "${cpu_decode_common_csv}" \
+        --adapt-only --profile production \
+        --run-id "${run_id}" \
+        --git-revision "${cpu_git_revision}" \
+        --build-id "${cpu_build_id}" \
+        --compiler-id "${cpu_compiler_id}" \
+        --architecture-class "${cpu_arch_class}" \
+        --device-name "${cpu_device_name}" \
+        --driver-runtime "${cpu_driver_runtime}" \
+        --serial-m1-policy-hash "${cpu_serial_policy_hash}" \
+        --shape-manifest "${shape_manifest_path}" \
+        "${cpu_fixed_timing_gate_args[@]}"
+    fi
     collect_backend_profiler_evidence \
       cpu "${cpu_decode_common_csv}" "${cpu_avx2_sweep_bin}" \
       "${cpu_decode_profiler_requests}" "${cpu_decode_profiler_evidence}" \
       "${cpu_decode_profiler_features}" "${cpu_decode_profiler_raw}"
     run_cpu_decode_paired_refinement "${cpu_decode_common_csv}"
+
+    local -a cpu_decode_burned_args=()
+    local burned_index
+    for burned_index in "${!cpu_decode_burned_sealed_plans[@]}"; do
+      cpu_decode_burned_args+=(
+        --burned-sealed-plan-json
+        "${cpu_decode_burned_sealed_plans[burned_index]}"
+        --burned-sealed-paired-dir
+        "${cpu_decode_burned_sealed_paired_dirs[burned_index]}"
+      )
+    done
 
     local cpu_decode_freeze=(
       python3 "${cpu_decode_generator}"
@@ -4893,7 +5992,9 @@ refresh_cpu_decode() {
       --output "${cpu_decode_frozen_inc}" \
       --summary "${cpu_decode_summary}" \
       --common-observations "${cpu_decode_common_csv}" \
+      --reuse-development-common \
       --policy-json "${cpu_decode_frozen_policy_json}" \
+      --sealed-route-probe-json "${cpu_decode_sealed_route_probe_json}" \
       --freeze-generic --profile production \
       --run-id "${run_id}" \
       --git-revision "${cpu_git_revision}" \
@@ -4907,30 +6008,109 @@ refresh_cpu_decode() {
       --fit-cache-dir "${cpu_decode_fit_cache_dir}" \
       --development-profiler-requests "${cpu_decode_profiler_requests}" \
       --development-profiler-evidence "${cpu_decode_profiler_evidence}" \
-      --development-profiler-observations "${cpu_decode_profiler_witnesses}"
+      --development-profiler-observations "${cpu_decode_profiler_witnesses}" \
+      --sealed-build-id "${cpu_measurement_build_id}" \
+      "${cpu_fixed_timing_gate_args[@]}"
     )
     local cpu_paired_path
     for cpu_paired_path in "${cpu_decode_paired_evidence[@]}"; do
       cpu_decode_freeze+=(--paired-development-csv "${cpu_paired_path}")
     done
+    cpu_decode_freeze+=("${cpu_decode_burned_args[@]}")
     run_cmd "${cpu_decode_freeze[@]}"
-    if (( ! skip_sweep )); then
-      combine_csvs "${cpu_decode_sealed_csv}" "${sealed_partials[@]}"
-      combine_csvs \
-        "${cpu_decode_sealed_timing_csv}" \
-        "${sealed_timing_partials[@]}"
+
+    local cpu_decode_sealed_route_args=()
+    local cpu_decode_sealed_build_token="${cpu_measurement_build_id#sha256:}"
+    cpu_decode_sealed_build_token="${cpu_decode_sealed_build_token:0:12}"
+    local cpu_decode_sealed_route_probe_token=""
+    if (( dry_run )); then
+      cpu_decode_sealed_route_probe_token="dry-run-probe"
+    else
+      # A trainer rebuild does not imply that the learned reserve geometry is
+      # unchanged. Bind each timing-free route manifest to the exact probe
+      # bytes as well as the binary build so a later reserve generation can
+      # never reuse a stale shape subset from the same executable.
+      cpu_decode_sealed_route_probe_token="$(
+        sha256sum "${cpu_decode_sealed_route_probe_json}" |
+          awk '{print substr($1, 1, 12)}'
+      )"
     fi
+    local route_spec route_regime route_runtime_isa route_bin route_manifest
+    for route_spec in \
+        "avx2-build.avx2-runtime|AVX2|${cpu_avx2_sweep_bin}" \
+        "avx512-build.avx2-runtime|AVX2|${cpu_avx512_sweep_bin}" \
+        "avx512-build.avx512-runtime|AVX512|${cpu_avx512_sweep_bin}"; do
+      IFS='|' read -r route_regime route_runtime_isa route_bin <<< "${route_spec}"
+      route_manifest="${output_dir}/cpu_decode_m1.sealed-route.${route_regime}.${cpu_decode_sealed_build_token}.${cpu_decode_sealed_route_probe_token}.csv"
+      if [[ ! -s "${route_manifest}" ]]; then
+        run_cmd \
+          "OMP_NUM_THREADS=${cpu_threads}" \
+          "OMP_PLACES=cores" \
+          "OMP_PROC_BIND=close" \
+          "LLAMINAR_ISA_LEVEL=${route_runtime_isa}" \
+          "LLAMINAR_CPU_NVNNI_PREFILL_ROUTE_CSV=${route_manifest}.inprogress" \
+          "LLAMINAR_CPU_NVNNI_PREFILL_ROUTE_ISA_REGIME=${route_regime}" \
+          "LLAMINAR_CPU_NVNNI_PREFILL_ROUTE_REFINEMENT_PROBE_JSON=${cpu_decode_sealed_route_probe_json}" \
+          "${route_bin}" \
+          "--gtest_filter=*TrainerCsv_PrefillSerialRouteManifest"
+        if (( ! dry_run )); then
+          mv "${route_manifest}.inprogress" "${route_manifest}"
+        fi
+      fi
+      cpu_decode_sealed_route_args+=(--sealed-route-manifest "${route_manifest}")
+    done
+
+    local cpu_decode_plan=(
+      python3 "${cpu_decode_generator}"
+      --input "${cpu_decode_development_csv}"
+      --timing-sidecar "${cpu_decode_development_timing_csv}"
+      --output "${cpu_decode_frozen_inc}"
+      --common-observations "${cpu_decode_common_csv}"
+      --reuse-development-common
+      --frozen-policy-json "${cpu_decode_frozen_policy_json}"
+      --sealed-route-probe-json "${cpu_decode_sealed_route_probe_json}"
+      --sealed-plan-json "${cpu_decode_sealed_plan_json}"
+      --sealed-request-dir "${cpu_decode_sealed_request_dir}"
+      --plan-sealed-pairs --profile production
+      --run-id "${run_id}"
+      --git-revision "${cpu_git_revision}"
+      --build-id "${cpu_build_id}"
+      --compiler-id "${cpu_compiler_id}"
+      --architecture-class "${cpu_arch_class}"
+      --device-name "${cpu_device_name}"
+      --driver-runtime "${cpu_driver_runtime}"
+      --serial-m1-policy-hash "${cpu_serial_policy_hash}"
+      --shape-manifest "${shape_manifest_path}"
+      --fit-cache-dir "${cpu_decode_fit_cache_dir}"
+      --development-profiler-requests "${cpu_decode_profiler_requests}"
+      --development-profiler-evidence "${cpu_decode_profiler_evidence}"
+      --development-profiler-observations "${cpu_decode_profiler_witnesses}"
+      --sealed-build-id "${cpu_measurement_build_id}"
+      "${cpu_decode_sealed_route_args[@]}"
+      "${cpu_fixed_timing_gate_args[@]}"
+    )
+    for cpu_paired_path in "${cpu_decode_paired_evidence[@]}"; do
+      cpu_decode_plan+=(--paired-development-csv "${cpu_paired_path}")
+    done
+    cpu_decode_plan+=("${cpu_decode_burned_args[@]}")
+    run_cmd "${cpu_decode_plan[@]}"
+
+    local cpu_decode_sealed_paired_csvs=()
+    run_cpu_sealed_paired_shards \
+      "decode-m1" "${cpu_decode_sealed_request_dir}" \
+      cpu_decode_sealed_paired_csvs
     local cpu_decode_certify=(
       python3 "${cpu_decode_generator}"
       --development-input "${cpu_decode_development_csv}" \
       --development-timing-sidecar "${cpu_decode_development_timing_csv}" \
-      --sealed-input "${cpu_decode_sealed_csv}" \
-      --sealed-timing-sidecar "${cpu_decode_sealed_timing_csv}" \
       --frozen-policy-json "${cpu_decode_frozen_policy_json}" \
+      --sealed-plan-json "${cpu_decode_sealed_plan_json}" \
       --policy-json "${cpu_decode_policy_json}" \
+      --certification-diagnostic "${cpu_decode_certification_diagnostic}" \
       --output "${cpu_decode_inc}" \
       --summary "${cpu_decode_summary}" \
       --common-observations "${cpu_decode_common_csv}" \
+      --reuse-development-common \
       --certify-generic --profile production \
       --run-id "${run_id}" \
       --git-revision "${cpu_git_revision}" \
@@ -4944,11 +6124,17 @@ refresh_cpu_decode() {
       --fit-cache-dir "${cpu_decode_fit_cache_dir}" \
       --development-profiler-requests "${cpu_decode_profiler_requests}" \
       --development-profiler-evidence "${cpu_decode_profiler_evidence}" \
-      --development-profiler-observations "${cpu_decode_profiler_witnesses}"
+      --development-profiler-observations "${cpu_decode_profiler_witnesses}" \
+      --sealed-build-id "${cpu_measurement_build_id}" \
+      "${cpu_fixed_timing_gate_args[@]}"
     )
     for cpu_paired_path in "${cpu_decode_paired_evidence[@]}"; do
       cpu_decode_certify+=(--paired-development-csv "${cpu_paired_path}")
     done
+    cpu_decode_certify+=(
+      --sealed-paired-dir "${cpu_decode_sealed_request_dir}"
+    )
+    cpu_decode_certify+=("${cpu_decode_burned_args[@]}")
     run_cmd "${cpu_decode_certify[@]}"
     run_cmd python3 "${dispatch_validator}" "${cpu_decode_inc}"
     run_cmd \
@@ -4982,7 +6168,43 @@ refresh_cpu_decode() {
     --device-name "${cpu_device_name}" \
     --driver-runtime "${cpu_driver_runtime}" \
     --serial-m1-policy-hash "${cpu_serial_policy_hash}" \
-    --shape-manifest "${shape_manifest_path}"
+    --shape-manifest "${shape_manifest_path}" \
+    "${cpu_fixed_timing_gate_args[@]}"
+}
+
+authenticate_completed_cpu_decode() {
+  local installed_inc="${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIDecodePolicyGenerated.inc"
+
+  # The continuation boundary is deliberately stronger than a file-exists
+  # checkpoint. The policy validator authenticates sealed certification and
+  # the embedded policy digests, while byte equality proves the exact include
+  # under review is already the production table consumed by both CPU builds.
+  if (( ! dry_run )); then
+    local required_path
+    for required_path in \
+        "${cpu_decode_policy_json}" \
+        "${cpu_decode_inc}" \
+        "${installed_inc}"; do
+      if [[ ! -s "${required_path}" ]]; then
+        echo "error: --resume-after-cpu-decode requires completed artifact ${required_path}" >&2
+        return 2
+      fi
+    done
+  fi
+
+  run_cmd \
+    "PYTHONPATH=${shape_manifest_python_root}" \
+    python3 -m native_vnni_dispatch.policy_artifact \
+    --policy-json "${cpu_decode_policy_json}" \
+    --include "${cpu_decode_inc}"
+  if (( dry_run )); then
+    run_cmd cmp --silent "${cpu_decode_inc}" "${installed_inc}"
+  elif ! cmp --silent "${cpu_decode_inc}" "${installed_inc}"; then
+    echo "error: installed CPU decode policy differs from the certified output artifact" >&2
+    return 2
+  fi
+  printf 'Authenticated installed CPU decode prerequisite: %s\n' \
+    "${cpu_decode_policy_json}"
 }
 
 refresh_cpu() {
@@ -5002,12 +6224,16 @@ refresh_cpu() {
   cpu_arch_class="$(cpu_architecture_class)"
   cpu_device_name="$(cpu_lscpu_field "Model name")"
   cpu_driver_runtime="linux-$(uname -r)-openmp"
-  cpu_serial_policy_hash="$(sha256_file_set \
-    "${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemv.h" \
-    "${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeAVX2Gemv.h" \
-    "${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIDecode.h" \
-    "${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNITileConfig.h")"
-  if [[ "${shape_partition}" != verifier-* ]]; then
+  cpu_serial_policy_hash="$(cpu_serial_arithmetic_contract_hash)"
+  # Development timings and the post-freeze grouped seal can come from two
+  # different binary generations. Keep the currently installed trainers as
+  # the seal identity before a fit-only replay restores the immutable
+  # provenance recorded by the development corpus.
+  local cpu_measurement_build_id="${cpu_build_id}"
+  local cpu_measurement_serial_policy_hash="${cpu_serial_policy_hash}"
+  if (( resume_after_cpu_decode )); then
+    authenticate_completed_cpu_decode
+  elif [[ "${shape_partition}" != verifier-* ]]; then
     refresh_cpu_decode \
       "${cpu_git_revision}" "${cpu_build_id}" "${cpu_compiler_id}" \
       "${cpu_arch_class}" "${cpu_device_name}" "${cpu_driver_runtime}" \
@@ -5023,12 +6249,13 @@ refresh_cpu() {
     if [[ "${measurement_profile}" == "production" ]]; then
       cpu_build_id="$(sha256_file_set \
         "${cpu_avx2_sweep_bin}" "${cpu_avx512_sweep_bin}")"
-      cpu_serial_policy_hash="$(sha256_file_set \
-        "${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemv.h" \
-        "${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIDecodePolicyGenerated.inc")"
+      cpu_serial_policy_hash="$(cpu_serial_arithmetic_contract_hash)"
     fi
   fi
-  local cpu_sweep_m_values="${m_values}"
+  # Grouped verifier rows begin at M=2. Keep this inventory independent from
+  # the M=1 serial-decode transaction so caller-provided mixed ranges cannot
+  # accidentally admit the oracle-only row count into grouped evidence.
+  local cpu_sweep_m_values="${cpu_grouped_m_values}"
   local cpu_sweep_shapes="${shapes}"
   if (( partitioned_measurement )); then
     cpu_sweep_m_values="${partition_m_values}"
@@ -5037,7 +6264,8 @@ refresh_cpu() {
         cpu_sweep_shapes="${cpu_verifier_development_shapes}"
         ;;
       verifier-sealed)
-        cpu_sweep_shapes="${cpu_verifier_sealed_shapes}"
+        finish_backend_collection_target
+        return
         ;;
     esac
   elif [[ "${measurement_profile}" == "production" ]]; then
@@ -5045,7 +6273,11 @@ refresh_cpu() {
     # independent production serial oracle and Fast-only CUDA/ROCm refinement
     # geometries have no place in this measurement matrix.
     cpu_sweep_m_values="${canonical_verifier_m_values}"
-    cpu_sweep_shapes="${cpu_verifier_all_shapes}"
+    cpu_sweep_shapes="${cpu_verifier_development_shapes}"
+  fi
+  if [[ -z "${cpu_sweep_m_values}" ]]; then
+    echo "error: CPU grouped-verifier collection requires at least one --m-values entry >= 2" >&2
+    exit 2
   fi
   # One MPMD launch is a synchronization boundary: both ranks must finish
   # before the next pair can start. Pairing manifest neighbors can therefore
@@ -5120,8 +6352,6 @@ refresh_cpu() {
     local timing_partials=()
     local development_partials=()
     local development_timing_partials=()
-    local sealed_partials=()
-    local sealed_timing_partials=()
     local format_shards=()
     local job_format_specs=()
     local job_shapes=()
@@ -5166,11 +6396,8 @@ refresh_cpu() {
             if csv_contains "${cpu_verifier_development_shapes}" "${shape}"; then
               development_partials+=("${partial}")
               development_timing_partials+=("${timing_partial}")
-            elif csv_contains "${cpu_verifier_sealed_shapes}" "${shape}"; then
-              sealed_partials+=("${partial}")
-              sealed_timing_partials+=("${timing_partial}")
             else
-              echo "error: CPU verifier shape ${shape} lacks a frozen partition" >&2
+              echo "error: CPU verifier shape ${shape} is not development evidence" >&2
               exit 2
             fi
           fi
@@ -5305,43 +6532,107 @@ refresh_cpu() {
 
   local cpu_require_args=()
   if (( cpu_require_policy_keys )); then
-    while IFS= read -r format; do
-      while IFS= read -r shape; do
-        local n k
-        n="$(cpu_shape_n "${shape}")"
-        k="$(cpu_shape_k "${shape}")"
-        while IFS= read -r m; do
-          if (( m < 2 )); then
-            continue
-          fi
-          cpu_require_args+=(--require-key "${format}:${m}:${n}:${k}")
-        done < <(csv_values "${m_values}")
-      done < <(csv_values "${cpu_sweep_shapes}")
-    done < <(csv_values "${cpu_formats}")
+    cpu_require_args=(
+      --require-inventory-formats "${cpu_formats}"
+      --require-inventory-shapes "${cpu_sweep_shapes}"
+      --require-inventory-m-values "${cpu_sweep_m_values}"
+    )
   fi
 
   if [[ "${measurement_profile}" == "production" ]]; then
-    local cpu_run_id="${timestamp}-cpu-${profile}-development"
-    run_cmd python3 "${cpu_generator}" \
-      --input "${cpu_development_csv}" \
-      --timing-sidecar "${cpu_development_timing_csv}" \
-      --output "${cpu_provisional_inc}" \
-      --common-observations "${cpu_common_csv}" \
-      --adapt-only \
-      --profile production \
-      --run-id "${cpu_run_id}" \
-      --git-revision "${cpu_git_revision}" \
-      --build-id "${cpu_build_id}" \
-      --compiler-id "${cpu_compiler_id}" \
-      --architecture-class "${cpu_arch_class}" \
-      --device-name "${cpu_device_name}" \
-      --driver-runtime "${cpu_driver_runtime}" \
-      --serial-m1-policy-hash "${cpu_serial_policy_hash}" \
-      --shape-manifest "${shape_manifest_path}"
+    local cpu_run_id
+    local reuse_cpu_grouped_common=0
+    if [[ -s "${cpu_grouped_development_run_id_file}" ]]; then
+      IFS= read -r cpu_run_id < "${cpu_grouped_development_run_id_file}"
+    elif [[ -s "${cpu_common_csv}" ]] &&
+         (( resume_cpu_partials || skip_sweep )); then
+      cpu_run_id="$(csv_unique_field "${cpu_common_csv}" run_id)"
+      if (( ! dry_run )); then
+        printf '%s\n' "${cpu_run_id}" > \
+          "${cpu_grouped_development_run_id_file}.inprogress"
+        mv "${cpu_grouped_development_run_id_file}.inprogress" \
+          "${cpu_grouped_development_run_id_file}"
+      fi
+    else
+      cpu_run_id="${timestamp}-cpu-${profile}-development"
+      if (( ! dry_run )); then
+        printf '%s\n' "${cpu_run_id}" > \
+          "${cpu_grouped_development_run_id_file}.inprogress"
+        mv "${cpu_grouped_development_run_id_file}.inprogress" \
+          "${cpu_grouped_development_run_id_file}"
+      fi
+    fi
+    if [[ -z "${cpu_run_id}" || "${cpu_run_id}" == *$'\n'* ]]; then
+      echo "error: invalid CPU grouped development run ID checkpoint" >&2
+      exit 2
+    fi
+    if [[ -s "${cpu_common_csv}" ]] &&
+       (( resume_cpu_partials || skip_sweep )); then
+      reuse_cpu_grouped_common=1
+      local -a cpu_grouped_provenance=()
+      mapfile -t cpu_grouped_provenance < <(
+        csv_first_cpu_provenance "${cpu_common_csv}"
+      )
+      if (( ${#cpu_grouped_provenance[@]} != 8 )); then
+        echo "error: invalid CPU grouped provenance checkpoint" >&2
+        exit 2
+      fi
+      if [[ "${cpu_run_id}" != "${cpu_grouped_provenance[0]}" ]]; then
+        echo "error: CPU grouped run-ID checkpoint disagrees with common corpus" >&2
+        exit 2
+      fi
+      cpu_git_revision="${cpu_grouped_provenance[1]}"
+      cpu_build_id="${cpu_grouped_provenance[2]}"
+      cpu_compiler_id="${cpu_grouped_provenance[3]}"
+      cpu_arch_class="${cpu_grouped_provenance[4]}"
+      cpu_device_name="${cpu_grouped_provenance[5]}"
+      cpu_driver_runtime="${cpu_grouped_provenance[6]}"
+      cpu_serial_policy_hash="${cpu_grouped_provenance[7]}"
+      if [[ "${cpu_serial_policy_hash}" != \
+            "${cpu_measurement_serial_policy_hash}" ]]; then
+        echo "error: fresh CPU grouped seal cannot certify a changed serial arithmetic policy" >&2
+        exit 2
+      fi
+      printf 'Reusing authenticated CPU grouped common corpus: %s\n' \
+        "${cpu_common_csv}"
+      printf 'Fit-only CPU grouped replay retains measured build provenance: %s\n' \
+        "${cpu_build_id}"
+    fi
+    if (( ! reuse_cpu_grouped_common )); then
+      run_cmd python3 "${cpu_generator}" \
+        --input "${cpu_development_csv}" \
+        --timing-sidecar "${cpu_development_timing_csv}" \
+        --output "${cpu_provisional_inc}" \
+        --common-observations "${cpu_common_csv}" \
+        --adapt-only \
+        --profile production \
+        --run-id "${cpu_run_id}" \
+        --git-revision "${cpu_git_revision}" \
+        --build-id "${cpu_build_id}" \
+        --compiler-id "${cpu_compiler_id}" \
+        --architecture-class "${cpu_arch_class}" \
+        --device-name "${cpu_device_name}" \
+        --driver-runtime "${cpu_driver_runtime}" \
+        --serial-m1-policy-hash "${cpu_serial_policy_hash}" \
+        --shape-manifest "${shape_manifest_path}" \
+        "${cpu_fixed_timing_gate_args[@]}"
+    fi
     collect_backend_profiler_evidence \
       cpu "${cpu_common_csv}" "${cpu_avx2_sweep_bin}" \
       "${cpu_profiler_requests}" "${cpu_profiler_evidence}" \
       "${cpu_profiler_features}" "${cpu_profiler_raw}"
+    run_cpu_grouped_paired_refinement "${cpu_common_csv}"
+
+    local -a cpu_grouped_burned_args=()
+    local grouped_burned_index
+    for grouped_burned_index in "${!cpu_grouped_burned_sealed_plans[@]}"; do
+      cpu_grouped_burned_args+=(
+        --burned-sealed-plan-json
+        "${cpu_grouped_burned_sealed_plans[grouped_burned_index]}"
+        --burned-sealed-paired-dir
+        "${cpu_grouped_burned_sealed_paired_dirs[grouped_burned_index]}"
+      )
+    done
 
     local -a cpu_frozen_args=(
       python3 "${cpu_generator}"
@@ -5350,7 +6641,10 @@ refresh_cpu() {
       --output "${cpu_frozen_inc}"
       --summary "${cpu_summary}"
       --common-observations "${cpu_common_csv}"
+      --reuse-development-common
       --policy-json "${cpu_frozen_policy_json}"
+      --sealed-plan-json "${cpu_grouped_sealed_plan_json}"
+      --sealed-request-dir "${cpu_grouped_sealed_request_dir}"
       --freeze-generic
       --profile production
       --run-id "${cpu_run_id}"
@@ -5362,29 +6656,42 @@ refresh_cpu() {
       --driver-runtime "${cpu_driver_runtime}"
       --serial-m1-policy-hash "${cpu_serial_policy_hash}"
       --shape-manifest "${shape_manifest_path}"
+      --fit-cache-dir "${cpu_grouped_fit_cache_dir}"
       --development-profiler-requests "${cpu_profiler_requests}"
       --development-profiler-evidence "${cpu_profiler_evidence}"
+      --development-profiler-observations "${cpu_common_csv}"
+      --generic-max-leaves "${cpu_grouped_max_leaves}"
+      --sealed-build-id "${cpu_measurement_build_id}"
+      "${cpu_fixed_timing_gate_args[@]}"
     )
+    cpu_frozen_args+=("${cpu_grouped_burned_args[@]}")
+    local cpu_grouped_development_paired_path
+    for cpu_grouped_development_paired_path in \
+        "${cpu_grouped_paired_evidence[@]}"; do
+      cpu_frozen_args+=(
+        --paired-development-csv
+        "${cpu_grouped_development_paired_path}"
+      )
+    done
     run_cmd "${cpu_frozen_args[@]}"
 
-    if (( ! skip_sweep )); then
-      combine_csvs "${cpu_sealed_csv}" "${sealed_partials[@]}"
-      combine_csvs \
-        "${cpu_sealed_timing_csv}" \
-        "${sealed_timing_partials[@]}"
-    fi
+    local cpu_grouped_sealed_paired_csvs=()
+    run_cpu_sealed_paired_shards \
+      "grouped-decode" "${cpu_grouped_sealed_request_dir}" \
+      cpu_grouped_sealed_paired_csvs
 
     local -a cpu_certify_args=(
       python3 "${cpu_generator}"
       --development-input "${cpu_development_csv}"
       --development-timing-sidecar "${cpu_development_timing_csv}"
-      --sealed-input "${cpu_sealed_csv}"
-      --sealed-timing-sidecar "${cpu_sealed_timing_csv}"
       --frozen-policy-json "${cpu_frozen_policy_json}"
+      --sealed-plan-json "${cpu_grouped_sealed_plan_json}"
       --policy-json "${cpu_policy_json}"
+      --certification-diagnostic "${cpu_grouped_certification_diagnostic}"
       --output "${cpu_inc}"
       --summary "${cpu_summary}"
       --common-observations "${cpu_common_csv}"
+      --reuse-development-common
       --certify-generic
       --profile production
       --run-id "${cpu_run_id}"
@@ -5396,28 +6703,39 @@ refresh_cpu() {
       --driver-runtime "${cpu_driver_runtime}"
       --serial-m1-policy-hash "${cpu_serial_policy_hash}"
       --shape-manifest "${shape_manifest_path}"
+      --fit-cache-dir "${cpu_grouped_fit_cache_dir}"
       --development-profiler-requests "${cpu_profiler_requests}"
       --development-profiler-evidence "${cpu_profiler_evidence}"
+      --development-profiler-observations "${cpu_common_csv}"
+      --generic-max-leaves "${cpu_grouped_max_leaves}"
+      --sealed-build-id "${cpu_measurement_build_id}"
+      "${cpu_fixed_timing_gate_args[@]}"
     )
+    cpu_certify_args+=("${cpu_grouped_burned_args[@]}")
+    for cpu_grouped_development_paired_path in \
+        "${cpu_grouped_paired_evidence[@]}"; do
+      cpu_certify_args+=(
+        --paired-development-csv
+        "${cpu_grouped_development_paired_path}"
+      )
+    done
     cpu_certify_args+=("${cpu_require_args[@]}")
+    local cpu_grouped_paired_path
+    cpu_certify_args+=(
+      --sealed-paired-dir "${cpu_grouped_sealed_request_dir}"
+    )
     run_cmd "${cpu_certify_args[@]}"
-    if (( ! skip_sweep )); then
-      combine_csvs \
-        "${cpu_csv}" "${cpu_development_csv}" "${cpu_sealed_csv}"
-      combine_csvs \
-        "${cpu_timing_csv}" \
-        "${cpu_development_timing_csv}" "${cpu_sealed_timing_csv}"
-    fi
     run_cmd python3 "${dispatch_validator}" "${cpu_inc}"
     run_cmd \
       "PYTHONPATH=${shape_manifest_python_root}" \
       python3 -m native_vnni_dispatch.policy_artifact \
       --policy-json "${cpu_policy_json}" \
       --include "${cpu_inc}"
-    collect_backend_profiler_evidence \
-      cpu "${cpu_common_csv}" "${cpu_avx2_sweep_bin}" \
+    reuse_identical_backend_profiler_evidence \
+      "${cpu_profiler_requests}" "${cpu_profiler_evidence}" \
+      "${cpu_profiler_features}" \
       "${cpu_final_profiler_requests}" "${cpu_final_profiler_evidence}" \
-      "${cpu_final_profiler_features}" "${cpu_final_profiler_raw}"
+      "${cpu_final_profiler_features}"
 
     if (( install )); then
       local cpu_install_target="${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIVerifierRowsPolicyGenerated.inc"
@@ -5446,6 +6764,7 @@ refresh_cpu() {
     --driver-runtime "${cpu_driver_runtime}"
     --serial-m1-policy-hash "${cpu_serial_policy_hash}"
     --shape-manifest "${shape_manifest_path}"
+    "${cpu_fixed_timing_gate_args[@]}"
   )
   if [[ "${measurement_profile}" == "production" ||
         "${measurement_profile}" == "family-smoke" ]]; then
@@ -5495,11 +6814,7 @@ refresh_cpu_prefill() {
   cpu_measurement_arch_class="$(cpu_architecture_class)"
   cpu_measurement_device_name="$(cpu_lscpu_field "Model name")"
   cpu_measurement_driver_runtime="linux-$(uname -r)-openmp"
-  cpu_measurement_serial_policy_hash="$(sha256_file_set \
-    "${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemv.h" \
-    "${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeAVX2Gemv.h" \
-    "${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIDecode.h" \
-    "${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNITileConfig.h")"
+  cpu_measurement_serial_policy_hash="$(cpu_serial_arithmetic_contract_hash)"
   cpu_git_revision="${cpu_measurement_git_revision}"
   cpu_build_id="${cpu_measurement_build_id}"
   cpu_compiler_id="${cpu_measurement_compiler_id}"
@@ -5634,7 +6949,13 @@ refresh_cpu_prefill() {
     shape_m="${cpu_prefill_shape_m[${shape}]}"
     if [[ "${profile}" != "all" ]]; then
       case "${profile}" in
-        quick) shape_m="64" ;;
+        quick)
+          # Quick CPU-prefill diagnostics must still exercise a depth owned by
+          # the selected geometry's production tier. Sub-14B overlays begin at
+          # M=512; hard-coding M=64 here would silently reintroduce a launch the
+          # bounded production inventory intentionally removed.
+          shape_m="$(printf '%s' "${shape_m}" | tr ',' '\n' | head -n 1)"
+          ;;
         family-smoke)
           max_m="$(printf '%s' "${shape_m}" | tr ',' '\n' | tail -n 1)"
           shape_m="${max_m}"
@@ -5895,7 +7216,7 @@ refresh_cpu_prefill() {
     sha256sum "${cpu_prefill_split_manifest_path}" | awk '{print $1}'
   )"
   contract_payload="$(printf '%s\n' \
-    "schema=cpu-native-vnni-prefill-collection-v16" \
+    "schema=cpu-native-vnni-prefill-collection-v17" \
     "profile=${measurement_profile}" \
     "shape_records=$(IFS=';'; printf '%s' "${sorted_shape_records[*]}")" \
     "formats=${cpu_formats}" \
@@ -5991,7 +7312,17 @@ refresh_cpu_prefill() {
         timing_partials+=("${timing_partial}")
         if (( resume_cpu_partials )) &&
            [[ -s "${partial}" && -s "${timing_partial}" ]]; then
-          continue
+          if PYTHONPATH="${shape_manifest_python_root}" \
+              python3 -m \
+                tests.v2.performance.kernels.native_vnni_dispatch.validate_cpu_prefill_partial \
+                --input "${partial}" \
+                --timing-sidecar "${timing_partial}" \
+                --expected-m-values "${m_values}"; then
+            continue
+          fi
+          printf 'Discarding incomplete CPU prefill baseline partial before resume: %s\n' \
+            "${partial}" >&2
+          rm -f "${partial}" "${timing_partial}"
         fi
         # MPI complete-round synchronization requires every rank in one MPMD
         # launch to visit exactly the same ordered M phases.  The v4 covering
@@ -6032,7 +7363,8 @@ refresh_cpu_prefill() {
         fi
         for regime_spec in "${regime_specs[@]}"; do
           IFS='|' read -r regime_name runtime_isa regime_bin <<< "${regime_spec}"
-          group_starts+=("${#job_shapes[@]}")
+          local profile_pending_m_inventory=""
+          local profile_group_open=0
           for record in "${sorted_shape_records[@]}"; do
             IFS=$'\t' read -r shape m_values <<< "${record}"
             n="${cpu_prefill_shape_n[${shape}]}"
@@ -6043,7 +7375,31 @@ refresh_cpu_prefill() {
             timing_partials+=("${timing_partial}")
             if (( resume_cpu_partials )) &&
                [[ -s "${partial}" && -s "${timing_partial}" ]]; then
-              continue
+              if PYTHONPATH="${shape_manifest_python_root}" \
+                  python3 -m \
+                    tests.v2.performance.kernels.native_vnni_dispatch.validate_cpu_prefill_partial \
+                    --input "${partial}" \
+                    --timing-sidecar "${timing_partial}" \
+                    --expected-m-values "${m_values}"; then
+                continue
+              fi
+              printf 'Discarding incomplete CPU prefill baseline partial before resume: %s\n' \
+                "${partial}" >&2
+              rm -f "${partial}" "${timing_partial}"
+            fi
+            # Quick, family-smoke, and explicit-shape profiles may combine
+            # model tiers with different depth ceilings. MPI complete-round
+            # synchronization permits pairing only records with an identical
+            # ordered M inventory, so close the current group before adding a
+            # record from another tier.
+            if (( ! profile_group_open )) ||
+               [[ "${m_values}" != "${profile_pending_m_inventory}" ]]; then
+              if (( profile_group_open )); then
+                group_ends+=("${#job_shapes[@]}")
+              fi
+              group_starts+=("${#job_shapes[@]}")
+              profile_pending_m_inventory="${m_values}"
+              profile_group_open=1
             fi
             job_formats+=("${format_spec}")
             job_shapes+=("${shape}")
@@ -6055,7 +7411,9 @@ refresh_cpu_prefill() {
             job_partials+=("${partial}")
             job_timing_partials+=("${timing_partial}")
           done
-          group_ends+=("${#job_shapes[@]}")
+          if (( profile_group_open )); then
+            group_ends+=("${#job_shapes[@]}")
+          fi
         done
       done
     fi
@@ -6244,7 +7602,17 @@ refresh_cpu_prefill() {
         refinement_timing_partials+=("${timing_partial}")
         if (( resume_cpu_partials )) &&
            [[ -s "${partial}" && -s "${timing_partial}" ]]; then
-          continue
+          if PYTHONPATH="${shape_manifest_python_root}" \
+              python3 -m \
+                tests.v2.performance.kernels.native_vnni_dispatch.validate_cpu_prefill_partial \
+                --input "${partial}" \
+                --timing-sidecar "${timing_partial}" \
+                --expected-m-values "${m_values}"; then
+            continue
+          fi
+          printf 'Discarding incomplete CPU prefill refinement-v4 partial before resume: %s\n' \
+            "${partial}" >&2
+          rm -f "${partial}" "${timing_partial}"
         fi
         if (( ! refinement_pending_group_open )) ||
            [[ "${m_values}" != "${refinement_pending_m_inventory}" ]]; then

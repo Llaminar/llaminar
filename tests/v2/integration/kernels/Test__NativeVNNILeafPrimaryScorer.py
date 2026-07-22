@@ -572,6 +572,9 @@ class TestNativeVNNILeafPrimaryScorer(unittest.TestCase):
             4 * (8 + TREE_MAXIMUM_HELDOUT_POINTS * 4)
             + len(heldout_groups) * 4
             + 4
+            # ABI v15 publishes aggregate expanded/unique candidate counts in
+            # the same terminal transaction; no intermediate transfer is added.
+            + 2 * 8
         )
         self.assertEqual(
             after_replay.final_result_d2h_bytes
@@ -973,6 +976,135 @@ class TestNativeVNNILeafPrimaryScorer(unittest.TestCase):
                     primary_scorer=self.scorer,
                 )
                 self.assertEqual(actual, expected)
+
+    def test_kpart_producer_geometry_matches_python_oracle(self) -> None:
+        """Exercise the device opcodes that include frozen K-tile geometry."""
+
+        costs = []
+        k_tile_inventory = (1, 2, 3, 4, 7, 8, 12, 16)
+        for point_index, k_tiles in enumerate(k_tile_inventory):
+            key = RuntimeKey(
+                backend=Backend.CPU,
+                architecture_class="unit|threads=28",
+                semantic_contract=SemanticContract.FAST,
+                operation_kind="NativeVNNIFastM1Projection",
+                bundle_signature="unit-serial-kpart",
+                projection_n_vector=(512,),
+                prepared_family_id="unit-prepared",
+                packing_abi="unit-packing",
+                runtime_codebook_id=4,
+                execution_mode=ExecutionMode.EAGER,
+                m=1,
+                aggregate_n=512,
+                k=4096,
+                launch_k_tiles=k_tiles,
+            )
+            for candidate, regret in (
+                (
+                    "candidate.fine-grid",
+                    0.004 if k_tiles <= 4 else 0.080,
+                ),
+                (
+                    "candidate.coarse-grid",
+                    0.080 if k_tiles <= 4 else 0.004,
+                ),
+            ):
+                costs.append(segmented_policy.CandidatePointCost(
+                    runtime_key=key,
+                    shape_group_id=f"kpart-producer-{point_index:02d}",
+                    candidate_id=candidate,
+                    max_surface_regret=regret,
+                    p95_surface_regret=regret,
+                    mean_surface_regret=regret,
+                ))
+
+        expected = segmented_policy._fit_tree_budgets(
+            costs,
+            max_leaves=2,
+            min_shape_groups_per_leaf=2,
+            feature_policy=(
+                segmented_policy.FeaturePolicy.KPART_PRODUCER_GRID_SCHEDULES
+            ),
+        )
+        actual = segmented_policy._fit_tree_budgets(
+            costs,
+            max_leaves=2,
+            min_shape_groups_per_leaf=2,
+            feature_policy=(
+                segmented_policy.FeaturePolicy.KPART_PRODUCER_GRID_SCHEDULES
+            ),
+            primary_scorer=self.scorer,
+        )
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual[-1].leaf_count, 2)
+        self.assertIn(
+            actual[-1].root.threshold.axis,
+            {
+                *segmented_policy.KPART_PRODUCER_WAVE_WIDTH_BY_AXIS,
+                *segmented_policy.KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS,
+            },
+        )
+
+    def test_kpart_tail_geometry_matches_python_oracle(self) -> None:
+        """Exercise short/full K-tail metadata on the selected device tree."""
+
+        costs = []
+        for point_index, k_blocks in enumerate(range(128, 136)):
+            key = RuntimeKey(
+                backend=Backend.CPU,
+                architecture_class="unit|threads=28",
+                semantic_contract=SemanticContract.FAST,
+                operation_kind="NativeVNNIFastM1Projection",
+                bundle_signature="unit-serial-kpart",
+                projection_n_vector=(512,),
+                prepared_family_id="unit-prepared",
+                packing_abi="unit-packing",
+                runtime_codebook_id=4,
+                execution_mode=ExecutionMode.EAGER,
+                m=1,
+                aggregate_n=512,
+                k=k_blocks * 32,
+                launch_k_tiles=4,
+            )
+            full_tail = k_blocks % 4 == 0
+            for candidate, regret in (
+                ("candidate.full-tail", 0.004 if full_tail else 0.080),
+                ("candidate.short-tail", 0.080 if full_tail else 0.004),
+            ):
+                costs.append(segmented_policy.CandidatePointCost(
+                    runtime_key=key,
+                    shape_group_id=f"kpart-tail-{point_index:02d}",
+                    candidate_id=candidate,
+                    max_surface_regret=regret,
+                    p95_surface_regret=regret,
+                    mean_surface_regret=regret,
+                ))
+
+        expected = segmented_policy._fit_tree_budgets(
+            costs,
+            max_leaves=2,
+            min_shape_groups_per_leaf=2,
+            feature_policy=(
+                segmented_policy.FeaturePolicy.KPART_PRODUCER_GRID_SCHEDULES
+            ),
+        )
+        actual = segmented_policy._fit_tree_budgets(
+            costs,
+            max_leaves=2,
+            min_shape_groups_per_leaf=2,
+            feature_policy=(
+                segmented_policy.FeaturePolicy.KPART_PRODUCER_GRID_SCHEDULES
+            ),
+            primary_scorer=self.scorer,
+        )
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual[-1].leaf_count, 2)
+        self.assertEqual(
+            actual[-1].root.threshold.axis,
+            segmented_policy.FeatureAxis.KPART_FINAL_K_TILE_UTILIZATION,
+        )
 
     def test_identical_geometry_returns_one_leaf_for_every_budget(self) -> None:
         """No legal threshold is a terminal incumbent, not an empty policy."""

@@ -50,6 +50,16 @@ TRAINER_SOURCE = (
     / "rocm"
     / "Perf__NativeVNNI_Throughput.cpp"
 )
+RUNTIME_SOURCE = (
+    REPO_ROOT
+    / "src"
+    / "v2"
+    / "kernels"
+    / "rocm"
+    / "gemm"
+    / "ROCmGemvKernel_native_VNNI.hip"
+)
+DEBUG_ENV_SOURCE = REPO_ROOT / "src" / "v2" / "utils" / "DebugEnv.h"
 
 
 class ROCmNativeVNNIDecodeTrainerTest(unittest.TestCase):
@@ -245,6 +255,27 @@ class ROCmNativeVNNIDecodeTrainerTest(unittest.TestCase):
             source,
         )
 
+    def test_generated_query_never_manufactures_a_q8_policy_on_miss(self) -> None:
+        """Codebook 19 must earn coverage from the same generated table as all formats."""
+
+        source = RUNTIME_SOURCE.read_text(encoding="utf-8")
+        self.assertNotIn("resolveNativeVNNIQ80DirectRuntimeConfig", source)
+        self.assertNotIn(
+            "LLAMINAR_ROCM_NVNNI_Q8_DIRECT",
+            DEBUG_ENV_SOURCE.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "cache.insert(cache_key, false, cached);\n"
+            "        return cached;",
+            source,
+        )
+        self.assertIn(
+            "return resolveNativeVNNIDecodeGeneratedRuntimeConfig(\n"
+            "        codebook_id, 1, N, K);",
+            source,
+        )
+        self.assertIn("generated dispatch miss", source)
+
     def test_generic_tree_emitter_compiles_every_launch_geometry_axis(self) -> None:
         """ROCm must consume the common predicate IR rather than legacy ranges."""
 
@@ -319,6 +350,131 @@ class ROCmNativeVNNIDecodeTrainerTest(unittest.TestCase):
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
         self.assertNotIn("aspect_ratio", generated)
         self.assertNotIn("min_work_items", generated)
+
+    def test_additive_overlay_totalizes_codebook_missing_from_base(self) -> None:
+        """A new execution codebook gets exact and unseen-geometry coverage."""
+
+        spec = importlib.util.spec_from_file_location(
+            "rocm_native_vnni_overlay_test_module",
+            ANALYZER,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        entries = [
+            module.FastEntry(
+                codebook=19,
+                n=n,
+                k=k,
+                kb=kb,
+                candidate_id=f"rocm.nvnni.decode.fast.kb{kb}",
+                shape_name=name,
+                max_surface_regret=0.01,
+                max_cv=0.01,
+            )
+            for name, n, k, kb in (
+                ("Tall", 128, 512, 16),
+                ("Balanced", 512, 512, 8),
+                ("Wide", 2048, 512, 4),
+                ("VeryWide", 16384, 512, 1),
+            )
+        ]
+        base = (
+            REPO_ROOT
+            / "src"
+            / "v2"
+            / "kernels"
+            / "rocm"
+            / "gemm"
+            / "ROCmNativeVNNIDecodeDispatchGenerated.inc"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            generated_path = root / "generated.inc"
+            source_path = root / "totality.cpp"
+            binary_path = root / "totality"
+            module.emit_overlay(entries, generated_path, base)
+            generated = generated_path.read_text(encoding="utf-8")
+            self.assertIn(module.OVERLAY_BEGIN, generated)
+            self.assertIn(module.GENERIC_OVERLAY_BEGIN, generated)
+            self.assertIn("codebook_id == 19", generated)
+            self.assertIn("kCommonExactOverlay", generated)
+            self.assertNotIn("codebook_id == 19 &&", generated)
+
+            source_path.write_text(
+                "\n".join((
+                    f'#include "{generated_path}"',
+                    "int main() {",
+                    "  using namespace llaminar2::rocm::generated;",
+                    "  ROCmNativeVNNIDecodeDispatchConfig out{};",
+                    "  const int ns[] = {64, 1024, 4096, 32768};",
+                    "  const int ks[] = {1024, 1024, 1024, 1024};",
+                    "  for (int i = 0; i < 4; ++i)",
+                    "    if (!selectROCmNativeVNNIDecodeGenerated(",
+                    "            19, 1, ns[i], ks[i], out)) return 1;",
+                    "  if (selectROCmNativeVNNIDecodeGenerated(",
+                    "          19, 2, 1024, 1024, out)) return 2;",
+                    "  return 0;",
+                    "}",
+                )),
+                encoding="utf-8",
+            )
+            compiled = subprocess.run(
+                [
+                    "g++", "-std=c++20", str(source_path),
+                    "-o", str(binary_path),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            executed = subprocess.run(
+                [str(binary_path)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(executed.returncode, 0, executed.stderr)
+
+    def test_generic_supplement_deduplicates_equal_work_boundaries(self) -> None:
+        """N*K collisions keep the lowest-regret representable launch."""
+
+        spec = importlib.util.spec_from_file_location(
+            "rocm_native_vnni_boundary_test_module",
+            ANALYZER,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        entries = [
+            module.FastEntry(
+                codebook=19,
+                n=n,
+                k=k,
+                kb=kb,
+                candidate_id=f"rocm.nvnni.decode.fast.kb{kb}",
+                shape_name=f"Shape{kb}",
+                max_surface_regret=regret,
+                max_cv=0.01,
+            )
+            for n, k, kb, regret in (
+                (1024, 2048, 8, 0.04),
+                (2048, 1024, 4, 0.01),
+            )
+        ]
+
+        self.assertEqual(
+            module._compress_totalizing_rules(entries),
+            [(1024 * 2048, 4)],
+        )
 
 
 if __name__ == "__main__":

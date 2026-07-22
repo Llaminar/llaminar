@@ -37,15 +37,19 @@ from multiprocessing.connection import wait as wait_for_connections
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
+import numpy as np
+
 from .corpus import (
     GenericDomain,
     ObservationCorpus,
     RuntimeKey,
     SurfaceKey,
+    runtime_key,
 )
 from .exact_oracle import candidate_is_eligible
 from .paired_confirmation import PairedCellKey, PairedTimingComparison
 from .policy_accelerator import (
+    TREE_MAXIMUM_FEATURE_AXES,
     UINT32_MAX,
     AcceleratedFoldEvaluation,
     AcceleratedTreeFitResult,
@@ -62,7 +66,10 @@ from .policy_accelerator import (
 from .profiles import MIN_GENERIC_CROSS_VALIDATION_SHAPE_GROUPS
 from .profiler_model import (
     ProfilerFeatureCatalog,
+    ProfilerModelRecordIndex,
     ProfilerObservationIndex,
+    _compact_profiler_regret_prediction_values,
+    _profiler_exemplar_index,
     apply_profiler_regret_predictions,
     build_profiler_model_record_index,
     build_profiler_observation_index,
@@ -73,7 +80,9 @@ from .schema import (
     ExecutionMode,
     NativeVNNIObservation,
     P95_REGRET_BUDGET,
+    MINIMUM_PASSING_DOMAIN_FRACTION,
     SemanticContract,
+    classify_aspect,
 )
 
 
@@ -81,16 +90,102 @@ TREE_BEAM_WIDTH = 64
 DEFAULT_TREE_LEAVES = 16
 MAX_TREE_LEAVES = 32
 GENERIC_REGRET_BUDGET = P95_REGRET_BUDGET
-GENERIC_DOMAIN_PROMOTION_NUMERATOR = 99
-GENERIC_DOMAIN_PROMOTION_DENOMINATOR = 100
-POLICY_FIT_CACHE_SCHEMA_VERSION = "native-vnni-policy-fit-cache-v10"
+POLICY_FIT_CACHE_SCHEMA_VERSION = "native-vnni-policy-fit-cache-v14"
+POLICY_FINAL_FIT_SCHEMA_VERSION = "oof-distillation-bounded-complexity-v2"
 POLICY_COST_STATISTIC_VERSION = "conservative-nearest-rank-p95-v1"
 POLICY_PRIMARY_OBJECTIVE_VERSION = (
-    "cross-fitted-publication-measured-leaf-p95-v13"
+    "cross-fitted-publication-measured-leaf-p95-v15-effective-launch"
 )
-CROSS_VALIDATION_FOLD_SCHEMA_VERSION = "geometry-atomic-kd-regions-v1"
+CROSS_VALIDATION_FOLD_SCHEMA_VERSION = (
+    "geometry-atomic-kd-regions-profiler-teacher-distillation-v2"
+)
 PROFILER_REGRET_BLEND_WEIGHT = 0.25
 PROFILER_MAX_REGRET_ADJUSTMENT = GENERIC_REGRET_BUDGET
+
+
+@dataclass(frozen=True)
+class _ProfilerPredictionPointInventory:
+    """Canonical point order shared by every fold surface in one domain."""
+
+    points: tuple[tuple[RuntimeKey, str, str], ...]
+    digest: str
+
+    @cached_property
+    def rows(self) -> Mapping[tuple[RuntimeKey, str, str], int]:
+        """Build one point-to-row map lazily for all sibling surfaces."""
+
+        return {point: row for row, point in enumerate(self.points)}
+
+
+class ProfilerPredictionSurface(
+    Mapping[tuple[RuntimeKey, str, str], float | None]
+):
+    """Read-only row-aligned profiler predictions backed by a raw memmap."""
+
+    def __init__(
+        self,
+        inventory: _ProfilerPredictionPointInventory,
+        values_path: Path,
+    ) -> None:
+        self.inventory = inventory
+        self.values_path = values_path
+        self.values = (
+            np.empty((0,), dtype="<f8")
+            if not inventory.points
+            else np.memmap(
+                values_path,
+                dtype="<f8",
+                mode="r",
+                shape=(len(inventory.points),),
+            )
+        )
+
+    def __getitem__(
+        self,
+        point: tuple[RuntimeKey, str, str],
+    ) -> float | None:
+        value = float(self.values[self.inventory.rows[point]])
+        return None if math.isnan(value) else value
+
+    def __iter__(self):
+        return iter(self.inventory.points)
+
+    def __len__(self) -> int:
+        return len(self.inventory.points)
+
+
+@lru_cache(maxsize=512)
+def _profiler_prediction_point_inventory(
+    points: frozenset[tuple[RuntimeKey, str, str]],
+) -> _ProfilerPredictionPointInventory:
+    """Return canonical point order and a streaming authenticated identity.
+
+    Prediction surfaces share their point inventory across every held-out fold
+    of a domain. Caching by ``frozenset`` therefore performs the expensive sort
+    and canonical serialization once, while the cached set hash makes later
+    lookups independent of inventory size. The digest enters both the content
+    key and compact payload manifest, so a row-aligned binary value file can
+    never be interpreted against a different point order.
+    """
+
+    ordered = tuple(sorted(points))
+    digest = hashlib.sha256()
+    for runtime_key, shape_group_id, candidate_id in ordered:
+        encoded = json.dumps(
+            {
+                "runtime_key": _runtime_key_mapping(runtime_key),
+                "shape_group_id": shape_group_id,
+                "candidate_id": candidate_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        digest.update(len(encoded).to_bytes(8, byteorder="little"))
+        digest.update(encoded)
+    return _ProfilerPredictionPointInventory(
+        points=ordered,
+        digest="sha256:" + digest.hexdigest(),
+    )
 
 
 def _physical_core_worker_count(
@@ -135,6 +230,40 @@ def _physical_core_worker_count(
             return len(visible_cpus)
         physical_cores.add((package_id, core_id))
     return max(1, len(physical_cores))
+
+
+def _profiler_surrogate_cuda_devices() -> tuple[str, ...]:
+    """Return every explicitly visible CUDA device for surrogate fitting."""
+
+    configured = os.environ.get(
+        "LLAMINAR_NATIVE_VNNI_PROFILER_MODEL_CUDA_DEVICES"
+    )
+    if configured is not None:
+        ordinals = tuple(
+            int(token.strip())
+            for token in configured.split(",")
+            if token.strip()
+        )
+    else:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible and visible.strip() not in ("-1", "NoDevFiles"):
+            # CUDA_VISIBLE_DEVICES remaps selected devices to dense process-local
+            # ordinals regardless of host UUID or ordinal spelling.
+            ordinals = tuple(range(len([
+                token for token in visible.split(",") if token.strip()
+            ])))
+        else:
+            ordinals = tuple(sorted(
+                int(path.name.removeprefix("nvidia"))
+                for path in Path("/dev").glob("nvidia[0-9]*")
+                if path.name.removeprefix("nvidia").isdigit()
+            ))
+    if not ordinals or len(set(ordinals)) != len(ordinals):
+        raise RuntimeError(
+            "profiler surrogate fitting requires at least one distinct CUDA "
+            "device; set LLAMINAR_NATIVE_VNNI_PROFILER_MODEL_CUDA_DEVICES"
+        )
+    return tuple(f"cuda:{ordinal}" for ordinal in ordinals)
 
 
 class FeatureAxis(str, Enum):
@@ -188,6 +317,11 @@ class FeatureAxis(str, Enum):
     N_PARALLEL_WAVES_256 = "n_parallel_waves_256"
     N_PARALLEL_WAVES_512 = "n_parallel_waves_512"
     N_PARALLEL_WAVES_1024 = "n_parallel_waves_1024"
+    KPART_PRODUCER_WAVES_64 = "kpart_producer_waves_64"
+    KPART_PRODUCER_WAVES_128 = "kpart_producer_waves_128"
+    KPART_PRODUCER_WAVES_256 = "kpart_producer_waves_256"
+    KPART_PRODUCER_WAVES_512 = "kpart_producer_waves_512"
+    KPART_PRODUCER_WAVES_1024 = "kpart_producer_waves_1024"
     N_FINAL_PARALLEL_WAVE_UTILIZATION_64 = (
         "n_final_parallel_wave_utilization_64"
     )
@@ -203,6 +337,25 @@ class FeatureAxis(str, Enum):
     N_FINAL_PARALLEL_WAVE_UTILIZATION_1024 = (
         "n_final_parallel_wave_utilization_1024"
     )
+    KPART_FINAL_PRODUCER_WAVE_UTILIZATION_64 = (
+        "kpart_final_producer_wave_utilization_64"
+    )
+    KPART_FINAL_PRODUCER_WAVE_UTILIZATION_128 = (
+        "kpart_final_producer_wave_utilization_128"
+    )
+    KPART_FINAL_PRODUCER_WAVE_UTILIZATION_256 = (
+        "kpart_final_producer_wave_utilization_256"
+    )
+    KPART_FINAL_PRODUCER_WAVE_UTILIZATION_512 = (
+        "kpart_final_producer_wave_utilization_512"
+    )
+    KPART_FINAL_PRODUCER_WAVE_UTILIZATION_1024 = (
+        "kpart_final_producer_wave_utilization_1024"
+    )
+    KPART_K_BLOCKS_PER_TILE = "kpart_k_blocks_per_tile"
+    KPART_FINAL_K_TILE_BLOCKS = "kpart_final_k_tile_blocks"
+    KPART_FINAL_K_TILE_UTILIZATION = "kpart_final_k_tile_utilization"
+    KPART_K_TILE_COUNT = "kpart_k_tile_count"
     MN_PARALLEL_WAVES_64 = "mn_parallel_waves_64"
     MN_FINAL_PARALLEL_WAVE_UTILIZATION_64 = (
         "mn_final_parallel_wave_utilization_64"
@@ -266,6 +419,9 @@ class FeaturePolicy(str, Enum):
     TILE_1024 = "tile_1024"
     TILE_64_128 = "tile_64_128"
     PARALLEL_WAVE_SCHEDULES = "parallel_wave_schedules"
+    KPART_CHUNK_GRID_SCHEDULES = "kpart_chunk_grid_schedules"
+    KPART_PRODUCER_GRID_SCHEDULES = "kpart_producer_grid_schedules"
+    KPART_COMPLETE_SCHEDULES = "kpart_complete_schedules"
     ROW_GRID_PARALLEL_WAVE_SCHEDULES = "row_grid_parallel_wave_schedules"
     FULL_LAUNCH_GEOMETRY = "full_launch_geometry"
     FULL_ROW_GRID_LAUNCH_GEOMETRY = "full_row_grid_launch_geometry"
@@ -298,6 +454,45 @@ PROFILER_BLEND_WEIGHT_BY_INFLUENCE = {
 }
 
 FEATURE_POLICIES = tuple(FeaturePolicy)
+
+
+def _leaf_budget_feature_policies(
+    max_leaves: int,
+    requested: Iterable[FeaturePolicy] | None = None,
+) -> tuple[FeaturePolicy, ...]:
+    """Return the distinct feature-policy tournament for one leaf budget.
+
+    A one-leaf tree contains no predicate. Feature axes therefore cannot
+    affect its route, selected candidate, or measured regret. Running every
+    reviewed feature family would repeat the same fit fifteen times per fold
+    and domain. Retain the first requested family as the canonical provenance
+    label and run the complete tournament as soon as a split is possible.
+    """
+
+    if max_leaves < 1:
+        raise ValueError("tree leaf budget must be positive")
+    policies = tuple(FEATURE_POLICIES if requested is None else requested)
+    if not policies:
+        raise ValueError("tree fitting requires a feature policy")
+    if len(set(policies)) != len(policies):
+        raise ValueError("tree fitting feature policies must be unique")
+    if any(policy not in FEATURE_POLICIES for policy in policies):
+        raise ValueError("tree fitting named an unknown feature policy")
+    return policies[:1] if max_leaves == 1 else policies
+
+
+def _leaf_budget_boundary_placements(
+    max_leaves: int,
+) -> tuple[BoundaryPlacement, ...]:
+    """Return distinct threshold policies for one leaf budget.
+
+    Threshold placement is observable only after a predicate exists. Midpoint
+    is the canonical provenance label for the unsplit one-leaf model.
+    """
+
+    if max_leaves < 1:
+        raise ValueError("tree leaf budget must be positive")
+    return BOUNDARY_PLACEMENTS[:1] if max_leaves == 1 else BOUNDARY_PLACEMENTS
 
 
 N_TILE_WIDTH_BY_AXIS = {
@@ -362,6 +557,14 @@ N_PARALLEL_WAVE_WIDTH_BY_AXIS = {
     FeatureAxis.N_PARALLEL_WAVES_1024: 1024,
 }
 
+KPART_PRODUCER_WAVE_WIDTH_BY_AXIS = {
+    FeatureAxis.KPART_PRODUCER_WAVES_64: 64,
+    FeatureAxis.KPART_PRODUCER_WAVES_128: 128,
+    FeatureAxis.KPART_PRODUCER_WAVES_256: 256,
+    FeatureAxis.KPART_PRODUCER_WAVES_512: 512,
+    FeatureAxis.KPART_PRODUCER_WAVES_1024: 1024,
+}
+
 N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS = {
     FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_64: 64,
     FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_128: 128,
@@ -369,6 +572,27 @@ N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS = {
     FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_512: 512,
     FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_1024: 1024,
 }
+
+KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS = {
+    FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_64: 64,
+    FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_128: 128,
+    FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_256: 256,
+    FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_512: 512,
+    FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_1024: 1024,
+}
+
+# CPU serial-K-part decode partitions K in the fixed 32-value NativeVNNI
+# block unit before the candidate-specific N-block workshare starts. These
+# axes describe that frozen, candidate-independent partition exactly. They
+# are deliberately separate from producer-wave features: equal producer
+# counts can still execute different amounts of work per producer and can
+# leave a very short (or empty) final K tile.
+KPART_PARTITION_GEOMETRY_AXES = (
+    FeatureAxis.KPART_K_TILE_COUNT,
+    FeatureAxis.KPART_K_BLOCKS_PER_TILE,
+    FeatureAxis.KPART_FINAL_K_TILE_BLOCKS,
+    FeatureAxis.KPART_FINAL_K_TILE_UTILIZATION,
+)
 
 # The CPU row-chunk prefill kernel publishes one independent task for every
 # `(row, 64-column chunk)` pair.  That launch is fundamentally different from
@@ -392,6 +616,8 @@ MN_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS = {
 N_PARALLEL_WAVE_AXES = frozenset((
     *N_PARALLEL_WAVE_WIDTH_BY_AXIS,
     *N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS,
+    *KPART_PRODUCER_WAVE_WIDTH_BY_AXIS,
+    *KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS,
 ))
 MN_PARALLEL_WAVE_AXES = frozenset((
     *MN_PARALLEL_WAVE_WIDTH_BY_AXIS,
@@ -497,6 +723,68 @@ FEATURE_AXES_BY_POLICY = {
         *N_PARALLEL_WAVE_WIDTH_BY_AXIS,
         *N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS,
     ),
+    FeaturePolicy.KPART_CHUNK_GRID_SCHEDULES: (
+        *BASE_FEATURE_AXES,
+        # CPU serial-K-part decode schedules one OpenMP task for each
+        # [64-column N chunk group, K tile].  The K-tile inventory is frozen
+        # before dispatch, so choosing nbc1/2/4/8/16 changes only these five
+        # candidate-independent N-grid geometries.  Keep them together in one
+        # reviewed tournament family instead of making the greedy tree search
+        # compete with unrelated 32-column and grouped-row predicates from
+        # FULL_LAUNCH_GEOMETRY.
+        *(axis for axis, width in N_TILE_WIDTH_BY_AXIS.items() if width >= 64),
+        *(axis for axis, width in K_GROUPS_PER_N_TILE_WIDTH_BY_AXIS.items()
+          if width >= 64),
+        *(axis for axis, width in N_FINAL_TILE_WIDTH_BY_AXIS.items()
+          if width >= 64),
+        *(axis for axis, width in K_FINAL_TILE_WIDTH_BY_AXIS.items()
+          if width >= 64),
+        *(axis for axis, width in N_TILE_UTILIZATION_WIDTH_BY_AXIS.items()
+          if width >= 64),
+        *(axis for axis, width in N_TILE_ALIGNED_WIDTH_BY_AXIS.items()
+          if width >= 64),
+        *N_PARALLEL_WAVE_WIDTH_BY_AXIS,
+        *N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS,
+    ),
+    FeaturePolicy.KPART_PRODUCER_GRID_SCHEDULES: (
+        *BASE_FEATURE_AXES,
+        # Raw CPU launch telemetry authenticates the frozen arithmetic
+        # policy's candidate-independent K-tile count.  Each nbc candidate
+        # then publishes ceil(Nchunks / nbc) * Ktiles producer tasks.  These
+        # axes expose the exact worker-wave transitions that production runs,
+        # including the partially occupied terminal wave, without admitting
+        # candidate identity or timing labels into the generic tree.
+        *KPART_PRODUCER_WAVE_WIDTH_BY_AXIS,
+        *KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS,
+        *KPART_PARTITION_GEOMETRY_AXES,
+    ),
+    FeaturePolicy.KPART_COMPLETE_SCHEDULES: (
+        *BASE_FEATURE_AXES,
+        # A serial-K-part launch changes economics on two independent grids.
+        # NBC1/2/4/8/16 change the 64-column N chunk grouping, while the
+        # frozen K-tile count changes producer waves and the exact terminal K
+        # span.  The separate narrow families above remain useful when only
+        # one grid matters.  This family is their ordered union for domains
+        # whose winner changes at a conjunction such as an N-chunk boundary
+        # and a K-partition rollover.  It deliberately excludes grouped-row
+        # axes and the unrelated 32-column tile family.
+        *(axis for axis, width in N_TILE_WIDTH_BY_AXIS.items() if width >= 64),
+        *(axis for axis, width in K_GROUPS_PER_N_TILE_WIDTH_BY_AXIS.items()
+          if width >= 64),
+        *(axis for axis, width in N_FINAL_TILE_WIDTH_BY_AXIS.items()
+          if width >= 64),
+        *(axis for axis, width in K_FINAL_TILE_WIDTH_BY_AXIS.items()
+          if width >= 64),
+        *(axis for axis, width in N_TILE_UTILIZATION_WIDTH_BY_AXIS.items()
+          if width >= 64),
+        *(axis for axis, width in N_TILE_ALIGNED_WIDTH_BY_AXIS.items()
+          if width >= 64),
+        *N_PARALLEL_WAVE_WIDTH_BY_AXIS,
+        *N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS,
+        *KPART_PRODUCER_WAVE_WIDTH_BY_AXIS,
+        *KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS,
+        *KPART_PARTITION_GEOMETRY_AXES,
+    ),
     FeaturePolicy.ROW_GRID_PARALLEL_WAVE_SCHEDULES: (
         *BASE_FEATURE_AXES,
         *N_PARALLEL_WAVE_WIDTH_BY_AXIS,
@@ -569,6 +857,20 @@ FEATURE_AXIS_PRIORITY = {
     FeatureAxis.K_FINAL_TILE_VALUES_256: 49,
     FeatureAxis.K_FINAL_TILE_VALUES_512: 50,
     FeatureAxis.K_FINAL_TILE_VALUES_1024: 51,
+    FeatureAxis.KPART_PRODUCER_WAVES_64: 52,
+    FeatureAxis.KPART_PRODUCER_WAVES_128: 53,
+    FeatureAxis.KPART_PRODUCER_WAVES_256: 54,
+    FeatureAxis.KPART_PRODUCER_WAVES_512: 55,
+    FeatureAxis.KPART_PRODUCER_WAVES_1024: 56,
+    FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_64: 57,
+    FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_128: 58,
+    FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_256: 59,
+    FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_512: 60,
+    FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_1024: 61,
+    FeatureAxis.KPART_K_BLOCKS_PER_TILE: 62,
+    FeatureAxis.KPART_FINAL_K_TILE_BLOCKS: 63,
+    FeatureAxis.KPART_FINAL_K_TILE_UTILIZATION: 64,
+    FeatureAxis.KPART_K_TILE_COUNT: 65,
 }
 
 
@@ -576,6 +878,33 @@ def _n_tile_count(aggregate_n: int, tile_width: int) -> int:
     """Return the exact positive ceil-div N tile count used by launchers."""
 
     return (aggregate_n + tile_width - 1) // tile_width
+
+
+def _kpart_partition_geometry(
+    k: int,
+    launch_k_tiles: int,
+) -> tuple[int, int]:
+    """Return production-equivalent K blocks per tile and final-tile span.
+
+    NativeVNNI consumes K in 32-value blocks. Production treats absent K-tile
+    telemetry as one tile, while an explicit tile inventory is preserved even
+    when its ceil-div partition leaves the final launch empty. The latter is
+    economically meaningful because the producer task still exists. Clamping
+    only the *work span* to zero therefore models the real launch instead of
+    rewriting it into a different schedule.
+    """
+
+    if k <= 0:
+        raise ValueError("K-part geometry requires positive K")
+    k_blocks = (k + 31) // 32
+    k_tiles = max(1, launch_k_tiles)
+    blocks_per_tile = (k_blocks + k_tiles - 1) // k_tiles
+    prefix_blocks = (k_tiles - 1) * blocks_per_tile
+    final_tile_blocks = max(
+        0,
+        min(blocks_per_tile, k_blocks - prefix_blocks),
+    )
+    return blocks_per_tile, final_tile_blocks
 
 
 @dataclass(frozen=True, order=True)
@@ -612,7 +941,12 @@ class FeatureThreshold:
         # counterparts; retaining the exact multiplier keeps the common
         # feature tournament total across CPU, CUDA, and ROCm domains.
 
-    def matches_less_equal(self, aggregate_n: int, k: int) -> bool:
+    def matches_less_equal(
+        self,
+        aggregate_n: int,
+        k: int,
+        launch_k_tiles: int = 0,
+    ) -> bool:
         """Evaluate the threshold without floating-point boundary drift."""
 
         if aggregate_n <= 0 or k <= 0:
@@ -677,6 +1011,44 @@ class FeatureThreshold:
                 final_wave_tasks * self.denominator
                 <= self.parallelism_width * self.numerator
             )
+        if self.axis in KPART_PRODUCER_WAVE_WIDTH_BY_AXIS:
+            n_blocks = _n_tile_count(
+                aggregate_n,
+                KPART_PRODUCER_WAVE_WIDTH_BY_AXIS[self.axis],
+            )
+            tasks = n_blocks * max(1, launch_k_tiles)
+            waves = _n_tile_count(tasks, self.parallelism_width)
+            return waves * self.denominator <= self.numerator
+        if self.axis in KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS:
+            n_blocks = _n_tile_count(
+                aggregate_n,
+                KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS[self.axis],
+            )
+            tasks = n_blocks * max(1, launch_k_tiles)
+            final_wave_tasks = (tasks - 1) % self.parallelism_width + 1
+            return (
+                final_wave_tasks * self.denominator
+                <= self.parallelism_width * self.numerator
+            )
+        if self.axis in KPART_PARTITION_GEOMETRY_AXES:
+            blocks_per_tile, final_tile_blocks = _kpart_partition_geometry(
+                k,
+                launch_k_tiles,
+            )
+            if self.axis == FeatureAxis.KPART_K_TILE_COUNT:
+                return max(1, launch_k_tiles) * self.denominator <= self.numerator
+            if self.axis == FeatureAxis.KPART_K_BLOCKS_PER_TILE:
+                return (
+                    blocks_per_tile * self.denominator <= self.numerator
+                )
+            if self.axis == FeatureAxis.KPART_FINAL_K_TILE_BLOCKS:
+                return (
+                    final_tile_blocks * self.denominator <= self.numerator
+                )
+            return (
+                final_tile_blocks * self.denominator
+                <= blocks_per_tile * self.numerator
+            )
         if self.axis in MN_PARALLEL_WAVE_WIDTH_BY_AXIS:
             tasks = self.task_multiplier * _n_tile_count(
                 aggregate_n, MN_PARALLEL_WAVE_WIDTH_BY_AXIS[self.axis]
@@ -735,6 +1107,26 @@ def _accelerated_threshold_descriptor(
     elif threshold.axis in N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS:
         operation = TreeThresholdOperation.N_FINAL_PARALLEL_WAVE_UTILIZATION
         tile_width = N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS[threshold.axis]
+    elif threshold.axis in KPART_PRODUCER_WAVE_WIDTH_BY_AXIS:
+        operation = TreeThresholdOperation.KPART_PRODUCER_WAVES
+        tile_width = KPART_PRODUCER_WAVE_WIDTH_BY_AXIS[threshold.axis]
+    elif threshold.axis in KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS:
+        operation = (
+            TreeThresholdOperation.KPART_FINAL_PRODUCER_WAVE_UTILIZATION
+        )
+        tile_width = KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS[threshold.axis]
+    elif threshold.axis == FeatureAxis.KPART_K_BLOCKS_PER_TILE:
+        operation = TreeThresholdOperation.KPART_K_BLOCKS_PER_TILE
+        tile_width = 32
+    elif threshold.axis == FeatureAxis.KPART_FINAL_K_TILE_BLOCKS:
+        operation = TreeThresholdOperation.KPART_FINAL_K_TILE_BLOCKS
+        tile_width = 32
+    elif threshold.axis == FeatureAxis.KPART_FINAL_K_TILE_UTILIZATION:
+        operation = TreeThresholdOperation.KPART_FINAL_K_TILE_UTILIZATION
+        tile_width = 32
+    elif threshold.axis == FeatureAxis.KPART_K_TILE_COUNT:
+        operation = TreeThresholdOperation.KPART_K_TILE_COUNT
+        tile_width = 32
     elif threshold.axis in MN_PARALLEL_WAVE_WIDTH_BY_AXIS:
         operation = TreeThresholdOperation.MN_PARALLEL_WAVES
         tile_width = MN_PARALLEL_WAVE_WIDTH_BY_AXIS[threshold.axis]
@@ -823,10 +1215,17 @@ class FeaturePredicate:
     threshold: FeatureThreshold
     require_less_equal: bool
 
-    def matches(self, aggregate_n: int, k: int) -> bool:
+    def matches(
+        self,
+        aggregate_n: int,
+        k: int,
+        launch_k_tiles: int = 0,
+    ) -> bool:
         """Return whether dimensions follow this recorded tree edge."""
 
-        comparison = self.threshold.matches_less_equal(aggregate_n, k)
+        comparison = self.threshold.matches_less_equal(
+            aggregate_n, k, launch_k_tiles
+        )
         return comparison if self.require_less_equal else not comparison
 
 
@@ -914,11 +1313,16 @@ class GenericDispatchRule:
     development_p95_regret: float
     development_mean_regret: float
 
-    def matches(self, aggregate_n: int, k: int) -> bool:
+    def matches(
+        self,
+        aggregate_n: int,
+        k: int,
+        launch_k_tiles: int = 0,
+    ) -> bool:
         """Evaluate every root-to-leaf predicate for one runtime shape."""
 
         return all(
-            predicate.matches(aggregate_n, k)
+            predicate.matches(aggregate_n, k, launch_k_tiles)
             for predicate in self.predicates
         )
 
@@ -966,6 +1370,7 @@ class DomainCrossValidation:
     worst_exact_candidate_id: str
     cells: tuple[CrossValidationCell, ...]
     competitive_cells: tuple[CrossValidationCell, ...] = ()
+    failed_point_count: int | None = None
     publication_feature_policy: FeaturePolicy | None = None
     publication_max_leaves: int | None = None
     publication_boundary_placement: BoundaryPlacement | None = None
@@ -1042,22 +1447,30 @@ def domain_cross_validation_has_complete_coverage(
 def domain_promotion_quota_is_satisfied(
     passing_domain_count: int,
     required_domain_count: int,
+    *,
+    minimum_passing_fraction: float = MINIMUM_PASSING_DOMAIN_FRACTION,
 ) -> bool:
-    """Return whether at least 99% of required domains pass strict p95 CV.
+    """Return whether the configured fraction of domains pass strict p95 CV.
 
-    Integer cross multiplication makes the inclusive corpus-level boundary
-    exact: 99 of 100 domains passes, while 98 of 99 does not. Individual
-    domains still pass only when their measured p95 regret is strictly below
-    :data:`GENERIC_REGRET_BUDGET`.
+    Decimal-derived integer cross multiplication makes the inclusive
+    corpus-level boundary exact. The production default therefore accepts 95
+    of 100 domains while rejecting 94 of 99. A turnkey best-effort run may
+    lower only this performance quota; complete generic coverage, verifier
+    byte equality, and sealed evidence remain mandatory.
     """
 
     if required_domain_count <= 0:
         return False
     if passing_domain_count < 0 or passing_domain_count > required_domain_count:
         raise ValueError("passing domain count is outside the required domain set")
+    if not math.isfinite(minimum_passing_fraction) or not (
+        0.0 <= minimum_passing_fraction <= 1.0
+    ):
+        raise ValueError("minimum passing-domain fraction must be in [0, 1]")
+    fraction = Fraction(str(minimum_passing_fraction))
     return (
-        passing_domain_count * GENERIC_DOMAIN_PROMOTION_DENOMINATOR
-        >= required_domain_count * GENERIC_DOMAIN_PROMOTION_NUMERATOR
+        passing_domain_count * fraction.denominator
+        >= required_domain_count * fraction.numerator
     )
 
 
@@ -1066,9 +1479,9 @@ class GenericPolicy:
     """Generic leaves plus explicit per-domain performance diagnostics.
 
     ``unpromoted_domains`` contains only corpus-blocking obligations. A policy
-    that satisfies the 99% performance quota has total generic rules and an
-    empty blocking set while retaining diagnostics for its sub-1% over-budget
-    domains.
+    that satisfies its frozen performance quota has total generic rules and an
+    empty blocking set while retaining diagnostics for every over-budget
+    domain.
     """
 
     rules: tuple[GenericDispatchRule, ...]
@@ -1081,13 +1494,15 @@ class GenericPolicy:
         domain: GenericDomain,
         aggregate_n: int,
         k: int,
+        launch_k_tiles: int = 0,
     ) -> GenericDispatchRule | None:
         """Resolve one generic key without consulting any exact overlay."""
 
         matches = [
             rule
             for rule in self.rules
-            if rule.domain == domain and rule.matches(aggregate_n, k)
+            if rule.domain == domain
+            and rule.matches(aggregate_n, k, launch_k_tiles)
         ]
         if len(matches) > 1:
             raise ValueError(f"generic policy leaves overlap for {domain}")
@@ -1202,7 +1617,43 @@ def _runtime_key_mapping(key: RuntimeKey) -> dict[str, object]:
         "m": key.m,
         "aggregate_n": key.aggregate_n,
         "k": key.k,
+        "launch_k_tiles": key.launch_k_tiles,
     }
+
+
+def _profiler_prediction_sort_key(
+    item: tuple[ProfilerPredictionPoint, float | None],
+) -> tuple[object, ...]:
+    """Return a cheap canonical order for one profiler prediction row.
+
+    ``RuntimeKey`` is an ordered dataclass, but sorting a large prediction
+    surface through its generated rich-comparison methods repeatedly compares
+    nested enums and tuples.  A production surface can contain hundreds of
+    thousands of candidate rows, making cache publication a visible serial
+    phase after the profiler forests have already finished.  Flattening the
+    immutable runtime identity once per comparison key preserves the exact
+    canonical order while avoiding that dataclass comparison hot spot.
+    """
+
+    (runtime_key, shape_group_id, candidate_id), _prediction = item
+    return (
+        runtime_key.backend.value,
+        runtime_key.architecture_class,
+        runtime_key.semantic_contract.value,
+        runtime_key.operation_kind,
+        runtime_key.bundle_signature,
+        runtime_key.projection_n_vector,
+        runtime_key.prepared_family_id,
+        runtime_key.packing_abi,
+        runtime_key.runtime_codebook_id,
+        runtime_key.execution_mode.value,
+        runtime_key.m,
+        runtime_key.aggregate_n,
+        runtime_key.k,
+        runtime_key.launch_k_tiles,
+        shape_group_id,
+        candidate_id,
+    )
 
 
 def _runtime_key_from_mapping(raw: Mapping[str, object]) -> RuntimeKey:
@@ -1224,6 +1675,7 @@ def _runtime_key_from_mapping(raw: Mapping[str, object]) -> RuntimeKey:
         m=int(raw["m"]),
         aggregate_n=int(raw["aggregate_n"]),
         k=int(raw["k"]),
+        launch_k_tiles=int(raw.get("launch_k_tiles", 0)),
     )
 
 
@@ -1331,6 +1783,7 @@ def _cross_validation_mapping(
             _cross_validation_cell_mapping(cell)
             for cell in validation.competitive_cells
         ],
+        "failed_point_count": validation.failed_point_count,
         "publication_feature_policy": (
             validation.publication_feature_policy.value
             if validation.publication_feature_policy is not None
@@ -1399,6 +1852,11 @@ def _cross_validation_from_mapping(
         competitive_cells=tuple(
             _cross_validation_cell_from_mapping(cell)
             for cell in raw.get("competitive_cells", ())
+        ),
+        failed_point_count=(
+            int(raw["failed_point_count"])
+            if raw.get("failed_point_count") is not None
+            else None
         ),
         publication_feature_policy=(
             FeaturePolicy(str(raw["publication_feature_policy"]))
@@ -1608,14 +2066,28 @@ class PolicyFitCache:
         return self.directory / kind / f"{content_key}.json"
 
     def _read(self, kind: str, content_key: str) -> Mapping[str, object] | None:
-        """Read and validate one immutable cache payload if it exists."""
+        """Read and validate one immutable current-generation cache payload.
+
+        A schema bump changes the fitted artifact ABI, so an older entry is an
+        ordinary cache miss rather than corrupt evidence. This distinction is
+        important for resumable corpus work: timing/profiler CSVs remain valid
+        while only derived tree-search state is recomputed. Arbitrary schema
+        spellings still fail loudly because they may indicate file corruption.
+        """
 
         path = self._path(kind, content_key)
         if not path.exists():
             return None
         with path.open(encoding="utf-8") as handle:
             raw = json.load(handle)
-        if raw.get("schema_version") != POLICY_FIT_CACHE_SCHEMA_VERSION:
+        schema_version = raw.get("schema_version")
+        if (
+            isinstance(schema_version, str)
+            and schema_version.startswith("native-vnni-policy-fit-cache-v")
+            and schema_version != POLICY_FIT_CACHE_SCHEMA_VERSION
+        ):
+            return None
+        if schema_version != POLICY_FIT_CACHE_SCHEMA_VERSION:
             raise ValueError(f"{path}: unsupported policy fit cache schema")
         if raw.get("kind") != kind or raw.get("content_key") != content_key:
             raise ValueError(f"{path}: policy fit cache identity mismatch")
@@ -1788,6 +2260,7 @@ class PolicyFitCache:
             ],
         })
 
+
     def profiler_prediction_key(
         self,
         *,
@@ -1815,22 +2288,38 @@ class PolicyFitCache:
                     f"profiler prediction {label} digest must be a sha256 identity"
                 )
         geometries = tuple(sorted(set(held_out_geometries)))
-        points = tuple(sorted(set(prediction_points)))
+        inventory = _profiler_prediction_point_inventory(
+            frozenset(prediction_points)
+        )
         return _content_key({
             "schema_version": POLICY_FIT_CACHE_SCHEMA_VERSION,
             "kind": "profiler-prediction-surface",
             "training_pool_digest": training_pool_digest,
             "profiler_model_digest": profiler_model_digest,
             "held_out_geometries": [list(item) for item in geometries],
-            "prediction_points": [
-                {
-                    "runtime_key": _runtime_key_mapping(runtime_key),
-                    "shape_group_id": shape_group_id,
-                    "candidate_id": candidate_id,
-                }
-                for runtime_key, shape_group_id, candidate_id in points
-            ],
+            "prediction_point_count": len(inventory.points),
+            "prediction_point_digest": inventory.digest,
         })
+
+    def _profiler_prediction_values_path(self, content_key: str) -> Path:
+        """Return the raw row-aligned value file for one prediction surface."""
+
+        return self.directory / "profiler-prediction-surface" / (
+            f"{content_key}.f64"
+        )
+
+    @staticmethod
+    def _atomic_binary_write(path: Path, encoded: bytes) -> None:
+        """Publish immutable binary cache bytes and reject collisions."""
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if path.read_bytes() != encoded:
+                raise ValueError(f"{path}: content-addressed cache collision")
+            return
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        temporary.write_bytes(encoded)
+        os.replace(temporary, path)
 
     def load_profiler_predictions(
         self,
@@ -1840,14 +2329,17 @@ class PolicyFitCache:
         profiler_model_digest: str,
         held_out_geometries: Iterable[tuple[int, int]],
         prediction_points: Iterable[ProfilerPredictionPoint],
-    ) -> dict[ProfilerPredictionPoint, float | None] | None:
+        authenticate_values: bool = True,
+    ) -> Mapping[ProfilerPredictionPoint, float | None] | None:
         """Load one exact profiler surface and reject partial point maps."""
 
         raw = self._read("profiler-prediction-surface", content_key)
         if raw is None:
             return None
         expected_geometries = tuple(sorted(set(held_out_geometries)))
-        expected_points = frozenset(prediction_points)
+        inventory = _profiler_prediction_point_inventory(
+            frozenset(prediction_points)
+        )
         if raw.get("training_pool_digest") != training_pool_digest:
             raise ValueError("profiler prediction cache changed training pool")
         if raw.get("profiler_model_digest") != profiler_model_digest:
@@ -1858,30 +2350,39 @@ class PolicyFitCache:
         )
         if observed_geometries != expected_geometries:
             raise ValueError("profiler prediction cache changed held geometries")
+        if int(raw.get("prediction_point_count", -1)) != len(inventory.points):
+            raise ValueError("profiler prediction cache changed point count")
+        if raw.get("prediction_point_digest") != inventory.digest:
+            raise ValueError("profiler prediction cache changed point inventory")
 
-        predictions = {}
-        for item in raw.get("predictions", []):
-            point = (
-                _runtime_key_from_mapping(item["runtime_key"]),
-                str(item["shape_group_id"]),
-                str(item["candidate_id"]),
+        values_path = self._profiler_prediction_values_path(content_key)
+        if not values_path.is_file():
+            raise ValueError("profiler prediction cache omitted binary values")
+        expected_bytes = 8 * len(inventory.points)
+        if values_path.stat().st_size != expected_bytes:
+            raise ValueError("profiler prediction cache changed value count")
+        if authenticate_values:
+            with values_path.open("rb") as handle:
+                observed_values_digest = "sha256:" + hashlib.file_digest(
+                    handle, "sha256"
+                ).hexdigest()
+            if raw.get("prediction_values_digest") != observed_values_digest:
+                raise ValueError("profiler prediction cache changed binary values")
+            values = (
+                np.empty((0,), dtype="<f8")
+                if not inventory.points
+                else np.memmap(
+                    values_path,
+                    dtype="<f8",
+                    mode="r",
+                    shape=(len(inventory.points),),
+                )
             )
-            if point in predictions:
-                raise ValueError("profiler prediction cache repeats one point")
-            encoded_prediction = item["prediction"]
-            predictions[point] = (
-                None
-                if encoded_prediction is None
-                else float.fromhex(str(encoded_prediction))
-            )
-        if frozenset(predictions) != expected_points:
-            missing = len(expected_points - predictions.keys())
-            foreign = len(predictions.keys() - expected_points)
-            raise ValueError(
-                "profiler prediction cache changed requested point inventory: "
-                f"missing={missing}, foreign={foreign}"
-            )
-        return predictions
+            if np.isinf(values).any():
+                raise ValueError(
+                    "profiler prediction cache contains infinite values"
+                )
+        return ProfilerPredictionSurface(inventory, values_path)
 
     def store_profiler_predictions(
         self,
@@ -1891,32 +2392,44 @@ class PolicyFitCache:
         profiler_model_digest: str,
         held_out_geometries: Iterable[tuple[int, int]],
         predictions: Mapping[ProfilerPredictionPoint, float | None],
+        prediction_points: frozenset[ProfilerPredictionPoint],
     ) -> None:
-        """Publish the compact predictions consumed by one CV surface."""
+        """Publish a row-aligned binary surface plus authenticated manifest."""
 
+        inventory = _profiler_prediction_point_inventory(
+            prediction_points
+        )
+        if len(predictions) != len(inventory.points):
+            raise ValueError(
+                "profiler prediction publication changed point count"
+            )
+        values = np.empty(len(inventory.points), dtype="<f8")
+        for index, point in enumerate(inventory.points):
+            prediction = predictions[point]
+            if prediction is None:
+                values[index] = np.nan
+            else:
+                value = float(prediction)
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "profiler prediction cache cannot store non-finite values"
+                    )
+                values[index] = value
+        encoded = values.tobytes(order="C")
+        values_digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+        self._atomic_binary_write(
+            self._profiler_prediction_values_path(content_key),
+            encoded,
+        )
         self._write("profiler-prediction-surface", content_key, {
             "training_pool_digest": training_pool_digest,
             "profiler_model_digest": profiler_model_digest,
             "held_out_geometries": [
                 list(item) for item in sorted(set(held_out_geometries))
             ],
-            "predictions": [
-                {
-                    "runtime_key": _runtime_key_mapping(runtime_key),
-                    "shape_group_id": shape_group_id,
-                    "candidate_id": candidate_id,
-                    "prediction": (
-                        None
-                        if prediction is None
-                        else float(prediction).hex()
-                    ),
-                }
-                for (
-                    runtime_key,
-                    shape_group_id,
-                    candidate_id,
-                ), prediction in sorted(predictions.items())
-            ],
+            "prediction_point_count": len(inventory.points),
+            "prediction_point_digest": inventory.digest,
+            "prediction_values_digest": values_digest,
         })
 
     def validation_key(
@@ -1930,6 +2443,8 @@ class PolicyFitCache:
         profiler_feature_catalog_digest: str | None,
         fit_final_rules: bool,
         profiler_training_pool_digest: str | None = None,
+        feature_policies: Iterable[FeaturePolicy] | None = None,
+        boundary_placements: Iterable[BoundaryPlacement] | None = None,
     ) -> str:
         """Hash the exact model search applied to one cached regret matrix.
 
@@ -1937,7 +2452,38 @@ class PolicyFitCache:
         cross-M prefill transfer pool.  The pool digest therefore participates in new
         CV keys even though candidate costs themselves remain domain-local.
         Omitting it intentionally reproduces the legacy v6 key for migration.
+
+        ``fit_final_rules`` is intentionally absent from the identity. Planning
+        and publication consume the same selected CV winner; publication is a
+        later fit over that winner's certified out-of-fold decisions, not
+        another CV experiment. The argument remains in the API so callers
+        cannot accidentally omit which phase they are requesting.
         """
+
+        _ = fit_final_rules
+
+        feature_policies = _leaf_budget_feature_policies(
+            max_leaves,
+            feature_policies,
+        )
+        boundary_placements = tuple(
+            _leaf_budget_boundary_placements(max_leaves)
+            if boundary_placements is None
+            else boundary_placements
+        )
+        if not boundary_placements:
+            raise ValueError("cross-validation requires a boundary placement")
+        if len(set(boundary_placements)) != len(boundary_placements):
+            raise ValueError(
+                "cross-validation boundary placements must be unique"
+            )
+        if any(
+            placement not in BOUNDARY_PLACEMENTS
+            for placement in boundary_placements
+        ):
+            raise ValueError(
+                "cross-validation named an unknown boundary placement"
+            )
 
         payload = {
             "schema_version": POLICY_FIT_CACHE_SCHEMA_VERSION,
@@ -1951,17 +2497,16 @@ class PolicyFitCache:
                 CROSS_VALIDATION_FOLD_SCHEMA_VERSION
             ),
             "profiler_feature_catalog_digest": profiler_feature_catalog_digest,
-            "selection_mode": (
-                "production-final-frontier"
-                if fit_final_rules
-                else "paired-request-frontier"
-            ),
+            # Retain the historical spelling so completed planning caches stay
+            # reusable. Both planning and publication have used the complete
+            # model frontier since paired_model_frontier became ``complete``.
+            "selection_mode": "paired-request-frontier",
             "tree_beam_width": TREE_BEAM_WIDTH,
             "primary_objective": POLICY_PRIMARY_OBJECTIVE_VERSION,
             "paired_model_frontier": "complete",
-            "feature_policies": [item.value for item in FEATURE_POLICIES],
+            "feature_policies": [item.value for item in feature_policies],
             "boundary_placements": [
-                item.value for item in BOUNDARY_PLACEMENTS
+                item.value for item in boundary_placements
             ],
             "profiler_influences": [
                 item.value for item in PROFILER_INFLUENCES
@@ -2028,6 +2573,46 @@ class PolicyFitCache:
                 validate_generic_rule_partition(rules)
         return True, validation, rules
 
+    def has_validation_entry_for_domain(
+        self,
+        domain: GenericDomain,
+    ) -> bool:
+        """Return whether the cache contains any CV generation for ``domain``.
+
+        Historical profiler-aware keys used the digest of the complete raw
+        profiler catalog. Reconstructing that identity can hash millions of
+        provenance records, so ordinary cache misses must never pay for it.
+        The old digest is worth rebuilding only when an immutable same-domain
+        record actually exists and may be the paid legacy fit we need to
+        migrate. This scan reads compact CV headers; it never deserializes the
+        much larger candidate-cost matrix.
+        """
+
+        return domain in self._validation_domain_index
+
+    @cached_property
+    def _validation_domain_index(self) -> set[GenericDomain]:
+        """Index all current CV cache domains once per fitter transaction.
+
+        A fit can probe legacy migration for every generic domain. Re-reading
+        every immutable JSON record for every probe made this check quadratic
+        in the domain count: an 864-domain corpus decoded roughly 190 GB of
+        repeated JSON. The index preserves the same schema and identity checks
+        while performing exactly one directory pass.
+        """
+
+        domains: set[GenericDomain] = set()
+        directory = self.directory / "domain-cross-validation"
+        if not directory.is_dir():
+            return domains
+        for path in sorted(directory.glob("*.json")):
+            content_key = path.stem
+            raw = self._read("domain-cross-validation", content_key)
+            if raw is None:
+                continue
+            domains.add(_generic_domain_from_mapping(raw["domain"]))
+        return domains
+
     def store_validation(
         self,
         content_key: str,
@@ -2060,6 +2645,158 @@ class PolicyFitCache:
                 else None
             ),
         })
+        cached_domains = self.__dict__.get("_validation_domain_index")
+        if cached_domains is not None:
+            cached_domains.add(domain)
+
+    def load_final_fit(
+        self,
+        content_key: str,
+        domain: GenericDomain,
+    ) -> tuple[
+        DomainCrossValidation,
+        tuple[GenericDispatchRule, ...],
+    ] | None:
+        """Load publication leaves fitted from one certified CV artifact.
+
+        Final publication is deliberately separate from cross-validation. A
+        paired-evidence iteration can certify CV without paying for final-tree
+        fitting, while the later freeze pass can add publication leaves without
+        mutating or recomputing the immutable CV record.
+        """
+
+        content_key = _content_key({
+            "validation_key": content_key,
+            "final_fit_schema": POLICY_FINAL_FIT_SCHEMA_VERSION,
+        })
+        raw = self._read("domain-final-fit", content_key)
+        if raw is None:
+            return None
+        if _generic_domain_from_mapping(raw["domain"]) != domain:
+            raise ValueError("final-fit cache changed policy domain")
+        validation = _cross_validation_from_mapping(raw["validation"])
+        if validation.domain != domain:
+            raise ValueError("final-fit cache changed validation domain")
+        rules = tuple(
+            _generic_dispatch_rule_from_mapping(rule)
+            for rule in raw["final_rules"]
+        )
+        if any(rule.domain != domain for rule in rules):
+            raise ValueError("final-fit cache changed final-rule domain")
+        if rules:
+            validate_generic_rule_partition(rules)
+        return validation, rules
+
+    def store_final_fit(
+        self,
+        content_key: str,
+        domain: GenericDomain,
+        validation: DomainCrossValidation,
+        final_rules: Iterable[GenericDispatchRule],
+    ) -> None:
+        """Publish deterministic final leaves without rewriting certified CV."""
+
+        if validation.domain != domain:
+            raise ValueError("cannot cache final validation for another domain")
+        rules = tuple(final_rules)
+        if any(rule.domain != domain for rule in rules):
+            raise ValueError("cannot cache final rules for another domain")
+        if rules:
+            validate_generic_rule_partition(rules)
+        content_key = _content_key({
+            "validation_key": content_key,
+            "final_fit_schema": POLICY_FINAL_FIT_SCHEMA_VERSION,
+        })
+        self._write("domain-final-fit", content_key, {
+            "domain": _generic_domain_mapping(domain),
+            "validation": _cross_validation_mapping(validation),
+            "final_rules": [
+                _generic_dispatch_rule_mapping(rule) for rule in rules
+            ],
+        })
+
+
+_PARALLEL_COST_CACHE: PolicyFitCache | None = None
+_PARALLEL_COST_LOAD_TASKS: tuple[
+    tuple[GenericDomain, str, tuple[str, ...]], ...
+] = ()
+
+
+def _load_cached_cost_at(
+    index: int,
+) -> tuple[GenericDomain, list[CandidatePointCost] | None, str | None]:
+    """Deserialize one independent domain cost matrix in a fork worker."""
+
+    if _PARALLEL_COST_CACHE is None:
+        raise RuntimeError("parallel candidate-cost cache is unavailable")
+    domain, canonical_key, legacy_keys = _PARALLEL_COST_LOAD_TASKS[index]
+    costs = _PARALLEL_COST_CACHE.load_costs(canonical_key, domain)
+    if costs is not None:
+        return domain, costs, canonical_key
+    for legacy_key in legacy_keys:
+        costs = _PARALLEL_COST_CACHE.load_costs(legacy_key, domain)
+        if costs is not None:
+            return domain, costs, legacy_key
+    return domain, None, None
+
+
+def _load_cached_costs_parallel(
+    cache: PolicyFitCache,
+    tasks: Iterable[tuple[GenericDomain, str, tuple[str, ...]]],
+) -> dict[
+    GenericDomain, tuple[list[CandidatePointCost] | None, str | None]
+]:
+    """Load independent domain matrices across physical CPU cores.
+
+    Candidate-cost JSON stores compact each point, candidate index, and exact
+    hexadecimal regret. Publication requires many such matrices at once. Fork
+    workers parse them independently and return only the fully typed matrix;
+    the parent retains canonical ordering and performs any rare legacy-key
+    migration after the parallel read. Small task sets remain in-process.
+    """
+
+    global _PARALLEL_COST_CACHE
+    global _PARALLEL_COST_LOAD_TASKS
+
+    task_items = tuple(tasks)
+    if not task_items:
+        return {}
+    requested_workers = int(os.environ.get(
+        "LLAMINAR_NATIVE_VNNI_POLICY_WORKERS",
+        str(_physical_core_worker_count()),
+    ))
+    if requested_workers < 1:
+        raise ValueError("policy worker count must be positive")
+    worker_count = min(
+        requested_workers,
+        _physical_core_worker_count(),
+        len(task_items),
+        max(1, (len(task_items) + 3) // 4),
+    )
+    _PARALLEL_COST_CACHE = cache
+    _PARALLEL_COST_LOAD_TASKS = task_items
+    try:
+        if worker_count > 1 and len(task_items) >= 4:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                loaded = tuple(executor.map(
+                    _load_cached_cost_at,
+                    range(len(task_items)),
+                ))
+        else:
+            loaded = tuple(
+                _load_cached_cost_at(index)
+                for index in range(len(task_items))
+            )
+        return {
+            domain: (costs, loaded_key)
+            for domain, costs, loaded_key in loaded
+        }
+    finally:
+        _PARALLEL_COST_CACHE = None
+        _PARALLEL_COST_LOAD_TASKS = ()
 
 
 def load_cached_cross_validations(
@@ -2262,17 +2999,76 @@ def _paired_cell_key_for_observation(
     )
 
 
+def _runtime_paired_comparisons(
+    development: ObservationCorpus,
+    comparisons: Mapping[
+        PairedCellKey, tuple[PairedTimingComparison, ...]
+    ] | None,
+) -> dict[RuntimeKey, tuple[PairedTimingComparison, ...]]:
+    """Pool paired timing edges by the production runtime identity.
+
+    Source formats are provenance and correctness surfaces, but they are not a
+    production dispatch discriminator after packing has normalized them to one
+    runtime codebook.  Resolve every source-qualified evidence key through the
+    authenticated development observation that produced it, then pool only
+    keys whose complete ``RuntimeKey`` is identical.  This prevents aliases of
+    the same prepared launch from teaching contradictory trees while retaining
+    operation, bundle, packing ABI, ISA, mode, and exact work geometry.
+    """
+
+    if not comparisons:
+        return {}
+    runtime_keys_by_evidence_key: dict[PairedCellKey, set[RuntimeKey]] = (
+        defaultdict(set)
+    )
+    for row in development:
+        runtime_keys_by_evidence_key[
+            _paired_cell_key_for_observation(row)
+        ].add(runtime_key(row))
+
+    grouped: dict[RuntimeKey, list[PairedTimingComparison]] = defaultdict(list)
+    for evidence_key, edges in comparisons.items():
+        matching_runtime_keys = runtime_keys_by_evidence_key.get(
+            evidence_key, set()
+        )
+        if len(matching_runtime_keys) != 1:
+            raise ValueError(
+                "paired evidence does not identify exactly one physical "
+                f"runtime surface: key={evidence_key!r}, "
+                f"runtime_keys={sorted(matching_runtime_keys)!r}"
+            )
+        physical_key = next(iter(matching_runtime_keys))
+        for edge in edges:
+            if edge.key != evidence_key:
+                raise ValueError(
+                    "paired comparison key disagrees with its evidence index"
+                )
+            grouped[physical_key].append(edge)
+
+    return {
+        key: tuple(sorted(
+            edges,
+            key=lambda edge: (
+                edge.selected_effective_candidate_id,
+                edge.exact_effective_candidate_id,
+                edge.selected_to_exact_median_ratio,
+                edge.pair_count,
+                edge.key,
+            ),
+        ))
+        for key, edges in grouped.items()
+    }
+
+
 def _paired_domain_digest(
     rows: Iterable[NativeVNNIObservation],
     comparisons: Mapping[
-        PairedCellKey, tuple[PairedTimingComparison, ...]
+        RuntimeKey, tuple[PairedTimingComparison, ...]
     ] | None,
 ) -> str:
     """Hash only tournament edges capable of changing this domain's costs."""
 
-    relevant_keys = {
-        _paired_cell_key_for_observation(row) for row in rows
-    }
+    relevant_keys = {runtime_key(row) for row in rows}
     payload = []
     for key in sorted(relevant_keys):
         for comparison in sorted(
@@ -2286,15 +3082,18 @@ def _paired_domain_digest(
         ):
             payload.append({
                 "key": {
-                    "backend": key.backend,
+                    "backend": key.backend.value,
                     "architecture_class": key.architecture_class,
-                    "source_format": key.source_format,
-                    "source_codebook": key.source_codebook,
-                    "execution_codebook": key.execution_codebook,
-                    "shape": key.shape,
-                    "execution_mode": key.execution_mode,
+                    "semantic_contract": key.semantic_contract.value,
+                    "operation_kind": key.operation_kind,
+                    "bundle_signature": key.bundle_signature,
+                    "projection_n_vector": list(key.projection_n_vector),
+                    "prepared_family_id": key.prepared_family_id,
+                    "packing_abi": key.packing_abi,
+                    "runtime_codebook": key.runtime_codebook_id,
+                    "execution_mode": key.execution_mode.value,
                     "m": key.m,
-                    "n": key.n,
+                    "n": key.aggregate_n,
                     "k": key.k,
                 },
                 "selected_effective_candidate_id": (
@@ -2311,11 +3110,52 @@ def _paired_domain_digest(
     return "sha256:" + _content_key({"comparisons": payload})
 
 
+def _supplemental_cost_digest(
+    costs: Iterable[CandidatePointCost],
+) -> str:
+    """Hash generic-only development points outside the broad timing corpus."""
+
+    return "sha256:" + _content_key({
+        "schema_version": "native-vnni-supplemental-development-costs-v1",
+        "costs": [
+            {
+                "runtime_key": _runtime_key_mapping(cost.runtime_key),
+                "shape_group_id": cost.shape_group_id,
+                "candidate_id": cost.candidate_id,
+                "max_surface_regret": cost.max_surface_regret.hex(),
+                "p95_surface_regret": cost.p95_surface_regret.hex(),
+                "mean_surface_regret": cost.mean_surface_regret.hex(),
+            }
+            for cost in costs
+        ],
+    })
+
+
+def _combined_domain_evidence_digest(
+    rows: Iterable[NativeVNNIObservation],
+    comparisons: Mapping[
+        RuntimeKey, tuple[PairedTimingComparison, ...]
+    ] | None,
+    supplemental_costs: Iterable[CandidatePointCost],
+) -> str:
+    """Bind cached candidate costs to paired edges and burned-seal points."""
+
+    return "sha256:" + _content_key({
+        "paired_domain_digest": _paired_domain_digest(rows, comparisons),
+        "supplemental_cost_digest": _supplemental_cost_digest(
+            supplemental_costs
+        ),
+    })
+
+
 _PARALLEL_CACHE_IDENTITY_CORPUS: ObservationCorpus | None = None
 _PARALLEL_CACHE_IDENTITY_DOMAINS: tuple[GenericDomain, ...] = ()
 _PARALLEL_CACHE_IDENTITY_COMPARISONS: Mapping[
-    PairedCellKey, tuple[PairedTimingComparison, ...]
+    RuntimeKey, tuple[PairedTimingComparison, ...]
 ] | None = None
+_PARALLEL_CACHE_IDENTITY_SUPPLEMENTAL_COSTS: Mapping[
+    GenericDomain, tuple[CandidatePointCost, ...]
+] = {}
 _PARALLEL_CACHE_IDENTITY_SERIAL_HASHES: Mapping[RuntimeKey, str] | None = None
 
 
@@ -2336,9 +3176,10 @@ def _domain_cache_identity_at(index: int) -> tuple[
     runtime_keys = {corpus.runtime_key_for(row) for row in rows}
     return (
         domain,
-        _paired_domain_digest(
+        _combined_domain_evidence_digest(
             rows,
             _PARALLEL_CACHE_IDENTITY_COMPARISONS,
+            _PARALLEL_CACHE_IDENTITY_SUPPLEMENTAL_COSTS.get(domain, ()),
         ),
         generic_domain_corpus_digest(corpus, domain),
         _legacy_generic_domain_corpus_digest(corpus, domain),
@@ -2353,8 +3194,11 @@ def _domain_cache_identity_inputs(
     corpus: ObservationCorpus,
     domains: tuple[GenericDomain, ...],
     paired_comparisons: Mapping[
-        PairedCellKey, tuple[PairedTimingComparison, ...]
+        RuntimeKey, tuple[PairedTimingComparison, ...]
     ] | None,
+    supplemental_costs: Mapping[
+        GenericDomain, tuple[CandidatePointCost, ...]
+    ],
     serial_m1_hashes: Mapping[RuntimeKey, str] | None,
 ) -> tuple[tuple[GenericDomain, str, str, str, str], ...]:
     """Compute deterministic domain-local cache identities across host cores.
@@ -2368,6 +3212,7 @@ def _domain_cache_identity_inputs(
     global _PARALLEL_CACHE_IDENTITY_CORPUS
     global _PARALLEL_CACHE_IDENTITY_DOMAINS
     global _PARALLEL_CACHE_IDENTITY_COMPARISONS
+    global _PARALLEL_CACHE_IDENTITY_SUPPLEMENTAL_COSTS
     global _PARALLEL_CACHE_IDENTITY_SERIAL_HASHES
 
     requested_workers = int(os.environ.get(
@@ -2378,12 +3223,14 @@ def _domain_cache_identity_inputs(
         raise ValueError("policy worker count must be positive")
     worker_count = min(
         requested_workers,
+        _physical_core_worker_count(),
         len(domains),
         max(1, len(corpus) // 4096),
     )
     _PARALLEL_CACHE_IDENTITY_CORPUS = corpus
     _PARALLEL_CACHE_IDENTITY_DOMAINS = domains
     _PARALLEL_CACHE_IDENTITY_COMPARISONS = paired_comparisons
+    _PARALLEL_CACHE_IDENTITY_SUPPLEMENTAL_COSTS = supplemental_costs
     _PARALLEL_CACHE_IDENTITY_SERIAL_HASHES = serial_m1_hashes
     try:
         if worker_count > 1 and len(domains) >= 4:
@@ -2402,6 +3249,7 @@ def _domain_cache_identity_inputs(
         _PARALLEL_CACHE_IDENTITY_CORPUS = None
         _PARALLEL_CACHE_IDENTITY_DOMAINS = ()
         _PARALLEL_CACHE_IDENTITY_COMPARISONS = None
+        _PARALLEL_CACHE_IDENTITY_SUPPLEMENTAL_COSTS = {}
         _PARALLEL_CACHE_IDENTITY_SERIAL_HASHES = None
 
 
@@ -2409,7 +3257,7 @@ def _surface_candidate_timings(
     rows: Iterable[NativeVNNIObservation],
     current_serial_m1_hash: str | None,
     paired_comparisons: Mapping[
-        PairedCellKey, tuple[PairedTimingComparison, ...]
+        RuntimeKey, tuple[PairedTimingComparison, ...]
     ] | None = None,
 ) -> tuple[dict[tuple[str, SurfaceKey], float], frozenset[SurfaceKey]]:
     """Aggregate broad latency and apply validated paired ratio corrections."""
@@ -2431,15 +3279,11 @@ def _surface_candidate_timings(
             row.effective_candidate_id
         )
 
-    timings = {
+    broad_timings = {
         key: statistics.median(values) for key, values in grouped.items()
     }
-    broad_timings = dict(timings)
+    timings = dict(broad_timings)
     for surface, exemplar in identity_rows.items():
-        pair_key = _paired_cell_key_for_observation(exemplar)
-        comparisons = (paired_comparisons or {}).get(pair_key, ())
-        if not comparisons:
-            continue
         effective_broad: dict[str, list[float]] = defaultdict(list)
         for (candidate, candidate_surface), candidate_timings in (
             effective_ids.items()
@@ -2450,22 +3294,25 @@ def _surface_candidate_timings(
                 effective_broad[effective_id].append(
                     broad_timings[(candidate, candidate_surface)]
                 )
-        corrected_effective = _paired_effective_latencies(
-            {
-                effective_id: statistics.median(values)
-                for effective_id, values in effective_broad.items()
-            },
-            comparisons,
-        )
+        effective_timings = {
+            effective_id: statistics.median(values)
+            for effective_id, values in effective_broad.items()
+        }
+        comparisons = (paired_comparisons or {}).get(runtime_key(exemplar), ())
+        if comparisons:
+            effective_timings.update(_paired_effective_latencies(
+                effective_timings,
+                comparisons,
+            ))
         for (candidate, candidate_surface), candidate_effective_ids in (
             effective_ids.items()
         ):
             if candidate_surface != surface:
                 continue
             corrected_values = [
-                corrected_effective[effective_id]
+                effective_timings[effective_id]
                 for effective_id in candidate_effective_ids
-                if effective_id in corrected_effective
+                if effective_id in effective_timings
             ]
             if corrected_values:
                 timings[(candidate, surface)] = statistics.median(
@@ -2522,7 +3369,7 @@ def build_domain_candidate_point_costs(
     *,
     serial_m1_hashes: Mapping[RuntimeKey, str] | None = None,
     paired_comparisons: Mapping[
-        PairedCellKey, tuple[PairedTimingComparison, ...]
+        RuntimeKey, tuple[PairedTimingComparison, ...]
     ] | None = None,
 ) -> list[CandidatePointCost]:
     """Build one independent domain's eligible candidate regret matrix.
@@ -2589,15 +3436,99 @@ def build_candidate_point_costs(
 ) -> dict[GenericDomain, list[CandidatePointCost]]:
     """Build every domain matrix through the incremental domain primitive."""
 
+    runtime_comparisons = _runtime_paired_comparisons(
+        corpus,
+        paired_comparisons,
+    )
     return {
         domain: build_domain_candidate_point_costs(
             corpus,
             domain,
             serial_m1_hashes=serial_m1_hashes,
-            paired_comparisons=paired_comparisons,
+            paired_comparisons=runtime_comparisons,
         )
         for domain in corpus.generic_domains()
     }
+
+
+def _validated_supplemental_costs(
+    development: ObservationCorpus,
+    costs_by_domain: Mapping[
+        GenericDomain, Iterable[CandidatePointCost]
+    ] | None,
+) -> dict[GenericDomain, tuple[CandidatePointCost, ...]]:
+    """Validate generic-only points that cannot become exact overlays.
+
+    Failed sealed tournaments are ratio evidence, not ordinary timing rows.
+    They may enrich generic CV after inspection, but must remain disjoint from
+    broad development shape groups and preserve every runtime discriminator of
+    the owning domain. Requiring a complete multi-candidate point also prevents
+    a selected-only burned row from biasing a later tree.
+    """
+
+    if not costs_by_domain:
+        return {}
+    development_domains = set(development.generic_domains())
+    development_groups = {row.shape_group_id for row in development}
+    result = {}
+    for domain, raw_costs in sorted(costs_by_domain.items()):
+        if domain not in development_domains:
+            raise ValueError(
+                "supplemental development costs introduce a new generic domain"
+            )
+        costs = tuple(raw_costs)
+        matrix = _point_matrix(list(costs))
+        if not matrix:
+            raise ValueError("supplemental development domain has no costs")
+        if any(point[1] in development_groups for point in matrix):
+            raise ValueError(
+                "supplemental development point collides with broad timing"
+            )
+        exemplar_candidates = {
+            row.candidate_id
+            for row in development.rows_for_generic_domain(domain)
+        }
+        for (key, _shape_group_id), candidate_costs in matrix.items():
+            if (
+                key.backend != domain.backend
+                or key.architecture_class != domain.architecture_class
+                or key.semantic_contract != domain.semantic_contract
+                or key.operation_kind != domain.operation_kind
+                or key.bundle_signature != domain.bundle_signature
+                or key.prepared_family_id != domain.prepared_family_id
+                or key.packing_abi != domain.packing_abi
+                or key.runtime_codebook_id != domain.runtime_codebook_id
+                or key.execution_mode != domain.execution_mode
+                or key.m != domain.m
+                or (
+                    not domain.all_aspects
+                    and classify_aspect(key.aggregate_n, key.k)
+                    != domain.aspect_bucket
+                )
+            ):
+                raise ValueError(
+                    "supplemental development point changed its generic domain"
+                )
+            if len(candidate_costs) < 2:
+                raise ValueError(
+                    "supplemental development point has fewer than two candidates"
+                )
+            if not set(candidate_costs).issubset(exemplar_candidates):
+                raise ValueError(
+                    "supplemental development point names an unknown candidate"
+                )
+            for cost in candidate_costs.values():
+                values = (
+                    cost.max_surface_regret,
+                    cost.p95_surface_regret,
+                    cost.mean_surface_regret,
+                )
+                if any(not math.isfinite(value) or value < 0.0 for value in values):
+                    raise ValueError(
+                        "supplemental development regret must be finite and non-negative"
+                    )
+        result[domain] = costs
+    return result
 
 
 def _point_matrix(costs: list[CandidatePointCost]):
@@ -2676,6 +3607,32 @@ def _feature_value(
         )
         final_wave_tasks = (tasks - 1) % parallelism_width + 1
         return Fraction(final_wave_tasks, parallelism_width)
+    if axis in KPART_PRODUCER_WAVE_WIDTH_BY_AXIS:
+        n_blocks = _n_tile_count(
+            key.aggregate_n, KPART_PRODUCER_WAVE_WIDTH_BY_AXIS[axis]
+        )
+        tasks = n_blocks * max(1, key.launch_k_tiles)
+        return Fraction(_n_tile_count(tasks, parallelism_width), 1)
+    if axis in KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS:
+        n_blocks = _n_tile_count(
+            key.aggregate_n,
+            KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS[axis],
+        )
+        tasks = n_blocks * max(1, key.launch_k_tiles)
+        final_wave_tasks = (tasks - 1) % parallelism_width + 1
+        return Fraction(final_wave_tasks, parallelism_width)
+    if axis in KPART_PARTITION_GEOMETRY_AXES:
+        blocks_per_tile, final_tile_blocks = _kpart_partition_geometry(
+            key.k,
+            key.launch_k_tiles,
+        )
+        if axis == FeatureAxis.KPART_K_TILE_COUNT:
+            return Fraction(max(1, key.launch_k_tiles), 1)
+        if axis == FeatureAxis.KPART_K_BLOCKS_PER_TILE:
+            return Fraction(blocks_per_tile, 1)
+        if axis == FeatureAxis.KPART_FINAL_K_TILE_BLOCKS:
+            return Fraction(final_tile_blocks, 1)
+        return Fraction(final_tile_blocks, blocks_per_tile)
     if axis in MN_PARALLEL_WAVE_WIDTH_BY_AXIS:
         tasks = key.m * _n_tile_count(
             key.aggregate_n, MN_PARALLEL_WAVE_WIDTH_BY_AXIS[axis]
@@ -3192,6 +4149,9 @@ def _fit_tree_budgets_accelerated(
             point[0].aggregate_n for point in points
         ),
         training_k=tuple(point[0].k for point in points),
+        training_launch_k_tiles=tuple(
+            point[0].launch_k_tiles for point in points
+        ),
         feature_axes=tuple(
             _accelerated_feature_axis_descriptor(axis)
             for axis in feature_axes
@@ -3332,6 +4292,9 @@ def _fit_and_evaluate_tree_budgets_accelerated(
             point[0].aggregate_n for point in training_points
         ),
         training_k=tuple(point[0].k for point in training_points),
+        training_launch_k_tiles=tuple(
+            point[0].launch_k_tiles for point in training_points
+        ),
         feature_axes=tuple(
             _accelerated_feature_axis_descriptor(axis)
             for axis in feature_axes
@@ -3345,6 +4308,9 @@ def _fit_and_evaluate_tree_budgets_accelerated(
             point[0].aggregate_n for point in heldout_points
         ),
         heldout_k=tuple(point[0].k for point in heldout_points),
+        heldout_launch_k_tiles=tuple(
+            point[0].launch_k_tiles for point in heldout_points
+        ),
         heldout_measured_p95_regrets=heldout_measured_p95,
         heldout_measured_mean_regrets=heldout_measured_means,
         heldout_measured_max_regrets=heldout_measured_maxima,
@@ -3488,7 +4454,9 @@ def _fit_tree_budgets(
         mask = 0
         for point_index, point in enumerate(points):
             if threshold.matches_less_equal(
-                point[0].aggregate_n, point[0].k
+                point[0].aggregate_n,
+                point[0].k,
+                point[0].launch_k_tiles,
             ):
                 mask |= 1 << point_index
         return mask
@@ -3842,7 +4810,13 @@ def _evaluate_rules(
     decisions: list[tuple[CandidatePointCost, CandidatePointCost]] = []
     uncovered = 0
     for (key, _shape_group), candidates in matrix.items():
-        matches = [rule for rule in rules if rule.matches(key.aggregate_n, key.k)]
+        matches = [
+            rule
+            for rule in rules
+            if rule.matches(
+                key.aggregate_n, key.k, key.launch_k_tiles
+            )
+        ]
         if len(matches) != 1 or matches[0].candidate_id not in candidates:
             uncovered += 1
             continue
@@ -3882,7 +4856,9 @@ def _evaluate_tree(
         while isinstance(node, _SplitNode):
             node = (
                 node.left
-                if node.threshold.matches_less_equal(key.aggregate_n, key.k)
+                if node.threshold.matches_less_equal(
+                    key.aggregate_n, key.k, key.launch_k_tiles
+                )
                 else node.right
             )
         selected = candidates.get(node.candidate_id)
@@ -3924,6 +4900,129 @@ class _PlacementFoldResult:
     complexities: tuple[_ComplexityFoldResult, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _CompactFoldTask:
+    """Describe one CV branch without cloning its candidate-cost surface.
+
+    Production all-format corpora contain millions of candidate rows.  The
+    eager task ABI copied those rows once per fold, profiler influence, feature
+    policy, and boundary placement before an accelerator could begin scoring.
+    Compact tasks instead retain one shared immutable cost tuple and, when
+    needed, one shared read-only profiler surface.  The scoring worker applies
+    the selected fitting-label view immediately before evaluation; measured
+    regret fields remain the original objects used by held-out certification.
+    """
+
+    domain: GenericDomain
+    fold_index: int
+    held_out_groups: frozenset[str]
+    feature_policy: FeaturePolicy
+    placement: BoundaryPlacement
+    profiler_influence: ProfilerInfluence
+    costs: tuple[CandidatePointCost, ...]
+    max_leaves: int
+    min_shape_groups_per_leaf: int
+    profiler_predictions: (
+        Mapping[tuple[RuntimeKey, str, str], float | None] | None
+    ) = None
+
+    def _legacy_components(self) -> tuple:
+        """Expose the stable diagnostic ABI without changing owned storage."""
+
+        return (
+            self.domain,
+            self.fold_index,
+            self.held_out_groups,
+            self.feature_policy,
+            self.placement,
+            self.profiler_influence,
+            self.costs,
+            self.max_leaves,
+            self.min_shape_groups_per_leaf,
+        )
+
+    def __len__(self) -> int:
+        """Report the historical tuple cardinality to test instrumentation."""
+
+        return 9
+
+    def __getitem__(self, index):
+        """Support read-only legacy field inspection by index or slice."""
+
+        return self._legacy_components()[index]
+
+
+def _fold_task_components(args) -> tuple:
+    """Return the historical nine task fields for either task representation."""
+
+    if isinstance(args, _CompactFoldTask):
+        return args._legacy_components()
+    if len(args) != 9:
+        raise ValueError("CV task changed its tuple ABI")
+    return args
+
+
+def _fold_task_weight(args) -> int:
+    """Estimate one task's accelerator work without materializing label views."""
+
+    components = _fold_task_components(args)
+    return max(1, len(components[6]) * components[7])
+
+
+def _materialize_compact_fold_costs(
+    task: _CompactFoldTask,
+) -> tuple[CandidatePointCost, ...]:
+    """Create only the fitting-label view consumed by one active scorer lane."""
+
+    if task.profiler_influence == ProfilerInfluence.MEASURED_ONLY:
+        return task.costs
+    predictions = task.profiler_predictions
+    if predictions is None:
+        raise RuntimeError(
+            "profiler-informed compact CV task has no prediction surface"
+        )
+    if task.profiler_influence == ProfilerInfluence.CROSS_FITTED_TEACHER:
+        teacher_costs = _profiler_teacher_candidate_costs(
+            task.costs,
+            predictions,
+        )
+        if teacher_costs is None:
+            raise RuntimeError(
+                "validated compact teacher surface became incomplete"
+            )
+        return teacher_costs
+
+    blend_weight = PROFILER_BLEND_WEIGHT_BY_INFLUENCE.get(
+        task.profiler_influence
+    )
+    if blend_weight is None:
+        raise ValueError(
+            "compact CV task selected an unknown profiler influence"
+        )
+    training = []
+    held_out = []
+    for cost in task.costs:
+        if cost.shape_group_id in task.held_out_groups:
+            # Preserve the historical result object's provenance fields even
+            # though held-out selection is scored only by measured regret.
+            held_out.append(replace(
+                cost,
+                profiler_blend_weight=blend_weight,
+            ))
+            continue
+        point = (
+            cost.runtime_key,
+            cost.shape_group_id,
+            cost.candidate_id,
+        )
+        training.append(replace(
+            cost,
+            profiler_predicted_regret=predictions[point],
+            profiler_blend_weight=blend_weight,
+        ))
+    return tuple((*training, *held_out))
+
+
 def _cross_validation_cell(
     selected: CandidatePointCost,
     exact: CandidatePointCost,
@@ -3956,12 +5055,146 @@ def _cross_validation_cells(
     ))
 
 
+def _domain_cross_validation_objective(
+    validation: DomainCrossValidation,
+) -> tuple[object, ...]:
+    """Return the normative deterministic objective for one CV model.
+
+    Keeping this ordering independent of the temporary fold-result objects is
+    what makes an additive feature-family tournament incremental.  A cached
+    winner from the complete previous family inventory can be compared exactly
+    with a newly scored family without replaying any old tree fits.
+    """
+
+    uncovered = (
+        validation.required_point_count - validation.covered_point_count
+    )
+    failed_point_count = validation.failed_point_count
+    if failed_point_count is None:
+        if len(validation.cells) != validation.covered_point_count:
+            raise ValueError(
+                "cached CV winner lacks the cells required for exact "
+                "incremental ranking"
+            )
+        failed_point_count = sum(
+            cell.observed_broad_regret >= GENERIC_REGRET_BUDGET
+            for cell in validation.cells
+        )
+    return (
+        uncovered,
+        validation.p95_regret >= GENERIC_REGRET_BUDGET,
+        validation.p95_regret,
+        validation.mean_regret,
+        failed_point_count,
+        validation.max_regret,
+        validation.selected_max_leaves,
+        FEATURE_POLICIES.index(validation.selected_feature_policy),
+        BOUNDARY_PLACEMENTS.index(
+            validation.selected_boundary_placement
+        ),
+        PROFILER_INFLUENCES.index(validation.selected_profiler_influence),
+    )
+
+
+def _merge_incremental_validation_frontier(
+    incumbent: DomainCrossValidation | None,
+    additions: tuple[DomainCrossValidation, ...],
+) -> tuple[DomainCrossValidation, ...]:
+    """Merge one cached tournament winner with newly scored model families.
+
+    The incumbent is already the minimum over every previously available
+    family.  Therefore comparing it with the newly ranked models is equivalent
+    to reranking the full Cartesian tournament.  Competitive paired edges are
+    unioned so refinement retains every old and new over-budget alternative.
+    """
+
+    if incumbent is None:
+        return additions
+    if any(validation.domain != incumbent.domain for validation in additions):
+        raise ValueError("incremental CV frontier changed policy domain")
+
+    competitive_cells = {
+        (
+            cell.runtime_key,
+            cell.shape_group_id,
+            cell.selected_candidate_id,
+            cell.exact_candidate_id,
+        ): cell
+        for validation in (incumbent, *additions)
+        for cell in validation.competitive_cells
+    }
+    merged_competitive = tuple(sorted(
+        competitive_cells.values(),
+        key=lambda cell: (
+            cell.runtime_key,
+            cell.shape_group_id,
+            cell.selected_candidate_id,
+            cell.exact_candidate_id,
+        ),
+    ))
+    merged = tuple(sorted(
+        (incumbent, *additions),
+        key=_domain_cross_validation_objective,
+    ))
+    return tuple(
+        replace(validation, competitive_cells=merged_competitive)
+        for validation in merged
+    )
+
+
+def _domain_cross_validation_model_identity(
+    validation: DomainCrossValidation,
+) -> tuple[object, ...]:
+    """Identify the fitted OOF model independently of diagnostic edge unions."""
+
+    return (
+        validation.domain,
+        validation.selected_feature_policy,
+        validation.selected_max_leaves,
+        validation.selected_boundary_placement,
+        validation.selected_profiler_influence,
+        tuple(
+            (
+                cell.runtime_key,
+                cell.shape_group_id,
+                cell.selected_candidate_id,
+            )
+            for cell in validation.cells
+        ),
+    )
+
+
+def _publication_validation_frontier(
+    validation: DomainCrossValidation | None,
+) -> tuple[DomainCrossValidation, ...]:
+    """Return the one durable OOF model that publication must distill.
+
+    The fit cache intentionally stores the tournament winner rather than every
+    losing feature/placement/complexity combination. A fresh fit must use the
+    same contract. Retaining every promotable runner-up only in process made a
+    cold fit launch thousands of additional 30-way publication searches, while
+    a resumed fit launched exactly one search surface for the same corpus.
+
+    Alternative measured candidates remain represented inside the winner's
+    held-out cells and competitive-edge diagnostics. They are refinement
+    evidence; they are not additional generic policies to publish.
+    """
+
+    if (
+        validation is None
+        or not domain_cross_validation_has_complete_coverage(validation)
+    ):
+        return ()
+    return (validation,)
+
+
 def _evaluate_placement_fold(
     args,
     primary_scorer: NativeVNNILeafPrimaryScorer | None = None,
 ) -> _PlacementFoldResult:
     """Fit one fold/placement tree sequence in an isolated worker process."""
 
+    compact_task = args if isinstance(args, _CompactFoldTask) else None
     (
         domain,
         fold_index,
@@ -3972,7 +5205,9 @@ def _evaluate_placement_fold(
         costs,
         max_leaves,
         min_shape_groups_per_leaf,
-    ) = args
+    ) = _fold_task_components(args)
+    if compact_task is not None:
+        costs = _materialize_compact_fold_costs(compact_task)
     training_costs = [
         cost for cost in costs if cost.shape_group_id not in held_out_groups
     ]
@@ -4064,10 +5299,20 @@ def _rank_domain_cross_validations(
             for result in fold_results
         )
     )
+    available_feature_policies = tuple(
+        policy
+        for policy in FEATURE_POLICIES
+        if any(result.feature_policy == policy for result in fold_results)
+    )
+    available_placements = tuple(
+        placement
+        for placement in BOUNDARY_PLACEMENTS
+        if any(result.placement == placement for result in fold_results)
+    )
     model_keys = tuple(
         (feature_policy, placement, influence, complexity)
-        for feature_policy in FEATURE_POLICIES
-        for placement in BOUNDARY_PLACEMENTS
+        for feature_policy in available_feature_policies
+        for placement in available_placements
         for influence in available_influences
         for complexity in range(1, max_leaves + 1)
     )
@@ -4140,26 +5385,7 @@ def _rank_domain_cross_validations(
                     competitive[identity] = _cross_validation_cell(
                         selected, exact
                     )
-        objective = (
-            uncovered,
-            # Installation is governed by population p95 regret. Prefer a
-            # model on the passing side of that boundary, then optimize p95
-            # directly. Worst-cell regret remains a later diagnostic
-            # tie-breaker so isolated outliers stay visible without allowing
-            # them to veto an otherwise economical generic policy.
-            p95_regret >= GENERIC_REGRET_BUDGET,
-            p95_regret,
-            mean_regret,
-            failed_cell_count,
-            max_regret,
-            complexity,
-            list(FEATURE_POLICIES).index(feature_policy),
-            0 if placement == BoundaryPlacement.MIDPOINT else 1,
-            PROFILER_INFLUENCES.index(influence),
-        )
-        scored.append((
-            objective,
-            DomainCrossValidation(
+        validation = DomainCrossValidation(
                 domain=domain,
                 selected_feature_policy=feature_policy,
                 selected_max_leaves=complexity,
@@ -4178,7 +5404,13 @@ def _rank_domain_cross_validations(
                 worst_selected_candidate_id=worst_selected.candidate_id,
                 worst_exact_candidate_id=worst_exact.candidate_id,
                 cells=(),
-            ),
+                failed_point_count=failed_cell_count,
+            )
+        # Installation is governed by population p95 regret. The shared
+        # objective also ranks immutable incumbents during additive searches.
+        scored.append((
+            _domain_cross_validation_objective(validation),
+            validation,
         ))
     if not scored:
         return ()
@@ -4295,6 +5527,23 @@ def _select_domain_cross_validation(
     return ranked[0] if ranked else None
 
 
+def _profiler_teacher_surface_is_complete(
+    costs: Iterable[CandidatePointCost],
+    predictions: Mapping[tuple[RuntimeKey, str, str], float | None],
+) -> bool:
+    """Check teacher totality without allocating a transformed cost surface."""
+
+    for cost in costs:
+        value = predictions.get((
+            cost.runtime_key,
+            cost.shape_group_id,
+            cost.candidate_id,
+        ))
+        if value is None or not math.isfinite(value):
+            return False
+    return True
+
+
 def _domain_fold_tasks(
     domain: GenericDomain,
     costs: list[CandidatePointCost],
@@ -4307,6 +5556,8 @@ def _domain_fold_tasks(
         tuple[tuple[object, ...], tuple[tuple[int, int], ...]],
         dict[tuple[RuntimeKey, str, str], float | None],
     ] | None = None,
+    feature_policies: Iterable[FeaturePolicy] | None = None,
+    compact: bool = False,
 ) -> tuple[tuple[tuple, ...], int]:
     """Build immutable fold/placement work from the sufficient cost matrix.
 
@@ -4318,6 +5569,12 @@ def _domain_fold_tasks(
     task assembly must never hide a serial model fit.
     """
 
+    feature_policies = _leaf_budget_feature_policies(
+        max_leaves,
+        feature_policies,
+    )
+    boundary_placements = _leaf_budget_boundary_placements(max_leaves)
+
     folds = _domain_folds(domain, costs, seed=seed)
     if (profiler_training_pool_key is None) != (
         profiler_prediction_cache is None
@@ -4325,6 +5582,100 @@ def _domain_fold_tasks(
         raise ValueError(
             "profiler-informed CV requires explicit prediction-cache ownership"
         )
+    prediction_surfaces_by_fold: dict[
+        int, Mapping[tuple[RuntimeKey, str, str], float | None]
+    ] = {}
+    teacher_surface_is_complete = profiler_prediction_cache is not None
+    if compact and profiler_prediction_cache is not None:
+        for fold_index, held_out_groups in enumerate(folds):
+            held_out_geometries = {
+                (cost.runtime_key.aggregate_n, cost.runtime_key.k)
+                for cost in costs
+                if cost.shape_group_id in held_out_groups
+            }
+            prediction_cache_key = (
+                profiler_training_pool_key,
+                tuple(sorted(held_out_geometries)),
+            )
+            if prediction_cache_key not in profiler_prediction_cache:
+                raise RuntimeError(
+                    "profiler prediction cache was not completed before CV "
+                    f"task assembly: {prediction_cache_key}"
+                )
+            predictions = profiler_prediction_cache[prediction_cache_key]
+            prediction_surfaces_by_fold[fold_index] = predictions
+            teacher_surface_is_complete = (
+                teacher_surface_is_complete
+                and _profiler_teacher_surface_is_complete(costs, predictions)
+            )
+
+    if compact:
+        shared_costs = tuple(costs)
+        tasks = []
+        for fold_index, held_out_groups in enumerate(folds):
+            predictions = prediction_surfaces_by_fold.get(fold_index)
+            influences = [ProfilerInfluence.MEASURED_ONLY]
+            if predictions is not None:
+                influences.extend(
+                    influence
+                    for influence in TREE_PROFILER_INFLUENCES
+                    if influence != ProfilerInfluence.MEASURED_ONLY
+                )
+                if teacher_surface_is_complete:
+                    influences.append(ProfilerInfluence.CROSS_FITTED_TEACHER)
+            tasks.extend(
+                _CompactFoldTask(
+                    domain=domain,
+                    fold_index=fold_index,
+                    held_out_groups=held_out_groups,
+                    feature_policy=feature_policy,
+                    placement=placement,
+                    profiler_influence=influence,
+                    costs=shared_costs,
+                    max_leaves=max_leaves,
+                    min_shape_groups_per_leaf=min_shape_groups_per_leaf,
+                    profiler_predictions=(
+                        None
+                        if influence == ProfilerInfluence.MEASURED_ONLY
+                        else predictions
+                    ),
+                )
+                for influence in influences
+                for feature_policy in feature_policies
+                for placement in boundary_placements
+            )
+        return tuple(tasks), len(folds)
+
+    teacher_costs_by_fold: dict[int, tuple[CandidatePointCost, ...]] = {}
+    if profiler_prediction_cache is not None:
+        for fold_index, held_out_groups in enumerate(folds):
+            held_out_geometries = {
+                (cost.runtime_key.aggregate_n, cost.runtime_key.k)
+                for cost in costs
+                if cost.shape_group_id in held_out_groups
+            }
+            prediction_cache_key = (
+                profiler_training_pool_key,
+                tuple(sorted(held_out_geometries)),
+            )
+            if prediction_cache_key not in profiler_prediction_cache:
+                raise RuntimeError(
+                    "profiler prediction cache was not completed before CV "
+                    f"task assembly: {prediction_cache_key}"
+                )
+            teacher_costs = _profiler_teacher_candidate_costs(
+                costs,
+                profiler_prediction_cache[prediction_cache_key],
+            )
+            if teacher_costs is None:
+                # A runtime tree is one complete model, so a teacher with a
+                # missing candidate prediction in any fold cannot enter only a
+                # subset of the grouped CV population. The measured and
+                # bounded-prior tree families remain available unchanged.
+                teacher_costs_by_fold.clear()
+                break
+            teacher_costs_by_fold[fold_index] = teacher_costs
+
     tasks = []
     for fold_index, held_out_groups in enumerate(folds):
         fold_cost_variants = [(
@@ -4388,6 +5739,11 @@ def _domain_fold_tasks(
                 for influence in TREE_PROFILER_INFLUENCES
                 if influence != ProfilerInfluence.MEASURED_ONLY
             )
+            if len(teacher_costs_by_fold) == len(folds):
+                fold_cost_variants.append((
+                    ProfilerInfluence.CROSS_FITTED_TEACHER,
+                    teacher_costs_by_fold[fold_index],
+                ))
         tasks.extend(
             (
                 domain,
@@ -4401,15 +5757,15 @@ def _domain_fold_tasks(
                 min_shape_groups_per_leaf,
             )
             for influence, fold_costs in fold_cost_variants
-            for feature_policy in FEATURE_POLICIES
-            for placement in BOUNDARY_PLACEMENTS
+            for feature_policy in feature_policies
+            for placement in boundary_placements
         )
     return tuple(tasks), len(folds)
 
 
 def _group_accelerated_cv_tasks(
-    tasks: Iterable[tuple],
-) -> tuple[tuple[tuple[int, tuple], ...], ...]:
+    tasks: Iterable[tuple | _CompactFoldTask],
+) -> tuple[tuple[tuple[int, tuple | _CompactFoldTask], ...], ...]:
     """Batch cost variants that share one immutable accelerator geometry.
 
     Measured-only and profiler-informed variants change only the fitting-regret
@@ -4422,21 +5778,23 @@ def _group_accelerated_cv_tasks(
     cannot change the deterministic result order consumed by model ranking.
     """
 
-    groups: dict[tuple[object, ...], list[tuple[int, tuple]]] = {}
+    groups: dict[
+        tuple[object, ...],
+        list[tuple[int, tuple | _CompactFoldTask]],
+    ] = {}
     influences_by_group: dict[tuple[object, ...], set[ProfilerInfluence]] = {}
     for task_index, task in enumerate(tasks):
-        if len(task) != 9:
-            raise ValueError("accelerated CV task changed its tuple ABI")
+        components = _fold_task_components(task)
         group_key = (
-            task[0],  # GenericDomain
-            task[1],  # fold index
-            task[2],  # exact held-out group inventory
-            task[3],  # feature policy
-            task[4],  # threshold placement
-            task[7],  # maximum leaves
-            task[8],  # minimum groups per leaf
+            components[0],  # GenericDomain
+            components[1],  # fold index
+            components[2],  # exact held-out group inventory
+            components[3],  # feature policy
+            components[4],  # threshold placement
+            components[7],  # maximum leaves
+            components[8],  # minimum groups per leaf
         )
-        influence = task[5]
+        influence = components[5]
         observed_influences = influences_by_group.setdefault(group_key, set())
         if influence in observed_influences:
             raise ValueError(
@@ -4447,105 +5805,57 @@ def _group_accelerated_cv_tasks(
     return tuple(tuple(group) for group in groups.values())
 
 
-def _domain_profiler_teacher_fold_results(
-    domain: GenericDomain,
-    costs: list[CandidatePointCost],
-    *,
-    max_leaves: int,
-    seed: str,
-    profiler_training_pool_key: tuple[object, ...],
-    profiler_prediction_cache: ProfilerPredictionCache,
-) -> tuple[_PlacementFoldResult, ...]:
-    """Score leakage-controlled teacher choices on held canonical timing.
+def _profiler_teacher_candidate_costs(
+    costs: Iterable[CandidatePointCost],
+    predictions: Mapping[tuple[RuntimeKey, str, str], float | None],
+) -> tuple[CandidatePointCost, ...] | None:
+    """Turn one leakage-controlled profiler surface into tree-fit labels.
 
-    The ExtraTrees surrogate for each fold was trained after removing every
-    occurrence of the held N/K geometry across all M values and codebooks. Its
-    dynamic profiler counters were masked under that same boundary. It may
-    therefore infer candidate economics at held runtime features without seeing
-    their timing answer. Candidate selection uses only those predictions;
-    measured regret appears for the first time in the returned decisions and
-    remains the sole CV acceptance score.
+    The profiler model was trained after removing the outer fold's complete
+    N/K geometry. It predicts every candidate on the remaining training groups;
+    the lowest predicted-regret candidate becomes that point's teacher label.
+    Non-target candidates receive a finite domain-local penalty, while all raw
+    measured regret fields remain unchanged and continue to own the strict
+    five-percent leaf gate.
 
-    A successful teacher is not emitted at runtime. Its out-of-fold candidate
-    choices flow through the existing cross-fitted publication stage, which
-    distills them into the same bounded, total generic C++ tree used by every
-    other tournament member.
+    Returning ``None`` disables the teacher for the complete domain CV when any
+    required prediction is unavailable. A partially observed teacher would no
+    longer describe one total runtime model and could make its apparent heldout
+    coverage depend on which fold happened to contain the missing point.
     """
 
-    results = []
-    for fold_index, held_out_groups in enumerate(
-        _domain_folds(domain, costs, seed=seed)
-    ):
-        held_out_costs = [
-            cost
-            for cost in costs
-            if cost.shape_group_id in held_out_groups
-        ]
-        held_out_geometries = {
-            (cost.runtime_key.aggregate_n, cost.runtime_key.k)
-            for cost in held_out_costs
-        }
-        request_key = (
-            profiler_training_pool_key,
-            tuple(sorted(held_out_geometries)),
-        )
-        predictions = profiler_prediction_cache.get(request_key)
-        if predictions is None:
-            raise RuntimeError(
-                "cross-fitted teacher prediction surface was not completed "
-                f"before CV scoring: {request_key}"
-            )
+    costs = tuple(costs)
+    if not costs:
+        return ()
+    matrix = _point_matrix(list(costs))
+    target_by_point = {}
+    for point, candidates in sorted(matrix.items()):
+        predicted = []
+        for candidate in candidates.values():
+            value = predictions.get((
+                candidate.runtime_key,
+                candidate.shape_group_id,
+                candidate.candidate_id,
+            ))
+            if value is None or not math.isfinite(value):
+                return None
+            predicted.append((value, candidate.candidate_id))
+        target_by_point[point] = min(predicted)[1]
 
-        matrix = _point_matrix(held_out_costs)
-        decisions = []
-        uncovered = 0
-        for point, candidates in sorted(matrix.items()):
-            predicted_candidates = []
-            for candidate in candidates.values():
-                prediction = predictions[(
-                    candidate.runtime_key,
-                    candidate.shape_group_id,
-                    candidate.candidate_id,
-                )]
-                if prediction is None:
-                    predicted_candidates = []
-                    break
-                predicted_candidates.append((prediction, candidate.candidate_id))
-            if not predicted_candidates:
-                uncovered += 1
-                continue
-            selected_id = min(predicted_candidates)[1]
-            selected = candidates[selected_id]
-            exact = min(
-                candidates.values(),
-                key=lambda candidate: (
-                    candidate.max_surface_regret,
-                    candidate.p95_surface_regret,
-                    candidate.mean_surface_regret,
-                    candidate.candidate_id,
-                ),
-            )
-            decisions.append((selected, exact))
-
-        decisions = tuple(decisions)
-        complexities = tuple(
-            _ComplexityFoldResult(
-                complexity=complexity,
-                decisions=decisions,
-                uncovered=uncovered,
-                required=len(matrix),
-            )
-            for complexity in range(1, max_leaves + 1)
+    measured_maximum = max(cost.max_surface_regret for cost in costs)
+    mismatch_penalty = max(1.0, measured_maximum + 1.0)
+    return tuple(
+        replace(
+            cost,
+            cross_fitted_selection_regret=(
+                cost.max_surface_regret
+                if cost.candidate_id
+                == target_by_point[(cost.runtime_key, cost.shape_group_id)]
+                else mismatch_penalty
+            ),
         )
-        results.append(_PlacementFoldResult(
-            domain=domain,
-            fold_index=fold_index,
-            feature_policy=FeaturePolicy.CONTINUOUS,
-            placement=BoundaryPlacement.MIDPOINT,
-            profiler_influence=ProfilerInfluence.CROSS_FITTED_TEACHER,
-            complexities=complexities,
-        ))
-    return tuple(results)
+        for cost in costs
+    )
 
 
 def cross_validate_domain_complexity(
@@ -4590,12 +5900,181 @@ _PARALLEL_ACCELERATED_CV_TASK_GROUPS: tuple[
 ] = ()
 _PARALLEL_CV_REDUCTION_TASKS: tuple[tuple, ...] = ()
 _PARALLEL_FINAL_TASKS: tuple[tuple, ...] = ()
+_PARALLEL_FINAL_CANDIDATE_TASKS: tuple[tuple, ...] = ()
+_PARALLEL_DOMAIN_FOLD_PLAN_TASKS: tuple[tuple, ...] = ()
+_PARALLEL_DOMAIN_FOLD_PREDICTION_CACHE: ProfilerPredictionCache | None = None
 
 
 def _evaluate_parallel_cv_index(index: int) -> _PlacementFoldResult:
     """Resolve one inherited CV task by index inside a forked worker."""
 
     return _evaluate_placement_fold(_PARALLEL_CV_TASKS[index])
+
+
+def _construct_parallel_domain_fold_plan_index(index: int) -> tuple[
+    GenericDomain,
+    tuple[tuple, ...],
+    int,
+]:
+    """Construct one domain's complete immutable CV work in a fork worker.
+
+    The parent publishes the large candidate matrices and profiler-prediction
+    cache through copy-on-write globals before forking. Workers receive only an
+    integer index, derive the domain's folds and profiler-influence surfaces,
+    and return results in canonical domain order through ``Executor.map``.
+    This keeps the Python allocation-heavy preparation phase off the parent
+    thread without serializing the complete corpus as worker input.
+    """
+
+    plan_task = _PARALLEL_DOMAIN_FOLD_PLAN_TASKS[index]
+    if len(plan_task) == 6:
+        (
+            domain,
+            costs,
+            max_leaves,
+            min_shape_groups_per_leaf,
+            seed,
+            profiler_training_pool_key,
+        ) = plan_task
+        feature_policies = FEATURE_POLICIES
+    elif len(plan_task) == 7:
+        (
+            domain,
+            costs,
+            max_leaves,
+            min_shape_groups_per_leaf,
+            seed,
+            profiler_training_pool_key,
+            feature_policies,
+        ) = plan_task
+    else:
+        raise ValueError("domain fold-plan task changed its tuple ABI")
+    profiler_prediction_cache = (
+        _PARALLEL_DOMAIN_FOLD_PREDICTION_CACHE
+        if profiler_training_pool_key is not None
+        else None
+    )
+    domain_tasks, fold_count = _domain_fold_tasks(
+        domain,
+        costs,
+        max_leaves=max_leaves,
+        min_shape_groups_per_leaf=min_shape_groups_per_leaf,
+        seed=seed,
+        profiler_training_pool_key=profiler_training_pool_key,
+        profiler_prediction_cache=profiler_prediction_cache,
+        feature_policies=feature_policies,
+    )
+    return domain, domain_tasks, fold_count
+
+
+def _construct_domain_fold_plans(
+    tasks: tuple[tuple, ...],
+    *,
+    profiler_prediction_cache: ProfilerPredictionCache | None,
+    requested_workers: int | None = None,
+    compact: bool = False,
+) -> tuple[
+    tuple[
+        tuple[
+            GenericDomain,
+            tuple[tuple, ...],
+            int,
+        ],
+        ...,
+    ],
+    int,
+]:
+    """Build independent domain fold plans across physical CPU cores.
+
+    Task construction performs deterministic fold partitioning and creates
+    every profiler-blended and teacher-distillation candidate-cost surface.
+    Those operations are independent by generic domain
+    and sufficiently allocation-heavy that a parent-only loop becomes visible
+    during cached fits. A fork pool inherits the immutable evidence and model
+    predictions copy-on-write; ordered ``map`` reduction preserves the exact
+    task stream consumed by CUDA, ROCm, or CPU scoring.
+
+    The worker count follows the same physical-core cap as CV reduction. This
+    deliberately excludes SMT siblings, which add duplicate Python heaps and
+    memory-bandwidth pressure without useful throughput for this phase.
+
+    Production uses compact descriptors. They preserve references to the
+    parent-owned immutable cost and profiler surfaces and are therefore built
+    directly in the parent without any candidate-row serialization. The
+    historical eager form remains parallel for the focused equivalence oracle.
+    """
+
+    global _PARALLEL_DOMAIN_FOLD_PLAN_TASKS
+    global _PARALLEL_DOMAIN_FOLD_PREDICTION_CACHE
+
+    if not tasks:
+        return (), 0
+    if compact:
+        plans = []
+        for plan_task in tasks:
+            if len(plan_task) == 6:
+                (
+                    domain,
+                    costs,
+                    max_leaves,
+                    min_shape_groups_per_leaf,
+                    seed,
+                    profiler_training_pool_key,
+                ) = plan_task
+                feature_policies = FEATURE_POLICIES
+            elif len(plan_task) == 7:
+                (
+                    domain,
+                    costs,
+                    max_leaves,
+                    min_shape_groups_per_leaf,
+                    seed,
+                    profiler_training_pool_key,
+                    feature_policies,
+                ) = plan_task
+            else:
+                raise ValueError("domain fold-plan task changed its tuple ABI")
+            domain_tasks, fold_count = _domain_fold_tasks(
+                domain,
+                costs,
+                max_leaves=max_leaves,
+                min_shape_groups_per_leaf=min_shape_groups_per_leaf,
+                seed=seed,
+                profiler_training_pool_key=profiler_training_pool_key,
+                profiler_prediction_cache=(
+                    profiler_prediction_cache
+                    if profiler_training_pool_key is not None
+                    else None
+                ),
+                feature_policies=feature_policies,
+                compact=True,
+            )
+            plans.append((domain, domain_tasks, fold_count))
+        return tuple(plans), 1
+    worker_count = _cv_reduction_worker_count(
+        len(tasks), requested_workers=requested_workers
+    )
+    _PARALLEL_DOMAIN_FOLD_PLAN_TASKS = tasks
+    _PARALLEL_DOMAIN_FOLD_PREDICTION_CACHE = profiler_prediction_cache
+    try:
+        if worker_count > 1 and len(tasks) >= 4:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                plans = tuple(executor.map(
+                    _construct_parallel_domain_fold_plan_index,
+                    range(len(tasks)),
+                ))
+        else:
+            plans = tuple(
+                _construct_parallel_domain_fold_plan_index(index)
+                for index in range(len(tasks))
+            )
+        return plans, worker_count
+    finally:
+        _PARALLEL_DOMAIN_FOLD_PLAN_TASKS = ()
+        _PARALLEL_DOMAIN_FOLD_PREDICTION_CACHE = None
 
 
 def _reduce_parallel_cv_index(index: int) -> tuple[
@@ -4619,7 +6098,7 @@ def _reduce_parallel_cv_index(index: int) -> tuple[
         fold_count,
         fold_results,
         max_leaves,
-        fit_final_rules,
+        _fit_final_rules,
     ) = _PARALLEL_CV_REDUCTION_TASKS[index]
     ranked = _rank_domain_cross_validations(
         domain,
@@ -4627,11 +6106,9 @@ def _reduce_parallel_cv_index(index: int) -> tuple[
         fold_count,
         fold_results,
         max_leaves=max_leaves,
-        retain_model_cells=not fit_final_rules,
+        retain_model_cells=True,
     )
     selected = ranked[0] if ranked else None
-    if fit_final_rules and selected is not None:
-        selected = _hydrate_cross_validation_cells(selected, fold_results)
     return domain, ranked, selected
 
 
@@ -4794,67 +6271,127 @@ def _fit_cross_fitted_publication_rules(
 ) -> tuple[tuple[GenericDispatchRule, ...], DomainCrossValidation]:
     """Distill one held-out decision surface into the final generic tree.
 
-    The CV model's feature policy and leaf count describe how OOF labels were
-    obtained; they need not be the most compact representation of those labels
-    once all points are available.  Publication therefore runs the complete
-    reviewed feature/placement tournament against the fixed OOF targets.  Tree
-    search still gives measured leaf-p95 failures absolute priority, and the
-    configured maximum leaf budget remains unchanged.
+    The publication tree may use a different reviewed feature/placement pair
+    to compactly represent the fixed OOF labels. Its labels are independently
+    selected held-out decisions from every development geometry, so this
+    distillation phase may use the complete reviewed publication leaf bound.
+    Fold-local complexity is not a valid upper bound here: independently fit
+    folds can place different boundaries, and representing their union can
+    require more leaves than any one fold used. Every emitted leaf still has
+    to pass measured p95 below, and the frozen generic tree is independently
+    exercised by the untouched sealed corpus before installation.
     """
 
     observations = tuple(observations)
     publication_costs, target_by_point = _cross_fitted_publication_costs(
         costs, validation
     )
-    measured_matrix = _point_matrix(list(publication_costs))
-    fitted = []
-    for feature_policy in FEATURE_POLICIES:
-        for placement in BOUNDARY_PLACEMENTS:
-            fit = _fit_tree(
-                list(publication_costs),
-                max_leaves=max_leaves,
-                min_shape_groups_per_leaf=min_shape_groups_per_leaf,
-                boundary_placement=placement,
-                feature_policy=feature_policy,
-                primary_scorer=primary_scorer,
-            )
-            if fit is None:
-                continue
-            selected_by_point = {
-                point: leaf.candidate_id
-                for leaf in _tree_leaves(fit.root)
-                for point in leaf.points
-            }
-            selected_costs = tuple(
-                measured_matrix[point][selected_by_point[point]]
-                for point in sorted(measured_matrix)
-            )
-            observed_p95 = _percentile(
-                (cost.max_surface_regret for cost in selected_costs), 0.95
-            )
-            observed_mean = _ordered_mean(
-                cost.max_surface_regret for cost in selected_costs
-            )
-            mismatch_count = sum(
-                selected_by_point.get(point) != target_candidate
-                for point, target_candidate in target_by_point.items()
-            )
-            fitted.append((
-                fit.root.failed_leaf_count,
-                observed_p95 >= GENERIC_REGRET_BUDGET,
-                observed_p95,
-                observed_mean,
-                mismatch_count,
-                *fit.objective[1:-1],
-                FEATURE_POLICIES.index(feature_policy),
-                BOUNDARY_PLACEMENTS.index(placement),
-                fit.root.signature,
+    publication_leaf_budget = max_leaves
+    if publication_leaf_budget < 1:
+        raise ValueError("cross-fitted publication leaf budget must be positive")
+    fitted = tuple(
+        candidate
+        for feature_policy in _leaf_budget_feature_policies(max_leaves)
+        for placement in _leaf_budget_boundary_placements(max_leaves)
+        if (
+            candidate := _fit_cross_fitted_publication_candidate((
+                publication_costs,
+                target_by_point,
+                publication_leaf_budget,
+                min_shape_groups_per_leaf,
                 feature_policy,
                 placement,
-                fit,
-                selected_by_point,
-            ))
-    if not fitted:
+            ), primary_scorer=primary_scorer)
+        ) is not None
+    )
+    return _materialize_cross_fitted_publication_candidate(
+        domain,
+        observations,
+        validation,
+        target_by_point,
+        min(fitted) if fitted else None,
+    )
+
+
+def _fit_cross_fitted_publication_candidate(
+    args,
+    primary_scorer: NativeVNNILeafPrimaryScorer | None = None,
+):
+    """Fit one independent publication feature/placement candidate.
+
+    Publication searches previously nested all reviewed feature policies and
+    boundary placements inside one domain task. A difficult 15-policy domain
+    consequently left five accelerators idle for minutes. Keeping one candidate
+    as the scheduling unit exposes all 30 independent searches while retaining
+    the exact historical ordering tuple used to choose the winner.
+    """
+
+    (
+        publication_costs,
+        target_by_point,
+        publication_leaf_budget,
+        min_shape_groups_per_leaf,
+        feature_policy,
+        placement,
+    ) = args
+    measured_matrix = _point_matrix(list(publication_costs))
+    fit = _fit_tree(
+        list(publication_costs),
+        max_leaves=publication_leaf_budget,
+        min_shape_groups_per_leaf=min_shape_groups_per_leaf,
+        boundary_placement=placement,
+        feature_policy=feature_policy,
+        primary_scorer=primary_scorer,
+    )
+    if fit is None:
+        return None
+    selected_by_point = {
+        point: leaf.candidate_id
+        for leaf in _tree_leaves(fit.root)
+        for point in leaf.points
+    }
+    selected_costs = tuple(
+        measured_matrix[point][selected_by_point[point]]
+        for point in sorted(measured_matrix)
+    )
+    observed_p95 = _percentile(
+        (cost.max_surface_regret for cost in selected_costs), 0.95
+    )
+    observed_mean = _ordered_mean(
+        cost.max_surface_regret for cost in selected_costs
+    )
+    mismatch_count = sum(
+        selected_by_point.get(point) != target_candidate
+        for point, target_candidate in target_by_point.items()
+    )
+    return (
+        fit.root.failed_leaf_count,
+        observed_p95 >= GENERIC_REGRET_BUDGET,
+        observed_p95,
+        observed_mean,
+        mismatch_count,
+        *fit.objective[1:-1],
+        FEATURE_POLICIES.index(feature_policy),
+        BOUNDARY_PLACEMENTS.index(placement),
+        fit.root.signature,
+        feature_policy,
+        placement,
+        fit,
+        selected_by_point,
+    )
+
+
+def _materialize_cross_fitted_publication_candidate(
+    domain: GenericDomain,
+    observations: Iterable[NativeVNNIObservation],
+    validation: DomainCrossValidation,
+    target_by_point: Mapping[tuple[RuntimeKey, str], str],
+    selected,
+) -> tuple[tuple[GenericDispatchRule, ...], DomainCrossValidation]:
+    """Turn one deterministically selected publication candidate into rules."""
+
+    observations = tuple(observations)
+    if selected is None:
         return (), replace(
             validation,
             publication_oof_p95_regret=math.inf,
@@ -4862,7 +6399,6 @@ def _fit_cross_fitted_publication_rules(
             publication_oof_mismatch_count=len(target_by_point),
         )
 
-    selected = min(fitted)
     feature_policy, placement, fit, selected_by_point = selected[-4:]
     exemplar_by_candidate = {
         row.candidate_id: row for row in observations
@@ -4872,21 +6408,13 @@ def _fit_cross_fitted_publication_rules(
         selected_by_point.get(point) != target_candidate
         for point, target_candidate in target_by_point.items()
     )
-    selected_costs = tuple(
-        measured_matrix[point][selected_by_point[point]]
-        for point in sorted(measured_matrix)
-    )
     return rules, replace(
         validation,
         publication_feature_policy=feature_policy,
         publication_max_leaves=fit.leaf_count,
         publication_boundary_placement=placement,
-        publication_oof_p95_regret=_percentile(
-            (cost.max_surface_regret for cost in selected_costs), 0.95
-        ),
-        publication_oof_mean_regret=_ordered_mean(
-            cost.max_surface_regret for cost in selected_costs
-        ),
+        publication_oof_p95_regret=selected[2],
+        publication_oof_mean_regret=selected[3],
         publication_oof_mismatch_count=mismatch_count,
     )
 
@@ -4916,9 +6444,9 @@ def _fit_final_domain(
     if not validation_frontier:
         raise ValueError("final fit requires a non-empty promotable CV frontier")
 
-    best_failure = None
     fitted_by_targets = {}
-    for frontier_rank, validation in enumerate(validation_frontier):
+    fitted_frontier = []
+    for validation in validation_frontier:
         validation = _hydrate_cross_validation_cells(validation, fold_results)
         target_signature = tuple(
             (cell.runtime_key, cell.shape_group_id, cell.selected_candidate_id)
@@ -4959,6 +6487,20 @@ def _fit_final_domain(
                     fitted_validation.publication_oof_mismatch_count
                 ),
             )
+        fitted_frontier.append((rules, fitted_validation))
+    return _select_final_domain_frontier(domain, fitted_frontier)
+
+
+def _select_final_domain_frontier(
+    domain: GenericDomain,
+    fitted_frontier: Iterable[
+        tuple[tuple[GenericDispatchRule, ...], DomainCrossValidation]
+    ],
+):
+    """Select the first promotable publication target or its best failure."""
+
+    best_failure = None
+    for frontier_rank, (rules, fitted_validation) in enumerate(fitted_frontier):
         cross_fitted_p95 = (
             fitted_validation.publication_oof_p95_regret
             if fitted_validation.publication_oof_p95_regret is not None
@@ -5003,6 +6545,132 @@ def _fit_parallel_final_index(index: int):
     """Resolve one inherited final-fit task by index inside a forked worker."""
 
     return _fit_final_domain(_PARALLEL_FINAL_TASKS[index])
+
+
+def _fit_accelerated_final_candidate_index(
+    index: int,
+    primary_scorer: NativeVNNILeafPrimaryScorer,
+):
+    """Fit one inherited publication candidate on one accelerator lane."""
+
+    context_index, candidate_args = _PARALLEL_FINAL_CANDIDATE_TASKS[index]
+    return (
+        context_index,
+        _fit_cross_fitted_publication_candidate(
+            candidate_args,
+            primary_scorer=primary_scorer,
+        ),
+    )
+
+
+def _prepare_accelerated_final_candidates(
+    final_tasks: Iterable[tuple],
+) -> tuple[tuple[tuple, ...], tuple[tuple, ...], tuple[Mapping, ...]]:
+    """Expand domain publication work into independent candidate searches.
+
+    The returned frontier records retain validation order and share one context
+    index for duplicate OOF target surfaces. Candidate task tuples reference the
+    immutable publication-cost object directly; fork workers inherit it through
+    copy-on-write rather than receiving repeated corpus payloads through pipes.
+    """
+
+    candidate_tasks = []
+    prepared_frontiers = []
+    targets_by_context = []
+    for final_task in final_tasks:
+        (
+            domain,
+            costs,
+            observations,
+            validation_frontier,
+            fold_results,
+            min_shape_groups_per_leaf,
+            max_leaves,
+        ) = final_task
+        contexts_by_target = {}
+        prepared_frontier = []
+        for validation in validation_frontier:
+            hydrated = _hydrate_cross_validation_cells(
+                validation, fold_results
+            )
+            target_signature = tuple(
+                (
+                    cell.runtime_key,
+                    cell.shape_group_id,
+                    cell.selected_candidate_id,
+                )
+                for cell in hydrated.cells
+            )
+            context_index = contexts_by_target.get(target_signature)
+            if context_index is None:
+                publication_costs, target_by_point = (
+                    _cross_fitted_publication_costs(costs, hydrated)
+                )
+                context_index = len(targets_by_context)
+                contexts_by_target[target_signature] = context_index
+                targets_by_context.append(target_by_point)
+                for feature_policy in _leaf_budget_feature_policies(
+                    max_leaves
+                ):
+                    for placement in _leaf_budget_boundary_placements(
+                        max_leaves
+                    ):
+                        candidate_tasks.append((
+                            context_index,
+                            (
+                                publication_costs,
+                                target_by_point,
+                                max_leaves,
+                                min_shape_groups_per_leaf,
+                                feature_policy,
+                                placement,
+                            ),
+                        ))
+            prepared_frontier.append((hydrated, context_index))
+        prepared_frontiers.append((
+            domain,
+            tuple(observations),
+            tuple(prepared_frontier),
+        ))
+    return (
+        tuple(candidate_tasks),
+        tuple(prepared_frontiers),
+        tuple(targets_by_context),
+    )
+
+
+def _reduce_accelerated_final_candidates(
+    candidate_results: Iterable[tuple[int, tuple | None]],
+    prepared_frontiers: Iterable[tuple],
+    targets_by_context: tuple[Mapping, ...],
+):
+    """Reduce independently scored candidates into exact domain winners."""
+
+    candidates_by_context = defaultdict(list)
+    for context_index, candidate in candidate_results:
+        if candidate is not None:
+            candidates_by_context[context_index].append(candidate)
+    selected_by_context = {
+        context_index: min(candidates_by_context.get(context_index, ()), default=None)
+        for context_index in range(len(targets_by_context))
+    }
+
+    final_fits = []
+    for domain, observations, prepared_frontier in prepared_frontiers:
+        fitted_frontier = tuple(
+            _materialize_cross_fitted_publication_candidate(
+                domain,
+                observations,
+                validation,
+                targets_by_context[context_index],
+                selected_by_context[context_index],
+            )
+            for validation, context_index in prepared_frontier
+        )
+        final_fits.append(
+            _select_final_domain_frontier(domain, fitted_frontier)
+        )
+    return final_fits
 
 
 @dataclass(frozen=True)
@@ -5073,6 +6741,11 @@ def _accelerated_worker(
                 result = _fit_final_domain(
                     _PARALLEL_FINAL_TASKS[task_index],
                     primary_scorer=scorer,
+                )
+            elif task_kind == "final-candidate":
+                result = _fit_accelerated_final_candidate_index(
+                    task_index,
+                    scorer,
                 )
             else:
                 raise RuntimeError(
@@ -5153,8 +6826,10 @@ def _run_accelerated_tasks(
 
     if not specs:
         raise ValueError("accelerated policy scheduling requires a device spec")
-    if task_kind not in ("cv", "final"):
-        raise ValueError("accelerated policy task kind must be cv or final")
+    if task_kind not in ("cv", "final", "final-candidate"):
+        raise ValueError(
+            "accelerated policy task kind must be cv, final, or final-candidate"
+        )
     if not task_weights:
         return []
     timing_enabled = os.environ.get(
@@ -5372,6 +7047,85 @@ def _profiler_transfer_key(domain: GenericDomain) -> tuple[object, ...]:
     )
 
 
+_PARALLEL_PROFILER_DIGEST_CATALOG: ProfilerFeatureCatalog | None = None
+_PARALLEL_PROFILER_DIGEST_POOLS: tuple[
+    tuple[tuple[object, ...], tuple[NativeVNNIObservation, ...]], ...
+] = ()
+
+
+def _profiler_model_digest_at(
+    index: int,
+) -> tuple[tuple[object, ...], str]:
+    """Hash one independent profiler transfer pool in a fork worker."""
+
+    if _PARALLEL_PROFILER_DIGEST_CATALOG is None:
+        raise RuntimeError("parallel profiler digest catalog is unavailable")
+    pool_key, rows = _PARALLEL_PROFILER_DIGEST_POOLS[index]
+    return (
+        pool_key,
+        _PARALLEL_PROFILER_DIGEST_CATALOG.model_digest_for(rows),
+    )
+
+
+def _profiler_model_digests_for_pools(
+    catalog: ProfilerFeatureCatalog,
+    pools: Mapping[
+        tuple[object, ...], Iterable[NativeVNNIObservation]
+    ],
+) -> dict[tuple[object, ...], str]:
+    """Hash disjoint profiler transfer pools across physical CPU cores.
+
+    A model digest canonicalizes every normalized descriptor reachable by one
+    transfer pool.  CPU policy generations commonly own several independent
+    ISA/runtime pools, and serial JSON construction left all but one core idle
+    for multiple seconds during every incremental replay.  Fork workers inherit
+    the immutable corpus and catalog, receive only integer indices, and return
+    one small digest.  This avoids serializing the descriptor table through a
+    multiprocessing pipe while preserving deterministic pool identities.
+    """
+
+    global _PARALLEL_PROFILER_DIGEST_CATALOG
+    global _PARALLEL_PROFILER_DIGEST_POOLS
+
+    pool_items = tuple(
+        (pool_key, tuple(rows)) for pool_key, rows in pools.items()
+    )
+    if not pool_items:
+        return {}
+    requested_workers = int(os.environ.get(
+        "LLAMINAR_NATIVE_VNNI_POLICY_WORKERS",
+        str(_physical_core_worker_count()),
+    ))
+    if requested_workers < 1:
+        raise ValueError("policy worker count must be positive")
+    worker_count = min(
+        requested_workers,
+        _physical_core_worker_count(),
+        len(pool_items),
+    )
+    _PARALLEL_PROFILER_DIGEST_CATALOG = catalog
+    _PARALLEL_PROFILER_DIGEST_POOLS = pool_items
+    try:
+        if worker_count > 1:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                results = tuple(executor.map(
+                    _profiler_model_digest_at,
+                    range(len(pool_items)),
+                ))
+        else:
+            results = tuple(
+                _profiler_model_digest_at(index)
+                for index in range(len(pool_items))
+            )
+        return dict(results)
+    finally:
+        _PARALLEL_PROFILER_DIGEST_CATALOG = None
+        _PARALLEL_PROFILER_DIGEST_POOLS = ()
+
+
 ProfilerPredictionCacheKey = tuple[
     tuple[object, ...],
     tuple[tuple[int, int], ...],
@@ -5379,12 +7133,12 @@ ProfilerPredictionCacheKey = tuple[
 ProfilerPredictionPoint = tuple[RuntimeKey, str, str]
 ProfilerPredictionCache = dict[
     ProfilerPredictionCacheKey,
-    dict[ProfilerPredictionPoint, float | None],
+    Mapping[ProfilerPredictionPoint, float | None],
 ]
 ProfilerPredictionPoolResult = tuple[
     tuple[
         ProfilerPredictionCacheKey,
-        dict[ProfilerPredictionPoint, float | None],
+        dict[ProfilerPredictionPoint, float | None] | None,
     ], ...
 ]
 ProfilerPredictionPointRequests = Mapping[
@@ -5407,6 +7161,159 @@ _PARALLEL_PROFILER_MODEL_RECORD_INDICES: Mapping[
     ]
 ] = {}
 _PARALLEL_PROFILER_PREDICTION_POINTS: ProfilerPredictionPointRequests = {}
+_PARALLEL_PROFILER_PERSISTENT_CACHE_TASKS: tuple[tuple, ...] = ()
+_PARALLEL_PROFILER_FIT_CACHE: PolicyFitCache | None = None
+_PARALLEL_PROFILER_STORE_IDENTITIES: Mapping[
+    ProfilerPredictionCacheKey, tuple[str, str, str]
+] = {}
+_PARALLEL_PROFILER_SURROGATE_DEVICE: str | None = None
+
+
+def _initialize_parallel_profiler_gpu_worker(
+    devices: tuple[str, ...],
+) -> None:
+    """Assign one persistent fit worker to one CUDA device."""
+
+    identity = multiprocessing.current_process()._identity
+    if not identity:
+        raise RuntimeError("profiler GPU worker has no process identity")
+    global _PARALLEL_PROFILER_SURROGATE_DEVICE
+    _PARALLEL_PROFILER_SURROGATE_DEVICE = devices[(identity[-1] - 1) % len(devices)]
+
+
+def _load_parallel_profiler_prediction_cache_index(
+    index: int,
+) -> tuple[
+    ProfilerPredictionCacheKey,
+    str,
+    bool,
+]:
+    """Hash and load one inherited persistent prediction surface."""
+
+    if _PARALLEL_PROFILER_FIT_CACHE is None:
+        raise RuntimeError("parallel profiler prediction cache is not initialized")
+    (
+        request_key,
+        training_pool_digest,
+        profiler_model_digest,
+        prediction_points,
+        load_cached_predictions,
+    ) = _PARALLEL_PROFILER_PERSISTENT_CACHE_TASKS[index]
+    _pool_key, held_out_geometries = request_key
+    persistent_key = _PARALLEL_PROFILER_FIT_CACHE.profiler_prediction_key(
+        training_pool_digest=training_pool_digest,
+        profiler_model_digest=profiler_model_digest,
+        held_out_geometries=held_out_geometries,
+        prediction_points=prediction_points,
+    )
+    cached_predictions = (
+        _PARALLEL_PROFILER_FIT_CACHE.load_profiler_predictions(
+            persistent_key,
+            training_pool_digest=training_pool_digest,
+            profiler_model_digest=profiler_model_digest,
+            held_out_geometries=held_out_geometries,
+            prediction_points=prediction_points,
+        )
+        if load_cached_predictions
+        else None
+    )
+    return request_key, persistent_key, cached_predictions is not None
+
+
+def _load_persistent_profiler_prediction_cache(
+    request_keys: tuple[ProfilerPredictionCacheKey, ...],
+    prediction_points_by_request: ProfilerPredictionPointRequests,
+    prediction_cache: ProfilerPredictionCache,
+    fit_cache: PolicyFitCache,
+    training_pool_digests: Mapping[tuple[object, ...], str],
+    profiler_model_digests: Mapping[tuple[object, ...], str],
+    *,
+    requested_workers: int | None = None,
+) -> tuple[dict[ProfilerPredictionCacheKey, str], int, int]:
+    """Resolve content keys and cache hits across physical CPU cores.
+
+    A persistent prediction key covers the full output point inventory. Large
+    all-format runs therefore canonicalize tens of thousands of runtime points
+    for each independently held geometry surface. The work is CPU-bound JSON
+    encoding and SHA-256 hashing, followed by independent cache-file parsing;
+    doing it on the parent left every accelerator idle for more than a minute.
+
+    Fork workers inherit all immutable point sets and the cache root
+    copy-on-write. ``Executor.map`` returns in request order, while every result
+    also carries its request key, so parallel completion cannot alter policy or
+    cache identity. The process count is capped at affinity-visible physical
+    cores and never counts SMT siblings as additional capacity.
+    """
+
+    global _PARALLEL_PROFILER_PERSISTENT_CACHE_TASKS
+    global _PARALLEL_PROFILER_FIT_CACHE
+
+    if not request_keys:
+        return {}, 0, 0
+    if requested_workers is None:
+        requested_workers = int(os.environ.get(
+            "LLAMINAR_NATIVE_VNNI_POLICY_WORKERS",
+            str(_physical_core_worker_count()),
+        ))
+    if requested_workers < 1:
+        raise ValueError("policy worker count must be positive")
+    worker_count = min(
+        requested_workers,
+        _physical_core_worker_count(),
+        len(request_keys),
+    )
+    tasks = tuple(
+        (
+            request_key,
+            training_pool_digests[request_key[0]],
+            profiler_model_digests[request_key[0]],
+            prediction_points_by_request[request_key],
+            request_key not in prediction_cache,
+        )
+        for request_key in request_keys
+    )
+    _PARALLEL_PROFILER_PERSISTENT_CACHE_TASKS = tasks
+    _PARALLEL_PROFILER_FIT_CACHE = fit_cache
+    try:
+        if worker_count > 1 and len(tasks) >= 4:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                results = tuple(executor.map(
+                    _load_parallel_profiler_prediction_cache_index,
+                    range(len(tasks)),
+                ))
+        else:
+            results = tuple(
+                _load_parallel_profiler_prediction_cache_index(index)
+                for index in range(len(tasks))
+            )
+    finally:
+        _PARALLEL_PROFILER_PERSISTENT_CACHE_TASKS = ()
+        _PARALLEL_PROFILER_FIT_CACHE = None
+
+    persistent_keys = {}
+    cache_hits = 0
+    for request_key, persistent_key, cache_hit in results:
+        persistent_keys[request_key] = persistent_key
+        if cache_hit:
+            pool_key, held_out_geometries = request_key
+            cached_predictions = fit_cache.load_profiler_predictions(
+                persistent_key,
+                training_pool_digest=training_pool_digests[pool_key],
+                profiler_model_digest=profiler_model_digests[pool_key],
+                held_out_geometries=held_out_geometries,
+                prediction_points=prediction_points_by_request[request_key],
+                authenticate_values=False,
+            )
+            if cached_predictions is None:
+                raise RuntimeError(
+                    "authenticated profiler prediction cache disappeared"
+                )
+            prediction_cache[request_key] = cached_predictions
+            cache_hits += 1
+    return persistent_keys, worker_count, cache_hits
 
 
 def _domain_profiler_prediction_request_keys(
@@ -5454,9 +7361,17 @@ def _domain_profiler_prediction_requests(
     """
 
     pool_key = _profiler_transfer_key(domain)
+    requested_points = frozenset(
+        (
+            cost.runtime_key,
+            cost.shape_group_id,
+            cost.candidate_id,
+        )
+        for cost in costs
+    )
     requests: dict[
-        ProfilerPredictionCacheKey, set[ProfilerPredictionPoint]
-    ] = defaultdict(set)
+        ProfilerPredictionCacheKey, frozenset[ProfilerPredictionPoint]
+    ] = {}
     for held_out_groups in _domain_folds(domain, costs, seed=seed):
         held_out_geometries = {
             (cost.runtime_key.aggregate_n, cost.runtime_key.k)
@@ -5464,18 +7379,8 @@ def _domain_profiler_prediction_requests(
             if cost.shape_group_id in held_out_groups
         }
         request_key = (pool_key, tuple(sorted(held_out_geometries)))
-        requests[request_key].update(
-            (
-                cost.runtime_key,
-                cost.shape_group_id,
-                cost.candidate_id,
-            )
-            for cost in costs
-        )
-    return {
-        key: frozenset(points)
-        for key, points in requests.items()
-    }
+        requests[request_key] = requested_points
+    return requests
 
 
 def _fit_profiler_prediction_pool(
@@ -5485,12 +7390,16 @@ def _fit_profiler_prediction_pool(
     corpus: ObservationCorpus,
     catalog: ProfilerFeatureCatalog,
     observation_index: ProfilerObservationIndex,
-    model_record_index: Mapping[
-        tuple[RuntimeKey, str, str], dict[str, float | str]
-    ] | None = None,
+    model_record_index: (
+        Mapping[tuple[RuntimeKey, str, str], dict[str, float | str]]
+        | ProfilerModelRecordIndex
+        | None
+    ) = None,
     prediction_points_by_request: ProfilerPredictionPointRequests | None = None,
+    *,
+    surrogate_device: str = "cuda:0",
 ) -> ProfilerPredictionPoolResult:
-    """Fit requested forests from one immutable pool feature index."""
+    """Fit requested GPU histogram surfaces from one immutable feature index."""
 
     if model_record_index is None:
         model_record_index = build_profiler_model_record_index(
@@ -5508,14 +7417,25 @@ def _fit_profiler_prediction_pool(
                 f"pool: expected {pool_key}, received {request_pool_key}"
             )
         held_out_geometry_set = set(held_out_geometries)
-        model_training_costs = [
-            cost
-            for cost in training_pool
-            if (
-                cost.runtime_key.aggregate_n,
-                cost.runtime_key.k,
-            ) not in held_out_geometry_set
-        ]
+        if isinstance(model_record_index, ProfilerModelRecordIndex):
+            anchors = np.asarray(model_record_index.anchor_matrix)
+            held_rows = np.zeros(len(training_pool), dtype=np.bool_)
+            for n, k in held_out_geometry_set:
+                held_rows |= (anchors[:, 0] == n) & (anchors[:, 1] == k)
+            model_training_rows = np.flatnonzero(~held_rows)
+            model_training_costs = None
+        else:
+            model_training_rows = [
+                row
+                for row, cost in enumerate(training_pool)
+                if (
+                    cost.runtime_key.aggregate_n,
+                    cost.runtime_key.k,
+                ) not in held_out_geometry_set
+            ]
+            model_training_costs = [
+                training_pool[row] for row in model_training_rows
+            ]
         requested_points = (
             frozenset(
                 (
@@ -5528,49 +7448,79 @@ def _fit_profiler_prediction_pool(
             if prediction_points_by_request is None
             else prediction_points_by_request[request_key]
         )
-        prediction_costs = [
-            cost
-            for cost in training_pool
-            if (
-                cost.runtime_key,
-                cost.shape_group_id,
-                cost.candidate_id,
-            ) in requested_points
-        ]
-        observed_points = {
-            (
-                cost.runtime_key,
-                cost.shape_group_id,
-                cost.candidate_id,
+        if isinstance(model_record_index, ProfilerModelRecordIndex):
+            prediction_rows = model_record_index.row_indices_for_points(
+                requested_points
             )
-            for cost in prediction_costs
-        }
-        if observed_points != requested_points:
+        else:
+            prediction_rows = [
+                row
+                for row, cost in enumerate(training_pool)
+                if (
+                    cost.runtime_key,
+                    cost.shape_group_id,
+                    cost.candidate_id,
+                ) in requested_points
+            ]
+        prediction_costs = [training_pool[row] for row in prediction_rows]
+        if len(prediction_rows) != len(requested_points):
             raise ValueError(
                 "profiler prediction request contains points outside its "
-                f"training pool: missing={len(requested_points - observed_points)}"
+                "training pool"
             )
-        informed_pool = apply_profiler_regret_predictions(
-            prediction_costs,
-            corpus,
-            catalog,
-            observation_index=observation_index,
-            model_training_costs=model_training_costs,
-            model_record_index=model_record_index,
-            excluded_profiler_geometries=frozenset(
-                held_out_geometry_set
-            ),
-        )
-        fitted.append((
-            request_key,
-            {
+        if isinstance(model_record_index, ProfilerModelRecordIndex):
+            compact_predictions = _compact_profiler_regret_prediction_values(
+                prediction_costs,
+                model_training_costs,
+                model_record_index,
+                training_row_indices=model_training_rows,
+                prediction_row_indices=prediction_rows,
+                excluded_profiler_geometries=frozenset(
+                    held_out_geometry_set
+                ),
+                surrogate_device=surrogate_device,
+            )
+            prediction_values = (
+                (cost.profiler_predicted_regret for cost in prediction_costs)
+                if compact_predictions is None
+                else (float(value) for value in compact_predictions)
+            )
+            predictions = {
+                (
+                    cost.runtime_key,
+                    cost.shape_group_id,
+                    cost.candidate_id,
+                ): prediction
+                for cost, prediction in zip(
+                    prediction_costs, prediction_values, strict=True
+                )
+            }
+        else:
+            informed_pool = apply_profiler_regret_predictions(
+                prediction_costs,
+                corpus,
+                catalog,
+                observation_index=observation_index,
+                model_training_costs=model_training_costs,
+                model_record_index=model_record_index,
+                model_training_row_indices=model_training_rows,
+                prediction_row_indices=prediction_rows,
+                excluded_profiler_geometries=frozenset(
+                    held_out_geometry_set
+                ),
+                _surrogate_device=surrogate_device,
+            )
+            predictions = {
                 (
                     cost.runtime_key,
                     cost.shape_group_id,
                     cost.candidate_id,
                 ): cost.profiler_predicted_regret
                 for cost in informed_pool
-            },
+            }
+        fitted.append((
+            request_key,
+            predictions,
         ))
     return tuple(fitted)
 
@@ -5578,16 +7528,24 @@ def _fit_profiler_prediction_pool(
 def _fit_parallel_profiler_pool_index(
     index: int,
 ) -> ProfilerPredictionPoolResult:
-    """Fit one global pool task inside a forked copy-on-write worker."""
+    """Fit and durably publish one pool task in its owning fork worker.
+
+    Prediction surfaces are independent content-addressed transactions.  The
+    worker that already owns a fitted surface also owns its compact binary
+    encoding and atomic write. A durable worker returns only request identities;
+    the coordinator reconstructs values from those files instead of receiving
+    millions of repeated point keys through the process pipe as pickle.
+    """
 
     if (
         _PARALLEL_PROFILER_CORPUS is None
         or _PARALLEL_PROFILER_CATALOG is None
         or _PARALLEL_PROFILER_OBSERVATION_INDEX is None
+        or _PARALLEL_PROFILER_SURROGATE_DEVICE is None
     ):
         raise RuntimeError("parallel profiler model context is not initialized")
     pool_key, request_keys = _PARALLEL_PROFILER_POOL_TASKS[index]
-    return _fit_profiler_prediction_pool(
+    fitted = _fit_profiler_prediction_pool(
         pool_key,
         request_keys,
         _PARALLEL_PROFILER_TRAINING_POOLS[pool_key],
@@ -5596,7 +7554,33 @@ def _fit_parallel_profiler_pool_index(
         _PARALLEL_PROFILER_OBSERVATION_INDEX,
         _PARALLEL_PROFILER_MODEL_RECORD_INDICES[pool_key],
         _PARALLEL_PROFILER_PREDICTION_POINTS,
+        surrogate_device=_PARALLEL_PROFILER_SURROGATE_DEVICE,
     )
+    if _PARALLEL_PROFILER_FIT_CACHE is not None:
+        for request_key, predictions in fitted:
+            try:
+                (
+                    persistent_key,
+                    training_pool_digest,
+                    profiler_model_digest,
+                ) = _PARALLEL_PROFILER_STORE_IDENTITIES[request_key]
+            except KeyError as error:
+                raise RuntimeError(
+                    "parallel profiler cache publication omitted one identity"
+                ) from error
+            _pool_key, held_out_geometries = request_key
+            _PARALLEL_PROFILER_FIT_CACHE.store_profiler_predictions(
+                persistent_key,
+                training_pool_digest=training_pool_digest,
+                profiler_model_digest=profiler_model_digest,
+                held_out_geometries=held_out_geometries,
+                predictions=predictions,
+                prediction_points=(
+                    _PARALLEL_PROFILER_PREDICTION_POINTS[request_key]
+                ),
+            )
+        return tuple((request_key, None) for request_key, _values in fitted)
+    return fitted
 
 
 def _populate_profiler_prediction_cache(
@@ -5614,16 +7598,15 @@ def _populate_profiler_prediction_cache(
     fit_cache: PolicyFitCache | None = None,
     training_pool_digests: Mapping[tuple[object, ...], str] | None = None,
     profiler_model_digests: Mapping[tuple[object, ...], str] | None = None,
+    surrogate_devices: tuple[str, ...] | None = None,
 ) -> int:
-    """Fit every missing profiler surface concurrently across host cores.
+    """Fit missing profiler surfaces on persistent CUDA-device workers.
 
     The parent materializes each cross-M pool's candidate descriptors and
-    normalized profiler interactions once. Forked workers inherit those
-    immutable indices copy-on-write and independently fit held-out surfaces,
-    allowing even one large pool to occupy the complete host. Every individual
-    sklearn model is single-threaded, preventing nested oversubscription while
-    surface-level work occupies all host cores. Fixed random seeds make
-    completion order irrelevant to output.
+    normalized profiler interactions once. One persistent process owns each
+    selected CUDA device and executes whole GPU histogram surfaces serially on
+    that device, preventing VRAM oversubscription while both local NVIDIA GPUs
+    remain occupied. Fixed random seeds make completion order irrelevant.
 
     Returns the number of model workers used, for fit diagnostics.
     """
@@ -5635,6 +7618,9 @@ def _populate_profiler_prediction_cache(
     global _PARALLEL_PROFILER_OBSERVATION_INDEX
     global _PARALLEL_PROFILER_MODEL_RECORD_INDICES
     global _PARALLEL_PROFILER_PREDICTION_POINTS
+    global _PARALLEL_PROFILER_FIT_CACHE
+    global _PARALLEL_PROFILER_STORE_IDENTITIES
+    global _PARALLEL_PROFILER_SURROGATE_DEVICE
 
     request_keys = tuple(dict.fromkeys(request_keys))
     if prediction_points_by_request is None:
@@ -5665,26 +7651,29 @@ def _populate_profiler_prediction_cache(
             raise ValueError(
                 "persistent profiler predictions require pool and model digests"
             )
-        for request_key in request_keys:
-            pool_key, held_out_geometries = request_key
-            persistent_key = fit_cache.profiler_prediction_key(
-                training_pool_digest=training_pool_digests[pool_key],
-                profiler_model_digest=profiler_model_digests[pool_key],
-                held_out_geometries=held_out_geometries,
-                prediction_points=prediction_points_by_request[request_key],
+        persistent_cache_started = time.perf_counter()
+        (
+            persistent_keys,
+            persistent_cache_workers,
+            persistent_cache_hits,
+        ) = _load_persistent_profiler_prediction_cache(
+            request_keys,
+            prediction_points_by_request,
+            prediction_cache,
+            fit_cache,
+            training_pool_digests,
+            profiler_model_digests,
+            requested_workers=requested_workers,
+        )
+        if os.environ.get("LLAMINAR_NATIVE_VNNI_POLICY_TIMING", "0") == "1":
+            print(
+                "NativeVNNI profiler prediction cache complete "
+                f"elapsed={time.perf_counter() - persistent_cache_started:.3f}s "
+                f"workers={persistent_cache_workers} "
+                f"hits={persistent_cache_hits}/{len(request_keys)}",
+                file=sys.stderr,
+                flush=True,
             )
-            persistent_keys[request_key] = persistent_key
-            if request_key in prediction_cache:
-                continue
-            cached_predictions = fit_cache.load_profiler_predictions(
-                persistent_key,
-                training_pool_digest=training_pool_digests[pool_key],
-                profiler_model_digest=profiler_model_digests[pool_key],
-                held_out_geometries=held_out_geometries,
-                prediction_points=prediction_points_by_request[request_key],
-            )
-            if cached_predictions is not None:
-                prediction_cache[request_key] = cached_predictions
 
     missing_requests = tuple(dict.fromkeys(
         key for key in request_keys if key not in prediction_cache
@@ -5696,12 +7685,14 @@ def _populate_profiler_prediction_cache(
     ] = defaultdict(list)
     for request_key in missing_requests:
         requests_by_pool[request_key[0]].append(request_key)
+    exemplar_index = _profiler_exemplar_index(observation_index)
     model_record_indices = {
         pool_key: build_profiler_model_record_index(
             training_pools[pool_key],
             corpus,
             catalog,
             observation_index=observation_index,
+            exemplar_index=exemplar_index,
         )
         for pool_key in requests_by_pool
     }
@@ -5716,13 +7707,23 @@ def _populate_profiler_prediction_cache(
 
     if requested_workers is None:
         requested_workers = int(os.environ.get(
-            "LLAMINAR_NATIVE_VNNI_PROFILER_MODEL_WORKERS",
-            str(_physical_core_worker_count()),
+            "LLAMINAR_NATIVE_VNNI_PROFILER_MODEL_WORKERS", "2147483647"
         ))
     if requested_workers < 1:
         raise ValueError("profiler model worker count must be positive")
-    worker_count = min(requested_workers, len(pool_tasks))
+    if surrogate_devices is None:
+        surrogate_devices = _profiler_surrogate_cuda_devices()
+    if not surrogate_devices or any(
+        not device.strip() for device in surrogate_devices
+    ):
+        raise ValueError("profiler surrogate device inventory is empty")
+    worker_count = min(
+        requested_workers,
+        len(pool_tasks),
+        len(surrogate_devices),
+    )
     executor = None
+    workers_publish_cache = False
     try:
         if worker_count == 1 or len(pool_tasks) < 4:
             fitted_pools = (
@@ -5735,6 +7736,7 @@ def _populate_profiler_prediction_cache(
                     observation_index,
                     model_record_indices[pool_key],
                     prediction_points_by_request,
+                    surrogate_device=surrogate_devices[0],
                 )
                 for pool_key, pool_requests in pool_tasks
             )
@@ -5748,9 +7750,22 @@ def _populate_profiler_prediction_cache(
             _PARALLEL_PROFILER_PREDICTION_POINTS = (
                 prediction_points_by_request
             )
+            if fit_cache is not None:
+                _PARALLEL_PROFILER_FIT_CACHE = fit_cache
+                _PARALLEL_PROFILER_STORE_IDENTITIES = {
+                    request_key: (
+                        persistent_keys[request_key],
+                        training_pool_digests[request_key[0]],
+                        profiler_model_digests[request_key[0]],
+                    )
+                    for request_key in missing_requests
+                }
+                workers_publish_cache = True
             executor = ProcessPoolExecutor(
                 max_workers=worker_count,
                 mp_context=multiprocessing.get_context("fork"),
+                initializer=_initialize_parallel_profiler_gpu_worker,
+                initargs=(surrogate_devices,),
             )
             futures = tuple(
                 executor.submit(_fit_parallel_profiler_pool_index, index)
@@ -5765,8 +7780,27 @@ def _populate_profiler_prediction_cache(
             )
         for fitted_pool in fitted_pools:
             for request_key, predictions in fitted_pool:
+                if predictions is None:
+                    if fit_cache is None or not workers_publish_cache:
+                        raise RuntimeError(
+                            "profiler worker omitted non-durable predictions"
+                        )
+                    pool_key, held_out_geometries = request_key
+                    predictions = fit_cache.load_profiler_predictions(
+                        persistent_keys[request_key],
+                        training_pool_digest=training_pool_digests[pool_key],
+                        profiler_model_digest=profiler_model_digests[pool_key],
+                        held_out_geometries=held_out_geometries,
+                        prediction_points=(
+                            prediction_points_by_request[request_key]
+                        ),
+                    )
+                    if predictions is None:
+                        raise RuntimeError(
+                            "profiler worker publication was not durable"
+                        )
                 prediction_cache[request_key] = predictions
-                if fit_cache is not None:
+                if fit_cache is not None and not workers_publish_cache:
                     pool_key, held_out_geometries = request_key
                     fit_cache.store_profiler_predictions(
                         persistent_keys[request_key],
@@ -5774,10 +7808,16 @@ def _populate_profiler_prediction_cache(
                         profiler_model_digest=profiler_model_digests[pool_key],
                         held_out_geometries=held_out_geometries,
                         predictions=predictions,
+                        prediction_points=(
+                            prediction_points_by_request[request_key]
+                        ),
                     )
     finally:
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
+        for record_index in model_record_indices.values():
+            if isinstance(record_index, ProfilerModelRecordIndex):
+                record_index.close()
         _PARALLEL_PROFILER_POOL_TASKS = ()
         _PARALLEL_PROFILER_TRAINING_POOLS = {}
         _PARALLEL_PROFILER_CORPUS = None
@@ -5785,6 +7825,9 @@ def _populate_profiler_prediction_cache(
         _PARALLEL_PROFILER_OBSERVATION_INDEX = None
         _PARALLEL_PROFILER_MODEL_RECORD_INDICES = {}
         _PARALLEL_PROFILER_PREDICTION_POINTS = {}
+        _PARALLEL_PROFILER_FIT_CACHE = None
+        _PARALLEL_PROFILER_STORE_IDENTITIES = {}
+        _PARALLEL_PROFILER_SURROGATE_DEVICE = None
     return worker_count
 
 
@@ -5794,6 +7837,9 @@ def fit_generic_policy(
     serial_m1_hashes: Mapping[RuntimeKey, str] | None = None,
     paired_comparisons: Mapping[
         PairedCellKey, tuple[PairedTimingComparison, ...]
+    ] | None = None,
+    supplemental_development_costs: Mapping[
+        GenericDomain, Iterable[CandidatePointCost]
     ] | None = None,
     max_leaves: int = DEFAULT_TREE_LEAVES,
     min_shape_groups_per_leaf: int = 2,
@@ -5832,6 +7878,7 @@ def fit_generic_policy(
     global _PARALLEL_CV_TASKS
     global _PARALLEL_ACCELERATED_CV_TASK_GROUPS
     global _PARALLEL_FINAL_TASKS
+    global _PARALLEL_FINAL_CANDIDATE_TASKS
 
     accelerator_specs = (
         policy_accelerator_specs_from_environment()
@@ -5839,6 +7886,8 @@ def fit_generic_policy(
         else policy_accelerators
     )
     accelerator_workers = policy_accelerator_worker_specs(accelerator_specs)
+    fit_feature_policies = _leaf_budget_feature_policies(max_leaves)
+    fit_boundary_placements = _leaf_budget_boundary_placements(max_leaves)
     if (
         fit_cache is not None
         and domain_corpus_provider is not None
@@ -5852,6 +7901,14 @@ def fit_generic_policy(
         "LLAMINAR_NATIVE_VNNI_POLICY_TIMING", "0"
     ) == "1"
     fit_started = time.perf_counter()
+    runtime_paired_comparisons = _runtime_paired_comparisons(
+        development,
+        paired_comparisons,
+    )
+    supplemental_costs = _validated_supplemental_costs(
+        development,
+        supplemental_development_costs,
+    )
     domains = development.generic_domains()
     domain_corpora: dict[GenericDomain, ObservationCorpus] = {}
     shared_profiler_observation_index = (
@@ -5895,7 +7952,17 @@ def fit_generic_policy(
     cached_final_rules: dict[
         GenericDomain, tuple[GenericDispatchRule, ...]
     ] = {}
+    incremental_validation_incumbents: dict[
+        GenericDomain, DomainCrossValidation | None
+    ] = {}
+    incremental_feature_policies: dict[
+        GenericDomain, tuple[FeaturePolicy, ...]
+    ] = {}
+    incremental_cached_final_rules: dict[
+        GenericDomain, tuple[GenericDispatchRule, ...]
+    ] = {}
     validation_cache_hits = 0
+    validation_incremental_hits = 0
     cache_identity_inputs = {
         domain: (
             paired_domain_digest,
@@ -5913,7 +7980,8 @@ def fit_generic_policy(
             _domain_cache_identity_inputs(
                 development,
                 domains,
-                paired_comparisons,
+                runtime_paired_comparisons,
+                supplemental_costs,
                 serial_m1_hashes,
             )
             if fit_cache is not None and domain_corpus_provider is None
@@ -5932,9 +8000,10 @@ def fit_generic_policy(
                 ) = cache_identity_inputs[domain]
             else:
                 domain_rows = development.rows_for_generic_domain(domain)
-                paired_domain_digest = _paired_domain_digest(
+                paired_domain_digest = _combined_domain_evidence_digest(
                     domain_rows,
-                    paired_comparisons,
+                    runtime_paired_comparisons,
+                    supplemental_costs.get(domain, ()),
                 )
                 if domain_corpus_digest_provider is None:
                     raise RuntimeError(
@@ -6038,10 +8107,10 @@ def fit_generic_policy(
                         profiler_pool_rows[
                             _profiler_transfer_key(pool_domain)
                         ].append(row)
-            profiler_model_digests = {
-                pool_key: profiler_feature_catalog.model_digest_for(rows)
-                for pool_key, rows in profiler_pool_rows.items()
-            }
+            profiler_model_digests = _profiler_model_digests_for_pools(
+                profiler_feature_catalog,
+                profiler_pool_rows,
+            )
         else:
             # Lazy formula projection deliberately avoids materializing a
             # cache-hit domain. Its exact projected corpus digest still guards
@@ -6056,15 +8125,6 @@ def fit_generic_policy(
     profiler_identities_complete = time.perf_counter()
 
     if fit_cache is not None:
-        # Full profiler provenance is immutable for the fit.  Legacy cache-key
-        # migration consults it for every domain, but canonical serialization
-        # belongs outside that loop even though ProfilerFeatureCatalog also
-        # memoizes the value defensively.
-        profiler_catalog_digest = (
-            profiler_feature_catalog.digest
-            if profiler_feature_catalog is not None
-            else None
-        )
         for domain in domains:
             cost_key = cost_keys[domain]
             profiler_model_digest = (
@@ -6085,6 +8145,8 @@ def fit_generic_policy(
                 profiler_training_pool_digest=profiler_pool_digests.get(
                     domain
                 ),
+                feature_policies=fit_feature_policies,
+                boundary_placements=fit_boundary_placements,
             )
             validation_keys[domain] = validation_key
             hit, cached_validation, cached_rules = (
@@ -6093,110 +8155,203 @@ def fit_generic_policy(
                     domain,
                 )
             )
-            legacy_profiler_catalog_digest = (
-                profiler_catalog_digest
-                if profiler_catalog_digest is not None
-                and profiler_catalog_digest != profiler_model_digest
-                else None
-            )
-            catalog_digest_candidates = (
-                tuple(dict.fromkeys((
-                    profiler_model_digest,
-                    profiler_catalog_digest,
-                )))
-                if profiler_catalog_digest is not None
-                else (None,)
-            )
-            legacy_validation_inputs = []
-            if legacy_profiler_catalog_digest is not None:
-                # Read through both profiler-cache generations that predate
-                # pool-local model identities.  The older production ABI used
-                # the complete provenance digest and had no transfer-pool
-                # field.  A short-lived intermediate ABI added the pool field
-                # while retaining that complete digest.  Keeping the two
-                # candidates explicit lets an already-paid fit migrate without
-                # rebuilding profiler surrogates or cross-validation folds.
-                legacy_validation_inputs.extend((
-                    (
+            loaded_validation_key = validation_key if hit else None
+            incremental_hit = False
+            if not hit and len(fit_feature_policies) > 1:
+                # Feature expansion is monotonic. Probe every one-family-smaller
+                # inventory in canonical order; a hit is the exact incumbent
+                # over all old families, so only the omitted family needs new
+                # fold work. This also makes the next additive expansion
+                # incremental without hard-coding policy-generation history.
+                for omitted_policy in fit_feature_policies:
+                    predecessor_policies = tuple(
+                        policy
+                        for policy in fit_feature_policies
+                        if policy != omitted_policy
+                    )
+                    predecessor_key = fit_cache.validation_key(
+                        domain,
                         cost_key,
-                        profiler_pool_digests.get(domain),
-                        legacy_profiler_catalog_digest,
-                    ),
+                        max_leaves=max_leaves,
+                        min_shape_groups_per_leaf=(
+                            min_shape_groups_per_leaf
+                        ),
+                        cross_validation_seed=cross_validation_seed,
+                        profiler_feature_catalog_digest=(
+                            profiler_model_digest
+                        ),
+                        fit_final_rules=fit_final_rules,
+                        profiler_training_pool_digest=(
+                            profiler_pool_digests.get(domain)
+                        ),
+                        feature_policies=predecessor_policies,
+                        boundary_placements=fit_boundary_placements,
+                    )
                     (
-                        cost_key,
-                        None,
-                        legacy_profiler_catalog_digest,
-                    ),
-                ))
-            for legacy_cost_key, legacy_pool_digest in (
-                (
-                    aggregate_local_cost_keys.get(domain),
-                    aggregate_local_pool_digests.get(domain),
-                ),
-                (semantic_global_cost_keys[domain], None),
-                (aggregate_global_cost_keys.get(domain), None),
-            ):
-                legacy_validation_inputs.extend(
-                    (
+                        predecessor_hit,
+                        predecessor_validation,
+                        predecessor_rules,
+                    ) = fit_cache.load_validation_entry(
+                        predecessor_key,
+                        domain,
+                    )
+                    if not predecessor_hit:
+                        continue
+                    if (
+                        predecessor_validation is not None
+                        and predecessor_validation.selected_feature_policy
+                        not in predecessor_policies
+                    ):
+                        raise ValueError(
+                            "cached incremental CV winner is absent from its "
+                            "feature-policy inventory"
+                        )
+                    if fit_final_rules:
+                        predecessor_final_fit = None
+                        if predecessor_rules is None:
+                            predecessor_final_fit = fit_cache.load_final_fit(
+                                predecessor_key,
+                                domain,
+                            )
+                        elif (
+                            predecessor_validation is not None
+                            and len(predecessor_rules)
+                            <= predecessor_validation.selected_max_leaves
+                        ):
+                            predecessor_final_fit = (
+                                predecessor_validation,
+                                predecessor_rules,
+                            )
+                        if predecessor_final_fit is not None:
+                            (
+                                predecessor_validation,
+                                predecessor_rules,
+                            ) = predecessor_final_fit
+                    incremental_validation_incumbents[domain] = (
+                        predecessor_validation
+                    )
+                    incremental_feature_policies[domain] = (omitted_policy,)
+                    if predecessor_rules is not None:
+                        incremental_cached_final_rules[domain] = (
+                            predecessor_rules
+                        )
+                    validation_incremental_hits += 1
+                    incremental_hit = True
+                    break
+
+            if not hit and not incremental_hit:
+                # Current cache generations use model-visible descriptor
+                # identities and a cross-M transfer-pool digest. Cheap/current
+                # identities are always probed first. The obsolete full-catalog
+                # digest is reconstructed only when a same-domain CV record is
+                # present, because hashing raw profiler provenance on every
+                # first-use miss would make cache lookup scale with corpus size.
+                catalog_digest_rounds = [
+                    (profiler_model_digest,)
+                    if profiler_model_digest is not None
+                    else (None,)
+                ]
+                if (
+                    profiler_feature_catalog is not None
+                    and fit_cache.has_validation_entry_for_domain(domain)
+                ):
+                    legacy_catalog_digest = profiler_feature_catalog.digest
+                    if legacy_catalog_digest != profiler_model_digest:
+                        catalog_digest_rounds.append((legacy_catalog_digest,))
+
+                for catalog_digest_candidates in catalog_digest_rounds:
+                    legacy_validation_inputs = []
+                    for legacy_cost_key, legacy_pool_digest in (
+                        (cost_key, None),
+                        (
+                            aggregate_local_cost_keys.get(domain),
+                            aggregate_local_pool_digests.get(domain),
+                        ),
+                        (semantic_global_cost_keys[domain], None),
+                        (aggregate_global_cost_keys.get(domain), None),
+                    ):
+                        legacy_validation_inputs.extend(
+                            (
+                                legacy_cost_key,
+                                legacy_pool_digest,
+                                catalog_digest,
+                            )
+                            for catalog_digest in catalog_digest_candidates
+                        )
+                    for (
                         legacy_cost_key,
                         legacy_pool_digest,
-                        catalog_digest,
-                    )
-                    for catalog_digest in catalog_digest_candidates
-                )
-            if not hit:
-                for (
-                    legacy_cost_key,
-                    legacy_pool_digest,
-                    legacy_catalog_digest,
-                ) in dict.fromkeys(
-                    legacy_validation_inputs
-                ):
-                    if legacy_cost_key is None:
-                        continue
-                    legacy_validation_key = fit_cache.validation_key(
+                        legacy_catalog_digest,
+                    ) in dict.fromkeys(legacy_validation_inputs):
+                        if legacy_cost_key is None:
+                            continue
+                        legacy_validation_key = fit_cache.validation_key(
+                            domain,
+                            legacy_cost_key,
+                            max_leaves=max_leaves,
+                            min_shape_groups_per_leaf=(
+                                min_shape_groups_per_leaf
+                            ),
+                            cross_validation_seed=cross_validation_seed,
+                            profiler_feature_catalog_digest=(
+                                legacy_catalog_digest
+                            ),
+                            fit_final_rules=fit_final_rules,
+                            profiler_training_pool_digest=legacy_pool_digest,
+                        )
+                        if legacy_validation_key == validation_key:
+                            continue
+                        hit, cached_validation, cached_rules = (
+                            fit_cache.load_validation_entry(
+                                legacy_validation_key,
+                                domain,
+                            )
+                        )
+                        if hit:
+                            loaded_validation_key = legacy_validation_key
+                            break
+                    if hit:
+                        break
+            if hit:
+                if loaded_validation_key != validation_key:
+                    # Cost-key migrations do not change CV semantics. Publish
+                    # the canonical CV address before consulting publication
+                    # leaves so subsequent aggregate relabeling is lookup-only.
+                    fit_cache.store_validation(
+                        validation_key,
                         domain,
-                        legacy_cost_key,
-                        max_leaves=max_leaves,
-                        min_shape_groups_per_leaf=min_shape_groups_per_leaf,
-                        cross_validation_seed=cross_validation_seed,
-                        profiler_feature_catalog_digest=legacy_catalog_digest,
-                        fit_final_rules=fit_final_rules,
-                        profiler_training_pool_digest=legacy_pool_digest,
+                        cached_validation,
                     )
-                    if legacy_validation_key == validation_key:
-                        continue
-                    hit, cached_validation, cached_rules = (
-                        fit_cache.load_validation_entry(
-                            legacy_validation_key,
+                if fit_final_rules:
+                    cached_final_fit = None
+                    if cached_rules is None:
+                        cached_final_fit = fit_cache.load_final_fit(
+                            loaded_validation_key,
                             domain,
                         )
-                    )
-                    if hit:
-                        if (
-                            cached_rules is not None
-                            or not fit_final_rules
-                            or cached_validation is None
-                            or not domain_cross_validation_is_promotable(
-                                cached_validation
-                            )
-                        ):
-                            fit_cache.store_validation(
+                    elif (
+                        cached_validation is not None
+                        and len(cached_rules)
+                        <= cached_validation.selected_max_leaves
+                    ):
+                        # Read old records that embedded leaves in the CV file.
+                        cached_final_fit = (
+                            cached_validation,
+                            cached_rules,
+                        )
+                    if cached_final_fit is not None:
+                        cached_validation, cached_rules = cached_final_fit
+                        if loaded_validation_key != validation_key:
+                            fit_cache.store_final_fit(
                                 validation_key,
                                 domain,
                                 cached_validation,
                                 cached_rules,
                             )
-                        break
             if hit:
                 validations[domain] = cached_validation
                 validation_frontiers[domain] = (
-                    (cached_validation,)
-                    if cached_validation is not None
-                    and domain_cross_validation_has_complete_coverage(
-                        cached_validation
-                    )
-                    else ()
+                    _publication_validation_frontier(cached_validation)
                 )
                 if cached_rules is not None:
                     cached_final_rules[domain] = cached_rules
@@ -6216,8 +8371,9 @@ def fit_generic_policy(
         for domain in domains
         if domain not in validations
     }
-    for domain in domains:
-        requires_costs = (
+    domains_requiring_costs = tuple(
+        domain for domain in domains
+        if (
             domain not in validations
             or (
                 fit_final_rules
@@ -6232,23 +8388,38 @@ def fit_generic_policy(
                 and _profiler_transfer_key(domain) in missing_profiler_pools
             )
         )
-        if not requires_costs:
+    )
+    cached_cost_entries = (
+        _load_cached_costs_parallel(
+            fit_cache,
+            (
+                (
+                    domain,
+                    cost_keys[domain],
+                    legacy_cost_key_candidates[domain],
+                )
+                for domain in domains_requiring_costs
+            ),
+        )
+        if fit_cache is not None
+        else {}
+    )
+    for domain in domains:
+        if domain not in domains_requiring_costs:
             cost_cache_bypasses += 1
             continue
-        cached_costs = (
-            fit_cache.load_costs(cost_keys[domain], domain)
-            if fit_cache is not None
-            else None
+        cached_costs, loaded_cost_key = cached_cost_entries.get(
+            domain,
+            (None, None),
         )
-        if cached_costs is None and fit_cache is not None:
-            for legacy_cost_key in legacy_cost_key_candidates[domain]:
-                cached_costs = fit_cache.load_costs(legacy_cost_key, domain)
-                if cached_costs is not None:
-                    fit_cache.store_costs(
-                        cost_keys[domain], domain, cached_costs
-                    )
-                    break
         if cached_costs is not None:
+            if (
+                fit_cache is not None
+                and loaded_cost_key != cost_keys[domain]
+            ):
+                fit_cache.store_costs(
+                    cost_keys[domain], domain, cached_costs
+                )
             costs[domain] = cached_costs
             cost_cache_hits += 1
             continue
@@ -6257,8 +8428,9 @@ def fit_generic_policy(
             domain_corpus,
             domain,
             serial_m1_hashes=serial_m1_hashes,
-            paired_comparisons=paired_comparisons,
+            paired_comparisons=runtime_paired_comparisons,
         )
+        domain_costs.extend(supplemental_costs.get(domain, ()))
         costs[domain] = domain_costs
         if fit_cache is not None:
             fit_cache.store_costs(cost_keys[domain], domain, domain_costs)
@@ -6267,23 +8439,13 @@ def fit_generic_policy(
         profiler_feature_catalog is not None
         and domain_corpus_provider is not None
     ):
-        # Cross-format profiler transfer needs authenticated observations for
-        # every cost in the cross-M pool. Lazy CUDA projection therefore
-        # materializes each domain exactly once before model construction; a
-        # domain-local index would silently make pooling backend-asymmetric.
-        for domain in domains:
-            corpus_for_domain(domain)
-        merged_profiler_index = {}
-        for domain_corpus in domain_corpora.values():
-            for point, observation in build_profiler_observation_index(
-                domain_corpus
-            ).items():
-                previous = merged_profiler_index.setdefault(point, observation)
-                if previous != observation:
-                    raise ValueError(
-                        "pooled profiler observation index changed one point"
-                    )
-        shared_profiler_observation_index = merged_profiler_index
+        # Shape-resolved CUDA costs already carry every runtime dimension and
+        # nominal formula ID needed to recover the authenticated physical
+        # descriptor. Profiler model construction resolves that exact catalog
+        # key directly. Building a projected observation index here cloned
+        # millions of aliases, consumed tens of GiB, and delayed both GPUs for
+        # minutes without adding evidence.
+        shared_profiler_observation_index = {}
     profiler_training_pool_lists: dict[
         tuple[object, ...], list[CandidatePointCost]
     ] = (
@@ -6313,13 +8475,12 @@ def fit_generic_policy(
                     "candidate-cost identities"
                 )
     tasks = []
-    profiler_teacher_fold_results = []
     fold_counts = {}
     profiler_prediction_cache: ProfilerPredictionCache = {}
     profiler_prediction_request_keys = []
     profiler_prediction_point_sets: dict[
-        ProfilerPredictionCacheKey, set[ProfilerPredictionPoint]
-    ] = defaultdict(set)
+        ProfilerPredictionCacheKey, frozenset[ProfilerPredictionPoint]
+    ] = {}
     if profiler_feature_catalog is not None:
         for domain in domains:
             if domain in validations:
@@ -6331,7 +8492,16 @@ def fit_generic_policy(
             )
             profiler_prediction_request_keys.extend(domain_requests)
             for request_key, points in domain_requests.items():
-                profiler_prediction_point_sets[request_key].update(points)
+                existing = profiler_prediction_point_sets.get(request_key)
+                if existing is None:
+                    # Every fold in one domain deliberately shares this exact
+                    # immutable object, allowing inventory sort/digest reuse by
+                    # identity in forked fit and publication workers.
+                    profiler_prediction_point_sets[request_key] = points
+                elif existing is not points:
+                    profiler_prediction_point_sets[request_key] = (
+                        existing | points
+                    )
         if shared_profiler_observation_index is None:
             raise RuntimeError(
                 "profiler-informed fit did not construct a shared observation index"
@@ -6352,10 +8522,7 @@ def fit_generic_policy(
             development,
             profiler_feature_catalog,
             shared_profiler_observation_index,
-            prediction_points_by_request={
-                key: frozenset(points)
-                for key, points in profiler_prediction_point_sets.items()
-            },
+            prediction_points_by_request=profiler_prediction_point_sets,
             fit_cache=fit_cache,
             training_pool_digests=(
                 profiler_training_pool_digests
@@ -6380,42 +8547,41 @@ def fit_generic_policy(
             file=sys.stderr,
             flush=True,
         )
-    for domain in domains:
-        if domain in validations:
-            continue
-        domain_tasks, fold_count = _domain_fold_tasks(
+    domain_fold_plan_tasks = tuple(
+        (
             domain,
             costs.get(domain, []),
-            max_leaves=max_leaves,
-            min_shape_groups_per_leaf=min_shape_groups_per_leaf,
-            seed=cross_validation_seed,
-            profiler_training_pool_key=(
+            max_leaves,
+            min_shape_groups_per_leaf,
+            cross_validation_seed,
+            (
                 _profiler_transfer_key(domain)
                 if profiler_feature_catalog is not None
                 else None
             ),
+            incremental_feature_policies.get(domain, fit_feature_policies),
+        )
+        for domain in domains
+        if domain not in validations
+    )
+    domain_fold_plans, task_construction_workers = (
+        _construct_domain_fold_plans(
+            domain_fold_plan_tasks,
             profiler_prediction_cache=(
                 profiler_prediction_cache
                 if profiler_feature_catalog is not None
                 else None
             ),
+            compact=True,
         )
+    )
+    for (
+        domain,
+        domain_tasks,
+        fold_count,
+    ) in domain_fold_plans:
         tasks.extend(domain_tasks)
         fold_counts[domain] = fold_count
-        if profiler_feature_catalog is not None:
-            teacher_results = _domain_profiler_teacher_fold_results(
-                domain,
-                costs.get(domain, []),
-                max_leaves=max_leaves,
-                seed=cross_validation_seed,
-                profiler_training_pool_key=_profiler_transfer_key(domain),
-                profiler_prediction_cache=profiler_prediction_cache,
-            )
-            if len(teacher_results) != fold_count:
-                raise RuntimeError(
-                    "cross-fitted profiler teacher changed the domain fold count"
-                )
-            profiler_teacher_fold_results.extend(teacher_results)
     tasks_complete = time.perf_counter()
     requested_workers = None
     if accelerator_workers and tasks:
@@ -6425,7 +8591,7 @@ def fit_generic_policy(
             grouped_fold_results = _run_accelerated_tasks(
                 accelerator_workers,
                 tuple(
-                    sum(max(1, len(task[6]) * task[7]) for _index, task in group)
+                    sum(_fold_task_weight(task) for _index, task in group)
                     for group in accelerated_task_groups
                 ),
                 "cv",
@@ -6467,11 +8633,6 @@ def fit_generic_policy(
                 _PARALLEL_CV_TASKS = ()
         else:
             fold_results = [_evaluate_placement_fold(task) for task in tasks]
-    # The teacher is evaluated in the parent from already-persisted prediction
-    # surfaces. It performs no model fit and no tree search, so appending these
-    # compact decisions after the accelerated work preserves both process-pool
-    # ownership and deterministic tournament ordering.
-    fold_results = [*fold_results, *profiler_teacher_fold_results]
     folds_complete = time.perf_counter()
 
     results_by_domain: dict[GenericDomain, list[_PlacementFoldResult]] = (
@@ -6498,30 +8659,40 @@ def fit_generic_policy(
         )
     )
     for domain, ranked_validations, validation in reduced_domains:
+        incumbent = incremental_validation_incumbents.get(domain)
+        if domain in incremental_validation_incumbents:
+            ranked_validations = _merge_incremental_validation_frontier(
+                incumbent,
+                ranked_validations,
+            )
+            validation = ranked_validations[0] if ranked_validations else None
         validations[domain] = validation
-        promotable_frontier = tuple(
-            candidate
-            for candidate in ranked_validations
-            if domain_cross_validation_is_promotable(candidate)
-        )
         validation_frontiers[domain] = (
-            promotable_frontier
-            if promotable_frontier
-            else tuple(ranked_validations)
+            _publication_validation_frontier(validation)
         )
-        if fit_cache is not None and (
-            not fit_final_rules
-            or validation is None
-            or not domain_cross_validation_is_promotable(validation)
-        ):
-            # A promotable model is still provisional until the complete
-            # development tree passes its own leaf-p95 gate. Content-addressed
-            # cache records are immutable, so publish those domains exactly
-            # once after final-frontier selection instead of attempting to
-            # mutate a preliminary CV winner in place.
+        if fit_cache is not None:
+            # CV is immutable and phase-independent. Final publication leaves
+            # are cached separately, so a freeze pass can reuse this result
+            # without either mutating the record or evaluating the folds again.
             fit_cache.store_validation(
                 validation_keys[domain], domain, validation
             )
+        incumbent_rules = incremental_cached_final_rules.get(domain)
+        if (
+            incumbent is not None
+            and validation is not None
+            and incumbent_rules is not None
+            and _domain_cross_validation_model_identity(validation)
+            == _domain_cross_validation_model_identity(incumbent)
+        ):
+            cached_final_rules[domain] = incumbent_rules
+            if fit_cache is not None:
+                fit_cache.store_final_fit(
+                    validation_keys[domain],
+                    domain,
+                    validation,
+                    incumbent_rules,
+                )
     selection_complete = time.perf_counter()
 
     structurally_complete_validations = {
@@ -6569,24 +8740,34 @@ def fit_generic_policy(
             ))
     final_tasks = tuple(final_tasks)
     if accelerator_workers and final_tasks:
-        _PARALLEL_FINAL_TASKS = final_tasks
+        (
+            final_candidate_tasks,
+            prepared_final_frontiers,
+            final_targets_by_context,
+        ) = _prepare_accelerated_final_candidates(final_tasks)
+        _PARALLEL_FINAL_CANDIDATE_TASKS = final_candidate_tasks
         try:
-            final_fits = _run_accelerated_tasks(
+            candidate_results = _run_accelerated_tasks(
                 accelerator_workers,
                 tuple(
                     max(
                         1,
-                        len(task[1])
-                        * task[6]
-                        * len(FEATURE_POLICIES)
-                        * len(BOUNDARY_PLACEMENTS),
+                        len(candidate_args[0])
+                        * candidate_args[2]
+                        * len(FEATURE_AXES_BY_POLICY[candidate_args[4]]),
                     )
-                    for task in _PARALLEL_FINAL_TASKS
+                    for _context_index, candidate_args
+                    in _PARALLEL_FINAL_CANDIDATE_TASKS
                 ),
-                "final",
+                "final-candidate",
+            )
+            final_fits = _reduce_accelerated_final_candidates(
+                candidate_results,
+                prepared_final_frontiers,
+                final_targets_by_context,
             )
         finally:
-            _PARALLEL_FINAL_TASKS = ()
+            _PARALLEL_FINAL_CANDIDATE_TASKS = ()
     else:
         if requested_workers is None:
             requested_workers = int(os.environ.get(
@@ -6632,8 +8813,11 @@ def fit_generic_policy(
             f"cost_cache_hits={cost_cache_hits}/{len(domains)} "
             f"cost_cache_bypasses={cost_cache_bypasses}/{len(domains)} "
             f"cv_cache_hits={validation_cache_hits}/{len(domains)} "
+            "cv_incremental_hits="
+            f"{validation_incremental_hits}/{len(domains)} "
             f"final_rule_cache_hits={len(cached_final_rules)}/{len(domains)} "
             f"profiler_model_workers={profiler_model_workers} "
+            f"task_construction_workers={task_construction_workers} "
             f"cv_reduction_workers={reduction_worker_count} "
             f"accelerator_processes={min(len(accelerator_workers), len(tasks))} ",
             file=sys.stderr,
@@ -6647,14 +8831,11 @@ def fit_generic_policy(
         )
         rules_by_domain[domain] = domain_rules
         validations[domain] = selected_validation
-        if (
-            fit_cache is not None
-            and domain_cross_validation_is_promotable(selected_validation)
-        ):
-            # Publish the stable full-development winner under the same search
-            # key. A later immutable-corpus refit can reuse it directly instead
-            # of reconstructing an already-proven model frontier.
-            fit_cache.store_validation(
+        if fit_cache is not None:
+            # Publication is an immutable derivative of the certified CV
+            # artifact. Keeping it separate permits planning-only iterations
+            # to stop before this work and freeze runs to add only this work.
+            fit_cache.store_final_fit(
                 validation_keys[domain],
                 domain,
                 selected_validation,
@@ -6694,6 +8875,7 @@ def fit_generic_policy(
                     and worst_final_rule.matches(
                         cost.runtime_key.aggregate_n,
                         cost.runtime_key.k,
+                        cost.runtime_key.launch_k_tiles,
                     )
                 ),
                 key=lambda cost: (

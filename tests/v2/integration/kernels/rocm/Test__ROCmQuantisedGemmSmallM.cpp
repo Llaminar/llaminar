@@ -91,6 +91,37 @@ namespace
         TensorType tensor_type = TensorType::FP32;
     };
 
+#ifdef HAVE_ROCM
+    /**
+     * @brief Apply one trainer-only NativeVNNI launch override for a test scope.
+     *
+     * The ROCm decode trainer evaluates explicit kernel schedules through the
+     * same process-wide override API used below.  Always restoring automatic
+     * dispatch is important because GoogleTest may continue with another test
+     * in the same process after an expectation fails.
+     */
+    class ScopedROCmNativeVNNITuningOverride final
+    {
+    public:
+        /** Select the explicit K partition and target-wave candidate. */
+        ScopedROCmNativeVNNITuningOverride(int kb, int target_waves_per_cu)
+        {
+            rocmGemv_native_vnni_set_tuning_overrides(kb, target_waves_per_cu);
+        }
+
+        /** Restore generated production dispatch when the test scope ends. */
+        ~ScopedROCmNativeVNNITuningOverride()
+        {
+            rocmGemv_native_vnni_reset_tuning_overrides();
+        }
+
+        ScopedROCmNativeVNNITuningOverride(
+            const ScopedROCmNativeVNNITuningOverride &) = delete;
+        ScopedROCmNativeVNNITuningOverride &operator=(
+            const ScopedROCmNativeVNNITuningOverride &) = delete;
+    };
+#endif
+
     /**
      * @brief One production-weight representative for each ROCm MoE native-VNNI codegroup.
      *
@@ -3543,7 +3574,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, ProductionSerialM1RouteTelemetryMatchesResol
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
     ScopedEnv automatic_kb("LLAMINAR_ROCM_NVNNI_GEMV_KB", "-1");
     ScopedEnv automatic_waves("LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES", "-1");
-    ScopedEnv disable_q8_direct("LLAMINAR_ROCM_NVNNI_Q8_DIRECT", "0");
     rocmGemv_native_vnni_reset_tuning_overrides();
     PerfStatsCollector::reset();
 
@@ -3603,6 +3633,112 @@ TEST(Test__ROCmQuantisedGemmSmallM, ProductionSerialM1RouteTelemetryMatchesResol
                {"kernel.rocm_native_vnni_small_m_launch"}, 20);
 
     PerfStatsCollector::reset();
+}
+
+/**
+ * @test Prove explicit trainer candidates control the IQ-grid LDS launch.
+ *
+ * IQ-grid decode uses a dedicated LDS-cached kernel once geometry provides
+ * enough parallelism.  Candidate sweeps must still control that kernel's K
+ * partition and target occupancy; otherwise many nominally different corpus
+ * rows measure the same hidden heuristic launch.  This test deliberately uses
+ * a K-heavy IQ2_S shape that takes the LDS branch and validates the effective
+ * production launch through perfstats telemetry.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM, ExplicitIQGridTrainerCandidateControlsLDSRoute)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    constexpr uint8_t IQ2_S_CODEBOOK = 13;
+    constexpr int M = 1;
+    constexpr int N = 1536;
+    constexpr int K = 6144;
+    constexpr int FORCED_KB = 3;
+    constexpr int FORCED_TARGET_WAVES = 12;
+    ScopedROCmNativeVNNITuningOverride tuning(
+        FORCED_KB,
+        FORCED_TARGET_WAVES);
+
+    auto weights = TestTensorFactory::createIQ2_SRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)},
+        7319);
+    auto prepared = makeGpuPreparedGemm(
+        weights.get(),
+        DeviceId::rocm(0),
+        "test.rocm.native_vnni.iq_lds_explicit_candidate",
+        ModelContextId{7319});
+    auto *kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(prepared.kernel);
+    ASSERT_NE(kernel, nullptr);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(
+        hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+        hipSuccess);
+    kernel->setGPUStream(stream);
+    auto workspace = bindWorkspace(*kernel, M, N, K);
+    ASSERT_NE(workspace, nullptr);
+
+    auto input = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(M), static_cast<size_t>(K)},
+        -0.35f,
+        0.35f,
+        7320);
+    auto output = TestTensorFactory::createFP32(
+        {static_cast<size_t>(M), static_cast<size_t>(N)});
+    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), stream));
+    ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    PerfStatsCollector::reset();
+    ASSERT_TRUE(kernel->multiply_tensor(input.get(), output.get(), M, N, K));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    uint64_t matching_launches = 0;
+    for (const auto &record : PerfStatsCollector::snapshot(
+             {"kernel.rocm_native_vnni_small_m_launch"}))
+    {
+        if (record.domain != "kernel" ||
+            record.name != "rocm_native_vnni_small_m_launch" ||
+            record.kind != PerfStatRecord::Kind::Counter ||
+            record.tags.at("m") != std::to_string(M) ||
+            record.tags.at("n") != std::to_string(N) ||
+            record.tags.at("k") != std::to_string(K) ||
+            record.tags.at("codebook") !=
+                std::to_string(IQ2_S_CODEBOOK))
+        {
+            continue;
+        }
+
+        EXPECT_EQ(record.tags.at("kb"), std::to_string(FORCED_KB));
+        EXPECT_EQ(
+            record.tags.at("target_waves_per_cu"),
+            std::to_string(FORCED_TARGET_WAVES));
+        EXPECT_EQ(record.tags.at("path"), "split_reduce");
+        EXPECT_EQ(record.tags.at("grid_n"), "6")
+            << "N=1536 must take the 256-column IQ LDS launch geometry";
+        matching_launches += record.count;
+    }
+    EXPECT_EQ(matching_launches, 1u)
+        << "The explicit IQ2_S candidate must produce one observable LDS launch\n"
+        << PerfStatsCollector::summaryString(
+               {"kernel.rocm_native_vnni_small_m_launch"}, 20);
+
+    output->transitionTo(
+        TensorCoherenceState::DEVICE_AUTHORITATIVE,
+        DeviceId::rocm(0));
+    EXPECT_GT(l2Norm(output->data(), output->numel()), 1.0e-7)
+        << "The observed candidate must produce a non-zero output witness";
+
+    kernel->setGPUStream(nullptr);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+    kernel->unbindWorkspace();
+    PerfStatsCollector::reset();
+#endif
 }
 
 TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2MatchesReference)

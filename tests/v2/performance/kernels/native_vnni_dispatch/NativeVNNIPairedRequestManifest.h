@@ -36,6 +36,24 @@ namespace llaminar2::test::native_vnni_dispatch
     inline constexpr const char *kNativeVNNIPairedRequestSchema =
         "native-vnni-paired-request-v2";
 
+    /** Timing-free reason emitted only by a frozen M=1 certification plan. */
+    inline constexpr const char *kNativeVNNIM1SealedChallengerReason =
+        "sealed_frozen_leaf_exhaustive_challenger";
+
+    /** Timing-free reason emitted only by a frozen grouped certification plan. */
+    inline constexpr const char *kNativeVNNIGroupedSealedChallengerReason =
+        "grouped_frozen_leaf_exhaustive_challenger";
+
+    /**
+     * Timing-free route/byte witness for a grouped domain with one schedule.
+     *
+     * Both interleaved roles name the same forceable grouped candidate. The
+     * final certifier treats the cell as zero dispatch regret while retaining
+     * the fresh-geometry production-route and serial-M1 byte proof.
+     */
+    inline constexpr const char *kNativeVNNIGroupedSingleCandidateReason =
+        "grouped_frozen_leaf_single_candidate_witness";
+
     /**
      * @brief One concrete selected/reference edge to measure interleaved.
      *
@@ -280,22 +298,49 @@ namespace llaminar2::test::native_vnni_dispatch
                                  !request.selected_candidate_id.empty() &&
                                  !request.exact_candidate_id.empty() &&
                                  !request.reason.empty();
-            const bool dimensions_ok = request.m == 1 && request.n > 0 &&
+            const bool dimensions_ok = request.m > 0 && request.n > 0 &&
                                        request.k > 0 && request.k % 32 == 0;
             const bool mode_ok = request.execution_mode == "eager" ||
                                  request.execution_mode == "graph_captured";
             const bool codebooks_ok = request.source_codebook >= 0 &&
                                       request.execution_codebook >= 0;
+            const bool m1_sealed =
+                request.reason == kNativeVNNIM1SealedChallengerReason;
+            const bool grouped_sealed =
+                request.reason == kNativeVNNIGroupedSealedChallengerReason;
+            const bool grouped_single_candidate =
+                request.reason == kNativeVNNIGroupedSingleCandidateReason;
+            const bool sealed_request =
+                m1_sealed || grouped_sealed || grouped_single_candidate;
+            const bool sealed_m_ok = !sealed_request ||
+                                     (m1_sealed && request.m == 1) ||
+                                     ((grouped_sealed ||
+                                       grouped_single_candidate) &&
+                                      request.m > 1);
+
+            /**
+             * Development refinement requests are actionable only when their
+             * held-out regret reaches the promotion budget. Frozen plans have
+             * a different contract: every challenger edge is measured without
+             * consulting timing, so zero is the sole permitted placeholder.
+             * The final Python certifier cryptographically binds those rows to
+             * the frozen plan before they can influence installation.
+             */
             const bool regret_ok = std::isfinite(request.observed_cv_regret) &&
-                                   request.observed_cv_regret >= manifest.max_regret;
+                (sealed_request
+                     ? request.observed_cv_regret == 0.0
+                     : request.observed_cv_regret >= manifest.max_regret);
             const bool candidates_ok =
-                request.selected_candidate_id != request.exact_candidate_id &&
+                ((grouped_single_candidate &&
+                  request.selected_candidate_id == request.exact_candidate_id) ||
+                 (!grouped_single_candidate &&
+                  request.selected_candidate_id != request.exact_candidate_id)) &&
                 request.selected_candidate_id.find("kpar_formula") ==
                     std::string::npos &&
                 request.exact_candidate_id.find("kpar_formula") ==
                     std::string::npos;
             if (!text_ok || !dimensions_ok || !mode_ok || !codebooks_ok ||
-                !regret_ok || !candidates_ok)
+                !sealed_m_ok || !regret_ok || !candidates_ok)
             {
                 throw std::runtime_error(
                     "Paired request record is not forceable: " +

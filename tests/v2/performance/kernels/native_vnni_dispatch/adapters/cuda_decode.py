@@ -1,20 +1,24 @@
 """CUDA NativeVNNI public-M1 and grouped-verifier trainer adapter.
 
 The CUDA speedometer emits one row for an explicit, normalized public-M1
-candidate or for the grouped verifier's ``INHERIT_SERIAL_M1`` candidate.  This
-adapter proves that the requested production route really ran, validates raw
-CUDA-event timings, and requires grouped runtime-M output bytes to equal repeated
-public M1 decode rows.  Approximate diagnostics remain useful breadcrumbs but
-cannot make a verifier candidate eligible.
+candidate or one of the grouped verifier's DP4A row-bucket and integer
+tensor-core candidates. This adapter proves that the requested production route
+really ran, validates raw CUDA-event timings, and requires grouped runtime-M
+output bytes to equal repeated public M1 decode rows. Approximate diagnostics
+remain useful breadcrumbs but cannot make a verifier candidate eligible.
 """
 
 from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import math
+import multiprocessing
+import os
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -74,6 +78,13 @@ REQUIRED_TIMING_COLUMNS = frozenset({
 
 RawTimingKey = tuple[str, int, int, str, str, int, int, int, str, int, int]
 MeasurementGroupKey = tuple[str, int, int, str, str, int, int, int]
+
+
+# Fork workers inherit the immutable adapter context and timing index through
+# copy-on-write mappings. Tasks contain only file byte ranges, avoiding a copy
+# of the multi-gigabyte timing corpus in every process payload.
+_PARALLEL_CUDA_ADAPTER_CONTEXT: CUDADecodeAdapterContext | None = None
+_PARALLEL_CUDA_TIMING_INDEX: Mapping[RawTimingKey, tuple[float, ...]] = {}
 
 
 def _sha256(value: object) -> str:
@@ -171,81 +182,86 @@ def _validate_measurement_orders(
             )
 
 
-def read_cuda_decode_timing_sidecars(
-    paths: Iterable[Path],
+def _read_cuda_decode_timing_shard(
+    task: tuple[str, tuple[str, ...], int, int],
 ) -> dict[RawTimingKey, tuple[float, ...]]:
-    """Read exact samples and prove complete interleaved candidate rounds."""
+    """Parse and validate one complete-group-aligned byte range."""
 
+    path_text, fieldnames, begin, end = task
+    path = Path(path_text)
     indexed: dict[RawTimingKey, list[float]] = {}
     replay_count: dict[RawTimingKey, int] = {}
     sample_rounds: dict[
         tuple[MeasurementGroupKey, int],
         list[tuple[int, int, str]],
     ] = defaultdict(list)
-    for path in (Path(item) for item in paths):
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            missing = REQUIRED_TIMING_COLUMNS.difference(reader.fieldnames or ())
-            if missing:
+    with path.open("rb") as handle:
+        handle.seek(begin)
+
+        def lines() -> Iterable[str]:
+            while handle.tell() < end:
+                raw_line = handle.readline()
+                if not raw_line:
+                    break
+                yield raw_line.decode("utf-8")
+
+        reader = csv.DictReader(lines(), fieldnames=fieldnames)
+        for row_number, raw in enumerate(reader, start=1):
+            location = f"{path}:range-{begin}+{row_number}"
+            if raw["backend"].strip().lower() != "cuda" or (
+                raw["phase"].strip() != "decode"
+            ):
+                raise ValueError(f"{location}: wrong timing sidecar surface")
+            if raw["measurement_protocol"].strip() != (
+                CUDA_DECODE_MEASUREMENT_PROTOCOL
+            ):
                 raise ValueError(
-                    f"{path}: missing CUDA decode timing columns {sorted(missing)}"
+                    f"{location}: CUDA timing is not sample-interleaved"
                 )
-            for row_number, raw in enumerate(reader, start=2):
-                if raw["backend"].strip().lower() != "cuda" or (
-                    raw["phase"].strip() != "decode"
-                ):
-                    raise ValueError(f"{path}:{row_number}: wrong timing sidecar surface")
-                if raw["measurement_protocol"].strip() != (
-                    CUDA_DECODE_MEASUREMENT_PROTOCOL
-                ):
-                    raise ValueError(
-                        f"{path}:{row_number}: CUDA timing is not "
-                        "sample-interleaved"
-                    )
-                _execution_mode(raw["execution_mode"])
-                timed_replays = int(raw["timed_replays"])
-                if timed_replays <= 0:
-                    raise ValueError(
-                        f"{path}:{row_number}: CUDA timed_replays must be positive"
-                    )
-                key = _timing_key(raw)
-                previous_replays = replay_count.setdefault(key, timed_replays)
-                if previous_replays != timed_replays:
-                    raise ValueError(
-                        f"{path}:{row_number}: CUDA timed_replays changed from "
-                        f"{previous_replays} to {timed_replays} within one trial"
-                    )
-                sample_index = int(raw["sample_index"])
-                samples = indexed.setdefault(key, [])
-                if sample_index != len(samples):
-                    raise ValueError(
-                        f"{path}:{row_number}: timing sample index {sample_index} "
-                        f"is not the next contiguous index {len(samples)}"
-                    )
-                sample_measurement_order = int(raw["sample_measurement_order"])
-                sample_order_seed = int(raw["sample_order_seed"])
-                if sample_measurement_order < 0 or sample_order_seed <= 0:
-                    raise ValueError(
-                        f"{path}:{row_number}: invalid interleaved sample order"
-                    )
-                sample_rounds[
-                    (_measurement_group_key(raw), sample_index)
-                ].append((
-                    sample_measurement_order,
-                    sample_order_seed,
-                    raw["candidate_id"].strip().lower(),
-                ))
-                latency_us = float.fromhex(raw["latency_us_hex"].strip())
-                readable_us = float(raw["latency_us"])
-                if latency_us <= 0.0 or not math.isfinite(latency_us):
-                    raise ValueError(f"{path}:{row_number}: invalid raw latency")
-                if not math.isclose(
-                    readable_us, latency_us, rel_tol=0.0, abs_tol=5.1e-7
-                ):
-                    raise ValueError(
-                        f"{path}:{row_number}: readable and exact latency disagree"
-                    )
-                samples.append(latency_us)
+            _execution_mode(raw["execution_mode"])
+            timed_replays = int(raw["timed_replays"])
+            if timed_replays <= 0:
+                raise ValueError(
+                    f"{location}: CUDA timed_replays must be positive"
+                )
+            key = _timing_key(raw)
+            previous_replays = replay_count.setdefault(key, timed_replays)
+            if previous_replays != timed_replays:
+                raise ValueError(
+                    f"{location}: CUDA timed_replays changed from "
+                    f"{previous_replays} to {timed_replays} within one trial"
+                )
+            sample_index = int(raw["sample_index"])
+            samples = indexed.setdefault(key, [])
+            if sample_index != len(samples):
+                raise ValueError(
+                    f"{location}: timing sample index {sample_index} is not "
+                    f"the next contiguous index {len(samples)}"
+                )
+            sample_measurement_order = int(raw["sample_measurement_order"])
+            sample_order_seed = int(raw["sample_order_seed"])
+            if sample_measurement_order < 0 or sample_order_seed <= 0:
+                raise ValueError(
+                    f"{location}: invalid interleaved sample order"
+                )
+            sample_rounds[
+                (_measurement_group_key(raw), sample_index)
+            ].append((
+                sample_measurement_order,
+                sample_order_seed,
+                raw["candidate_id"].strip().lower(),
+            ))
+            latency_us = float.fromhex(raw["latency_us_hex"].strip())
+            readable_us = float(raw["latency_us"])
+            if latency_us <= 0.0 or not math.isfinite(latency_us):
+                raise ValueError(f"{location}: invalid raw latency")
+            if not math.isclose(
+                readable_us, latency_us, rel_tol=0.0, abs_tol=5.1e-7
+            ):
+                raise ValueError(
+                    f"{location}: readable and exact latency disagree"
+                )
+            samples.append(latency_us)
 
     rounds_by_group: dict[
         MeasurementGroupKey,
@@ -292,6 +308,175 @@ def read_cuda_decode_timing_sidecars(
         # from sorted samples. The raw sidecar remains in chronological sample
         # order so the independent per-round permutations can be audited.
         result[key] = tuple(sorted(samples))
+    return result
+
+
+def _cuda_timing_header(path: Path) -> tuple[tuple[str, ...], int]:
+    """Read and validate one sidecar header and return its data offset."""
+
+    with path.open("rb") as handle:
+        header_line = handle.readline()
+        data_begin = handle.tell()
+    try:
+        rows = list(csv.reader([header_line.decode("utf-8")]))
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{path}: timing header is not UTF-8") from error
+    if len(rows) != 1:
+        raise ValueError(f"{path}: malformed CUDA decode timing header")
+    fieldnames = tuple(rows[0])
+    missing = REQUIRED_TIMING_COLUMNS.difference(fieldnames)
+    if missing:
+        raise ValueError(
+            f"{path}: missing CUDA decode timing columns {sorted(missing)}"
+        )
+    return fieldnames, data_begin
+
+
+def _cuda_timing_row_at(
+    raw_line: bytes,
+    fieldnames: tuple[str, ...],
+    path: Path,
+) -> dict[str, str]:
+    """Decode one complete physical CSV row for boundary discovery."""
+
+    try:
+        rows = list(csv.reader([raw_line.decode("utf-8")]))
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{path}: timing row is not UTF-8") from error
+    if len(rows) != 1 or len(rows[0]) != len(fieldnames):
+        raise ValueError(f"{path}: malformed physical timing CSV row")
+    return dict(zip(fieldnames, rows[0], strict=True))
+
+
+def _next_cuda_timing_group_boundary(
+    path: Path,
+    fieldnames: tuple[str, ...],
+    data_begin: int,
+    target: int,
+    file_size: int,
+) -> int:
+    """Move an approximate byte target to the next complete group boundary."""
+
+    if target <= data_begin:
+        return data_begin
+    if target >= file_size:
+        return file_size
+    with path.open("rb") as handle:
+        handle.seek(target - 1)
+        if handle.read(1) != b"\n":
+            handle.readline()
+        first_line = handle.readline()
+        if not first_line:
+            return file_size
+        first_group = _measurement_group_key(
+            _cuda_timing_row_at(first_line, fieldnames, path)
+        )
+        while True:
+            row_begin = handle.tell()
+            raw_line = handle.readline()
+            if not raw_line:
+                return file_size
+            group = _measurement_group_key(
+                _cuda_timing_row_at(raw_line, fieldnames, path)
+            )
+            if group != first_group:
+                return row_begin
+
+
+def _cuda_timing_byte_ranges(
+    path: Path,
+    fieldnames: tuple[str, ...],
+    data_begin: int,
+    worker_count: int,
+) -> tuple[tuple[int, int], ...]:
+    """Partition a sidecar without splitting one measurement group."""
+
+    file_size = path.stat().st_size
+    if file_size <= data_begin:
+        return ()
+    boundaries = [data_begin]
+    data_bytes = file_size - data_begin
+    for worker_index in range(1, worker_count):
+        target = data_begin + data_bytes * worker_index // worker_count
+        boundary = _next_cuda_timing_group_boundary(
+            path, fieldnames, data_begin, target, file_size
+        )
+        if boundaries[-1] < boundary < file_size:
+            boundaries.append(boundary)
+    boundaries.append(file_size)
+    return tuple(zip(boundaries[:-1], boundaries[1:], strict=True))
+
+
+def _cuda_timing_physical_core_count() -> int:
+    """Return the affinity-visible physical-core count for sidecar parsing."""
+
+    visible = tuple(sorted(os.sched_getaffinity(0)))
+    physical = set()
+    for cpu in visible:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package = (topology / "physical_package_id").read_text().strip()
+            core = (topology / "core_id").read_text().strip()
+        except OSError:
+            return max(1, len(visible))
+        physical.add((package, core))
+    return max(1, len(physical))
+
+
+def read_cuda_decode_timing_sidecars(
+    paths: Iterable[Path],
+    *,
+    workers: int | None = None,
+) -> dict[RawTimingKey, tuple[float, ...]]:
+    """Read exact samples and prove complete interleaved candidate rounds."""
+
+    resolved_paths = tuple(Path(item) for item in paths)
+    if not resolved_paths:
+        return {}
+    physical_cores = _cuda_timing_physical_core_count()
+    if workers is None:
+        requested_workers = int(os.environ.get(
+            "LLAMINAR_NATIVE_VNNI_CUDA_TIMING_WORKERS",
+            str(physical_cores),
+        ))
+    else:
+        requested_workers = workers
+    if requested_workers < 1:
+        raise ValueError("CUDA timing worker count must be positive")
+    worker_count = min(requested_workers, physical_cores)
+
+    tasks: list[tuple[str, tuple[str, ...], int, int]] = []
+    for path in resolved_paths:
+        fieldnames, data_begin = _cuda_timing_header(path)
+        data_bytes = max(0, path.stat().st_size - data_begin)
+        useful_workers = max(1, data_bytes // (32 * 1024 * 1024))
+        path_workers = min(worker_count, useful_workers)
+        tasks.extend(
+            (str(path), fieldnames, begin, end)
+            for begin, end in _cuda_timing_byte_ranges(
+                path, fieldnames, data_begin, path_workers
+            )
+        )
+    if not tasks:
+        return {}
+    if len(tasks) == 1:
+        shards = (_read_cuda_decode_timing_shard(tasks[0]),)
+    else:
+        with ProcessPoolExecutor(
+            max_workers=min(worker_count, len(tasks)),
+            mp_context=multiprocessing.get_context("fork"),
+        ) as executor:
+            shards = tuple(executor.map(_read_cuda_decode_timing_shard, tasks))
+
+    result: dict[RawTimingKey, tuple[float, ...]] = {}
+    for shard in shards:
+        overlap = result.keys() & shard.keys()
+        if overlap:
+            raise ValueError(
+                "CUDA timing shards repeat complete trial keys: "
+                f"{next(iter(overlap))}"
+            )
+        result.update(shard)
     return result
 
 
@@ -392,6 +577,12 @@ def _raw_candidate_config(raw: Mapping[str, str]) -> dict[str, object]:
 
     family = raw["family"].strip().lower()
     if family == "inherit_serial_m1":
+        config: dict[str, object] = {"family": family}
+        candidate_id = raw["candidate_id"].strip()
+        if candidate_id.rsplit(".", 1)[-1].startswith("r"):
+            config["grouped_rows"] = int(raw["grouped_rows"])
+        return config
+    if family == "tensor_core_mma16":
         return {"family": family}
     return {
         "family": family,
@@ -628,23 +819,160 @@ def adapt_cuda_decode_row(
     return observation
 
 
+def _cuda_aggregate_header(path: Path) -> tuple[tuple[str, ...], int]:
+    """Validate one aggregate header and return its first data byte."""
+
+    with path.open("rb") as handle:
+        header_line = handle.readline()
+        data_begin = handle.tell()
+    try:
+        rows = list(csv.reader([header_line.decode("utf-8")]))
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{path}: aggregate header is not UTF-8") from error
+    if len(rows) != 1:
+        raise ValueError(f"{path}: malformed CUDA decode aggregate header")
+    fieldnames = tuple(rows[0])
+    missing = REQUIRED_RAW_COLUMNS.difference(fieldnames)
+    if missing:
+        raise ValueError(
+            f"{path}: missing strong CUDA decode columns {sorted(missing)}"
+        )
+    return fieldnames, data_begin
+
+
+def _adapt_cuda_decode_range(
+    task: tuple[str, tuple[str, ...], int, int],
+) -> tuple[tuple[NativeVNNIObservation, ...], frozenset[RawTimingKey]]:
+    """Adapt one complete-group-aligned aggregate byte range in a worker."""
+
+    if _PARALLEL_CUDA_ADAPTER_CONTEXT is None:
+        raise RuntimeError("parallel CUDA adapter context was not initialized")
+    path_text, fieldnames, begin, end = task
+    path = Path(path_text)
+    with path.open("rb") as handle:
+        handle.seek(begin)
+        encoded = handle.read(end - begin)
+    try:
+        text = encoded.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{path}:byte-{begin}: invalid UTF-8") from error
+
+    observations = []
+    used_timing_keys: set[RawTimingKey] = set()
+    measurement_groups: dict[
+        MeasurementGroupKey, list[tuple[int, int, str]]
+    ] = defaultdict(list)
+    reader = csv.DictReader(io.StringIO(text, newline=""), fieldnames=fieldnames)
+    for local_row, raw in enumerate(reader):
+        try:
+            timing_key = _timing_key(raw)
+            if timing_key in used_timing_keys:
+                raise ValueError(f"aggregate repeats timing key {timing_key}")
+            used_timing_keys.add(timing_key)
+            measurement_groups[_measurement_group_key(raw)].append((
+                int(raw["measurement_order"]),
+                int(raw["measurement_order_seed"]),
+                raw["candidate_id"].strip().lower(),
+            ))
+            observations.append(adapt_cuda_decode_row(
+                raw,
+                _PARALLEL_CUDA_ADAPTER_CONTEXT,
+                _PARALLEL_CUDA_TIMING_INDEX.get(timing_key),
+            ))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"{path}:byte-{begin}:row-{local_row}: {error}"
+            ) from error
+    _validate_measurement_orders(measurement_groups)
+    return tuple(observations), frozenset(used_timing_keys)
+
+
 def adapt_cuda_decode_csv(
     paths: Iterable[Path],
     context: CUDADecodeAdapterContext,
     *,
     timing_sidecars: Iterable[Path] = (),
+    workers: int | None = None,
+    parallel_threshold_bytes: int = 16 * 1024 * 1024,
 ) -> ObservationCorpus:
-    """Read strong CUDA shards and return one validated common corpus."""
+    """Read CUDA shards with deterministic physical-core row adaptation."""
 
     context.validate()
     timing_index = read_cuda_decode_timing_sidecars(timing_sidecars)
     if context.profile.installable and not timing_index:
         raise ValueError("installable CUDA corpus is missing timing sidecars")
+
+    resolved_paths = tuple(Path(item) for item in paths)
+    headers = tuple(
+        (path, *_cuda_aggregate_header(path)) for path in resolved_paths
+    )
+    total_bytes = sum(
+        max(0, path.stat().st_size - data_begin)
+        for path, _fieldnames, data_begin in headers
+    )
+    physical_cores = _cuda_timing_physical_core_count()
+    if workers is None:
+        workers = int(os.environ.get(
+            "LLAMINAR_NATIVE_VNNI_CUDA_ADAPTER_WORKERS",
+            str(physical_cores),
+        ))
+    if workers < 1:
+        raise ValueError("CUDA adapter worker count must be positive")
+    worker_count = min(workers, physical_cores)
+
+    if worker_count > 1 and total_bytes >= parallel_threshold_bytes:
+        tasks = []
+        for path, fieldnames, data_begin in headers:
+            data_bytes = max(0, path.stat().st_size - data_begin)
+            useful_workers = max(1, data_bytes // (8 * 1024 * 1024))
+            path_workers = min(worker_count, useful_workers)
+            tasks.extend(
+                (str(path), fieldnames, begin, end)
+                for begin, end in _cuda_timing_byte_ranges(
+                    path, fieldnames, data_begin, path_workers
+                )
+            )
+        global _PARALLEL_CUDA_ADAPTER_CONTEXT
+        global _PARALLEL_CUDA_TIMING_INDEX
+        _PARALLEL_CUDA_ADAPTER_CONTEXT = context
+        _PARALLEL_CUDA_TIMING_INDEX = timing_index
+        try:
+            with ProcessPoolExecutor(
+                max_workers=min(worker_count, len(tasks)),
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                partitions = tuple(executor.map(_adapt_cuda_decode_range, tasks))
+        finally:
+            _PARALLEL_CUDA_ADAPTER_CONTEXT = None
+            _PARALLEL_CUDA_TIMING_INDEX = {}
+
+        used_timing_keys: set[RawTimingKey] = set()
+        for _observations, shard_keys in partitions:
+            overlap = used_timing_keys.intersection(shard_keys)
+            if overlap:
+                raise ValueError(
+                    "CUDA aggregate shards repeat complete timing keys: "
+                    f"{next(iter(overlap))}"
+                )
+            used_timing_keys.update(shard_keys)
+        unused_timing_keys = timing_index.keys() - used_timing_keys
+        if unused_timing_keys:
+            first = next(iter(unused_timing_keys))
+            raise ValueError(f"CUDA timing sidecar has no aggregate row for {first}")
+        observations = tuple(
+            observation
+            for shard_observations, _shard_keys in partitions
+            for observation in shard_observations
+        )
+        if not observations:
+            raise ValueError("CUDA decode trainer inputs contained no observations")
+        return ObservationCorpus._from_validated(observations)
+
     observations = []
     measurement_groups: dict[
         MeasurementGroupKey, list[tuple[int, int, str]]
     ] = defaultdict(list)
-    for path in (Path(item) for item in paths):
+    for path in resolved_paths:
         with path.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
             missing = REQUIRED_RAW_COLUMNS.difference(reader.fieldnames or ())
@@ -669,4 +997,4 @@ def adapt_cuda_decode_csv(
     if timing_index:
         first = next(iter(timing_index))
         raise ValueError(f"CUDA timing sidecar has no aggregate row for {first}")
-    return ObservationCorpus(observations)
+    return ObservationCorpus._from_validated(observations)

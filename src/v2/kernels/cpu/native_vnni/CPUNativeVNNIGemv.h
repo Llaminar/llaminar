@@ -42,6 +42,7 @@
 #pragma once
 
 #include <immintrin.h>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -135,7 +136,212 @@ namespace llaminar2::cpu::native_vnni
         Auto,
         Pairwise,
         WideRows,
+        FullKRowChunkGrid,
+        FullKTwoRowNbc1,
+        FullKTwoRowNbc2,
+        FullKTwoRowPairGridNbc1,
+        FullKTwoRowPairGridNbc2,
+        FullKTwoRowPairGridNbc4,
+        FullKTwoRowPairGridNbc8,
     };
+
+    /**
+     * @brief Return the stable compiler and telemetry name for one grouped policy.
+     *
+     * These names are shared by the forceable trainer registry, route
+     * telemetry, generated C++ policy, and sealed evidence. Keep the spelling
+     * centralized so a new physical schedule cannot be timed under one name
+     * and executed under another.
+     */
+    inline const char *verifierRowsPolicyName(VerifierRowsPolicy policy)
+    {
+        switch (policy)
+        {
+        case VerifierRowsPolicy::Auto:
+            return "Auto";
+        case VerifierRowsPolicy::Pairwise:
+            return "Pairwise";
+        case VerifierRowsPolicy::WideRows:
+            return "WideRows";
+        case VerifierRowsPolicy::FullKRowChunkGrid:
+            return "FullKRowChunkGrid";
+        case VerifierRowsPolicy::FullKTwoRowNbc1:
+            return "FullKTwoRowNbc1";
+        case VerifierRowsPolicy::FullKTwoRowNbc2:
+            return "FullKTwoRowNbc2";
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc1:
+            return "FullKTwoRowPairGridNbc1";
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc2:
+            return "FullKTwoRowPairGridNbc2";
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc4:
+            return "FullKTwoRowPairGridNbc4";
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc8:
+            return "FullKTwoRowPairGridNbc8";
+        }
+        return "Invalid";
+    }
+
+    /**
+     * @brief Test whether a grouped policy requires serial M=1 full-K arithmetic.
+     *
+     * The prefill-style candidates reuse packed weights across rows while each
+     * row still traverses K in serial order. They are valid only when serial
+     * M=1 itself owns one K tile. Long-K domains must retain the independently
+     * reduced Pairwise/WideRows K-partition kernels.
+     */
+    inline bool verifierRowsPolicyRequiresFullK(VerifierRowsPolicy policy)
+    {
+        switch (policy)
+        {
+        case VerifierRowsPolicy::FullKRowChunkGrid:
+        case VerifierRowsPolicy::FullKTwoRowNbc1:
+        case VerifierRowsPolicy::FullKTwoRowNbc2:
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc1:
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc2:
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc4:
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc8:
+            return true;
+        case VerifierRowsPolicy::Auto:
+        case VerifierRowsPolicy::Pairwise:
+        case VerifierRowsPolicy::WideRows:
+            return false;
+        }
+        return false;
+    }
+
+    /** Return true for the N-major two-row full-K candidate family. */
+    inline bool verifierRowsPolicyUsesFullKNMajor(VerifierRowsPolicy policy)
+    {
+        return policy == VerifierRowsPolicy::FullKTwoRowNbc1 ||
+               policy == VerifierRowsPolicy::FullKTwoRowNbc2;
+    }
+
+    /** Return true for the Cartesian row-pair/N-block full-K family. */
+    inline bool verifierRowsPolicyUsesFullKPairGrid(VerifierRowsPolicy policy)
+    {
+        switch (policy)
+        {
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc1:
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc2:
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc4:
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc8:
+            return true;
+        case VerifierRowsPolicy::Auto:
+        case VerifierRowsPolicy::Pairwise:
+        case VerifierRowsPolicy::WideRows:
+        case VerifierRowsPolicy::FullKRowChunkGrid:
+        case VerifierRowsPolicy::FullKTwoRowNbc1:
+        case VerifierRowsPolicy::FullKTwoRowNbc2:
+            return false;
+        }
+        return false;
+    }
+
+    /**
+     * @brief Return an explicit full-K N-block width or a caller fallback.
+     */
+    inline int verifierRowsPolicyNBlockChunks(
+        VerifierRowsPolicy policy,
+        int fallback)
+    {
+        switch (policy)
+        {
+        case VerifierRowsPolicy::FullKTwoRowNbc1:
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc1:
+            return 1;
+        case VerifierRowsPolicy::FullKTwoRowNbc2:
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc2:
+            return 2;
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc4:
+            return 4;
+        case VerifierRowsPolicy::FullKTwoRowPairGridNbc8:
+            return 8;
+        case VerifierRowsPolicy::Auto:
+        case VerifierRowsPolicy::Pairwise:
+        case VerifierRowsPolicy::WideRows:
+        case VerifierRowsPolicy::FullKRowChunkGrid:
+            return fallback;
+        }
+        return fallback;
+    }
+
+    /**
+     * @brief Normalize a requested policy to its unique physical grouped route.
+     *
+     * A nominal N-block width wider than the complete N inventory aliases a
+     * narrower launch. WideRows likewise aliases Pairwise when the active ISA
+     * or runtime M cannot execute a three/four-row microkernel. Publishing the
+     * normalized identity prevents duplicate labels from entering the learner.
+     */
+    inline VerifierRowsPolicy normalizeVerifierRowsPolicy(
+        VerifierRowsPolicy policy,
+        int n_chunks,
+        bool use_avx512,
+        int M)
+    {
+        if (policy == VerifierRowsPolicy::WideRows &&
+            (!use_avx512 || M < 3))
+        {
+            return VerifierRowsPolicy::Pairwise;
+        }
+        if (policy == VerifierRowsPolicy::FullKTwoRowNbc2 && n_chunks <= 1)
+            return VerifierRowsPolicy::FullKTwoRowNbc1;
+        if (verifierRowsPolicyUsesFullKPairGrid(policy))
+        {
+            const int width = verifierRowsPolicyNBlockChunks(policy, 1);
+            if (n_chunks <= 1)
+                return VerifierRowsPolicy::FullKTwoRowPairGridNbc1;
+            if (width >= n_chunks && n_chunks <= 2)
+                return VerifierRowsPolicy::FullKTwoRowPairGridNbc2;
+            if (width >= n_chunks && n_chunks <= 4)
+                return VerifierRowsPolicy::FullKTwoRowPairGridNbc4;
+            if (width >= n_chunks && n_chunks <= 8)
+                return VerifierRowsPolicy::FullKTwoRowPairGridNbc8;
+        }
+        return policy;
+    }
+
+    /**
+     * @brief Convert the generated grouped-policy ABI to the runtime enum.
+     *
+     * The checked-in generated include may temporarily predate a newly
+     * admitted candidate family while its replacement corpus is being
+     * measured and certified. Decode the stable generated ordinal instead of
+     * naming every generated enumerator here, allowing that transaction to
+     * compile without weakening validation of unknown policy bytes.
+     *
+     * @param policy Policy byte returned by the generated selector.
+     * @return The corresponding forceable runtime grouped schedule.
+     * @throws std::runtime_error if generated data is outside the registered ABI.
+     */
+    inline VerifierRowsPolicy verifierRowsPolicyFromGenerated(
+        generated::CPUNativeVNNIVerifierRowsPolicy policy)
+    {
+        switch (static_cast<uint8_t>(policy))
+        {
+        case 0:
+            return VerifierRowsPolicy::Pairwise;
+        case 1:
+            return VerifierRowsPolicy::WideRows;
+        case 2:
+            return VerifierRowsPolicy::FullKRowChunkGrid;
+        case 3:
+            return VerifierRowsPolicy::FullKTwoRowNbc1;
+        case 4:
+            return VerifierRowsPolicy::FullKTwoRowNbc2;
+        case 5:
+            return VerifierRowsPolicy::FullKTwoRowPairGridNbc1;
+        case 6:
+            return VerifierRowsPolicy::FullKTwoRowPairGridNbc2;
+        case 7:
+            return VerifierRowsPolicy::FullKTwoRowPairGridNbc4;
+        case 8:
+            return VerifierRowsPolicy::FullKTwoRowPairGridNbc8;
+        default:
+            throw std::runtime_error(
+                "Generated CPU NativeVNNI verifier policy is outside the runtime ABI");
+        }
+    }
 
     /**
      * @brief Forceable CPU M=1 N-chunk ownership policy.
@@ -255,6 +461,33 @@ namespace llaminar2::cpu::native_vnni
     }
 
     /**
+     * @brief Resolve one learned nominal width to its physical launch schedule.
+     *
+     * Generic trees learn candidate families from measured geometries.  A
+     * family wider than a new geometry's complete N-chunk inventory aliases
+     * the smallest power-of-two schedule that owns that inventory.  Resolve
+     * that geometry-dependent identity at the generated-policy boundary so
+     * every production `Auto` result is directly forceable by the kernel.
+     *
+     * @param policy Nominal candidate emitted by the generated generic tree.
+     * @param N Runtime output width in scalar columns.
+     * @return The unique physical schedule for this candidate and geometry.
+     */
+    inline DecodeSchedulePolicy resolveGeneratedDecodeSchedulePolicy(
+        generated::CPUNativeVNNIDecodePolicy policy,
+        int N)
+    {
+        if (N <= 0)
+        {
+            throw std::invalid_argument(
+                "CPU NativeVNNI decode policy requires positive N");
+        }
+        return normalizeDecodeSchedulePolicy(
+            decodeSchedulePolicyFromGenerated(policy),
+            (N + 63) / 64);
+    }
+
+    /**
      * @brief Resolve the sealed CPU M=1 schedule for a physical launch.
      *
      * @param packed Prepared weights whose execution codebook owns the domain.
@@ -263,6 +496,7 @@ namespace llaminar2::cpu::native_vnni
      * @param use_avx512 Whether this invocation selected AVX512 kernels.
      * @param use_avx2 Whether this invocation selected AVX2 kernels.
      * @param serial_kpart Whether frozen serial arithmetic has multiple K tiles.
+     * @param serial_k_tiles Exact frozen K-tile count for producer-grid policy.
      * @return A forceable N-chunk schedule backed by certified evidence.
      * @throws std::runtime_error when no certified total policy is installed.
      */
@@ -272,7 +506,8 @@ namespace llaminar2::cpu::native_vnni
         int K,
         bool use_avx512,
         bool use_avx2,
-        bool serial_kpart)
+        bool serial_kpart,
+        int serial_k_tiles)
     {
         if constexpr (!LLAMINAR_CPU_NVNNI_DECODE_POLICY_CERTIFIED)
         {
@@ -306,9 +541,10 @@ namespace llaminar2::cpu::native_vnni
                 N,
                 K,
                 serial_kpart,
+                serial_k_tiles,
                 generated_policy))
         {
-            return decodeSchedulePolicyFromGenerated(generated_policy);
+            return resolveGeneratedDecodeSchedulePolicy(generated_policy, N);
         }
         throw std::runtime_error(
             std::string("No certified CPU NativeVNNI M=1 decode policy for build=") +
@@ -347,24 +583,105 @@ namespace llaminar2::cpu::native_vnni
         TwoRowPairGrid,
     };
 
+    /**
+     * @brief One immutable grouped-policy lookup cached by the caller thread.
+     *
+     * Generated policy publication is immutable for the lifetime of a binary,
+     * but OpenMP thread count, effective runtime ISA, and serial K partition
+     * remain part of the certified dispatch identity. Keeping those dimensions
+     * beside the packed geometry key prevents tests or applications that
+     * intentionally change a runtime regime from reusing a decision certified
+     * for another regime.
+     */
+    struct VerifierRowsPolicyCacheEntry
+    {
+        uint64_t geometry_key = 0;
+        int threads = 0;
+        int k_tiles = 0;
+        generated::CPUNativeVNNIRuntimeISA runtime_isa =
+            generated::CPUNativeVNNIRuntimeISA::AVX2;
+        VerifierRowsPolicy policy = VerifierRowsPolicy::Pairwise;
+        bool valid = false;
+
+        /** Return true only for the complete certified runtime identity. */
+        bool matches(
+            uint64_t expected_geometry_key,
+            int expected_threads,
+            int expected_k_tiles,
+            generated::CPUNativeVNNIRuntimeISA expected_runtime_isa) const
+        {
+            return valid && geometry_key == expected_geometry_key &&
+                   threads == expected_threads &&
+                   k_tiles == expected_k_tiles &&
+                   runtime_isa == expected_runtime_isa;
+        }
+    };
+
+    /**
+     * @brief Hash one grouped-policy identity into the allocation-free cache.
+     */
+    inline size_t verifierRowsPolicyCacheIndex(
+        uint64_t geometry_key,
+        int threads,
+        int k_tiles,
+        generated::CPUNativeVNNIRuntimeISA runtime_isa)
+    {
+        /*
+         * The generated ABI already packs N, K, M, and codebook into distinct
+         * byte ranges. Folding those ranges is both cheaper and better suited
+         * to this tiny direct-mapped table than a general-purpose avalanche
+         * hash with multiple 64-bit multiplications. Thread count and ISA are
+         * folded into the same low byte because each is part of cache identity.
+         */
+        const uint64_t folded =
+            geometry_key ^ (geometry_key >> 24) ^ (geometry_key >> 48) ^
+            (geometry_key >> 56) ^
+            (static_cast<uint64_t>(static_cast<uint32_t>(threads)) << 1) ^
+            (static_cast<uint64_t>(static_cast<uint32_t>(k_tiles)) << 9) ^
+            (static_cast<uint64_t>(runtime_isa) << 7);
+        return static_cast<size_t>(folded & 255ULL);
+    }
+
+    /**
+     * @brief Resolve grouped policy for an already-known runtime context.
+     *
+     * The grouped launcher has already resolved its effective ISA and OpenMP
+     * team size before selecting a physical row schedule. Accepting that
+     * context avoids repeating runtime probes in the hot path. A one-entry MRU
+     * serves the normal graph-replay case in which the same tensor geometry and
+     * M recur on every token. A 256-entry direct-mapped table retains nearby M,
+     * codebook, and geometry variants without allocation, locking, or mutable
+     * state in the shared packed-weight object.
+     *
+     * The cache is thread-local because multiple inference requests may read
+     * one packed tensor concurrently. Generated policy data is immutable, so a
+     * cache hit is exactly equivalent to rerunning the generated selector.
+     */
     inline VerifierRowsPolicy selectVerifierRowsPolicy(
         const CPUNativeVNNIPackedWeights &packed,
         int M,
         int N,
-        int K)
+        int K,
+        ISALevel effective_isa,
+        int threads,
+        int serial_k_tiles)
     {
         if (M < 2)
             throw std::invalid_argument(
                 "CPU NativeVNNI grouped verifier policy requires M >= 2");
+        if (threads <= 0)
+            throw std::invalid_argument(
+                "CPU NativeVNNI grouped verifier policy requires a positive thread count");
+        if (serial_k_tiles < 0)
+            throw std::invalid_argument(
+                "CPU NativeVNNI grouped verifier policy requires non-negative K tiles");
 
         /*
          * The kernel inventory is physical-row-tile based, not speculative
-         * depth specialized. Generated evidence may still choose between the
-         * Pairwise and WideRows schedules for an exact runtime M because task
-         * count and tail composition affect economy. Every production M must
-         * therefore have its own generated decision. Reusing an M4 decision
-         * for an untrained wider batch would preserve correctness but make an
-         * unsupported economy claim, so missing exact coverage fails closed.
+         * depth specialized. Generated evidence chooses among K-partition and
+         * full-K grouped schedules because task count, weight reuse, and tail
+         * composition affect economy. Every result must still resolve to one
+         * registered physical policy before the cache may publish it.
          */
         generated::CPUNativeVNNIVerifierRowsPolicy generated_policy{};
 #if LLAMINAR_COMPILED_WITH_AVX512
@@ -375,7 +692,7 @@ namespace llaminar2::cpu::native_vnni
             generated::CPUNativeVNNIBuildISA::AVX2;
 #endif
         generated::CPUNativeVNNIRuntimeISA runtime_isa{};
-        switch (activeISALevel())
+        switch (effective_isa)
         {
         case ISALevel::AVX512:
             runtime_isa = generated::CPUNativeVNNIRuntimeISA::AVX512;
@@ -388,32 +705,108 @@ namespace llaminar2::cpu::native_vnni
             throw std::runtime_error(
                 "CPU NativeVNNI verifier rows require AVX2 or AVX512");
         }
-        if (generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+
+        const uint64_t geometry_key =
+            generated::packCPUNativeVNNIVerifierRowsPolicyKey(
+                packed.codebook_id, M, N, K);
+        constexpr size_t cache_capacity = 256;
+        static thread_local VerifierRowsPolicyCacheEntry most_recent;
+        static thread_local std::array<
+            VerifierRowsPolicyCacheEntry,
+            cache_capacity>
+            cache{};
+
+        if (most_recent.matches(
+                geometry_key, threads, serial_k_tiles, runtime_isa))
+            return most_recent.policy;
+
+        VerifierRowsPolicyCacheEntry &cache_entry = cache[
+            verifierRowsPolicyCacheIndex(
+                geometry_key, threads, serial_k_tiles, runtime_isa)];
+        if (cache_entry.matches(
+                geometry_key, threads, serial_k_tiles, runtime_isa))
+        {
+            most_recent = cache_entry;
+            return cache_entry.policy;
+        }
+
+#if LLAMINAR_CPU_NVNNI_VERIFIER_POLICY_ABI >= 3
+        const bool selected_generated_policy =
+            generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
                 build_isa,
                 runtime_isa,
-                omp_get_max_threads(),
+                threads,
                 packed.codebook_id,
                 M,
                 N,
                 K,
-                generated_policy))
+                serial_k_tiles,
+                generated_policy);
+#else
+        const bool selected_generated_policy =
+            generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+                build_isa,
+                runtime_isa,
+                threads,
+                packed.codebook_id,
+                M,
+                N,
+                K,
+                generated_policy);
+#endif
+        if (selected_generated_policy)
         {
-            return generated_policy ==
-                       generated::CPUNativeVNNIVerifierRowsPolicy::WideRows
-                       ? VerifierRowsPolicy::WideRows
-                       : VerifierRowsPolicy::Pairwise;
+            const VerifierRowsPolicy policy =
+                verifierRowsPolicyFromGenerated(generated_policy);
+            cache_entry = {
+                .geometry_key = geometry_key,
+                .threads = threads,
+                .k_tiles = serial_k_tiles,
+                .runtime_isa = runtime_isa,
+                .policy = policy,
+                .valid = true,
+            };
+            most_recent = cache_entry;
+            return policy;
         }
 
         throw std::runtime_error(
             std::string("No certified CPU NativeVNNI verifier-row policy for build=") +
             compiledNativeVNNIBuildISAName() +
             " runtime=" +
-            (activeISALevel() == ISALevel::AVX512 ? "AVX512" : "AVX2") +
-            " threads=" + std::to_string(omp_get_max_threads()) +
+            (effective_isa == ISALevel::AVX512 ? "AVX512" : "AVX2") +
+            " threads=" + std::to_string(threads) +
             " codebook=" + std::to_string(packed.codebook_id) +
             " M=" + std::to_string(M) +
             " N=" + std::to_string(N) +
             " K=" + std::to_string(K));
+    }
+
+    /**
+     * @brief Resolve grouped policy from the ambient CPU runtime context.
+     *
+     * Diagnostic callers that have not already selected an ISA use this
+     * convenience overload. Production grouped GEMM passes its pre-resolved
+     * context to the overload above and therefore does not pay these probes a
+     * second time.
+     */
+    inline VerifierRowsPolicy selectVerifierRowsPolicy(
+        const CPUNativeVNNIPackedWeights &packed,
+        int M,
+        int N,
+        int K)
+    {
+        const int threads = omp_get_max_threads();
+        const NativeVNNITileConfig serial_geometry = computeTileConfig(
+            N, K, 1, packed.payload_bytes, threads);
+        return selectVerifierRowsPolicy(
+            packed,
+            M,
+            N,
+            K,
+            activeISALevel(),
+            threads,
+            serial_geometry.k_tiles);
     }
 
     /**
@@ -1310,20 +1703,18 @@ namespace llaminar2::cpu::native_vnni
         if (selected_schedule == DecodeSchedulePolicy::Auto)
         {
             selected_schedule = selectDecodeSchedulePolicy(
-                packed, N, K, use_avx512, use_avx2, serial_kpart);
+                packed,
+                N,
+                K,
+                use_avx512,
+                use_avx2,
+                serial_kpart,
+                cfg.k_tiles);
         }
         if (selected_schedule != DecodeSchedulePolicy::FrozenSerialOracle)
         {
-            const DecodeSchedulePolicy normalized_schedule =
+            selected_schedule =
                 normalizeDecodeSchedulePolicy(selected_schedule, N_chunks);
-            if (requested_schedule == DecodeSchedulePolicy::Auto &&
-                normalized_schedule != selected_schedule)
-            {
-                throw std::runtime_error(
-                    "Generated CPU NativeVNNI M=1 policy selected a nominal "
-                    "N-block width that is not a physical candidate");
-            }
-            selected_schedule = normalized_schedule;
             n_block_chunks = decodeScheduleNBlockChunks(selected_schedule);
         }
 
@@ -2578,7 +2969,8 @@ namespace llaminar2::cpu::native_vnni
         int ldc,
         ISAPath isa_path = ISAPath::AUTO,
         VerifierRowsPolicy verifier_policy_override = VerifierRowsPolicy::Auto,
-        PrefillSchedulePolicy schedule_override = PrefillSchedulePolicy::Auto)
+        PrefillSchedulePolicy schedule_override = PrefillSchedulePolicy::Auto,
+        int n_block_chunks_override = 0)
     {
         const int N = packed.N;
         const int K_blocks = packed.blocks_per_row;
@@ -2627,6 +3019,21 @@ namespace llaminar2::cpu::native_vnni
         }
 
         int n_block_chunks = cfg.n_block_chunks;
+        if (n_block_chunks_override < 0)
+        {
+            throw std::invalid_argument(
+                "CPU NativeVNNI prefill N-block override must be non-negative");
+        }
+        if (n_block_chunks_override > 0)
+        {
+            if (use_generated_policy)
+            {
+                throw std::invalid_argument(
+                    "CPU NativeVNNI generated prefill policy cannot be combined "
+                    "with an explicit N-block override");
+            }
+            n_block_chunks = n_block_chunks_override;
+        }
         bool use_row_chunk_grid =
             (N_chunks + n_block_chunks - 1) / n_block_chunks <=
                     num_threads / 4 &&
@@ -2653,58 +3060,64 @@ namespace llaminar2::cpu::native_vnni
         }
         else
         {
-            switch (generated_policy)
+            /*
+             * Decode stable ordinals rather than naming every generated enum
+             * member. A newly admitted candidate family must compile while the
+             * previous development-only table is still installed; only the
+             * regenerated certified include can return its new ordinals.
+             */
+            switch (static_cast<uint8_t>(generated_policy))
             {
-            case generated::CPUNativeVNNIPrefillPolicy::RowChunkGrid:
+            case 0: // RowChunkGrid
                 use_row_chunk_grid = true;
                 break;
-            case generated::CPUNativeVNNIPrefillPolicy::TwoRowNbc1:
+            case 1: // TwoRowNbc1
                 n_block_chunks = 1;
                 use_row_chunk_grid = false;
                 break;
-            case generated::CPUNativeVNNIPrefillPolicy::TwoRowNbc2:
+            case 2: // TwoRowNbc2
                 n_block_chunks = 2;
                 use_row_chunk_grid = false;
                 break;
-            case generated::CPUNativeVNNIPrefillPolicy::TwoRowNbc4:
+            case 3: // TwoRowNbc4
                 n_block_chunks = 4;
                 use_row_chunk_grid = false;
                 break;
-            case generated::CPUNativeVNNIPrefillPolicy::TwoRowNbc8:
+            case 4: // TwoRowNbc8
                 n_block_chunks = 8;
                 use_row_chunk_grid = false;
                 break;
-            case generated::CPUNativeVNNIPrefillPolicy::TwoRowNbc16:
+            case 5: // TwoRowNbc16
                 n_block_chunks = 16;
                 use_row_chunk_grid = false;
                 break;
-            case generated::CPUNativeVNNIPrefillPolicy::TwoRowPairGridNbc1:
+            case 8: // TwoRowPairGridNbc1
                 n_block_chunks = 1;
                 use_row_chunk_grid = false;
                 use_two_row_pair_grid = true;
                 break;
-            case generated::CPUNativeVNNIPrefillPolicy::TwoRowPairGridNbc2:
+            case 9: // TwoRowPairGridNbc2
                 n_block_chunks = 2;
                 use_row_chunk_grid = false;
                 use_two_row_pair_grid = true;
                 break;
-            case generated::CPUNativeVNNIPrefillPolicy::TwoRowPairGridNbc4:
+            case 10: // TwoRowPairGridNbc4
                 n_block_chunks = 4;
                 use_row_chunk_grid = false;
                 use_two_row_pair_grid = true;
                 break;
-            case generated::CPUNativeVNNIPrefillPolicy::TwoRowPairGridNbc8:
+            case 11: // TwoRowPairGridNbc8
                 n_block_chunks = 8;
                 use_row_chunk_grid = false;
                 use_two_row_pair_grid = true;
                 break;
-            case generated::CPUNativeVNNIPrefillPolicy::TwoRowPairGridNbc16:
+            case 12: // TwoRowPairGridNbc16
                 n_block_chunks = 16;
                 use_row_chunk_grid = false;
                 use_two_row_pair_grid = true;
                 break;
-            case generated::CPUNativeVNNIPrefillPolicy::KPartPairwise:
-            case generated::CPUNativeVNNIPrefillPolicy::KPartWideRows:
+            case 6: // KPartPairwise
+            case 7: // KPartWideRows
                 if (!use_decode_equivalent_kpart)
                 {
                     throw std::runtime_error(
@@ -2713,6 +3126,9 @@ namespace llaminar2::cpu::native_vnni
                 }
                 use_row_chunk_grid = false;
                 break;
+            default:
+                throw std::runtime_error(
+                    "Generated CPU NativeVNNI prefill policy is outside the runtime ABI");
             }
         }
         const int total_n_blocks =
@@ -2720,9 +3136,7 @@ namespace llaminar2::cpu::native_vnni
         const VerifierRowsPolicy requested_kpart_policy =
             use_decode_equivalent_kpart
                 ? (use_generated_policy
-                       ? (generated_policy ==
-                                  generated::CPUNativeVNNIPrefillPolicy::
-                                      KPartWideRows
+                       ? (static_cast<uint8_t>(generated_policy) == 7
                               ? VerifierRowsPolicy::WideRows
                               : VerifierRowsPolicy::Pairwise)
                        : verifier_policy_override)
@@ -2790,7 +3204,6 @@ namespace llaminar2::cpu::native_vnni
                     {"k_tile_blocks", std::to_string(effective_k_tile_blocks)},
                     {"k_tiles", std::to_string(effective_k_tiles)},
                     {"parallel_tasks", std::to_string(parallel_tasks)},
-                    {"row_tile", use_two_row_pair_grid ? "2" : "1"},
                     {"threads", std::to_string(num_threads)}});
         }
 
@@ -2809,12 +3222,11 @@ namespace llaminar2::cpu::native_vnni
         }
 
         /*
-         * The grouped verifier helper already owns the economical full-K
-         * two-row Cartesian task grid. Calling it with an explicit Pairwise
-         * policy bypasses verifier-policy lookup while reusing the exact same
-         * AVX2/AVX512 chunk microkernels as the N-major prefill schedule. Each
-         * task writes a disjoint pair of output rows and N block, so changing
-         * task order cannot alter any row's floating-point accumulation order.
+         * The grouped verifier helper owns the economical full-K Cartesian
+         * row-pair grid. Calling it with an explicit Pairwise arithmetic
+         * policy bypasses verifier-policy lookup while retaining the selected
+         * physical row width. Every task writes a disjoint row tile and N
+         * block, so scheduling cannot alter an output row's K accumulation.
          */
         if (use_two_row_pair_grid)
         {
@@ -3109,7 +3521,7 @@ namespace llaminar2::cpu::native_vnni
      *
      * Grouped rows must preserve the production M1 reduction tree whenever
      * their results can feed speculative or recurrent state. Ordinary full-K
-     * prefill uses its economical two-row kernel directly; when serial M1
+     * prefill uses its economical multi-row kernels directly; when serial M1
      * selects K partitioning, the ordinary dispatcher enters this same helper.
      * Work remains grouped across `(row, N-block[, K-tile])` tasks while every
      * row preserves the exact GEMV chunk and reduction order used by
@@ -3146,15 +3558,45 @@ namespace llaminar2::cpu::native_vnni
             !use_avx512 &&
             ((isa_path == ISAPath::AUTO && active_isa >= ISALevel::AVX2) ||
              isa_path == ISAPath::AVX2);
-        const VerifierRowsPolicy verifier_policy =
+        const ISALevel effective_isa =
+            use_avx512
+                ? ISALevel::AVX512
+                : (use_avx2 ? ISALevel::AVX2 : ISALevel::Scalar);
+        const int num_threads = omp_get_max_threads();
+        NativeVNNITileConfig cfg = computeTileConfig(
+            N, K, 1, packed.payload_bytes, num_threads);
+        const VerifierRowsPolicy selected_policy =
             verifier_policy_override == VerifierRowsPolicy::Auto
-                ? selectVerifierRowsPolicy(packed, M, N, K)
+                ? selectVerifierRowsPolicy(
+                      packed,
+                      M,
+                      N,
+                      K,
+                      effective_isa,
+                      num_threads,
+                      cfg.k_tiles)
                 : verifier_policy_override;
+        VerifierRowsPolicy verifier_policy = normalizeVerifierRowsPolicy(
+            selected_policy, N_chunks, use_avx512, M);
+        if (verifierRowsPolicyRequiresFullK(verifier_policy) &&
+            cfg.k_tiles > 1)
+        {
+            if (verifier_policy_override == VerifierRowsPolicy::Auto)
+            {
+                throw std::runtime_error(
+                    "Generated CPU grouped verifier policy selected a full-K "
+                    "schedule for a serial M=1 K-partition domain");
+            }
+            /*
+             * Explicit trainer requests must remain observable as unsupported
+             * evidence. Execute the established Pairwise K-partition route and
+             * publish its physical identity; route mismatch then prevents the
+             * requested full-K label from entering timing or policy fitting.
+             */
+            verifier_policy = VerifierRowsPolicy::Pairwise;
+        }
         const bool use_wide_rows =
             verifier_policy == VerifierRowsPolicy::WideRows;
-
-        const int num_threads = omp_get_max_threads();
-        NativeVNNITileConfig cfg = computeTileConfig(N, K, 1, packed.payload_bytes, num_threads);
         if (full_k_n_block_chunks_override < 0)
         {
             throw std::invalid_argument(
@@ -3166,10 +3608,12 @@ namespace llaminar2::cpu::native_vnni
                 "CPU NativeVNNI pair-grid N-block override cannot replace "
                 "the serial decode K-partition geometry");
         }
+        const int policy_n_block_chunks = verifierRowsPolicyNBlockChunks(
+            verifier_policy, cfg.n_block_chunks);
         const int effective_n_block_chunks =
             full_k_n_block_chunks_override > 0
                 ? full_k_n_block_chunks_override
-                : cfg.n_block_chunks;
+                : policy_n_block_chunks;
 
         /*
          * Route identity is part of the grouped verifier contract.  WideRows
@@ -3181,16 +3625,10 @@ namespace llaminar2::cpu::native_vnni
          */
         if (publish_verifier_route && PerfStatsCollector::isEnabled())
         {
-            const bool effective_wide_rows =
-                use_wide_rows && use_avx512 && M >= 3;
-            const char *requested_policy =
-                verifier_policy_override == VerifierRowsPolicy::Auto
-                    ? "Auto"
-                    : (verifier_policy_override == VerifierRowsPolicy::WideRows
-                           ? "WideRows"
-                           : "Pairwise");
-            const char *effective_policy =
-                effective_wide_rows ? "WideRows" : "Pairwise";
+            const char *requested_policy = verifierRowsPolicyName(
+                verifier_policy_override);
+            const char *effective_policy = verifierRowsPolicyName(
+                verifier_policy);
             const char *effective_isa =
                 use_avx512 ? "AVX512" : (use_avx2 ? "AVX2" : "Scalar");
             PerfStatsCollector::addCounter(
@@ -3262,6 +3700,31 @@ namespace llaminar2::cpu::native_vnni
                 }
             };
             OMP_WORKSHARE_REGION(do_scalar_rows);
+            return;
+        }
+
+        if (verifier_policy == VerifierRowsPolicy::FullKRowChunkGrid ||
+            verifierRowsPolicyUsesFullKNMajor(verifier_policy))
+        {
+            /*
+             * These two schedules already have one audited implementation in
+             * the ordinary prefill engine. Enter it with explicit policy and
+             * width controls after the grouped route has been published. This
+             * is direct grouped execution over the complete M-by-N tensor; it
+             * never replays serial rows and never consults the prefill table.
+             */
+            gemm_native_vnni_preq(
+                packed,
+                A_q8_all,
+                C,
+                M,
+                ldc,
+                isa_path,
+                VerifierRowsPolicy::Pairwise,
+                verifier_policy == VerifierRowsPolicy::FullKRowChunkGrid
+                    ? PrefillSchedulePolicy::RowChunkGrid
+                    : PrefillSchedulePolicy::TwoRowNMajor,
+                effective_n_block_chunks);
             return;
         }
 
@@ -3447,20 +3910,19 @@ namespace llaminar2::cpu::native_vnni
         const int n_block_chunks = effective_n_block_chunks;
         const int total_blocks = (N_chunks + n_block_chunks - 1) / n_block_chunks;
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
         if (use_avx512 && M >= 3 && use_wide_rows)
         {
             /*
-             * Compose arbitrary runtime M from bounded four-row physical
-             * tiles. A final 1/2/3-row tile uses the matching serial-shaped
-             * chunk kernel, so M changes neither K order nor output layout.
+             * Compose arbitrary runtime M from bounded four-row physical tiles.
+             * AVX512 has native three/four-row kernels. Every tail still owns
+             * disjoint output rows and increasing-K arithmetic.
              */
             const int row_tile_count = (M + 3) / 4;
-            const int total_wide_tasks = row_tile_count * total_blocks;
-            auto do_wide_rows = [&]()
+            const int total_four_row_tasks = row_tile_count * total_blocks;
+            auto do_four_rows = [&]()
             {
 #pragma omp for schedule(static)
-                for (int task = 0; task < total_wide_tasks; ++task)
+                for (int task = 0; task < total_four_row_tasks; ++task)
                 {
                     const int block_idx = task / row_tile_count;
                     const int row_tile = task % row_tile_count;
@@ -3497,64 +3959,73 @@ namespace llaminar2::cpu::native_vnni
                                              : tail_output[row];
                         }
 
-                        if (tile_rows == 4)
+                        if (use_avx512)
                         {
-                            if (packed.is_nibble_lut)
-                                gemm_4row_native_2z_chunk(
-                                    packed, row_q8[0], row_q8[1], row_q8[2],
-                                    row_q8[3], kernel_output[0], kernel_output[1],
-                                    kernel_output[2], kernel_output[3], chunk, 0,
-                                    K_blocks, decode_lut_512,
-                                    /*accumulate=*/false);
+                            /*
+                             * Keep all AVX512-only symbols inside the compile
+                             * guard so the AVX2-only trainer builds the same
+                             * runtime launcher without dead declarations.
+                             */
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                            if (tile_rows == 4)
+                            {
+                                if (packed.is_nibble_lut)
+                                    gemm_4row_native_2z_chunk(
+                                        packed, row_q8[0], row_q8[1], row_q8[2],
+                                        row_q8[3], kernel_output[0], kernel_output[1],
+                                        kernel_output[2], kernel_output[3], chunk, 0,
+                                        K_blocks, decode_lut_512,
+                                        /*accumulate=*/false);
+                                else
+                                    gemm_4row_int8_2z_chunk(
+                                        packed, row_q8[0], row_q8[1], row_q8[2],
+                                        row_q8[3], kernel_output[0], kernel_output[1],
+                                        kernel_output[2], kernel_output[3], chunk, 0,
+                                        K_blocks, /*accumulate=*/false);
+                            }
+                            else if (tile_rows == 3)
+                            {
+                                if (packed.is_nibble_lut)
+                                    gemm_3row_native_2z_chunk(
+                                        packed, row_q8[0], row_q8[1], row_q8[2],
+                                        kernel_output[0], kernel_output[1],
+                                        kernel_output[2], chunk, 0, K_blocks,
+                                        decode_lut_512, /*accumulate=*/false);
+                                else
+                                    gemm_3row_int8_2z_chunk(
+                                        packed, row_q8[0], row_q8[1], row_q8[2],
+                                        kernel_output[0], kernel_output[1],
+                                        kernel_output[2], chunk, 0, K_blocks,
+                                        /*accumulate=*/false);
+                            }
+                            else if (tile_rows == 2)
+                            {
+                                if (packed.is_nibble_lut)
+                                    gemm_2row_native_chunk(
+                                        packed, row_q8[0], row_q8[1],
+                                        kernel_output[0], kernel_output[1], chunk,
+                                        0, K_blocks, decode_lut_512,
+                                        /*accumulate=*/false);
+                                else
+                                    gemm_2row_int8_chunk(
+                                        packed, row_q8[0], row_q8[1],
+                                        kernel_output[0], kernel_output[1], chunk,
+                                        0, K_blocks, /*accumulate=*/false);
+                            }
+                            else if (packed.is_nibble_lut)
+                            {
+                                gemv_native_vnni_avx512_chunk_native(
+                                    packed, row_q8[0], kernel_output[0], chunk, 0,
+                                    K_blocks, decode_lut_512);
+                            }
                             else
-                                gemm_4row_int8_2z_chunk(
-                                    packed, row_q8[0], row_q8[1], row_q8[2],
-                                    row_q8[3], kernel_output[0], kernel_output[1],
-                                    kernel_output[2], kernel_output[3], chunk, 0,
-                                    K_blocks, /*accumulate=*/false);
+                            {
+                                gemv_native_vnni_avx512_chunk_int8(
+                                    packed, row_q8[0], kernel_output[0], chunk, 0,
+                                    K_blocks);
+                            }
+#endif
                         }
-                        else if (tile_rows == 3)
-                        {
-                            if (packed.is_nibble_lut)
-                                gemm_3row_native_2z_chunk(
-                                    packed, row_q8[0], row_q8[1], row_q8[2],
-                                    kernel_output[0], kernel_output[1],
-                                    kernel_output[2], chunk, 0, K_blocks,
-                                    decode_lut_512, /*accumulate=*/false);
-                            else
-                                gemm_3row_int8_2z_chunk(
-                                    packed, row_q8[0], row_q8[1], row_q8[2],
-                                    kernel_output[0], kernel_output[1],
-                                    kernel_output[2], chunk, 0, K_blocks,
-                                    /*accumulate=*/false);
-                        }
-                        else if (tile_rows == 2)
-                        {
-                            if (packed.is_nibble_lut)
-                                gemm_2row_native_chunk(
-                                    packed, row_q8[0], row_q8[1],
-                                    kernel_output[0], kernel_output[1], chunk,
-                                    0, K_blocks, decode_lut_512,
-                                    /*accumulate=*/false);
-                            else
-                                gemm_2row_int8_chunk(
-                                    packed, row_q8[0], row_q8[1],
-                                    kernel_output[0], kernel_output[1], chunk,
-                                    0, K_blocks, /*accumulate=*/false);
-                        }
-                        else if (packed.is_nibble_lut)
-                        {
-                            gemv_native_vnni_avx512_chunk_native(
-                                packed, row_q8[0], kernel_output[0], chunk, 0,
-                                K_blocks, decode_lut_512);
-                        }
-                        else
-                        {
-                            gemv_native_vnni_avx512_chunk_int8(
-                                packed, row_q8[0], kernel_output[0], chunk, 0,
-                                K_blocks);
-                        }
-
                         if (n_cols < 64)
                         {
                             for (int row = 0; row < tile_rows; ++row)
@@ -3568,10 +4039,9 @@ namespace llaminar2::cpu::native_vnni
                     }
                 }
             };
-            OMP_WORKSHARE_REGION(do_wide_rows);
+            OMP_WORKSHARE_REGION(do_four_rows);
             return;
         }
-#endif
 
         /*
          * Pair verifier rows for AVX2 and AVX512.
@@ -3745,6 +4215,12 @@ namespace llaminar2::cpu::native_vnni
          * is selected independently by the verifier policy table.
          */
         DecodeSchedulePolicy decode_schedule = DecodeSchedulePolicy::Auto;
+        /**
+         * Forceable grouped schedule for M>1 trainer and regression launches.
+         * Production descriptors leave this as Auto and resolve the sealed
+         * grouped policy independently for each projection geometry/codebook.
+         */
+        VerifierRowsPolicy verifier_schedule = VerifierRowsPolicy::Auto;
     };
 
     /**
@@ -3791,6 +4267,13 @@ namespace llaminar2::cpu::native_vnni
                     "CPU NativeVNNI grouped verifier bundles cannot override "
                     "the M=1 decode schedule");
             }
+            if (M == 1 &&
+                d.verifier_schedule != VerifierRowsPolicy::Auto)
+            {
+                throw std::invalid_argument(
+                    "CPU NativeVNNI fused M=1 bundles cannot override the "
+                    "grouped verifier schedule");
+            }
         }
 
         const ISALevel active_isa = activeISALevel();
@@ -3823,6 +4306,10 @@ namespace llaminar2::cpu::native_vnni
                 DecodeSchedulePolicy::Auto;
             DecodeSchedulePolicy effective_decode_schedule =
                 DecodeSchedulePolicy::Auto;
+            VerifierRowsPolicy requested_verifier_schedule =
+                VerifierRowsPolicy::Auto;
+            VerifierRowsPolicy effective_verifier_schedule =
+                VerifierRowsPolicy::Pairwise;
         };
 
         std::vector<FusedVerifierRowsPlan> plans(static_cast<size_t>(num_descs));
@@ -3850,26 +4337,53 @@ namespace llaminar2::cpu::native_vnni
                         d.packed->K,
                         use_avx512,
                         use_avx2,
-                        plan.k_tiles > 1);
+                        plan.k_tiles > 1,
+                        plan.k_tiles);
                 }
                 if (plan.effective_decode_schedule !=
                     DecodeSchedulePolicy::FrozenSerialOracle)
                 {
-                    const DecodeSchedulePolicy normalized =
+                    plan.effective_decode_schedule =
                         normalizeDecodeSchedulePolicy(
                             plan.effective_decode_schedule,
                             plan.n_chunks);
-                    if (plan.requested_decode_schedule ==
-                            DecodeSchedulePolicy::Auto &&
-                        normalized != plan.effective_decode_schedule)
+                    plan.n_block_chunks = decodeScheduleNBlockChunks(
+                        plan.effective_decode_schedule);
+                }
+            }
+            else
+            {
+                plan.requested_verifier_schedule = d.verifier_schedule;
+                const VerifierRowsPolicy selected =
+                    d.verifier_schedule == VerifierRowsPolicy::Auto
+                        ? selectVerifierRowsPolicy(
+                              *d.packed,
+                              M,
+                              d.N,
+                              d.packed->K,
+                              use_avx512 ? ISALevel::AVX512 : ISALevel::AVX2,
+                              num_threads,
+                              plan.k_tiles)
+                        : d.verifier_schedule;
+                plan.effective_verifier_schedule =
+                    normalizeVerifierRowsPolicy(
+                        selected, plan.n_chunks, use_avx512, M);
+                if (verifierRowsPolicyRequiresFullK(
+                        plan.effective_verifier_schedule) &&
+                    plan.k_tiles > 1)
+                {
+                    if (d.verifier_schedule == VerifierRowsPolicy::Auto)
                     {
                         throw std::runtime_error(
-                            "Generated CPU NativeVNNI fused M=1 policy selected "
-                            "a nominal N-block width that is not physical");
+                            "Generated fused CPU grouped verifier policy selected "
+                            "a full-K schedule for a K-partition domain");
                     }
-                    plan.effective_decode_schedule = normalized;
-                    plan.n_block_chunks = decodeScheduleNBlockChunks(normalized);
+                    plan.effective_verifier_schedule =
+                        VerifierRowsPolicy::Pairwise;
                 }
+                plan.n_block_chunks = verifierRowsPolicyNBlockChunks(
+                    plan.effective_verifier_schedule,
+                    plan.n_block_chunks);
             }
             plan.total_blocks =
                 (plan.n_chunks + plan.n_block_chunks - 1) /
@@ -3904,11 +4418,35 @@ namespace llaminar2::cpu::native_vnni
                 const auto &plan = plans[static_cast<size_t>(p)];
                 const bool grouped_k_parallel =
                     plan.k_tiles > 1;
+                const bool full_k_row_chunks =
+                    plan.effective_verifier_schedule ==
+                    VerifierRowsPolicy::FullKRowChunkGrid;
+                const bool full_k_wide_rows =
+                    !grouped_k_parallel && use_avx512 && M >= 3 &&
+                    plan.effective_verifier_schedule ==
+                        VerifierRowsPolicy::WideRows;
+                const bool kpart_wide_rows =
+                    grouped_k_parallel && use_avx512 && M >= 3 &&
+                    plan.effective_verifier_schedule ==
+                        VerifierRowsPolicy::WideRows;
                 const int physical_row_tile = M == 1
                                                   ? 1
-                                                  : (grouped_k_parallel
-                                                         ? (use_avx512 ? 4 : 2)
-                                                         : 2);
+                                              : full_k_row_chunks
+                                                  ? 1
+                                              : (full_k_wide_rows ||
+                                                 kpart_wide_rows)
+                                                  ? 4
+                                                  : 2;
+                const char *grouped_route = grouped_k_parallel
+                    ? "grouped_k_parallel_row_tiles"
+                    : full_k_row_chunks
+                        ? "grouped_full_k_row_chunk_grid"
+                    : verifierRowsPolicyUsesFullKNMajor(
+                          plan.effective_verifier_schedule)
+                        ? "grouped_full_k_two_row_n_major"
+                    : full_k_wide_rows
+                        ? "grouped_full_k_wide_rows"
+                        : "grouped_full_k_pair_grid";
                 PerfStatsCollector::addCounter(
                     "kernel",
                     "cpu_native_vnni_fused_verifier_rows_projection_launch",
@@ -3931,15 +4469,19 @@ namespace llaminar2::cpu::native_vnni
                         {"effective_decode_policy",
                          decodeSchedulePolicyName(
                              plan.effective_decode_schedule)},
+                        {"requested_verifier_policy",
+                         verifierRowsPolicyName(
+                             plan.requested_verifier_schedule)},
+                        {"effective_verifier_policy",
+                         verifierRowsPolicyName(
+                             plan.effective_verifier_schedule)},
                         {"physical_row_tile", std::to_string(physical_row_tile)},
                         {"route",
                          M == 1
                              ? (grouped_k_parallel
                                     ? "decode_k_parallel_row"
                                     : "decode_full_k_row")
-                             : (grouped_k_parallel
-                                    ? "grouped_k_parallel_row_tiles"
-                                    : "grouped_full_k_pair_tiles")}});
+                             : grouped_route}});
             }
         }
         /*
@@ -4110,7 +4652,12 @@ namespace llaminar2::cpu::native_vnni
                      * configured capacities never degrade into independent
                      * one-row K-part tasks.
                      */
-                    const int row_tile_width = use_avx512 ? 4 : 2;
+                    const int row_tile_width =
+                        use_avx512 &&
+                                plan.effective_verifier_schedule ==
+                                    VerifierRowsPolicy::WideRows
+                            ? 4
+                            : 2;
                     const int row_tile_count =
                         (M + row_tile_width - 1) / row_tile_width;
                     const int total_shared_tile_tasks =
@@ -4265,6 +4812,345 @@ namespace llaminar2::cpu::native_vnni
                                 d.output + static_cast<size_t>(row) * d.ldc;
                             addNativeVNNIBiasRow(
                                 row_out, d.bias, d.N, use_avx512);
+                        }
+                    }
+                    continue;
+                }
+
+                const auto compute_full_k_one_row =
+                    [&](const Q8_1Block *row_q8, float *destination, int chunk)
+                {
+                    if (use_avx512)
+                    {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                        if (packed.is_nibble_lut)
+                            gemv_native_vnni_avx512_chunk_native(
+                                packed, row_q8, destination, chunk, 0,
+                                K_blocks, decode_lut_512);
+                        else
+                            gemv_native_vnni_avx512_chunk_int8(
+                                packed, row_q8, destination, chunk, 0,
+                                K_blocks);
+#endif
+                    }
+                    else if (packed.is_nibble_lut)
+                    {
+                        gemv_avx2_chunk_native(
+                            packed, row_q8, destination, chunk, 0, K_blocks,
+                            decode_lut_256);
+                    }
+                    else
+                    {
+                        gemv_avx2_chunk_int8(
+                            packed, row_q8, destination, chunk, 0, K_blocks);
+                    }
+                };
+                const auto compute_full_k_two_rows =
+                    [&](const Q8_1Block *row0_q8,
+                        const Q8_1Block *row1_q8,
+                        float *destination0,
+                        float *destination1,
+                        int chunk)
+                {
+                    if (use_avx512)
+                    {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                        if (packed.is_nibble_lut)
+                            gemm_2row_native_chunk(
+                                packed, row0_q8, row1_q8, destination0,
+                                destination1, chunk, 0, K_blocks,
+                                decode_lut_512, /*accumulate=*/false);
+                        else
+                            gemm_2row_int8_chunk(
+                                packed, row0_q8, row1_q8, destination0,
+                                destination1, chunk, 0, K_blocks,
+                                /*accumulate=*/false);
+#endif
+                    }
+                    else if (packed.is_nibble_lut)
+                    {
+                        gemm_2row_native_chunk_avx2(
+                            packed, row0_q8, row1_q8, destination0,
+                            destination1, chunk, 0, K_blocks,
+                            decode_lut_256, /*accumulate=*/false);
+                    }
+                    else
+                    {
+                        gemm_2row_int8_chunk_avx2(
+                            packed, row0_q8, row1_q8, destination0,
+                            destination1, chunk, 0, K_blocks,
+                        /*accumulate=*/false);
+                    }
+                };
+                if (plan.effective_verifier_schedule ==
+                    VerifierRowsPolicy::FullKRowChunkGrid)
+                {
+                    /*
+                     * One task owns one `(row, 64-column chunk)`. This exposes
+                     * both dimensions to the shared OpenMP team and is usually
+                     * strongest on native AVX512, where a two-row task can
+                     * otherwise leave too little outer parallelism.
+                     */
+                    const int total_tasks = M * N_chunks;
+#pragma omp for schedule(static)
+                    for (int task = 0; task < total_tasks; ++task)
+                    {
+                        const int chunk = task / M;
+                        const int row = task % M;
+                        const int n_start = chunk * 64;
+                        const int n_columns = std::min(64, N - n_start);
+                        const Q8_1Block *row_q8 =
+                            projection_input +
+                            static_cast<size_t>(row) * K_blocks;
+                        float *compact =
+                            d.output + static_cast<size_t>(row) * d.ldc + n_start;
+                        alignas(64) float tail[64];
+                        float *destination = n_columns == 64 ? compact : tail;
+                        compute_full_k_one_row(row_q8, destination, chunk);
+                        if (n_columns < 64)
+                        {
+                            std::memcpy(
+                                compact,
+                                tail,
+                                static_cast<size_t>(n_columns) * sizeof(float));
+                        }
+                    }
+                    if (d.bias)
+                    {
+#pragma omp for schedule(static) nowait
+                        for (int row = 0; row < M; ++row)
+                        {
+                            addNativeVNNIBiasRow(
+                                d.output + static_cast<size_t>(row) * d.ldc,
+                                d.bias,
+                                d.N,
+                                use_avx512);
+                        }
+                    }
+                    continue;
+                }
+
+                if (verifierRowsPolicyUsesFullKNMajor(
+                        plan.effective_verifier_schedule))
+                {
+                    /*
+                     * One task owns an N block and visits every verifier row.
+                     * Adjacent rows share packed-weight decode through the
+                     * two-row microkernel; an odd tail uses the exact serial
+                     * chunk kernel. No task shares an output address.
+                     */
+#pragma omp for schedule(static)
+                    for (int block_idx = 0;
+                         block_idx < total_blocks;
+                         ++block_idx)
+                    {
+                        const int chunk_start = block_idx * n_block_chunks;
+                        const int chunk_count = std::min(
+                            n_block_chunks, N_chunks - chunk_start);
+                        int row = 0;
+                        for (; row + 1 < M; row += 2)
+                        {
+                            const Q8_1Block *row0_q8 =
+                                projection_input +
+                                static_cast<size_t>(row) * K_blocks;
+                            const Q8_1Block *row1_q8 = row0_q8 + K_blocks;
+                            for (int offset = 0;
+                                 offset < chunk_count;
+                                 ++offset)
+                            {
+                                const int chunk = chunk_start + offset;
+                                const int n_start = chunk * 64;
+                                const int n_columns =
+                                    std::min(64, N - n_start);
+                                float *compact0 =
+                                    d.output + static_cast<size_t>(row) * d.ldc +
+                                    n_start;
+                                float *compact1 =
+                                    d.output +
+                                    static_cast<size_t>(row + 1) * d.ldc +
+                                    n_start;
+                                alignas(64) float tail0[64];
+                                alignas(64) float tail1[64];
+                                float *destination0 =
+                                    n_columns == 64 ? compact0 : tail0;
+                                float *destination1 =
+                                    n_columns == 64 ? compact1 : tail1;
+                                compute_full_k_two_rows(
+                                    row0_q8,
+                                    row1_q8,
+                                    destination0,
+                                    destination1,
+                                    chunk);
+                                if (n_columns < 64)
+                                {
+                                    const size_t bytes =
+                                        static_cast<size_t>(n_columns) *
+                                        sizeof(float);
+                                    std::memcpy(compact0, tail0, bytes);
+                                    std::memcpy(compact1, tail1, bytes);
+                                }
+                            }
+                        }
+                        if (row < M)
+                        {
+                            const Q8_1Block *row_q8 =
+                                projection_input +
+                                static_cast<size_t>(row) * K_blocks;
+                            for (int offset = 0;
+                                 offset < chunk_count;
+                                 ++offset)
+                            {
+                                const int chunk = chunk_start + offset;
+                                const int n_start = chunk * 64;
+                                const int n_columns =
+                                    std::min(64, N - n_start);
+                                float *compact =
+                                    d.output + static_cast<size_t>(row) * d.ldc +
+                                    n_start;
+                                alignas(64) float tail[64];
+                                float *destination =
+                                    n_columns == 64 ? compact : tail;
+                                compute_full_k_one_row(
+                                    row_q8, destination, chunk);
+                                if (n_columns < 64)
+                                {
+                                    std::memcpy(
+                                        compact,
+                                        tail,
+                                        static_cast<size_t>(n_columns) *
+                                            sizeof(float));
+                                }
+                            }
+                        }
+                    }
+                    if (d.bias)
+                    {
+#pragma omp for schedule(static) nowait
+                        for (int row = 0; row < M; ++row)
+                        {
+                            addNativeVNNIBiasRow(
+                                d.output + static_cast<size_t>(row) * d.ldc,
+                                d.bias,
+                                d.N,
+                                use_avx512);
+                        }
+                    }
+                    continue;
+                }
+
+                if (use_avx512 && M >= 3 &&
+                    plan.effective_verifier_schedule ==
+                        VerifierRowsPolicy::WideRows)
+                {
+                    /*
+                     * WideRows owns bounded AVX512 four-row physical tiles. A
+                     * partial tile uses the matching smaller AVX512 kernel.
+                     */
+                    const int row_tile_count = (M + 3) / 4;
+                    const int total_tasks = row_tile_count * total_blocks;
+#pragma omp for schedule(static)
+                    for (int task = 0; task < total_tasks; ++task)
+                    {
+                        const int block_idx = task / row_tile_count;
+                        const int row_tile = task % row_tile_count;
+                        const int first_row = row_tile * 4;
+                        const int tile_rows = std::min(4, M - first_row);
+                        const int chunk_start = block_idx * n_block_chunks;
+                        const int chunk_count = std::min(
+                            n_block_chunks, N_chunks - chunk_start);
+                        const Q8_1Block *row_q8[4] = {};
+                        float *row_output[4] = {};
+                        for (int row = 0; row < tile_rows; ++row)
+                        {
+                            row_q8[row] = projection_input +
+                                static_cast<size_t>(first_row + row) * K_blocks;
+                            row_output[row] = d.output +
+                                static_cast<size_t>(first_row + row) * d.ldc;
+                        }
+                        for (int offset = 0;
+                             offset < chunk_count;
+                             ++offset)
+                        {
+                            const int chunk = chunk_start + offset;
+                            const int n_start = chunk * 64;
+                            const int n_columns = std::min(64, N - n_start);
+                            float *compact[4] = {};
+                            float *destination[4] = {};
+                            alignas(64) float tail[4][64];
+                            for (int row = 0; row < tile_rows; ++row)
+                            {
+                                compact[row] = row_output[row] + n_start;
+                                destination[row] =
+                                    n_columns == 64 ? compact[row] : tail[row];
+                            }
+                            if (tile_rows == 4)
+                            {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                                if (packed.is_nibble_lut)
+                                    gemm_4row_native_2z_chunk(
+                                        packed, row_q8[0], row_q8[1], row_q8[2],
+                                        row_q8[3], destination[0], destination[1],
+                                        destination[2], destination[3], chunk, 0,
+                                        K_blocks, decode_lut_512,
+                                        /*accumulate=*/false);
+                                else
+                                    gemm_4row_int8_2z_chunk(
+                                        packed, row_q8[0], row_q8[1], row_q8[2],
+                                        row_q8[3], destination[0], destination[1],
+                                        destination[2], destination[3], chunk, 0,
+                                        K_blocks, /*accumulate=*/false);
+#endif
+                            }
+                            else if (tile_rows == 3)
+                            {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                                if (packed.is_nibble_lut)
+                                    gemm_3row_native_2z_chunk(
+                                        packed, row_q8[0], row_q8[1],
+                                        row_q8[2], destination[0],
+                                        destination[1], destination[2],
+                                        chunk, 0, K_blocks, decode_lut_512,
+                                        /*accumulate=*/false);
+                                else
+                                    gemm_3row_int8_2z_chunk(
+                                        packed, row_q8[0], row_q8[1],
+                                        row_q8[2], destination[0],
+                                        destination[1], destination[2],
+                                        chunk, 0, K_blocks,
+                                        /*accumulate=*/false);
+#endif
+                            }
+                            else if (tile_rows == 2)
+                            {
+                                compute_full_k_two_rows(
+                                    row_q8[0], row_q8[1], destination[0],
+                                    destination[1], chunk);
+                            }
+                            else
+                            {
+                                compute_full_k_one_row(
+                                    row_q8[0], destination[0], chunk);
+                            }
+                            if (n_columns < 64)
+                            {
+                                const size_t bytes =
+                                    static_cast<size_t>(n_columns) *
+                                    sizeof(float);
+                                for (int row = 0; row < tile_rows; ++row)
+                                    std::memcpy(compact[row], tail[row], bytes);
+                            }
+                        }
+                    }
+                    if (d.bias)
+                    {
+#pragma omp for schedule(static) nowait
+                        for (int row = 0; row < M; ++row)
+                        {
+                            addNativeVNNIBiasRow(
+                                d.output + static_cast<size_t>(row) * d.ldc,
+                                d.bias,
+                                d.N,
+                                use_avx512);
                         }
                     }
                     continue;

@@ -74,8 +74,33 @@ class QwenReleaseModel:
             self.gdn_value_head_count,
             self.gdn_time_step_rank,
         )
-        if not self.release_id or any(value <= 0 for value in dimensions):
+        if (
+            not self.release_id
+            or any(value <= 0 for value in dimensions)
+            or self.parameter_count_billions <= 0
+        ):
             raise ValueError("Qwen release geometry fields must be positive")
+
+    @property
+    def parameter_count_billions(self) -> float:
+        """Return the published total parameter count encoded in the ID.
+
+        Release IDs are reviewed corpus metadata and always begin with a
+        ``Qwen<version>-<total>B`` token.  Deriving the CPU-only measurement
+        tier here avoids changing the shared catalog bytes, which would
+        needlessly invalidate reusable CUDA and ROCm evidence.
+        """
+
+        try:
+            size_token = self.release_id.split("-", 1)[1].split("B", 1)[0]
+            size = float(size_token)
+        except (IndexError, ValueError) as error:
+            raise ValueError(
+                f"{self.release_id}: Qwen release ID lacks a total-size token"
+            ) from error
+        if size <= 0:
+            raise ValueError("Qwen release parameter count must be positive")
+        return size
 
     @property
     def attention_query_width(self) -> int:

@@ -22,6 +22,7 @@ import csv
 import hashlib
 import json
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Mapping, Sequence
@@ -589,12 +590,12 @@ def _read_historical_plans(
 
     by_digest = {}
     for manifest in split_manifests:
-        digest = manifest.digest()
-        if digest in by_digest:
-            raise CPUPrefillReplayRecipeError(
-                f"duplicate lineage source split digest: {digest}"
-            )
-        by_digest[digest] = manifest
+        for digest in manifest.accepted_digests():
+            if digest in by_digest and by_digest[digest] is not manifest:
+                raise CPUPrefillReplayRecipeError(
+                    f"duplicate lineage source split digest: {digest}"
+                )
+            by_digest[digest] = manifest
     plans = []
     for artifact in recipe.lineage_historical_refinement_plans:
         path = artifact.resolve(recipe.path)
@@ -962,6 +963,87 @@ def finalize_checkpoint(recipe_path: Path, checkpoint_path: Path) -> None:
     os.replace(temporary, recipe_path)
 
 
+def relocate_recipe(source_path: Path, output_path: Path) -> None:
+    """Stage an authenticated replay recipe in a clean transaction directory.
+
+    A post-freeze CPU-prefill seal must never share its output names with the
+    seal that was burned into development evidence.  Merely copying a recipe
+    is insufficient because recipe-relative profiler and burned-seal
+    artifacts would then resolve against the new directory.  This operation
+    preserves those immutable source locations by rewriting each
+    recipe-relative artifact path relative to the destination recipe, copies
+    the mutable common-observation checkpoint, and authenticates the relocated
+    transaction before publishing it.
+
+    The large timing and profiler payloads remain in place.  Only the adapted
+    checkpoint is copied because the refresh driver owns that filename in its
+    output directory and may replace it when a future recipe explicitly asks
+    for a rebase or rebuild.
+    """
+
+    source_path = Path(source_path).resolve()
+    output_path = Path(output_path).resolve()
+    if source_path == output_path:
+        raise CPUPrefillReplayRecipeError(
+            "CPU prefill replay relocation requires a distinct output path"
+        )
+
+    source_recipe = load_recipe(source_path)
+    authenticate_recipe(source_recipe)
+    raw = json.loads(source_path.read_text(encoding="utf-8"))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def relocate_artifacts(value: object) -> None:
+        """Retarget every strict recipe-relative artifact in one JSON tree."""
+
+        if isinstance(value, dict):
+            if set(value) == {"base", "path", "sha256"} and value["base"] == "recipe":
+                source_artifact = source_path.parent.joinpath(
+                    *PurePosixPath(str(value["path"])).parts
+                ).resolve()
+                value["path"] = PurePosixPath(os.path.relpath(
+                    source_artifact,
+                    output_path.parent,
+                )).as_posix()
+            for child in value.values():
+                relocate_artifacts(child)
+        elif isinstance(value, list):
+            for child in value:
+                relocate_artifacts(child)
+
+    relocate_artifacts(raw)
+    authenticated = dict(raw)
+    authenticated.pop("recipe_digest", None)
+    raw["recipe_digest"] = _canonical_digest(authenticated)
+
+    source_checkpoint = source_recipe.checkpoint_path()
+    destination_checkpoint = output_path.parent.joinpath(
+        *source_recipe.checkpoint.path.parts
+    ).resolve()
+    if source_recipe.checkpoint.state != "rebuild":
+        destination_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_temporary = destination_checkpoint.with_name(
+            f"{destination_checkpoint.name}.{os.getpid()}.tmp"
+        )
+        shutil.copyfile(source_checkpoint, checkpoint_temporary)
+        os.replace(checkpoint_temporary, destination_checkpoint)
+
+    temporary = output_path.with_name(f"{output_path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(raw, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, output_path)
+
+    relocated = load_recipe(output_path)
+    action = authenticate_recipe(relocated)
+    if action != source_recipe.checkpoint.state:
+        raise CPUPrefillReplayRecipeError(
+            "relocated CPU prefill replay checkpoint changed lifecycle state: "
+            f"expected={source_recipe.checkpoint.state} actual={action}"
+        )
+
+
 def add_burned_seal_transaction(
     recipe_path: Path,
     transaction_path: Path,
@@ -1130,6 +1212,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--clear-additive-profiler-transactions",
         action="store_true",
     )
+    relocate = subparsers.add_parser("relocate")
+    relocate.add_argument("--recipe", type=Path, required=True)
+    relocate.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args(argv)
 
     if arguments.command == "finalize-checkpoint":
@@ -1159,6 +1244,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             "installed CPU prefill primary profiler transaction: "
             f"{arguments.requests}"
+        )
+        return 0
+    if arguments.command == "relocate":
+        relocate_recipe(arguments.recipe, arguments.output)
+        print(
+            "relocated authenticated CPU prefill replay recipe: "
+            f"{arguments.recipe} -> {arguments.output}"
         )
         return 0
 

@@ -2,7 +2,9 @@
 """Smoke-test the CUDA NativeVNNI prefill dispatch generator.
 
 Q4_1/Q4_K, Q5_1/Q5_K, and IQ4_NL/IQ4_XS share NativeVNNI codebook ids.
-The generated C++ must group by numeric codebook, not by format spelling.
+Q8_0/Q8_1/Q8_K also normalize to GPU execution codebook 19 despite retaining
+distinct source codebooks in the evidence CSV. The generated C++ must group by
+runtime codebook, not by source-format spelling.
 """
 
 from __future__ import annotations
@@ -50,10 +52,20 @@ def main() -> int:
         if duplicates:
             raise SystemExit(f"duplicate generated codebook branch(es): {', '.join(duplicates)}")
 
-        expected = {"4", "5", "7"}
+        expected = {"4", "5", "7", "19"}
         found = set(helpers)
         if found != expected:
             raise SystemExit(f"expected codebook branches {sorted(expected)}, found {sorted(found)}")
+
+        # The fixture contains a deliberately faster but byte-incorrect Q4_1
+        # candidate. Exact overlays must retain the slower byte-exact tile.
+        packed_key = (64 << 40) | (2048 << 20) | 512
+        key = f"0x{packed_key:016X}ULL"
+        entry = re.search(
+            rf"\{{\s*{key},\s*(\d+),\s*(\d+)\s*\}}", text)
+        if not entry or entry.groups() != ("1", "1"):
+            raise SystemExit(
+                "byte-incorrect CUDA prefill candidate entered generated dispatch")
 
         if not summary.read_text().strip():
             raise SystemExit("generator summary was empty")

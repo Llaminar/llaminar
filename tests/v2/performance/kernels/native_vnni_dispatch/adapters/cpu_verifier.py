@@ -8,10 +8,16 @@ repeat bytes, and complete FP32 output match serial M=1 decode.
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 import csv
 import hashlib
 import json
 import math
+import multiprocessing
+import os
+import pickle
+import shutil
+import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -19,6 +25,10 @@ from typing import Iterable, Mapping
 
 from .evidence import raw_corpus_id, verify_aggregate_timing
 from ..candidate_registry import cpu_native_vnni_verifier_registry
+from ..candidate_observation import (
+    _physical_core_count,
+    write_observation_csv,
+)
 from ..corpus import ObservationCorpus
 from ..format_registry import format_spec
 from ..profiles import (
@@ -65,6 +75,12 @@ REQUIRED_TIMING_COLUMNS = frozenset({
 RawTimingKey = tuple[
     str, int, int, str, str, int, int, int, str, str, str, str
 ]
+
+
+_PARALLEL_CPU_VERIFIER_RECORDS: tuple[
+    tuple[Path, int, Mapping[str, str], tuple[float, ...] | None], ...
+] = ()
+_PARALLEL_CPU_VERIFIER_CONTEXT: CPUVerifierAdapterContext | None = None
 
 
 def _sha256(value: object) -> str:
@@ -117,10 +133,10 @@ def _timing_key(raw: Mapping[str, str]) -> RawTimingKey:
     )
 
 
-def read_cpu_verifier_timing_sidecars(
+def _read_cpu_verifier_timing_sidecars_serial(
     paths: Iterable[Path],
 ) -> dict[RawTimingKey, tuple[float, ...]]:
-    """Read exact steady-clock samples with contiguous sorted indices."""
+    """Read exact steady-clock samples in the calling process."""
 
     indexed: dict[RawTimingKey, list[float]] = {}
     for path in (Path(item) for item in paths):
@@ -167,6 +183,185 @@ def read_cpu_verifier_timing_sidecars(
     return result
 
 
+def _read_cpu_verifier_timing_range(
+    task: tuple[Path, str, int, int, int, Path],
+) -> Path:
+    """Parse one byte-disjoint timing range into a compact pickle shard."""
+
+    path, header, data_start, start, stop, output = task
+    indexed: dict[RawTimingKey, tuple[int, list[float]]] = {}
+    with path.open("rb") as handle:
+        handle.seek(start)
+        if start > data_start:
+            handle.seek(start - 1)
+            if handle.read(1) != b"\n":
+                handle.readline()
+
+        def selected_lines():
+            """Yield complete CSV records whose first byte belongs here."""
+
+            yield header
+            while handle.tell() < stop:
+                encoded = handle.readline()
+                if not encoded:
+                    break
+                yield encoded.decode("utf-8")
+
+        reader = csv.DictReader(selected_lines())
+        for local_row, raw in enumerate(reader, start=1):
+            try:
+                if raw["backend"].strip().lower() != "cpu" or (
+                    raw["phase"].strip() != "verifier_rows"
+                ):
+                    raise ValueError("wrong timing sidecar surface")
+                if raw["execution_mode"].strip().lower() != "eager":
+                    raise ValueError("CPU execution mode must be eager")
+                key = _timing_key(raw)
+                sample_index = int(raw["sample_index"])
+                latency_us = float.fromhex(raw["latency_us_hex"].strip())
+                readable_us = float(raw["latency_us"])
+                if latency_us <= 0.0 or not math.isfinite(latency_us):
+                    raise ValueError("invalid raw latency")
+                if not math.isclose(
+                    readable_us,
+                    latency_us,
+                    rel_tol=0.0,
+                    abs_tol=5.1e-10,
+                ):
+                    raise ValueError(
+                        "readable and exact latency fields disagree"
+                    )
+                first_index, samples = indexed.setdefault(
+                    key, (sample_index, [])
+                )
+                if sample_index != first_index + len(samples):
+                    raise ValueError(
+                        f"timing sample index {sample_index} is not the next "
+                        f"contiguous index {first_index + len(samples)}"
+                    )
+                samples.append(latency_us)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{path}:byte-range={start}:{stop}:"
+                    f"row={local_row}: {exc}"
+                ) from exc
+
+    compact = {
+        key: (first_index, tuple(samples))
+        for key, (first_index, samples) in indexed.items()
+    }
+    with output.open("wb") as handle:
+        pickle.dump(compact, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    return output
+
+
+def read_cpu_verifier_timing_sidecars(
+    paths: Iterable[Path],
+    *,
+    workers: int | None = None,
+    parallel_threshold_bytes: int = 64 * 1024 * 1024,
+) -> dict[RawTimingKey, tuple[float, ...]]:
+    """Read exact timing samples using deterministic physical-core shards.
+
+    Grouped-verifier sidecars are the same flat, independently parseable CSV
+    evidence as M=1 decode sidecars. Large files are divided at byte ranges;
+    each worker advances to a complete record and writes a private compact
+    shard. The parent merges file/range order and revalidates global sample
+    continuity, so worker scheduling cannot alter the authenticated corpus.
+    """
+
+    paths = tuple(Path(item) for item in paths)
+    if not paths:
+        return {}
+    if workers is None:
+        workers = int(os.environ.get(
+            "LLAMINAR_NATIVE_VNNI_IO_WORKERS",
+            str(_physical_core_count()),
+        ))
+    if workers < 1:
+        raise ValueError("CPU verifier timing worker count must be positive")
+    workers = min(workers, _physical_core_count())
+    total_bytes = sum(path.stat().st_size for path in paths)
+    if workers <= 1 or total_bytes < parallel_threshold_bytes:
+        return _read_cpu_verifier_timing_sidecars_serial(paths)
+
+    indexed: dict[RawTimingKey, list[float]] = {}
+    with tempfile.TemporaryDirectory(
+        prefix="native-vnni-cpu-verifier-timing-",
+    ) as temporary_directory:
+        temporary_root = Path(temporary_directory)
+        tasks = []
+        target_chunk_bytes = max(1, parallel_threshold_bytes)
+        for path_index, path in enumerate(paths):
+            with path.open("rb") as handle:
+                encoded_header = handle.readline()
+                data_start = handle.tell()
+            header = encoded_header.decode("utf-8")
+            fieldnames = next(csv.reader((header,)), ())
+            missing = REQUIRED_TIMING_COLUMNS.difference(fieldnames)
+            if missing:
+                raise ValueError(
+                    f"{path}: missing CPU verifier timing columns "
+                    f"{sorted(missing)}"
+                )
+            file_size = path.stat().st_size
+            data_bytes = max(0, file_size - data_start)
+            path_workers = min(
+                workers,
+                max(
+                    1,
+                    (data_bytes + target_chunk_bytes - 1)
+                    // target_chunk_bytes,
+                ),
+            )
+            for range_index in range(path_workers):
+                start = data_start + data_bytes * range_index // path_workers
+                stop = (
+                    data_start
+                    + data_bytes * (range_index + 1) // path_workers
+                )
+                tasks.append((
+                    path,
+                    header,
+                    data_start,
+                    start,
+                    stop,
+                    temporary_root
+                    / f"timing-{path_index:04d}-{range_index:04d}.pickle",
+                ))
+
+        with ProcessPoolExecutor(
+            max_workers=min(workers, len(tasks)),
+            mp_context=multiprocessing.get_context("fork"),
+        ) as executor:
+            shards = tuple(executor.map(
+                _read_cpu_verifier_timing_range,
+                tasks,
+            ))
+
+        for shard in shards:
+            with shard.open("rb") as handle:
+                compact = pickle.load(handle)
+            for key, (first_index, values) in compact.items():
+                samples = indexed.setdefault(key, [])
+                if first_index != len(samples):
+                    raise ValueError(
+                        f"timing sample index {first_index} is not the next "
+                        f"contiguous index {len(samples)} for {key}"
+                    )
+                samples.extend(values)
+
+    result = {}
+    for key, samples in indexed.items():
+        values = tuple(samples)
+        if tuple(sorted(values)) != values:
+            raise ValueError(
+                f"timing sidecar samples are not trainer-sorted for {key}"
+            )
+        result[key] = values
+    return result
+
+
 @dataclass(frozen=True)
 class CPUVerifierAdapterContext:
     """Immutable run and CPU architecture provenance."""
@@ -182,9 +377,17 @@ class CPUVerifierAdapterContext:
     driver_runtime: str
     serial_m1_policy_hash: str
     raw_timing_sidecar_retained: bool
+    minimum_promotion_warmups: int = MIN_PROMOTION_WARMUPS
+    minimum_promotion_samples: int = MIN_PROMOTION_SAMPLES
 
     @classmethod
-    def workflow_smoke(cls, *, corpus_id: str) -> "CPUVerifierAdapterContext":
+    def workflow_smoke(
+        cls,
+        *,
+        corpus_id: str,
+        minimum_promotion_warmups: int = MIN_PROMOTION_WARMUPS,
+        minimum_promotion_samples: int = MIN_PROMOTION_SAMPLES,
+    ) -> "CPUVerifierAdapterContext":
         return cls(
             profile=MeasurementProfile.QUICK,
             run_id="workflow-smoke",
@@ -197,6 +400,8 @@ class CPUVerifierAdapterContext:
             driver_runtime="workflow-cpu-runtime",
             serial_m1_policy_hash="sha256:" + "0" * 64,
             raw_timing_sidecar_retained=False,
+            minimum_promotion_warmups=minimum_promotion_warmups,
+            minimum_promotion_samples=minimum_promotion_samples,
         )
 
     def validate(self) -> None:
@@ -210,6 +415,13 @@ class CPUVerifierAdapterContext:
             raise ValueError("corpus_id must be a sha256 digest")
         if not self.serial_m1_policy_hash.startswith("sha256:"):
             raise ValueError("serial_m1_policy_hash must be a sha256 digest")
+        for name in (
+            "minimum_promotion_warmups",
+            "minimum_promotion_samples",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         if self.profile.installable:
             markers = (
                 self.run_id, self.git_revision, self.build_id, self.compiler_id,
@@ -220,6 +432,26 @@ class CPUVerifierAdapterContext:
                 raise ValueError("installable CPU verifier evidence has placeholder provenance")
             if not self.raw_timing_sidecar_retained:
                 raise ValueError("installable CPU verifier evidence needs raw timing sidecars")
+
+    def validate_promotion_timing(
+        self,
+        warmups: int,
+        samples: int,
+        *,
+        forced_route_ok: bool,
+    ) -> None:
+        """Enforce the transaction's explicit installable timing floor."""
+
+        if self.profile.installable and forced_route_ok and (
+            warmups < self.minimum_promotion_warmups
+            or samples < self.minimum_promotion_samples
+        ):
+            raise ValueError(
+                "installable profile requires "
+                f"{self.minimum_promotion_warmups}/"
+                f"{self.minimum_promotion_samples} timing, got "
+                f"{warmups}/{samples}"
+            )
 
 
 @lru_cache(maxsize=None)
@@ -317,13 +549,11 @@ def adapt_cpu_verifier_row(
 
     warmups = int(raw["warmup_count"])
     samples = int(raw["sample_count"])
-    if context.profile.installable and forced_route_ok and (
-        warmups < MIN_PROMOTION_WARMUPS or samples < MIN_PROMOTION_SAMPLES
-    ):
-        raise ValueError(
-            f"installable profile requires {MIN_PROMOTION_WARMUPS}/"
-            f"{MIN_PROMOTION_SAMPLES} timing, got {warmups}/{samples}"
-        )
+    context.validate_promotion_timing(
+        warmups,
+        samples,
+        forced_route_ok=forced_route_ok,
+    )
     if timing_samples is not None:
         if len(timing_samples) != samples:
             raise ValueError(
@@ -351,11 +581,32 @@ def adapt_cpu_verifier_row(
         raise ValueError("requested CPU runtime ISA did not become effective")
     if build_isa == "AVX2" and effective_runtime_isa != "AVX2":
         raise ValueError("an AVX2-only build cannot execute an AVX512 runtime path")
+    k_tiles = int(raw["k_tiles"])
+    n_block_chunks = int(raw["n_block_chunks"])
+    if k_tiles < 0 or n_block_chunks <= 0:
+        raise ValueError("CPU verifier launch geometry is invalid")
     if forced_route_ok and candidate.config_json["policy"] == "WideRows" and (
         effective_runtime_isa == "AVX2" or m == 2
     ):
         raise ValueError(
             "CPU telemetry claimed an impossible effective WideRows route"
+        )
+    if (
+        forced_route_ok
+        and candidate.config_json.get("k_tile_policy") == "full_k"
+        and k_tiles > 1
+    ):
+        raise ValueError(
+            "CPU telemetry claimed a full-K verifier route in a K-partition domain"
+        )
+    expected_n_block_chunks = candidate.config_json.get("n_block_chunks")
+    if (
+        forced_route_ok
+        and expected_n_block_chunks is not None
+        and n_block_chunks != int(expected_n_block_chunks)
+    ):
+        raise ValueError(
+            "CPU verifier telemetry disagrees with the candidate N-block width"
         )
     architecture_class = (
         f"{context.architecture_class}|build={build_isa}|"
@@ -456,9 +707,213 @@ def adapt_cpu_verifier_row(
         route_counter_ok=route_counter_ok,
         workspace_ok=True,
         explicit_stream_ok=True,
+        launch_k_tiles=k_tiles,
+        launch_n_block_chunks=n_block_chunks,
     )
     observation.validate()
     return observation
+
+
+def _read_cpu_verifier_raw_records(
+    paths: Iterable[Path],
+) -> tuple[tuple[Path, int, Mapping[str, str]], ...]:
+    """Read aggregate rows once while retaining precise diagnostics."""
+
+    records = []
+    for path in (Path(item) for item in paths):
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            missing = REQUIRED_RAW_COLUMNS.difference(reader.fieldnames or ())
+            if missing:
+                raise ValueError(
+                    f"{path}: missing strong CPU verifier columns "
+                    f"{sorted(missing)}"
+                )
+            records.extend(
+                (path, row_number, raw)
+                for row_number, raw in enumerate(reader, start=2)
+            )
+    return tuple(records)
+
+
+def _adapt_cpu_verifier_range(
+    task: tuple[int, int, Path],
+) -> tuple[Path, Path, int]:
+    """Adapt one range into canonical CSV and private object shards."""
+
+    if _PARALLEL_CPU_VERIFIER_CONTEXT is None:
+        raise RuntimeError(
+            "parallel CPU verifier adapter context is unavailable"
+        )
+    start, stop, output = task
+    observations = []
+    for index in range(start, stop):
+        path, row_number, raw, samples = _PARALLEL_CPU_VERIFIER_RECORDS[index]
+        try:
+            observations.append(adapt_cpu_verifier_row(
+                raw,
+                _PARALLEL_CPU_VERIFIER_CONTEXT,
+                samples,
+            ))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{path}:{row_number}: {exc}") from exc
+    immutable_observations = tuple(observations)
+    write_observation_csv(output, immutable_observations, workers=1)
+    object_output = output.with_suffix(".pickle")
+    with object_output.open("wb") as handle:
+        pickle.dump(
+            immutable_observations,
+            handle,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    return output, object_output, len(immutable_observations)
+
+
+def _read_cpu_verifier_object_shards(
+    results: Iterable[tuple[Path, Path, int]],
+) -> Iterable[NativeVNNIObservation]:
+    """Yield trusted worker results without reparsing the published CSV.
+
+    Object shards exist only inside the adapter-owned temporary directory and
+    are never durable or accepted as evidence. Each row was already fully
+    validated by ``adapt_cpu_verifier_row``; the parent checks transfer shape
+    and types before rebuilding canonical corpus indices.
+    """
+
+    for _csv_path, object_path, expected_count in results:
+        with object_path.open("rb") as handle:
+            observations = pickle.load(handle)
+        if not isinstance(observations, tuple):
+            raise RuntimeError("CPU verifier adapter object shard is not a tuple")
+        if len(observations) != expected_count:
+            raise RuntimeError("CPU verifier adapter object shard count changed")
+        if not all(
+            isinstance(observation, NativeVNNIObservation)
+            for observation in observations
+        ):
+            raise RuntimeError("CPU verifier adapter object shard has invalid rows")
+        yield from observations
+
+
+def adapt_cpu_verifier_csv_to_common(
+    paths: Iterable[Path],
+    context: CPUVerifierAdapterContext,
+    output: Path,
+    *,
+    timing_sidecars: Iterable[Path] = (),
+    workers: int | None = None,
+    parallel_threshold: int = 4096,
+) -> ObservationCorpus:
+    """Adapt grouped evidence in workers and atomically publish common CSV.
+
+    Fork workers inherit the immutable aggregate rows, exact timing tuples,
+    and provenance. Each worker writes a canonical CSV shard for a contiguous
+    input range plus a private object-transfer shard and returns only their
+    paths and row count. The parent concatenates canonical CSV in source order
+    and indexes the validated objects directly, avoiding giant process results,
+    duplicate CSV parsing, and any change to durable common evidence bytes.
+    """
+
+    global _PARALLEL_CPU_VERIFIER_CONTEXT
+    global _PARALLEL_CPU_VERIFIER_RECORDS
+
+    context.validate()
+    timing_index = read_cpu_verifier_timing_sidecars(
+        timing_sidecars,
+        workers=workers,
+    )
+    if context.profile.installable and not timing_index:
+        raise ValueError("installable CPU corpus is missing timing sidecars")
+    raw_records = _read_cpu_verifier_raw_records(paths)
+    if not raw_records:
+        raise ValueError("CPU verifier inputs contained no observations")
+
+    available_timing = dict(timing_index)
+    records = []
+    for path, row_number, raw in raw_records:
+        try:
+            samples = available_timing.pop(_timing_key(raw), None)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{path}:{row_number}: {exc}") from exc
+        records.append((path, row_number, raw, samples))
+    if available_timing:
+        first = next(iter(available_timing))
+        raise ValueError(
+            f"CPU timing sidecar has no aggregate row for {first}"
+        )
+
+    if workers is None:
+        workers = int(os.environ.get(
+            "LLAMINAR_NATIVE_VNNI_IO_WORKERS",
+            str(_physical_core_count()),
+        ))
+    if workers < 1:
+        raise ValueError("CPU verifier adapter worker count must be positive")
+    worker_count = min(
+        workers,
+        _physical_core_count(),
+        len(records),
+    )
+    if worker_count <= 1 or len(records) < parallel_threshold:
+        corpus = ObservationCorpus(
+            adapt_cpu_verifier_row(raw, context, samples)
+            for _path, _row_number, raw, samples in records
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_observation_csv(output, corpus, workers=1)
+        return corpus
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    rows_per_worker = (len(records) + worker_count - 1) // worker_count
+    _PARALLEL_CPU_VERIFIER_CONTEXT = context
+    _PARALLEL_CPU_VERIFIER_RECORDS = tuple(records)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=f".{output.name}.adapt-",
+            dir=output.parent,
+        ) as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            tasks = tuple(
+                (
+                    start,
+                    min(start + rows_per_worker, len(records)),
+                    temporary_root / f"part-{part:04d}.csv",
+                )
+                for part, start in enumerate(
+                    range(0, len(records), rows_per_worker)
+                )
+            )
+            with ProcessPoolExecutor(
+                max_workers=len(tasks),
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                results = tuple(executor.map(
+                    _adapt_cpu_verifier_range,
+                    tasks,
+                ))
+            if sum(count for _csv, _objects, count in results) != len(records):
+                raise RuntimeError("parallel CPU verifier adapter lost rows")
+
+            staged = temporary_root / "complete.csv"
+            with staged.open("wb") as destination:
+                for part, (shard, _objects, _count) in enumerate(results):
+                    with shard.open("rb") as source:
+                        if part:
+                            source.readline()
+                        shutil.copyfileobj(
+                            source,
+                            destination,
+                            length=1024 * 1024,
+                        )
+            corpus = ObservationCorpus._from_validated(
+                _read_cpu_verifier_object_shards(results)
+            )
+            os.replace(staged, output)
+    finally:
+        _PARALLEL_CPU_VERIFIER_CONTEXT = None
+        _PARALLEL_CPU_VERIFIER_RECORDS = ()
+
+    return corpus
 
 
 def adapt_cpu_verifier_csv(
@@ -474,20 +929,12 @@ def adapt_cpu_verifier_csv(
     if context.profile.installable and not timing_index:
         raise ValueError("installable CPU corpus is missing timing sidecars")
     observations = []
-    for path in (Path(item) for item in paths):
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            missing = REQUIRED_RAW_COLUMNS.difference(reader.fieldnames or ())
-            if missing:
-                raise ValueError(
-                    f"{path}: missing strong CPU verifier columns {sorted(missing)}"
-                )
-            for row_number, raw in enumerate(reader, start=2):
-                try:
-                    samples = timing_index.pop(_timing_key(raw), None)
-                    observations.append(adapt_cpu_verifier_row(raw, context, samples))
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise ValueError(f"{path}:{row_number}: {exc}") from exc
+    for path, row_number, raw in _read_cpu_verifier_raw_records(paths):
+        try:
+            samples = timing_index.pop(_timing_key(raw), None)
+            observations.append(adapt_cpu_verifier_row(raw, context, samples))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{path}:{row_number}: {exc}") from exc
     if not observations:
         raise ValueError("CPU verifier inputs contained no observations")
     if timing_index:

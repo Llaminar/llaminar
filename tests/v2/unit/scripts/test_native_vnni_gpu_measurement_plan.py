@@ -14,6 +14,7 @@ sys.path.insert(0, str(KERNEL_ROOT))
 
 from native_vnni_dispatch.measurement_plan import load_gpu_measurement_plan
 from native_vnni_dispatch.format_registry import FORMAT_SPECS
+from native_vnni_dispatch.qwen_release_geometry import qwen_release_geometries
 from native_vnni_dispatch.schema import (
     AspectBucket,
     Backend,
@@ -164,6 +165,66 @@ class NativeVNNIGPUMeasurementPlanTest(unittest.TestCase):
             and surface[0] == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
             for surface in cuda
         ))
+
+    def test_exact_overlays_cover_every_format_mode_and_decode_m(self) -> None:
+        """All known geometries own all-format evidence on both GPU backends."""
+
+        manifest = load_shape_manifest()
+        plan = load_gpu_measurement_plan(manifest=manifest)
+        exact_shapes = {
+            shape.name
+            for shape in manifest.shapes
+            if shape.role == ShapeRole.PRODUCTION and shape.exact_overlay
+        }
+        source_formats = tuple(spec.label for spec in FORMAT_SPECS)
+        modes = (ExecutionMode.EAGER, ExecutionMode.GRAPH_CAPTURED)
+        verifier_ms = frozenset((*range(2, 17), 31))
+        for backend in (Backend.CUDA, Backend.ROCM):
+            surfaces = plan.expected_decode_surfaces(
+                manifest,
+                backend=backend,
+                source_formats=source_formats,
+                execution_modes=modes,
+                verifier_m_values=verifier_ms,
+            )
+            with self.subTest(backend=backend.value):
+                for shape_name in exact_shapes:
+                    for source_format in source_formats:
+                        for mode in modes:
+                            self.assertIn((
+                                SemanticContract.FAST,
+                                1,
+                                shape_name,
+                                source_format,
+                                mode,
+                            ), surfaces)
+                            for m in verifier_ms:
+                                self.assertIn((
+                                    SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+                                    m,
+                                    shape_name,
+                                    source_format,
+                                    mode,
+                                ), surfaces)
+
+    def test_qwen36_release_geometries_resolve_to_exact_overlay_shapes(self) -> None:
+        """Every reviewed Qwen 3.6 sidecar dimension reaches the same plan."""
+
+        manifest = load_shape_manifest()
+        production_dimensions = {
+            (shape.n, shape.k)
+            for shape in manifest.shapes
+            if shape.role == ShapeRole.PRODUCTION and shape.exact_overlay
+        }
+        qwen36_dimensions = {
+            (geometry.n, geometry.k)
+            for geometry in qwen_release_geometries()
+            if any(
+                use.release_id.startswith("Qwen3.6-")
+                for use in geometry.uses
+            )
+        }
+        self.assertTrue(qwen36_dimensions.issubset(production_dimensions))
 
 
 if __name__ == "__main__":

@@ -26,7 +26,12 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from native_vnni_codebooks import CODEBOOK_TO_FORMAT, FORMAT_TO_CODEBOOK, infer_format_from_filename
+from native_vnni_codebooks import (
+    CODEBOOK_TO_FORMAT,
+    FORMAT_TO_CODEBOOK,
+    GPU_FORMAT_TO_EXECUTION_CODEBOOK,
+    infer_format_from_filename,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[6]
 DEFAULT_POLICY_HEADER = REPO_ROOT / "src/v2/utils/PrefillGraphBucketDefaults.h"
@@ -100,6 +105,33 @@ def parse_args():
     return p.parse_args()
 
 
+def require_byte_exact_row(raw: dict[str, str], path: Path) -> bool:
+    """Validate and return the candidate's serial-row byte-equality result.
+
+    Timing-only legacy rows are not admissible training evidence. A failed
+    candidate remains useful in the corpus for diagnostics, but it can never
+    win an exact overlay or influence production gap analysis.
+    """
+    required = ("bit_mismatches", "correctness_pass")
+    missing = [field for field in required if not raw.get(field, "").strip()]
+    if missing:
+        raise SystemExit(
+            f"{path}: CUDA prefill evidence is missing mandatory byte-exact "
+            f"field(s): {', '.join(missing)}")
+
+    bit_mismatches = int(raw["bit_mismatches"])
+    correctness = int(raw["correctness_pass"])
+    if correctness not in (0, 1):
+        raise SystemExit(
+            f"{path}: correctness_pass must be 0 or 1, found {correctness}")
+    expected = int(bit_mismatches == 0)
+    if correctness != expected:
+        raise SystemExit(
+            f"{path}: correctness_pass={correctness} disagrees with "
+            f"bit_mismatches={bit_mismatches}")
+    return correctness == 1
+
+
 def load_rows(paths, format_override=None, m_policy=None, include_off_policy_m=False):
     """Load sweep CSV rows, keeping only STD strategy rows with tile_id >= 0."""
     rows = []
@@ -117,6 +149,8 @@ def load_rows(paths, format_override=None, m_policy=None, include_off_policy_m=F
 
                 tile_id = int(raw["tile_id"])
                 if tile_id < 0:
+                    continue
+                if not require_byte_exact_row(raw, p):
                     continue
 
                 # Detect format: explicit column, or from filename, or override
@@ -136,13 +170,14 @@ def load_rows(paths, format_override=None, m_policy=None, include_off_policy_m=F
                     print(f"WARNING: Unknown format '{fmt}' in {p}, skipping", file=sys.stderr)
                     continue
 
-                codebook = FORMAT_TO_CODEBOOK[fmt]
+                source_codebook = FORMAT_TO_CODEBOOK[fmt]
                 if "codebook" in raw and raw["codebook"].strip():
                     csv_codebook = int(raw["codebook"])
-                    if csv_codebook != codebook:
+                    if csv_codebook != source_codebook:
                         raise SystemExit(
-                            f"codebook mismatch in {p}: format {fmt} maps to {codebook}, CSV row has {csv_codebook}")
-                    codebook = csv_codebook
+                            f"codebook mismatch in {p}: format {fmt} maps to "
+                            f"{source_codebook}, CSV row has {csv_codebook}")
+                codebook = GPU_FORMAT_TO_EXECUTION_CODEBOOK[fmt]
 
                 m = int(raw["m"])
                 n = int(raw["n"])
@@ -188,6 +223,8 @@ def load_auto_rows(paths, format_override=None, m_policy=None, include_off_polic
                 strategy = raw.get("strategy", "").strip()
                 if strategy != "AUTO":
                     continue
+                if not require_byte_exact_row(raw, p):
+                    continue
 
                 fmt = None
                 if "format" in raw and raw["format"].strip():
@@ -200,13 +237,14 @@ def load_auto_rows(paths, format_override=None, m_policy=None, include_off_polic
                 if not fmt or fmt not in FORMAT_TO_CODEBOOK:
                     continue
 
-                codebook = FORMAT_TO_CODEBOOK[fmt]
+                source_codebook = FORMAT_TO_CODEBOOK[fmt]
                 if "codebook" in raw and raw["codebook"].strip():
                     csv_codebook = int(raw["codebook"])
-                    if csv_codebook != codebook:
+                    if csv_codebook != source_codebook:
                         raise SystemExit(
-                            f"codebook mismatch in {p}: format {fmt} maps to {codebook}, CSV row has {csv_codebook}")
-                    codebook = csv_codebook
+                            f"codebook mismatch in {p}: format {fmt} maps to "
+                            f"{source_codebook}, CSV row has {csv_codebook}")
+                codebook = GPU_FORMAT_TO_EXECUTION_CODEBOOK[fmt]
 
                 m = int(raw["m"])
                 n = int(raw["n"])
@@ -268,7 +306,7 @@ def load_exceptions(path):
         if fmt not in FORMAT_TO_CODEBOOK:
             print(f"WARNING: Unknown format '{fmt}' in exceptions, skipping", file=sys.stderr)
             continue
-        cb = FORMAT_TO_CODEBOOK[fmt]
+        cb = GPU_FORMAT_TO_EXECUTION_CODEBOOK[fmt]
         m_key = entry.get("m_key", entry.get("m_bin"))
         if m_key is None:
             raise SystemExit("exception entry must include m_key")

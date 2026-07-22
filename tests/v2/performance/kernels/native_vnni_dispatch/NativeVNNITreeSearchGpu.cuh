@@ -40,7 +40,7 @@ constexpr std::uint32_t kNativeVNNILeafCandidateGroups = 8;
 constexpr std::uint32_t kNativeVNNILeafGroupThreads = 32;
 constexpr std::uint32_t kNativeVNNIExpandedHashGroups = 8;
 constexpr std::uint32_t kNativeVNNIHeldoutExactWarpsPerBlock = 4;
-constexpr std::uint32_t kNativeVNNITreeMaximumAxes = 64;
+constexpr std::uint32_t kNativeVNNITreeMaximumAxes = 72;
 constexpr std::uint32_t kNativeVNNITreeSplitSignatureWords = 10;
 constexpr std::uint32_t kNativeVNNITreeMaximumSignatureTokens =
     kLlaminarNativeVNNITreeMaximumPoints
@@ -438,8 +438,10 @@ struct NativeVNNITreeScratch {
     std::size_t pointRankCapacity = 0;
     std::uint64_t* trainingAggregateN = nullptr;
     std::uint64_t* trainingK = nullptr;
+    std::uint32_t* trainingLaunchKTiles = nullptr;
     std::size_t trainingAggregateNCapacity = 0;
     std::size_t trainingKCapacity = 0;
+    std::size_t trainingLaunchKTilesCapacity = 0;
     LlaminarNativeVNNITreeFeatureAxis* featureAxes = nullptr;
     std::size_t featureAxisCapacity = 0;
     std::uint32_t* axisValueCounts = nullptr;
@@ -455,6 +457,7 @@ struct NativeVNNITreeScratch {
 
     std::uint64_t* heldoutAggregateN = nullptr;
     std::uint64_t* heldoutK = nullptr;
+    std::uint32_t* heldoutLaunchKTiles = nullptr;
     double* heldoutMeasuredP95 = nullptr;
     double* heldoutMeasuredMeans = nullptr;
     double* heldoutMeasuredMaxima = nullptr;
@@ -462,6 +465,7 @@ struct NativeVNNITreeScratch {
     LlaminarNativeVNNITreeFoldEvaluation* foldEvaluations = nullptr;
     std::size_t heldoutAggregateNCapacity = 0;
     std::size_t heldoutKCapacity = 0;
+    std::size_t heldoutLaunchKTilesCapacity = 0;
     std::size_t heldoutMeasuredP95Capacity = 0;
     std::size_t heldoutMeasuredMeanCapacity = 0;
     std::size_t heldoutMeasuredMaximumCapacity = 0;
@@ -499,6 +503,8 @@ struct NativeVNNITreeScratch {
     std::uint32_t* childMaskCount = nullptr;
     std::uint32_t* uniqueCount = nullptr;
     std::uint32_t* status = nullptr;
+    std::uint64_t* expandedCandidateTotal = nullptr;
+    std::uint64_t* structurallyUniqueCandidateTotal = nullptr;
     std::size_t frontierCountCapacityA = 0;
     std::size_t frontierCountCapacityB = 0;
     std::size_t expandedCountCapacity = 0;
@@ -506,6 +512,8 @@ struct NativeVNNITreeScratch {
     std::size_t childMaskCountCapacity = 0;
     std::size_t uniqueCountCapacity = 0;
     std::size_t statusCapacity = 0;
+    std::size_t expandedCandidateTotalCapacity = 0;
+    std::size_t structurallyUniqueCandidateTotalCapacity = 0;
 
     std::uint32_t* hashSlots = nullptr;
     std::size_t hashCapacity = 0;
@@ -1711,11 +1719,54 @@ __device__ __forceinline__ int nativeVNNIRationalCompare(
     return leftProduct < rightProduct ? -1 : leftProduct > rightProduct ? 1 : 0;
 }
 
+/** Exact work spans produced by the frozen serial-K-part arithmetic policy. */
+struct NativeVNNIKPartGeometry {
+    std::uint64_t blocksPerTile;
+    std::uint64_t finalTileBlocks;
+};
+
+/**
+ * Reconstruct production's K partition without changing its launch inventory.
+ *
+ * `launchKTiles == 0` is historical full-K telemetry and therefore denotes one
+ * tile. An explicit tile count is never clamped: ceil division can make the
+ * last producer empty, but that producer still launches and affects economy.
+ * Only the final producer's work span is saturated at zero, matching the
+ * production `kb_start >= K_blocks` no-op.
+ */
+__device__ __forceinline__ bool nativeVNNIComputeKPartGeometry(
+    std::uint64_t k,
+    std::uint64_t blockWidth,
+    std::uint32_t launchKTiles,
+    NativeVNNIKPartGeometry* geometry,
+    std::uint32_t* status) {
+    if (k == 0 || blockWidth == 0 || geometry == nullptr) {
+        atomicOr(status, kNativeVNNITreeStatusEvaluationFailure);
+        return false;
+    }
+    const std::uint64_t kBlocks = nativeVNNICeilDiv(k, blockWidth);
+    const std::uint64_t kTiles = launchKTiles > 0 ? launchKTiles : 1U;
+    const std::uint64_t blocksPerTile = nativeVNNICeilDiv(kBlocks, kTiles);
+    std::uint64_t prefixBlocks = 0;
+    if (!nativeVNNICheckedMultiply(
+            kTiles - 1U, blocksPerTile, &prefixBlocks)) {
+        atomicOr(status, kNativeVNNITreeStatusThresholdOverflow);
+        return false;
+    }
+    const std::uint64_t remainingBlocks =
+        prefixBlocks < kBlocks ? kBlocks - prefixBlocks : 0U;
+    geometry->blocksPerTile = blocksPerTile;
+    geometry->finalTileBlocks = remainingBlocks < blocksPerTile
+        ? remainingBlocks : blocksPerTile;
+    return true;
+}
+
 /** Compute one normalized runtime feature value from raw training geometry. */
 __device__ bool nativeVNNIFeatureValue(
     const LlaminarNativeVNNITreeFeatureAxis& axis,
     std::uint64_t aggregateN,
     std::uint64_t k,
+    std::uint32_t launchKTiles,
     std::uint32_t parallelismWidth,
     std::uint32_t taskMultiplier,
     std::uint64_t* numerator,
@@ -1793,6 +1844,50 @@ __device__ bool nativeVNNIFeatureValue(
                 resultNumerator = (nTiles - 1U) % parallelismWidth + 1U;
                 resultDenominator = parallelismWidth;
                 break;
+            case kLlaminarNativeVNNITreeThresholdKPartProducerWaves: {
+                const std::uint64_t kTiles = launchKTiles > 0 ? launchKTiles : 1U;
+                std::uint64_t tasks = 0;
+                if (!nativeVNNICheckedMultiply(kTiles, nTiles, &tasks)) {
+                    atomicOr(status, kNativeVNNITreeStatusThresholdOverflow);
+                    return false;
+                }
+                resultNumerator = nativeVNNICeilDiv(tasks, parallelismWidth);
+                break;
+            }
+            case kLlaminarNativeVNNITreeThresholdKPartFinalProducerWaveUtilization: {
+                const std::uint64_t kTiles = launchKTiles > 0 ? launchKTiles : 1U;
+                std::uint64_t tasks = 0;
+                if (!nativeVNNICheckedMultiply(kTiles, nTiles, &tasks)) {
+                    atomicOr(status, kNativeVNNITreeStatusThresholdOverflow);
+                    return false;
+                }
+                resultNumerator = (tasks - 1U) % parallelismWidth + 1U;
+                resultDenominator = parallelismWidth;
+                break;
+            }
+            case kLlaminarNativeVNNITreeThresholdKPartKBlocksPerTile:
+            case kLlaminarNativeVNNITreeThresholdKPartFinalKTileBlocks:
+            case kLlaminarNativeVNNITreeThresholdKPartFinalKTileUtilization: {
+                NativeVNNIKPartGeometry geometry = {};
+                if (!nativeVNNIComputeKPartGeometry(
+                        k, tileWidth, launchKTiles, &geometry, status)) {
+                    return false;
+                }
+                if (axis.operation
+                    == kLlaminarNativeVNNITreeThresholdKPartKBlocksPerTile) {
+                    resultNumerator = geometry.blocksPerTile;
+                } else if (axis.operation
+                           == kLlaminarNativeVNNITreeThresholdKPartFinalKTileBlocks) {
+                    resultNumerator = geometry.finalTileBlocks;
+                } else {
+                    resultNumerator = geometry.finalTileBlocks;
+                    resultDenominator = geometry.blocksPerTile;
+                }
+                break;
+            }
+            case kLlaminarNativeVNNITreeThresholdKPartKTileCount:
+                resultNumerator = launchKTiles > 0 ? launchKTiles : 1U;
+                break;
             case kLlaminarNativeVNNITreeThresholdMNParallelWaves: {
                 std::uint64_t tasks = 0;
                 if (!nativeVNNICheckedMultiply(
@@ -1837,6 +1932,7 @@ __device__ bool nativeVNNIFeatureValue(
 __global__ void buildNativeVNNIAxisMetadata(
     const std::uint64_t* aggregateN,
     const std::uint64_t* k,
+    const std::uint32_t* launchKTiles,
     const LlaminarNativeVNNITreeFeatureAxis* axes,
     std::uint32_t pointCount,
     std::uint32_t parallelismWidth,
@@ -1859,8 +1955,9 @@ __global__ void buildNativeVNNIAxisMetadata(
         std::uint64_t numerator = 0;
         std::uint64_t denominator = 1;
         (void)nativeVNNIFeatureValue(
-            axes[axis], aggregateN[lane], k[lane], parallelismWidth,
-            taskMultiplier, &numerator, &denominator, status);
+            axes[axis], aggregateN[lane], k[lane], launchKTiles[lane],
+            parallelismWidth, taskMultiplier, &numerator, &denominator,
+            status);
         numerators[lane] = numerator;
         denominators[lane] = denominator;
         points[lane] = lane;
@@ -1998,6 +2095,10 @@ __device__ bool nativeVNNIBuildThreshold(
         (axis.operation == kLlaminarNativeVNNITreeThresholdNParallelWaves
          || axis.operation
             == kLlaminarNativeVNNITreeThresholdNFinalParallelWaveUtilization
+         || axis.operation
+            == kLlaminarNativeVNNITreeThresholdKPartProducerWaves
+         || axis.operation
+            == kLlaminarNativeVNNITreeThresholdKPartFinalProducerWaveUtilization
          || axis.operation == kLlaminarNativeVNNITreeThresholdMNParallelWaves
          || axis.operation
             == kLlaminarNativeVNNITreeThresholdMNFinalParallelWaveUtilization)
@@ -2038,6 +2139,9 @@ void enumerateNativeVNNISplitDescriptors(
     std::uint32_t descriptorCapacity,
     std::uint32_t* descriptorCount,
     std::uint32_t* status) {
+    __shared__ std::uint8_t occupiedValues[
+        kLlaminarNativeVNNITreeMaximumPoints];
+
     // The graph launch maps these coordinates directly onto hardware grid
     // dimensions. Threads therefore spend their work on thresholds instead of
     // repeatedly dividing a flattened 64-bit combination index.
@@ -2054,20 +2158,29 @@ void enumerateNativeVNNISplitDescriptors(
     }
     const std::uint32_t valueCount = axisValueCounts[axis];
     const NativeVNNIPointMask subset = parent.leaves[targetLeaf].pointMask;
+
+    // Determine subset occupancy once per axis value. The prior implementation
+    // repeated an eight-word mask intersection while every occupied value
+    // searched for its next occupied neighbour. Sparse axes therefore reread
+    // the same global masks many times. The shared byte map preserves the exact
+    // adjacent-selected-value split set while making those later probes local.
+    for (std::uint32_t value = threadIdx.x;
+         value < valueCount; value += blockDim.x) {
+        occupiedValues[value] = static_cast<std::uint8_t>(
+            !nativeVNNIMaskEmpty(nativeVNNIMaskAnd(
+                subset,
+                axisValueMasks[
+                    static_cast<std::uint64_t>(axis) * pointCount + value])));
+    }
+    __syncthreads();
+
     for (std::uint32_t lower = threadIdx.x;
          lower + 1U < valueCount; lower += blockDim.x) {
-        const NativeVNNIPointMask lowerValueMask =
-            axisValueMasks[static_cast<std::uint64_t>(axis) * pointCount + lower];
-        if (nativeVNNIMaskEmpty(nativeVNNIMaskAnd(subset, lowerValueMask))) {
+        if (occupiedValues[lower] == 0U) {
             continue;
         }
         std::uint32_t upper = lower + 1U;
-        while (upper < valueCount
-               && nativeVNNIMaskEmpty(nativeVNNIMaskAnd(
-                   subset,
-                   axisValueMasks[
-                       static_cast<std::uint64_t>(axis) * pointCount
-                       + upper]))) {
+        while (upper < valueCount && occupiedValues[upper] == 0U) {
             ++upper;
         }
         if (upper >= valueCount) {
@@ -2383,9 +2496,8 @@ __device__ double nativeVNNIExpandedFittingP95FromTails(
  * substitutes the two scored children while computing the exact scalar tree
  * objective. The same owner then merges the preordered child tails for exact
  * fitting p95 and composes the structural hash from immutable parent/child
- * fragments. Keeping those operations together avoids publishing and rereading
- * every candidate through a second full-grid kernel; no complete leaf array or
- * signature is copied at this stage.
+ * fragments. Keeping these operations together preserves coalesced descriptor
+ * traversal and avoids a scattered second pass through deduplicated indices.
  */
 __global__ void scoreNativeVNNIExpandedCandidates(
     const NativeVNNIDeviceTree* frontier,
@@ -2798,12 +2910,7 @@ __global__ void deduplicateNativeVNNITrees(
  * double comparator without repeatedly spending scarce GPU FP64 throughput.
  */
 struct NativeVNNITreeOrderKey {
-    std::uint32_t failedLeafCount;
-    std::uint32_t measuredFailureCount;
-    std::uint64_t fittingP95;
-    std::uint64_t fittingMean;
-    std::uint64_t worstLeafP95;
-    std::uint64_t measuredMaximum;
+    std::uint64_t words[5];
 };
 
 /** Uniform immutable pointer bundle shared by one depth's ordering kernels. */
@@ -2891,48 +2998,63 @@ __global__ void buildNativeVNNIFrontierLcp(
 __device__ __forceinline__ int nativeVNNITreeScalarCompare(
     const NativeVNNITreeOrderKey& left,
     const NativeVNNITreeOrderKey& right) {
-#define LLAMINAR_COMPARE_TREE_SCALAR(member) \
-    if (left.member < right.member) { \
-        return -1; \
-    } \
-    if (left.member > right.member) { \
-        return 1; \
+    #pragma unroll
+    for (std::uint32_t word = 0U; word < 5U; ++word) {
+        if (left.words[word] < right.words[word]) {
+            return -1;
+        }
+        if (left.words[word] > right.words[word]) {
+            return 1;
+        }
     }
-    LLAMINAR_COMPARE_TREE_SCALAR(failedLeafCount)
-    LLAMINAR_COMPARE_TREE_SCALAR(fittingP95)
-    LLAMINAR_COMPARE_TREE_SCALAR(fittingMean)
-    LLAMINAR_COMPARE_TREE_SCALAR(worstLeafP95)
-    LLAMINAR_COMPARE_TREE_SCALAR(measuredFailureCount)
-    LLAMINAR_COMPARE_TREE_SCALAR(measuredMaximum)
-#undef LLAMINAR_COMPARE_TREE_SCALAR
     return 0;
 }
 
 /** Extract dense ordering keys with coalesced writes. */
 __global__ void extractNativeVNNITreeOrderKeys(
     const NativeVNNIExpandedCandidate* candidates,
-    const std::uint32_t* treeCount,
-    std::uint32_t treeCapacity,
+    const std::uint32_t* expandedCount,
+    const std::uint32_t* uniqueIndices,
+    const std::uint32_t* uniqueCount,
+    std::uint32_t uniqueCapacity,
+    std::uint64_t* expandedCandidateTotal,
+    std::uint64_t* structurallyUniqueCandidateTotal,
     NativeVNNITreeOrderKey* keys) {
     const std::uint32_t count =
-        *treeCount < treeCapacity ? *treeCount : treeCapacity;
+        *uniqueCount < uniqueCapacity ? *uniqueCount : uniqueCapacity;
+    if (blockIdx.x == 0U && threadIdx.x == 0U) {
+        atomicAdd(
+            reinterpret_cast<unsigned long long*>(expandedCandidateTotal),
+            static_cast<unsigned long long>(
+                *expandedCount < uniqueCapacity ? *expandedCount : uniqueCapacity));
+        atomicAdd(
+            reinterpret_cast<unsigned long long*>(
+                structurallyUniqueCandidateTotal),
+            static_cast<unsigned long long>(count));
+    }
     const std::uint64_t stride =
         static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    for (std::uint64_t index =
+    for (std::uint64_t uniquePosition =
              static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         index < count; index += stride) {
+         uniquePosition < count; uniquePosition += stride) {
+        const std::uint32_t index = uniqueIndices[uniquePosition];
         const NativeVNNIExpandedCandidate& candidate = candidates[index];
         const NativeVNNIDeviceTreeObjective& objective = candidate.objective;
         NativeVNNITreeOrderKey* key = &keys[index];
-        key->failedLeafCount = objective.failedLeafCount;
-        key->measuredFailureCount = objective.measuredFailureCount;
-        key->fittingP95 = nativeVNNIDoubleOrderKey(
+        const std::uint64_t fittingP95 = nativeVNNIDoubleOrderKey(
             nativeVNNIDoubleBits(objective.fittingP95));
-        key->fittingMean = nativeVNNIDoubleOrderKey(
+        const std::uint64_t fittingMean = nativeVNNIDoubleOrderKey(
             nativeVNNIDoubleBits(objective.fittingMean));
-        key->worstLeafP95 = nativeVNNIDoubleOrderKey(
+        const std::uint64_t worstLeafP95 = nativeVNNIDoubleOrderKey(
             nativeVNNIDoubleBits(objective.worstLeafP95));
-        key->measuredMaximum = nativeVNNIDoubleOrderKey(
+        key->words[0] =
+            static_cast<std::uint64_t>(objective.failedLeafCount) << 32U
+            | fittingP95 >> 32U;
+        key->words[1] = fittingP95 << 32U | fittingMean >> 32U;
+        key->words[2] = fittingMean << 32U | worstLeafP95 >> 32U;
+        key->words[3] = worstLeafP95 << 32U
+            | static_cast<std::uint64_t>(objective.measuredFailureCount);
+        key->words[4] = nativeVNNIDoubleOrderKey(
             nativeVNNIDoubleBits(objective.measuredMaximum));
     }
 }
@@ -3034,19 +3156,12 @@ __device__ __forceinline__ bool nativeVNNIStagedTreeIndexLess(
 __device__ __forceinline__ void nativeVNNISwapTreeOrderKeys(
     NativeVNNITreeOrderKey* left,
     NativeVNNITreeOrderKey* right) {
-#define LLAMINAR_SWAP_TREE_KEY(member) \
-    { \
-        const auto temporary = left->member; \
-        left->member = right->member; \
-        right->member = temporary; \
+    #pragma unroll
+    for (std::uint32_t word = 0U; word < 5U; ++word) {
+        const std::uint64_t temporary = left->words[word];
+        left->words[word] = right->words[word];
+        right->words[word] = temporary;
     }
-    LLAMINAR_SWAP_TREE_KEY(failedLeafCount)
-    LLAMINAR_SWAP_TREE_KEY(measuredFailureCount)
-    LLAMINAR_SWAP_TREE_KEY(fittingP95)
-    LLAMINAR_SWAP_TREE_KEY(fittingMean)
-    LLAMINAR_SWAP_TREE_KEY(worstLeafP95)
-    LLAMINAR_SWAP_TREE_KEY(measuredMaximum)
-#undef LLAMINAR_SWAP_TREE_KEY
 }
 
 /**
@@ -3099,12 +3214,10 @@ __global__ void narrowNativeVNNITreeTopIndices(
         scalarKeys[threadIdx.x] = context->orderKeys[value];
     } else {
         NativeVNNITreeOrderKey* key = &scalarKeys[threadIdx.x];
-        key->failedLeafCount = ~std::uint32_t{0};
-        key->measuredFailureCount = ~std::uint32_t{0};
-        key->fittingP95 = ~std::uint64_t{0};
-        key->fittingMean = ~std::uint64_t{0};
-        key->worstLeafP95 = ~std::uint64_t{0};
-        key->measuredMaximum = ~std::uint64_t{0};
+        #pragma unroll
+        for (std::uint32_t word = 0U; word < 5U; ++word) {
+            key->words[word] = ~std::uint64_t{0};
+        }
     }
     if (threadIdx.x == 0U) {
         activeCount = 0U;
@@ -3637,6 +3750,7 @@ __device__ bool nativeVNNIThresholdMatchesLessEqual(
     const LlaminarNativeVNNITreeThreshold& threshold,
     std::uint64_t aggregateN,
     std::uint64_t k,
+    std::uint32_t launchKTiles,
     std::uint32_t* status) {
     if (aggregateN == 0 || k == 0 || threshold.denominator == 0
         || threshold.parallelism_width == 0
@@ -3711,12 +3825,50 @@ __device__ bool nativeVNNIThresholdMatchesLessEqual(
             return nativeVNNIProductLessEqual(
                 finalTile, denominator, numerator, 1U, status);
         }
+        case kLlaminarNativeVNNITreeThresholdKPartKBlocksPerTile:
+        case kLlaminarNativeVNNITreeThresholdKPartFinalKTileBlocks:
+        case kLlaminarNativeVNNITreeThresholdKPartFinalKTileUtilization: {
+            NativeVNNIKPartGeometry geometry = {};
+            if (!nativeVNNIComputeKPartGeometry(
+                    k, tileWidth, launchKTiles, &geometry, status)) {
+                return false;
+            }
+            if (threshold.operation
+                == kLlaminarNativeVNNITreeThresholdKPartKBlocksPerTile) {
+                return nativeVNNIProductLessEqual(
+                    geometry.blocksPerTile, denominator,
+                    numerator, 1U, status);
+            }
+            if (threshold.operation
+                == kLlaminarNativeVNNITreeThresholdKPartFinalKTileBlocks) {
+                return nativeVNNIProductLessEqual(
+                    geometry.finalTileBlocks, denominator,
+                    numerator, 1U, status);
+            }
+            return nativeVNNIProductLessEqual(
+                geometry.finalTileBlocks, denominator,
+                geometry.blocksPerTile, numerator, status);
+        }
+        case kLlaminarNativeVNNITreeThresholdKPartKTileCount:
+            return nativeVNNIProductLessEqual(
+                launchKTiles > 0 ? launchKTiles : 1U,
+                denominator, numerator, 1U, status);
         default:
             break;
     }
 
     const std::uint64_t parallelism = threshold.parallelism_width;
     std::uint64_t tasks = nTiles;
+    if (threshold.operation
+            == kLlaminarNativeVNNITreeThresholdKPartProducerWaves
+        || threshold.operation
+            == kLlaminarNativeVNNITreeThresholdKPartFinalProducerWaveUtilization) {
+        if (!nativeVNNICheckedMultiply(
+                launchKTiles > 0 ? launchKTiles : 1U, nTiles, &tasks)) {
+            atomicOr(status, kNativeVNNITreeStatusThresholdOverflow);
+            return false;
+        }
+    }
     if (threshold.operation == kLlaminarNativeVNNITreeThresholdMNParallelWaves
         || threshold.operation
             == kLlaminarNativeVNNITreeThresholdMNFinalParallelWaveUtilization) {
@@ -3728,6 +3880,8 @@ __device__ bool nativeVNNIThresholdMatchesLessEqual(
     }
     if (threshold.operation == kLlaminarNativeVNNITreeThresholdNParallelWaves
         || threshold.operation
+            == kLlaminarNativeVNNITreeThresholdKPartProducerWaves
+        || threshold.operation
             == kLlaminarNativeVNNITreeThresholdMNParallelWaves) {
         const std::uint64_t waves = nativeVNNICeilDiv(tasks, parallelism);
         return nativeVNNIProductLessEqual(
@@ -3735,6 +3889,8 @@ __device__ bool nativeVNNIThresholdMatchesLessEqual(
     }
     if (threshold.operation
             == kLlaminarNativeVNNITreeThresholdNFinalParallelWaveUtilization
+        || threshold.operation
+            == kLlaminarNativeVNNITreeThresholdKPartFinalProducerWaveUtilization
         || threshold.operation
             == kLlaminarNativeVNNITreeThresholdMNFinalParallelWaveUtilization) {
         const std::uint64_t finalTasks = (tasks - 1U) % parallelism + 1U;
@@ -3768,6 +3924,7 @@ __device__ std::uint32_t nativeVNNISelectHeldoutCandidate(
     const LlaminarNativeVNNITreeFitResult& tree,
     std::uint64_t aggregateN,
     std::uint64_t k,
+    std::uint32_t launchKTiles,
     std::uint32_t* status) {
     if (tree.leaf_count == 0 || tree.structure_token_count == 0) {
         return kNativeVNNITreeInvalidIndex;
@@ -3789,7 +3946,8 @@ __device__ std::uint32_t nativeVNNISelectHeldoutCandidate(
             return kNativeVNNITreeInvalidIndex;
         }
         if (!nativeVNNIThresholdMatchesLessEqual(
-                tree.split_thresholds[position], aggregateN, k, status)) {
+                tree.split_thresholds[position], aggregateN, k,
+                launchKTiles, status)) {
             std::uint32_t skippedLeaves = 0;
             if (!nativeVNNISkipEvaluationSubtree(
                     tree, &tokenIndex, &skippedLeaves)) {
@@ -3904,6 +4062,7 @@ __global__ void evaluateNativeVNNIHeldoutTrees(
     const LlaminarNativeVNNITreeFitResult* trees,
     const std::uint64_t* heldoutAggregateN,
     const std::uint64_t* heldoutK,
+    const std::uint32_t* heldoutLaunchKTiles,
     const double* heldoutMeasuredP95,
     std::uint32_t heldoutPointCount,
     std::uint32_t candidateCount,
@@ -3920,7 +4079,8 @@ __global__ void evaluateNativeVNNIHeldoutTrees(
     std::uint32_t selected = kNativeVNNITreeInvalidIndex;
     if (point < heldoutPointCount) {
         selected = nativeVNNISelectHeldoutCandidate(
-            trees[budget], heldoutAggregateN[point], heldoutK[point], status);
+            trees[budget], heldoutAggregateN[point], heldoutK[point],
+            heldoutLaunchKTiles[point], status);
         if (selected != kNativeVNNITreeInvalidIndex) {
             if (selected >= candidateCount
                 || !isfinite(heldoutMeasuredP95[
@@ -4053,6 +4213,10 @@ std::uint64_t nativeVNNITreeScratchBytes(const NativeVNNITreeScratch& scratch) {
         + scratch.pointRankCapacity * sizeof(std::uint32_t)
         + (scratch.trainingAggregateNCapacity + scratch.trainingKCapacity)
               * sizeof(std::uint64_t)
+        + (scratch.expandedCandidateTotalCapacity
+           + scratch.structurallyUniqueCandidateTotalCapacity)
+              * sizeof(std::uint64_t)
+        + scratch.trainingLaunchKTilesCapacity * sizeof(std::uint32_t)
         + scratch.featureAxisCapacity
               * sizeof(LlaminarNativeVNNITreeFeatureAxis)
         + scratch.axisCapacity * sizeof(std::uint32_t)
@@ -4062,6 +4226,7 @@ std::uint64_t nativeVNNITreeScratchBytes(const NativeVNNITreeScratch& scratch) {
            + scratch.axisValueDenominatorCapacity) * sizeof(std::uint64_t)
         + (scratch.heldoutAggregateNCapacity + scratch.heldoutKCapacity)
               * sizeof(std::uint64_t)
+        + scratch.heldoutLaunchKTilesCapacity * sizeof(std::uint32_t)
         + (scratch.heldoutMeasuredP95Capacity
            + scratch.heldoutMeasuredMeanCapacity
            + scratch.heldoutMeasuredMaximumCapacity) * sizeof(double)
@@ -4173,6 +4338,9 @@ bool ensureNativeVNNITreeScratch(
             "training-N high-water growth")
         && LLAMINAR_ENSURE_TREE_BUFFER(trainingK, trainingKCapacity,
             pointCount, "training-K high-water growth")
+        && LLAMINAR_ENSURE_TREE_BUFFER(trainingLaunchKTiles,
+            trainingLaunchKTilesCapacity, pointCount,
+            "training-K-tiles high-water growth")
         && LLAMINAR_ENSURE_TREE_BUFFER(featureAxes, featureAxisCapacity,
             axisCount, "feature-axis high-water growth")
         && LLAMINAR_ENSURE_TREE_BUFFER(axisValueCounts, axisCapacity,
@@ -4192,6 +4360,9 @@ bool ensureNativeVNNITreeScratch(
             "heldout-N high-water growth")
         && LLAMINAR_ENSURE_TREE_BUFFER(heldoutK, heldoutKCapacity,
             evaluationPointCount, "heldout-K high-water growth")
+        && LLAMINAR_ENSURE_TREE_BUFFER(heldoutLaunchKTiles,
+            heldoutLaunchKTilesCapacity, evaluationPointCount,
+            "heldout-K-tiles high-water growth")
         && LLAMINAR_ENSURE_TREE_BUFFER(heldoutMeasuredP95,
             heldoutMeasuredP95Capacity, evaluationMatrixCount,
             "heldout-p95 high-water growth")
@@ -4251,6 +4422,12 @@ bool ensureNativeVNNITreeScratch(
             1, "unique-count high-water growth")
         && LLAMINAR_ENSURE_TREE_BUFFER(status, statusCapacity,
             1, "tree-status high-water growth")
+        && LLAMINAR_ENSURE_TREE_BUFFER(expandedCandidateTotal,
+            expandedCandidateTotalCapacity, 1,
+            "expanded-candidate diagnostic high-water growth")
+        && LLAMINAR_ENSURE_TREE_BUFFER(structurallyUniqueCandidateTotal,
+            structurallyUniqueCandidateTotalCapacity, 1,
+            "unique-candidate diagnostic high-water growth")
         && LLAMINAR_ENSURE_TREE_BUFFER(hashSlots, hashCapacity,
             treeHashCapacity, "signature-hash high-water growth")
         && LLAMINAR_ENSURE_TREE_BUFFER(uniqueIndices, uniqueIndexCapacity,
@@ -4365,6 +4542,12 @@ void launchNativeVNNITreePipeline(
     (void)LLAMINAR_SCORER_MEMSET_ASYNC(
         scratch->status, 0, sizeof(std::uint32_t), session->stream);
     (void)LLAMINAR_SCORER_MEMSET_ASYNC(
+        scratch->expandedCandidateTotal, 0, sizeof(std::uint64_t),
+        session->stream);
+    (void)LLAMINAR_SCORER_MEMSET_ASYNC(
+        scratch->structurallyUniqueCandidateTotal, 0, sizeof(std::uint64_t),
+        session->stream);
+    (void)LLAMINAR_SCORER_MEMSET_ASYNC(
         scratch->results, 0,
         maxLeaves * sizeof(LlaminarNativeVNNITreeFitResult), session->stream);
     (void)LLAMINAR_SCORER_MEMSET_ASYNC(
@@ -4373,6 +4556,7 @@ void launchNativeVNNITreePipeline(
         axisCount, kLlaminarNativeVNNITreeMaximumPoints, 0,
         session->stream>>>(
         scratch->trainingAggregateN, scratch->trainingK,
+        scratch->trainingLaunchKTiles,
         scratch->featureAxes, session->pointCount, parallelismWidth,
             taskMultiplier, scratch->axisValueCounts,
             scratch->axisValueMasks, scratch->axisPrefixMasks,
@@ -4527,13 +4711,9 @@ void launchNativeVNNITreePipeline(
             scratch->childUniqueIndices, scratch->childMaskCount,
             depthChildCapacity,
             scratch->childLeaves, scratch->childFittingTailPoints,
-            session->deviceFittingRegrets,
-            session->pointCount, session->candidateCount, scratch->expanded,
+            session->deviceFittingRegrets, session->pointCount,
+            session->candidateCount, scratch->expanded,
             depthExpansionCapacity, scratch->expandedCount, scratch->status);
-        extractNativeVNNITreeOrderKeys<<<
-            objectiveBlocks, kNativeVNNITreeThreads, 0, session->stream>>>(
-            scratch->expanded, scratch->expandedCount, depthExpansionCapacity,
-            scratch->expandedOrderKeys);
 
         const std::uint32_t dedupeBlocks = std::min(
             (depthExpansionCapacity + kNativeVNNITreeThreads - 1U)
@@ -4547,6 +4727,14 @@ void launchNativeVNNITreePipeline(
             scratch->pointGroupRanks, session->pointCount,
             scratch->hashSlots, depthTreeHashCapacity,
             scratch->uniqueIndices, scratch->uniqueCount, scratch->status);
+
+        extractNativeVNNITreeOrderKeys<<<
+            objectiveBlocks, kNativeVNNITreeThreads, 0, session->stream>>>(
+            scratch->expanded, scratch->expandedCount,
+            scratch->uniqueIndices, scratch->uniqueCount,
+            depthExpansionCapacity, scratch->expandedCandidateTotal,
+            scratch->structurallyUniqueCandidateTotal,
+            scratch->expandedOrderKeys);
 
         const std::uint32_t* selectionInput = scratch->uniqueIndices;
         const std::uint32_t* deviceSelectionCount = scratch->uniqueCount;
@@ -4647,6 +4835,7 @@ void launchNativeVNNITreePipeline(
             maxLeaves * evaluationPointTiles,
             kNativeVNNITreeEvaluationThreads, 0, session->stream>>>(
             scratch->results, scratch->heldoutAggregateN, scratch->heldoutK,
+            scratch->heldoutLaunchKTiles,
             scratch->heldoutMeasuredP95, heldoutPointCount,
             session->candidateCount, scratch->foldEvaluations,
             scratch->status);
@@ -4772,6 +4961,7 @@ NativeVNNIScorerError releaseNativeVNNITreeScratch(
     release(scratch->pointGroupRanks);
     release(scratch->trainingAggregateN);
     release(scratch->trainingK);
+    release(scratch->trainingLaunchKTiles);
     release(scratch->featureAxes);
     release(scratch->axisValueCounts);
     release(scratch->axisValueMasks);
@@ -4780,6 +4970,7 @@ NativeVNNIScorerError releaseNativeVNNITreeScratch(
     release(scratch->axisValueDenominators);
     release(scratch->heldoutAggregateN);
     release(scratch->heldoutK);
+    release(scratch->heldoutLaunchKTiles);
     release(scratch->heldoutMeasuredP95);
     release(scratch->heldoutMeasuredMeans);
     release(scratch->heldoutMeasuredMaxima);
@@ -4804,6 +4995,8 @@ NativeVNNIScorerError releaseNativeVNNITreeScratch(
     release(scratch->childMaskCount);
     release(scratch->uniqueCount);
     release(scratch->status);
+    release(scratch->expandedCandidateTotal);
+    release(scratch->structurallyUniqueCandidateTotal);
     release(scratch->hashSlots);
     release(scratch->uniqueIndices);
     release(scratch->selectionA);
@@ -4827,9 +5020,11 @@ int runNativeVNNITreeSearch(
     const std::uint32_t* pointGroupRanks,
     const std::uint64_t* trainingAggregateN,
     const std::uint64_t* trainingK,
+    const std::uint32_t* trainingLaunchKTiles,
     const LlaminarNativeVNNITreeFeatureAxis* featureAxes,
     const std::uint64_t* heldoutAggregateN,
     const std::uint64_t* heldoutK,
+    const std::uint32_t* heldoutLaunchKTiles,
     const double* heldoutMeasuredP95,
     const double* heldoutMeasuredMeans,
     const double* heldoutMeasuredMaxima,
@@ -4849,10 +5044,12 @@ int runNativeVNNITreeSearch(
     if (session == nullptr || measuredMeanRegrets == nullptr
         || measuredMaxRegrets == nullptr || pointGroupRanks == nullptr
         || trainingAggregateN == nullptr || trainingK == nullptr
+        || trainingLaunchKTiles == nullptr
         || featureAxes == nullptr
         || (!evaluateHeldout && results == nullptr)
         || (evaluateHeldout
             && (heldoutAggregateN == nullptr || heldoutK == nullptr
+                || heldoutLaunchKTiles == nullptr
                 || heldoutMeasuredP95 == nullptr
                 || heldoutMeasuredMeans == nullptr
                 || heldoutMeasuredMaxima == nullptr || evaluations == nullptr
@@ -4874,7 +5071,7 @@ int runNativeVNNITreeSearch(
                 || heldoutPointCount
                     > kLlaminarNativeVNNITreeMaximumHeldoutPoints))) {
         writeNativeVNNIScorerError(
-            error, errorCapacity, "tree search dimensions exceed the v12 ABI");
+            error, errorCapacity, "tree search dimensions exceed the v14 ABI");
         return 1;
     }
     bool axisPriorities[kNativeVNNITreeMaximumAxes] = {};
@@ -4883,7 +5080,7 @@ int runNativeVNNITreeSearch(
         if (descriptor.axis_priority >= kNativeVNNITreeMaximumAxes
             || axisPriorities[descriptor.axis_priority]
             || descriptor.operation
-                > kLlaminarNativeVNNITreeThresholdKFinalTile
+                > kLlaminarNativeVNNITreeThresholdKPartKTileCount
             || (descriptor.operation
                     <= kLlaminarNativeVNNITreeThresholdAspectRatio
                 ? descriptor.tile_width != 0
@@ -4982,6 +5179,10 @@ int runNativeVNNITreeSearch(
                 scratch->trainingK, trainingK, session->pointCount,
                 std::uint64_t, "training-K upload");
             LLAMINAR_UPLOAD_TREE_METADATA(
+                scratch->trainingLaunchKTiles, trainingLaunchKTiles,
+                session->pointCount, std::uint32_t,
+                "training-K-tiles upload");
+            LLAMINAR_UPLOAD_TREE_METADATA(
                 scratch->featureAxes, featureAxes, axisCount,
                 LlaminarNativeVNNITreeFeatureAxis, "feature-axis upload");
             if (evaluateHeldout) {
@@ -4991,6 +5192,10 @@ int runNativeVNNITreeSearch(
                 LLAMINAR_UPLOAD_TREE_METADATA(
                     scratch->heldoutK, heldoutK, heldoutPointCount,
                     std::uint64_t, "heldout-K upload");
+                LLAMINAR_UPLOAD_TREE_METADATA(
+                    scratch->heldoutLaunchKTiles, heldoutLaunchKTiles,
+                    heldoutPointCount, std::uint32_t,
+                    "heldout-K-tiles upload");
                 LLAMINAR_UPLOAD_TREE_METADATA(
                     scratch->heldoutMeasuredP95, heldoutMeasuredP95,
                     heldoutMatrixCount, double, "heldout-p95 upload");
@@ -5080,6 +5285,8 @@ int runNativeVNNITreeSearch(
         }
 
         std::uint32_t hostStatus = 0;
+        std::uint64_t hostExpandedCandidateCount = 0;
+        std::uint64_t hostStructurallyUniqueCandidateCount = 0;
         std::uint64_t finalResultBytes = 0;
         if (evaluateHeldout) {
             const std::size_t evaluationBytes =
@@ -5109,10 +5316,29 @@ int runNativeVNNITreeSearch(
                 LLAMINAR_SCORER_DEVICE_TO_HOST);
         }
         if (runtimeResult == kNativeVNNIScorerSuccess) {
+            runtimeResult = copyNativeVNNIScorerBytesAsync(session,
+                &hostExpandedCandidateCount, scratch->expandedCandidateTotal,
+                sizeof(hostExpandedCandidateCount),
+                LLAMINAR_SCORER_DEVICE_TO_HOST);
+        }
+        if (runtimeResult == kNativeVNNIScorerSuccess) {
+            runtimeResult = copyNativeVNNIScorerBytesAsync(session,
+                &hostStructurallyUniqueCandidateCount,
+                scratch->structurallyUniqueCandidateTotal,
+                sizeof(hostStructurallyUniqueCandidateCount),
+                LLAMINAR_SCORER_DEVICE_TO_HOST);
+        }
+        if (runtimeResult == kNativeVNNIScorerSuccess) {
             runtimeResult = synchronizeNativeVNNIScorerStream(session);
             ++session->runtimeStats.tree_search_stream_sync_count;
             session->runtimeStats.final_result_d2h_bytes +=
-                finalResultBytes + sizeof(hostStatus);
+                finalResultBytes + sizeof(hostStatus)
+                + sizeof(hostExpandedCandidateCount)
+                + sizeof(hostStructurallyUniqueCandidateCount);
+            session->runtimeStats.expanded_candidate_count +=
+                hostExpandedCandidateCount;
+            session->runtimeStats.structurally_unique_candidate_count +=
+                hostStructurallyUniqueCandidateCount;
         }
         if (runtimeResult != kNativeVNNIScorerSuccess) {
             return failNativeVNNIScorer(
@@ -5162,6 +5388,7 @@ extern "C" int llaminarNativeVNNITreeSearch(
     const std::uint32_t* pointGroupRanks,
     const std::uint64_t* trainingAggregateN,
     const std::uint64_t* trainingK,
+    const std::uint32_t* trainingLaunchKTiles,
     const LlaminarNativeVNNITreeFeatureAxis* featureAxes,
     std::uint32_t axisCount,
     std::uint32_t boundaryPlacement,
@@ -5174,8 +5401,9 @@ extern "C" int llaminarNativeVNNITreeSearch(
     std::size_t errorCapacity) {
     return runNativeVNNITreeSearch(
         session, measuredMeanRegrets, measuredMaxRegrets, pointGroupRanks,
-        trainingAggregateN, trainingK, featureAxes, nullptr, nullptr, nullptr,
-        nullptr, nullptr, 0, axisCount, boundaryPlacement, parallelismWidth,
+        trainingAggregateN, trainingK, trainingLaunchKTiles, featureAxes,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, axisCount,
+        boundaryPlacement, parallelismWidth,
         taskMultiplier, minShapeGroupsPerLeaf, maxLeaves, results, nullptr,
         nullptr, false, error, errorCapacity);
 }
@@ -5187,9 +5415,11 @@ extern "C" int llaminarNativeVNNITreeSearchAndEvaluate(
     const std::uint32_t* pointGroupRanks,
     const std::uint64_t* trainingAggregateN,
     const std::uint64_t* trainingK,
+    const std::uint32_t* trainingLaunchKTiles,
     const LlaminarNativeVNNITreeFeatureAxis* featureAxes,
     const std::uint64_t* heldoutAggregateN,
     const std::uint64_t* heldoutK,
+    const std::uint32_t* heldoutLaunchKTiles,
     const double* heldoutMeasuredP95Regrets,
     const double* heldoutMeasuredMeanRegrets,
     const double* heldoutMeasuredMaxRegrets,
@@ -5206,7 +5436,8 @@ extern "C" int llaminarNativeVNNITreeSearchAndEvaluate(
     std::size_t errorCapacity) {
     return runNativeVNNITreeSearch(
         session, measuredMeanRegrets, measuredMaxRegrets, pointGroupRanks,
-        trainingAggregateN, trainingK, featureAxes, heldoutAggregateN, heldoutK,
+        trainingAggregateN, trainingK, trainingLaunchKTiles, featureAxes,
+        heldoutAggregateN, heldoutK, heldoutLaunchKTiles,
         heldoutMeasuredP95Regrets, heldoutMeasuredMeanRegrets,
         heldoutMeasuredMaxRegrets, heldoutPointCount, axisCount,
         boundaryPlacement, parallelismWidth, taskMultiplier,

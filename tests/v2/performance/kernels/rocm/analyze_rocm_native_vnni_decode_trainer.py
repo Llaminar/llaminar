@@ -19,6 +19,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -105,6 +106,16 @@ from native_vnni_dispatch.validation import (  # noqa: E402
 CANONICAL_TARGET_WAVES = 4
 OVERLAY_BEGIN = "    // BEGIN COMMON ROCM NATIVEVNNI DECODE EXACT OVERLAY"
 OVERLAY_END = "    // END COMMON ROCM NATIVEVNNI DECODE EXACT OVERLAY"
+GENERIC_OVERLAY_BEGIN = (
+    "    // BEGIN COMMON ROCM NATIVEVNNI DECODE GENERIC SUPPLEMENT"
+)
+GENERIC_OVERLAY_END = (
+    "    // END COMMON ROCM NATIVEVNNI DECODE GENERIC SUPPLEMENT"
+)
+BASE_FALLBACK_RETURN = (
+    "    return selectROCmNativeVNNIDecodeAspectFallback("
+    "codebook_id, m, n, k, out);\n"
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -778,22 +789,174 @@ def generate_include(
 
 
 def _strip_existing_overlay(text: str) -> str:
-    """Remove one previous partial exact overlay before inserting a refresh."""
+    """Remove previous exact and generic supplements before one refresh."""
 
     begin = text.find(OVERLAY_BEGIN)
-    if begin < 0:
-        return text
-    end = text.find(OVERLAY_END, begin)
-    if end < 0:
-        raise ValueError("base include has an unterminated common exact overlay")
-    end += len(OVERLAY_END)
-    if end < len(text) and text[end] == "\n":
-        end += 1
-    return text[:begin] + text[end:]
+    if begin >= 0:
+        end = text.find(OVERLAY_END, begin)
+        if end < 0:
+            raise ValueError("base include has an unterminated common exact overlay")
+        end += len(OVERLAY_END)
+        if end < len(text) and text[end] == "\n":
+            end += 1
+        text = text[:begin] + text[end:]
+
+    begin = text.find(GENERIC_OVERLAY_BEGIN)
+    if begin >= 0:
+        end = text.find(GENERIC_OVERLAY_END, begin)
+        if end < 0:
+            raise ValueError(
+                "base include has an unterminated common generic supplement"
+            )
+        end += len(GENERIC_OVERLAY_END)
+        if end < len(text) and text[end] == "\n":
+            end += 1
+        text = text[:begin] + BASE_FALLBACK_RETURN + text[end:]
+    return text
+
+
+def _base_generic_codebooks(text: str) -> frozenset[int]:
+    """Return codebooks already totalized by the base aspect selector."""
+
+    begin = text.find(
+        "inline bool selectROCmNativeVNNIDecodeAspectFallback("
+    )
+    end = text.find(
+        "inline bool selectROCmNativeVNNIDecodeGenerated(",
+        begin,
+    )
+    if begin < 0 or end < 0:
+        raise ValueError("base include lacks the ROCm generic selector surface")
+    return frozenset(
+        int(value)
+        for value in re.findall(
+            r"if \(codebook_id == ([0-9]+)\)",
+            text[begin:end],
+        )
+    )
+
+
+def _entry_aspect_bucket(entry: FastEntry) -> str:
+    """Classify an exact winner using runtime's integer aspect boundaries."""
+
+    if entry.n >= 16 * entry.k:
+        return "very_wide"
+    if entry.n >= 2 * entry.k:
+        return "wide"
+    if 4 * entry.n >= 3 * entry.k:
+        return "balanced"
+    return "tall"
+
+
+def _compress_totalizing_rules(
+    entries: list[FastEntry],
+) -> list[tuple[int, int]]:
+    """Build a deterministic upper-neighbor work-size model from winners.
+
+    Exact overlays continue to own measured points. These rules cover unseen
+    work sizes for a codebook absent from the older base policy. Adjacent
+    winners with the same launch are coalesced; the final rule intentionally
+    covers positive infinity through the base picker's last-entry contract.
+    """
+
+    ordered = sorted(
+        entries,
+        key=lambda entry: (
+            entry.n * entry.k,
+            entry.max_surface_regret,
+            entry.candidate_id,
+        ),
+    )
+    rules: list[tuple[int, int]] = []
+    for entry in ordered:
+        work_items = entry.n * entry.k
+        if rules and rules[-1][0] == work_items:
+            # Ordering already placed the lowest-regret winner first. Exact
+            # overlays disambiguate measured N/K pairs; a generic work-size
+            # predicate cannot represent two launches at the same boundary.
+            continue
+        if rules and rules[-1][1] == entry.kb:
+            rules[-1] = (work_items, entry.kb)
+        else:
+            rules.append((work_items, entry.kb))
+    return rules
+
+
+def _render_generic_supplement(
+    entries: list[FastEntry],
+    missing_codebooks: frozenset[int],
+) -> str:
+    """Render total generic rules for codebooks absent from the base policy."""
+
+    grouped: dict[int, dict[str, list[FastEntry]]] = {}
+    for entry in entries:
+        if entry.codebook not in missing_codebooks:
+            continue
+        grouped.setdefault(entry.codebook, {}).setdefault(
+            _entry_aspect_bucket(entry), []
+        ).append(entry)
+
+    lines = [GENERIC_OVERLAY_BEGIN]
+    lines.extend([
+        "    if (selectROCmNativeVNNIDecodeAspectFallback(",
+        "            codebook_id, m, n, k, out))",
+        "        return true;",
+        "    if (m == 1 && n > 0 && k > 0 && (k % 32) == 0)",
+        "    {",
+        "        const long long supplement_work_items =",
+        "            static_cast<long long>(n) * static_cast<long long>(k);",
+    ])
+    conditions = {
+        "very_wide": "n >= 16LL * k",
+        "wide": "n >= 2LL * k",
+        "balanced": "4LL * n >= 3LL * k",
+        "tall": "true",
+    }
+    bucket_order = ("very_wide", "wide", "balanced", "tall")
+    for codebook in sorted(grouped):
+        available = [
+            entry
+            for bucket_entries in grouped[codebook].values()
+            for entry in bucket_entries
+        ]
+        if not available:
+            continue
+        lines.append(f"        if (codebook_id == {codebook})")
+        lines.append("        {")
+        for index, bucket in enumerate(bucket_order):
+            bucket_entries = grouped[codebook].get(bucket, available)
+            keyword = "if" if index == 0 else "else if"
+            lines.append(
+                f"            {keyword} ({conditions[bucket]})"
+            )
+            lines.append("            {")
+            lines.append(
+                "                static constexpr "
+                "ROCmNativeVNNIDecodeAspectRule kRules[] = {"
+            )
+            for work_items, kb in _compress_totalizing_rules(bucket_entries):
+                lines.append(
+                    f"                    {{{work_items}LL, "
+                    f"{{{kb}, {CANONICAL_TARGET_WAVES}}}}},"
+                )
+            lines.extend([
+                "                };",
+                "                out = pickROCmNativeVNNIDecodeAspectRule(",
+                "                    kRules, supplement_work_items);",
+                "                return true;",
+                "            }",
+            ])
+        lines.append("        }")
+    lines.extend([
+        "    }",
+        GENERIC_OVERLAY_END,
+        "    return false;",
+    ])
+    return "\n".join(lines) + "\n"
 
 
 def emit_overlay(entries: list[FastEntry], output: Path, base: Path) -> None:
-    """Layer common exact M=1 winners above a broader checked-in policy."""
+    """Layer exact winners and missing-codebook generic rules over a base."""
 
     if not base.is_file():
         raise ValueError(f"base include not found: {base}")
@@ -807,17 +970,43 @@ def emit_overlay(entries: list[FastEntry], output: Path, base: Path) -> None:
         raise ValueError("base include lacks the ROCm selector key marker")
     insert_at = location + len(marker)
     overlay = [OVERLAY_BEGIN]
-    for entry in sorted(entries):
+    entries_by_codebook: dict[int, list[FastEntry]] = {}
+    for entry in entries:
+        entries_by_codebook.setdefault(entry.codebook, []).append(entry)
+    for codebook in sorted(entries_by_codebook):
         overlay.extend([
-            f"    if (codebook_id == {entry.codebook} &&",
-            f"        key == 0x{pack_shape_key(1, entry.n, entry.k):016x}ULL)",
+            f"    if (codebook_id == {codebook})",
             "    {",
-            f"        out = ROCmNativeVNNIDecodeDispatchConfig{{{entry.kb}, {CANONICAL_TARGET_WAVES}}};",
-            "        return true;",
+            "        static constexpr ROCmNativeVNNIDecodeTuningEntry "
+            "kCommonExactOverlay[] = {",
+        ])
+        overlay.extend(
+            _entry_line(entry, indent="            ")
+            for entry in sorted(
+                entries_by_codebook[codebook],
+                key=lambda item: pack_shape_key(1, item.n, item.k),
+            )
+        )
+        overlay.extend([
+            "        };",
+            "        if (findROCmNativeVNNIDecodeDispatchEntry(",
+            "                kCommonExactOverlay, key, out))",
+            "            return true;",
             "    }",
         ])
     overlay.append(OVERLAY_END)
     updated = text[:insert_at] + "\n".join(overlay) + "\n" + text[insert_at:]
+    missing_codebooks = frozenset(
+        {entry.codebook for entry in entries} - _base_generic_codebooks(text)
+    )
+    if missing_codebooks:
+        if BASE_FALLBACK_RETURN not in updated:
+            raise ValueError("base include lacks the ROCm fallback return marker")
+        updated = updated.replace(
+            BASE_FALLBACK_RETURN,
+            _render_generic_supplement(entries, missing_codebooks),
+            1,
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(updated, encoding="utf-8")
 
@@ -1261,10 +1450,12 @@ def main() -> int:
         policy_corpus,
         context.serial_m1_policy_hash,
     )
-    generic_rules = select_fast_generic_rules(
-        policy_corpus,
-        context.serial_m1_policy_hash,
-    )
+    generic_rules = []
+    if not args.base_include:
+        generic_rules = select_fast_generic_rules(
+            policy_corpus,
+            context.serial_m1_policy_hash,
+        )
     if args.require_complete:
         manifest = load_shape_manifest(args.shape_manifest)
         validate_complete(

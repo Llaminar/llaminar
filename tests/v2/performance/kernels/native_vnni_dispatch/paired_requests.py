@@ -9,23 +9,29 @@ exact-KB launch, CPU schedules retain their build/runtime/thread class, and the
 accumulated paired tournament emits only measurements that can still change a
 decision.
 
-The emitted JSON is consumed directly by the CUDA performance trainer. It is a
-development-only measurement plan, never a production dispatch artifact.
-Sealed observations are intentionally absent from this workflow.
+The emitted JSON is consumed directly by the backend performance trainer. It
+is a development-only measurement plan, never a production dispatch artifact.
+An inspected CPU seal may re-enter only as generic development costs for the
+next policy generation; its points are already exhaustive paired contests and
+are therefore never requested again by this planner.
 """
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import hashlib
 import json
 import math
+import multiprocessing
+import os
+import statistics
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .candidate_observation import read_observation_csv, read_observation_rows
+from .candidate_observation import read_observation_rows
 from .candidate_registry import cuda_native_vnni_gemv_registry
 from .corpus import GenericDomain, ObservationCorpus
 from .cuda_shape_resolved import (
@@ -53,6 +59,9 @@ from .segmented_policy import (
     CrossValidationCell,
     GenericPolicy,
     PolicyFitCache,
+    _paired_effective_latencies,
+    _runtime_paired_comparisons,
+    domain_promotion_quota_is_satisfied,
     fit_generic_policy,
     generic_domain_corpus_digest,
     load_cached_cross_validations,
@@ -71,6 +80,8 @@ PROJECTED_CORPUS_IDENTITY_SCHEMA_VERSION = (
     "native-vnni-paired-projected-corpus-identity-v1"
 )
 DEFAULT_MAX_REGRET = P95_REGRET_BUDGET
+DECODE_M1_SURFACE = "decode-m1"
+GROUPED_VERIFIER_SURFACE = "grouped-verifier"
 
 
 @dataclass(frozen=True, order=True)
@@ -99,6 +110,9 @@ class PairedPlanIssue:
     """A measured over-budget or internally inconsistent tournament edge."""
 
     source_format: str
+    source_codebook: int
+    execution_codebook: int
+    architecture_class: str
     shape: str
     shape_group_id: str
     execution_mode: str
@@ -117,8 +131,15 @@ class PairedDomainSummary:
     """Compact CV diagnostics for one mode/codebook/aspect policy domain."""
 
     backend: str
+    architecture_class: str
+    semantic_contract: str
+    operation_kind: str
+    bundle_signature: str
+    prepared_family_id: str
+    packing_abi: str
     runtime_codebook: int
     execution_mode: str
+    m: int
     aspect_bucket: str
     feature_policy: str
     profiler_influence: str
@@ -129,6 +150,35 @@ class PairedDomainSummary:
     mean_regret: float
     failed_cell_count: int
     cell_count: int
+
+
+@dataclass(frozen=True, order=True)
+class PairedPromotionDiagnostic:
+    """Structured publication failure retained in the planner report."""
+
+    backend: str
+    architecture_class: str
+    bundle_signature: str
+    runtime_codebook: int
+    execution_mode: str
+    m: int
+    blocking: bool
+    rejection_stage: str
+    selected_feature_policy: str
+    selected_profiler_influence: str
+    selected_max_leaves: int | None
+    cv_required_point_count: int
+    cv_covered_point_count: int
+    cv_p95_regret: float | None
+    cv_max_regret: float | None
+    final_cross_fitted_p95_regret: float | None
+    final_rule_count: int
+    final_worst_p95_regret: float | None
+    final_worst_max_regret: float | None
+    final_worst_shape_group_id: str
+    final_worst_aggregate_n: int | None
+    final_worst_k: int | None
+    final_worst_candidate_id: str
 
 
 @dataclass(frozen=True)
@@ -143,11 +193,12 @@ class PairedRequestPlan:
     failed_cv_cell_count: int
     passing_cv_cell_count: int
     equivalent_effective_surface_count: int
-    competitive_frontier_request_count: int
+    tournament_completion_request_count: int
     domains: tuple[PairedDomainSummary, ...]
     requests: tuple[PairedTimingRequest, ...]
     confirmed_cv_misses: tuple[PairedPlanIssue, ...]
     conflicts: tuple[PairedPlanIssue, ...]
+    promotion_diagnostics: tuple[PairedPromotionDiagnostic, ...]
     unvalidated_domains: tuple[str, ...]
 
     @property
@@ -199,14 +250,17 @@ class PairedRequestPlan:
             "equivalent_effective_surface_count": (
                 self.equivalent_effective_surface_count
             ),
-            "competitive_frontier_request_count": (
-                self.competitive_frontier_request_count
+            "tournament_completion_request_count": (
+                self.tournament_completion_request_count
             ),
             "domains": [asdict(domain) for domain in self.domains],
             "confirmed_cv_misses": [
                 asdict(issue) for issue in self.confirmed_cv_misses
             ],
             "conflicts": [asdict(issue) for issue in self.conflicts],
+            "promotion_diagnostics": [
+                asdict(diagnostic) for diagnostic in self.promotion_diagnostics
+            ],
             "unvalidated_domains": list(self.unvalidated_domains),
         }
 
@@ -239,6 +293,27 @@ def paired_comparison_digest(
                 "pair_count": edge.pair_count,
             })
     encoded = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def combined_development_evidence_digest(
+    comparisons: Mapping[PairedCellKey, tuple[PairedTimingComparison, ...]],
+    supplemental_evidence_digests: Iterable[str],
+) -> str:
+    """Bind request identities to direct pairs and inspected seal evidence."""
+
+    supplemental = tuple(sorted(supplemental_evidence_digests))
+    if not supplemental:
+        return paired_comparison_digest(comparisons)
+    if any(not digest.startswith("sha256:") for digest in supplemental):
+        raise ValueError("supplemental development evidence lacks a digest")
+    payload = {
+        "paired_comparison_digest": paired_comparison_digest(comparisons),
+        "supplemental_evidence_digests": supplemental,
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode()
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
@@ -288,6 +363,95 @@ def projected_domain_cache_key(
         payload, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+_PARALLEL_PROJECTED_CACHE_CORPUS: ObservationCorpus | None = None
+_PARALLEL_PROJECTED_CACHE_DOMAINS: tuple[GenericDomain, ...] = ()
+
+
+def _projected_domain_cache_key_at(index: int) -> tuple[GenericDomain, str]:
+    """Compute one projected CUDA domain identity in a fork worker."""
+
+    if _PARALLEL_PROJECTED_CACHE_CORPUS is None:
+        raise RuntimeError("parallel projected CUDA corpus is unavailable")
+    domain = _PARALLEL_PROJECTED_CACHE_DOMAINS[index]
+    return domain, projected_domain_cache_key(
+        _PARALLEL_PROJECTED_CACHE_CORPUS,
+        domain,
+    )
+
+
+def projected_domain_cache_keys(
+    development: ObservationCorpus,
+) -> dict[GenericDomain, str]:
+    """Precompute CUDA projected-corpus keys across physical CPU cores.
+
+    CUDA lazily projects shape-resolved formula candidates per generic domain.
+    Supplying a domain provider disables the common fitter's aggregate cache-key
+    prepass, so computing these identities inside its serial domain loop used to
+    JSON-encode the entire development corpus on one core. Fork workers inherit
+    immutable observations and return keys in canonical domain order.
+    """
+
+    domains = development.generic_domains()
+    worker_count = min(_physical_core_count(), len(domains))
+    global _PARALLEL_PROJECTED_CACHE_CORPUS
+    global _PARALLEL_PROJECTED_CACHE_DOMAINS
+    _PARALLEL_PROJECTED_CACHE_CORPUS = development
+    _PARALLEL_PROJECTED_CACHE_DOMAINS = domains
+    try:
+        if worker_count > 1 and len(domains) >= 4:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                pairs = tuple(executor.map(
+                    _projected_domain_cache_key_at,
+                    range(len(domains)),
+                ))
+        else:
+            pairs = tuple(
+                _projected_domain_cache_key_at(index)
+                for index in range(len(domains))
+            )
+    finally:
+        _PARALLEL_PROJECTED_CACHE_CORPUS = None
+        _PARALLEL_PROJECTED_CACHE_DOMAINS = ()
+    return dict(pairs)
+
+
+def projected_cuda_domain_corpora(
+    development: ObservationCorpus,
+) -> dict[GenericDomain, ObservationCorpus]:
+    """Project each CUDA policy domain without building a giant aggregate.
+
+    Profiler-informed fitting consumes every generic domain to construct its
+    cross-format observation index. The earlier batched implementation first
+    materialized and fully indexed a multi-million-row aggregate corpus, then
+    indexed every row again while partitioning it. Formula resolution is tiny
+    and memoized by geometry; constructing each domain directly preserves the
+    same rows and source order while paying for exactly one corpus index.
+    """
+
+    domains = development.generic_domains()
+    projected = {
+        domain: project_cuda_shape_resolved_candidates(
+            development.rows_for_generic_domain(domain),
+            known_generic_domain=domain,
+        )
+        for domain in domains
+    }
+    changed = tuple(
+        domain
+        for domain, corpus in projected.items()
+        if corpus.generic_domains() != (domain,)
+    )
+    if changed:
+        raise ValueError(
+            "domain-local CUDA formula projection changed the generic domain "
+            f"inventory for {changed!r}"
+        )
+    return projected
 
 
 def _request_id(
@@ -379,39 +543,62 @@ def _direct_paired_regret(
     return math.exp(weighted_log_sum / total_pairs) - 1.0
 
 
-def _paired_candidates_connected(
+def _directed_paired_ratio(
     edges: Iterable[PairedTimingComparison],
-    first_candidate_id: str,
-    second_candidate_id: str,
-) -> bool:
-    """Return whether validated tournament evidence links two candidates.
+    selected_candidate_id: str,
+    exact_candidate_id: str,
+) -> float | None:
+    """Return one role-preserving direct ratio from a single star direction."""
 
-    Cost construction solves every connected component as one weighted
-    log-latency graph. An alternate CV model therefore needs connectivity, not
-    a quadratic inventory of direct candidate pairs. The currently selected
-    model still receives a direct confirmation edge before terminal promotion
-    or failure.
+    weighted_log_sum = 0.0
+    total_pairs = 0
+    for edge in edges:
+        if (
+            edge.selected_effective_candidate_id != selected_candidate_id
+            or edge.exact_effective_candidate_id != exact_candidate_id
+        ):
+            continue
+        weighted_log_sum += edge.pair_count * math.log(
+            edge.selected_to_exact_median_ratio
+        )
+        total_pairs += edge.pair_count
+    if total_pairs == 0:
+        return None
+    return math.exp(weighted_log_sum / total_pairs)
+
+
+def _complete_directional_star_latencies(
+    edges: Iterable[PairedTimingComparison],
+    candidates: Iterable[str],
+) -> tuple[str, dict[str, float]] | None:
+    """Recover relative latencies from one complete role-preserving star.
+
+    Every edge emitted for a cell in one generation names the same selected
+    anchor. Requiring that direction distinguishes a coherent atomic star from
+    an undirected graph pieced together over unrelated process histories. The
+    anchor latency is normalized to one; an ``anchor / candidate`` measurement
+    therefore places the candidate at the reciprocal ratio.
     """
 
-    if first_candidate_id == second_candidate_id:
-        return True
-    adjacency: dict[str, set[str]] = {}
-    for edge in edges:
-        selected = edge.selected_effective_candidate_id
-        exact = edge.exact_effective_candidate_id
-        adjacency.setdefault(selected, set()).add(exact)
-        adjacency.setdefault(exact, set()).add(selected)
-    pending = [first_candidate_id]
-    visited = set()
-    while pending:
-        candidate = pending.pop()
-        if candidate == second_candidate_id:
-            return True
-        if candidate in visited:
-            continue
-        visited.add(candidate)
-        pending.extend(adjacency.get(candidate, set()) - visited)
-    return False
+    edges = tuple(edges)
+    candidates = tuple(sorted(set(candidates)))
+    complete = []
+    for anchor in candidates:
+        relative_latencies = {anchor: 1.0}
+        for candidate in candidates:
+            if candidate == anchor:
+                continue
+            ratio = _directed_paired_ratio(edges, anchor, candidate)
+            if ratio is None:
+                break
+            relative_latencies[candidate] = 1.0 / ratio
+        else:
+            complete.append((anchor, relative_latencies))
+    if len(complete) > 1:
+        raise ValueError(
+            "paired runtime cell contains multiple complete directional stars"
+        )
+    return complete[0] if complete else None
 
 
 def _surface_rows(
@@ -469,6 +656,82 @@ def _request_architecture_class(rows: tuple) -> str:
     return next(iter(architectures))
 
 
+def _source_alias_regret_witness(
+    aliases: Iterable[tuple[str, tuple]],
+    selected_effective_candidate_id: str,
+    comparisons: Iterable[PairedTimingComparison],
+) -> str | None:
+    """Return the physical candidate that witnesses selected's worst regret.
+
+    ``CrossValidationCell.exact_candidate_id`` is the best minimax compromise
+    across source aliases. It is not necessarily the candidate that establishes
+    the selected candidate's maximum per-alias regret. Separate aliases can
+    name different winners even though they normalize to one production
+    ``RuntimeKey``. Reconstruct the same paired-corrected effective timings used
+    by cost construction, then select the candidate with the largest advantage
+    over the held-out choice. That concrete edge is the one paired timing can
+    actually confirm or repair.
+    """
+
+    competitors: list[tuple[float, str]] = []
+    for _, rows in aliases:
+        latencies: dict[str, list[float]] = {}
+        for row in rows:
+            if not row.generic_eligible or not candidate_is_eligible(row, None):
+                continue
+            latencies.setdefault(row.effective_candidate_id, []).append(
+                row.median_us
+            )
+        medians = {
+            candidate: statistics.median(values)
+            for candidate, values in latencies.items()
+        }
+        if comparisons:
+            medians.update(_paired_effective_latencies(medians, comparisons))
+        selected_latency = medians.get(selected_effective_candidate_id)
+        if selected_latency is None:
+            raise ValueError(
+                "selected effective candidate is absent from one source alias"
+            )
+        for candidate, latency in medians.items():
+            if candidate == selected_effective_candidate_id:
+                continue
+            advantage = selected_latency / latency - 1.0
+            if advantage > 0.0:
+                competitors.append((advantage, candidate))
+    if not competitors:
+        return None
+    return max(competitors, key=lambda item: (item[0], item[1]))[1]
+
+
+def _source_alias_effective_candidates(
+    aliases: Iterable[tuple[str, tuple]],
+) -> tuple[str, ...]:
+    """Return forceable physical launches shared by every source alias.
+
+    A production runtime key has no source-format discriminator.  Its paired
+    tournament must therefore compare only concrete launches represented by
+    every source alias that contributed to the held-out point.  Returning the
+    intersection also collapses nominal formula aliases that resolve to the
+    same physical launch.
+    """
+
+    candidate_sets = []
+    for _, rows in aliases:
+        candidates = {
+            row.effective_candidate_id
+            for row in rows
+            if row.generic_eligible and candidate_is_eligible(row, None)
+        }
+        if not candidates:
+            raise ValueError("source alias has no forceable paired candidates")
+        candidate_sets.append(candidates)
+    shared = set.intersection(*candidate_sets)
+    if not shared:
+        raise ValueError("source aliases share no forceable paired candidates")
+    return tuple(sorted(shared))
+
+
 def build_paired_request_plan(
     development: ObservationCorpus,
     policy: GenericPolicy,
@@ -476,6 +739,8 @@ def build_paired_request_plan(
     *,
     max_regret: float = DEFAULT_MAX_REGRET,
     development_corpus_digest: str | None = None,
+    supplemental_shape_group_ids: frozenset[str] = frozenset(),
+    supplemental_evidence_digests: tuple[str, ...] = (),
 ) -> PairedRequestPlan:
     """Classify p95-failing CV domains and emit actionable pair timings.
 
@@ -495,18 +760,29 @@ def build_paired_request_plan(
         raise ValueError("paired planning requires one supported backend")
     backend = next(iter(backends))
 
-    evidence_digest = paired_comparison_digest(comparisons)
+    evidence_digest = combined_development_evidence_digest(
+        comparisons, supplemental_evidence_digests
+    )
+    runtime_comparisons = _runtime_paired_comparisons(
+        development,
+        comparisons,
+    )
     requests: list[PairedTimingRequest] = []
     failures: list[PairedPlanIssue] = []
     conflicts: list[PairedPlanIssue] = []
-    failed_cells = 0
-    passing_cells = 0
     equivalent_surfaces = 0
     domains = tuple(sorted(
         PairedDomainSummary(
             backend=validation.domain.backend.value,
+            architecture_class=validation.domain.architecture_class,
+            semantic_contract=validation.domain.semantic_contract.value,
+            operation_kind=validation.domain.operation_kind,
+            bundle_signature=validation.domain.bundle_signature,
+            prepared_family_id=validation.domain.prepared_family_id,
+            packing_abi=validation.domain.packing_abi,
             runtime_codebook=validation.domain.runtime_codebook_id,
             execution_mode=validation.domain.execution_mode.value,
+            m=validation.domain.m,
             aspect_bucket=validation.domain.aspect_bucket.value,
             feature_policy=validation.selected_feature_policy.value,
             profiler_influence=(
@@ -526,35 +802,175 @@ def build_paired_request_plan(
         for validation in policy.cross_validation
     ))
 
+    validated_domains = {result.domain for result in policy.cross_validation}
+    final_publication_failures = {
+        diagnostic.domain
+        for diagnostic in policy.promotion_diagnostics
+        if diagnostic.rejection_stage.startswith("final_fit")
+    }
+    validation_by_domain = {
+        validation.domain: validation
+        for validation in policy.cross_validation
+    }
+    blocking_domains = set(policy.unpromoted_domains)
+    promotion_diagnostics = tuple(sorted(
+        PairedPromotionDiagnostic(
+            backend=diagnostic.domain.backend.value,
+            architecture_class=diagnostic.domain.architecture_class,
+            bundle_signature=diagnostic.domain.bundle_signature,
+            runtime_codebook=diagnostic.domain.runtime_codebook_id,
+            execution_mode=diagnostic.domain.execution_mode.value,
+            m=diagnostic.domain.m,
+            blocking=diagnostic.domain in blocking_domains,
+            rejection_stage=diagnostic.rejection_stage,
+            selected_feature_policy=(
+                validation_by_domain[diagnostic.domain].selected_feature_policy.value
+                if diagnostic.domain in validation_by_domain
+                else ""
+            ),
+            selected_profiler_influence=(
+                validation_by_domain[
+                    diagnostic.domain
+                ].selected_profiler_influence.value
+                if diagnostic.domain in validation_by_domain
+                else ""
+            ),
+            selected_max_leaves=(
+                validation_by_domain[diagnostic.domain].selected_max_leaves
+                if diagnostic.domain in validation_by_domain
+                else None
+            ),
+            cv_required_point_count=diagnostic.cv_required_point_count,
+            cv_covered_point_count=diagnostic.cv_covered_point_count,
+            cv_p95_regret=diagnostic.cv_p95_regret,
+            cv_max_regret=diagnostic.cv_max_regret,
+            final_cross_fitted_p95_regret=(
+                diagnostic.final_cross_fitted_p95_regret
+            ),
+            final_rule_count=diagnostic.final_rule_count,
+            final_worst_p95_regret=diagnostic.final_worst_p95_regret,
+            final_worst_max_regret=diagnostic.final_worst_max_regret,
+            final_worst_shape_group_id=(
+                diagnostic.final_worst_shape_group_id
+            ),
+            final_worst_aggregate_n=diagnostic.final_worst_aggregate_n,
+            final_worst_k=diagnostic.final_worst_k,
+            final_worst_candidate_id=diagnostic.final_worst_candidate_id,
+        )
+        for diagnostic in policy.promotion_diagnostics
+    ))
+    # Ordinary CV failures remain repairable by the paired tournament below.
+    # A final publication failure is different: CV exists, but no installable
+    # total tree was produced. Surface that state before sealed data is opened.
+    unvalidated = tuple(
+        repr(domain)
+        for domain in policy.unpromoted_domains
+        if domain not in validated_domains
+        or domain in final_publication_failures
+    )
+    passing_domain_count = sum(
+        validation.p95_regret < max_regret
+        for validation in policy.cross_validation
+    )
+    quota_allows_performance_exceptions = (
+        not unvalidated
+        and domain_promotion_quota_is_satisfied(
+            passing_domain_count,
+            len(policy.cross_validation),
+        )
+    )
+    if not quota_allows_performance_exceptions:
+        supplemental_blockers = tuple(
+            "supplemental-development:" + repr(validation.domain)
+            for validation in policy.cross_validation
+            if validation.p95_regret >= max_regret
+            and any(
+                cell.observed_broad_regret >= max_regret
+                and cell.shape_group_id in supplemental_shape_group_ids
+                for cell in validation.cells
+            )
+        )
+        unvalidated = tuple(sorted((*unvalidated, *supplemental_blockers)))
+    failed_cells = sum(
+        sum(
+            cell.observed_broad_regret >= max_regret
+            for cell in validation.cells
+        )
+        for validation in policy.cross_validation
+        if validation.p95_regret >= max_regret
+    )
+    passing_cells = sum(
+        len(validation.cells)
+        if validation.p95_regret < max_regret
+        else sum(
+            cell.observed_broad_regret < max_regret
+            for cell in validation.cells
+        )
+        for validation in policy.cross_validation
+    )
+
+    tournament_completion_request_count = 0
+    requested_edges = set()
     for validation in policy.cross_validation:
-        if validation.p95_regret < max_regret:
-            passing_cells += len(validation.cells)
+        if (
+            validation.p95_regret < max_regret
+            or quota_allows_performance_exceptions
+        ):
             continue
         for cell in validation.cells:
-            if cell.observed_broad_regret < max_regret:
-                passing_cells += 1
-                continue
-            failed_cells += 1
-            if cell.runtime_key.semantic_contract != SemanticContract.FAST:
-                raise ValueError("paired planner currently accepts only Fast cells")
-            if cell.runtime_key.m != 1:
-                raise ValueError("paired planner currently accepts only public M1")
-            for source_format, rows in sorted(
-                _surface_rows(development, cell).items()
+            if (
+                cell.observed_broad_regret < max_regret
+                or cell.shape_group_id in supplemental_shape_group_ids
             ):
-                key = _paired_key(rows, cell)
-                selected = _effective_candidate(
-                    rows, cell.selected_candidate_id
+                continue
+            aliases = sorted(_surface_rows(development, cell).items())
+            resolved = tuple(
+                (
+                    source_format,
+                    rows,
+                    _paired_key(rows, cell),
+                    _effective_candidate(rows, cell.selected_candidate_id),
                 )
-                exact = _effective_candidate(rows, cell.exact_candidate_id)
-                if selected == exact:
-                    equivalent_surfaces += 1
-                    continue
-                direct_regret = _direct_paired_regret(
-                    comparisons.get(key, ()), selected, exact
+                for source_format, rows in aliases
+            )
+            selected_launches = {selected for _, _, _, selected in resolved}
+            if len(selected_launches) != 1:
+                raise ValueError(
+                    "source aliases of one runtime surface resolve different "
+                    f"selected launches: {sorted(selected_launches)!r}"
+                )
+            source_format, rows, key, selected = resolved[0]
+            shared_candidates = _source_alias_effective_candidates(aliases)
+            if selected not in shared_candidates:
+                raise ValueError(
+                    "selected launch is not forceable across every source alias"
+                )
+            runtime_edges = runtime_comparisons.get(cell.runtime_key, ())
+            competitor = _source_alias_regret_witness(
+                aliases,
+                selected,
+                runtime_edges,
+            )
+            if competitor is None:
+                equivalent_surfaces += 1
+                continue
+
+            complete_star = _complete_directional_star_latencies(
+                runtime_edges,
+                shared_candidates,
+            )
+            if complete_star is not None:
+                _, relative_latencies = complete_star
+                star_regret = (
+                    relative_latencies[selected]
+                    / relative_latencies[competitor]
+                    - 1.0
                 )
                 issue_fields = {
                     "source_format": source_format,
+                    "source_codebook": key.source_codebook,
+                    "execution_codebook": key.execution_codebook,
+                    "architecture_class": _request_architecture_class(rows),
                     "shape": key.shape,
                     "shape_group_id": cell.shape_group_id,
                     "execution_mode": key.execution_mode,
@@ -562,110 +978,61 @@ def build_paired_request_plan(
                     "n": key.n,
                     "k": key.k,
                     "selected_candidate_id": selected,
-                    "exact_candidate_id": exact,
+                    "exact_candidate_id": competitor,
                     "observed_cv_regret": cell.observed_broad_regret,
-                    "direct_paired_regret": direct_regret,
+                    "direct_paired_regret": star_regret,
                 }
-                if direct_regret is not None and direct_regret >= max_regret:
-                    failures.append(PairedPlanIssue(
-                        **issue_fields,
-                        reason="direct_pair_confirms_over_budget",
-                    ))
-                    continue
-
-                reason = (
-                    "missing_direct_tournament_edge"
-                    if direct_regret is None
-                    else "tournament_fit_conflicts_with_direct_edge"
+                destination = (
+                    failures if star_regret >= max_regret else conflicts
                 )
-                if direct_regret is not None:
-                    conflicts.append(PairedPlanIssue(
-                        **issue_fields,
-                        reason=reason,
-                    ))
-                request_fields = {
-                    key_name: value
-                    for key_name, value in issue_fields.items()
-                    if key_name != "direct_paired_regret"
-                }
-                request_fields.update({
-                    "source_codebook": key.source_codebook,
-                    "execution_codebook": key.execution_codebook,
-                    "architecture_class": _request_architecture_class(rows),
-                })
-                requests.append(PairedTimingRequest(
-                    request_id=_request_id(request_fields, evidence_digest),
-                    **request_fields,
-                    reason=reason,
+                destination.append(PairedPlanIssue(
+                    **issue_fields,
+                    reason=(
+                        "complete_tournament_star_confirms_over_budget"
+                        if star_regret >= max_regret
+                        else "tournament_fit_conflicts_with_complete_star"
+                    ),
+                ))
+                continue
+
+            direct_regret = _direct_paired_regret(
+                runtime_edges, selected, competitor
+            )
+            issue_fields = {
+                "source_format": source_format,
+                "source_codebook": key.source_codebook,
+                "execution_codebook": key.execution_codebook,
+                "architecture_class": _request_architecture_class(rows),
+                "shape": key.shape,
+                "shape_group_id": cell.shape_group_id,
+                "execution_mode": key.execution_mode,
+                "m": key.m,
+                "n": key.n,
+                "k": key.k,
+                "selected_candidate_id": selected,
+                "exact_candidate_id": competitor,
+                "observed_cv_regret": cell.observed_broad_regret,
+                "direct_paired_regret": direct_regret,
+            }
+            if direct_regret is not None:
+                destination = (
+                    failures if direct_regret >= max_regret else conflicts
+                )
+                destination.append(PairedPlanIssue(
+                    **issue_fields,
+                    reason=(
+                        "direct_pair_confirms_over_budget"
+                        if direct_regret >= max_regret
+                        else "tournament_fit_conflicts_with_direct_edge"
+                    ),
                 ))
 
-    # The selected model is only one point on the retained CV frontier. A new
-    # direct timing can promote the next model and expose another candidate
-    # edge. Measure missing edges from the bounded competitive frontier in this
-    # same batch so refinement closes as a tournament instead of advancing one
-    # expensive whole-corpus fit at a time. Frontier edges already represented
-    # by direct paired evidence need no further launch, and only selected-model
-    # misses can make the policy terminally fail.
-    selected_cell_identities = {
-        (
-            cell.runtime_key,
-            cell.shape_group_id,
-            cell.selected_candidate_id,
-            cell.exact_candidate_id,
-        )
-        for validation in policy.cross_validation
-        for cell in validation.cells
-    }
-    requested_edges = {
-        (
-            request.source_format,
-            request.source_codebook,
-            request.execution_codebook,
-            request.architecture_class,
-            request.shape,
-            request.shape_group_id,
-            request.execution_mode,
-            request.m,
-            request.n,
-            request.k,
-            request.selected_candidate_id,
-            request.exact_candidate_id,
-        )
-        for request in requests
-    }
-    frontier_request_count = 0
-    for validation in policy.cross_validation:
-        if validation.p95_regret < max_regret:
-            continue
-        for cell in validation.competitive_cells:
-            cell_identity = (
-                cell.runtime_key,
-                cell.shape_group_id,
-                cell.selected_candidate_id,
-                cell.exact_candidate_id,
-            )
-            if (
-                cell_identity in selected_cell_identities
-                or cell.observed_broad_regret < max_regret
-            ):
-                continue
-            for source_format, rows in sorted(
-                _surface_rows(development, cell).items()
-            ):
-                key = _paired_key(rows, cell)
-                selected = _effective_candidate(
-                    rows, cell.selected_candidate_id
-                )
-                exact = _effective_candidate(rows, cell.exact_candidate_id)
-                if selected == exact:
+            for exact in shared_candidates:
+                if exact == selected:
                     continue
-                if _paired_candidates_connected(
-                    comparisons.get(key, ()), selected, exact
-                ):
+                if _directed_paired_ratio(runtime_edges, selected, exact) is not None:
                     continue
                 edge = (
-                    source_format,
-                    key.source_codebook,
                     key.execution_codebook,
                     _request_architecture_class(rows),
                     key.shape,
@@ -674,8 +1041,7 @@ def build_paired_request_plan(
                     key.m,
                     key.n,
                     key.k,
-                    selected,
-                    exact,
+                    frozenset((selected, exact)),
                 )
                 if edge in requested_edges:
                     continue
@@ -697,10 +1063,15 @@ def build_paired_request_plan(
                 requests.append(PairedTimingRequest(
                     request_id=_request_id(request_fields, evidence_digest),
                     **request_fields,
-                    reason="competitive_model_frontier_edge",
+                    reason=(
+                        "missing_direct_tournament_edge"
+                        if exact == competitor
+                        else "complete_tournament_star_edge"
+                    ),
                 ))
                 requested_edges.add(edge)
-                frontier_request_count += 1
+                if exact != competitor:
+                    tournament_completion_request_count += 1
 
     duplicate_ids = {
         request.request_id
@@ -710,12 +1081,6 @@ def build_paired_request_plan(
     if duplicate_ids:
         raise ValueError(f"duplicate paired request IDs: {sorted(duplicate_ids)}")
 
-    validated_domains = {result.domain for result in policy.cross_validation}
-    unvalidated = tuple(
-        repr(domain)
-        for domain in policy.unpromoted_domains
-        if domain not in validated_domains
-    )
     return PairedRequestPlan(
         backend=backend.value,
         development_corpus_digest=(
@@ -727,11 +1092,14 @@ def build_paired_request_plan(
         failed_cv_cell_count=failed_cells,
         passing_cv_cell_count=passing_cells,
         equivalent_effective_surface_count=equivalent_surfaces,
-        competitive_frontier_request_count=frontier_request_count,
+        tournament_completion_request_count=(
+            tournament_completion_request_count
+        ),
         domains=domains,
         requests=tuple(sorted(requests)),
         confirmed_cv_misses=tuple(sorted(failures)),
         conflicts=tuple(sorted(conflicts)),
+        promotion_diagnostics=promotion_diagnostics,
         unvalidated_domains=unvalidated,
     )
 
@@ -758,9 +1126,11 @@ def write_request_shards(
 
     A CPU process has one compiled ISA and one runtime dispatch request, while a
     planner transaction can contain all three CPU regimes. Shards therefore
-    never cross architecture classes. Bounded request counts also keep fixture
-    setup and retained work small enough that a process interruption discards
-    only one short `.inprogress` output rather than the complete tournament.
+    never cross architecture classes. Every edge for one runtime cell remains
+    in one process invocation so CPU clock, socket, cache, and thread-runtime
+    state cannot turn separately gathered edges into an inconsistent graph.
+    ``max_requests_per_shard`` is a packing target; one indivisible cell may
+    exceed it when a backend exposes a larger candidate family.
     """
 
     if max_requests_per_shard < 1:
@@ -777,12 +1147,42 @@ def write_request_shards(
     shard_records = []
     shard_index = 0
     for (backend, architecture_class), requests in sorted(grouped.items()):
-        requests = sorted(requests)
+        cell_groups: dict[tuple, list[PairedTimingRequest]] = {}
+        for request in requests:
+            cell_groups.setdefault((
+                request.source_format,
+                request.source_codebook,
+                request.execution_codebook,
+                request.shape,
+                request.shape_group_id,
+                request.execution_mode,
+                request.m,
+                request.n,
+                request.k,
+            ), []).append(request)
+        batches: list[tuple[PairedTimingRequest, ...]] = []
+        current: list[PairedTimingRequest] = []
+        for _, cell_requests in sorted(cell_groups.items()):
+            ordered_cell = sorted(
+                cell_requests,
+                key=lambda request: (
+                    request.selected_candidate_id,
+                    request.exact_candidate_id,
+                    request.request_id,
+                ),
+            )
+            if current and (
+                len(current) + len(ordered_cell) > max_requests_per_shard
+            ):
+                batches.append(tuple(current))
+                current = []
+            current.extend(ordered_cell)
+        if current:
+            batches.append(tuple(current))
         architecture_digest = hashlib.sha256(
             architecture_class.encode("utf-8")
         ).hexdigest()[:12]
-        for begin in range(0, len(requests), max_requests_per_shard):
-            selected = tuple(requests[begin:begin + max_requests_per_shard])
+        for selected in batches:
             payload = plan.request_manifest_mapping()
             payload["request_count"] = len(selected)
             payload["requests"] = [asdict(request) for request in selected]
@@ -825,19 +1225,63 @@ def write_request_shards(
 
 
 def _read_paired_shards(paths: Iterable[Path]) -> tuple[PairedCellEvidence, ...]:
-    """Read shards independently so legacy v1 files may hold parallel edges."""
+    """Read independent evidence shards across affinity-visible physical cores.
 
-    cells = []
-    for path in paths:
-        cells.extend(read_paired_confirmation_csv((path,)))
-    return tuple(cells)
+    A refinement generation commonly retains hundreds of immutable CSV files.
+    Each file has a self-contained protocol/header/cell validation transaction,
+    so process workers can authenticate them independently. ``executor.map``
+    preserves canonical path order; the parent still constructs the tournament
+    graph and therefore remains the sole owner of cross-shard duplicate checks.
+    """
+
+    paths = tuple(sorted(Path(path) for path in paths))
+    if not paths:
+        return ()
+    workers = min(_physical_core_count(), len(paths))
+    if workers <= 1 or len(paths) < 4:
+        shards = tuple(_read_one_paired_shard(path) for path in paths)
+    else:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("fork"),
+        ) as executor:
+            shards = tuple(executor.map(_read_one_paired_shard, paths))
+    return tuple(cell for shard in shards for cell in shard)
+
+
+def _read_one_paired_shard(path: Path) -> tuple[PairedCellEvidence, ...]:
+    """Authenticate one immutable paired CSV in a process worker."""
+
+    return read_paired_confirmation_csv((path,))
+
+
+def _physical_core_count() -> int:
+    """Return physical cores visible through the current affinity mask."""
+
+    logical_cpus = (
+        sorted(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else list(range(os.cpu_count() or 1))
+    )
+    physical_cores = set()
+    for cpu in logical_cpus:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package_id = (topology / "physical_package_id").read_text().strip()
+            core_id = (topology / "core_id").read_text().strip()
+        except OSError:
+            return max(1, len(logical_cpus))
+        physical_cores.add((package_id, core_id))
+    return max(1, len(physical_cores))
 
 
 def _development_corpus(
     observations: Iterable,
     manifest_path: Path,
+    *,
+    surface: str = DECODE_M1_SURFACE,
 ) -> ObservationCorpus:
-    """Retain only compact direct Fast-M1 development observations.
+    """Retain one compact direct CPU/CUDA development surface.
 
     Shape-resolved formula aliases are projected lazily for a cost/CV cache-miss
     domain. Keeping them out of this owning corpus avoids expanding a modest
@@ -848,17 +1292,38 @@ def _development_corpus(
     manifest = load_shape_manifest(manifest_path)
     assignments = partition_assignments(
         ((row.shape_group_id, row.shape_name) for row in rows),
-        verifier=False,
+        verifier=surface == GROUPED_VERIFIER_SURFACE,
         manifest=manifest,
     )
+    if surface == DECODE_M1_SURFACE:
+        matches_surface = lambda row: (
+            row.semantic_contract == SemanticContract.FAST and row.m == 1
+        )
+    elif surface == GROUPED_VERIFIER_SURFACE:
+        matches_surface = lambda row: (
+            row.backend == Backend.CPU
+            and row.semantic_contract
+            == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+            and row.m > 1
+        )
+    else:
+        raise ValueError(f"unknown paired development surface {surface!r}")
     direct_development = tuple(
         row
         for row in rows
-        if row.semantic_contract == SemanticContract.FAST
-        and row.m == 1
+        if matches_surface(row)
         and assignments[row.shape_group_id] == ShapePartition.DEVELOPMENT
     )
-    return ObservationCorpus._from_validated(direct_development)
+    # CPU generic rules deliberately learn aspect ratio inside one tree. Build
+    # that collapsed index directly: constructing the default aspect-partitioned
+    # corpus and immediately rebuilding it touched all trainer rows twice.
+    collapse_aspect_domains = {
+        row.backend for row in direct_development
+    } == {Backend.CPU}
+    return ObservationCorpus._from_validated(
+        direct_development,
+        distinguish_aspect_bucket=not collapse_aspect_domains,
+    )
 
 
 def _policy_from_cached_validations(
@@ -907,17 +1372,83 @@ def _policy_from_cached_validations(
     )
 
 
+def _load_cpu_burned_development(
+    development: ObservationCorpus,
+    surface: str,
+    plan_paths: tuple[Path, ...],
+    evidence_directories: tuple[Path, ...],
+):
+    """Load one CPU surface's inspected seals without creating import cycles."""
+
+    if not plan_paths and not evidence_directories:
+        return {}, (), {}
+    # The CPU seal modules import request schemas from this module. Importing
+    # them only after module initialization keeps that dependency acyclic while
+    # still sharing the exact plan readers and cost adapters used by freeze.
+    from .cpu_sealed_paired import load_cpu_burned_seal_development
+
+    if surface == DECODE_M1_SURFACE:
+        from .cpu_decode_sealed_plan import (
+            cpu_decode_burned_seal_costs,
+            read_cpu_decode_sealed_plan,
+        )
+
+        return load_cpu_burned_seal_development(
+            development,
+            plan_paths,
+            evidence_directories,
+            surface_name="decode",
+            read_plan=read_cpu_decode_sealed_plan,
+            build_costs=cpu_decode_burned_seal_costs,
+        )
+    if surface == GROUPED_VERIFIER_SURFACE:
+        from .cpu_grouped_decode_sealed_plan import (
+            cpu_grouped_burned_seal_costs,
+            read_cpu_grouped_sealed_plan,
+        )
+
+        return load_cpu_burned_seal_development(
+            development,
+            plan_paths,
+            evidence_directories,
+            surface_name="grouped decode",
+            read_plan=read_cpu_grouped_sealed_plan,
+            build_costs=cpu_grouped_burned_seal_costs,
+        )
+    raise ValueError(f"burned CPU evidence cannot target {surface!r}")
+
+
 def main() -> int:
     """Fit development CV, emit the next paired batch, and report disposition."""
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument(
+        "--surface",
+        choices=(DECODE_M1_SURFACE, GROUPED_VERIFIER_SURFACE),
+        default=DECODE_M1_SURFACE,
+        help="Development semantic/M surface to fit and refine",
+    )
+    parser.add_argument(
         "--paired-csv",
         action="append",
         type=Path,
         default=[],
         help="Validated paired evidence shard; repeat for every retained file",
+    )
+    parser.add_argument(
+        "--burned-sealed-plan-json",
+        action="append",
+        type=Path,
+        default=[],
+        help="Inspected CPU seal plan reused as generic development evidence",
+    )
+    parser.add_argument(
+        "--burned-sealed-paired-dir",
+        action="append",
+        type=Path,
+        default=[],
+        help="Paired CSV directory matched positionally to a burned CPU plan",
     )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--report", type=Path)
@@ -989,6 +1520,12 @@ def main() -> int:
         parser.error("--min-shape-groups-per-leaf must be positive")
     if args.max_requests_per_shard < 1:
         parser.error("--max-requests-per-shard must be positive")
+    if len(args.burned_sealed_plan_json) != len(
+        args.burned_sealed_paired_dir
+    ):
+        parser.error(
+            "burned sealed plans and paired directories must pair by position"
+        )
     if args.request_shard_dir is None and (
         args.max_requests_per_shard != 16
     ):
@@ -1011,6 +1548,11 @@ def main() -> int:
                 "cached-CV bootstrap accepts no paired evidence; refit changed "
                 "domains through the normal fit-cache path"
             )
+        if args.burned_sealed_plan_json:
+            parser.error(
+                "cached-CV bootstrap cannot add burned evidence; use the "
+                "normal content-addressed fit"
+            )
     elif not all(profiler_pair):
         parser.error(
             "a new or incremental fit requires development profiler evidence"
@@ -1022,23 +1564,36 @@ def main() -> int:
     digest_complete = time.perf_counter()
     observations = read_observation_rows(input_paths)
     read_complete = time.perf_counter()
-    development = _development_corpus(observations, args.shape_manifest)
+    development = _development_corpus(
+        observations,
+        args.shape_manifest,
+        surface=args.surface,
+    )
     del observations
     backends = {row.backend for row in development}
     if len(backends) != 1:
         parser.error("paired planning requires one homogeneous backend corpus")
     backend = next(iter(backends))
-    if backend == Backend.CPU:
-        development = development.with_collapsed_aspect_domains()
+    if args.burned_sealed_plan_json and backend != Backend.CPU:
+        parser.error("burned sealed development is currently a CPU transaction")
     development_complete = time.perf_counter()
+    supplemental_costs, supplemental_digests, _supplemental_dimensions = (
+        _load_cpu_burned_development(
+            development,
+            args.surface,
+            tuple(args.burned_sealed_plan_json),
+            tuple(args.burned_sealed_paired_dir),
+        )
+    )
     profiler_catalog = (
         load_profiler_feature_catalog(
             development,
             args.development_profiler_requests,
             args.development_profiler_evidence,
-            source_corpus=(
-                read_observation_csv((args.development_profiler_observations,))
-                if args.development_profiler_observations
+            source_corpus_path=args.development_profiler_observations,
+            cache_path=(
+                args.fit_cache_dir / "profiler_feature_catalog_v1.json"
+                if args.fit_cache_dir is not None
                 else None
             ),
         )
@@ -1058,9 +1613,10 @@ def main() -> int:
     else:
         fit_arguments = {
             "paired_comparisons": comparisons,
+            "supplemental_development_costs": supplemental_costs,
             "max_leaves": args.max_leaves,
             "min_shape_groups_per_leaf": args.min_shape_groups_per_leaf,
-            "fit_final_rules": False,
+            "fit_final_rules": True,
             "fit_cache": (
                 PolicyFitCache(args.fit_cache_dir)
                 if args.fit_cache_dir is not None
@@ -1069,14 +1625,16 @@ def main() -> int:
             "profiler_feature_catalog": profiler_catalog,
         }
         if backend == Backend.CUDA:
+            projected_cache_keys = projected_domain_cache_keys(development)
             fit_arguments.update({
                 "domain_corpus_provider": lambda domain: (
                     project_cuda_shape_resolved_candidates(
-                        development.rows_for_generic_domain(domain)
+                        development.rows_for_generic_domain(domain),
+                        known_generic_domain=domain,
                     )
                 ),
                 "domain_corpus_digest_provider": lambda domain: (
-                    projected_domain_cache_key(development, domain)
+                    projected_cache_keys[domain]
                 ),
             })
         policy = fit_generic_policy(development, **fit_arguments)
@@ -1087,6 +1645,12 @@ def main() -> int:
         comparisons,
         max_regret=args.max_regret,
         development_corpus_digest=source_digest,
+        supplemental_shape_group_ids=frozenset(
+            cost.shape_group_id
+            for domain_costs in supplemental_costs.values()
+            for cost in domain_costs
+        ),
+        supplemental_evidence_digests=supplemental_digests,
     )
     plan_complete = time.perf_counter()
     write_json(args.output, plan.request_manifest_mapping())

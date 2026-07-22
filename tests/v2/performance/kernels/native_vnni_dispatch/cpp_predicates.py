@@ -12,6 +12,9 @@ from __future__ import annotations
 from .schema import AspectBucket
 from .segmented_policy import (
     FEATURE_AXIS_PRIORITY,
+    KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS,
+    KPART_PARTITION_GEOMETRY_AXES,
+    KPART_PRODUCER_WAVE_WIDTH_BY_AXIS,
     K_FINAL_TILE_WIDTH_BY_AXIS,
     K_GROUPS_PER_N_TILE_WIDTH_BY_AXIS,
     MN_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS,
@@ -32,6 +35,36 @@ def _i64(expression: str) -> str:
     """Cast one runtime dimension before any potentially widening arithmetic."""
 
     return f"static_cast<long long>({expression})"
+
+
+def _kpart_geometry_expressions(
+    k_expression: str,
+    k_tiles_expression: str,
+) -> tuple[str, str]:
+    """Render production-equivalent K-part span and final-tail expressions."""
+
+    k64 = _i64(k_expression)
+    positive_k_tiles = (
+        f"static_cast<long long>((({k_tiles_expression}) > 0) "
+        f"? ({k_tiles_expression}) : 1)"
+    )
+    k_blocks = f"(({k64} + 31LL) / 32LL)"
+    blocks_per_tile = (
+        f"(({k_blocks} + {positive_k_tiles} - 1LL) / "
+        f"{positive_k_tiles})"
+    )
+    prefix_blocks = (
+        f"(({positive_k_tiles} - 1LL) * {blocks_per_tile})"
+    )
+    remaining_blocks = (
+        f"({prefix_blocks} < {k_blocks} "
+        f"? ({k_blocks} - {prefix_blocks}) : 0LL)"
+    )
+    final_tile_blocks = (
+        f"({remaining_blocks} < {blocks_per_tile} "
+        f"? {remaining_blocks} : {blocks_per_tile})"
+    )
+    return blocks_per_tile, final_tile_blocks
 
 
 def aspect_condition(
@@ -68,6 +101,7 @@ def predicate_condition(
     n_expression: str = "n",
     k_expression: str = "k",
     work_expression: str = "work_items",
+    k_tiles_expression: str = "1",
 ) -> str:
     """Render one learner edge with the same exact rational comparison as Python.
 
@@ -151,6 +185,64 @@ def predicate_condition(
             f"{final_wave_tasks} * {denominator}LL <= "
             f"{threshold.parallelism_width}LL * {numerator}LL"
         )
+    elif threshold.axis in KPART_PRODUCER_WAVE_WIDTH_BY_AXIS:
+        width = KPART_PRODUCER_WAVE_WIDTH_BY_AXIS[threshold.axis]
+        n_blocks = f"(({n64} + {width - 1}LL) / {width}LL)"
+        positive_k_tiles = (
+            f"(({k_tiles_expression}) > 0 ? ({k_tiles_expression}) : 1)"
+        )
+        tasks = (
+            f"({n_blocks} * static_cast<long long>("
+            f"{positive_k_tiles}))"
+        )
+        waves = (
+            f"(({tasks} + {threshold.parallelism_width - 1}LL) / "
+            f"{threshold.parallelism_width}LL)"
+        )
+        comparison = f"{waves} * {denominator}LL <= {numerator}LL"
+    elif threshold.axis in KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS:
+        width = KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS[threshold.axis]
+        n_blocks = f"(({n64} + {width - 1}LL) / {width}LL)"
+        positive_k_tiles = (
+            f"(({k_tiles_expression}) > 0 ? ({k_tiles_expression}) : 1)"
+        )
+        tasks = (
+            f"({n_blocks} * static_cast<long long>("
+            f"{positive_k_tiles}))"
+        )
+        final_wave_tasks = (
+            f"((({tasks} - 1LL) % {threshold.parallelism_width}LL) + 1LL)"
+        )
+        comparison = (
+            f"{final_wave_tasks} * {denominator}LL <= "
+            f"{threshold.parallelism_width}LL * {numerator}LL"
+        )
+    elif threshold.axis in KPART_PARTITION_GEOMETRY_AXES:
+        blocks_per_tile, final_tile_blocks = _kpart_geometry_expressions(
+            k_expression,
+            k_tiles_expression,
+        )
+        if threshold.axis == FeatureAxis.KPART_K_TILE_COUNT:
+            positive_k_tiles = (
+                f"static_cast<long long>((({k_tiles_expression}) > 0) "
+                f"? ({k_tiles_expression}) : 1)"
+            )
+            comparison = (
+                f"{positive_k_tiles} * {denominator}LL <= {numerator}LL"
+            )
+        elif threshold.axis == FeatureAxis.KPART_K_BLOCKS_PER_TILE:
+            comparison = (
+                f"{blocks_per_tile} * {denominator}LL <= {numerator}LL"
+            )
+        elif threshold.axis == FeatureAxis.KPART_FINAL_K_TILE_BLOCKS:
+            comparison = (
+                f"{final_tile_blocks} * {denominator}LL <= {numerator}LL"
+            )
+        else:
+            comparison = (
+                f"{final_tile_blocks} * {denominator}LL <= "
+                f"{blocks_per_tile} * {numerator}LL"
+            )
     elif threshold.axis in MN_PARALLEL_WAVE_WIDTH_BY_AXIS:
         width = MN_PARALLEL_WAVE_WIDTH_BY_AXIS[threshold.axis]
         n_tiles = f"(({n64} + {width - 1}LL) / {width}LL)"

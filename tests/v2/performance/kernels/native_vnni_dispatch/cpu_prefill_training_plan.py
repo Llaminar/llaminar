@@ -1,25 +1,11 @@
-"""Two-hour covering plan for CPU NativeVNNI ordinary-prefill timing.
+"""Exhaustive CPU NativeVNNI ordinary-prefill timing plan.
 
-The target runtime surface remains the complete model-tiered matrix declared in
-``prefill_matrix``.  Timing every source format at every target point and in
-every ISA regime, however, repeats the same feature interactions thousands of
-times and cannot satisfy the backend-wide two-hour collection budget.
-
-This module builds a deterministic covering array over the dimensions that can
-change dispatch policy:
-
-* every CPU runtime codebook is paired with every production geometry;
-* every runtime codebook sees every legal M bucket in every aspect class;
-* every production geometry sees every M bucket allowed by its tier;
-* every runtime codebook/M/aspect dispatch domain is measured in every ISA
-  regime, while every production geometry is also paired with every ISA; and
-* source-format aliases of one CPU runtime codebook are co-measured at exactly
-  the same selected cells.
-
-The plan therefore retains all pairwise policy features and the critical
-codebook/M/aspect interaction without taking their full Cartesian product.
-Exhaustive native-byte correctness remains the responsibility of the dedicated
-all-format grouped sweep; this plan gathers canonical performance evidence.
+Every production exact-overlay geometry is measured at every canonical prefill
+M, in every runtime codebook and CPU build/runtime ISA regime. Source aliases
+of a runtime codebook are expanded into independent records so every supported
+tensor format receives direct timing evidence. The resulting Cartesian plan is
+intentional: exact overlays may augment generic learned dispatch only when the
+published winner was measured at that exact format/geometry/work point.
 """
 
 from __future__ import annotations
@@ -27,9 +13,8 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
-import heapq
 import json
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -45,7 +30,8 @@ from .cpu_prefill_route_manifest import (
 )
 from .cpu_prefill_split_manifest import CPUPrefillSplitManifest
 from .prefill_matrix import (
-    PREFILL_M_BUCKETS,
+    CPU_PREFILL_M_BUCKETS,
+    SUPPORTED_CPU_PREFILL_M_BUCKETS,
     CPUPrefillMeasurement,
     cpu_prefill_measurements,
 )
@@ -54,7 +40,7 @@ from .shape_manifest import load_shape_manifest
 from .segmented_policy import GenericDispatchRule
 
 
-CPU_PREFILL_TRAINING_PLAN_VERSION = "cpu-prefill-covering-plan-v11"
+CPU_PREFILL_TRAINING_PLAN_VERSION = "cpu-prefill-exhaustive-plan-v12"
 CPU_PREFILL_SEALED_WITNESS_PLAN_SCHEMA = (
     "cpu-prefill-sealed-witness-plan-v2"
 )
@@ -278,9 +264,6 @@ class CPUPrefillSealedWitnessPlan:
         }
 
 
-CoverageToken = tuple[object, ...]
-
-
 @lru_cache(maxsize=1)
 def _codebook_aliases() -> dict[int, tuple[str, ...]]:
     """Return the complete ordered CPU source-alias set per runtime codebook."""
@@ -290,296 +273,6 @@ def _codebook_aliases() -> dict[int, tuple[str, ...]]:
         codebook: runtime_aliases("cpu", codebook)
         for codebook in codebooks
     }
-
-
-def _aspect(measurement: CPUPrefillMeasurement) -> str:
-    return measurement.shape.aspect_bucket.value
-
-
-def _cell_cost(
-    runtime_codebook: int,
-    measurement: CPUPrefillMeasurement,
-    m: int,
-) -> float:
-    """Estimate source-expanded CPU work for one runtime training cell.
-
-    A logarithmic cost still allowed the solver to repeat 7B/M16384 cells in
-    all three ISA regimes.  Canonical timing is approximately proportional to
-    M*N*K in that tail, and every source alias is a separate correctness/timing
-    launch, so both terms belong in the selection objective.
-    """
-
-    baseline_work = 896 * 896 * 64
-    work = m * measurement.shape.n * measurement.shape.k
-    aliases = len(_codebook_aliases()[runtime_codebook])
-    return aliases * (1.0 + float(work) / float(baseline_work))
-
-
-def _base_tokens(
-    runtime_codebook: int,
-    measurement: CPUPrefillMeasurement,
-    m: int,
-) -> frozenset[CoverageToken]:
-    """Return non-ISA interactions covered by one candidate cell."""
-
-    return frozenset({
-        ("codebook_shape", runtime_codebook, measurement.shape.name),
-        ("codebook_m_aspect", runtime_codebook, m, _aspect(measurement)),
-        ("shape_m", measurement.shape.name, m),
-    })
-
-
-def _required_base_tokens(
-    measurements: tuple[CPUPrefillMeasurement, ...],
-    codebooks: tuple[int, ...],
-) -> set[CoverageToken]:
-    required: set[CoverageToken] = set()
-    for codebook in codebooks:
-        for measurement in measurements:
-            required.add(("codebook_shape", codebook, measurement.shape.name))
-        for aspect in sorted({_aspect(item) for item in measurements}):
-            m_values = {
-                m
-                for item in measurements
-                if _aspect(item) == aspect
-                for m in item.m_values
-            }
-            for m in m_values:
-                required.add(("codebook_m_aspect", codebook, m, aspect))
-    for measurement in measurements:
-        for m in measurement.m_values:
-            required.add(("shape_m", measurement.shape.name, m))
-    return required
-
-
-def _select_base_cells(
-    measurements: tuple[CPUPrefillMeasurement, ...],
-    codebooks: tuple[int, ...],
-) -> list[tuple[int, CPUPrefillMeasurement, int, float]]:
-    """Greedily cover required interactions with deterministic cost tie-breaking."""
-
-    candidates = [
-        (
-            codebook,
-            measurement,
-            m,
-            _cell_cost(codebook, measurement, m),
-            _base_tokens(codebook, measurement, m),
-        )
-        for codebook in codebooks
-        for measurement in measurements
-        for m in measurement.m_values
-    ]
-    uncovered = _required_base_tokens(measurements, codebooks)
-    selected: list[tuple[int, CPUPrefillMeasurement, int, float]] = []
-
-    class _DescendingKey:
-        """Adapt the original ``max`` ordering to Python's min-heap."""
-
-        __slots__ = ("value",)
-
-        def __init__(
-            self,
-            value: tuple[float, int, float, int, str, int],
-        ) -> None:
-            self.value = value
-
-        def __lt__(self, other: "_DescendingKey") -> bool:
-            return self.value > other.value
-
-    def selection_key(
-        candidate_index: int,
-        covered: int,
-    ) -> tuple[float, int, float, int, str, int]:
-        """Return the unchanged deterministic greedy ordering for one cell."""
-
-        codebook, measurement, m, cost, _ = candidates[candidate_index]
-        return (
-            covered / cost,
-            covered,
-            -cost,
-            -codebook,
-            measurement.shape.name,
-            -m,
-        )
-
-    # A selected cell removes at most three coverage tokens. Only candidates
-    # sharing one of those tokens can change rank, so index those dependencies
-    # and lazily invalidate their old heap entries. This preserves the exact
-    # greedy result without rescanning thousands of unaffected candidates for
-    # every selected cell.
-    candidates_by_token: dict[CoverageToken, list[int]] = defaultdict(list)
-    versions = [0] * len(candidates)
-    heap: list[tuple[_DescendingKey, int, int]] = []
-    for candidate_index, candidate in enumerate(candidates):
-        for token in candidate[4]:
-            candidates_by_token[token].append(candidate_index)
-        heapq.heappush(
-            heap,
-            (
-                _DescendingKey(selection_key(candidate_index, len(candidate[4]))),
-                candidate_index,
-                0,
-            ),
-        )
-
-    while uncovered:
-        while heap:
-            _, best_index, version = heapq.heappop(heap)
-            if version != versions[best_index]:
-                continue
-            removed_tokens = tuple(
-                token
-                for token in candidates[best_index][4]
-                if token in uncovered
-            )
-            if removed_tokens:
-                break
-        else:
-            raise ValueError(f"CPU prefill plan cannot cover {sorted(uncovered)[:1]}")
-
-        best = candidates[best_index]
-        selected.append(best[:4])
-        uncovered.difference_update(removed_tokens)
-
-        touched = {
-            candidate_index
-            for token in removed_tokens
-            for candidate_index in candidates_by_token[token]
-        }
-        for candidate_index in touched:
-            versions[candidate_index] += 1
-            covered = sum(
-                token in uncovered for token in candidates[candidate_index][4]
-            )
-            if covered == 0:
-                continue
-            heapq.heappush(
-                heap,
-                (
-                    _DescendingKey(selection_key(candidate_index, covered)),
-                    candidate_index,
-                    versions[candidate_index],
-                ),
-            )
-    return selected
-
-
-def _regime_tokens(
-    runtime_codebook: int,
-    measurement: CPUPrefillMeasurement,
-    m: int,
-    regime: str,
-) -> frozenset[CoverageToken]:
-    return frozenset({
-        (
-            "codebook_m_aspect_regime",
-            runtime_codebook,
-            m,
-            _aspect(measurement),
-            regime,
-        ),
-        ("shape_regime", measurement.shape.name, regime),
-    })
-
-
-def _required_regime_tokens(
-    measurements: tuple[CPUPrefillMeasurement, ...],
-    codebooks: tuple[int, ...],
-) -> set[CoverageToken]:
-    required: set[CoverageToken] = set()
-    for regime in ISA_REGIMES:
-        for measurement in measurements:
-            required.add(("shape_regime", measurement.shape.name, regime))
-        for codebook in codebooks:
-            for aspect in sorted({_aspect(item) for item in measurements}):
-                for m in {
-                    value
-                    for item in measurements
-                    if _aspect(item) == aspect
-                    for value in item.m_values
-                }:
-                    required.add((
-                        "codebook_m_aspect_regime",
-                        codebook,
-                        m,
-                        aspect,
-                        regime,
-                    ))
-    return required
-
-
-def _required_minimum_geometry_anchor_cells(
-    measurements: tuple[CPUPrefillMeasurement, ...],
-    codebooks: tuple[int, ...],
-) -> set[CPUPrefillRuntimeTrainingCell]:
-    """Anchor every generic policy domain at its smallest production geometry.
-
-    A codebook/M/aspect/ISA witness is not by itself enough to train a generic
-    policy.  The cheapest covering-array choice can come from a single large
-    model family, in which case grouped cross-validation correctly declines to
-    certify extrapolation toward a smaller shape. Requiring the cheapest
-    production geometry in every domain supplies a real lower edge. Additional
-    cheap shapes are selected separately only where the existing covering plan
-    lacks enough shape groups for cross-validation.
-
-    These anchors are deliberately lower-edge focused. Decision-tree leaves are
-    exhaustive above their final threshold, while extrapolation below the first
-    observed feature value lacks any training evidence.  The production total-
-    policy validator remains the final proof over every declared shape.
-    """
-
-    required: set[CPUPrefillRuntimeTrainingCell] = set()
-    aspects = sorted({item.shape.aspect_bucket for item in measurements})
-    for codebook in codebooks:
-        for regime in ISA_REGIMES:
-            for aspect in aspects:
-                m_values = sorted({
-                    value
-                    for item in measurements
-                    if item.shape.aspect_bucket == aspect
-                    for value in item.m_values
-                })
-                for m in m_values:
-                    eligible = [
-                        item
-                        for item in measurements
-                        if item.shape.aspect_bucket == aspect
-                        and m in item.m_values
-                    ]
-                    anchor = min(
-                        eligible,
-                        key=lambda item: (
-                            item.shape.n * item.shape.k,
-                            item.shape.n,
-                            item.shape.k,
-                            item.shape.name,
-                        ),
-                    )
-                    required.add(CPUPrefillRuntimeTrainingCell(
-                        runtime_codebook=codebook,
-                        shape_name=anchor.shape.name,
-                        m=m,
-                        isa_regime=regime,
-                    ))
-    return required
-
-
-def _generic_domain_shape_group_counts(
-    cells: Iterable[CPUPrefillRuntimeTrainingCell],
-    measurements: tuple[CPUPrefillMeasurement, ...],
-) -> Counter[tuple[int, int, str]]:
-    """Count shapes in each cross-aspect CPU prefill policy domain."""
-
-    _ = measurements
-    groups: dict[tuple[int, int, str], set[str]] = defaultdict(set)
-    for cell in cells:
-        groups[(
-            cell.runtime_codebook,
-            cell.m,
-            cell.isa_regime,
-        )].add(cell.shape_name)
-    return Counter({domain: len(shapes) for domain, shapes in groups.items()})
 
 
 def _validate_serial_route_manifest(
@@ -648,84 +341,6 @@ def validate_cpu_prefill_serial_route_manifest(
     )
 
 
-def _required_arithmetic_route_cells(
-    initial_cells: Iterable[CPUPrefillRuntimeTrainingCell],
-    measurements: tuple[CPUPrefillMeasurement, ...],
-    codebooks: tuple[int, ...],
-    manifest: CPUPrefillSerialRouteManifest,
-) -> set[CPUPrefillRuntimeTrainingCell]:
-    """Close production-shape coverage in each arithmetic family.
-
-    Full-K and serial-K-part rows do not share candidate families. A generic
-    learner therefore needs independent shape groups *inside* one arithmetic
-    bundle. This baseline selector measures every production geometry when a
-    bundle has fewer than the grouped-CV minimum. Additional non-overlay route
-    anchors are selected by
-    :func:`cpu_prefill_arithmetic_refinement_source_training_records`; exact
-    overlays never satisfy this obligation.
-    """
-
-    materialized = set(initial_cells)
-    by_name = {item.shape.name: item for item in measurements}
-    targets: dict[tuple[int, int, str, str], set[str]] = defaultdict(set)
-    selected: dict[tuple[int, int, str, str], set[str]] = defaultdict(set)
-    for codebook in codebooks:
-        for measurement in measurements:
-            for m in measurement.m_values:
-                for regime in ISA_REGIMES:
-                    bundle = manifest.route_for(
-                        codebook,
-                        measurement.shape.name,
-                        regime,
-                    ).bundle_signature
-                    targets[(codebook, m, regime, bundle)].add(
-                        measurement.shape.name
-                    )
-    for cell in materialized:
-        bundle = manifest.route_for(
-            cell.runtime_codebook,
-            cell.shape_name,
-            cell.isa_regime,
-        ).bundle_signature
-        selected[(
-            cell.runtime_codebook,
-            cell.m,
-            cell.isa_regime,
-            bundle,
-        )].add(cell.shape_name)
-
-    required: set[CPUPrefillRuntimeTrainingCell] = set()
-    for domain, target_shapes in sorted(targets.items()):
-        codebook, m, regime, bundle = domain
-        needed = min(
-            MIN_GENERIC_CROSS_VALIDATION_SHAPE_GROUPS,
-            len(target_shapes),
-        )
-        missing_count = needed - len(selected[domain])
-        if missing_count <= 0:
-            continue
-        candidates = sorted(
-            target_shapes - selected[domain],
-            key=lambda shape_name: (
-                _cell_cost(codebook, by_name[shape_name], m),
-                by_name[shape_name].shape.n * by_name[shape_name].shape.k,
-                shape_name,
-            ),
-        )
-        if len(candidates) < missing_count:
-            raise ValueError(f"CPU prefill route domain cannot close {domain}")
-        for shape_name in candidates[:missing_count]:
-            cell = CPUPrefillRuntimeTrainingCell(
-                runtime_codebook=codebook,
-                shape_name=shape_name,
-                m=m,
-                isa_regime=regime,
-            )
-            required.add(cell)
-            selected[domain].add(shape_name)
-    return required
-
-
 def cpu_prefill_arithmetic_refinement_source_training_records(
     route_manifest: CPUPrefillSerialRouteManifest,
 ) -> tuple[CPUPrefillSourceTrainingRecord, ...]:
@@ -759,28 +374,23 @@ def cpu_prefill_arithmetic_refinement_source_training_records(
 
     for codebook in codebooks:
         for regime in ISA_REGIMES:
-            production_by_bundle: dict[str, set[str]] = defaultdict(set)
-            m_by_bundle: dict[str, set[int]] = defaultdict(set)
+            production_by_bundle_m: dict[
+                tuple[str, int], set[str]
+            ] = defaultdict(set)
+            production_bundles: set[str] = set()
             for measurement in measurements:
                 route = route_manifest.route_for(
                     codebook,
                     measurement.shape.name,
                     regime,
                 )
-                production_by_bundle[route.bundle_signature].add(
-                    measurement.shape.name
-                )
-                m_by_bundle[route.bundle_signature].update(measurement.m_values)
+                production_bundles.add(route.bundle_signature)
+                for m in measurement.m_values:
+                    production_by_bundle_m[(route.bundle_signature, m)].add(
+                        measurement.shape.name
+                    )
 
-            for bundle, production_shapes in sorted(
-                production_by_bundle.items()
-            ):
-                missing_count = (
-                    MIN_GENERIC_CROSS_VALIDATION_SHAPE_GROUPS
-                    - len(production_shapes)
-                )
-                if missing_count <= 0:
-                    continue
+            for bundle in sorted(production_bundles):
                 eligible = []
                 for shape in development_candidates:
                     route = route_manifest.route_for(
@@ -796,18 +406,25 @@ def cpu_prefill_arithmetic_refinement_source_training_records(
                     shape.k,
                     shape.name,
                 ))
-                if len(eligible) < missing_count:
-                    raise ValueError(
-                        "CPU prefill arithmetic bundle lacks measured generic "
-                        "refinement geometries: "
-                        f"codebook={codebook} regime={regime} bundle={bundle} "
-                        f"production_groups={len(production_shapes)} "
-                        f"refinement_groups={len(eligible)}"
+                for m in CPU_PREFILL_M_BUCKETS:
+                    production_shapes = production_by_bundle_m[(bundle, m)]
+                    missing_count = (
+                        MIN_GENERIC_CROSS_VALIDATION_SHAPE_GROUPS
+                        - len(production_shapes)
                     )
-                for shape in eligible[:missing_count]:
-                    grouped_m[(codebook, shape.name, regime)].update(
-                        m_by_bundle[bundle]
-                    )
+                    if missing_count <= 0:
+                        continue
+                    if len(eligible) < missing_count:
+                        raise ValueError(
+                            "CPU prefill arithmetic bundle lacks measured "
+                            "generic refinement geometries: "
+                            f"codebook={codebook} regime={regime} "
+                            f"bundle={bundle} M={m} "
+                            f"production_groups={len(production_shapes)} "
+                            f"refinement_groups={len(eligible)}"
+                        )
+                    for shape in eligible[:missing_count]:
+                        grouped_m[(codebook, shape.name, regime)].add(m)
 
     records = []
     for (codebook, shape_name, regime), m_values in grouped_m.items():
@@ -824,120 +441,26 @@ def cpu_prefill_arithmetic_refinement_source_training_records(
     return _order_source_records(records)
 
 
-def _select_regime_cells(
-    base_cells: list[tuple[int, CPUPrefillMeasurement, int, float]],
-    measurements: tuple[CPUPrefillMeasurement, ...],
-    codebooks: tuple[int, ...],
-) -> tuple[CPUPrefillRuntimeTrainingCell, ...]:
-    """Add the cheapest cells needed to populate every ISA policy domain.
-
-    One base cell may deliberately be measured in multiple ISA regimes.  That
-    duplication is necessary: ISA is part of the production policy domain, so
-    separate codebook/M/aspect evidence must exist before the generator can
-    emit a total selector for AVX2 and AVX512 execution.
-    """
-
-    uncovered = _required_regime_tokens(measurements, codebooks)
-    regime_loads: Counter[str] = Counter()
-    assigned: list[CPUPrefillRuntimeTrainingCell] = []
-
-    candidates = [
-        (
-            codebook,
-            measurement,
-            m,
-            cost,
-            regime,
-            _regime_tokens(codebook, measurement, m, regime),
-        )
-        for codebook, measurement, m, cost in base_cells
-        for regime in ISA_REGIMES
-    ]
-
-    # Preserve every cell selected for the non-ISA covering obligations.  The
-    # first pass gives each one the regime where it covers the most outstanding
-    # policy-domain evidence; the second pass below may repeat a cell in other
-    # regimes to make the runtime selector total.
-    for codebook, measurement, m, _ in sorted(
-        base_cells,
-        key=lambda item: (-item[3], item[0], item[1].shape.name, item[2]),
-    ):
-        regime = max(
-            ISA_REGIMES,
-            key=lambda candidate: (
-                len(_regime_tokens(
-                    codebook, measurement, m, candidate
-                ) & uncovered),
-                -regime_loads[candidate],
-                -ISA_REGIMES.index(candidate),
-            ),
-        )
-        assigned.append(CPUPrefillRuntimeTrainingCell(
-            runtime_codebook=codebook,
-            shape_name=measurement.shape.name,
-            m=m,
-            isa_regime=regime,
-        ))
-        regime_loads[regime] += 1
-        uncovered.difference_update(
-            _regime_tokens(codebook, measurement, m, regime)
-        )
-
-    while uncovered:
-        eligible = [item for item in candidates if item[5] & uncovered]
-        if not eligible:
-            raise ValueError(
-                "CPU prefill plan cannot populate ISA domains: "
-                f"{sorted(uncovered)[:1]}"
-            )
-        best = max(
-            eligible,
-            key=lambda item: (
-                len(item[5] & uncovered) / item[3],
-                len(item[5] & uncovered),
-                -regime_loads[item[4]],
-                -item[3],
-                -item[0],
-                item[1].shape.name,
-                -item[2],
-                -ISA_REGIMES.index(item[4]),
-            ),
-        )
-        codebook, measurement, m, _, regime, tokens = best
-        assigned.append(CPUPrefillRuntimeTrainingCell(
-            runtime_codebook=codebook,
-            shape_name=measurement.shape.name,
-            m=m,
-            isa_regime=regime,
-        ))
-        regime_loads[regime] += 1
-        uncovered.difference_update(tokens)
-
-    return tuple(sorted(assigned))
-
-
 @lru_cache(maxsize=None)
 def cpu_prefill_runtime_training_cells(
     route_manifest: CPUPrefillSerialRouteManifest | None = None,
 ) -> tuple[CPUPrefillRuntimeTrainingCell, ...]:
-    """Return and validate the canonical runtime-codebook covering array."""
+    """Return the complete codebook/geometry/M/ISA Cartesian inventory."""
 
     measurements = cpu_prefill_measurements()
     codebooks = tuple(_codebook_aliases())
-    base_cells = _select_base_cells(measurements, codebooks)
-    initial_cells = {
-        *_select_regime_cells(base_cells, measurements, codebooks),
-        *_required_minimum_geometry_anchor_cells(measurements, codebooks),
-    }
-    if route_manifest is not None:
-        validate_cpu_prefill_serial_route_manifest(route_manifest)
-        initial_cells.update(_required_arithmetic_route_cells(
-            initial_cells,
-            measurements,
-            codebooks,
-            route_manifest,
-        ))
-    cells = tuple(sorted(initial_cells))
+    cells = tuple(
+        CPUPrefillRuntimeTrainingCell(
+            runtime_codebook=codebook,
+            shape_name=measurement.shape.name,
+            m=m,
+            isa_regime=regime,
+        )
+        for codebook in codebooks
+        for measurement in measurements
+        for m in measurement.m_values
+        for regime in ISA_REGIMES
+    )
     validate_cpu_prefill_runtime_training_cells(cells, route_manifest)
     return cells
 
@@ -946,101 +469,35 @@ def validate_cpu_prefill_runtime_training_cells(
     cells: Iterable[CPUPrefillRuntimeTrainingCell],
     route_manifest: CPUPrefillSerialRouteManifest | None = None,
 ) -> None:
-    """Prove that a proposed plan satisfies every declared coverage obligation."""
+    """Prove that a proposed plan is exactly the exhaustive runtime matrix."""
 
     materialized = tuple(cells)
     measurements = cpu_prefill_measurements()
-    by_name = {item.shape.name: item for item in measurements}
     codebooks = tuple(_codebook_aliases())
-    actual_base: set[CoverageToken] = set()
-    actual_regime: set[CoverageToken] = set()
-    for cell in materialized:
-        if cell.runtime_codebook not in codebooks:
-            raise ValueError(f"unknown CPU runtime codebook {cell.runtime_codebook}")
-        if cell.shape_name not in by_name:
-            raise ValueError(f"unknown CPU prefill shape {cell.shape_name}")
-        if cell.isa_regime not in ISA_REGIMES:
-            raise ValueError(f"unknown CPU ISA regime {cell.isa_regime}")
-        measurement = by_name[cell.shape_name]
-        if cell.m not in measurement.m_values:
-            raise ValueError(f"{cell.shape_name}: illegal training M={cell.m}")
-        actual_base.update(_base_tokens(cell.runtime_codebook, measurement, cell.m))
-        actual_regime.update(_regime_tokens(
-            cell.runtime_codebook, measurement, cell.m, cell.isa_regime
-        ))
-    missing_base = _required_base_tokens(measurements, codebooks) - actual_base
-    missing_regime = _required_regime_tokens(measurements, codebooks) - actual_regime
-    missing_lower_boundaries = (
-        _required_minimum_geometry_anchor_cells(measurements, codebooks)
-        - set(materialized)
-    )
-    domain_counts = _generic_domain_shape_group_counts(materialized, measurements)
-    required_cross_aspect_domains = {
-        (token[1], token[2], token[4])
-        for token in _required_regime_tokens(measurements, codebooks)
-        if token[0] == "codebook_m_aspect_regime"
+    expected = {
+        CPUPrefillRuntimeTrainingCell(
+            runtime_codebook=codebook,
+            shape_name=measurement.shape.name,
+            m=m,
+            isa_regime=regime,
+        )
+        for codebook in codebooks
+        for measurement in measurements
+        for m in measurement.m_values
+        for regime in ISA_REGIMES
     }
-    undersubscribed_domains = sorted(
-        (domain, domain_counts[domain])
-        for domain in required_cross_aspect_domains
-        if domain_counts[domain]
-        < MIN_GENERIC_CROSS_VALIDATION_SHAPE_GROUPS
-    )
-    missing_route_coverage: list[tuple[object, ...]] = []
+    actual = set(materialized)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    duplicates = len(materialized) - len(actual)
+    if missing or unexpected or duplicates:
+        raise ValueError(
+            "CPU prefill exhaustive plan is incomplete: "
+            f"missing={missing[:3]} unexpected={unexpected[:3]} "
+            f"duplicates={duplicates}"
+        )
     if route_manifest is not None:
         _validate_serial_route_manifest(route_manifest, measurements, codebooks)
-        route_groups: dict[tuple[int, int, str, str], set[str]] = defaultdict(set)
-        route_targets: dict[tuple[int, int, str, str], set[str]] = defaultdict(set)
-        for codebook in codebooks:
-            for measurement in measurements:
-                for m in measurement.m_values:
-                    for regime in ISA_REGIMES:
-                        bundle = route_manifest.route_for(
-                            codebook,
-                            measurement.shape.name,
-                            regime,
-                        ).bundle_signature
-                        route_targets[(codebook, m, regime, bundle)].add(
-                            measurement.shape.name
-                        )
-        for cell in materialized:
-            bundle = route_manifest.route_for(
-                cell.runtime_codebook,
-                cell.shape_name,
-                cell.isa_regime,
-            ).bundle_signature
-            route_groups[(
-                cell.runtime_codebook,
-                cell.m,
-                cell.isa_regime,
-                bundle,
-            )].add(cell.shape_name)
-        for domain, target_shapes in sorted(route_targets.items()):
-            required_count = min(
-                MIN_GENERIC_CROSS_VALIDATION_SHAPE_GROUPS,
-                len(target_shapes),
-            )
-            if len(route_groups[domain]) < required_count:
-                missing_route_coverage.append((
-                    *domain,
-                    len(route_groups[domain]),
-                    required_count,
-                ))
-    if (
-        missing_base
-        or missing_regime
-        or missing_lower_boundaries
-        or undersubscribed_domains
-        or missing_route_coverage
-    ):
-        raise ValueError(
-            "CPU prefill covering plan is incomplete: "
-            f"base={sorted(missing_base)[:3]} "
-            f"regime={sorted(missing_regime)[:3]} "
-            f"lower_boundaries={sorted(missing_lower_boundaries)[:3]} "
-            f"undersubscribed={undersubscribed_domains[:3]} "
-            f"arithmetic_routes={missing_route_coverage[:3]}"
-        )
 
 
 @lru_cache(maxsize=None)
@@ -1126,7 +583,10 @@ def _materialize_opened_witness_records(
         if (
             not m_values
             or tuple(sorted(set(m_values))) != m_values
-            or any(value not in PREFILL_M_BUCKETS for value in m_values)
+            or any(
+                value not in SUPPORTED_CPU_PREFILL_M_BUCKETS
+                for value in m_values
+            )
         ):
             raise ValueError(
                 f"{shape_name}: opened {version} M inventory is invalid"
@@ -1369,7 +829,7 @@ def cpu_prefill_development_refinement_source_training_records(
                     k=shape.k,
                     isa_regime=regime,
                     runtime_isa=RUNTIME_ISA_BY_REGIME[regime],
-                    m_values=PREFILL_M_BUCKETS,
+                    m_values=CPU_PREFILL_M_BUCKETS,
                 ))
     records.extend(
         cpu_prefill_opened_witness_v5_source_training_records(route_manifest)
@@ -1711,7 +1171,10 @@ def read_cpu_prefill_sealed_witness_plan(
         if (
             not record.m_values
             or tuple(sorted(set(record.m_values))) != record.m_values
-            or any(value not in PREFILL_M_BUCKETS for value in record.m_values)
+            or any(
+                value not in SUPPORTED_CPU_PREFILL_M_BUCKETS
+                for value in record.m_values
+            )
         ):
             raise ValueError(
                 f"{record.shape_name}: sealed witness M inventory is invalid"
@@ -1748,7 +1211,7 @@ def validate_cpu_prefill_sealed_witness_plan(
 
     if plan.frozen_generic_policy_digest == "":
         raise ValueError("CPU prefill sealed plan lacks a frozen policy digest")
-    if plan.split_manifest_digest != split_manifest.digest():
+    if plan.split_manifest_digest not in split_manifest.accepted_digests():
         raise ValueError("CPU prefill sealed plan disagrees with split manifest")
     if plan.route_manifest_digest != route_manifest.digest():
         raise ValueError("CPU prefill sealed plan disagrees with production routes")

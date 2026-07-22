@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from enum import Enum
 from fractions import Fraction
 from unittest import mock
 from pathlib import Path
@@ -26,6 +27,7 @@ if str(KERNEL_PERF_ROOT) not in sys.path:
     sys.path.insert(0, str(KERNEL_PERF_ROOT))
 
 from native_vnni_dispatch.certification import certify_generic_policy  # noqa: E402
+from native_vnni_dispatch import corpus as corpus_module  # noqa: E402
 from native_vnni_dispatch.candidate_observation import (  # noqa: E402
     read_observation_csv,
     write_observation_csv,
@@ -40,6 +42,7 @@ from native_vnni_dispatch.candidate_registry import (  # noqa: E402
     rocm_native_vnni_decode_registry,
 )
 from native_vnni_dispatch.compiler import (  # noqa: E402
+    CompiledPolicy,
     certify_frozen_policy,
     compile_policy,
     freeze_policy,
@@ -66,13 +69,19 @@ from native_vnni_dispatch.exact_oracle import (  # noqa: E402
     build_exact_winners,
     candidate_is_eligible,
 )
+from native_vnni_dispatch import exact_oracle as exact_oracle_module  # noqa: E402
 from native_vnni_dispatch.format_registry import (  # noqa: E402
     FORMAT_SPECS,
     format_spec,
     registry_digest,
     runtime_aliases,
 )
-from native_vnni_dispatch.policy_ir import make_policy_ir  # noqa: E402
+from native_vnni_dispatch.policy_ir import (  # noqa: E402
+    ExactDispatchEntry,
+    PolicyIR,
+    _normalize_policy_inventory,
+    make_policy_ir,
+)
 from native_vnni_dispatch.policy_artifact import (  # noqa: E402
     validate_installable_policy_artifact,
     write_certification_diagnostic,
@@ -87,6 +96,7 @@ from native_vnni_dispatch.schema import (  # noqa: E402
     AspectBucket,
     Backend,
     ExecutionMode,
+    FEATURE_SCHEMA_VERSION,
     LEARNER_VERSION,
     NativeVNNIObservation,
     P95_REGRET_BUDGET,
@@ -125,6 +135,11 @@ from native_vnni_dispatch.adapters.rocm_moe import (  # noqa: E402
     timing_sample_digest,
 )
 from native_vnni_dispatch.profiles import MeasurementProfile  # noqa: E402
+from native_vnni_dispatch.profiler_model import (  # noqa: E402
+    ProfilerCandidateDescriptor,
+    ProfilerFeatureCatalog,
+    _physical_key,
+)
 
 
 SERIAL_HASH = "sha256:serial-m1-policy-v1"
@@ -300,6 +315,125 @@ def candidate_rows_for_aliases(
 
 
 class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
+    def test_parallel_policy_serializer_preserves_legacy_digest(self) -> None:
+        """Fast publication must retain the historical policy artifact bytes."""
+
+        row = observation(shape_group="serializer-shape", n=384, k=1024)
+        key = runtime_key(row)
+        domain = generic_domain(row)
+        cell = segmented_policy.CrossValidationCell(
+            runtime_key=key,
+            shape_group_id=row.shape_group_id,
+            selected_candidate_id=row.effective_candidate_id,
+            exact_candidate_id=row.effective_candidate_id,
+            observed_broad_regret=0.0,
+        )
+        validation = segmented_policy.DomainCrossValidation(
+            domain=domain,
+            selected_feature_policy=FeaturePolicy.CONTINUOUS,
+            selected_max_leaves=1,
+            selected_boundary_placement=BoundaryPlacement.MIDPOINT,
+            selected_profiler_influence=(
+                segmented_policy.ProfilerInfluence.MEASURED_ONLY
+            ),
+            fold_count=1,
+            shape_group_count=1,
+            required_point_count=1,
+            covered_point_count=1,
+            max_regret=0.0,
+            p95_regret=0.0,
+            mean_regret=0.0,
+            worst_shape_group_id=row.shape_group_id,
+            worst_aggregate_n=row.aggregate_n,
+            worst_k=row.k,
+            worst_selected_candidate_id=row.effective_candidate_id,
+            worst_exact_candidate_id=row.effective_candidate_id,
+            cells=(cell,),
+        )
+        rule = GenericDispatchRule(
+            domain=domain,
+            predicates=(),
+            candidate_id=row.effective_candidate_id,
+            arithmetic_fingerprint=row.arithmetic_fingerprint,
+            development_shape_groups=(row.shape_group_id,),
+            development_max_regret=0.0,
+            development_p95_regret=0.0,
+            development_mean_regret=0.0,
+        )
+        exact = ExactDispatchEntry(
+            key=key,
+            candidate_id=row.effective_candidate_id,
+            arithmetic_fingerprint=row.arithmetic_fingerprint,
+            config_json={"nested": {"candidate": row.effective_candidate_id}},
+        )
+        policy = PolicyIR(
+            policy_abi=POLICY_ABI,
+            learner_version=LEARNER_VERSION,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            exact_entries=(exact,),
+            generic_rules=(rule,),
+            unpromoted_domains=(),
+            cross_validation=(validation,),
+            metadata={"regime": ExecutionMode.GRAPH_CAPTURED},
+        )
+
+        def legacy_normalize(value):
+            if isinstance(value, Enum):
+                return value.value
+            if isinstance(value, dict):
+                return {
+                    str(name): legacy_normalize(item)
+                    for name, item in sorted(value.items())
+                }
+            if isinstance(value, (tuple, list)):
+                return [legacy_normalize(item) for item in value]
+            if hasattr(value, "__dataclass_fields__"):
+                return legacy_normalize(dataclasses.asdict(value))
+            return value
+
+        expected_generic = {
+            "policy_abi": policy.policy_abi,
+            "learner_version": policy.learner_version,
+            "feature_schema_version": policy.feature_schema_version,
+            "generic_rules": legacy_normalize(policy.generic_rules),
+            "unpromoted_domains": legacy_normalize(policy.unpromoted_domains),
+            "cross_validation": legacy_normalize(policy.cross_validation),
+        }
+        expected_complete = dict(expected_generic)
+        expected_complete["exact_entries"] = legacy_normalize(
+            policy.exact_entries
+        )
+        expected_complete["metadata"] = legacy_normalize(dict(policy.metadata))
+
+        self.assertEqual(policy.canonical_mapping(generic_only=True), expected_generic)
+        self.assertEqual(policy.canonical_mapping(), expected_complete)
+        self.assertIs(policy.canonical_mapping(), policy.canonical_mapping())
+        self.assertIs(
+            policy.canonical_mapping(generic_only=True),
+            policy.canonical_mapping(generic_only=True),
+        )
+        for generic_only, expected in (
+            (True, expected_generic),
+            (False, expected_complete),
+        ):
+            encoded = json.dumps(
+                expected, sort_keys=True, separators=(",", ":")
+            ).encode()
+            expected_digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+            self.assertEqual(
+                policy.digest(generic_only=generic_only), expected_digest
+            )
+
+        repeated = (validation,) * 8
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_SERIALIZATION_WORKERS": "2"},
+        ):
+            parallel = _normalize_policy_inventory(
+                repeated, items_per_worker=1
+            )
+        self.assertEqual(parallel, legacy_normalize(repeated))
+
     def test_policy_worker_default_counts_affinity_visible_physical_cores(
         self,
     ) -> None:
@@ -415,6 +549,28 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         ):
             self.assertEqual(corpus.digest(), expected)
 
+    def test_parallel_corpus_digest_caps_workers_at_physical_cores(self) -> None:
+        """Offline hashing must not schedule one process per SMT sibling."""
+
+        corpus = ObservationCorpus((observation(),) * 8192)
+        with (
+            mock.patch.object(
+                corpus_module,
+                "_physical_core_count",
+                return_value=1,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "99"},
+            ),
+            mock.patch.object(
+                corpus_module,
+                "ProcessPoolExecutor",
+            ) as executor,
+        ):
+            corpus.digest()
+        executor.assert_not_called()
+
     def test_parallel_corpus_digest_preserves_collapsed_prefix_order(self) -> None:
         """Mode/aspect visibility markers retain their historical hash order."""
 
@@ -490,6 +646,7 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 corpus,
                 corpus.generic_domains(),
                 None,
+                {},
                 serial_hashes,
             )
         with mock.patch.dict(
@@ -500,8 +657,49 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 corpus,
                 corpus.generic_domains(),
                 None,
+                {},
                 serial_hashes,
             )
+
+        self.assertEqual(parallel, serial)
+
+    def test_parallel_candidate_cost_cache_loads_match_serial_generation(
+        self,
+    ) -> None:
+        """Publication cache parsing must preserve every typed regret row."""
+
+        corpus = ObservationCorpus(tuple(
+            observation(
+                source_format=source_format,
+                shape_group=f"cost-cache-{index}",
+            )
+            for index, source_format in enumerate(
+                ("Q4_0", "Q5_0", "Q8_0", "IQ4_NL")
+            )
+        )).with_collapsed_aspect_domains()
+        costs = build_candidate_point_costs(corpus)
+        with tempfile.TemporaryDirectory() as directory:
+            cache = PolicyFitCache(Path(directory))
+            tasks = []
+            for index, domain in enumerate(corpus.generic_domains()):
+                content_key = f"unit-cost-key-{index}"
+                cache.store_costs(content_key, domain, costs[domain])
+                tasks.append((domain, content_key, ()))
+
+            with mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+            ):
+                serial = segmented_policy._load_cached_costs_parallel(
+                    cache, tasks
+                )
+            with mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "4"},
+            ):
+                parallel = segmented_policy._load_cached_costs_parallel(
+                    cache, tasks
+                )
 
         self.assertEqual(parallel, serial)
 
@@ -1228,7 +1426,106 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertEqual(tuple(dict.fromkeys(row_grid_axes)), row_grid_axes)
         self.assertEqual(set(n_only_axes), set(FeatureAxis) - row_grid_only_axes)
         self.assertEqual(set(row_grid_axes), set(FeatureAxis))
-        self.assertLessEqual(len(row_grid_axes), 64)
+        self.assertLessEqual(
+            len(row_grid_axes),
+            segmented_policy.TREE_MAXIMUM_FEATURE_AXES,
+        )
+
+    def test_kpart_chunk_grid_policy_contains_only_physical_schedule_axes(
+        self,
+    ) -> None:
+        """Serial-K-part routing must model the five forceable N task grids."""
+
+        axes = segmented_policy.FEATURE_AXES_BY_POLICY[
+            FeaturePolicy.KPART_CHUNK_GRID_SCHEDULES
+        ]
+        expected = (
+            *segmented_policy.BASE_FEATURE_AXES,
+            *(axis for axis, width in
+              segmented_policy.N_TILE_WIDTH_BY_AXIS.items() if width >= 64),
+            *(axis for axis, width in
+              segmented_policy.K_GROUPS_PER_N_TILE_WIDTH_BY_AXIS.items()
+              if width >= 64),
+            *(axis for axis, width in
+              segmented_policy.N_FINAL_TILE_WIDTH_BY_AXIS.items()
+              if width >= 64),
+            *(axis for axis, width in
+              segmented_policy.K_FINAL_TILE_WIDTH_BY_AXIS.items()
+              if width >= 64),
+            *(axis for axis, width in
+              segmented_policy.N_TILE_UTILIZATION_WIDTH_BY_AXIS.items()
+              if width >= 64),
+            *(axis for axis, width in
+              segmented_policy.N_TILE_ALIGNED_WIDTH_BY_AXIS.items()
+              if width >= 64),
+            *segmented_policy.N_PARALLEL_WAVE_WIDTH_BY_AXIS,
+            *segmented_policy.N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS,
+        )
+
+        self.assertEqual(axes, expected)
+        self.assertEqual(tuple(dict.fromkeys(axes)), axes)
+        self.assertFalse(
+            set(axes)
+            & (
+                set(segmented_policy.MN_PARALLEL_WAVE_WIDTH_BY_AXIS)
+                | set(segmented_policy.MN_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS)
+            )
+        )
+        self.assertNotIn(FeatureAxis.N_TILES_32, axes)
+        self.assertLessEqual(len(axes), 64)
+
+    def test_kpart_producer_policy_contains_partition_span_and_tail(self) -> None:
+        """Producer-grid fitting must see both task count and K work span."""
+
+        axes = segmented_policy.FEATURE_AXES_BY_POLICY[
+            FeaturePolicy.KPART_PRODUCER_GRID_SCHEDULES
+        ]
+        self.assertEqual(tuple(dict.fromkeys(axes)), axes)
+        self.assertTrue(
+            set(segmented_policy.KPART_PARTITION_GEOMETRY_AXES).issubset(axes)
+        )
+        self.assertTrue(
+            set(segmented_policy.KPART_PRODUCER_WAVE_WIDTH_BY_AXIS).issubset(
+                axes
+            )
+        )
+        self.assertTrue(
+            set(
+                segmented_policy.KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS
+            ).issubset(axes)
+        )
+
+    def test_kpart_complete_policy_combines_both_physical_schedule_grids(
+        self,
+    ) -> None:
+        """One tree must express joint N-chunk and K-partition rollovers."""
+
+        chunk_axes = segmented_policy.FEATURE_AXES_BY_POLICY[
+            FeaturePolicy.KPART_CHUNK_GRID_SCHEDULES
+        ]
+        producer_axes = segmented_policy.FEATURE_AXES_BY_POLICY[
+            FeaturePolicy.KPART_PRODUCER_GRID_SCHEDULES
+        ]
+        complete_axes = segmented_policy.FEATURE_AXES_BY_POLICY[
+            FeaturePolicy.KPART_COMPLETE_SCHEDULES
+        ]
+        expected = tuple(dict.fromkeys((*chunk_axes, *producer_axes)))
+
+        self.assertEqual(complete_axes, expected)
+        self.assertLess(set(chunk_axes), set(complete_axes))
+        self.assertLess(set(producer_axes), set(complete_axes))
+        self.assertNotIn(FeatureAxis.N_TILES_32, complete_axes)
+        self.assertFalse(
+            set(complete_axes)
+            & (
+                set(segmented_policy.MN_PARALLEL_WAVE_WIDTH_BY_AXIS)
+                | set(segmented_policy.MN_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS)
+            )
+        )
+        self.assertLessEqual(
+            len(complete_axes),
+            segmented_policy.TREE_MAXIMUM_FEATURE_AXES,
+        )
 
     def test_tree_beam_prioritizes_segment_p95_over_failure_count(self) -> None:
         """The same percentile used by installation must own beam ranking."""
@@ -1434,7 +1731,28 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertEqual(len(rocm_moe.entries), 12)
         self.assertEqual(len(rocm_decode.entries), 65)
         self.assertEqual(len(cpu_decode.entries), 5)
-        self.assertEqual(len(cpu.entries), 2)
+        self.assertEqual(len(cpu.entries), 9)
+        self.assertEqual(
+            {entry.config_json["policy"] for entry in cpu.entries},
+            {
+                "Pairwise",
+                "WideRows",
+                "FullKRowChunkGrid",
+                "FullKTwoRowNbc1",
+                "FullKTwoRowNbc2",
+                "FullKTwoRowPairGridNbc1",
+                "FullKTwoRowPairGridNbc2",
+                "FullKTwoRowPairGridNbc4",
+                "FullKTwoRowPairGridNbc8",
+            },
+        )
+        self.assertEqual(
+            sum(
+                entry.config_json.get("route") == "two_row_pair_grid"
+                for entry in cpu.entries
+            ),
+            4,
+        )
         self.assertEqual(len(cpu_prefill.entries), 13)
         self.assertEqual(
             cpu_prefill.entries[0].candidate_id,
@@ -1451,7 +1769,7 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             ),
             5,
         )
-        self.assertEqual(len(cuda.entries), 4489)
+        self.assertEqual(len(cuda.entries), 4495)
         self.assertEqual(
             {
                 entry.config_json["n_block_chunks"]
@@ -1507,11 +1825,14 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertTrue(public_m1.ordered_reduction)
         self.assertFalse(public_m1.uses_atomic_reduction)
 
-        cuda_verifier = cuda.resolve("INHERIT_SERIAL_M1")
+        cuda_verifier = cuda.resolve(
+            "cuda.nvnni.decode.verifier.inherit_serial_m1.r2"
+        )
         self.assertFalse(cuda_verifier.supports_contract(SemanticContract.FAST))
         self.assertTrue(cuda_verifier.supports_contract(
             SemanticContract.VERIFIER_SERIAL_M1_BITWISE
         ))
+        self.assertEqual(cuda_verifier.config_json["grouped_rows"], 2)
         self.assertTrue(cuda_verifier.ordered_reduction)
         self.assertFalse(cuda_verifier.uses_atomic_reduction)
         with self.assertRaisesRegex(ValueError, "unknown forceable candidate"):
@@ -1598,6 +1919,52 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             generic_candidates,
         )
         self.assertNotIn(concrete_id, generic_candidates)
+
+    def test_shape_resolved_cuda_aliases_share_registry_config_storage(self) -> None:
+        """Formula projection must not allocate one config mapping per alias."""
+
+        concrete_id = "cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb8"
+        concrete = dataclasses.replace(
+            observation(
+                candidate=concrete_id,
+                family="cuda_public_m1_kpar",
+                n=192,
+                k=256,
+                m=1,
+                contract=SemanticContract.FAST,
+            ),
+            backend=Backend.CUDA,
+            prepared_family_id=format_spec("Q4_0").prepared_family("cuda"),
+            packing_abi=format_spec("Q4_0").packing_abi("cuda"),
+            runtime_codebook_id=format_spec("Q4_0").runtime_codebook("cuda"),
+            observed_candidate_id=concrete_id,
+            config_json={
+                "family": "kpar",
+                "tile_n": 128,
+                "cpt": 1,
+                "exact_kb": 8,
+            },
+        )
+        sibling = dataclasses.replace(
+            concrete,
+            shape_group_id="shape-registry-config-sibling",
+            shape_name="shape-registry-config-sibling",
+        )
+        projected = project_cuda_shape_resolved_candidates(
+            ObservationCorpus((concrete, sibling))
+        )
+        formula_id = (
+            "cuda.nvnni.decode.fast_m1.kpar_formula."
+            "tn128.cpt1.tb328.mkg1"
+        )
+        formulas = tuple(
+            row for row in projected if row.candidate_id == formula_id
+        )
+
+        self.assertEqual(len(formulas), 2)
+        self.assertIs(formulas[0].config_json, formulas[1].config_json)
+        for row in formulas:
+            row.validate()
 
     @staticmethod
     def rocm_moe_raw_row(**overrides) -> dict[str, str]:
@@ -1851,6 +2218,44 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             "candidate.captured",
         )
 
+    def test_parallel_exact_winners_match_serial_runtime_key_order(self) -> None:
+        """Physical-core reduction must preserve exact policy bytes and order."""
+
+        rows = ObservationCorpus(tuple(
+            observation(
+                candidate=f"candidate.{candidate}",
+                family=f"family.{candidate}",
+                shape_group=f"shape-{shape:03d}",
+                n=256 + shape * 16,
+                k=1024 + shape * 32,
+                m=1,
+                latency_us=1.0 + candidate * 0.25,
+            )
+            for shape in range(40)
+            for candidate in range(2)
+        ))
+        with mock.patch.object(
+            exact_oracle_module,
+            "_physical_core_count",
+            return_value=2,
+        ), mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_EXACT_WINNER_WORKERS": "1"},
+        ):
+            serial = build_exact_winners(rows)
+        with mock.patch.object(
+            exact_oracle_module,
+            "_physical_core_count",
+            return_value=2,
+        ), mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_EXACT_WINNER_WORKERS": "2"},
+        ):
+            parallel = build_exact_winners(rows)
+
+        self.assertEqual(tuple(parallel), tuple(serial))
+        self.assertEqual(parallel, serial)
+
     def test_missing_alias_surface_cannot_win_or_quietly_fallback(self) -> None:
         rows = candidate_rows_for_aliases(
             "candidate.partial", {"Q4_1": 1.0}
@@ -1895,6 +2300,78 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertEqual(len(policy.rules), 1)
         self.assertEqual(policy.rules[0].candidate_id, "candidate.robust")
         self.assertLessEqual(policy.rules[0].development_max_regret, 0.02 + 1.0e-12)
+
+    def test_burned_seal_costs_change_generic_fit_without_exact_overlay(
+        self,
+    ) -> None:
+        """Ratio-only failed-seal evidence may influence only generic rules."""
+
+        rows = []
+        for index in range(20):
+            n = 512 + 32 * index
+            for candidate, latency in (
+                ("candidate.a", 10.0),
+                ("candidate.b", 10.1),
+            ):
+                rows.append(observation(
+                    candidate=candidate,
+                    family=candidate,
+                    shape_group=f"broad-{index}",
+                    n=n,
+                    k=4 * n,
+                    latency_us=latency,
+                ))
+        corpus = ObservationCorpus(rows)
+        domain = corpus.generic_domains()[0]
+        supplemental = []
+        supplemental_dimensions = ((3008, 12032), (3040, 12160))
+        exemplar = runtime_key(rows[0])
+        for index, (n, k) in enumerate(supplemental_dimensions):
+            key = dataclasses.replace(
+                exemplar,
+                projection_n_vector=(n,),
+                aggregate_n=n,
+                k=k,
+            )
+            for candidate, regret in (
+                ("candidate.a", 0.30),
+                ("candidate.b", 0.0),
+            ):
+                supplemental.append(segmented_policy.CandidatePointCost(
+                    runtime_key=key,
+                    shape_group_id=f"cpu-burned-seal:unit-{index}",
+                    candidate_id=candidate,
+                    max_surface_regret=regret,
+                    p95_surface_regret=regret,
+                    mean_surface_regret=regret,
+                ))
+
+        baseline = fit_generic_policy(corpus, max_leaves=1)
+        adapted = fit_generic_policy(
+            corpus,
+            max_leaves=1,
+            supplemental_development_costs={domain: tuple(supplemental)},
+        )
+        frozen = freeze_policy(
+            corpus,
+            sealed_commitment="sha256:" + "1" * 64,
+            split_manifest_digest="sha256:" + "2" * 64,
+            supplemental_development_costs={domain: tuple(supplemental)},
+            max_leaves=1,
+            require_promotable=False,
+        )
+
+        self.assertEqual(baseline.rules[0].candidate_id, "candidate.a")
+        self.assertFalse(adapted.rules)
+        self.assertIn(
+            adapted.cross_validation[0].worst_shape_group_id,
+            {"cpu-burned-seal:unit-0", "cpu-burned-seal:unit-1"},
+        )
+        exact_dimensions = {
+            (entry.key.aggregate_n, entry.key.k)
+            for entry in frozen.policy_ir.exact_entries
+        }
+        self.assertTrue(set(supplemental_dimensions).isdisjoint(exact_dimensions))
 
     def test_low_winner_label_accuracy_can_pass_when_all_regret_is_below_three_pct(self) -> None:
         rows = []
@@ -2035,17 +2512,17 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             rejected.worst_exact_candidate_id,
         )
 
-    def test_domain_promotion_quota_is_exactly_ninety_nine_percent(self) -> None:
+    def test_domain_promotion_quota_is_exactly_ninety_five_percent(self) -> None:
         """The corpus gate is inclusive while every domain gate stays strict."""
 
         self.assertTrue(
-            segmented_policy.domain_promotion_quota_is_satisfied(99, 100)
+            segmented_policy.domain_promotion_quota_is_satisfied(95, 100)
         )
         self.assertTrue(
-            segmented_policy.domain_promotion_quota_is_satisfied(2494, 2501)
+            segmented_policy.domain_promotion_quota_is_satisfied(19, 20)
         )
         self.assertFalse(
-            segmented_policy.domain_promotion_quota_is_satisfied(98, 99)
+            segmented_policy.domain_promotion_quota_is_satisfied(94, 99)
         )
         self.assertFalse(
             segmented_policy.domain_promotion_quota_is_satisfied(0, 0)
@@ -2053,12 +2530,63 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside the required domain"):
             segmented_policy.domain_promotion_quota_is_satisfied(101, 100)
 
-    def test_ninety_nine_percent_policy_keeps_exception_domain_total(self) -> None:
+    def test_manual_domain_quota_preserves_structural_nonempty_requirement(self) -> None:
+        """A zero best-effort quota admits misses but never an empty corpus."""
+
+        self.assertTrue(
+            segmented_policy.domain_promotion_quota_is_satisfied(
+                0,
+                100,
+                minimum_passing_fraction=0.0,
+            )
+        )
+        self.assertFalse(
+            segmented_policy.domain_promotion_quota_is_satisfied(
+                0,
+                0,
+                minimum_passing_fraction=0.0,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "fraction must be in"):
+            segmented_policy.domain_promotion_quota_is_satisfied(
+                1,
+                1,
+                minimum_passing_fraction=1.01,
+            )
+
+    def test_promotion_percent_environment_is_parsed_in_one_common_module(self) -> None:
+        """Every analyzer process must observe identical manual criteria."""
+
+        environment = {
+            **os.environ,
+            "PYTHONPATH": str(KERNEL_PERF_ROOT),
+            "LLAMINAR_NATIVE_VNNI_PROMOTION_P95_REGRET_PERCENT": "12.5",
+            "LLAMINAR_NATIVE_VNNI_PROMOTION_MIN_PASSING_DOMAIN_PERCENT": "0",
+        }
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from native_vnni_dispatch.schema import "
+                    "P95_REGRET_BUDGET,MINIMUM_PASSING_DOMAIN_FRACTION;"
+                    "print(P95_REGRET_BUDGET,MINIMUM_PASSING_DOMAIN_FRACTION)"
+                ),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(completed.stdout.strip(), "0.125 0.0")
+
+    def test_ninety_five_percent_policy_keeps_exception_domains_total(self) -> None:
         """A permitted performance exception must still own a generic tree."""
 
         rows = []
         for m in range(1, 101):
-            shape_count = 6 if m == 100 else 3
+            is_exception = m > 95
+            shape_count = 6 if is_exception else 3
             for shape_index in range(shape_count):
                 exception_a_is_fast = shape_index < shape_count // 2
                 rows.extend((
@@ -2070,7 +2598,7 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                         n=256 + 64 * shape_index,
                         latency_us=(
                             1.0
-                            if m != 100 or exception_a_is_fast
+                            if not is_exception or exception_a_is_fast
                             else 2.0
                         ),
                     ),
@@ -2082,7 +2610,7 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                         n=256 + 64 * shape_index,
                         latency_us=(
                             1.10
-                            if m != 100
+                            if not is_exception
                             else (2.0 if exception_a_is_fast else 1.0)
                         ),
                     ),
@@ -2098,12 +2626,20 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             )
 
         self.assertFalse(policy.unpromoted_domains)
-        self.assertEqual(len(policy.promotion_diagnostics), 1)
-        exception = policy.promotion_diagnostics[0]
-        self.assertEqual(exception.domain.m, 100)
-        self.assertEqual(exception.rejection_stage, "cross_validation_p95")
+        self.assertEqual(len(policy.promotion_diagnostics), 5)
+        self.assertEqual(
+            {diagnostic.domain.m for diagnostic in policy.promotion_diagnostics},
+            {96, 97, 98, 99, 100},
+        )
+        self.assertTrue(all(
+            diagnostic.rejection_stage == "cross_validation_p95"
+            for diagnostic in policy.promotion_diagnostics
+        ))
         self.assertEqual(len({rule.domain for rule in policy.rules}), 100)
-        self.assertIsNotNone(policy.resolve(exception.domain, 256, 2048))
+        for diagnostic in policy.promotion_diagnostics:
+            self.assertIsNotNone(
+                policy.resolve(diagnostic.domain, 256, 2048)
+            )
 
     def test_final_fit_p95_failure_retains_separate_diagnostic(self) -> None:
         """A full-development leaf failure must not look like a CV miss."""
@@ -2237,6 +2773,110 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             1.0 / 0.9 - 1.0,
         )
 
+    def test_paired_ratios_pool_true_source_aliases_by_runtime_identity(self) -> None:
+        """Packed aliases cannot teach opposite policies for one CPU launch."""
+
+        rows = []
+        for source_format in ("IQ4_NL", "IQ4_XS"):
+            rows.extend((
+                observation(
+                    backend=Backend.CPU,
+                    contract=SemanticContract.FAST,
+                    mode=ExecutionMode.EAGER,
+                    m=1,
+                    source_format=source_format,
+                    candidate="candidate.selected",
+                    family="selected",
+                    shape_group="paired-alias-shape",
+                    latency_us=11.0,
+                ),
+                observation(
+                    backend=Backend.CPU,
+                    contract=SemanticContract.FAST,
+                    mode=ExecutionMode.EAGER,
+                    m=1,
+                    source_format=source_format,
+                    candidate="candidate.exact",
+                    family="exact",
+                    shape_group="paired-alias-shape",
+                    latency_us=10.0,
+                ),
+            ))
+        corpus = ObservationCorpus(rows)
+        cells = []
+        for source_format, ratio in (("IQ4_NL", 0.9), ("IQ4_XS", 1.1)):
+            exemplar = next(
+                row for row in rows if row.source_format == source_format
+            )
+            pair_key = PairedCellKey(
+                backend=exemplar.backend.value,
+                source_format=exemplar.source_format,
+                source_codebook=exemplar.source_codebook_id,
+                execution_codebook=exemplar.runtime_codebook_id,
+                shape=exemplar.shape_name,
+                execution_mode=exemplar.execution_mode.value,
+                m=exemplar.m,
+                n=exemplar.aggregate_n,
+                k=exemplar.k,
+                architecture_class=exemplar.architecture_class,
+            )
+            cells.append(PairedCellEvidence(
+                key=pair_key,
+                selected_candidate_id="candidate.selected",
+                exact_candidate_id="candidate.exact",
+                selected_latency_us=(ratio * 10.0,) * 30,
+                exact_latency_us=(10.0,) * 30,
+                selected_first_count=15,
+                exact_first_count=15,
+            ))
+
+        corrected = next(iter(build_candidate_point_costs(
+            corpus,
+            paired_comparisons=paired_timing_comparisons(cells),
+        ).values()))
+        by_candidate = {cost.candidate_id: cost for cost in corrected}
+        pooled_ratio = math.sqrt(0.9 * 1.1)
+        self.assertEqual(
+            by_candidate["candidate.selected"].max_surface_regret,
+            0.0,
+        )
+        self.assertAlmostEqual(
+            by_candidate["candidate.exact"].max_surface_regret,
+            1.0 / pooled_ratio - 1.0,
+        )
+
+    def test_nominal_aliases_of_one_effective_launch_have_zero_regret(self) -> None:
+        """Repeated policy names cannot make one physical launch beat itself."""
+
+        rows = tuple(
+            dataclasses.replace(
+                observation(
+                    candidate=candidate,
+                    family="nominal-alias",
+                    shape_group="effective-alias-shape",
+                    latency_us=latency,
+                ),
+                effective_candidate_id="physical.launch.same",
+                observed_candidate_id="physical.launch.same",
+            )
+            for candidate, latency in (
+                ("candidate.alias-a", 10.0),
+                ("candidate.alias-b", 20.0),
+            )
+        )
+
+        costs = next(iter(build_candidate_point_costs(
+            ObservationCorpus(rows)
+        ).values()))
+
+        self.assertEqual(
+            {cost.candidate_id: cost.max_surface_regret for cost in costs},
+            {
+                "candidate.alias-a": 0.0,
+                "candidate.alias-b": 0.0,
+            },
+        )
+
     def test_grouped_cv_selects_two_leaves_and_uses_midpoint_boundary(self) -> None:
         rows = []
         lower_ns = (128, 160, 192)
@@ -2366,8 +3006,36 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 min_shape_groups_per_leaf=2,
             )
         )
+        (
+            candidate_tasks,
+            prepared_frontiers,
+            targets_by_context,
+        ) = segmented_policy._prepare_accelerated_final_candidates(((
+            domain,
+            costs,
+            tuple(rows),
+            (validation,),
+            (),
+            2,
+            2,
+        ),))
+        split_results = tuple(
+            (
+                context_index,
+                segmented_policy._fit_cross_fitted_publication_candidate(
+                    candidate_args
+                ),
+            )
+            for context_index, candidate_args in candidate_tasks
+        )
+        split_fits = segmented_policy._reduce_accelerated_final_candidates(
+            split_results,
+            prepared_frontiers,
+            targets_by_context,
+        )
 
         self.assertEqual(len(rules), 2)
+        self.assertEqual(split_fits, [(domain, rules, fitted_validation)])
         self.assertEqual(fitted_validation.publication_oof_p95_regret, 0.0)
         self.assertEqual(fitted_validation.publication_oof_mismatch_count, 0)
         self.assertEqual(
@@ -2382,6 +3050,120 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             next(rule for rule in rules if rule.matches(288, 2048)).candidate_id,
             "candidate.high",
         )
+
+    def test_publication_frontier_contains_only_durable_cv_winner(self) -> None:
+        """Cold publication must not fit runner-ups absent from a resumed fit."""
+
+        winner = mock.Mock(
+            spec=segmented_policy.DomainCrossValidation,
+            required_point_count=12,
+            covered_point_count=12,
+        )
+        runner_up = mock.Mock(
+            spec=segmented_policy.DomainCrossValidation,
+            required_point_count=12,
+            covered_point_count=12,
+        )
+
+        frontier = segmented_policy._publication_validation_frontier(winner)
+
+        self.assertEqual(frontier, (winner,))
+        self.assertNotIn(runner_up, frontier)
+        self.assertEqual(
+            segmented_policy._publication_validation_frontier(None), ()
+        )
+        incomplete = mock.Mock(
+            spec=segmented_policy.DomainCrossValidation,
+            required_point_count=12,
+            covered_point_count=11,
+        )
+        self.assertEqual(
+            segmented_policy._publication_validation_frontier(incomplete), ()
+        )
+
+    def test_final_publication_tree_can_represent_union_of_fold_boundaries(self) -> None:
+        """OOF distillation may need more leaves than each independent fold."""
+
+        rows = []
+        selected_by_group = {}
+        for index, n in enumerate(range(128, 384, 32)):
+            selected = "candidate.low" if (index // 2) % 2 == 0 else "candidate.high"
+            selected_by_group[f"publication-bound-{index}"] = selected
+            rows.extend((
+                observation(
+                    candidate="candidate.low",
+                    family="low",
+                    shape_group=f"publication-bound-{index}",
+                    n=n,
+                    latency_us=10.0 if selected == "candidate.low" else 14.0,
+                ),
+                observation(
+                    candidate="candidate.high",
+                    family="high",
+                    shape_group=f"publication-bound-{index}",
+                    n=n,
+                    latency_us=10.0 if selected == "candidate.high" else 14.0,
+                ),
+            ))
+        corpus = ObservationCorpus(rows)
+        domain = corpus.generic_domains()[0]
+        costs = build_candidate_point_costs(corpus)[domain]
+        cells = tuple(
+            segmented_policy.CrossValidationCell(
+                runtime_key=cost.runtime_key,
+                shape_group_id=cost.shape_group_id,
+                selected_candidate_id=selected_by_group[cost.shape_group_id],
+                exact_candidate_id=selected_by_group[cost.shape_group_id],
+                observed_broad_regret=0.0,
+            )
+            for cost in costs
+            if cost.candidate_id == selected_by_group[cost.shape_group_id]
+        )
+        validation = segmented_policy.DomainCrossValidation(
+            domain=domain,
+            selected_feature_policy=FeaturePolicy.CONTINUOUS,
+            selected_max_leaves=2,
+            selected_boundary_placement=BoundaryPlacement.MIDPOINT,
+            selected_profiler_influence=(
+                segmented_policy.ProfilerInfluence.MEASURED_ONLY
+            ),
+            fold_count=5,
+            shape_group_count=len(cells),
+            required_point_count=len(cells),
+            covered_point_count=len(cells),
+            max_regret=0.0,
+            p95_regret=0.0,
+            mean_regret=0.0,
+            worst_shape_group_id=cells[0].shape_group_id,
+            worst_aggregate_n=cells[0].runtime_key.aggregate_n,
+            worst_k=cells[0].runtime_key.k,
+            worst_selected_candidate_id=cells[0].selected_candidate_id,
+            worst_exact_candidate_id=cells[0].exact_candidate_id,
+            cells=cells,
+        )
+
+        rules, fitted = segmented_policy._fit_cross_fitted_publication_rules(
+            domain,
+            costs,
+            rows,
+            validation,
+            max_leaves=4,
+            min_shape_groups_per_leaf=2,
+        )
+
+        # Each held-out fold selected at most two leaves, but their alternating
+        # cross-fitted decisions form four stable regions once all OOF labels
+        # are assembled. Artificially retaining the fold-local two-leaf cap
+        # makes the final generic tree merge unlike regions and fail its hard
+        # per-leaf measured-p95 gate.
+        self.assertGreater(len(rules), validation.selected_max_leaves)
+        self.assertLessEqual(len(rules), 4)
+        self.assertEqual(fitted.publication_max_leaves, len(rules))
+        self.assertEqual(fitted.publication_oof_p95_regret, 0.0)
+        self.assertTrue(all(
+            rule.development_p95_regret < P95_REGRET_BUDGET
+            for rule in rules
+        ))
 
     def test_grouped_cv_retains_competitive_model_edges_for_one_batch(self) -> None:
         """The planner sees alternate model misses before the fit discards them."""
@@ -2749,10 +3531,71 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertTrue(all(
             validation.cells for validation in serial.cross_validation
         ))
-        self.assertTrue(all(
-            not validation.competitive_cells
+        self.assertTrue(any(
+            validation.competitive_cells
             for validation in serial.cross_validation
         ))
+
+    def test_parallel_domain_fold_plans_match_serial_and_cap_workers(self) -> None:
+        """Parallel task assembly preserves order and excludes SMT workers."""
+
+        rows = []
+        for mode in (
+            ExecutionMode.EAGER,
+            ExecutionMode.GRAPH_CAPTURED,
+        ):
+            for source_format in ("Q4_0", "Q5_0"):
+                for index, n in enumerate((128, 160, 192, 288, 320, 384)):
+                    for candidate, latency in (
+                        ("candidate.low", 10.0),
+                        ("candidate.high", 11.0),
+                    ):
+                        rows.append(observation(
+                            source_format=source_format,
+                            candidate=candidate,
+                            family=candidate,
+                            shape_group=(
+                                f"parallel-plan-{mode.value}-{source_format}-"
+                                f"{index}"
+                            ),
+                            n=n,
+                            latency_us=latency,
+                            mode=mode,
+                        ))
+        corpus = ObservationCorpus(rows)
+        costs = build_candidate_point_costs(corpus)
+        plan_tasks = tuple(
+            (
+                domain,
+                costs[domain],
+                2,
+                2,
+                "unit-parallel-domain-plan",
+                None,
+            )
+            for domain in corpus.generic_domains()
+        )
+        serial, serial_workers = segmented_policy._construct_domain_fold_plans(
+            plan_tasks,
+            profiler_prediction_cache=None,
+            requested_workers=1,
+        )
+        with mock.patch.object(
+            segmented_policy,
+            "_physical_core_worker_count",
+            return_value=2,
+        ):
+            parallel, parallel_workers = (
+                segmented_policy._construct_domain_fold_plans(
+                    plan_tasks,
+                    profiler_prediction_cache=None,
+                    requested_workers=99,
+                )
+            )
+
+        self.assertEqual(serial_workers, 1)
+        self.assertEqual(parallel_workers, 2)
+        self.assertEqual(parallel, serial)
 
     def test_fit_cache_retrains_only_the_domain_touched_by_paired_evidence(self) -> None:
         """A new tournament edge cannot force unrelated mode domains to refit."""
@@ -2898,6 +3741,69 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                     )
                 self.assertEqual(cached_fit, paired_fit)
 
+    def test_current_fit_cache_miss_never_hashes_full_profiler_provenance(
+        self,
+    ) -> None:
+        """Current model keys must not rebuild the obsolete catalog identity."""
+
+        rows = tuple(
+            observation(
+                candidate=candidate,
+                family=candidate,
+                shape_group=f"profiler-cache-{point}",
+                n=128 + point * 32,
+                latency_us=latency,
+            )
+            for point in range(6)
+            for candidate, latency in (
+                ("candidate.low", 10.0),
+                ("candidate.high", 11.0),
+            )
+        )
+        corpus = ObservationCorpus(rows)
+        descriptors = {}
+        for row in rows:
+            key = _physical_key(row)
+            descriptors[key] = ProfilerCandidateDescriptor(
+                key=key,
+                anchor_m=row.m,
+                anchor_n=row.aggregate_n,
+                anchor_k=row.k,
+                features={},
+            )
+        catalog = ProfilerFeatureCatalog(
+            corpus_digest=corpus.digest(),
+            request_manifest_digest="sha256:requests",
+            evidence_manifest_digest="sha256:evidence",
+            descriptors=descriptors,
+        )
+
+        def reject_obsolete_digest(_catalog) -> str:
+            raise AssertionError("full profiler provenance digest was requested")
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+            ),
+            mock.patch.object(
+                ProfilerFeatureCatalog,
+                "digest",
+                new=property(reject_obsolete_digest),
+            ),
+        ):
+            policy = fit_generic_policy(
+                corpus,
+                max_leaves=1,
+                fit_final_rules=False,
+                policy_accelerators=(),
+                fit_cache=PolicyFitCache(Path(directory)),
+                profiler_feature_catalog=catalog,
+            )
+
+        self.assertEqual(len(policy.cross_validation), 1)
+
     def test_fit_cache_publishes_only_the_final_stable_cv_model(self) -> None:
         """Immutable cache keys cannot first receive a provisional CV winner."""
 
@@ -2958,6 +3864,13 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             )
             self.assertEqual(len(cache_files), 1)
             cached = json.loads(cache_files[0].read_text(encoding="utf-8"))
+            final_cache_files = tuple(
+                (Path(directory) / "domain-final-fit").glob("*.json")
+            )
+            self.assertEqual(len(final_cache_files), 1)
+            cached_final = json.loads(
+                final_cache_files[0].read_text(encoding="utf-8")
+            )
 
             final_fit.reset_mock()
             final_fit.side_effect = AssertionError(
@@ -2982,9 +3895,16 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         )
         self.assertEqual(
             cached["validation"]["selected_feature_policy"],
+            selected.selected_feature_policy.value,
+        )
+        self.assertEqual(
+            cached_final["validation"]["selected_feature_policy"],
             FeaturePolicy.TILE_32.value,
         )
-        self.assertEqual(len(cached["final_rules"]), len(baseline.rules))
+        self.assertIsNone(cached["final_rules"])
+        self.assertEqual(
+            len(cached_final["final_rules"]), len(baseline.rules)
+        )
         self.assertEqual(replay, fitted)
 
     def test_fit_cache_identity_changes_only_with_its_domain_rows(self) -> None:
@@ -3247,8 +4167,204 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertNotEqual(changed, baseline)
         self.assertNotEqual(legacy, baseline)
 
-    def test_fit_cache_separates_paired_planning_from_final_fitting(self) -> None:
-        """A selected planning model cannot truncate production's frontier."""
+    def test_additive_feature_policy_scores_only_new_family(self) -> None:
+        """A cached prior tournament must not replay unchanged tree families."""
+
+        rows = []
+        for point, n in enumerate((128, 160, 192, 224, 256, 288)):
+            rows.extend((
+                observation(
+                    candidate="candidate.low",
+                    family="low",
+                    shape_group=f"incremental-policy-{point}",
+                    n=n,
+                    latency_us=10.0,
+                ),
+                observation(
+                    candidate="candidate.high",
+                    family="high",
+                    shape_group=f"incremental-policy-{point}",
+                    n=n,
+                    latency_us=11.0,
+                ),
+            ))
+        corpus = ObservationCorpus(rows)
+        added_policy = FeaturePolicy.KPART_CHUNK_GRID_SCHEDULES
+        predecessor_policies = tuple(
+            policy
+            for policy in segmented_policy.FEATURE_POLICIES
+            if policy != added_policy
+        )
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            cache = PolicyFitCache(Path(directory))
+            with mock.patch.object(
+                segmented_policy,
+                "FEATURE_POLICIES",
+                predecessor_policies,
+            ):
+                fit_generic_policy(
+                    corpus,
+                    max_leaves=2,
+                    fit_final_rules=False,
+                    policy_accelerators=(),
+                    fit_cache=cache,
+                )
+
+            with mock.patch.object(
+                segmented_policy,
+                "_evaluate_placement_fold",
+                wraps=segmented_policy._evaluate_placement_fold,
+            ) as evaluate:
+                incremental = fit_generic_policy(
+                    corpus,
+                    max_leaves=2,
+                    fit_final_rules=False,
+                    policy_accelerators=(),
+                    fit_cache=cache,
+                )
+            fresh = fit_generic_policy(
+                corpus,
+                max_leaves=2,
+                fit_final_rules=False,
+                policy_accelerators=(),
+            )
+
+        self.assertTrue(evaluate.call_args_list)
+        self.assertEqual(
+            {
+                call.args[0][3]
+                for call in evaluate.call_args_list
+            },
+            {added_policy},
+        )
+        self.assertEqual(
+            segmented_policy._cross_validation_mapping(
+                incremental.cross_validation[0]
+            ),
+            segmented_policy._cross_validation_mapping(
+                fresh.cross_validation[0]
+            ),
+        )
+
+    def test_one_leaf_cv_removes_predicate_only_tournament_duplicates(
+        self,
+    ) -> None:
+        """An unsplit tree must score one canonical feature/threshold pair."""
+
+        rows = []
+        for point, n in enumerate((128, 160, 192, 224, 256, 288)):
+            rows.extend((
+                observation(
+                    candidate="candidate.low",
+                    family="low",
+                    shape_group=f"one-leaf-{point}",
+                    n=n,
+                    latency_us=10.0,
+                ),
+                observation(
+                    candidate="candidate.high",
+                    family="high",
+                    shape_group=f"one-leaf-{point}",
+                    n=n,
+                    latency_us=11.0,
+                ),
+            ))
+        corpus = ObservationCorpus(rows)
+        domain = generic_domain(rows[0])
+        costs = build_candidate_point_costs(corpus)[domain]
+
+        one_leaf_tasks, fold_count = segmented_policy._domain_fold_tasks(
+            domain,
+            costs,
+            max_leaves=1,
+            min_shape_groups_per_leaf=2,
+            seed="one-leaf-dedup",
+        )
+        split_tasks, split_fold_count = segmented_policy._domain_fold_tasks(
+            domain,
+            costs,
+            max_leaves=2,
+            min_shape_groups_per_leaf=2,
+            seed="one-leaf-dedup",
+        )
+
+        self.assertEqual(fold_count, split_fold_count)
+        self.assertEqual(len(one_leaf_tasks), fold_count)
+        self.assertEqual(
+            {(task[3], task[4]) for task in one_leaf_tasks},
+            {(FeaturePolicy.CONTINUOUS, BoundaryPlacement.MIDPOINT)},
+        )
+        self.assertEqual(
+            len(split_tasks),
+            fold_count
+            * len(segmented_policy.FEATURE_POLICIES)
+            * len(segmented_policy.BOUNDARY_PLACEMENTS),
+        )
+
+    def test_parallel_profiler_prediction_cache_keys_match_serial(self) -> None:
+        """Forked cache lookup preserves every persistent surface identity."""
+
+        exemplar = observation()
+        runtime = runtime_key(exemplar)
+        pool_key = ("cpu", "unit-pool")
+        request_keys = tuple(
+            (pool_key, ((128 + index * 32, 4096),))
+            for index in range(4)
+        )
+        prediction_points = {
+            request_key: frozenset((
+                (runtime, f"shape-{point}", f"candidate-{point}"),
+            ))
+            for point, request_key in enumerate(request_keys)
+        }
+        training_digests = {pool_key: "sha256:training"}
+        model_digests = {pool_key: "sha256:model"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = PolicyFitCache(Path(directory))
+            serial_cache = {}
+            serial_keys, serial_workers, serial_hits = (
+                segmented_policy._load_persistent_profiler_prediction_cache(
+                    request_keys,
+                    prediction_points,
+                    serial_cache,
+                    cache,
+                    training_digests,
+                    model_digests,
+                    requested_workers=1,
+                )
+            )
+            with mock.patch.object(
+                segmented_policy,
+                "_physical_core_worker_count",
+                return_value=2,
+            ):
+                parallel_cache = {}
+                parallel_keys, parallel_workers, parallel_hits = (
+                    segmented_policy._load_persistent_profiler_prediction_cache(
+                        request_keys,
+                        prediction_points,
+                        parallel_cache,
+                        cache,
+                        training_digests,
+                        model_digests,
+                        requested_workers=99,
+                    )
+                )
+
+        self.assertEqual(serial_workers, 1)
+        self.assertEqual(parallel_workers, 2)
+        self.assertEqual(serial_hits, 0)
+        self.assertEqual(parallel_hits, 0)
+        self.assertEqual(parallel_keys, serial_keys)
+        self.assertEqual(parallel_cache, serial_cache)
+
+    def test_fit_cache_shares_cv_identity_between_planning_and_publication(self) -> None:
+        """Publication is a derivative of planning CV, not a second search."""
 
         domain = generic_domain(observation())
         cache = PolicyFitCache(Path("unused-selection-mode-cache"))
@@ -3272,10 +4388,10 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             **arguments,
         )
 
-        self.assertNotEqual(production, planning)
+        self.assertEqual(production, planning)
 
-    def test_planning_cache_cannot_satisfy_production_fit(self) -> None:
-        """Production writes its own final-frontier-selected cache record."""
+    def test_planning_cache_satisfies_production_cv_without_refitting(self) -> None:
+        """Freeze fits final leaves while reusing every certified CV fold."""
 
         rows = []
         for point, n in enumerate((128, 160, 192, 224, 256, 288)):
@@ -3302,19 +4418,53 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             planning_records = tuple(
                 (Path(directory) / "domain-cross-validation").glob("*.json")
             )
-            production = fit_generic_policy(
-                corpus,
-                max_leaves=1,
-                fit_final_rules=True,
-                fit_cache=cache,
-            )
+            with mock.patch.object(
+                segmented_policy,
+                "_evaluate_placement_fold",
+                side_effect=AssertionError("certified CV was recomputed"),
+            ), mock.patch.object(
+                segmented_policy,
+                "_populate_profiler_prediction_cache",
+                side_effect=AssertionError("cached CV rebuilt profiler models"),
+            ):
+                production = fit_generic_policy(
+                    corpus,
+                    max_leaves=1,
+                    fit_final_rules=True,
+                    fit_cache=cache,
+                )
             production_records = tuple(
                 (Path(directory) / "domain-cross-validation").glob("*.json")
             )
+            final_records = tuple(
+                (Path(directory) / "domain-final-fit").glob("*.json")
+            )
+
+            with mock.patch.object(
+                segmented_policy,
+                "_evaluate_placement_fold",
+                side_effect=AssertionError("certified CV was recomputed"),
+            ), mock.patch.object(
+                segmented_policy,
+                "_fit_final_domain",
+                side_effect=AssertionError("final leaves were recomputed"),
+            ), mock.patch.object(
+                PolicyFitCache,
+                "load_costs",
+                side_effect=AssertionError("cached final fit loaded costs"),
+            ):
+                replay = fit_generic_policy(
+                    corpus,
+                    max_leaves=1,
+                    fit_final_rules=True,
+                    fit_cache=cache,
+                )
 
         self.assertEqual(len(planning_records), 1)
-        self.assertEqual(len(production_records), 2)
+        self.assertEqual(len(production_records), 1)
+        self.assertEqual(len(final_records), 1)
         self.assertTrue(production.cross_validation[0].cells)
+        self.assertEqual(replay, production)
 
     def test_fit_cache_promotes_legacy_global_serial_hash_keys(self) -> None:
         """Current v6 global-key records migrate without recomputing policy."""
@@ -3415,6 +4565,50 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "identity mismatch"):
                 cache.load_costs(content_key, domain)
+
+    def test_fit_cache_ignores_obsolete_schema_during_domain_scan(self) -> None:
+        """Derived v13 state must not block a resumable v14 corpus refit."""
+
+        exemplar = observation()
+        domain = generic_domain(exemplar)
+        with tempfile.TemporaryDirectory() as directory:
+            cache = PolicyFitCache(Path(directory))
+            path = cache._path("domain-cross-validation", "1" * 64)
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({
+                "schema_version": "native-vnni-policy-fit-cache-v13",
+                "kind": "domain-cross-validation",
+                "content_key": "1" * 64,
+                "domain": segmented_policy._generic_domain_mapping(domain),
+                "validation": None,
+                "final_rules": None,
+            }), encoding="utf-8")
+
+            self.assertFalse(cache.has_validation_entry_for_domain(domain))
+            self.assertTrue(path.exists(), "obsolete derived state is retained")
+
+    def test_fit_cache_indexes_validation_domains_once_and_tracks_writes(
+        self,
+    ) -> None:
+        """Legacy migration lookup stays linear and sees same-run writes."""
+
+        exemplar = observation()
+        first = generic_domain(exemplar)
+        second = dataclasses.replace(first, m=first.m + 1)
+        with tempfile.TemporaryDirectory() as directory:
+            cache = PolicyFitCache(Path(directory))
+            first_key = "1" * 64
+            cache.store_validation(first_key, first, None)
+
+            self.assertTrue(cache.has_validation_entry_for_domain(first))
+            index = cache._validation_domain_index
+            self.assertFalse(cache.has_validation_entry_for_domain(second))
+            self.assertIs(cache._validation_domain_index, index)
+
+            second_key = "2" * 64
+            cache.store_validation(second_key, second, None)
+            self.assertTrue(cache.has_validation_entry_for_domain(second))
+            self.assertIs(cache._validation_domain_index, index)
 
     def test_equivalent_dimension_cuts_prefer_k_partition_axis(self) -> None:
         """Correlated N must not hide the K dimension governing reduction."""
@@ -3756,11 +4950,76 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 "domain_promotion_quota_satisfied"
             ] = False
             policy_path.write_text(json.dumps(failed_domain), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "does not reach 99%"):
+            with self.assertRaisesRegex(ValueError, "does not reach 95%"):
                 validate_installable_policy_artifact(
                     policy_path,
                     include_path=include_path,
                 )
+
+    def test_best_effort_artifact_retains_misses_and_uses_frozen_quota(self) -> None:
+        """A manual zero quota installs measured trees without hiding regret."""
+
+        development = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="dev-a", n=256),
+            observation(candidate="candidate.b", shape_group="dev-a", n=256, latency_us=11.0),
+            observation(candidate="candidate.a", shape_group="dev-b", n=384),
+            observation(candidate="candidate.b", shape_group="dev-b", n=384, latency_us=11.0),
+            observation(candidate="candidate.a", shape_group="dev-c", n=448),
+            observation(candidate="candidate.b", shape_group="dev-c", n=448, latency_us=11.0),
+        ])
+        sealed = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="sealed", n=512),
+            observation(candidate="candidate.b", shape_group="sealed", n=512, latency_us=11.0),
+        ])
+        frozen = freeze_policy(
+            development,
+            sealed_commitment="sha256:sealed-shape-inventory",
+            split_manifest_digest="sha256:split-manifest",
+        )
+        compiled = certify_frozen_policy(frozen, development, sealed)
+        failed_cells = tuple(
+            dataclasses.replace(
+                cell,
+                observed_worst_surface_regret=0.50,
+                simultaneous_95pct_upper_regret=0.60,
+            )
+            for cell in compiled.certification.cells
+        )
+        metadata = {
+            **compiled.policy_ir.metadata,
+            "promotion_minimum_passing_domain_fraction": 0.0,
+        }
+        best_effort = CompiledPolicy(
+            dataclasses.replace(compiled.policy_ir, metadata=metadata),
+            dataclasses.replace(
+                compiled.certification,
+                cells=failed_cells,
+                minimum_passing_domain_fraction=0.0,
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            policy_path = root / "policy.json"
+            include_path = root / "policy.inc"
+            write_compiled_policy(policy_path, best_effort)
+            include_path.write_text(
+                f"// Common policy digest: {best_effort.policy_ir.digest()}\n"
+                "// Frozen generic policy digest: "
+                f"{best_effort.policy_ir.digest(generic_only=True)}\n",
+                encoding="utf-8",
+            )
+            payload = validate_installable_policy_artifact(
+                policy_path,
+                include_path=include_path,
+            )
+
+        certificate = payload["certification"]
+        self.assertEqual(certificate["passing_domain_count"], 0)
+        self.assertTrue(certificate["domain_promotion_quota_satisfied"])
+        self.assertFalse(
+            certificate["domain_results"][0]["passes_p95_budget"]
+        )
 
     def test_sealed_p95_allows_exactly_five_percent_diagnostic_outliers(self) -> None:
         """Nearest-rank p95, not the maximum, owns the installation decision."""
@@ -3822,8 +5081,8 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "p95 observed regret"):
             six_outliers.require_promotable()
 
-    def test_sealed_promotion_requires_ninety_nine_percent_of_domains(self) -> None:
-        """One of 100 over-budget domains is diagnostic; two block promotion."""
+    def test_sealed_promotion_requires_ninety_five_percent_of_domains(self) -> None:
+        """Five of 100 over-budget domains are diagnostic; six block promotion."""
 
         development = ObservationCorpus([
             observation(candidate="candidate.a", shape_group="dev-a", n=256),
@@ -3874,32 +5133,40 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             )
             for index in range(100)
         )
-        ninety_nine_percent = dataclasses.replace(
+        ninety_five_percent = dataclasses.replace(
             report,
-            cells=cells,
-            sealed_cell_count=100,
-            required_cell_count=100,
-            covered_cell_count=100,
-        )
-
-        self.assertEqual(ninety_nine_percent.required_domain_count, 100)
-        self.assertEqual(ninety_nine_percent.passing_domain_count(), 99)
-        ninety_nine_percent.require_promotable()
-
-        ninety_eight_percent = dataclasses.replace(
-            ninety_nine_percent,
             cells=tuple(
                 dataclasses.replace(
                     cell,
                     observed_worst_surface_regret=0.50,
                     simultaneous_95pct_upper_regret=0.60,
                 )
-                if index == 98 else cell
-                for index, cell in enumerate(ninety_nine_percent.cells)
+                if index >= 95 else cell
+                for index, cell in enumerate(cells)
+            ),
+            sealed_cell_count=100,
+            required_cell_count=100,
+            covered_cell_count=100,
+        )
+
+        self.assertEqual(ninety_five_percent.required_domain_count, 100)
+        self.assertEqual(ninety_five_percent.passing_domain_count(), 95)
+        ninety_five_percent.require_promotable()
+
+        ninety_four_percent = dataclasses.replace(
+            ninety_five_percent,
+            cells=tuple(
+                dataclasses.replace(
+                    cell,
+                    observed_worst_surface_regret=0.50,
+                    simultaneous_95pct_upper_regret=0.60,
+                )
+                if index == 94 else cell
+                for index, cell in enumerate(ninety_five_percent.cells)
             ),
         )
-        with self.assertRaisesRegex(ValueError, "98/100.*does not reach 99%"):
-            ninety_eight_percent.require_promotable()
+        with self.assertRaisesRegex(ValueError, "94/100.*does not reach 95%"):
+            ninety_four_percent.require_promotable()
 
     def test_installable_compiler_rejects_short_timing_corpus(self) -> None:
         rows = []
@@ -4036,6 +5303,11 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 ],
                 1,
             )
+            with self.assertRaisesRegex(ValueError, "not promotable"):
+                write_compiled_policy(
+                    Path(temporary) / "must-not-publish.json",
+                    compiled,
+                )
             with self.assertRaisesRegex(ValueError, "sealed_certified"):
                 validate_installable_policy_artifact(path)
 
@@ -4104,6 +5376,20 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_256: (4, 7),
             FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_512: (4, 7),
             FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_1024: (4, 7),
+            FeatureAxis.KPART_PRODUCER_WAVES_64: (3, 1),
+            FeatureAxis.KPART_PRODUCER_WAVES_128: (3, 1),
+            FeatureAxis.KPART_PRODUCER_WAVES_256: (3, 1),
+            FeatureAxis.KPART_PRODUCER_WAVES_512: (3, 1),
+            FeatureAxis.KPART_PRODUCER_WAVES_1024: (3, 1),
+            FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_64: (4, 7),
+            FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_128: (4, 7),
+            FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_256: (4, 7),
+            FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_512: (4, 7),
+            FeatureAxis.KPART_FINAL_PRODUCER_WAVE_UTILIZATION_1024: (4, 7),
+            FeatureAxis.KPART_K_BLOCKS_PER_TILE: (8, 1),
+            FeatureAxis.KPART_FINAL_K_TILE_BLOCKS: (4, 1),
+            FeatureAxis.KPART_FINAL_K_TILE_UTILIZATION: (1, 2),
+            FeatureAxis.KPART_K_TILE_COUNT: (7, 1),
             FeatureAxis.MN_PARALLEL_WAVES_64: (3, 1),
             FeatureAxis.MN_FINAL_PARALLEL_WAVE_UTILIZATION_64: (4, 7),
         }
@@ -4111,6 +5397,8 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         wave_axes = (
             set(segmented_policy.N_PARALLEL_WAVE_WIDTH_BY_AXIS)
             | set(segmented_policy.N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS)
+            | set(segmented_policy.KPART_PRODUCER_WAVE_WIDTH_BY_AXIS)
+            | set(segmented_policy.KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS)
             | set(segmented_policy.MN_PARALLEL_WAVE_WIDTH_BY_AXIS)
             | set(segmented_policy.MN_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS)
         )
@@ -4135,28 +5423,36 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             for require_less_equal in (True, False)
         )
         points = (
-            (31, 32),
-            (32, 64),
-            (33, 96),
-            (127, 256),
-            (128, 128),
-            (129, 64),
-            (511, 2656),
-            (512, 2656),
-            (513, 2656),
-            (2400, 2656),
-            (42496, 2656),
+            (31, 32, 0),
+            (32, 64, 1),
+            (33, 96, 2),
+            (127, 256, 3),
+            (128, 128, 4),
+            (129, 64, 5),
+            (511, 2656, 7),
+            (512, 2656, 8),
+            (513, 2656, 9),
+            (2400, 2656, 13),
+            (42496, 2656, 16),
         )
         source = ["int main() {"]
         failure = 1
         for predicate in predicates:
-            condition = predicate_condition(predicate)
-            for n, k in points:
-                expected = "true" if predicate.matches(n, k) else "false"
+            condition = predicate_condition(
+                predicate,
+                k_tiles_expression="k_tiles",
+            )
+            for n, k, k_tiles in points:
+                expected = (
+                    "true"
+                    if predicate.matches(n, k, k_tiles)
+                    else "false"
+                )
                 source.extend((
                     "  {",
                     f"    const int n = {n};",
                     f"    const int k = {k};",
+                    f"    const int k_tiles = {k_tiles};",
                     "    const long long work_items =",
                     "        static_cast<long long>(n) * static_cast<long long>(k);",
                     f"    if (({condition}) != {expected}) return {failure};",
@@ -4271,6 +5567,48 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertFalse(k_tail_at_most_192.matches_less_equal(2048, 11008))
         self.assertTrue(k_tail_at_most_192.matches_less_equal(2048, 11072))
         self.assertTrue(k_tail_at_most_192.matches_less_equal(2048, 11136))
+
+    def test_kpart_span_and_tail_match_frozen_serial_partition(self) -> None:
+        """K-part predicates must retain short and empty terminal launches."""
+
+        span_at_most_four = FeatureThreshold(
+            FeatureAxis.KPART_K_BLOCKS_PER_TILE,
+            4,
+        )
+        tile_count_at_most_one = FeatureThreshold(
+            FeatureAxis.KPART_K_TILE_COUNT,
+            1,
+        )
+        final_at_most_one = FeatureThreshold(
+            FeatureAxis.KPART_FINAL_K_TILE_BLOCKS,
+            1,
+        )
+        final_at_most_half_full = FeatureThreshold(
+            FeatureAxis.KPART_FINAL_K_TILE_UTILIZATION,
+            1,
+            2,
+        )
+
+        # K=320 contains ten NativeVNNI blocks. Missing telemetry and one tile
+        # both own all ten blocks. Three tiles own 4,4,2 blocks; four own
+        # 3,3,3,1; and eight preserve all eight producer launches even though
+        # the final ceil-div partition starts beyond K and therefore does no
+        # arithmetic.
+        self.assertFalse(span_at_most_four.matches_less_equal(64, 320, 0))
+        self.assertFalse(span_at_most_four.matches_less_equal(64, 320, 1))
+        self.assertTrue(span_at_most_four.matches_less_equal(64, 320, 3))
+        self.assertTrue(tile_count_at_most_one.matches_less_equal(64, 320, 0))
+        self.assertTrue(tile_count_at_most_one.matches_less_equal(64, 320, 1))
+        self.assertFalse(tile_count_at_most_one.matches_less_equal(64, 320, 3))
+        self.assertFalse(final_at_most_one.matches_less_equal(64, 320, 3))
+        self.assertTrue(final_at_most_one.matches_less_equal(64, 320, 4))
+        self.assertTrue(final_at_most_one.matches_less_equal(64, 320, 8))
+        self.assertTrue(
+            final_at_most_half_full.matches_less_equal(64, 320, 3)
+        )
+        self.assertTrue(
+            final_at_most_half_full.matches_less_equal(64, 320, 8)
+        )
 
     def test_mn_parallel_wave_features_match_row_chunk_grid_geometry(
         self,

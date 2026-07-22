@@ -2016,6 +2016,1528 @@ inline bool selectROCmNativeVNNIDecodeGenerated(
     uint8_t codebook_id, int m, int n, int k, ROCmNativeVNNIDecodeDispatchConfig &out)
 {
     const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(m, n, k);
+    // BEGIN COMMON ROCM NATIVEVNNI DECODE EXACT OVERLAY
+    if (codebook_id == 0)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {4, 4}}, // CB=0 M=1 128x256 rocm.nvnni.decode.fast.kb4 Integration_Tall_128x256 max-regret=0.0000% max-cv=22.2405%
+            {0x01000010000000bfULL, {6, 4}}, // CB=0 M=1 191x256 rocm.nvnni.decode.fast.kb6 Generic_Tall_BoundaryBelow max-regret=1.8750% max-cv=19.1746%
+            {0x01000010000000c0ULL, {4, 4}}, // CB=0 M=1 192x256 rocm.nvnni.decode.fast.kb4 Integration_Balanced_192x256 max-regret=0.0000% max-cv=12.9252%
+            {0x0100001000000280ULL, {5, 4}}, // CB=0 M=1 640x256 rocm.nvnni.decode.fast.kb5 V3Development_Wide_640x256 max-regret=0.9259% max-cv=21.5987%
+            {0x0100001000001080ULL, {3, 4}}, // CB=0 M=1 4224x256 rocm.nvnni.decode.fast.kb3 FastSealed_VeryWide_4224x256 max-regret=1.8182% max-cv=14.2932%
+            {0x0100001200000090ULL, {9, 4}}, // CB=0 M=1 144x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Tall_128x256 max-regret=0.6993% max-cv=5.9447%
+            {0x01000012000000a0ULL, {5, 4}}, // CB=0 M=1 160x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_Tall_160x288 max-regret=0.0000% max-cv=6.0585%
+            {0x01000012000000d7ULL, {6, 4}}, // CB=0 M=1 215x288 rocm.nvnni.decode.fast.kb6 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=15.6633%
+            {0x01000012000000d8ULL, {3, 4}}, // CB=0 M=1 216x288 rocm.nvnni.decode.fast.kb3 DevNeighbor_Integration_Balanced_192x256 max-regret=1.8519% max-cv=15.1436%
+            {0x0100001200000280ULL, {5, 4}}, // CB=0 M=1 640x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_640x288 max-regret=0.0000% max-cv=6.1237%
+            {0x0100001200001400ULL, {1, 4}}, // CB=0 M=1 5120x288 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_5120x288 max-regret=0.8696% max-cv=6.8409%
+            {0x0100001200002400ULL, {1, 4}}, // CB=0 M=1 9216x288 rocm.nvnni.decode.fast.kb1 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=3.0592%
+            {0x0100001400000060ULL, {5, 4}}, // CB=0 M=1 96x320 rocm.nvnni.decode.fast.kb5 V3FastSealed_Tall_96x320 max-regret=0.0000% max-cv=6.6381%
+            {0x0100001400000070ULL, {5, 4}}, // CB=0 M=1 112x320 rocm.nvnni.decode.fast.kb5 V3Development_Tall_112x320 max-regret=0.0000% max-cv=5.2647%
+            {0x0100001400000100ULL, {5, 4}}, // CB=0 M=1 256x320 rocm.nvnni.decode.fast.kb5 V3Development_Balanced_256x320 max-regret=0.0000% max-cv=6.2980%
+            {0x0100001400000110ULL, {4, 4}}, // CB=0 M=1 272x320 rocm.nvnni.decode.fast.kb4 V4FastSealed_Balanced_272x320 max-regret=0.9259% max-cv=5.0279%
+            {0x0100001400000320ULL, {4, 4}}, // CB=0 M=1 800x320 rocm.nvnni.decode.fast.kb4 V3VerifierSealed_Wide_800x320 max-regret=1.8018% max-cv=14.2699%
+            {0x0100001600000120ULL, {6, 4}}, // CB=0 M=1 288x352 rocm.nvnni.decode.fast.kb6 V3VerifierSealed_Balanced_288x352 max-regret=0.0000% max-cv=2.1618%
+            {0x0100001c00000100ULL, {7, 4}}, // CB=0 M=1 256x448 rocm.nvnni.decode.fast.kb7 V3Development_Tall_256x448 max-regret=0.0000% max-cv=15.7073%
+            {0x0100001c00000800ULL, {3, 4}}, // CB=0 M=1 2048x448 rocm.nvnni.decode.fast.kb3 V4FastSealed_Wide_2048x448 max-regret=1.7391% max-cv=5.1193%
+            {0x0100001c00004000ULL, {1, 4}}, // CB=0 M=1 16384x448 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_16384x448 max-regret=0.0000% max-cv=5.4927%
+            {0x0100002000000800ULL, {6, 4}}, // CB=0 M=1 2048x512 rocm.nvnni.decode.fast.kb6 35BMoE_Expert_Down max-regret=0.0000% max-cv=4.3109%
+            {0x01000024000001b0ULL, {9, 4}}, // CB=0 M=1 432x576 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Balanced_384x512 max-regret=0.8850% max-cv=15.3886%
+            {0x0100002c00000260ULL, {15, 4}}, // CB=0 M=1 608x704 rocm.nvnni.decode.fast.kb15 V4FastSealed_Balanced_608x704 max-regret=4.6667% max-cv=4.1480%
+            {0x0100002c00001200ULL, {6, 4}}, // CB=0 M=1 4608x704 rocm.nvnni.decode.fast.kb6 V4FastSealed_Wide_4608x704 max-regret=0.7813% max-cv=19.9408%
+            {0x01000034000001a0ULL, {13, 4}}, // CB=0 M=1 416x832 rocm.nvnni.decode.fast.kb13 V4FastSealed_Tall_416x832 max-regret=1.3245% max-cv=5.8706%
+            {0x0100003800000380ULL, {10, 4}}, // CB=0 M=1 896x896 rocm.nvnni.decode.fast.kb10 0.5B_AttnOut max-regret=1.3031% max-cv=2.6298%
+            {0x0100003800000480ULL, {8, 4}}, // CB=0 M=1 1152x896 rocm.nvnni.decode.fast.kb8 0.5B_QKV max-regret=0.8264% max-cv=6.9842%
+            {0x0100003800001300ULL, {3, 4}}, // CB=0 M=1 4864x896 rocm.nvnni.decode.fast.kb3 0.5B_FFN_Up max-regret=3.9773% max-cv=1.5225%
+            {0x010000380000a000ULL, {2, 4}}, // CB=0 M=1 40960x896 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_40960x896 max-regret=6.7797% max-cv=42.4288%
+            {0x0100003800025180ULL, {3, 4}}, // CB=0 M=1 151936x896 rocm.nvnni.decode.fast.kb3 0.5B_LM_Head max-regret=0.0000% max-cv=16.1555%
+            {0x0100004000000510ULL, {11, 4}}, // CB=0 M=1 1296x1024 rocm.nvnni.decode.fast.kb11 DevNeighbor_0.5B_QKV max-regret=0.8130% max-cv=5.1153%
+            {0x0100004000001560ULL, {5, 4}}, // CB=0 M=1 5472x1024 rocm.nvnni.decode.fast.kb5 DevNeighbor_0.5B_FFN_Up max-regret=0.0000% max-cv=5.0803%
+            {0x0100005000000320ULL, {10, 4}}, // CB=0 M=1 800x1280 rocm.nvnni.decode.fast.kb10 V4FastSealed_Tall_800x1280 max-regret=0.0000% max-cv=3.9364%
+            {0x0100005800000500ULL, {15, 4}}, // CB=0 M=1 1280x1408 rocm.nvnni.decode.fast.kb15 V4FastSealed_Balanced_1280x1408 max-regret=2.3437% max-cv=5.2759%
+            {0x0100005800002c00ULL, {4, 4}}, // CB=0 M=1 11264x1408 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_11264x1408 max-regret=0.9091% max-cv=2.8760%
+            {0x0100006000000600ULL, {10, 4}}, // CB=0 M=1 1536x1536 rocm.nvnni.decode.fast.kb10 1.5B_AttnOut max-regret=0.0000% max-cv=10.8385%
+            {0x0100006000000800ULL, {6, 4}}, // CB=0 M=1 2048x1536 rocm.nvnni.decode.fast.kb6 1.5B_QKV max-regret=0.7519% max-cv=1.1070%
+            {0x0100006000002300ULL, {7, 4}}, // CB=0 M=1 8960x1536 rocm.nvnni.decode.fast.kb7 1.5B_FFN_Up max-regret=0.9434% max-cv=3.3442%
+            {0x0100006000025180ULL, {1, 4}}, // CB=0 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.0000% max-cv=8.9953%
+            {0x0100006c00000260ULL, {9, 4}}, // CB=0 M=1 608x1728 rocm.nvnni.decode.fast.kb9 V4TransitionNeighbor_Tall_608x1728 max-regret=0.0000% max-cv=4.4474%
+            {0x0100007000014000ULL, {1, 4}}, // CB=0 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=11.5413%
+            {0x0100007c000002c0ULL, {16, 4}}, // CB=0 M=1 704x1984 rocm.nvnni.decode.fast.kb16 V4TransitionNeighbor_Tall_704x1984 max-regret=0.0000% max-cv=11.6713%
+            {0x0100008000000200ULL, {22, 4}}, // CB=0 M=1 512x2048 rocm.nvnni.decode.fast.kb22 35BMoE_Expert_GateUp max-regret=3.8760% max-cv=1.3128%
+            {0x0100008000000800ULL, {8, 4}}, // CB=0 M=1 2048x2048 rocm.nvnni.decode.fast.kb8 3B_AttnOut max-regret=1.1561% max-cv=2.8055%
+            {0x0100008000000a00ULL, {8, 4}}, // CB=0 M=1 2560x2048 rocm.nvnni.decode.fast.kb8 3B_QKV max-regret=0.6944% max-cv=1.6239%
+            {0x0100008000001000ULL, {7, 4}}, // CB=0 M=1 4096x2048 rocm.nvnni.decode.fast.kb7 Qwen36MoE_GDN_ZProjection max-regret=1.0582% max-cv=66.6936%
+            {0x0100008000002000ULL, {6, 4}}, // CB=0 M=1 8192x2048 rocm.nvnni.decode.fast.kb6 Qwen36MoE_GDN_QKVProjection max-regret=0.8969% max-cv=4.4277%
+            {0x0100008000002b00ULL, {5, 4}}, // CB=0 M=1 11008x2048 rocm.nvnni.decode.fast.kb5 3B_FFN_Up max-regret=1.6154% max-cv=5.0972%
+            {0x0100008000025180ULL, {1, 4}}, // CB=0 M=1 151936x2048 rocm.nvnni.decode.fast.kb1 3B_LM_Head max-regret=0.0000% max-cv=0.7659%
+            {0x010000a000000940ULL, {10, 4}}, // CB=0 M=1 2368x2560 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_2368x2560 max-regret=0.0000% max-cv=2.6161%
+            {0x010000a400000348ULL, {12, 4}}, // CB=0 M=1 840x2624 rocm.nvnni.decode.fast.kb12 V3TransitionRefine_Tall_840x2624 max-regret=0.0000% max-cv=22.1812%
+            {0x010000b000005800ULL, {2, 4}}, // CB=0 M=1 22528x2816 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=48.3393%
+            {0x010000b8000003a0ULL, {18, 4}}, // CB=0 M=1 928x2944 rocm.nvnni.decode.fast.kb18 V3Transition_Tall_928x2944 max-regret=1.3986% max-cv=25.1255%
+            {0x010000e000000e00ULL, {8, 4}}, // CB=0 M=1 3584x3584 rocm.nvnni.decode.fast.kb8 7B_AttnOut max-regret=0.5811% max-cv=5.1890%
+            {0x010000e000001200ULL, {6, 4}}, // CB=0 M=1 4608x3584 rocm.nvnni.decode.fast.kb6 7B_QKV max-regret=0.0000% max-cv=28.5940%
+            {0x010000e000004a00ULL, {3, 4}}, // CB=0 M=1 18944x3584 rocm.nvnni.decode.fast.kb3 7B_FFN_Up max-regret=0.0000% max-cv=2.3356%
+            {0x010000e000025200ULL, {1, 4}}, // CB=0 M=1 152064x3584 rocm.nvnni.decode.fast.kb1 7B_LM_Head max-regret=0.0000% max-cv=0.6522%
+            {0x010000e000028000ULL, {1, 4}}, // CB=0 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=0.5344%
+            {0x010000fc00001440ULL, {7, 4}}, // CB=0 M=1 5184x4032 rocm.nvnni.decode.fast.kb7 DevNeighbor_7B_QKV max-regret=0.0000% max-cv=32.8027%
+            {0x010000fc00005340ULL, {3, 4}}, // CB=0 M=1 21312x4032 rocm.nvnni.decode.fast.kb3 DevNeighbor_7B_FFN_Up max-regret=0.0000% max-cv=2.1224%
+            {0x0100012000001400ULL, {7, 4}}, // CB=0 M=1 5120x4608 rocm.nvnni.decode.fast.kb7 V4FastSealed_Balanced_5120x4608 max-regret=0.3861% max-cv=34.1363%
+            {0x0100013000000380ULL, {16, 4}}, // CB=0 M=1 896x4864 rocm.nvnni.decode.fast.kb16 0.5B_FFN_Dn max-regret=0.0000% max-cv=3.1935%
+            {0x0100014000000400ULL, {18, 4}}, // CB=0 M=1 1024x5120 rocm.nvnni.decode.fast.kb18 Qwen36_GDN_TimeProjection max-regret=0.5181% max-cv=5.1326%
+            {0x0100014000001400ULL, {6, 4}}, // CB=0 M=1 5120x5120 rocm.nvnni.decode.fast.kb6 32B_AttnOut max-regret=0.0000% max-cv=37.8162%
+            {0x0100014000001800ULL, {6, 4}}, // CB=0 M=1 6144x5120 rocm.nvnni.decode.fast.kb6 Qwen36_GDN_ZProjection max-regret=0.6873% max-cv=31.1368%
+            {0x0100014000001c00ULL, {5, 4}}, // CB=0 M=1 7168x5120 rocm.nvnni.decode.fast.kb5 32B_QKV max-regret=0.0000% max-cv=24.0439%
+            {0x0100014000002800ULL, {4, 4}}, // CB=0 M=1 10240x5120 rocm.nvnni.decode.fast.kb4 Qwen36_GDN_InnerProjection max-regret=0.2604% max-cv=1.5103%
+            {0x0100014000003000ULL, {5, 4}}, // CB=0 M=1 12288x5120 rocm.nvnni.decode.fast.kb5 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=2.5353%
+            {0x0100014000003600ULL, {3, 4}}, // CB=0 M=1 13824x5120 rocm.nvnni.decode.fast.kb3 14B_FFN_Up max-regret=0.0000% max-cv=1.7821%
+            {0x0100014000004400ULL, {3, 4}}, // CB=0 M=1 17408x5120 rocm.nvnni.decode.fast.kb3 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=2.6208%
+            {0x0100014000006c00ULL, {2, 4}}, // CB=0 M=1 27648x5120 rocm.nvnni.decode.fast.kb2 32B_FFN_Up max-regret=0.0000% max-cv=5.7071%
+            {0x0100014000025200ULL, {1, 4}}, // CB=0 M=1 152064x5120 rocm.nvnni.decode.fast.kb1 32B_LM_Head max-regret=0.0000% max-cv=0.8060%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=0 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=0.3137%
+            {0x0100016000000600ULL, {18, 4}}, // CB=0 M=1 1536x5632 rocm.nvnni.decode.fast.kb18 V4FastSealed_Tall_1536x5632 max-regret=2.5000% max-cv=19.3913%
+            {0x010001600000b000ULL, {1, 4}}, // CB=0 M=1 45056x5632 rocm.nvnni.decode.fast.kb1 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=1.2967%
+            {0x0100018000001400ULL, {7, 4}}, // CB=0 M=1 5120x6144 rocm.nvnni.decode.fast.kb7 Qwen36_GDN_OutputProjection max-regret=0.0000% max-cv=3.2611%
+            {0x0100022000002600ULL, {5, 4}}, // CB=0 M=1 9728x8704 rocm.nvnni.decode.fast.kb5 V4FastSealed_Balanced_9728x8704 max-regret=0.0000% max-cv=1.8005%
+            {0x0100023000000600ULL, {16, 4}}, // CB=0 M=1 1536x8960 rocm.nvnni.decode.fast.kb16 1.5B_FFN_Dn max-regret=2.1164% max-cv=3.6613%
+            {0x010002b000000800ULL, {14, 4}}, // CB=0 M=1 2048x11008 rocm.nvnni.decode.fast.kb14 3B_FFN_Dn max-regret=0.0000% max-cv=2.4832%
+            {0x0100030000000e80ULL, {9, 4}}, // CB=0 M=1 3712x12288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_3712x12288 max-regret=0.0000% max-cv=1.7821%
+            {0x0100036000001400ULL, {7, 4}}, // CB=0 M=1 5120x13824 rocm.nvnni.decode.fast.kb7 14B_FFN_Dn max-regret=0.0000% max-cv=3.4883%
+            {0x0100044000001400ULL, {6, 4}}, // CB=0 M=1 5120x17408 rocm.nvnni.decode.fast.kb6 Qwen36_FFN_DownProjection max-regret=0.0011% max-cv=24.0942%
+            {0x010004a000000e00ULL, {11, 4}}, // CB=0 M=1 3584x18944 rocm.nvnni.decode.fast.kb11 7B_FFN_Dn max-regret=0.0000% max-cv=41.1000%
+            {0x010004c800001680ULL, {5, 4}}, // CB=0 M=1 5760x19584 rocm.nvnni.decode.fast.kb5 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=3.1075%
+            {0x0100064000001d00ULL, {4, 4}}, // CB=0 M=1 7424x25600 rocm.nvnni.decode.fast.kb4 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.3979%
+            {0x010006c000001400ULL, {10, 4}}, // CB=0 M=1 5120x27648 rocm.nvnni.decode.fast.kb10 32B_FFN_Dn max-regret=0.7926% max-cv=2.1694%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 4)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {8, 4}}, // CB=4 M=1 128x256 rocm.nvnni.decode.fast.kb8 Integration_Tall_128x256 max-regret=0.9346% max-cv=7.3821%
+            {0x01000010000000bfULL, {4, 4}}, // CB=4 M=1 191x256 rocm.nvnni.decode.fast.kb4 Generic_Tall_BoundaryBelow max-regret=0.6993% max-cv=16.8063%
+            {0x01000010000000c0ULL, {3, 4}}, // CB=4 M=1 192x256 rocm.nvnni.decode.fast.kb3 Integration_Balanced_192x256 max-regret=3.7736% max-cv=13.8747%
+            {0x0100001000000280ULL, {4, 4}}, // CB=4 M=1 640x256 rocm.nvnni.decode.fast.kb4 V3Development_Wide_640x256 max-regret=0.0000% max-cv=20.9160%
+            {0x0100001000001080ULL, {3, 4}}, // CB=4 M=1 4224x256 rocm.nvnni.decode.fast.kb3 FastSealed_VeryWide_4224x256 max-regret=0.6329% max-cv=13.4416%
+            {0x0100001200000090ULL, {3, 4}}, // CB=4 M=1 144x288 rocm.nvnni.decode.fast.kb3 DevNeighbor_Integration_Tall_128x256 max-regret=1.8519% max-cv=17.8777%
+            {0x01000012000000a0ULL, {8, 4}}, // CB=4 M=1 160x288 rocm.nvnni.decode.fast.kb8 V4FastSealed_Tall_160x288 max-regret=2.7523% max-cv=35.0766%
+            {0x01000012000000d7ULL, {4, 4}}, // CB=4 M=1 215x288 rocm.nvnni.decode.fast.kb4 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=3.6697% max-cv=15.6618%
+            {0x01000012000000d8ULL, {9, 4}}, // CB=4 M=1 216x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Balanced_192x256 max-regret=0.9174% max-cv=5.9048%
+            {0x0100001200000280ULL, {5, 4}}, // CB=4 M=1 640x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_640x288 max-regret=13.1035% max-cv=20.4423%
+            {0x0100001200001400ULL, {3, 4}}, // CB=4 M=1 5120x288 rocm.nvnni.decode.fast.kb3 V4FastSealed_VeryWide_5120x288 max-regret=0.0000% max-cv=97.4974%
+            {0x0100001200002400ULL, {3, 4}}, // CB=4 M=1 9216x288 rocm.nvnni.decode.fast.kb3 DevNeighbor_Generic_VeryWide_Small max-regret=4.2069% max-cv=6.9002%
+            {0x0100001400000060ULL, {10, 4}}, // CB=4 M=1 96x320 rocm.nvnni.decode.fast.kb10 V3FastSealed_Tall_96x320 max-regret=1.8519% max-cv=15.7531%
+            {0x0100001400000070ULL, {5, 4}}, // CB=4 M=1 112x320 rocm.nvnni.decode.fast.kb5 V3Development_Tall_112x320 max-regret=0.0000% max-cv=5.5556%
+            {0x0100001400000100ULL, {6, 4}}, // CB=4 M=1 256x320 rocm.nvnni.decode.fast.kb6 V3Development_Balanced_256x320 max-regret=1.8349% max-cv=7.5168%
+            {0x0100001400000110ULL, {6, 4}}, // CB=4 M=1 272x320 rocm.nvnni.decode.fast.kb6 V4FastSealed_Balanced_272x320 max-regret=1.8349% max-cv=8.0378%
+            {0x0100001400000320ULL, {6, 4}}, // CB=4 M=1 800x320 rocm.nvnni.decode.fast.kb6 V3VerifierSealed_Wide_800x320 max-regret=1.8349% max-cv=19.0323%
+            {0x0100001600000120ULL, {6, 4}}, // CB=4 M=1 288x352 rocm.nvnni.decode.fast.kb6 V3VerifierSealed_Balanced_288x352 max-regret=0.0000% max-cv=19.8702%
+            {0x0100001c00000100ULL, {14, 4}}, // CB=4 M=1 256x448 rocm.nvnni.decode.fast.kb14 V3Development_Tall_256x448 max-regret=4.8276% max-cv=18.6398%
+            {0x0100001c00000800ULL, {8, 4}}, // CB=4 M=1 2048x448 rocm.nvnni.decode.fast.kb8 V4FastSealed_Wide_2048x448 max-regret=2.5862% max-cv=20.0745%
+            {0x0100001c00004000ULL, {3, 4}}, // CB=4 M=1 16384x448 rocm.nvnni.decode.fast.kb3 V4FastSealed_VeryWide_16384x448 max-regret=2.7586% max-cv=19.1114%
+            {0x0100002000000800ULL, {10, 4}}, // CB=4 M=1 2048x512 rocm.nvnni.decode.fast.kb10 35BMoE_Expert_Down max-regret=3.4188% max-cv=18.6810%
+            {0x01000024000001b0ULL, {5, 4}}, // CB=4 M=1 432x576 rocm.nvnni.decode.fast.kb5 DevNeighbor_Integration_Balanced_384x512 max-regret=2.6316% max-cv=8.5136%
+            {0x0100002c00000260ULL, {8, 4}}, // CB=4 M=1 608x704 rocm.nvnni.decode.fast.kb8 V4FastSealed_Balanced_608x704 max-regret=0.0000% max-cv=67.7636%
+            {0x0100002c00001200ULL, {6, 4}}, // CB=4 M=1 4608x704 rocm.nvnni.decode.fast.kb6 V4FastSealed_Wide_4608x704 max-regret=0.0000% max-cv=2.8433%
+            {0x01000034000001a0ULL, {16, 4}}, // CB=4 M=1 416x832 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_416x832 max-regret=5.0847% max-cv=10.4699%
+            {0x0100003800000380ULL, {24, 4}}, // CB=4 M=1 896x896 rocm.nvnni.decode.fast.kb24 0.5B_AttnOut max-regret=11.5702% max-cv=8.9532%
+            {0x0100003800000480ULL, {8, 4}}, // CB=4 M=1 1152x896 rocm.nvnni.decode.fast.kb8 0.5B_QKV max-regret=1.9231% max-cv=14.4312%
+            {0x0100003800001300ULL, {27, 4}}, // CB=4 M=1 4864x896 rocm.nvnni.decode.fast.kb27 0.5B_FFN_Up max-regret=18.9944% max-cv=48.9561%
+            {0x010000380000a000ULL, {2, 4}}, // CB=4 M=1 40960x896 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_40960x896 max-regret=3.2573% max-cv=41.2906%
+            {0x0100003800025180ULL, {1, 4}}, // CB=4 M=1 151936x896 rocm.nvnni.decode.fast.kb1 0.5B_LM_Head max-regret=5.7636% max-cv=27.4938%
+            {0x0100004000000510ULL, {9, 4}}, // CB=4 M=1 1296x1024 rocm.nvnni.decode.fast.kb9 DevNeighbor_0.5B_QKV max-regret=1.6129% max-cv=5.5281%
+            {0x0100004000001560ULL, {6, 4}}, // CB=4 M=1 5472x1024 rocm.nvnni.decode.fast.kb6 DevNeighbor_0.5B_FFN_Up max-regret=0.6897% max-cv=4.1885%
+            {0x0100005000000320ULL, {16, 4}}, // CB=4 M=1 800x1280 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_800x1280 max-regret=2.4691% max-cv=17.8497%
+            {0x0100005800000500ULL, {9, 4}}, // CB=4 M=1 1280x1408 rocm.nvnni.decode.fast.kb9 V4FastSealed_Balanced_1280x1408 max-regret=0.0000% max-cv=5.3296%
+            {0x0100005800002c00ULL, {5, 4}}, // CB=4 M=1 11264x1408 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_11264x1408 max-regret=0.4444% max-cv=29.5842%
+            {0x0100006000000600ULL, {19, 4}}, // CB=4 M=1 1536x1536 rocm.nvnni.decode.fast.kb19 1.5B_AttnOut max-regret=5.2239% max-cv=25.3646%
+            {0x0100006000000800ULL, {7, 4}}, // CB=4 M=1 2048x1536 rocm.nvnni.decode.fast.kb7 1.5B_QKV max-regret=1.4706% max-cv=29.3141%
+            {0x0100006000002300ULL, {7, 4}}, // CB=4 M=1 8960x1536 rocm.nvnni.decode.fast.kb7 1.5B_FFN_Up max-regret=0.4608% max-cv=3.5266%
+            {0x0100006000025180ULL, {1, 4}}, // CB=4 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.0000% max-cv=8.7623%
+            {0x0100006c00000260ULL, {12, 4}}, // CB=4 M=1 608x1728 rocm.nvnni.decode.fast.kb12 V4TransitionNeighbor_Tall_608x1728 max-regret=1.5385% max-cv=29.9940%
+            {0x0100007000014000ULL, {1, 4}}, // CB=4 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=10.3080%
+            {0x0100007c000002c0ULL, {13, 4}}, // CB=4 M=1 704x1984 rocm.nvnni.decode.fast.kb13 V4TransitionNeighbor_Tall_704x1984 max-regret=1.2048% max-cv=13.8839%
+            {0x0100008000000200ULL, {19, 4}}, // CB=4 M=1 512x2048 rocm.nvnni.decode.fast.kb19 35BMoE_Expert_GateUp max-regret=2.9630% max-cv=5.7481%
+            {0x0100008000000800ULL, {8, 4}}, // CB=4 M=1 2048x2048 rocm.nvnni.decode.fast.kb8 3B_AttnOut max-regret=1.6854% max-cv=4.5236%
+            {0x0100008000000a00ULL, {13, 4}}, // CB=4 M=1 2560x2048 rocm.nvnni.decode.fast.kb13 3B_QKV max-regret=2.7473% max-cv=18.1979%
+            {0x0100008000001000ULL, {11, 4}}, // CB=4 M=1 4096x2048 rocm.nvnni.decode.fast.kb11 Qwen36MoE_GDN_ZProjection max-regret=1.0309% max-cv=69.4215%
+            {0x0100008000002000ULL, {6, 4}}, // CB=4 M=1 8192x2048 rocm.nvnni.decode.fast.kb6 Qwen36MoE_GDN_QKVProjection max-regret=0.5465% max-cv=31.7780%
+            {0x0100008000002b00ULL, {5, 4}}, // CB=4 M=1 11008x2048 rocm.nvnni.decode.fast.kb5 3B_FFN_Up max-regret=0.0000% max-cv=3.4813%
+            {0x0100008000025180ULL, {1, 4}}, // CB=4 M=1 151936x2048 rocm.nvnni.decode.fast.kb1 3B_LM_Head max-regret=0.0000% max-cv=1.1980%
+            {0x010000a000000940ULL, {9, 4}}, // CB=4 M=1 2368x2560 rocm.nvnni.decode.fast.kb9 V4FastSealed_Balanced_2368x2560 max-regret=1.0695% max-cv=20.4240%
+            {0x010000a400000348ULL, {14, 4}}, // CB=4 M=1 840x2624 rocm.nvnni.decode.fast.kb14 V3TransitionRefine_Tall_840x2624 max-regret=0.0000% max-cv=24.0752%
+            {0x010000b000005800ULL, {3, 4}}, // CB=4 M=1 22528x2816 rocm.nvnni.decode.fast.kb3 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=37.0608%
+            {0x010000b8000003a0ULL, {12, 4}}, // CB=4 M=1 928x2944 rocm.nvnni.decode.fast.kb12 V3Transition_Tall_928x2944 max-regret=2.8571% max-cv=14.2891%
+            {0x010000e000000e00ULL, {19, 4}}, // CB=4 M=1 3584x3584 rocm.nvnni.decode.fast.kb19 7B_AttnOut max-regret=3.9106% max-cv=4.0255%
+            {0x010000e000001200ULL, {9, 4}}, // CB=4 M=1 4608x3584 rocm.nvnni.decode.fast.kb9 7B_QKV max-regret=0.5076% max-cv=27.4419%
+            {0x010000e000004a00ULL, {3, 4}}, // CB=4 M=1 18944x3584 rocm.nvnni.decode.fast.kb3 7B_FFN_Up max-regret=0.2398% max-cv=44.2316%
+            {0x010000e000025200ULL, {1, 4}}, // CB=4 M=1 152064x3584 rocm.nvnni.decode.fast.kb1 7B_LM_Head max-regret=0.0000% max-cv=0.9414%
+            {0x010000e000028000ULL, {1, 4}}, // CB=4 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.3426% max-cv=1.5439%
+            {0x010000fc00001440ULL, {12, 4}}, // CB=4 M=1 5184x4032 rocm.nvnni.decode.fast.kb12 DevNeighbor_7B_QKV max-regret=1.3761% max-cv=24.7857%
+            {0x010000fc00005340ULL, {4, 4}}, // CB=4 M=1 21312x4032 rocm.nvnni.decode.fast.kb4 DevNeighbor_7B_FFN_Up max-regret=0.5941% max-cv=39.8481%
+            {0x0100012000001400ULL, {10, 4}}, // CB=4 M=1 5120x4608 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_5120x4608 max-regret=0.0000% max-cv=31.5979%
+            {0x0100013000000380ULL, {12, 4}}, // CB=4 M=1 896x4864 rocm.nvnni.decode.fast.kb12 0.5B_FFN_Dn max-regret=5.7325% max-cv=15.0077%
+            {0x0100014000000400ULL, {16, 4}}, // CB=4 M=1 1024x5120 rocm.nvnni.decode.fast.kb16 Qwen36_GDN_TimeProjection max-regret=1.0101% max-cv=3.6835%
+            {0x0100014000001400ULL, {12, 4}}, // CB=4 M=1 5120x5120 rocm.nvnni.decode.fast.kb12 32B_AttnOut max-regret=1.6667% max-cv=33.8705%
+            {0x0100014000001800ULL, {10, 4}}, // CB=4 M=1 6144x5120 rocm.nvnni.decode.fast.kb10 Qwen36_GDN_ZProjection max-regret=0.6688% max-cv=2.8381%
+            {0x0100014000001c00ULL, {9, 4}}, // CB=4 M=1 7168x5120 rocm.nvnni.decode.fast.kb9 32B_QKV max-regret=0.3106% max-cv=30.2935%
+            {0x0100014000002800ULL, {6, 4}}, // CB=4 M=1 10240x5120 rocm.nvnni.decode.fast.kb6 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=1.7647%
+            {0x0100014000003000ULL, {5, 4}}, // CB=4 M=1 12288x5120 rocm.nvnni.decode.fast.kb5 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=2.6279%
+            {0x0100014000003600ULL, {6, 4}}, // CB=4 M=1 13824x5120 rocm.nvnni.decode.fast.kb6 14B_FFN_Up max-regret=0.0000% max-cv=1.8279%
+            {0x0100014000004400ULL, {6, 4}}, // CB=4 M=1 17408x5120 rocm.nvnni.decode.fast.kb6 Qwen36_FFN_GateUp max-regret=0.1927% max-cv=7.5759%
+            {0x0100014000006c00ULL, {3, 4}}, // CB=4 M=1 27648x5120 rocm.nvnni.decode.fast.kb3 32B_FFN_Up max-regret=0.2642% max-cv=3.3378%
+            {0x0100014000025200ULL, {1, 4}}, // CB=4 M=1 152064x5120 rocm.nvnni.decode.fast.kb1 32B_LM_Head max-regret=0.0000% max-cv=0.9924%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=4 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=0.3872%
+            {0x0100016000000600ULL, {18, 4}}, // CB=4 M=1 1536x5632 rocm.nvnni.decode.fast.kb18 V4FastSealed_Tall_1536x5632 max-regret=3.9801% max-cv=16.0302%
+            {0x010001600000b000ULL, {1, 4}}, // CB=4 M=1 45056x5632 rocm.nvnni.decode.fast.kb1 V4FastSealed_Wide_45056x5632 max-regret=0.1582% max-cv=2.1114%
+            {0x0100018000001400ULL, {10, 4}}, // CB=4 M=1 5120x6144 rocm.nvnni.decode.fast.kb10 Qwen36_GDN_OutputProjection max-regret=0.6579% max-cv=38.0028%
+            {0x0100022000002600ULL, {6, 4}}, // CB=4 M=1 9728x8704 rocm.nvnni.decode.fast.kb6 V4FastSealed_Balanced_9728x8704 max-regret=0.3925% max-cv=4.3823%
+            {0x0100023000000600ULL, {17, 4}}, // CB=4 M=1 1536x8960 rocm.nvnni.decode.fast.kb17 1.5B_FFN_Dn max-regret=2.0101% max-cv=3.8415%
+            {0x010002b000000800ULL, {21, 4}}, // CB=4 M=1 2048x11008 rocm.nvnni.decode.fast.kb21 3B_FFN_Dn max-regret=2.9630% max-cv=33.1360%
+            {0x0100030000000e80ULL, {13, 4}}, // CB=4 M=1 3712x12288 rocm.nvnni.decode.fast.kb13 V4FastSealed_Tall_3712x12288 max-regret=0.0017% max-cv=8.0548%
+            {0x0100036000001400ULL, {10, 4}}, // CB=4 M=1 5120x13824 rocm.nvnni.decode.fast.kb10 14B_FFN_Dn max-regret=0.0000% max-cv=2.7754%
+            {0x0100044000001400ULL, {14, 4}}, // CB=4 M=1 5120x17408 rocm.nvnni.decode.fast.kb14 Qwen36_FFN_DownProjection max-regret=3.2550% max-cv=2.0305%
+            {0x010004a000000e00ULL, {17, 4}}, // CB=4 M=1 3584x18944 rocm.nvnni.decode.fast.kb17 7B_FFN_Dn max-regret=0.4444% max-cv=40.2758%
+            {0x010004c800001680ULL, {10, 4}}, // CB=4 M=1 5760x19584 rocm.nvnni.decode.fast.kb10 DevNeighbor_Qwen36_FFN_DownProjection max-regret=1.1976% max-cv=2.1774%
+            {0x0100064000001d00ULL, {8, 4}}, // CB=4 M=1 7424x25600 rocm.nvnni.decode.fast.kb8 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.2403%
+            {0x010006c000001400ULL, {10, 4}}, // CB=4 M=1 5120x27648 rocm.nvnni.decode.fast.kb10 32B_FFN_Dn max-regret=0.0000% max-cv=2.4930%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 5)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {8, 4}}, // CB=5 M=1 128x256 rocm.nvnni.decode.fast.kb8 Integration_Tall_128x256 max-regret=11.5646% max-cv=20.6800%
+            {0x01000010000000bfULL, {8, 4}}, // CB=5 M=1 191x256 rocm.nvnni.decode.fast.kb8 Generic_Tall_BoundaryBelow max-regret=0.8696% max-cv=16.5714%
+            {0x01000010000000c0ULL, {6, 4}}, // CB=5 M=1 192x256 rocm.nvnni.decode.fast.kb6 Integration_Balanced_192x256 max-regret=2.6316% max-cv=18.1489%
+            {0x0100001000000280ULL, {6, 4}}, // CB=5 M=1 640x256 rocm.nvnni.decode.fast.kb6 V3Development_Wide_640x256 max-regret=2.7273% max-cv=15.2861%
+            {0x0100001000001080ULL, {8, 4}}, // CB=5 M=1 4224x256 rocm.nvnni.decode.fast.kb8 FastSealed_VeryWide_4224x256 max-regret=3.4783% max-cv=6.7521%
+            {0x0100001200000090ULL, {6, 4}}, // CB=5 M=1 144x288 rocm.nvnni.decode.fast.kb6 DevNeighbor_Integration_Tall_128x256 max-regret=1.3699% max-cv=15.9493%
+            {0x01000012000000a0ULL, {9, 4}}, // CB=5 M=1 160x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_160x288 max-regret=9.7345% max-cv=26.4618%
+            {0x01000012000000d7ULL, {3, 4}}, // CB=5 M=1 215x288 rocm.nvnni.decode.fast.kb3 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=2.7397% max-cv=60.4415%
+            {0x01000012000000d8ULL, {2, 4}}, // CB=5 M=1 216x288 rocm.nvnni.decode.fast.kb2 DevNeighbor_Integration_Balanced_192x256 max-regret=10.7143% max-cv=8.9262%
+            {0x0100001200000280ULL, {9, 4}}, // CB=5 M=1 640x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_640x288 max-regret=14.3836% max-cv=13.7494%
+            {0x0100001200001400ULL, {6, 4}}, // CB=5 M=1 5120x288 rocm.nvnni.decode.fast.kb6 V4FastSealed_VeryWide_5120x288 max-regret=1.6529% max-cv=6.5841%
+            {0x0100001200002400ULL, {3, 4}}, // CB=5 M=1 9216x288 rocm.nvnni.decode.fast.kb3 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=5.5005%
+            {0x0100001400000060ULL, {10, 4}}, // CB=5 M=1 96x320 rocm.nvnni.decode.fast.kb10 V3FastSealed_Tall_96x320 max-regret=2.7027% max-cv=22.7709%
+            {0x0100001400000070ULL, {5, 4}}, // CB=5 M=1 112x320 rocm.nvnni.decode.fast.kb5 V3Development_Tall_112x320 max-regret=0.0000% max-cv=5.3657%
+            {0x0100001400000100ULL, {10, 4}}, // CB=5 M=1 256x320 rocm.nvnni.decode.fast.kb10 V3Development_Balanced_256x320 max-regret=10.7383% max-cv=12.0559%
+            {0x0100001400000110ULL, {10, 4}}, // CB=5 M=1 272x320 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_272x320 max-regret=15.0685% max-cv=16.3438%
+            {0x0100001400000320ULL, {7, 4}}, // CB=5 M=1 800x320 rocm.nvnni.decode.fast.kb7 V3VerifierSealed_Wide_800x320 max-regret=2.6316% max-cv=6.0990%
+            {0x0100001600000120ULL, {3, 4}}, // CB=5 M=1 288x352 rocm.nvnni.decode.fast.kb3 V3VerifierSealed_Balanced_288x352 max-regret=6.1404% max-cv=13.7314%
+            {0x0100001c00000100ULL, {6, 4}}, // CB=5 M=1 256x448 rocm.nvnni.decode.fast.kb6 V3Development_Tall_256x448 max-regret=4.3860% max-cv=27.8629%
+            {0x0100001c00000800ULL, {4, 4}}, // CB=5 M=1 2048x448 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_2048x448 max-regret=4.2017% max-cv=6.6978%
+            {0x0100001c00004000ULL, {3, 4}}, // CB=5 M=1 16384x448 rocm.nvnni.decode.fast.kb3 V4FastSealed_VeryWide_16384x448 max-regret=0.6410% max-cv=5.4751%
+            {0x0100002000000800ULL, {6, 4}}, // CB=5 M=1 2048x512 rocm.nvnni.decode.fast.kb6 35BMoE_Expert_Down max-regret=17.8344% max-cv=24.2111%
+            {0x01000024000001b0ULL, {18, 4}}, // CB=5 M=1 432x576 rocm.nvnni.decode.fast.kb18 DevNeighbor_Integration_Balanced_384x512 max-regret=12.7119% max-cv=19.5713%
+            {0x0100002c00000260ULL, {10, 4}}, // CB=5 M=1 608x704 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_608x704 max-regret=4.9587% max-cv=24.7874%
+            {0x0100002c00001200ULL, {12, 4}}, // CB=5 M=1 4608x704 rocm.nvnni.decode.fast.kb12 V4FastSealed_Wide_4608x704 max-regret=4.5198% max-cv=6.2541%
+            {0x01000034000001a0ULL, {16, 4}}, // CB=5 M=1 416x832 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_416x832 max-regret=17.8344% max-cv=19.6996%
+            {0x0100003800000380ULL, {14, 4}}, // CB=5 M=1 896x896 rocm.nvnni.decode.fast.kb14 0.5B_AttnOut max-regret=1.5873% max-cv=6.8694%
+            {0x0100003800000480ULL, {14, 4}}, // CB=5 M=1 1152x896 rocm.nvnni.decode.fast.kb14 0.5B_QKV max-regret=1.5625% max-cv=11.5356%
+            {0x0100003800001300ULL, {9, 4}}, // CB=5 M=1 4864x896 rocm.nvnni.decode.fast.kb9 0.5B_FFN_Up max-regret=4.1958% max-cv=6.4682%
+            {0x010000380000a000ULL, {2, 4}}, // CB=5 M=1 40960x896 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_40960x896 max-regret=1.4970% max-cv=44.1784%
+            {0x0100003800025180ULL, {1, 4}}, // CB=5 M=1 151936x896 rocm.nvnni.decode.fast.kb1 0.5B_LM_Head max-regret=0.0000% max-cv=21.5100%
+            {0x0100004000000510ULL, {9, 4}}, // CB=5 M=1 1296x1024 rocm.nvnni.decode.fast.kb9 DevNeighbor_0.5B_QKV max-regret=0.6135% max-cv=17.9333%
+            {0x0100004000001560ULL, {6, 4}}, // CB=5 M=1 5472x1024 rocm.nvnni.decode.fast.kb6 DevNeighbor_0.5B_FFN_Up max-regret=2.6316% max-cv=22.2273%
+            {0x0100005000000320ULL, {17, 4}}, // CB=5 M=1 800x1280 rocm.nvnni.decode.fast.kb17 V4FastSealed_Tall_800x1280 max-regret=2.2727% max-cv=17.5768%
+            {0x0100005800000500ULL, {12, 4}}, // CB=5 M=1 1280x1408 rocm.nvnni.decode.fast.kb12 V4FastSealed_Balanced_1280x1408 max-regret=1.1905% max-cv=4.2478%
+            {0x0100005800002c00ULL, {5, 4}}, // CB=5 M=1 11264x1408 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_11264x1408 max-regret=0.4274% max-cv=30.4835%
+            {0x0100006000000600ULL, {19, 4}}, // CB=5 M=1 1536x1536 rocm.nvnni.decode.fast.kb19 1.5B_AttnOut max-regret=3.6232% max-cv=6.9552%
+            {0x0100006000000800ULL, {7, 4}}, // CB=5 M=1 2048x1536 rocm.nvnni.decode.fast.kb7 1.5B_QKV max-regret=3.4965% max-cv=5.0189%
+            {0x0100006000002300ULL, {5, 4}}, // CB=5 M=1 8960x1536 rocm.nvnni.decode.fast.kb5 1.5B_FFN_Up max-regret=0.5465% max-cv=4.7481%
+            {0x0100006000025180ULL, {1, 4}}, // CB=5 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.4489% max-cv=8.5393%
+            {0x0100006c00000260ULL, {13, 4}}, // CB=5 M=1 608x1728 rocm.nvnni.decode.fast.kb13 V4TransitionNeighbor_Tall_608x1728 max-regret=3.5503% max-cv=17.7379%
+            {0x0100007000014000ULL, {1, 4}}, // CB=5 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=9.7104%
+            {0x0100007c000002c0ULL, {18, 4}}, // CB=5 M=1 704x1984 rocm.nvnni.decode.fast.kb18 V4TransitionNeighbor_Tall_704x1984 max-regret=1.7544% max-cv=4.2520%
+            {0x0100008000000200ULL, {8, 4}}, // CB=5 M=1 512x2048 rocm.nvnni.decode.fast.kb8 35BMoE_Expert_GateUp max-regret=8.8235% max-cv=6.3002%
+            {0x0100008000000800ULL, {13, 4}}, // CB=5 M=1 2048x2048 rocm.nvnni.decode.fast.kb13 3B_AttnOut max-regret=0.0000% max-cv=22.1031%
+            {0x0100008000000a00ULL, {8, 4}}, // CB=5 M=1 2560x2048 rocm.nvnni.decode.fast.kb8 3B_QKV max-regret=2.7027% max-cv=18.8661%
+            {0x0100008000001000ULL, {7, 4}}, // CB=5 M=1 4096x2048 rocm.nvnni.decode.fast.kb7 Qwen36MoE_GDN_ZProjection max-regret=4.9959% max-cv=26.4232%
+            {0x0100008000002000ULL, {8, 4}}, // CB=5 M=1 8192x2048 rocm.nvnni.decode.fast.kb8 Qwen36MoE_GDN_QKVProjection max-regret=1.5464% max-cv=4.7522%
+            {0x0100008000002b00ULL, {5, 4}}, // CB=5 M=1 11008x2048 rocm.nvnni.decode.fast.kb5 3B_FFN_Up max-regret=0.0000% max-cv=4.8595%
+            {0x0100008000025180ULL, {2, 4}}, // CB=5 M=1 151936x2048 rocm.nvnni.decode.fast.kb2 3B_LM_Head max-regret=1.2277% max-cv=1.5418%
+            {0x010000a000000940ULL, {12, 4}}, // CB=5 M=1 2368x2560 rocm.nvnni.decode.fast.kb12 V4FastSealed_Balanced_2368x2560 max-regret=0.6061% max-cv=4.8335%
+            {0x010000a400000348ULL, {12, 4}}, // CB=5 M=1 840x2624 rocm.nvnni.decode.fast.kb12 V3TransitionRefine_Tall_840x2624 max-regret=2.2099% max-cv=4.7142%
+            {0x010000b000005800ULL, {4, 4}}, // CB=5 M=1 22528x2816 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_22528x2816 max-regret=0.2353% max-cv=1.7657%
+            {0x010000b8000003a0ULL, {24, 4}}, // CB=5 M=1 928x2944 rocm.nvnni.decode.fast.kb24 V3Transition_Tall_928x2944 max-regret=1.3199% max-cv=3.7801%
+            {0x010000e000000e00ULL, {16, 4}}, // CB=5 M=1 3584x3584 rocm.nvnni.decode.fast.kb16 7B_AttnOut max-regret=0.0000% max-cv=7.6928%
+            {0x010000e000001200ULL, {8, 4}}, // CB=5 M=1 4608x3584 rocm.nvnni.decode.fast.kb8 7B_QKV max-regret=2.4038% max-cv=34.4782%
+            {0x010000e000004a00ULL, {5, 4}}, // CB=5 M=1 18944x3584 rocm.nvnni.decode.fast.kb5 7B_FFN_Up max-regret=0.2227% max-cv=2.1823%
+            {0x010000e000025200ULL, {3, 4}}, // CB=5 M=1 152064x3584 rocm.nvnni.decode.fast.kb3 7B_LM_Head max-regret=0.0000% max-cv=0.9898%
+            {0x010000e000028000ULL, {1, 4}}, // CB=5 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=1.2262%
+            {0x010000fc00001440ULL, {9, 4}}, // CB=5 M=1 5184x4032 rocm.nvnni.decode.fast.kb9 DevNeighbor_7B_QKV max-regret=0.7407% max-cv=27.2573%
+            {0x010000fc00005340ULL, {4, 4}}, // CB=5 M=1 21312x4032 rocm.nvnni.decode.fast.kb4 DevNeighbor_7B_FFN_Up max-regret=0.1709% max-cv=47.2823%
+            {0x0100012000001400ULL, {10, 4}}, // CB=5 M=1 5120x4608 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_5120x4608 max-regret=0.8299% max-cv=38.0762%
+            {0x0100013000000380ULL, {38, 4}}, // CB=5 M=1 896x4864 rocm.nvnni.decode.fast.kb38 0.5B_FFN_Dn max-regret=7.2289% max-cv=4.4430%
+            {0x0100014000000400ULL, {30, 4}}, // CB=5 M=1 1024x5120 rocm.nvnni.decode.fast.kb30 Qwen36_GDN_TimeProjection max-regret=6.2857% max-cv=6.5190%
+            {0x0100014000001400ULL, {9, 4}}, // CB=5 M=1 5120x5120 rocm.nvnni.decode.fast.kb9 32B_AttnOut max-regret=0.3876% max-cv=5.3416%
+            {0x0100014000001800ULL, {9, 4}}, // CB=5 M=1 6144x5120 rocm.nvnni.decode.fast.kb9 Qwen36_GDN_ZProjection max-regret=0.6231% max-cv=41.3085%
+            {0x0100014000001c00ULL, {8, 4}}, // CB=5 M=1 7168x5120 rocm.nvnni.decode.fast.kb8 32B_QKV max-regret=0.3279% max-cv=35.8432%
+            {0x0100014000002800ULL, {8, 4}}, // CB=5 M=1 10240x5120 rocm.nvnni.decode.fast.kb8 Qwen36_GDN_InnerProjection max-regret=0.2625% max-cv=38.5896%
+            {0x0100014000003000ULL, {7, 4}}, // CB=5 M=1 12288x5120 rocm.nvnni.decode.fast.kb7 Qwen36_Attn_QKVProjection max-regret=0.2088% max-cv=2.2144%
+            {0x0100014000003600ULL, {6, 4}}, // CB=5 M=1 13824x5120 rocm.nvnni.decode.fast.kb6 14B_FFN_Up max-regret=0.2128% max-cv=2.6599%
+            {0x0100014000004400ULL, {5, 4}}, // CB=5 M=1 17408x5120 rocm.nvnni.decode.fast.kb5 Qwen36_FFN_GateUp max-regret=0.7168% max-cv=1.5483%
+            {0x0100014000006c00ULL, {3, 4}}, // CB=5 M=1 27648x5120 rocm.nvnni.decode.fast.kb3 32B_FFN_Up max-regret=0.0000% max-cv=2.2639%
+            {0x0100014000025200ULL, {3, 4}}, // CB=5 M=1 152064x5120 rocm.nvnni.decode.fast.kb3 32B_LM_Head max-regret=0.3824% max-cv=0.8840%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=5 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=0.3230%
+            {0x0100016000000600ULL, {18, 4}}, // CB=5 M=1 1536x5632 rocm.nvnni.decode.fast.kb18 V4FastSealed_Tall_1536x5632 max-regret=5.5249% max-cv=21.9664%
+            {0x010001600000b000ULL, {2, 4}}, // CB=5 M=1 45056x5632 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=1.3901%
+            {0x0100018000001400ULL, {11, 4}}, // CB=5 M=1 5120x6144 rocm.nvnni.decode.fast.kb11 Qwen36_GDN_OutputProjection max-regret=1.0453% max-cv=2.6719%
+            {0x0100022000002600ULL, {7, 4}}, // CB=5 M=1 9728x8704 rocm.nvnni.decode.fast.kb7 V4FastSealed_Balanced_9728x8704 max-regret=0.1706% max-cv=1.5696%
+            {0x0100023000000600ULL, {20, 4}}, // CB=5 M=1 1536x8960 rocm.nvnni.decode.fast.kb20 1.5B_FFN_Dn max-regret=0.4049% max-cv=31.0037%
+            {0x010002b000000800ULL, {23, 4}}, // CB=5 M=1 2048x11008 rocm.nvnni.decode.fast.kb23 3B_FFN_Dn max-regret=0.0000% max-cv=34.1557%
+            {0x0100030000000e80ULL, {17, 4}}, // CB=5 M=1 3712x12288 rocm.nvnni.decode.fast.kb17 V4FastSealed_Tall_3712x12288 max-regret=0.5025% max-cv=40.6674%
+            {0x0100036000001400ULL, {16, 4}}, // CB=5 M=1 5120x13824 rocm.nvnni.decode.fast.kb16 14B_FFN_Dn max-regret=0.2045% max-cv=2.5138%
+            {0x0100044000001400ULL, {14, 4}}, // CB=5 M=1 5120x17408 rocm.nvnni.decode.fast.kb14 Qwen36_FFN_DownProjection max-regret=1.1419% max-cv=26.0581%
+            {0x010004a000000e00ULL, {16, 4}}, // CB=5 M=1 3584x18944 rocm.nvnni.decode.fast.kb16 7B_FFN_Dn max-regret=0.3914% max-cv=39.6436%
+            {0x010004c800001680ULL, {16, 4}}, // CB=5 M=1 5760x19584 rocm.nvnni.decode.fast.kb16 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.2755% max-cv=2.4341%
+            {0x0100064000001d00ULL, {11, 4}}, // CB=5 M=1 7424x25600 rocm.nvnni.decode.fast.kb11 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.2423%
+            {0x010006c000001400ULL, {17, 4}}, // CB=5 M=1 5120x27648 rocm.nvnni.decode.fast.kb17 32B_FFN_Dn max-regret=0.3429% max-cv=3.1640%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 6)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {5, 4}}, // CB=6 M=1 128x256 rocm.nvnni.decode.fast.kb5 Integration_Tall_128x256 max-regret=0.9174% max-cv=14.7182%
+            {0x01000010000000bfULL, {8, 4}}, // CB=6 M=1 191x256 rocm.nvnni.decode.fast.kb8 Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=4.7600%
+            {0x01000010000000c0ULL, {4, 4}}, // CB=6 M=1 192x256 rocm.nvnni.decode.fast.kb4 Integration_Balanced_192x256 max-regret=0.9259% max-cv=8.6607%
+            {0x0100001000000280ULL, {4, 4}}, // CB=6 M=1 640x256 rocm.nvnni.decode.fast.kb4 V3Development_Wide_640x256 max-regret=0.0000% max-cv=1.1235%
+            {0x0100001000001080ULL, {8, 4}}, // CB=6 M=1 4224x256 rocm.nvnni.decode.fast.kb8 FastSealed_VeryWide_4224x256 max-regret=4.3103% max-cv=2.2279%
+            {0x0100001200000090ULL, {7, 4}}, // CB=6 M=1 144x288 rocm.nvnni.decode.fast.kb7 DevNeighbor_Integration_Tall_128x256 max-regret=1.8182% max-cv=5.4283%
+            {0x01000012000000a0ULL, {9, 4}}, // CB=6 M=1 160x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_160x288 max-regret=0.0000% max-cv=6.2531%
+            {0x01000012000000d7ULL, {9, 4}}, // CB=6 M=1 215x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=9.5609%
+            {0x01000012000000d8ULL, {7, 4}}, // CB=6 M=1 216x288 rocm.nvnni.decode.fast.kb7 DevNeighbor_Integration_Balanced_192x256 max-regret=2.7273% max-cv=5.9438%
+            {0x0100001200000280ULL, {5, 4}}, // CB=6 M=1 640x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_640x288 max-regret=0.0000% max-cv=7.9637%
+            {0x0100001200001400ULL, {5, 4}}, // CB=6 M=1 5120x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_VeryWide_5120x288 max-regret=2.4793% max-cv=13.6840%
+            {0x0100001200002400ULL, {3, 4}}, // CB=6 M=1 9216x288 rocm.nvnni.decode.fast.kb3 DevNeighbor_Generic_VeryWide_Small max-regret=0.7752% max-cv=4.7254%
+            {0x0100001400000060ULL, {10, 4}}, // CB=6 M=1 96x320 rocm.nvnni.decode.fast.kb10 V3FastSealed_Tall_96x320 max-regret=0.6944% max-cv=18.9124%
+            {0x0100001400000070ULL, {5, 4}}, // CB=6 M=1 112x320 rocm.nvnni.decode.fast.kb5 V3Development_Tall_112x320 max-regret=0.0000% max-cv=6.6734%
+            {0x0100001400000100ULL, {5, 4}}, // CB=6 M=1 256x320 rocm.nvnni.decode.fast.kb5 V3Development_Balanced_256x320 max-regret=0.0000% max-cv=15.7527%
+            {0x0100001400000110ULL, {9, 4}}, // CB=6 M=1 272x320 rocm.nvnni.decode.fast.kb9 V4FastSealed_Balanced_272x320 max-regret=4.5455% max-cv=4.4463%
+            {0x0100001400000320ULL, {4, 4}}, // CB=6 M=1 800x320 rocm.nvnni.decode.fast.kb4 V3VerifierSealed_Wide_800x320 max-regret=1.7857% max-cv=7.7835%
+            {0x0100001600000120ULL, {7, 4}}, // CB=6 M=1 288x352 rocm.nvnni.decode.fast.kb7 V3VerifierSealed_Balanced_288x352 max-regret=1.3793% max-cv=4.3897%
+            {0x0100001c00000100ULL, {7, 4}}, // CB=6 M=1 256x448 rocm.nvnni.decode.fast.kb7 V3Development_Tall_256x448 max-regret=0.0000% max-cv=5.6031%
+            {0x0100001c00000800ULL, {7, 4}}, // CB=6 M=1 2048x448 rocm.nvnni.decode.fast.kb7 V4FastSealed_Wide_2048x448 max-regret=0.0000% max-cv=5.4472%
+            {0x0100001c00004000ULL, {3, 4}}, // CB=6 M=1 16384x448 rocm.nvnni.decode.fast.kb3 V4FastSealed_VeryWide_16384x448 max-regret=0.0000% max-cv=1.8511%
+            {0x0100002000000800ULL, {4, 4}}, // CB=6 M=1 2048x512 rocm.nvnni.decode.fast.kb4 35BMoE_Expert_Down max-regret=0.0000% max-cv=4.0071%
+            {0x01000024000001b0ULL, {10, 4}}, // CB=6 M=1 432x576 rocm.nvnni.decode.fast.kb10 DevNeighbor_Integration_Balanced_384x512 max-regret=0.6579% max-cv=14.7419%
+            {0x0100002c00000260ULL, {9, 4}}, // CB=6 M=1 608x704 rocm.nvnni.decode.fast.kb9 V4FastSealed_Balanced_608x704 max-regret=0.6494% max-cv=6.7695%
+            {0x0100002c00001200ULL, {7, 4}}, // CB=6 M=1 4608x704 rocm.nvnni.decode.fast.kb7 V4FastSealed_Wide_4608x704 max-regret=2.1429% max-cv=6.8859%
+            {0x01000034000001a0ULL, {10, 4}}, // CB=6 M=1 416x832 rocm.nvnni.decode.fast.kb10 V4FastSealed_Tall_416x832 max-regret=0.0000% max-cv=4.9281%
+            {0x0100003800000380ULL, {10, 4}}, // CB=6 M=1 896x896 rocm.nvnni.decode.fast.kb10 0.5B_AttnOut max-regret=0.0000% max-cv=3.2710%
+            {0x0100003800000480ULL, {7, 4}}, // CB=6 M=1 1152x896 rocm.nvnni.decode.fast.kb7 0.5B_QKV max-regret=0.0000% max-cv=44.9192%
+            {0x0100003800001300ULL, {6, 4}}, // CB=6 M=1 4864x896 rocm.nvnni.decode.fast.kb6 0.5B_FFN_Up max-regret=0.0000% max-cv=3.1482%
+            {0x010000380000a000ULL, {3, 4}}, // CB=6 M=1 40960x896 rocm.nvnni.decode.fast.kb3 V4FastSealed_VeryWide_40960x896 max-regret=0.0000% max-cv=41.6344%
+            {0x0100003800025180ULL, {1, 4}}, // CB=6 M=1 151936x896 rocm.nvnni.decode.fast.kb1 0.5B_LM_Head max-regret=0.0000% max-cv=2.6349%
+            {0x0100004000000510ULL, {13, 4}}, // CB=6 M=1 1296x1024 rocm.nvnni.decode.fast.kb13 DevNeighbor_0.5B_QKV max-regret=2.3437% max-cv=4.7969%
+            {0x0100004000001560ULL, {6, 4}}, // CB=6 M=1 5472x1024 rocm.nvnni.decode.fast.kb6 DevNeighbor_0.5B_FFN_Up max-regret=0.0000% max-cv=5.2697%
+            {0x0100005000000320ULL, {16, 4}}, // CB=6 M=1 800x1280 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_800x1280 max-regret=0.7634% max-cv=2.4924%
+            {0x0100005800000500ULL, {13, 4}}, // CB=6 M=1 1280x1408 rocm.nvnni.decode.fast.kb13 V4FastSealed_Balanced_1280x1408 max-regret=1.4925% max-cv=7.4734%
+            {0x0100005800002c00ULL, {5, 4}}, // CB=6 M=1 11264x1408 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_11264x1408 max-regret=0.8097% max-cv=4.7958%
+            {0x0100006000000600ULL, {10, 4}}, // CB=6 M=1 1536x1536 rocm.nvnni.decode.fast.kb10 1.5B_AttnOut max-regret=0.0000% max-cv=3.2725%
+            {0x0100006000000800ULL, {18, 4}}, // CB=6 M=1 2048x1536 rocm.nvnni.decode.fast.kb18 1.5B_QKV max-regret=4.7945% max-cv=2.3109%
+            {0x0100006000002300ULL, {5, 4}}, // CB=6 M=1 8960x1536 rocm.nvnni.decode.fast.kb5 1.5B_FFN_Up max-regret=0.5051% max-cv=4.6096%
+            {0x0100006000025180ULL, {1, 4}}, // CB=6 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.0000% max-cv=7.3844%
+            {0x0100006c00000260ULL, {14, 4}}, // CB=6 M=1 608x1728 rocm.nvnni.decode.fast.kb14 V4TransitionNeighbor_Tall_608x1728 max-regret=0.0000% max-cv=74.1879%
+            {0x0100007000014000ULL, {1, 4}}, // CB=6 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=8.8847%
+            {0x0100007c000002c0ULL, {13, 4}}, // CB=6 M=1 704x1984 rocm.nvnni.decode.fast.kb13 V4TransitionNeighbor_Tall_704x1984 max-regret=1.4706% max-cv=3.0625%
+            {0x0100008000000200ULL, {16, 4}}, // CB=6 M=1 512x2048 rocm.nvnni.decode.fast.kb16 35BMoE_Expert_GateUp max-regret=0.0000% max-cv=3.8723%
+            {0x0100008000000800ULL, {10, 4}}, // CB=6 M=1 2048x2048 rocm.nvnni.decode.fast.kb10 3B_AttnOut max-regret=0.0000% max-cv=5.1963%
+            {0x0100008000000a00ULL, {11, 4}}, // CB=6 M=1 2560x2048 rocm.nvnni.decode.fast.kb11 3B_QKV max-regret=0.0000% max-cv=10.7209%
+            {0x0100008000001000ULL, {11, 4}}, // CB=6 M=1 4096x2048 rocm.nvnni.decode.fast.kb11 Qwen36MoE_GDN_ZProjection max-regret=0.0000% max-cv=3.0452%
+            {0x0100008000002000ULL, {6, 4}}, // CB=6 M=1 8192x2048 rocm.nvnni.decode.fast.kb6 Qwen36MoE_GDN_QKVProjection max-regret=0.0000% max-cv=2.1633%
+            {0x0100008000002b00ULL, {6, 4}}, // CB=6 M=1 11008x2048 rocm.nvnni.decode.fast.kb6 3B_FFN_Up max-regret=0.6944% max-cv=32.3075%
+            {0x0100008000025180ULL, {1, 4}}, // CB=6 M=1 151936x2048 rocm.nvnni.decode.fast.kb1 3B_LM_Head max-regret=0.0000% max-cv=1.0518%
+            {0x010000a000000940ULL, {16, 4}}, // CB=6 M=1 2368x2560 rocm.nvnni.decode.fast.kb16 V4FastSealed_Balanced_2368x2560 max-regret=0.5000% max-cv=1.3443%
+            {0x010000a400000348ULL, {17, 4}}, // CB=6 M=1 840x2624 rocm.nvnni.decode.fast.kb17 V3TransitionRefine_Tall_840x2624 max-regret=0.0000% max-cv=1.7467%
+            {0x010000b000005800ULL, {4, 4}}, // CB=6 M=1 22528x2816 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=44.0633%
+            {0x010000b8000003a0ULL, {16, 4}}, // CB=6 M=1 928x2944 rocm.nvnni.decode.fast.kb16 V3Transition_Tall_928x2944 max-regret=0.0000% max-cv=55.9870%
+            {0x010000e000000e00ULL, {8, 4}}, // CB=6 M=1 3584x3584 rocm.nvnni.decode.fast.kb8 7B_AttnOut max-regret=0.5000% max-cv=3.8012%
+            {0x010000e000001200ULL, {11, 4}}, // CB=6 M=1 4608x3584 rocm.nvnni.decode.fast.kb11 7B_QKV max-regret=0.9050% max-cv=29.6993%
+            {0x010000e000004a00ULL, {4, 4}}, // CB=6 M=1 18944x3584 rocm.nvnni.decode.fast.kb4 7B_FFN_Up max-regret=0.0000% max-cv=0.9792%
+            {0x010000e000025200ULL, {1, 4}}, // CB=6 M=1 152064x3584 rocm.nvnni.decode.fast.kb1 7B_LM_Head max-regret=0.6259% max-cv=1.6637%
+            {0x010000e000028000ULL, {1, 4}}, // CB=6 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=1.7926%
+            {0x010000fc00001440ULL, {12, 4}}, // CB=6 M=1 5184x4032 rocm.nvnni.decode.fast.kb12 DevNeighbor_7B_QKV max-regret=0.0000% max-cv=29.1826%
+            {0x010000fc00005340ULL, {4, 4}}, // CB=6 M=1 21312x4032 rocm.nvnni.decode.fast.kb4 DevNeighbor_7B_FFN_Up max-regret=0.4637% max-cv=1.7596%
+            {0x0100012000001400ULL, {12, 4}}, // CB=6 M=1 5120x4608 rocm.nvnni.decode.fast.kb12 V4FastSealed_Balanced_5120x4608 max-regret=0.6689% max-cv=32.9013%
+            {0x0100013000000380ULL, {17, 4}}, // CB=6 M=1 896x4864 rocm.nvnni.decode.fast.kb17 0.5B_FFN_Dn max-regret=0.0000% max-cv=4.0058%
+            {0x0100014000000400ULL, {18, 4}}, // CB=6 M=1 1024x5120 rocm.nvnni.decode.fast.kb18 Qwen36_GDN_TimeProjection max-regret=0.0000% max-cv=9.1838%
+            {0x0100014000001400ULL, {13, 4}}, // CB=6 M=1 5120x5120 rocm.nvnni.decode.fast.kb13 32B_AttnOut max-regret=0.0000% max-cv=36.0437%
+            {0x0100014000001800ULL, {11, 4}}, // CB=6 M=1 6144x5120 rocm.nvnni.decode.fast.kb11 Qwen36_GDN_ZProjection max-regret=0.0000% max-cv=4.5346%
+            {0x0100014000001c00ULL, {11, 4}}, // CB=6 M=1 7168x5120 rocm.nvnni.decode.fast.kb11 32B_QKV max-regret=0.5952% max-cv=6.5330%
+            {0x0100014000002800ULL, {6, 4}}, // CB=6 M=1 10240x5120 rocm.nvnni.decode.fast.kb6 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=1.7418%
+            {0x0100014000003000ULL, {6, 4}}, // CB=6 M=1 12288x5120 rocm.nvnni.decode.fast.kb6 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=6.5497%
+            {0x0100014000003600ULL, {6, 4}}, // CB=6 M=1 13824x5120 rocm.nvnni.decode.fast.kb6 14B_FFN_Up max-regret=0.0000% max-cv=1.9293%
+            {0x0100014000004400ULL, {5, 4}}, // CB=6 M=1 17408x5120 rocm.nvnni.decode.fast.kb5 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=1.2725%
+            {0x0100014000006c00ULL, {3, 4}}, // CB=6 M=1 27648x5120 rocm.nvnni.decode.fast.kb3 32B_FFN_Up max-regret=0.0000% max-cv=28.1610%
+            {0x0100014000025200ULL, {1, 4}}, // CB=6 M=1 152064x5120 rocm.nvnni.decode.fast.kb1 32B_LM_Head max-regret=0.0000% max-cv=1.1996%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=6 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=0.4103%
+            {0x0100016000000600ULL, {20, 4}}, // CB=6 M=1 1536x5632 rocm.nvnni.decode.fast.kb20 V4FastSealed_Tall_1536x5632 max-regret=0.0000% max-cv=3.9461%
+            {0x010001600000b000ULL, {2, 4}}, // CB=6 M=1 45056x5632 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_45056x5632 max-regret=0.2531% max-cv=1.6398%
+            {0x0100018000001400ULL, {10, 4}}, // CB=6 M=1 5120x6144 rocm.nvnni.decode.fast.kb10 Qwen36_GDN_OutputProjection max-regret=0.0000% max-cv=1.4289%
+            {0x0100022000002600ULL, {6, 4}}, // CB=6 M=1 9728x8704 rocm.nvnni.decode.fast.kb6 V4FastSealed_Balanced_9728x8704 max-regret=0.0000% max-cv=2.6671%
+            {0x0100023000000600ULL, {19, 4}}, // CB=6 M=1 1536x8960 rocm.nvnni.decode.fast.kb19 1.5B_FFN_Dn max-regret=1.3636% max-cv=1.4916%
+            {0x010002b000000800ULL, {15, 4}}, // CB=6 M=1 2048x11008 rocm.nvnni.decode.fast.kb15 3B_FFN_Dn max-regret=0.0000% max-cv=31.1298%
+            {0x0100030000000e80ULL, {16, 4}}, // CB=6 M=1 3712x12288 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_3712x12288 max-regret=0.4556% max-cv=34.4662%
+            {0x0100036000001400ULL, {12, 4}}, // CB=6 M=1 5120x13824 rocm.nvnni.decode.fast.kb12 14B_FFN_Dn max-regret=0.0000% max-cv=2.4402%
+            {0x0100044000001400ULL, {6, 4}}, // CB=6 M=1 5120x17408 rocm.nvnni.decode.fast.kb6 Qwen36_FFN_DownProjection max-regret=0.9365% max-cv=34.6149%
+            {0x010004a000000e00ULL, {17, 4}}, // CB=6 M=1 3584x18944 rocm.nvnni.decode.fast.kb17 7B_FFN_Dn max-regret=0.1765% max-cv=2.1960%
+            {0x010004c800001680ULL, {14, 4}}, // CB=6 M=1 5760x19584 rocm.nvnni.decode.fast.kb14 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=1.2407%
+            {0x0100064000001d00ULL, {8, 4}}, // CB=6 M=1 7424x25600 rocm.nvnni.decode.fast.kb8 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.2229%
+            {0x010006c000001400ULL, {12, 4}}, // CB=6 M=1 5120x27648 rocm.nvnni.decode.fast.kb12 32B_FFN_Dn max-regret=0.0000% max-cv=1.6824%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 7)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {8, 4}}, // CB=7 M=1 128x256 rocm.nvnni.decode.fast.kb8 Integration_Tall_128x256 max-regret=11.4865% max-cv=21.3275%
+            {0x01000010000000bfULL, {4, 4}}, // CB=7 M=1 191x256 rocm.nvnni.decode.fast.kb4 Generic_Tall_BoundaryBelow max-regret=5.3571% max-cv=9.4126%
+            {0x01000010000000c0ULL, {6, 4}}, // CB=7 M=1 192x256 rocm.nvnni.decode.fast.kb6 Integration_Balanced_192x256 max-regret=6.3063% max-cv=6.6637%
+            {0x0100001000000280ULL, {4, 4}}, // CB=7 M=1 640x256 rocm.nvnni.decode.fast.kb4 V3Development_Wide_640x256 max-regret=2.0548% max-cv=9.4762%
+            {0x0100001000001080ULL, {4, 4}}, // CB=7 M=1 4224x256 rocm.nvnni.decode.fast.kb4 FastSealed_VeryWide_4224x256 max-regret=0.8064% max-cv=3.3027%
+            {0x0100001200000090ULL, {6, 4}}, // CB=7 M=1 144x288 rocm.nvnni.decode.fast.kb6 DevNeighbor_Integration_Tall_128x256 max-regret=5.3571% max-cv=12.6201%
+            {0x01000012000000a0ULL, {7, 4}}, // CB=7 M=1 160x288 rocm.nvnni.decode.fast.kb7 V4FastSealed_Tall_160x288 max-regret=3.4014% max-cv=16.3996%
+            {0x01000012000000d7ULL, {5, 4}}, // CB=7 M=1 215x288 rocm.nvnni.decode.fast.kb5 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=6.1404% max-cv=28.0675%
+            {0x01000012000000d8ULL, {9, 4}}, // CB=7 M=1 216x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Balanced_192x256 max-regret=0.0000% max-cv=12.3391%
+            {0x0100001200000280ULL, {9, 4}}, // CB=7 M=1 640x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_640x288 max-regret=0.0000% max-cv=25.4878%
+            {0x0100001200001400ULL, {5, 4}}, // CB=7 M=1 5120x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_VeryWide_5120x288 max-regret=0.0000% max-cv=12.4009%
+            {0x0100001200002400ULL, {4, 4}}, // CB=7 M=1 9216x288 rocm.nvnni.decode.fast.kb4 DevNeighbor_Generic_VeryWide_Small max-regret=3.5971% max-cv=15.2685%
+            {0x0100001400000060ULL, {6, 4}}, // CB=7 M=1 96x320 rocm.nvnni.decode.fast.kb6 V3FastSealed_Tall_96x320 max-regret=2.0408% max-cv=18.9466%
+            {0x0100001400000070ULL, {10, 4}}, // CB=7 M=1 112x320 rocm.nvnni.decode.fast.kb10 V3Development_Tall_112x320 max-regret=12.6667% max-cv=29.0718%
+            {0x0100001400000100ULL, {5, 4}}, // CB=7 M=1 256x320 rocm.nvnni.decode.fast.kb5 V3Development_Balanced_256x320 max-regret=2.6549% max-cv=8.7922%
+            {0x0100001400000110ULL, {10, 4}}, // CB=7 M=1 272x320 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_272x320 max-regret=0.0000% max-cv=18.6322%
+            {0x0100001400000320ULL, {7, 4}}, // CB=7 M=1 800x320 rocm.nvnni.decode.fast.kb7 V3VerifierSealed_Wide_800x320 max-regret=3.4483% max-cv=9.8841%
+            {0x0100001600000120ULL, {11, 4}}, // CB=7 M=1 288x352 rocm.nvnni.decode.fast.kb11 V3VerifierSealed_Balanced_288x352 max-regret=9.1667% max-cv=22.0452%
+            {0x0100001c00000100ULL, {14, 4}}, // CB=7 M=1 256x448 rocm.nvnni.decode.fast.kb14 V3Development_Tall_256x448 max-regret=3.3058% max-cv=11.9334%
+            {0x0100001c00000800ULL, {11, 4}}, // CB=7 M=1 2048x448 rocm.nvnni.decode.fast.kb11 V4FastSealed_Wide_2048x448 max-regret=5.5118% max-cv=6.9475%
+            {0x0100001c00004000ULL, {5, 4}}, // CB=7 M=1 16384x448 rocm.nvnni.decode.fast.kb5 V4FastSealed_VeryWide_16384x448 max-regret=2.3256% max-cv=10.6956%
+            {0x0100002000000800ULL, {15, 4}}, // CB=7 M=1 2048x512 rocm.nvnni.decode.fast.kb15 35BMoE_Expert_Down max-regret=7.6923% max-cv=37.9371%
+            {0x01000024000001b0ULL, {11, 4}}, // CB=7 M=1 432x576 rocm.nvnni.decode.fast.kb11 DevNeighbor_Integration_Balanced_384x512 max-regret=3.3333% max-cv=19.1177%
+            {0x0100002c00000260ULL, {12, 4}}, // CB=7 M=1 608x704 rocm.nvnni.decode.fast.kb12 V4FastSealed_Balanced_608x704 max-regret=1.2579% max-cv=91.4236%
+            {0x0100002c00001200ULL, {9, 4}}, // CB=7 M=1 4608x704 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_4608x704 max-regret=1.3158% max-cv=86.3295%
+            {0x01000034000001a0ULL, {18, 4}}, // CB=7 M=1 416x832 rocm.nvnni.decode.fast.kb18 V4FastSealed_Tall_416x832 max-regret=3.9063% max-cv=4.3294%
+            {0x0100003800000380ULL, {10, 4}}, // CB=7 M=1 896x896 rocm.nvnni.decode.fast.kb10 0.5B_AttnOut max-regret=0.7463% max-cv=9.6765%
+            {0x0100003800000480ULL, {11, 4}}, // CB=7 M=1 1152x896 rocm.nvnni.decode.fast.kb11 0.5B_QKV max-regret=2.8985% max-cv=21.0164%
+            {0x0100003800001300ULL, {15, 4}}, // CB=7 M=1 4864x896 rocm.nvnni.decode.fast.kb15 0.5B_FFN_Up max-regret=4.9080% max-cv=3.7198%
+            {0x010000380000a000ULL, {3, 4}}, // CB=7 M=1 40960x896 rocm.nvnni.decode.fast.kb3 V4FastSealed_VeryWide_40960x896 max-regret=0.0000% max-cv=4.7987%
+            {0x0100003800025180ULL, {8, 4}}, // CB=7 M=1 151936x896 rocm.nvnni.decode.fast.kb8 0.5B_LM_Head max-regret=2.9783% max-cv=2.2281%
+            {0x0100004000000510ULL, {9, 4}}, // CB=7 M=1 1296x1024 rocm.nvnni.decode.fast.kb9 DevNeighbor_0.5B_QKV max-regret=5.0360% max-cv=5.0701%
+            {0x0100004000001560ULL, {8, 4}}, // CB=7 M=1 5472x1024 rocm.nvnni.decode.fast.kb8 DevNeighbor_0.5B_FFN_Up max-regret=1.4218% max-cv=23.2906%
+            {0x0100005000000320ULL, {10, 4}}, // CB=7 M=1 800x1280 rocm.nvnni.decode.fast.kb10 V4FastSealed_Tall_800x1280 max-regret=2.0979% max-cv=3.7818%
+            {0x0100005800000500ULL, {15, 4}}, // CB=7 M=1 1280x1408 rocm.nvnni.decode.fast.kb15 V4FastSealed_Balanced_1280x1408 max-regret=2.6846% max-cv=18.5407%
+            {0x0100005800002c00ULL, {9, 4}}, // CB=7 M=1 11264x1408 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_11264x1408 max-regret=1.8315% max-cv=27.3264%
+            {0x0100006000000600ULL, {15, 4}}, // CB=7 M=1 1536x1536 rocm.nvnni.decode.fast.kb15 1.5B_AttnOut max-regret=7.9470% max-cv=24.2166%
+            {0x0100006000000800ULL, {14, 4}}, // CB=7 M=1 2048x1536 rocm.nvnni.decode.fast.kb14 1.5B_QKV max-regret=3.7736% max-cv=7.3418%
+            {0x0100006000002300ULL, {8, 4}}, // CB=7 M=1 8960x1536 rocm.nvnni.decode.fast.kb8 1.5B_FFN_Up max-regret=0.0000% max-cv=5.8332%
+            {0x0100006000025180ULL, {3, 4}}, // CB=7 M=1 151936x1536 rocm.nvnni.decode.fast.kb3 1.5B_LM_Head max-regret=0.0000% max-cv=1.4567%
+            {0x0100006c00000260ULL, {15, 4}}, // CB=7 M=1 608x1728 rocm.nvnni.decode.fast.kb15 V4TransitionNeighbor_Tall_608x1728 max-regret=4.7619% max-cv=16.3062%
+            {0x0100007000014000ULL, {1, 4}}, // CB=7 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=4.8736%
+            {0x0100007c000002c0ULL, {16, 4}}, // CB=7 M=1 704x1984 rocm.nvnni.decode.fast.kb16 V4TransitionNeighbor_Tall_704x1984 max-regret=1.2987% max-cv=7.0967%
+            {0x0100008000000200ULL, {18, 4}}, // CB=7 M=1 512x2048 rocm.nvnni.decode.fast.kb18 35BMoE_Expert_GateUp max-regret=2.6316% max-cv=6.9838%
+            {0x0100008000000800ULL, {19, 4}}, // CB=7 M=1 2048x2048 rocm.nvnni.decode.fast.kb19 3B_AttnOut max-regret=3.4682% max-cv=3.0902%
+            {0x0100008000000a00ULL, {13, 4}}, // CB=7 M=1 2560x2048 rocm.nvnni.decode.fast.kb13 3B_QKV max-regret=1.1236% max-cv=6.4638%
+            {0x0100008000001000ULL, {16, 4}}, // CB=7 M=1 4096x2048 rocm.nvnni.decode.fast.kb16 Qwen36MoE_GDN_ZProjection max-regret=1.5873% max-cv=3.6437%
+            {0x0100008000002000ULL, {6, 4}}, // CB=7 M=1 8192x2048 rocm.nvnni.decode.fast.kb6 Qwen36MoE_GDN_QKVProjection max-regret=0.4082% max-cv=5.1050%
+            {0x0100008000002b00ULL, {6, 4}}, // CB=7 M=1 11008x2048 rocm.nvnni.decode.fast.kb6 3B_FFN_Up max-regret=0.3106% max-cv=30.3246%
+            {0x0100008000025180ULL, {4, 4}}, // CB=7 M=1 151936x2048 rocm.nvnni.decode.fast.kb4 3B_LM_Head max-regret=0.0000% max-cv=2.3761%
+            {0x010000a000000940ULL, {16, 4}}, // CB=7 M=1 2368x2560 rocm.nvnni.decode.fast.kb16 V4FastSealed_Balanced_2368x2560 max-regret=1.6304% max-cv=6.6077%
+            {0x010000a400000348ULL, {30, 4}}, // CB=7 M=1 840x2624 rocm.nvnni.decode.fast.kb30 V3TransitionRefine_Tall_840x2624 max-regret=3.0151% max-cv=4.5142%
+            {0x010000b000005800ULL, {5, 4}}, // CB=7 M=1 22528x2816 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=37.4788%
+            {0x010000b8000003a0ULL, {19, 4}}, // CB=7 M=1 928x2944 rocm.nvnni.decode.fast.kb19 V3Transition_Tall_928x2944 max-regret=0.5848% max-cv=4.3971%
+            {0x010000e000000e00ULL, {16, 4}}, // CB=7 M=1 3584x3584 rocm.nvnni.decode.fast.kb16 7B_AttnOut max-regret=0.3906% max-cv=25.2884%
+            {0x010000e000001200ULL, {17, 4}}, // CB=7 M=1 4608x3584 rocm.nvnni.decode.fast.kb17 7B_QKV max-regret=1.3889% max-cv=28.8197%
+            {0x010000e000004a00ULL, {5, 4}}, // CB=7 M=1 18944x3584 rocm.nvnni.decode.fast.kb5 7B_FFN_Up max-regret=0.0000% max-cv=2.5746%
+            {0x010000e000025200ULL, {5, 4}}, // CB=7 M=1 152064x3584 rocm.nvnni.decode.fast.kb5 7B_LM_Head max-regret=0.1315% max-cv=2.1468%
+            {0x010000e000028000ULL, {5, 4}}, // CB=7 M=1 163840x3584 rocm.nvnni.decode.fast.kb5 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=2.0873%
+            {0x010000fc00001440ULL, {12, 4}}, // CB=7 M=1 5184x4032 rocm.nvnni.decode.fast.kb12 DevNeighbor_7B_QKV max-regret=0.7117% max-cv=3.7045%
+            {0x010000fc00005340ULL, {5, 4}}, // CB=7 M=1 21312x4032 rocm.nvnni.decode.fast.kb5 DevNeighbor_7B_FFN_Up max-regret=0.5222% max-cv=1.4130%
+            {0x0100012000001400ULL, {12, 4}}, // CB=7 M=1 5120x4608 rocm.nvnni.decode.fast.kb12 V4FastSealed_Balanced_5120x4608 max-regret=0.0000% max-cv=33.8320%
+            {0x0100013000000380ULL, {39, 4}}, // CB=7 M=1 896x4864 rocm.nvnni.decode.fast.kb39 0.5B_FFN_Dn max-regret=3.1088% max-cv=6.6173%
+            {0x0100014000000400ULL, {32, 4}}, // CB=7 M=1 1024x5120 rocm.nvnni.decode.fast.kb32 Qwen36_GDN_TimeProjection max-regret=0.0000% max-cv=18.9928%
+            {0x0100014000001400ULL, {13, 4}}, // CB=7 M=1 5120x5120 rocm.nvnni.decode.fast.kb13 32B_AttnOut max-regret=0.3125% max-cv=32.9031%
+            {0x0100014000001800ULL, {11, 4}}, // CB=7 M=1 6144x5120 rocm.nvnni.decode.fast.kb11 Qwen36_GDN_ZProjection max-regret=0.0000% max-cv=1.8618%
+            {0x0100014000001c00ULL, {9, 4}}, // CB=7 M=1 7168x5120 rocm.nvnni.decode.fast.kb9 32B_QKV max-regret=0.2336% max-cv=2.6006%
+            {0x0100014000002800ULL, {9, 4}}, // CB=7 M=1 10240x5120 rocm.nvnni.decode.fast.kb9 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=2.6085%
+            {0x0100014000003000ULL, {6, 4}}, // CB=7 M=1 12288x5120 rocm.nvnni.decode.fast.kb6 Qwen36_Attn_QKVProjection max-regret=0.1667% max-cv=2.4997%
+            {0x0100014000003600ULL, {9, 4}}, // CB=7 M=1 13824x5120 rocm.nvnni.decode.fast.kb9 14B_FFN_Up max-regret=0.0000% max-cv=2.3065%
+            {0x0100014000004400ULL, {7, 4}}, // CB=7 M=1 17408x5120 rocm.nvnni.decode.fast.kb7 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=1.9119%
+            {0x0100014000006c00ULL, {9, 4}}, // CB=7 M=1 27648x5120 rocm.nvnni.decode.fast.kb9 32B_FFN_Up max-regret=1.2031% max-cv=27.1983%
+            {0x0100014000025200ULL, {4, 4}}, // CB=7 M=1 152064x5120 rocm.nvnni.decode.fast.kb4 32B_LM_Head max-regret=0.0188% max-cv=1.8651%
+            {0x010001400003ca00ULL, {3, 4}}, // CB=7 M=1 248320x5120 rocm.nvnni.decode.fast.kb3 Qwen36_LM_Head max-regret=0.0000% max-cv=1.1667%
+            {0x0100016000000600ULL, {30, 4}}, // CB=7 M=1 1536x5632 rocm.nvnni.decode.fast.kb30 V4FastSealed_Tall_1536x5632 max-regret=0.8130% max-cv=56.8734%
+            {0x010001600000b000ULL, {2, 4}}, // CB=7 M=1 45056x5632 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=2.6247%
+            {0x0100018000001400ULL, {13, 4}}, // CB=7 M=1 5120x6144 rocm.nvnni.decode.fast.kb13 Qwen36_GDN_OutputProjection max-regret=0.0000% max-cv=2.6475%
+            {0x0100022000002600ULL, {13, 4}}, // CB=7 M=1 9728x8704 rocm.nvnni.decode.fast.kb13 V4FastSealed_Balanced_9728x8704 max-regret=1.2640% max-cv=4.0633%
+            {0x0100023000000600ULL, {41, 4}}, // CB=7 M=1 1536x8960 rocm.nvnni.decode.fast.kb41 1.5B_FFN_Dn max-regret=3.1250% max-cv=25.8325%
+            {0x010002b000000800ULL, {29, 4}}, // CB=7 M=1 2048x11008 rocm.nvnni.decode.fast.kb29 3B_FFN_Dn max-regret=0.3106% max-cv=28.6157%
+            {0x0100030000000e80ULL, {17, 4}}, // CB=7 M=1 3712x12288 rocm.nvnni.decode.fast.kb17 V4FastSealed_Tall_3712x12288 max-regret=0.2110% max-cv=36.2103%
+            {0x0100036000001400ULL, {18, 4}}, // CB=7 M=1 5120x13824 rocm.nvnni.decode.fast.kb18 14B_FFN_Dn max-regret=2.4155% max-cv=3.9675%
+            {0x0100044000001400ULL, {19, 4}}, // CB=7 M=1 5120x17408 rocm.nvnni.decode.fast.kb19 Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=3.0510%
+            {0x010004a000000e00ULL, {28, 4}}, // CB=7 M=1 3584x18944 rocm.nvnni.decode.fast.kb28 7B_FFN_Dn max-regret=2.7200% max-cv=3.5712%
+            {0x010004c800001680ULL, {15, 4}}, // CB=7 M=1 5760x19584 rocm.nvnni.decode.fast.kb15 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.3279% max-cv=2.1379%
+            {0x0100064000001d00ULL, {17, 4}}, // CB=7 M=1 7424x25600 rocm.nvnni.decode.fast.kb17 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.8863%
+            {0x010006c000001400ULL, {18, 4}}, // CB=7 M=1 5120x27648 rocm.nvnni.decode.fast.kb18 32B_FFN_Dn max-regret=0.0000% max-cv=1.0410%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 8)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {4, 4}}, // CB=8 M=1 128x256 rocm.nvnni.decode.fast.kb4 Integration_Tall_128x256 max-regret=0.6849% max-cv=5.0977%
+            {0x01000010000000bfULL, {8, 4}}, // CB=8 M=1 191x256 rocm.nvnni.decode.fast.kb8 Generic_Tall_BoundaryBelow max-regret=9.5652% max-cv=16.5061%
+            {0x01000010000000c0ULL, {8, 4}}, // CB=8 M=1 192x256 rocm.nvnni.decode.fast.kb8 Integration_Balanced_192x256 max-regret=0.0000% max-cv=4.2026%
+            {0x0100001000000280ULL, {4, 4}}, // CB=8 M=1 640x256 rocm.nvnni.decode.fast.kb4 V3Development_Wide_640x256 max-regret=0.8850% max-cv=7.1509%
+            {0x0100001000001080ULL, {4, 4}}, // CB=8 M=1 4224x256 rocm.nvnni.decode.fast.kb4 FastSealed_VeryWide_4224x256 max-regret=0.0000% max-cv=3.5360%
+            {0x0100001200000090ULL, {7, 4}}, // CB=8 M=1 144x288 rocm.nvnni.decode.fast.kb7 DevNeighbor_Integration_Tall_128x256 max-regret=4.4248% max-cv=4.4827%
+            {0x01000012000000a0ULL, {5, 4}}, // CB=8 M=1 160x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_Tall_160x288 max-regret=2.6786% max-cv=5.5239%
+            {0x01000012000000d7ULL, {6, 4}}, // CB=8 M=1 215x288 rocm.nvnni.decode.fast.kb6 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=2.6143% max-cv=6.1671%
+            {0x01000012000000d8ULL, {6, 4}}, // CB=8 M=1 216x288 rocm.nvnni.decode.fast.kb6 DevNeighbor_Integration_Balanced_192x256 max-regret=0.8696% max-cv=4.3996%
+            {0x0100001200000280ULL, {6, 4}}, // CB=8 M=1 640x288 rocm.nvnni.decode.fast.kb6 V4FastSealed_Wide_640x288 max-regret=1.7241% max-cv=7.3325%
+            {0x0100001200001400ULL, {5, 4}}, // CB=8 M=1 5120x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_VeryWide_5120x288 max-regret=0.0000% max-cv=2.6430%
+            {0x0100001200002400ULL, {3, 4}}, // CB=8 M=1 9216x288 rocm.nvnni.decode.fast.kb3 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=5.2826%
+            {0x0100001400000060ULL, {5, 4}}, // CB=8 M=1 96x320 rocm.nvnni.decode.fast.kb5 V3FastSealed_Tall_96x320 max-regret=0.6803% max-cv=9.8952%
+            {0x0100001400000070ULL, {10, 4}}, // CB=8 M=1 112x320 rocm.nvnni.decode.fast.kb10 V3Development_Tall_112x320 max-regret=0.0000% max-cv=3.3728%
+            {0x0100001400000100ULL, {9, 4}}, // CB=8 M=1 256x320 rocm.nvnni.decode.fast.kb9 V3Development_Balanced_256x320 max-regret=3.4783% max-cv=5.5591%
+            {0x0100001400000110ULL, {8, 4}}, // CB=8 M=1 272x320 rocm.nvnni.decode.fast.kb8 V4FastSealed_Balanced_272x320 max-regret=3.3784% max-cv=5.5127%
+            {0x0100001400000320ULL, {6, 4}}, // CB=8 M=1 800x320 rocm.nvnni.decode.fast.kb6 V3VerifierSealed_Wide_800x320 max-regret=1.3423% max-cv=6.6804%
+            {0x0100001600000120ULL, {9, 4}}, // CB=8 M=1 288x352 rocm.nvnni.decode.fast.kb9 V3VerifierSealed_Balanced_288x352 max-regret=3.4483% max-cv=5.3914%
+            {0x0100001c00000100ULL, {7, 4}}, // CB=8 M=1 256x448 rocm.nvnni.decode.fast.kb7 V3Development_Tall_256x448 max-regret=0.0000% max-cv=3.1142%
+            {0x0100001c00000800ULL, {9, 4}}, // CB=8 M=1 2048x448 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_2048x448 max-regret=2.4000% max-cv=3.3741%
+            {0x0100001c00004000ULL, {6, 4}}, // CB=8 M=1 16384x448 rocm.nvnni.decode.fast.kb6 V4FastSealed_VeryWide_16384x448 max-regret=1.7647% max-cv=14.0443%
+            {0x0100002000000800ULL, {9, 4}}, // CB=8 M=1 2048x512 rocm.nvnni.decode.fast.kb9 35BMoE_Expert_Down max-regret=0.0000% max-cv=9.2476%
+            {0x01000024000001b0ULL, {9, 4}}, // CB=8 M=1 432x576 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Balanced_384x512 max-regret=0.0000% max-cv=5.9037%
+            {0x0100002c00000260ULL, {11, 4}}, // CB=8 M=1 608x704 rocm.nvnni.decode.fast.kb11 V4FastSealed_Balanced_608x704 max-regret=0.0000% max-cv=17.5250%
+            {0x0100002c00001200ULL, {5, 4}}, // CB=8 M=1 4608x704 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_4608x704 max-regret=1.3514% max-cv=4.3177%
+            {0x01000034000001a0ULL, {9, 4}}, // CB=8 M=1 416x832 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_416x832 max-regret=0.7813% max-cv=1.6456%
+            {0x0100003800000380ULL, {10, 4}}, // CB=8 M=1 896x896 rocm.nvnni.decode.fast.kb10 0.5B_AttnOut max-regret=0.0000% max-cv=6.4966%
+            {0x0100003800000480ULL, {14, 4}}, // CB=8 M=1 1152x896 rocm.nvnni.decode.fast.kb14 0.5B_QKV max-regret=1.5151% max-cv=4.1199%
+            {0x0100003800001300ULL, {7, 4}}, // CB=8 M=1 4864x896 rocm.nvnni.decode.fast.kb7 0.5B_FFN_Up max-regret=1.0000% max-cv=3.5395%
+            {0x010000380000a000ULL, {3, 4}}, // CB=8 M=1 40960x896 rocm.nvnni.decode.fast.kb3 V4FastSealed_VeryWide_40960x896 max-regret=0.0000% max-cv=2.9328%
+            {0x0100003800025180ULL, {1, 4}}, // CB=8 M=1 151936x896 rocm.nvnni.decode.fast.kb1 0.5B_LM_Head max-regret=0.0000% max-cv=1.1783%
+            {0x0100004000000510ULL, {20, 4}}, // CB=8 M=1 1296x1024 rocm.nvnni.decode.fast.kb20 DevNeighbor_0.5B_QKV max-regret=3.6232% max-cv=5.4113%
+            {0x0100004000001560ULL, {9, 4}}, // CB=8 M=1 5472x1024 rocm.nvnni.decode.fast.kb9 DevNeighbor_0.5B_FFN_Up max-regret=0.4673% max-cv=3.4261%
+            {0x0100005000000320ULL, {10, 4}}, // CB=8 M=1 800x1280 rocm.nvnni.decode.fast.kb10 V4FastSealed_Tall_800x1280 max-regret=0.0000% max-cv=4.7738%
+            {0x0100005800000500ULL, {12, 4}}, // CB=8 M=1 1280x1408 rocm.nvnni.decode.fast.kb12 V4FastSealed_Balanced_1280x1408 max-regret=0.5650% max-cv=5.4447%
+            {0x0100005800002c00ULL, {9, 4}}, // CB=8 M=1 11264x1408 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_11264x1408 max-regret=0.7380% max-cv=2.2926%
+            {0x0100006000000600ULL, {16, 4}}, // CB=8 M=1 1536x1536 rocm.nvnni.decode.fast.kb16 1.5B_AttnOut max-regret=0.0000% max-cv=1.6392%
+            {0x0100006000000800ULL, {12, 4}}, // CB=8 M=1 2048x1536 rocm.nvnni.decode.fast.kb12 1.5B_QKV max-regret=0.0000% max-cv=1.7928%
+            {0x0100006000002300ULL, {7, 4}}, // CB=8 M=1 8960x1536 rocm.nvnni.decode.fast.kb7 1.5B_FFN_Up max-regret=0.0000% max-cv=51.7939%
+            {0x0100006000025180ULL, {1, 4}}, // CB=8 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.0000% max-cv=1.3739%
+            {0x0100006c00000260ULL, {21, 4}}, // CB=8 M=1 608x1728 rocm.nvnni.decode.fast.kb21 V4TransitionNeighbor_Tall_608x1728 max-regret=2.1127% max-cv=3.4728%
+            {0x0100007000014000ULL, {1, 4}}, // CB=8 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=1.9844%
+            {0x0100007c000002c0ULL, {23, 4}}, // CB=8 M=1 704x1984 rocm.nvnni.decode.fast.kb23 V4TransitionNeighbor_Tall_704x1984 max-regret=1.3514% max-cv=4.1774%
+            {0x0100008000000200ULL, {16, 4}}, // CB=8 M=1 512x2048 rocm.nvnni.decode.fast.kb16 35BMoE_Expert_GateUp max-regret=0.6849% max-cv=3.2261%
+            {0x0100008000000800ULL, {13, 4}}, // CB=8 M=1 2048x2048 rocm.nvnni.decode.fast.kb13 3B_AttnOut max-regret=0.0000% max-cv=64.7683%
+            {0x0100008000000a00ULL, {13, 4}}, // CB=8 M=1 2560x2048 rocm.nvnni.decode.fast.kb13 3B_QKV max-regret=3.5503% max-cv=1.7175%
+            {0x0100008000001000ULL, {11, 4}}, // CB=8 M=1 4096x2048 rocm.nvnni.decode.fast.kb11 Qwen36MoE_GDN_ZProjection max-regret=0.4608% max-cv=2.3662%
+            {0x0100008000002000ULL, {6, 4}}, // CB=8 M=1 8192x2048 rocm.nvnni.decode.fast.kb6 Qwen36MoE_GDN_QKVProjection max-regret=0.0000% max-cv=1.6550%
+            {0x0100008000002b00ULL, {8, 4}}, // CB=8 M=1 11008x2048 rocm.nvnni.decode.fast.kb8 3B_FFN_Up max-regret=0.3125% max-cv=2.7022%
+            {0x0100008000025180ULL, {3, 4}}, // CB=8 M=1 151936x2048 rocm.nvnni.decode.fast.kb3 3B_LM_Head max-regret=0.2405% max-cv=0.9681%
+            {0x010000a000000940ULL, {11, 4}}, // CB=8 M=1 2368x2560 rocm.nvnni.decode.fast.kb11 V4FastSealed_Balanced_2368x2560 max-regret=1.9324% max-cv=6.2062%
+            {0x010000a400000348ULL, {18, 4}}, // CB=8 M=1 840x2624 rocm.nvnni.decode.fast.kb18 V3TransitionRefine_Tall_840x2624 max-regret=1.2658% max-cv=2.5944%
+            {0x010000b000005800ULL, {4, 4}}, // CB=8 M=1 22528x2816 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=4.2156%
+            {0x010000b8000003a0ULL, {23, 4}}, // CB=8 M=1 928x2944 rocm.nvnni.decode.fast.kb23 V3Transition_Tall_928x2944 max-regret=0.0000% max-cv=4.3994%
+            {0x010000e000000e00ULL, {16, 4}}, // CB=8 M=1 3584x3584 rocm.nvnni.decode.fast.kb16 7B_AttnOut max-regret=0.0000% max-cv=29.1804%
+            {0x010000e000001200ULL, {17, 4}}, // CB=8 M=1 4608x3584 rocm.nvnni.decode.fast.kb17 7B_QKV max-regret=1.0417% max-cv=28.6882%
+            {0x010000e000004a00ULL, {5, 4}}, // CB=8 M=1 18944x3584 rocm.nvnni.decode.fast.kb5 7B_FFN_Up max-regret=0.0000% max-cv=1.8778%
+            {0x010000e000025200ULL, {3, 4}}, // CB=8 M=1 152064x3584 rocm.nvnni.decode.fast.kb3 7B_LM_Head max-regret=0.0000% max-cv=0.7409%
+            {0x010000e000028000ULL, {2, 4}}, // CB=8 M=1 163840x3584 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_163840x3584 max-regret=0.0439% max-cv=0.5165%
+            {0x010000fc00001440ULL, {14, 4}}, // CB=8 M=1 5184x4032 rocm.nvnni.decode.fast.kb14 DevNeighbor_7B_QKV max-regret=1.2579% max-cv=35.2016%
+            {0x010000fc00005340ULL, {5, 4}}, // CB=8 M=1 21312x4032 rocm.nvnni.decode.fast.kb5 DevNeighbor_7B_FFN_Up max-regret=0.0000% max-cv=41.6155%
+            {0x0100012000001400ULL, {10, 4}}, // CB=8 M=1 5120x4608 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_5120x4608 max-regret=0.0000% max-cv=3.1684%
+            {0x0100013000000380ULL, {26, 4}}, // CB=8 M=1 896x4864 rocm.nvnni.decode.fast.kb26 0.5B_FFN_Dn max-regret=0.4587% max-cv=16.6964%
+            {0x0100014000000400ULL, {23, 4}}, // CB=8 M=1 1024x5120 rocm.nvnni.decode.fast.kb23 Qwen36_GDN_TimeProjection max-regret=1.0309% max-cv=6.2284%
+            {0x0100014000001400ULL, {9, 4}}, // CB=8 M=1 5120x5120 rocm.nvnni.decode.fast.kb9 32B_AttnOut max-regret=0.8357% max-cv=19.1669%
+            {0x0100014000001800ULL, {11, 4}}, // CB=8 M=1 6144x5120 rocm.nvnni.decode.fast.kb11 Qwen36_GDN_ZProjection max-regret=0.0000% max-cv=2.0233%
+            {0x0100014000001c00ULL, {11, 4}}, // CB=8 M=1 7168x5120 rocm.nvnni.decode.fast.kb11 32B_QKV max-regret=0.0000% max-cv=31.3550%
+            {0x0100014000002800ULL, {9, 4}}, // CB=8 M=1 10240x5120 rocm.nvnni.decode.fast.kb9 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=0.8595%
+            {0x0100014000003000ULL, {6, 4}}, // CB=8 M=1 12288x5120 rocm.nvnni.decode.fast.kb6 Qwen36_Attn_QKVProjection max-regret=0.1712% max-cv=2.2213%
+            {0x0100014000003600ULL, {7, 4}}, // CB=8 M=1 13824x5120 rocm.nvnni.decode.fast.kb7 14B_FFN_Up max-regret=0.1484% max-cv=1.7802%
+            {0x0100014000004400ULL, {6, 4}}, // CB=8 M=1 17408x5120 rocm.nvnni.decode.fast.kb6 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=1.2542%
+            {0x0100014000006c00ULL, {3, 4}}, // CB=8 M=1 27648x5120 rocm.nvnni.decode.fast.kb3 32B_FFN_Up max-regret=0.6963% max-cv=25.8592%
+            {0x0100014000025200ULL, {3, 4}}, // CB=8 M=1 152064x5120 rocm.nvnni.decode.fast.kb3 32B_LM_Head max-regret=0.0000% max-cv=0.3804%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=8 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=0.3867%
+            {0x0100016000000600ULL, {20, 4}}, // CB=8 M=1 1536x5632 rocm.nvnni.decode.fast.kb20 V4FastSealed_Tall_1536x5632 max-regret=0.0000% max-cv=2.6864%
+            {0x010001600000b000ULL, {2, 4}}, // CB=8 M=1 45056x5632 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=1.3647%
+            {0x0100018000001400ULL, {13, 4}}, // CB=8 M=1 5120x6144 rocm.nvnni.decode.fast.kb13 Qwen36_GDN_OutputProjection max-regret=0.0000% max-cv=26.8090%
+            {0x0100022000002600ULL, {9, 4}}, // CB=8 M=1 9728x8704 rocm.nvnni.decode.fast.kb9 V4FastSealed_Balanced_9728x8704 max-regret=0.7833% max-cv=2.0810%
+            {0x0100023000000600ULL, {20, 4}}, // CB=8 M=1 1536x8960 rocm.nvnni.decode.fast.kb20 1.5B_FFN_Dn max-regret=0.0000% max-cv=29.0027%
+            {0x010002b000000800ULL, {23, 4}}, // CB=8 M=1 2048x11008 rocm.nvnni.decode.fast.kb23 3B_FFN_Dn max-regret=0.0000% max-cv=27.7232%
+            {0x0100030000000e80ULL, {13, 4}}, // CB=8 M=1 3712x12288 rocm.nvnni.decode.fast.kb13 V4FastSealed_Tall_3712x12288 max-regret=0.0000% max-cv=2.4243%
+            {0x0100036000001400ULL, {13, 4}}, // CB=8 M=1 5120x13824 rocm.nvnni.decode.fast.kb13 14B_FFN_Dn max-regret=0.6211% max-cv=2.3368%
+            {0x0100044000001400ULL, {10, 4}}, // CB=8 M=1 5120x17408 rocm.nvnni.decode.fast.kb10 Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=2.2600%
+            {0x010004a000000e00ULL, {16, 4}}, // CB=8 M=1 3584x18944 rocm.nvnni.decode.fast.kb16 7B_FFN_Dn max-regret=0.3003% max-cv=2.2964%
+            {0x010004c800001680ULL, {14, 4}}, // CB=8 M=1 5760x19584 rocm.nvnni.decode.fast.kb14 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=1.6199%
+            {0x0100064000001d00ULL, {15, 4}}, // CB=8 M=1 7424x25600 rocm.nvnni.decode.fast.kb15 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=0.8734%
+            {0x010006c000001400ULL, {13, 4}}, // CB=8 M=1 5120x27648 rocm.nvnni.decode.fast.kb13 32B_FFN_Dn max-regret=0.0000% max-cv=1.8869%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 9)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {8, 4}}, // CB=9 M=1 128x256 rocm.nvnni.decode.fast.kb8 Integration_Tall_128x256 max-regret=0.0000% max-cv=32.3042%
+            {0x01000010000000bfULL, {8, 4}}, // CB=9 M=1 191x256 rocm.nvnni.decode.fast.kb8 Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=9.2837%
+            {0x01000010000000c0ULL, {8, 4}}, // CB=9 M=1 192x256 rocm.nvnni.decode.fast.kb8 Integration_Balanced_192x256 max-regret=0.0000% max-cv=3.1111%
+            {0x0100001000000280ULL, {8, 4}}, // CB=9 M=1 640x256 rocm.nvnni.decode.fast.kb8 V3Development_Wide_640x256 max-regret=0.0000% max-cv=9.1088%
+            {0x0100001000001080ULL, {5, 4}}, // CB=9 M=1 4224x256 rocm.nvnni.decode.fast.kb5 FastSealed_VeryWide_4224x256 max-regret=1.2346% max-cv=6.5265%
+            {0x0100001200000090ULL, {9, 4}}, // CB=9 M=1 144x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Tall_128x256 max-regret=0.0000% max-cv=15.2439%
+            {0x01000012000000a0ULL, {6, 4}}, // CB=9 M=1 160x288 rocm.nvnni.decode.fast.kb6 V4FastSealed_Tall_160x288 max-regret=2.6786% max-cv=4.6455%
+            {0x01000012000000d7ULL, {7, 4}}, // CB=9 M=1 215x288 rocm.nvnni.decode.fast.kb7 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=1.7241% max-cv=8.1509%
+            {0x01000012000000d8ULL, {9, 4}}, // CB=9 M=1 216x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Balanced_192x256 max-regret=0.0000% max-cv=4.1828%
+            {0x0100001200000280ULL, {9, 4}}, // CB=9 M=1 640x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_640x288 max-regret=0.0000% max-cv=69.2213%
+            {0x0100001200001400ULL, {5, 4}}, // CB=9 M=1 5120x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_VeryWide_5120x288 max-regret=0.8264% max-cv=9.0712%
+            {0x0100001200002400ULL, {3, 4}}, // CB=9 M=1 9216x288 rocm.nvnni.decode.fast.kb3 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=8.0165%
+            {0x0100001400000060ULL, {6, 4}}, // CB=9 M=1 96x320 rocm.nvnni.decode.fast.kb6 V3FastSealed_Tall_96x320 max-regret=1.7857% max-cv=16.7537%
+            {0x0100001400000070ULL, {10, 4}}, // CB=9 M=1 112x320 rocm.nvnni.decode.fast.kb10 V3Development_Tall_112x320 max-regret=0.0000% max-cv=6.3344%
+            {0x0100001400000100ULL, {6, 4}}, // CB=9 M=1 256x320 rocm.nvnni.decode.fast.kb6 V3Development_Balanced_256x320 max-regret=1.3605% max-cv=8.5160%
+            {0x0100001400000110ULL, {5, 4}}, // CB=9 M=1 272x320 rocm.nvnni.decode.fast.kb5 V4FastSealed_Balanced_272x320 max-regret=0.0000% max-cv=2.4161%
+            {0x0100001400000320ULL, {5, 4}}, // CB=9 M=1 800x320 rocm.nvnni.decode.fast.kb5 V3VerifierSealed_Wide_800x320 max-regret=0.0000% max-cv=2.3740%
+            {0x0100001600000120ULL, {7, 4}}, // CB=9 M=1 288x352 rocm.nvnni.decode.fast.kb7 V3VerifierSealed_Balanced_288x352 max-regret=0.6711% max-cv=6.7045%
+            {0x0100001c00000100ULL, {6, 4}}, // CB=9 M=1 256x448 rocm.nvnni.decode.fast.kb6 V3Development_Tall_256x448 max-regret=4.3103% max-cv=4.0942%
+            {0x0100001c00000800ULL, {7, 4}}, // CB=9 M=1 2048x448 rocm.nvnni.decode.fast.kb7 V4FastSealed_Wide_2048x448 max-regret=0.8264% max-cv=22.1862%
+            {0x0100001c00004000ULL, {5, 4}}, // CB=9 M=1 16384x448 rocm.nvnni.decode.fast.kb5 V4FastSealed_VeryWide_16384x448 max-regret=0.6494% max-cv=2.9477%
+            {0x0100002000000800ULL, {8, 4}}, // CB=9 M=1 2048x512 rocm.nvnni.decode.fast.kb8 35BMoE_Expert_Down max-regret=1.2658% max-cv=14.3663%
+            {0x01000024000001b0ULL, {11, 4}}, // CB=9 M=1 432x576 rocm.nvnni.decode.fast.kb11 DevNeighbor_Integration_Balanced_384x512 max-regret=1.6667% max-cv=6.0060%
+            {0x0100002c00000260ULL, {13, 4}}, // CB=9 M=1 608x704 rocm.nvnni.decode.fast.kb13 V4FastSealed_Balanced_608x704 max-regret=1.2658% max-cv=6.2791%
+            {0x0100002c00001200ULL, {8, 4}}, // CB=9 M=1 4608x704 rocm.nvnni.decode.fast.kb8 V4FastSealed_Wide_4608x704 max-regret=0.5525% max-cv=3.7045%
+            {0x01000034000001a0ULL, {14, 4}}, // CB=9 M=1 416x832 rocm.nvnni.decode.fast.kb14 V4FastSealed_Tall_416x832 max-regret=0.6211% max-cv=14.5142%
+            {0x0100003800000380ULL, {14, 4}}, // CB=9 M=1 896x896 rocm.nvnni.decode.fast.kb14 0.5B_AttnOut max-regret=0.0000% max-cv=8.4517%
+            {0x0100003800000480ULL, {10, 4}}, // CB=9 M=1 1152x896 rocm.nvnni.decode.fast.kb10 0.5B_QKV max-regret=0.0000% max-cv=23.6288%
+            {0x0100003800001300ULL, {6, 4}}, // CB=9 M=1 4864x896 rocm.nvnni.decode.fast.kb6 0.5B_FFN_Up max-regret=0.0000% max-cv=5.5509%
+            {0x010000380000a000ULL, {3, 4}}, // CB=9 M=1 40960x896 rocm.nvnni.decode.fast.kb3 V4FastSealed_VeryWide_40960x896 max-regret=0.0000% max-cv=37.4972%
+            {0x0100003800025180ULL, {3, 4}}, // CB=9 M=1 151936x896 rocm.nvnni.decode.fast.kb3 0.5B_LM_Head max-regret=1.4765% max-cv=11.8351%
+            {0x0100004000000510ULL, {11, 4}}, // CB=9 M=1 1296x1024 rocm.nvnni.decode.fast.kb11 DevNeighbor_0.5B_QKV max-regret=0.0000% max-cv=19.6038%
+            {0x0100004000001560ULL, {6, 4}}, // CB=9 M=1 5472x1024 rocm.nvnni.decode.fast.kb6 DevNeighbor_0.5B_FFN_Up max-regret=0.6536% max-cv=1.3093%
+            {0x0100005000000320ULL, {16, 4}}, // CB=9 M=1 800x1280 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_800x1280 max-regret=0.5917% max-cv=16.7114%
+            {0x0100005800000500ULL, {15, 4}}, // CB=9 M=1 1280x1408 rocm.nvnni.decode.fast.kb15 V4FastSealed_Balanced_1280x1408 max-regret=0.0000% max-cv=3.1136%
+            {0x0100005800002c00ULL, {9, 4}}, // CB=9 M=1 11264x1408 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_11264x1408 max-regret=0.0000% max-cv=3.4982%
+            {0x0100006000000600ULL, {12, 4}}, // CB=9 M=1 1536x1536 rocm.nvnni.decode.fast.kb12 1.5B_AttnOut max-regret=1.1561% max-cv=5.4716%
+            {0x0100006000000800ULL, {17, 4}}, // CB=9 M=1 2048x1536 rocm.nvnni.decode.fast.kb17 1.5B_QKV max-regret=2.2472% max-cv=4.2500%
+            {0x0100006000002300ULL, {12, 4}}, // CB=9 M=1 8960x1536 rocm.nvnni.decode.fast.kb12 1.5B_FFN_Up max-regret=1.6575% max-cv=1.6324%
+            {0x0100006000025180ULL, {1, 4}}, // CB=9 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.0000% max-cv=7.9582%
+            {0x0100006c00000260ULL, {19, 4}}, // CB=9 M=1 608x1728 rocm.nvnni.decode.fast.kb19 V4TransitionNeighbor_Tall_608x1728 max-regret=0.0000% max-cv=4.2519%
+            {0x0100007000014000ULL, {5, 4}}, // CB=9 M=1 81920x1792 rocm.nvnni.decode.fast.kb5 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=10.8334%
+            {0x0100007c000002c0ULL, {21, 4}}, // CB=9 M=1 704x1984 rocm.nvnni.decode.fast.kb21 V4TransitionNeighbor_Tall_704x1984 max-regret=1.7143% max-cv=16.5203%
+            {0x0100008000000200ULL, {16, 4}}, // CB=9 M=1 512x2048 rocm.nvnni.decode.fast.kb16 35BMoE_Expert_GateUp max-regret=0.0000% max-cv=3.7125%
+            {0x0100008000000800ULL, {16, 4}}, // CB=9 M=1 2048x2048 rocm.nvnni.decode.fast.kb16 3B_AttnOut max-regret=0.5319% max-cv=8.8284%
+            {0x0100008000000a00ULL, {12, 4}}, // CB=9 M=1 2560x2048 rocm.nvnni.decode.fast.kb12 3B_QKV max-regret=2.1164% max-cv=7.6796%
+            {0x0100008000001000ULL, {13, 4}}, // CB=9 M=1 4096x2048 rocm.nvnni.decode.fast.kb13 Qwen36MoE_GDN_ZProjection max-regret=0.0000% max-cv=3.8106%
+            {0x0100008000002000ULL, {13, 4}}, // CB=9 M=1 8192x2048 rocm.nvnni.decode.fast.kb13 Qwen36MoE_GDN_QKVProjection max-regret=0.8264% max-cv=3.8630%
+            {0x0100008000002b00ULL, {11, 4}}, // CB=9 M=1 11008x2048 rocm.nvnni.decode.fast.kb11 3B_FFN_Up max-regret=0.0000% max-cv=7.1445%
+            {0x0100008000025180ULL, {2, 4}}, // CB=9 M=1 151936x2048 rocm.nvnni.decode.fast.kb2 3B_LM_Head max-regret=0.0000% max-cv=0.7035%
+            {0x010000a000000940ULL, {14, 4}}, // CB=9 M=1 2368x2560 rocm.nvnni.decode.fast.kb14 V4FastSealed_Balanced_2368x2560 max-regret=0.5025% max-cv=5.0430%
+            {0x010000a400000348ULL, {17, 4}}, // CB=9 M=1 840x2624 rocm.nvnni.decode.fast.kb17 V3TransitionRefine_Tall_840x2624 max-regret=0.0000% max-cv=14.8567%
+            {0x010000b000005800ULL, {5, 4}}, // CB=9 M=1 22528x2816 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=39.2961%
+            {0x010000b8000003a0ULL, {19, 4}}, // CB=9 M=1 928x2944 rocm.nvnni.decode.fast.kb19 V3Transition_Tall_928x2944 max-regret=0.6369% max-cv=19.5291%
+            {0x010000e000000e00ULL, {16, 4}}, // CB=9 M=1 3584x3584 rocm.nvnni.decode.fast.kb16 7B_AttnOut max-regret=0.0000% max-cv=1.9940%
+            {0x010000e000001200ULL, {16, 4}}, // CB=9 M=1 4608x3584 rocm.nvnni.decode.fast.kb16 7B_QKV max-regret=0.8000% max-cv=25.7125%
+            {0x010000e000004a00ULL, {6, 4}}, // CB=9 M=1 18944x3584 rocm.nvnni.decode.fast.kb6 7B_FFN_Up max-regret=0.0000% max-cv=2.4030%
+            {0x010000e000025200ULL, {3, 4}}, // CB=9 M=1 152064x3584 rocm.nvnni.decode.fast.kb3 7B_LM_Head max-regret=0.0000% max-cv=1.0150%
+            {0x010000e000028000ULL, {3, 4}}, // CB=9 M=1 163840x3584 rocm.nvnni.decode.fast.kb3 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=1.0637%
+            {0x010000fc00001440ULL, {12, 4}}, // CB=9 M=1 5184x4032 rocm.nvnni.decode.fast.kb12 DevNeighbor_7B_QKV max-regret=2.2556% max-cv=25.7496%
+            {0x010000fc00005340ULL, {5, 4}}, // CB=9 M=1 21312x4032 rocm.nvnni.decode.fast.kb5 DevNeighbor_7B_FFN_Up max-regret=0.0000% max-cv=40.8045%
+            {0x0100012000001400ULL, {18, 4}}, // CB=9 M=1 5120x4608 rocm.nvnni.decode.fast.kb18 V4FastSealed_Balanced_5120x4608 max-regret=0.0000% max-cv=1.8881%
+            {0x0100013000000380ULL, {22, 4}}, // CB=9 M=1 896x4864 rocm.nvnni.decode.fast.kb22 0.5B_FFN_Dn max-regret=0.4831% max-cv=5.5120%
+            {0x0100014000000400ULL, {29, 4}}, // CB=9 M=1 1024x5120 rocm.nvnni.decode.fast.kb29 Qwen36_GDN_TimeProjection max-regret=2.8302% max-cv=1.2751%
+            {0x0100014000001400ULL, {19, 4}}, // CB=9 M=1 5120x5120 rocm.nvnni.decode.fast.kb19 32B_AttnOut max-regret=1.0274% max-cv=31.8652%
+            {0x0100014000001800ULL, {11, 4}}, // CB=9 M=1 6144x5120 rocm.nvnni.decode.fast.kb11 Qwen36_GDN_ZProjection max-regret=0.0000% max-cv=32.2530%
+            {0x0100014000001c00ULL, {18, 4}}, // CB=9 M=1 7168x5120 rocm.nvnni.decode.fast.kb18 32B_QKV max-regret=0.2994% max-cv=36.1125%
+            {0x0100014000002800ULL, {11, 4}}, // CB=9 M=1 10240x5120 rocm.nvnni.decode.fast.kb11 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=2.3085%
+            {0x0100014000003000ULL, {9, 4}}, // CB=9 M=1 12288x5120 rocm.nvnni.decode.fast.kb9 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=2.4893%
+            {0x0100014000003600ULL, {9, 4}}, // CB=9 M=1 13824x5120 rocm.nvnni.decode.fast.kb9 14B_FFN_Up max-regret=0.0000% max-cv=2.7647%
+            {0x0100014000004400ULL, {7, 4}}, // CB=9 M=1 17408x5120 rocm.nvnni.decode.fast.kb7 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=1.5428%
+            {0x0100014000006c00ULL, {4, 4}}, // CB=9 M=1 27648x5120 rocm.nvnni.decode.fast.kb4 32B_FFN_Up max-regret=0.0000% max-cv=0.9487%
+            {0x0100014000025200ULL, {3, 4}}, // CB=9 M=1 152064x5120 rocm.nvnni.decode.fast.kb3 32B_LM_Head max-regret=0.0000% max-cv=0.8849%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=9 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=0.6076%
+            {0x0100016000000600ULL, {20, 4}}, // CB=9 M=1 1536x5632 rocm.nvnni.decode.fast.kb20 V4FastSealed_Tall_1536x5632 max-regret=0.0000% max-cv=3.1064%
+            {0x010001600000b000ULL, {5, 4}}, // CB=9 M=1 45056x5632 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_45056x5632 max-regret=2.3293% max-cv=2.2311%
+            {0x0100018000001400ULL, {13, 4}}, // CB=9 M=1 5120x6144 rocm.nvnni.decode.fast.kb13 Qwen36_GDN_OutputProjection max-regret=0.0000% max-cv=26.3928%
+            {0x0100022000002600ULL, {12, 4}}, // CB=9 M=1 9728x8704 rocm.nvnni.decode.fast.kb12 V4FastSealed_Balanced_9728x8704 max-regret=0.0000% max-cv=1.6908%
+            {0x0100023000000600ULL, {28, 4}}, // CB=9 M=1 1536x8960 rocm.nvnni.decode.fast.kb28 1.5B_FFN_Dn max-regret=0.0000% max-cv=1.8324%
+            {0x010002b000000800ULL, {35, 4}}, // CB=9 M=1 2048x11008 rocm.nvnni.decode.fast.kb35 3B_FFN_Dn max-regret=0.7519% max-cv=28.5456%
+            {0x0100030000000e80ULL, {17, 4}}, // CB=9 M=1 3712x12288 rocm.nvnni.decode.fast.kb17 V4FastSealed_Tall_3712x12288 max-regret=0.5618% max-cv=18.9657%
+            {0x0100036000001400ULL, {22, 4}}, // CB=9 M=1 5120x13824 rocm.nvnni.decode.fast.kb22 14B_FFN_Dn max-regret=0.2000% max-cv=0.9758%
+            {0x0100044000001400ULL, {25, 4}}, // CB=9 M=1 5120x17408 rocm.nvnni.decode.fast.kb25 Qwen36_FFN_DownProjection max-regret=0.1838% max-cv=2.6181%
+            {0x010004a000000e00ULL, {35, 4}}, // CB=9 M=1 3584x18944 rocm.nvnni.decode.fast.kb35 7B_FFN_Dn max-regret=0.0000% max-cv=1.3868%
+            {0x010004c800001680ULL, {22, 4}}, // CB=9 M=1 5760x19584 rocm.nvnni.decode.fast.kb22 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=34.4958%
+            {0x0100064000001d00ULL, {15, 4}}, // CB=9 M=1 7424x25600 rocm.nvnni.decode.fast.kb15 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.4088%
+            {0x010006c000001400ULL, {19, 4}}, // CB=9 M=1 5120x27648 rocm.nvnni.decode.fast.kb19 32B_FFN_Dn max-regret=0.1269% max-cv=1.4975%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 10)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {4, 4}}, // CB=10 M=1 128x256 rocm.nvnni.decode.fast.kb4 Integration_Tall_128x256 max-regret=0.0000% max-cv=21.5234%
+            {0x01000010000000bfULL, {4, 4}}, // CB=10 M=1 191x256 rocm.nvnni.decode.fast.kb4 Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=6.9143%
+            {0x01000010000000c0ULL, {4, 4}}, // CB=10 M=1 192x256 rocm.nvnni.decode.fast.kb4 Integration_Balanced_192x256 max-regret=0.0000% max-cv=11.7778%
+            {0x0100001000000280ULL, {5, 4}}, // CB=10 M=1 640x256 rocm.nvnni.decode.fast.kb5 V3Development_Wide_640x256 max-regret=0.9434% max-cv=15.9627%
+            {0x0100001000001080ULL, {1, 4}}, // CB=10 M=1 4224x256 rocm.nvnni.decode.fast.kb1 FastSealed_VeryWide_4224x256 max-regret=0.0000% max-cv=26.8299%
+            {0x0100001200000090ULL, {3, 4}}, // CB=10 M=1 144x288 rocm.nvnni.decode.fast.kb3 DevNeighbor_Integration_Tall_128x256 max-regret=0.7092% max-cv=21.3288%
+            {0x01000012000000a0ULL, {9, 4}}, // CB=10 M=1 160x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_160x288 max-regret=0.0000% max-cv=5.9195%
+            {0x01000012000000d7ULL, {5, 4}}, // CB=10 M=1 215x288 rocm.nvnni.decode.fast.kb5 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=11.2208%
+            {0x01000012000000d8ULL, {5, 4}}, // CB=10 M=1 216x288 rocm.nvnni.decode.fast.kb5 DevNeighbor_Integration_Balanced_192x256 max-regret=0.0000% max-cv=81.2093%
+            {0x0100001200000280ULL, {4, 4}}, // CB=10 M=1 640x288 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_640x288 max-regret=0.7042% max-cv=4.8500%
+            {0x0100001200001400ULL, {3, 4}}, // CB=10 M=1 5120x288 rocm.nvnni.decode.fast.kb3 V4FastSealed_VeryWide_5120x288 max-regret=0.0000% max-cv=7.6251%
+            {0x0100001200002400ULL, {1, 4}}, // CB=10 M=1 9216x288 rocm.nvnni.decode.fast.kb1 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=5.5410%
+            {0x0100001400000060ULL, {5, 4}}, // CB=10 M=1 96x320 rocm.nvnni.decode.fast.kb5 V3FastSealed_Tall_96x320 max-regret=0.0000% max-cv=11.5181%
+            {0x0100001400000070ULL, {6, 4}}, // CB=10 M=1 112x320 rocm.nvnni.decode.fast.kb6 V3Development_Tall_112x320 max-regret=0.7042% max-cv=2.2275%
+            {0x0100001400000100ULL, {5, 4}}, // CB=10 M=1 256x320 rocm.nvnni.decode.fast.kb5 V3Development_Balanced_256x320 max-regret=0.0000% max-cv=5.4793%
+            {0x0100001400000110ULL, {6, 4}}, // CB=10 M=1 272x320 rocm.nvnni.decode.fast.kb6 V4FastSealed_Balanced_272x320 max-regret=0.9259% max-cv=2.9928%
+            {0x0100001400000320ULL, {7, 4}}, // CB=10 M=1 800x320 rocm.nvnni.decode.fast.kb7 V3VerifierSealed_Wide_800x320 max-regret=2.7523% max-cv=24.3021%
+            {0x0100001600000120ULL, {7, 4}}, // CB=10 M=1 288x352 rocm.nvnni.decode.fast.kb7 V3VerifierSealed_Balanced_288x352 max-regret=1.8519% max-cv=17.7035%
+            {0x0100001c00000100ULL, {8, 4}}, // CB=10 M=1 256x448 rocm.nvnni.decode.fast.kb8 V3Development_Tall_256x448 max-regret=1.8182% max-cv=7.4016%
+            {0x0100001c00000800ULL, {4, 4}}, // CB=10 M=1 2048x448 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_2048x448 max-regret=0.6711% max-cv=7.4207%
+            {0x0100001c00004000ULL, {1, 4}}, // CB=10 M=1 16384x448 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_16384x448 max-regret=0.0000% max-cv=28.9172%
+            {0x0100002000000800ULL, {6, 4}}, // CB=10 M=1 2048x512 rocm.nvnni.decode.fast.kb6 35BMoE_Expert_Down max-regret=0.0000% max-cv=6.4862%
+            {0x01000024000001b0ULL, {11, 4}}, // CB=10 M=1 432x576 rocm.nvnni.decode.fast.kb11 DevNeighbor_Integration_Balanced_384x512 max-regret=2.6549% max-cv=13.6987%
+            {0x0100002c00000260ULL, {8, 4}}, // CB=10 M=1 608x704 rocm.nvnni.decode.fast.kb8 V4FastSealed_Balanced_608x704 max-regret=0.0000% max-cv=19.2451%
+            {0x0100002c00001200ULL, {4, 4}}, // CB=10 M=1 4608x704 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_4608x704 max-regret=0.0000% max-cv=16.3962%
+            {0x01000034000001a0ULL, {7, 4}}, // CB=10 M=1 416x832 rocm.nvnni.decode.fast.kb7 V4FastSealed_Tall_416x832 max-regret=0.0000% max-cv=7.2157%
+            {0x0100003800000380ULL, {7, 4}}, // CB=10 M=1 896x896 rocm.nvnni.decode.fast.kb7 0.5B_AttnOut max-regret=0.0000% max-cv=5.1170%
+            {0x0100003800000480ULL, {8, 4}}, // CB=10 M=1 1152x896 rocm.nvnni.decode.fast.kb8 0.5B_QKV max-regret=0.0000% max-cv=8.4161%
+            {0x0100003800001300ULL, {6, 4}}, // CB=10 M=1 4864x896 rocm.nvnni.decode.fast.kb6 0.5B_FFN_Up max-regret=0.0000% max-cv=9.4871%
+            {0x010000380000a000ULL, {1, 4}}, // CB=10 M=1 40960x896 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_40960x896 max-regret=4.9430% max-cv=32.3588%
+            {0x0100003800025180ULL, {1, 4}}, // CB=10 M=1 151936x896 rocm.nvnni.decode.fast.kb1 0.5B_LM_Head max-regret=0.0000% max-cv=27.7716%
+            {0x0100004000000510ULL, {8, 4}}, // CB=10 M=1 1296x1024 rocm.nvnni.decode.fast.kb8 DevNeighbor_0.5B_QKV max-regret=0.0000% max-cv=21.7560%
+            {0x0100004000001560ULL, {5, 4}}, // CB=10 M=1 5472x1024 rocm.nvnni.decode.fast.kb5 DevNeighbor_0.5B_FFN_Up max-regret=0.0000% max-cv=2.5282%
+            {0x0100005000000320ULL, {8, 4}}, // CB=10 M=1 800x1280 rocm.nvnni.decode.fast.kb8 V4FastSealed_Tall_800x1280 max-regret=0.8130% max-cv=7.6469%
+            {0x0100005800000500ULL, {11, 4}}, // CB=10 M=1 1280x1408 rocm.nvnni.decode.fast.kb11 V4FastSealed_Balanced_1280x1408 max-regret=0.7813% max-cv=7.8721%
+            {0x0100005800002c00ULL, {5, 4}}, // CB=10 M=1 11264x1408 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_11264x1408 max-regret=0.0000% max-cv=3.8449%
+            {0x0100006000000600ULL, {12, 4}}, // CB=10 M=1 1536x1536 rocm.nvnni.decode.fast.kb12 1.5B_AttnOut max-regret=0.7634% max-cv=9.8067%
+            {0x0100006000000800ULL, {8, 4}}, // CB=10 M=1 2048x1536 rocm.nvnni.decode.fast.kb8 1.5B_QKV max-regret=0.0000% max-cv=10.5514%
+            {0x0100006000002300ULL, {5, 4}}, // CB=10 M=1 8960x1536 rocm.nvnni.decode.fast.kb5 1.5B_FFN_Up max-regret=0.0000% max-cv=27.7782%
+            {0x0100006000025180ULL, {1, 4}}, // CB=10 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.0000% max-cv=9.0012%
+            {0x0100006c00000260ULL, {9, 4}}, // CB=10 M=1 608x1728 rocm.nvnni.decode.fast.kb9 V4TransitionNeighbor_Tall_608x1728 max-regret=0.0000% max-cv=3.8210%
+            {0x0100007000014000ULL, {1, 4}}, // CB=10 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=9.6530%
+            {0x0100007c000002c0ULL, {13, 4}}, // CB=10 M=1 704x1984 rocm.nvnni.decode.fast.kb13 V4TransitionNeighbor_Tall_704x1984 max-regret=0.6098% max-cv=10.3300%
+            {0x0100008000000200ULL, {10, 4}}, // CB=10 M=1 512x2048 rocm.nvnni.decode.fast.kb10 35BMoE_Expert_GateUp max-regret=2.3077% max-cv=5.2779%
+            {0x0100008000000800ULL, {11, 4}}, // CB=10 M=1 2048x2048 rocm.nvnni.decode.fast.kb11 3B_AttnOut max-regret=0.7042% max-cv=3.9831%
+            {0x0100008000000a00ULL, {11, 4}}, // CB=10 M=1 2560x2048 rocm.nvnni.decode.fast.kb11 3B_QKV max-regret=0.0000% max-cv=5.8042%
+            {0x0100008000001000ULL, {11, 4}}, // CB=10 M=1 4096x2048 rocm.nvnni.decode.fast.kb11 Qwen36MoE_GDN_ZProjection max-regret=2.5974% max-cv=1.7702%
+            {0x0100008000002000ULL, {5, 4}}, // CB=10 M=1 8192x2048 rocm.nvnni.decode.fast.kb5 Qwen36MoE_GDN_QKVProjection max-regret=0.0000% max-cv=3.8063%
+            {0x0100008000002b00ULL, {5, 4}}, // CB=10 M=1 11008x2048 rocm.nvnni.decode.fast.kb5 3B_FFN_Up max-regret=0.0000% max-cv=4.7462%
+            {0x0100008000025180ULL, {1, 4}}, // CB=10 M=1 151936x2048 rocm.nvnni.decode.fast.kb1 3B_LM_Head max-regret=0.0000% max-cv=6.3862%
+            {0x010000a000000940ULL, {10, 4}}, // CB=10 M=1 2368x2560 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_2368x2560 max-regret=0.0000% max-cv=19.6569%
+            {0x010000a400000348ULL, {17, 4}}, // CB=10 M=1 840x2624 rocm.nvnni.decode.fast.kb17 V3TransitionRefine_Tall_840x2624 max-regret=0.7246% max-cv=31.0299%
+            {0x010000b000005800ULL, {3, 4}}, // CB=10 M=1 22528x2816 rocm.nvnni.decode.fast.kb3 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=3.0721%
+            {0x010000b8000003a0ULL, {12, 4}}, // CB=10 M=1 928x2944 rocm.nvnni.decode.fast.kb12 V3Transition_Tall_928x2944 max-regret=1.4389% max-cv=3.3176%
+            {0x010000e000000e00ULL, {8, 4}}, // CB=10 M=1 3584x3584 rocm.nvnni.decode.fast.kb8 7B_AttnOut max-regret=1.1696% max-cv=3.0579%
+            {0x010000e000001200ULL, {9, 4}}, // CB=10 M=1 4608x3584 rocm.nvnni.decode.fast.kb9 7B_QKV max-regret=0.4484% max-cv=1.9075%
+            {0x010000e000004a00ULL, {3, 4}}, // CB=10 M=1 18944x3584 rocm.nvnni.decode.fast.kb3 7B_FFN_Up max-regret=0.0000% max-cv=3.6481%
+            {0x010000e000025200ULL, {1, 4}}, // CB=10 M=1 152064x3584 rocm.nvnni.decode.fast.kb1 7B_LM_Head max-regret=0.0000% max-cv=1.0836%
+            {0x010000e000028000ULL, {1, 4}}, // CB=10 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=0.6761%
+            {0x010000fc00001440ULL, {13, 4}}, // CB=10 M=1 5184x4032 rocm.nvnni.decode.fast.kb13 DevNeighbor_7B_QKV max-regret=0.9901% max-cv=3.8195%
+            {0x010000fc00005340ULL, {3, 4}}, // CB=10 M=1 21312x4032 rocm.nvnni.decode.fast.kb3 DevNeighbor_7B_FFN_Up max-regret=0.0000% max-cv=43.0648%
+            {0x0100012000001400ULL, {7, 4}}, // CB=10 M=1 5120x4608 rocm.nvnni.decode.fast.kb7 V4FastSealed_Balanced_5120x4608 max-regret=0.0000% max-cv=24.8838%
+            {0x0100013000000380ULL, {19, 4}}, // CB=10 M=1 896x4864 rocm.nvnni.decode.fast.kb19 0.5B_FFN_Dn max-regret=0.6536% max-cv=1.7193%
+            {0x0100014000000400ULL, {15, 4}}, // CB=10 M=1 1024x5120 rocm.nvnni.decode.fast.kb15 Qwen36_GDN_TimeProjection max-regret=0.0000% max-cv=2.3731%
+            {0x0100014000001400ULL, {9, 4}}, // CB=10 M=1 5120x5120 rocm.nvnni.decode.fast.kb9 32B_AttnOut max-regret=0.0000% max-cv=3.7956%
+            {0x0100014000001800ULL, {7, 4}}, // CB=10 M=1 6144x5120 rocm.nvnni.decode.fast.kb7 Qwen36_GDN_ZProjection max-regret=0.0000% max-cv=31.7590%
+            {0x0100014000001c00ULL, {8, 4}}, // CB=10 M=1 7168x5120 rocm.nvnni.decode.fast.kb8 32B_QKV max-regret=0.3817% max-cv=36.8303%
+            {0x0100014000002800ULL, {6, 4}}, // CB=10 M=1 10240x5120 rocm.nvnni.decode.fast.kb6 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=1.8428%
+            {0x0100014000003000ULL, {5, 4}}, // CB=10 M=1 12288x5120 rocm.nvnni.decode.fast.kb5 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=2.0058%
+            {0x0100014000003600ULL, {4, 4}}, // CB=10 M=1 13824x5120 rocm.nvnni.decode.fast.kb4 14B_FFN_Up max-regret=0.2475% max-cv=1.1829%
+            {0x0100014000004400ULL, {3, 4}}, // CB=10 M=1 17408x5120 rocm.nvnni.decode.fast.kb3 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=39.3779%
+            {0x0100014000006c00ULL, {2, 4}}, // CB=10 M=1 27648x5120 rocm.nvnni.decode.fast.kb2 32B_FFN_Up max-regret=0.0000% max-cv=1.8141%
+            {0x0100014000025200ULL, {1, 4}}, // CB=10 M=1 152064x5120 rocm.nvnni.decode.fast.kb1 32B_LM_Head max-regret=0.0000% max-cv=0.5923%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=10 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=0.2604%
+            {0x0100016000000600ULL, {14, 4}}, // CB=10 M=1 1536x5632 rocm.nvnni.decode.fast.kb14 V4FastSealed_Tall_1536x5632 max-regret=1.9704% max-cv=13.5507%
+            {0x010001600000b000ULL, {1, 4}}, // CB=10 M=1 45056x5632 rocm.nvnni.decode.fast.kb1 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=1.2622%
+            {0x0100018000001400ULL, {7, 4}}, // CB=10 M=1 5120x6144 rocm.nvnni.decode.fast.kb7 Qwen36_GDN_OutputProjection max-regret=0.0000% max-cv=39.2019%
+            {0x0100022000002600ULL, {6, 4}}, // CB=10 M=1 9728x8704 rocm.nvnni.decode.fast.kb6 V4FastSealed_Balanced_9728x8704 max-regret=0.0000% max-cv=1.8627%
+            {0x0100023000000600ULL, {20, 4}}, // CB=10 M=1 1536x8960 rocm.nvnni.decode.fast.kb20 1.5B_FFN_Dn max-regret=0.0000% max-cv=1.3045%
+            {0x010002b000000800ULL, {15, 4}}, // CB=10 M=1 2048x11008 rocm.nvnni.decode.fast.kb15 3B_FFN_Dn max-regret=0.8811% max-cv=2.0372%
+            {0x0100030000000e80ULL, {13, 4}}, // CB=10 M=1 3712x12288 rocm.nvnni.decode.fast.kb13 V4FastSealed_Tall_3712x12288 max-regret=0.2907% max-cv=2.7616%
+            {0x0100036000001400ULL, {12, 4}}, // CB=10 M=1 5120x13824 rocm.nvnni.decode.fast.kb12 14B_FFN_Dn max-regret=0.0000% max-cv=1.8127%
+            {0x0100044000001400ULL, {10, 4}}, // CB=10 M=1 5120x17408 rocm.nvnni.decode.fast.kb10 Qwen36_FFN_DownProjection max-regret=0.5714% max-cv=12.2310%
+            {0x010004a000000e00ULL, {17, 4}}, // CB=10 M=1 3584x18944 rocm.nvnni.decode.fast.kb17 7B_FFN_Dn max-regret=1.2285% max-cv=40.7516%
+            {0x010004c800001680ULL, {11, 4}}, // CB=10 M=1 5760x19584 rocm.nvnni.decode.fast.kb11 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.4846% max-cv=2.1049%
+            {0x0100064000001d00ULL, {7, 4}}, // CB=10 M=1 7424x25600 rocm.nvnni.decode.fast.kb7 V4FastSealed_Tall_7424x25600 max-regret=0.1106% max-cv=0.8536%
+            {0x010006c000001400ULL, {11, 4}}, // CB=10 M=1 5120x27648 rocm.nvnni.decode.fast.kb11 32B_FFN_Dn max-regret=1.1527% max-cv=1.5033%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 11)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {4, 4}}, // CB=11 M=1 128x256 rocm.nvnni.decode.fast.kb4 Integration_Tall_128x256 max-regret=3.4483% max-cv=8.8303%
+            {0x01000010000000bfULL, {8, 4}}, // CB=11 M=1 191x256 rocm.nvnni.decode.fast.kb8 Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=9.7660%
+            {0x01000010000000c0ULL, {5, 4}}, // CB=11 M=1 192x256 rocm.nvnni.decode.fast.kb5 Integration_Balanced_192x256 max-regret=3.3333% max-cv=20.5064%
+            {0x0100001000000280ULL, {4, 4}}, // CB=11 M=1 640x256 rocm.nvnni.decode.fast.kb4 V3Development_Wide_640x256 max-regret=2.5424% max-cv=4.7986%
+            {0x0100001000001080ULL, {4, 4}}, // CB=11 M=1 4224x256 rocm.nvnni.decode.fast.kb4 FastSealed_VeryWide_4224x256 max-regret=0.0000% max-cv=6.3815%
+            {0x0100001200000090ULL, {5, 4}}, // CB=11 M=1 144x288 rocm.nvnni.decode.fast.kb5 DevNeighbor_Integration_Tall_128x256 max-regret=2.6316% max-cv=15.2042%
+            {0x01000012000000a0ULL, {9, 4}}, // CB=11 M=1 160x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_160x288 max-regret=0.0000% max-cv=14.8452%
+            {0x01000012000000d7ULL, {9, 4}}, // CB=11 M=1 215x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=4.0785%
+            {0x01000012000000d8ULL, {9, 4}}, // CB=11 M=1 216x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Balanced_192x256 max-regret=0.0000% max-cv=21.8063%
+            {0x0100001200000280ULL, {9, 4}}, // CB=11 M=1 640x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_640x288 max-regret=0.0000% max-cv=5.4011%
+            {0x0100001200001400ULL, {5, 4}}, // CB=11 M=1 5120x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_VeryWide_5120x288 max-regret=0.0000% max-cv=2.0257%
+            {0x0100001200002400ULL, {1, 4}}, // CB=11 M=1 9216x288 rocm.nvnni.decode.fast.kb1 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=4.5451%
+            {0x0100001400000060ULL, {6, 4}}, // CB=11 M=1 96x320 rocm.nvnni.decode.fast.kb6 V3FastSealed_Tall_96x320 max-regret=1.6807% max-cv=10.8856%
+            {0x0100001400000070ULL, {10, 4}}, // CB=11 M=1 112x320 rocm.nvnni.decode.fast.kb10 V3Development_Tall_112x320 max-regret=0.0000% max-cv=17.8100%
+            {0x0100001400000100ULL, {5, 4}}, // CB=11 M=1 256x320 rocm.nvnni.decode.fast.kb5 V3Development_Balanced_256x320 max-regret=1.6807% max-cv=2.2466%
+            {0x0100001400000110ULL, {10, 4}}, // CB=11 M=1 272x320 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_272x320 max-regret=0.0000% max-cv=4.6496%
+            {0x0100001400000320ULL, {6, 4}}, // CB=11 M=1 800x320 rocm.nvnni.decode.fast.kb6 V3VerifierSealed_Wide_800x320 max-regret=0.6369% max-cv=3.2379%
+            {0x0100001600000120ULL, {11, 4}}, // CB=11 M=1 288x352 rocm.nvnni.decode.fast.kb11 V3VerifierSealed_Balanced_288x352 max-regret=0.0000% max-cv=4.4053%
+            {0x0100001c00000100ULL, {9, 4}}, // CB=11 M=1 256x448 rocm.nvnni.decode.fast.kb9 V3Development_Tall_256x448 max-regret=2.4390% max-cv=1.6417%
+            {0x0100001c00000800ULL, {7, 4}}, // CB=11 M=1 2048x448 rocm.nvnni.decode.fast.kb7 V4FastSealed_Wide_2048x448 max-regret=0.0000% max-cv=1.3643%
+            {0x0100001c00004000ULL, {1, 4}}, // CB=11 M=1 16384x448 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_16384x448 max-regret=0.0000% max-cv=3.4321%
+            {0x0100002000000800ULL, {8, 4}}, // CB=11 M=1 2048x512 rocm.nvnni.decode.fast.kb8 35BMoE_Expert_Down max-regret=0.0000% max-cv=8.9316%
+            {0x01000024000001b0ULL, {9, 4}}, // CB=11 M=1 432x576 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Balanced_384x512 max-regret=0.0000% max-cv=1.2436%
+            {0x0100002c00000260ULL, {12, 4}}, // CB=11 M=1 608x704 rocm.nvnni.decode.fast.kb12 V4FastSealed_Balanced_608x704 max-regret=0.6061% max-cv=3.2014%
+            {0x0100002c00001200ULL, {10, 4}}, // CB=11 M=1 4608x704 rocm.nvnni.decode.fast.kb10 V4FastSealed_Wide_4608x704 max-regret=4.0404% max-cv=2.5117%
+            {0x01000034000001a0ULL, {13, 4}}, // CB=11 M=1 416x832 rocm.nvnni.decode.fast.kb13 V4FastSealed_Tall_416x832 max-regret=0.0000% max-cv=2.1187%
+            {0x0100003800000380ULL, {19, 4}}, // CB=11 M=1 896x896 rocm.nvnni.decode.fast.kb19 0.5B_AttnOut max-regret=3.7037% max-cv=3.8754%
+            {0x0100003800000480ULL, {18, 4}}, // CB=11 M=1 1152x896 rocm.nvnni.decode.fast.kb18 0.5B_QKV max-regret=2.2059% max-cv=3.4668%
+            {0x0100003800001300ULL, {6, 4}}, // CB=11 M=1 4864x896 rocm.nvnni.decode.fast.kb6 0.5B_FFN_Up max-regret=0.0000% max-cv=4.2113%
+            {0x010000380000a000ULL, {2, 4}}, // CB=11 M=1 40960x896 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_40960x896 max-regret=0.0000% max-cv=3.1788%
+            {0x0100003800025180ULL, {2, 4}}, // CB=11 M=1 151936x896 rocm.nvnni.decode.fast.kb2 0.5B_LM_Head max-regret=0.0000% max-cv=1.7494%
+            {0x0100004000000510ULL, {16, 4}}, // CB=11 M=1 1296x1024 rocm.nvnni.decode.fast.kb16 DevNeighbor_0.5B_QKV max-regret=0.0000% max-cv=4.9259%
+            {0x0100004000001560ULL, {7, 4}}, // CB=11 M=1 5472x1024 rocm.nvnni.decode.fast.kb7 DevNeighbor_0.5B_FFN_Up max-regret=2.1858% max-cv=13.1754%
+            {0x0100005000000320ULL, {21, 4}}, // CB=11 M=1 800x1280 rocm.nvnni.decode.fast.kb21 V4FastSealed_Tall_800x1280 max-regret=0.6897% max-cv=29.2181%
+            {0x0100005800000500ULL, {16, 4}}, // CB=11 M=1 1280x1408 rocm.nvnni.decode.fast.kb16 V4FastSealed_Balanced_1280x1408 max-regret=0.0000% max-cv=17.7101%
+            {0x0100005800002c00ULL, {4, 4}}, // CB=11 M=1 11264x1408 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_11264x1408 max-regret=0.0000% max-cv=3.5708%
+            {0x0100006000000600ULL, {12, 4}}, // CB=11 M=1 1536x1536 rocm.nvnni.decode.fast.kb12 1.5B_AttnOut max-regret=0.5348% max-cv=1.8923%
+            {0x0100006000000800ULL, {13, 4}}, // CB=11 M=1 2048x1536 rocm.nvnni.decode.fast.kb13 1.5B_QKV max-regret=1.2270% max-cv=2.9283%
+            {0x0100006000002300ULL, {6, 4}}, // CB=11 M=1 8960x1536 rocm.nvnni.decode.fast.kb6 1.5B_FFN_Up max-regret=0.0000% max-cv=6.2175%
+            {0x0100006000025180ULL, {2, 4}}, // CB=11 M=1 151936x1536 rocm.nvnni.decode.fast.kb2 1.5B_LM_Head max-regret=0.0000% max-cv=1.0111%
+            {0x0100006c00000260ULL, {20, 4}}, // CB=11 M=1 608x1728 rocm.nvnni.decode.fast.kb20 V4TransitionNeighbor_Tall_608x1728 max-regret=2.0408% max-cv=2.3728%
+            {0x0100007000014000ULL, {2, 4}}, // CB=11 M=1 81920x1792 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=2.1426%
+            {0x0100007c000002c0ULL, {21, 4}}, // CB=11 M=1 704x1984 rocm.nvnni.decode.fast.kb21 V4TransitionNeighbor_Tall_704x1984 max-regret=0.0000% max-cv=66.7121%
+            {0x0100008000000200ULL, {17, 4}}, // CB=11 M=1 512x2048 rocm.nvnni.decode.fast.kb17 35BMoE_Expert_GateUp max-regret=1.3072% max-cv=74.9373%
+            {0x0100008000000800ULL, {10, 4}}, // CB=11 M=1 2048x2048 rocm.nvnni.decode.fast.kb10 3B_AttnOut max-regret=1.4085% max-cv=4.1201%
+            {0x0100008000000a00ULL, {17, 4}}, // CB=11 M=1 2560x2048 rocm.nvnni.decode.fast.kb17 3B_QKV max-regret=1.3453% max-cv=1.9706%
+            {0x0100008000001000ULL, {11, 4}}, // CB=11 M=1 4096x2048 rocm.nvnni.decode.fast.kb11 Qwen36MoE_GDN_ZProjection max-regret=0.0000% max-cv=2.0498%
+            {0x0100008000002000ULL, {8, 4}}, // CB=11 M=1 8192x2048 rocm.nvnni.decode.fast.kb8 Qwen36MoE_GDN_QKVProjection max-regret=0.0000% max-cv=6.3105%
+            {0x0100008000002b00ULL, {8, 4}}, // CB=11 M=1 11008x2048 rocm.nvnni.decode.fast.kb8 3B_FFN_Up max-regret=0.0000% max-cv=4.1132%
+            {0x0100008000025180ULL, {2, 4}}, // CB=11 M=1 151936x2048 rocm.nvnni.decode.fast.kb2 3B_LM_Head max-regret=0.0000% max-cv=0.6921%
+            {0x010000a000000940ULL, {13, 4}}, // CB=11 M=1 2368x2560 rocm.nvnni.decode.fast.kb13 V4FastSealed_Balanced_2368x2560 max-regret=1.0000% max-cv=3.7794%
+            {0x010000a400000348ULL, {21, 4}}, // CB=11 M=1 840x2624 rocm.nvnni.decode.fast.kb21 V3TransitionRefine_Tall_840x2624 max-regret=0.0000% max-cv=68.2126%
+            {0x010000b000005800ULL, {8, 4}}, // CB=11 M=1 22528x2816 rocm.nvnni.decode.fast.kb8 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=2.9141%
+            {0x010000b8000003a0ULL, {25, 4}}, // CB=11 M=1 928x2944 rocm.nvnni.decode.fast.kb25 V3Transition_Tall_928x2944 max-regret=1.4778% max-cv=1.7573%
+            {0x010000e000000e00ULL, {19, 4}}, // CB=11 M=1 3584x3584 rocm.nvnni.decode.fast.kb19 7B_AttnOut max-regret=1.9672% max-cv=18.3483%
+            {0x010000e000001200ULL, {19, 4}}, // CB=11 M=1 4608x3584 rocm.nvnni.decode.fast.kb19 7B_QKV max-regret=0.3236% max-cv=17.1552%
+            {0x010000e000004a00ULL, {8, 4}}, // CB=11 M=1 18944x3584 rocm.nvnni.decode.fast.kb8 7B_FFN_Up max-regret=0.0000% max-cv=3.9262%
+            {0x010000e000025200ULL, {2, 4}}, // CB=11 M=1 152064x3584 rocm.nvnni.decode.fast.kb2 7B_LM_Head max-regret=0.0000% max-cv=1.4204%
+            {0x010000e000028000ULL, {1, 4}}, // CB=11 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=1.6819%
+            {0x010000fc00001440ULL, {16, 4}}, // CB=11 M=1 5184x4032 rocm.nvnni.decode.fast.kb16 DevNeighbor_7B_QKV max-regret=0.5076% max-cv=19.8849%
+            {0x010000fc00005340ULL, {7, 4}}, // CB=11 M=1 21312x4032 rocm.nvnni.decode.fast.kb7 DevNeighbor_7B_FFN_Up max-regret=0.0000% max-cv=2.2230%
+            {0x0100012000001400ULL, {18, 4}}, // CB=11 M=1 5120x4608 rocm.nvnni.decode.fast.kb18 V4FastSealed_Balanced_5120x4608 max-regret=0.0000% max-cv=17.7891%
+            {0x0100013000000380ULL, {22, 4}}, // CB=11 M=1 896x4864 rocm.nvnni.decode.fast.kb22 0.5B_FFN_Dn max-regret=0.4348% max-cv=13.8073%
+            {0x0100014000000400ULL, {23, 4}}, // CB=11 M=1 1024x5120 rocm.nvnni.decode.fast.kb23 Qwen36_GDN_TimeProjection max-regret=0.0000% max-cv=2.2478%
+            {0x0100014000001400ULL, {18, 4}}, // CB=11 M=1 5120x5120 rocm.nvnni.decode.fast.kb18 32B_AttnOut max-regret=0.0014% max-cv=19.1045%
+            {0x0100014000001800ULL, {15, 4}}, // CB=11 M=1 6144x5120 rocm.nvnni.decode.fast.kb15 Qwen36_GDN_ZProjection max-regret=0.0000% max-cv=18.9729%
+            {0x0100014000001c00ULL, {11, 4}}, // CB=11 M=1 7168x5120 rocm.nvnni.decode.fast.kb11 32B_QKV max-regret=0.0000% max-cv=0.7086%
+            {0x0100014000002800ULL, {16, 4}}, // CB=11 M=1 10240x5120 rocm.nvnni.decode.fast.kb16 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=1.9325%
+            {0x0100014000003000ULL, {10, 4}}, // CB=11 M=1 12288x5120 rocm.nvnni.decode.fast.kb10 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=2.6201%
+            {0x0100014000003600ULL, {10, 4}}, // CB=11 M=1 13824x5120 rocm.nvnni.decode.fast.kb10 14B_FFN_Up max-regret=0.0000% max-cv=0.9193%
+            {0x0100014000004400ULL, {8, 4}}, // CB=11 M=1 17408x5120 rocm.nvnni.decode.fast.kb8 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=0.7301%
+            {0x0100014000006c00ULL, {5, 4}}, // CB=11 M=1 27648x5120 rocm.nvnni.decode.fast.kb5 32B_FFN_Up max-regret=0.0000% max-cv=33.4545%
+            {0x0100014000025200ULL, {2, 4}}, // CB=11 M=1 152064x5120 rocm.nvnni.decode.fast.kb2 32B_LM_Head max-regret=0.0000% max-cv=1.3484%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=11 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=0.7401%
+            {0x0100016000000600ULL, {20, 4}}, // CB=11 M=1 1536x5632 rocm.nvnni.decode.fast.kb20 V4FastSealed_Tall_1536x5632 max-regret=0.7168% max-cv=4.5022%
+            {0x010001600000b000ULL, {4, 4}}, // CB=11 M=1 45056x5632 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=1.5688%
+            {0x0100018000001400ULL, {15, 4}}, // CB=11 M=1 5120x6144 rocm.nvnni.decode.fast.kb15 Qwen36_GDN_OutputProjection max-regret=0.2146% max-cv=1.1924%
+            {0x0100022000002600ULL, {16, 4}}, // CB=11 M=1 9728x8704 rocm.nvnni.decode.fast.kb16 V4FastSealed_Balanced_9728x8704 max-regret=0.0000% max-cv=3.3905%
+            {0x0100023000000600ULL, {35, 4}}, // CB=11 M=1 1536x8960 rocm.nvnni.decode.fast.kb35 1.5B_FFN_Dn max-regret=0.0000% max-cv=49.7906%
+            {0x010002b000000800ULL, {43, 4}}, // CB=11 M=1 2048x11008 rocm.nvnni.decode.fast.kb43 3B_FFN_Dn max-regret=0.0000% max-cv=28.0730%
+            {0x0100030000000e80ULL, {38, 4}}, // CB=11 M=1 3712x12288 rocm.nvnni.decode.fast.kb38 V4FastSealed_Tall_3712x12288 max-regret=4.4520% max-cv=20.5460%
+            {0x0100036000001400ULL, {18, 4}}, // CB=11 M=1 5120x13824 rocm.nvnni.decode.fast.kb18 14B_FFN_Dn max-regret=0.0000% max-cv=3.3598%
+            {0x0100044000001400ULL, {21, 4}}, // CB=11 M=1 5120x17408 rocm.nvnni.decode.fast.kb21 Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=1.0488%
+            {0x010004a000000e00ULL, {37, 4}}, // CB=11 M=1 3584x18944 rocm.nvnni.decode.fast.kb37 7B_FFN_Dn max-regret=0.0000% max-cv=2.9423%
+            {0x010004c800001680ULL, {18, 4}}, // CB=11 M=1 5760x19584 rocm.nvnni.decode.fast.kb18 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=0.9932%
+            {0x0100064000001d00ULL, {15, 4}}, // CB=11 M=1 7424x25600 rocm.nvnni.decode.fast.kb15 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=0.7565%
+            {0x010006c000001400ULL, {32, 4}}, // CB=11 M=1 5120x27648 rocm.nvnni.decode.fast.kb32 32B_FFN_Dn max-regret=0.0000% max-cv=2.7623%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 12)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {4, 4}}, // CB=12 M=1 128x256 rocm.nvnni.decode.fast.kb4 Integration_Tall_128x256 max-regret=3.4783% max-cv=5.4996%
+            {0x01000010000000bfULL, {8, 4}}, // CB=12 M=1 191x256 rocm.nvnni.decode.fast.kb8 Generic_Tall_BoundaryBelow max-regret=3.0121% max-cv=16.5454%
+            {0x01000010000000c0ULL, {6, 4}}, // CB=12 M=1 192x256 rocm.nvnni.decode.fast.kb6 Integration_Balanced_192x256 max-regret=2.5641% max-cv=6.6318%
+            {0x0100001000000280ULL, {8, 4}}, // CB=12 M=1 640x256 rocm.nvnni.decode.fast.kb8 V3Development_Wide_640x256 max-regret=0.0000% max-cv=5.2759%
+            {0x0100001000001080ULL, {8, 4}}, // CB=12 M=1 4224x256 rocm.nvnni.decode.fast.kb8 FastSealed_VeryWide_4224x256 max-regret=0.5952% max-cv=4.3983%
+            {0x0100001200000090ULL, {9, 4}}, // CB=12 M=1 144x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Tall_128x256 max-regret=8.3333% max-cv=15.4744%
+            {0x01000012000000a0ULL, {9, 4}}, // CB=12 M=1 160x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_160x288 max-regret=0.0000% max-cv=11.2023%
+            {0x01000012000000d7ULL, {9, 4}}, // CB=12 M=1 215x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=5.7329%
+            {0x01000012000000d8ULL, {5, 4}}, // CB=12 M=1 216x288 rocm.nvnni.decode.fast.kb5 DevNeighbor_Integration_Balanced_192x256 max-regret=1.7094% max-cv=5.5500%
+            {0x0100001200000280ULL, {9, 4}}, // CB=12 M=1 640x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_640x288 max-regret=0.0000% max-cv=15.6552%
+            {0x0100001200001400ULL, {4, 4}}, // CB=12 M=1 5120x288 rocm.nvnni.decode.fast.kb4 V4FastSealed_VeryWide_5120x288 max-regret=1.5748% max-cv=4.7737%
+            {0x0100001200002400ULL, {1, 4}}, // CB=12 M=1 9216x288 rocm.nvnni.decode.fast.kb1 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=4.8178%
+            {0x0100001400000060ULL, {4, 4}}, // CB=12 M=1 96x320 rocm.nvnni.decode.fast.kb4 V3FastSealed_Tall_96x320 max-regret=5.9322% max-cv=3.7820%
+            {0x0100001400000070ULL, {10, 4}}, // CB=12 M=1 112x320 rocm.nvnni.decode.fast.kb10 V3Development_Tall_112x320 max-regret=0.0000% max-cv=13.6984%
+            {0x0100001400000100ULL, {5, 4}}, // CB=12 M=1 256x320 rocm.nvnni.decode.fast.kb5 V3Development_Balanced_256x320 max-regret=0.0000% max-cv=3.3937%
+            {0x0100001400000110ULL, {6, 4}}, // CB=12 M=1 272x320 rocm.nvnni.decode.fast.kb6 V4FastSealed_Balanced_272x320 max-regret=1.6949% max-cv=5.3924%
+            {0x0100001400000320ULL, {6, 4}}, // CB=12 M=1 800x320 rocm.nvnni.decode.fast.kb6 V3VerifierSealed_Wide_800x320 max-regret=0.8333% max-cv=8.6926%
+            {0x0100001600000120ULL, {7, 4}}, // CB=12 M=1 288x352 rocm.nvnni.decode.fast.kb7 V3VerifierSealed_Balanced_288x352 max-regret=0.8264% max-cv=27.4255%
+            {0x0100001c00000100ULL, {7, 4}}, // CB=12 M=1 256x448 rocm.nvnni.decode.fast.kb7 V3Development_Tall_256x448 max-regret=0.0000% max-cv=15.2158%
+            {0x0100001c00000800ULL, {7, 4}}, // CB=12 M=1 2048x448 rocm.nvnni.decode.fast.kb7 V4FastSealed_Wide_2048x448 max-regret=0.0000% max-cv=2.9606%
+            {0x0100001c00004000ULL, {1, 4}}, // CB=12 M=1 16384x448 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_16384x448 max-regret=0.0000% max-cv=2.5112%
+            {0x0100002000000800ULL, {9, 4}}, // CB=12 M=1 2048x512 rocm.nvnni.decode.fast.kb9 35BMoE_Expert_Down max-regret=0.7874% max-cv=5.8953%
+            {0x01000024000001b0ULL, {10, 4}}, // CB=12 M=1 432x576 rocm.nvnni.decode.fast.kb10 DevNeighbor_Integration_Balanced_384x512 max-regret=0.0000% max-cv=7.4367%
+            {0x0100002c00000260ULL, {12, 4}}, // CB=12 M=1 608x704 rocm.nvnni.decode.fast.kb12 V4FastSealed_Balanced_608x704 max-regret=0.0000% max-cv=15.4117%
+            {0x0100002c00001200ULL, {7, 4}}, // CB=12 M=1 4608x704 rocm.nvnni.decode.fast.kb7 V4FastSealed_Wide_4608x704 max-regret=0.0000% max-cv=2.0433%
+            {0x01000034000001a0ULL, {15, 4}}, // CB=12 M=1 416x832 rocm.nvnni.decode.fast.kb15 V4FastSealed_Tall_416x832 max-regret=1.5385% max-cv=1.9417%
+            {0x0100003800000380ULL, {15, 4}}, // CB=12 M=1 896x896 rocm.nvnni.decode.fast.kb15 0.5B_AttnOut max-regret=1.5038% max-cv=3.3223%
+            {0x0100003800000480ULL, {11, 4}}, // CB=12 M=1 1152x896 rocm.nvnni.decode.fast.kb11 0.5B_QKV max-regret=2.2222% max-cv=4.2942%
+            {0x0100003800001300ULL, {6, 4}}, // CB=12 M=1 4864x896 rocm.nvnni.decode.fast.kb6 0.5B_FFN_Up max-regret=0.0000% max-cv=5.4785%
+            {0x010000380000a000ULL, {2, 4}}, // CB=12 M=1 40960x896 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_40960x896 max-regret=0.0000% max-cv=40.2234%
+            {0x0100003800025180ULL, {2, 4}}, // CB=12 M=1 151936x896 rocm.nvnni.decode.fast.kb2 0.5B_LM_Head max-regret=0.0000% max-cv=12.3963%
+            {0x0100004000000510ULL, {8, 4}}, // CB=12 M=1 1296x1024 rocm.nvnni.decode.fast.kb8 DevNeighbor_0.5B_QKV max-regret=1.4493% max-cv=6.9922%
+            {0x0100004000001560ULL, {7, 4}}, // CB=12 M=1 5472x1024 rocm.nvnni.decode.fast.kb7 DevNeighbor_0.5B_FFN_Up max-regret=1.3333% max-cv=13.9350%
+            {0x0100005000000320ULL, {10, 4}}, // CB=12 M=1 800x1280 rocm.nvnni.decode.fast.kb10 V4FastSealed_Tall_800x1280 max-regret=1.4286% max-cv=2.8168%
+            {0x0100005800000500ULL, {11, 4}}, // CB=12 M=1 1280x1408 rocm.nvnni.decode.fast.kb11 V4FastSealed_Balanced_1280x1408 max-regret=2.0408% max-cv=15.3596%
+            {0x0100005800002c00ULL, {4, 4}}, // CB=12 M=1 11264x1408 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_11264x1408 max-regret=0.0000% max-cv=22.1604%
+            {0x0100006000000600ULL, {11, 4}}, // CB=12 M=1 1536x1536 rocm.nvnni.decode.fast.kb11 1.5B_AttnOut max-regret=1.3072% max-cv=3.8077%
+            {0x0100006000000800ULL, {10, 4}}, // CB=12 M=1 2048x1536 rocm.nvnni.decode.fast.kb10 1.5B_QKV max-regret=0.6289% max-cv=5.2243%
+            {0x0100006000002300ULL, {6, 4}}, // CB=12 M=1 8960x1536 rocm.nvnni.decode.fast.kb6 1.5B_FFN_Up max-regret=0.0000% max-cv=19.3541%
+            {0x0100006000025180ULL, {2, 4}}, // CB=12 M=1 151936x1536 rocm.nvnni.decode.fast.kb2 1.5B_LM_Head max-regret=0.0000% max-cv=3.5422%
+            {0x0100006c00000260ULL, {18, 4}}, // CB=12 M=1 608x1728 rocm.nvnni.decode.fast.kb18 V4TransitionNeighbor_Tall_608x1728 max-regret=0.0000% max-cv=4.5653%
+            {0x0100007000014000ULL, {2, 4}}, // CB=12 M=1 81920x1792 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=5.8832%
+            {0x0100007c000002c0ULL, {14, 4}}, // CB=12 M=1 704x1984 rocm.nvnni.decode.fast.kb14 V4TransitionNeighbor_Tall_704x1984 max-regret=4.0541% max-cv=3.2602%
+            {0x0100008000000200ULL, {23, 4}}, // CB=12 M=1 512x2048 rocm.nvnni.decode.fast.kb23 35BMoE_Expert_GateUp max-regret=0.6667% max-cv=4.4922%
+            {0x0100008000000800ULL, {10, 4}}, // CB=12 M=1 2048x2048 rocm.nvnni.decode.fast.kb10 3B_AttnOut max-regret=0.9709% max-cv=3.3691%
+            {0x0100008000000a00ULL, {10, 4}}, // CB=12 M=1 2560x2048 rocm.nvnni.decode.fast.kb10 3B_QKV max-regret=0.0000% max-cv=64.5576%
+            {0x0100008000001000ULL, {7, 4}}, // CB=12 M=1 4096x2048 rocm.nvnni.decode.fast.kb7 Qwen36MoE_GDN_ZProjection max-regret=1.8779% max-cv=6.2828%
+            {0x0100008000002000ULL, {8, 4}}, // CB=12 M=1 8192x2048 rocm.nvnni.decode.fast.kb8 Qwen36MoE_GDN_QKVProjection max-regret=0.0000% max-cv=26.9930%
+            {0x0100008000002b00ULL, {8, 4}}, // CB=12 M=1 11008x2048 rocm.nvnni.decode.fast.kb8 3B_FFN_Up max-regret=0.0000% max-cv=2.6715%
+            {0x0100008000025180ULL, {2, 4}}, // CB=12 M=1 151936x2048 rocm.nvnni.decode.fast.kb2 3B_LM_Head max-regret=0.0000% max-cv=0.8282%
+            {0x010000a000000940ULL, {17, 4}}, // CB=12 M=1 2368x2560 rocm.nvnni.decode.fast.kb17 V4FastSealed_Balanced_2368x2560 max-regret=1.0417% max-cv=3.7251%
+            {0x010000a400000348ULL, {17, 4}}, // CB=12 M=1 840x2624 rocm.nvnni.decode.fast.kb17 V3TransitionRefine_Tall_840x2624 max-regret=0.0000% max-cv=3.7839%
+            {0x010000b000005800ULL, {8, 4}}, // CB=12 M=1 22528x2816 rocm.nvnni.decode.fast.kb8 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=38.9718%
+            {0x010000b8000003a0ULL, {23, 4}}, // CB=12 M=1 928x2944 rocm.nvnni.decode.fast.kb23 V3Transition_Tall_928x2944 max-regret=0.0000% max-cv=80.9576%
+            {0x010000e000000e00ULL, {16, 4}}, // CB=12 M=1 3584x3584 rocm.nvnni.decode.fast.kb16 7B_AttnOut max-regret=1.1494% max-cv=18.3753%
+            {0x010000e000001200ULL, {16, 4}}, // CB=12 M=1 4608x3584 rocm.nvnni.decode.fast.kb16 7B_QKV max-regret=0.0000% max-cv=18.3303%
+            {0x010000e000004a00ULL, {8, 4}}, // CB=12 M=1 18944x3584 rocm.nvnni.decode.fast.kb8 7B_FFN_Up max-regret=0.0000% max-cv=42.1548%
+            {0x010000e000025200ULL, {2, 4}}, // CB=12 M=1 152064x3584 rocm.nvnni.decode.fast.kb2 7B_LM_Head max-regret=0.0000% max-cv=1.1399%
+            {0x010000e000028000ULL, {1, 4}}, // CB=12 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=1.6235%
+            {0x010000fc00001440ULL, {14, 4}}, // CB=12 M=1 5184x4032 rocm.nvnni.decode.fast.kb14 DevNeighbor_7B_QKV max-regret=0.0000% max-cv=17.4587%
+            {0x010000fc00005340ULL, {7, 4}}, // CB=12 M=1 21312x4032 rocm.nvnni.decode.fast.kb7 DevNeighbor_7B_FFN_Up max-regret=0.0000% max-cv=30.4223%
+            {0x0100012000001400ULL, {18, 4}}, // CB=12 M=1 5120x4608 rocm.nvnni.decode.fast.kb18 V4FastSealed_Balanced_5120x4608 max-regret=0.0000% max-cv=1.3109%
+            {0x0100013000000380ULL, {23, 4}}, // CB=12 M=1 896x4864 rocm.nvnni.decode.fast.kb23 0.5B_FFN_Dn max-regret=0.4505% max-cv=2.2252%
+            {0x0100014000000400ULL, {23, 4}}, // CB=12 M=1 1024x5120 rocm.nvnni.decode.fast.kb23 Qwen36_GDN_TimeProjection max-regret=0.0000% max-cv=8.2365%
+            {0x0100014000001400ULL, {18, 4}}, // CB=12 M=1 5120x5120 rocm.nvnni.decode.fast.kb18 32B_AttnOut max-regret=0.0000% max-cv=17.5221%
+            {0x0100014000001800ULL, {15, 4}}, // CB=12 M=1 6144x5120 rocm.nvnni.decode.fast.kb15 Qwen36_GDN_ZProjection max-regret=0.0014% max-cv=12.6364%
+            {0x0100014000001c00ULL, {11, 4}}, // CB=12 M=1 7168x5120 rocm.nvnni.decode.fast.kb11 32B_QKV max-regret=0.0000% max-cv=14.9408%
+            {0x0100014000002800ULL, {16, 4}}, // CB=12 M=1 10240x5120 rocm.nvnni.decode.fast.kb16 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=16.9631%
+            {0x0100014000003000ULL, {10, 4}}, // CB=12 M=1 12288x5120 rocm.nvnni.decode.fast.kb10 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=1.3499%
+            {0x0100014000003600ULL, {10, 4}}, // CB=12 M=1 13824x5120 rocm.nvnni.decode.fast.kb10 14B_FFN_Up max-regret=0.0000% max-cv=19.9938%
+            {0x0100014000004400ULL, {8, 4}}, // CB=12 M=1 17408x5120 rocm.nvnni.decode.fast.kb8 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=13.4277%
+            {0x0100014000006c00ULL, {5, 4}}, // CB=12 M=1 27648x5120 rocm.nvnni.decode.fast.kb5 32B_FFN_Up max-regret=0.0000% max-cv=6.0309%
+            {0x0100014000025200ULL, {2, 4}}, // CB=12 M=1 152064x5120 rocm.nvnni.decode.fast.kb2 32B_LM_Head max-regret=0.0000% max-cv=0.9990%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=12 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=1.1707%
+            {0x0100016000000600ULL, {17, 4}}, // CB=12 M=1 1536x5632 rocm.nvnni.decode.fast.kb17 V4FastSealed_Tall_1536x5632 max-regret=1.2987% max-cv=4.8368%
+            {0x010001600000b000ULL, {4, 4}}, // CB=12 M=1 45056x5632 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=6.4971%
+            {0x0100018000001400ULL, {15, 4}}, // CB=12 M=1 5120x6144 rocm.nvnni.decode.fast.kb15 Qwen36_GDN_OutputProjection max-regret=0.0000% max-cv=14.2245%
+            {0x0100022000002600ULL, {16, 4}}, // CB=12 M=1 9728x8704 rocm.nvnni.decode.fast.kb16 V4FastSealed_Balanced_9728x8704 max-regret=0.0000% max-cv=15.2165%
+            {0x0100023000000600ULL, {35, 4}}, // CB=12 M=1 1536x8960 rocm.nvnni.decode.fast.kb35 1.5B_FFN_Dn max-regret=0.0000% max-cv=24.8197%
+            {0x010002b000000800ULL, {43, 4}}, // CB=12 M=1 2048x11008 rocm.nvnni.decode.fast.kb43 3B_FFN_Dn max-regret=0.0000% max-cv=24.7099%
+            {0x0100030000000e80ULL, {24, 4}}, // CB=12 M=1 3712x12288 rocm.nvnni.decode.fast.kb24 V4FastSealed_Tall_3712x12288 max-regret=4.1045% max-cv=21.1818%
+            {0x0100036000001400ULL, {16, 4}}, // CB=12 M=1 5120x13824 rocm.nvnni.decode.fast.kb16 14B_FFN_Dn max-regret=2.0679% max-cv=16.8445%
+            {0x0100044000001400ULL, {19, 4}}, // CB=12 M=1 5120x17408 rocm.nvnni.decode.fast.kb19 Qwen36_FFN_DownProjection max-regret=0.7009% max-cv=6.0866%
+            {0x010004a000000e00ULL, {37, 4}}, // CB=12 M=1 3584x18944 rocm.nvnni.decode.fast.kb37 7B_FFN_Dn max-regret=0.0000% max-cv=17.4365%
+            {0x010004c800001680ULL, {18, 4}}, // CB=12 M=1 5760x19584 rocm.nvnni.decode.fast.kb18 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.3012% max-cv=2.2221%
+            {0x0100064000001d00ULL, {15, 4}}, // CB=12 M=1 7424x25600 rocm.nvnni.decode.fast.kb15 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.0953%
+            {0x010006c000001400ULL, {32, 4}}, // CB=12 M=1 5120x27648 rocm.nvnni.decode.fast.kb32 32B_FFN_Dn max-regret=0.0000% max-cv=24.0692%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 13)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {8, 4}}, // CB=13 M=1 128x256 rocm.nvnni.decode.fast.kb8 Integration_Tall_128x256 max-regret=0.0000% max-cv=4.2800%
+            {0x01000010000000bfULL, {8, 4}}, // CB=13 M=1 191x256 rocm.nvnni.decode.fast.kb8 Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=11.2105%
+            {0x01000010000000c0ULL, {8, 4}}, // CB=13 M=1 192x256 rocm.nvnni.decode.fast.kb8 Integration_Balanced_192x256 max-regret=0.0000% max-cv=23.5262%
+            {0x0100001000000280ULL, {8, 4}}, // CB=13 M=1 640x256 rocm.nvnni.decode.fast.kb8 V3Development_Wide_640x256 max-regret=3.8217% max-cv=16.5882%
+            {0x0100001000001080ULL, {8, 4}}, // CB=13 M=1 4224x256 rocm.nvnni.decode.fast.kb8 FastSealed_VeryWide_4224x256 max-regret=4.5802% max-cv=81.5547%
+            {0x0100001200000090ULL, {9, 4}}, // CB=13 M=1 144x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Tall_128x256 max-regret=0.0000% max-cv=17.0224%
+            {0x01000012000000a0ULL, {9, 4}}, // CB=13 M=1 160x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_160x288 max-regret=3.3058% max-cv=16.0542%
+            {0x01000012000000d7ULL, {9, 4}}, // CB=13 M=1 215x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=16.4308%
+            {0x01000012000000d8ULL, {9, 4}}, // CB=13 M=1 216x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Balanced_192x256 max-regret=0.0000% max-cv=4.7554%
+            {0x0100001200000280ULL, {9, 4}}, // CB=13 M=1 640x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_640x288 max-regret=7.0064% max-cv=18.6325%
+            {0x0100001200001400ULL, {9, 4}}, // CB=13 M=1 5120x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_VeryWide_5120x288 max-regret=0.0000% max-cv=4.2638%
+            {0x0100001200002400ULL, {1, 4}}, // CB=13 M=1 9216x288 rocm.nvnni.decode.fast.kb1 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=16.6398%
+            {0x0100001400000060ULL, {10, 4}}, // CB=13 M=1 96x320 rocm.nvnni.decode.fast.kb10 V3FastSealed_Tall_96x320 max-regret=5.0955% max-cv=18.3205%
+            {0x0100001400000070ULL, {10, 4}}, // CB=13 M=1 112x320 rocm.nvnni.decode.fast.kb10 V3Development_Tall_112x320 max-regret=1.6260% max-cv=24.0205%
+            {0x0100001400000100ULL, {7, 4}}, // CB=13 M=1 256x320 rocm.nvnni.decode.fast.kb7 V3Development_Balanced_256x320 max-regret=1.6393% max-cv=20.5805%
+            {0x0100001400000110ULL, {10, 4}}, // CB=13 M=1 272x320 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_272x320 max-regret=4.4586% max-cv=17.0030%
+            {0x0100001400000320ULL, {10, 4}}, // CB=13 M=1 800x320 rocm.nvnni.decode.fast.kb10 V3VerifierSealed_Wide_800x320 max-regret=6.9620% max-cv=18.0273%
+            {0x0100001600000120ULL, {11, 4}}, // CB=13 M=1 288x352 rocm.nvnni.decode.fast.kb11 V3VerifierSealed_Balanced_288x352 max-regret=0.0000% max-cv=13.9416%
+            {0x0100001c00000100ULL, {14, 4}}, // CB=13 M=1 256x448 rocm.nvnni.decode.fast.kb14 V3Development_Tall_256x448 max-regret=0.0000% max-cv=5.5614%
+            {0x0100001c00000800ULL, {14, 4}}, // CB=13 M=1 2048x448 rocm.nvnni.decode.fast.kb14 V4FastSealed_Wide_2048x448 max-regret=0.0000% max-cv=16.1526%
+            {0x0100001c00004000ULL, {1, 4}}, // CB=13 M=1 16384x448 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_16384x448 max-regret=0.0000% max-cv=2.0260%
+            {0x0100002000000800ULL, {6, 4}}, // CB=13 M=1 2048x512 rocm.nvnni.decode.fast.kb6 35BMoE_Expert_Down max-regret=3.0769% max-cv=3.9482%
+            {0x01000024000001b0ULL, {18, 4}}, // CB=13 M=1 432x576 rocm.nvnni.decode.fast.kb18 DevNeighbor_Integration_Balanced_384x512 max-regret=0.0000% max-cv=2.9286%
+            {0x0100002c00000260ULL, {22, 4}}, // CB=13 M=1 608x704 rocm.nvnni.decode.fast.kb22 V4FastSealed_Balanced_608x704 max-regret=0.6061% max-cv=15.6452%
+            {0x0100002c00001200ULL, {22, 4}}, // CB=13 M=1 4608x704 rocm.nvnni.decode.fast.kb22 V4FastSealed_Wide_4608x704 max-regret=2.5253% max-cv=2.7624%
+            {0x01000034000001a0ULL, {14, 4}}, // CB=13 M=1 416x832 rocm.nvnni.decode.fast.kb14 V4FastSealed_Tall_416x832 max-regret=1.1905% max-cv=4.0620%
+            {0x0100003800000380ULL, {14, 4}}, // CB=13 M=1 896x896 rocm.nvnni.decode.fast.kb14 0.5B_AttnOut max-regret=0.0000% max-cv=21.1800%
+            {0x0100003800000480ULL, {16, 4}}, // CB=13 M=1 1152x896 rocm.nvnni.decode.fast.kb16 0.5B_QKV max-regret=0.0000% max-cv=3.5378%
+            {0x0100003800001300ULL, {11, 4}}, // CB=13 M=1 4864x896 rocm.nvnni.decode.fast.kb11 0.5B_FFN_Up max-regret=0.0000% max-cv=67.8305%
+            {0x010000380000a000ULL, {2, 4}}, // CB=13 M=1 40960x896 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_40960x896 max-regret=0.0000% max-cv=35.6693%
+            {0x0100003800025180ULL, {1, 4}}, // CB=13 M=1 151936x896 rocm.nvnni.decode.fast.kb1 0.5B_LM_Head max-regret=0.0000% max-cv=25.7768%
+            {0x0100004000000510ULL, {11, 4}}, // CB=13 M=1 1296x1024 rocm.nvnni.decode.fast.kb11 DevNeighbor_0.5B_QKV max-regret=0.0000% max-cv=3.1283%
+            {0x0100004000001560ULL, {12, 4}}, // CB=13 M=1 5472x1024 rocm.nvnni.decode.fast.kb12 DevNeighbor_0.5B_FFN_Up max-regret=1.1905% max-cv=14.2879%
+            {0x0100005000000320ULL, {14, 4}}, // CB=13 M=1 800x1280 rocm.nvnni.decode.fast.kb14 V4FastSealed_Tall_800x1280 max-regret=0.0000% max-cv=3.4051%
+            {0x0100005800000500ULL, {11, 4}}, // CB=13 M=1 1280x1408 rocm.nvnni.decode.fast.kb11 V4FastSealed_Balanced_1280x1408 max-regret=0.0000% max-cv=4.8717%
+            {0x0100005800002c00ULL, {4, 4}}, // CB=13 M=1 11264x1408 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_11264x1408 max-regret=0.0000% max-cv=9.4143%
+            {0x0100006000000600ULL, {16, 4}}, // CB=13 M=1 1536x1536 rocm.nvnni.decode.fast.kb16 1.5B_AttnOut max-regret=0.0000% max-cv=2.2028%
+            {0x0100006000000800ULL, {18, 4}}, // CB=13 M=1 2048x1536 rocm.nvnni.decode.fast.kb18 1.5B_QKV max-regret=1.8868% max-cv=5.2358%
+            {0x0100006000002300ULL, {6, 4}}, // CB=13 M=1 8960x1536 rocm.nvnni.decode.fast.kb6 1.5B_FFN_Up max-regret=0.0000% max-cv=5.8188%
+            {0x0100006000025180ULL, {1, 4}}, // CB=13 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.0000% max-cv=7.6510%
+            {0x0100006c00000260ULL, {19, 4}}, // CB=13 M=1 608x1728 rocm.nvnni.decode.fast.kb19 V4TransitionNeighbor_Tall_608x1728 max-regret=0.5494% max-cv=23.3409%
+            {0x0100007000014000ULL, {1, 4}}, // CB=13 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=7.6005%
+            {0x0100007c000002c0ULL, {22, 4}}, // CB=13 M=1 704x1984 rocm.nvnni.decode.fast.kb22 V4TransitionNeighbor_Tall_704x1984 max-regret=0.5405% max-cv=16.8475%
+            {0x0100008000000200ULL, {23, 4}}, // CB=13 M=1 512x2048 rocm.nvnni.decode.fast.kb23 35BMoE_Expert_GateUp max-regret=0.0000% max-cv=1.3743%
+            {0x0100008000000800ULL, {22, 4}}, // CB=13 M=1 2048x2048 rocm.nvnni.decode.fast.kb22 3B_AttnOut max-regret=0.4739% max-cv=1.2745%
+            {0x0100008000000a00ULL, {22, 4}}, // CB=13 M=1 2560x2048 rocm.nvnni.decode.fast.kb22 3B_QKV max-regret=0.0000% max-cv=4.8082%
+            {0x0100008000001000ULL, {22, 4}}, // CB=13 M=1 4096x2048 rocm.nvnni.decode.fast.kb22 Qwen36MoE_GDN_ZProjection max-regret=0.0000% max-cv=16.0885%
+            {0x0100008000002000ULL, {8, 4}}, // CB=13 M=1 8192x2048 rocm.nvnni.decode.fast.kb8 Qwen36MoE_GDN_QKVProjection max-regret=0.0000% max-cv=21.2960%
+            {0x0100008000002b00ULL, {4, 4}}, // CB=13 M=1 11008x2048 rocm.nvnni.decode.fast.kb4 3B_FFN_Up max-regret=0.0000% max-cv=3.5362%
+            {0x0100008000025180ULL, {1, 4}}, // CB=13 M=1 151936x2048 rocm.nvnni.decode.fast.kb1 3B_LM_Head max-regret=0.0000% max-cv=1.2207%
+            {0x010000a000000940ULL, {27, 4}}, // CB=13 M=1 2368x2560 rocm.nvnni.decode.fast.kb27 V4FastSealed_Balanced_2368x2560 max-regret=0.0000% max-cv=3.1169%
+            {0x010000a400000348ULL, {17, 4}}, // CB=13 M=1 840x2624 rocm.nvnni.decode.fast.kb17 V3TransitionRefine_Tall_840x2624 max-regret=0.0000% max-cv=5.3832%
+            {0x010000b000005800ULL, {2, 4}}, // CB=13 M=1 22528x2816 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=2.5112%
+            {0x010000b8000003a0ULL, {32, 4}}, // CB=13 M=1 928x2944 rocm.nvnni.decode.fast.kb32 V3Transition_Tall_928x2944 max-regret=0.0000% max-cv=3.5821%
+            {0x010000e000000e00ULL, {23, 4}}, // CB=13 M=1 3584x3584 rocm.nvnni.decode.fast.kb23 7B_AttnOut max-regret=0.0000% max-cv=12.4797%
+            {0x010000e000001200ULL, {19, 4}}, // CB=13 M=1 4608x3584 rocm.nvnni.decode.fast.kb19 7B_QKV max-regret=0.0000% max-cv=21.5575%
+            {0x010000e000004a00ULL, {4, 4}}, // CB=13 M=1 18944x3584 rocm.nvnni.decode.fast.kb4 7B_FFN_Up max-regret=0.0000% max-cv=3.4373%
+            {0x010000e000025200ULL, {1, 4}}, // CB=13 M=1 152064x3584 rocm.nvnni.decode.fast.kb1 7B_LM_Head max-regret=0.0000% max-cv=1.4951%
+            {0x010000e000028000ULL, {1, 4}}, // CB=13 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=1.4463%
+            {0x010000fc00001440ULL, {21, 4}}, // CB=13 M=1 5184x4032 rocm.nvnni.decode.fast.kb21 DevNeighbor_7B_QKV max-regret=0.3096% max-cv=4.5982%
+            {0x010000fc00005340ULL, {3, 4}}, // CB=13 M=1 21312x4032 rocm.nvnni.decode.fast.kb3 DevNeighbor_7B_FFN_Up max-regret=0.0000% max-cv=1.5064%
+            {0x0100012000001400ULL, {21, 4}}, // CB=13 M=1 5120x4608 rocm.nvnni.decode.fast.kb21 V4FastSealed_Balanced_5120x4608 max-regret=0.0000% max-cv=1.8305%
+            {0x0100013000000380ULL, {31, 4}}, // CB=13 M=1 896x4864 rocm.nvnni.decode.fast.kb31 0.5B_FFN_Dn max-regret=0.4310% max-cv=8.9036%
+            {0x0100014000000400ULL, {27, 4}}, // CB=13 M=1 1024x5120 rocm.nvnni.decode.fast.kb27 Qwen36_GDN_TimeProjection max-regret=0.0000% max-cv=1.5813%
+            {0x0100014000001400ULL, {18, 4}}, // CB=13 M=1 5120x5120 rocm.nvnni.decode.fast.kb18 32B_AttnOut max-regret=0.0000% max-cv=17.6740%
+            {0x0100014000001800ULL, {18, 4}}, // CB=13 M=1 6144x5120 rocm.nvnni.decode.fast.kb18 Qwen36_GDN_ZProjection max-regret=0.0000% max-cv=23.8391%
+            {0x0100014000001c00ULL, {16, 4}}, // CB=13 M=1 7168x5120 rocm.nvnni.decode.fast.kb16 32B_QKV max-regret=0.0000% max-cv=2.0191%
+            {0x0100014000002800ULL, {5, 4}}, // CB=13 M=1 10240x5120 rocm.nvnni.decode.fast.kb5 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=2.2575%
+            {0x0100014000003000ULL, {5, 4}}, // CB=13 M=1 12288x5120 rocm.nvnni.decode.fast.kb5 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=1.1621%
+            {0x0100014000003600ULL, {5, 4}}, // CB=13 M=1 13824x5120 rocm.nvnni.decode.fast.kb5 14B_FFN_Up max-regret=0.0000% max-cv=1.8022%
+            {0x0100014000004400ULL, {4, 4}}, // CB=13 M=1 17408x5120 rocm.nvnni.decode.fast.kb4 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=0.8544%
+            {0x0100014000006c00ULL, {2, 4}}, // CB=13 M=1 27648x5120 rocm.nvnni.decode.fast.kb2 32B_FFN_Up max-regret=0.0000% max-cv=20.0476%
+            {0x0100014000025200ULL, {1, 4}}, // CB=13 M=1 152064x5120 rocm.nvnni.decode.fast.kb1 32B_LM_Head max-regret=0.0000% max-cv=1.7473%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=13 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=1.1961%
+            {0x0100016000000600ULL, {36, 4}}, // CB=13 M=1 1536x5632 rocm.nvnni.decode.fast.kb36 V4FastSealed_Tall_1536x5632 max-regret=0.0000% max-cv=1.0048%
+            {0x010001600000b000ULL, {2, 4}}, // CB=13 M=1 45056x5632 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=1.9044%
+            {0x0100018000001400ULL, {22, 4}}, // CB=13 M=1 5120x6144 rocm.nvnni.decode.fast.kb22 Qwen36_GDN_OutputProjection max-regret=0.0000% max-cv=2.5233%
+            {0x0100022000002600ULL, {8, 4}}, // CB=13 M=1 9728x8704 rocm.nvnni.decode.fast.kb8 V4FastSealed_Balanced_9728x8704 max-regret=0.0000% max-cv=1.8773%
+            {0x0100023000000600ULL, {35, 4}}, // CB=13 M=1 1536x8960 rocm.nvnni.decode.fast.kb35 1.5B_FFN_Dn max-regret=0.0000% max-cv=12.6185%
+            {0x010002b000000800ULL, {43, 4}}, // CB=13 M=1 2048x11008 rocm.nvnni.decode.fast.kb43 3B_FFN_Dn max-regret=0.0000% max-cv=1.3253%
+            {0x0100030000000e80ULL, {32, 4}}, // CB=13 M=1 3712x12288 rocm.nvnni.decode.fast.kb32 V4FastSealed_Tall_3712x12288 max-regret=0.0000% max-cv=0.7130%
+            {0x0100036000001400ULL, {19, 4}}, // CB=13 M=1 5120x13824 rocm.nvnni.decode.fast.kb19 14B_FFN_Dn max-regret=1.3652% max-cv=4.7189%
+            {0x0100044000001400ULL, {23, 4}}, // CB=13 M=1 5120x17408 rocm.nvnni.decode.fast.kb23 Qwen36_FFN_DownProjection max-regret=1.6467% max-cv=7.6124%
+            {0x010004a000000e00ULL, {16, 4}}, // CB=13 M=1 3584x18944 rocm.nvnni.decode.fast.kb16 7B_FFN_Dn max-regret=0.0000% max-cv=2.4002%
+            {0x010004c800001680ULL, {20, 4}}, // CB=13 M=1 5760x19584 rocm.nvnni.decode.fast.kb20 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=20.3474%
+            {0x0100064000001d00ULL, {16, 4}}, // CB=13 M=1 7424x25600 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.2983%
+            {0x010006c000001400ULL, {12, 4}}, // CB=13 M=1 5120x27648 rocm.nvnni.decode.fast.kb12 32B_FFN_Dn max-regret=0.0000% max-cv=4.8177%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 14)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {8, 4}}, // CB=14 M=1 128x256 rocm.nvnni.decode.fast.kb8 Integration_Tall_128x256 max-regret=1.8987% max-cv=7.2949%
+            {0x01000010000000bfULL, {8, 4}}, // CB=14 M=1 191x256 rocm.nvnni.decode.fast.kb8 Generic_Tall_BoundaryBelow max-regret=4.4304% max-cv=18.4324%
+            {0x01000010000000c0ULL, {8, 4}}, // CB=14 M=1 192x256 rocm.nvnni.decode.fast.kb8 Integration_Balanced_192x256 max-regret=0.0000% max-cv=15.9047%
+            {0x0100001000000280ULL, {8, 4}}, // CB=14 M=1 640x256 rocm.nvnni.decode.fast.kb8 V3Development_Wide_640x256 max-regret=5.7325% max-cv=25.4359%
+            {0x0100001000001080ULL, {8, 4}}, // CB=14 M=1 4224x256 rocm.nvnni.decode.fast.kb8 FastSealed_VeryWide_4224x256 max-regret=0.0000% max-cv=1.5928%
+            {0x0100001200000090ULL, {9, 4}}, // CB=14 M=1 144x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Tall_128x256 max-regret=0.0000% max-cv=14.5653%
+            {0x01000012000000a0ULL, {9, 4}}, // CB=14 M=1 160x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_160x288 max-regret=0.0000% max-cv=5.1344%
+            {0x01000012000000d7ULL, {9, 4}}, // CB=14 M=1 215x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=10.7146%
+            {0x01000012000000d8ULL, {9, 4}}, // CB=14 M=1 216x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Balanced_192x256 max-regret=0.0000% max-cv=16.7311%
+            {0x0100001200000280ULL, {9, 4}}, // CB=14 M=1 640x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_640x288 max-regret=5.0314% max-cv=15.3239%
+            {0x0100001200001400ULL, {9, 4}}, // CB=14 M=1 5120x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_VeryWide_5120x288 max-regret=0.0000% max-cv=6.9873%
+            {0x0100001200002400ULL, {1, 4}}, // CB=14 M=1 9216x288 rocm.nvnni.decode.fast.kb1 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=4.9428%
+            {0x0100001400000060ULL, {10, 4}}, // CB=14 M=1 96x320 rocm.nvnni.decode.fast.kb10 V3FastSealed_Tall_96x320 max-regret=0.0000% max-cv=9.5535%
+            {0x0100001400000070ULL, {10, 4}}, // CB=14 M=1 112x320 rocm.nvnni.decode.fast.kb10 V3Development_Tall_112x320 max-regret=0.0000% max-cv=24.4000%
+            {0x0100001400000100ULL, {10, 4}}, // CB=14 M=1 256x320 rocm.nvnni.decode.fast.kb10 V3Development_Balanced_256x320 max-regret=0.0000% max-cv=11.8212%
+            {0x0100001400000110ULL, {10, 4}}, // CB=14 M=1 272x320 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_272x320 max-regret=0.0000% max-cv=16.1952%
+            {0x0100001400000320ULL, {10, 4}}, // CB=14 M=1 800x320 rocm.nvnni.decode.fast.kb10 V3VerifierSealed_Wide_800x320 max-regret=4.9689% max-cv=16.4907%
+            {0x0100001600000120ULL, {11, 4}}, // CB=14 M=1 288x352 rocm.nvnni.decode.fast.kb11 V3VerifierSealed_Balanced_288x352 max-regret=5.5901% max-cv=25.1089%
+            {0x0100001c00000100ULL, {14, 4}}, // CB=14 M=1 256x448 rocm.nvnni.decode.fast.kb14 V3Development_Tall_256x448 max-regret=0.0000% max-cv=8.8038%
+            {0x0100001c00000800ULL, {14, 4}}, // CB=14 M=1 2048x448 rocm.nvnni.decode.fast.kb14 V4FastSealed_Wide_2048x448 max-regret=0.0000% max-cv=21.7693%
+            {0x0100001c00004000ULL, {1, 4}}, // CB=14 M=1 16384x448 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_16384x448 max-regret=0.0000% max-cv=4.7583%
+            {0x0100002000000800ULL, {16, 4}}, // CB=14 M=1 2048x512 rocm.nvnni.decode.fast.kb16 35BMoE_Expert_Down max-regret=0.0000% max-cv=6.0217%
+            {0x01000024000001b0ULL, {18, 4}}, // CB=14 M=1 432x576 rocm.nvnni.decode.fast.kb18 DevNeighbor_Integration_Balanced_384x512 max-regret=0.0000% max-cv=24.7003%
+            {0x0100002c00000260ULL, {22, 4}}, // CB=14 M=1 608x704 rocm.nvnni.decode.fast.kb22 V4FastSealed_Balanced_608x704 max-regret=0.0000% max-cv=9.4506%
+            {0x0100002c00001200ULL, {8, 4}}, // CB=14 M=1 4608x704 rocm.nvnni.decode.fast.kb8 V4FastSealed_Wide_4608x704 max-regret=0.0000% max-cv=4.7178%
+            {0x01000034000001a0ULL, {14, 4}}, // CB=14 M=1 416x832 rocm.nvnni.decode.fast.kb14 V4FastSealed_Tall_416x832 max-regret=1.4706% max-cv=1.2976%
+            {0x0100003800000380ULL, {16, 4}}, // CB=14 M=1 896x896 rocm.nvnni.decode.fast.kb16 0.5B_AttnOut max-regret=0.5917% max-cv=3.5321%
+            {0x0100003800000480ULL, {10, 4}}, // CB=14 M=1 1152x896 rocm.nvnni.decode.fast.kb10 0.5B_QKV max-regret=0.0000% max-cv=5.3764%
+            {0x0100003800001300ULL, {10, 4}}, // CB=14 M=1 4864x896 rocm.nvnni.decode.fast.kb10 0.5B_FFN_Up max-regret=0.0000% max-cv=8.7554%
+            {0x010000380000a000ULL, {2, 4}}, // CB=14 M=1 40960x896 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_40960x896 max-regret=0.0000% max-cv=36.3908%
+            {0x0100003800025180ULL, {1, 4}}, // CB=14 M=1 151936x896 rocm.nvnni.decode.fast.kb1 0.5B_LM_Head max-regret=0.0000% max-cv=27.2646%
+            {0x0100004000000510ULL, {9, 4}}, // CB=14 M=1 1296x1024 rocm.nvnni.decode.fast.kb9 DevNeighbor_0.5B_QKV max-regret=5.7143% max-cv=4.5002%
+            {0x0100004000001560ULL, {13, 4}}, // CB=14 M=1 5472x1024 rocm.nvnni.decode.fast.kb13 DevNeighbor_0.5B_FFN_Up max-regret=1.7964% max-cv=4.4385%
+            {0x0100005000000320ULL, {19, 4}}, // CB=14 M=1 800x1280 rocm.nvnni.decode.fast.kb19 V4FastSealed_Tall_800x1280 max-regret=3.4722% max-cv=4.7015%
+            {0x0100005800000500ULL, {16, 4}}, // CB=14 M=1 1280x1408 rocm.nvnni.decode.fast.kb16 V4FastSealed_Balanced_1280x1408 max-regret=0.0000% max-cv=1.1561%
+            {0x0100005800002c00ULL, {4, 4}}, // CB=14 M=1 11264x1408 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_11264x1408 max-regret=0.0000% max-cv=4.3184%
+            {0x0100006000000600ULL, {16, 4}}, // CB=14 M=1 1536x1536 rocm.nvnni.decode.fast.kb16 1.5B_AttnOut max-regret=0.0000% max-cv=2.7033%
+            {0x0100006000000800ULL, {18, 4}}, // CB=14 M=1 2048x1536 rocm.nvnni.decode.fast.kb18 1.5B_QKV max-regret=1.8750% max-cv=6.3278%
+            {0x0100006000002300ULL, {6, 4}}, // CB=14 M=1 8960x1536 rocm.nvnni.decode.fast.kb6 1.5B_FFN_Up max-regret=0.0000% max-cv=16.1179%
+            {0x0100006000025180ULL, {1, 4}}, // CB=14 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.0000% max-cv=7.7836%
+            {0x0100006c00000260ULL, {21, 4}}, // CB=14 M=1 608x1728 rocm.nvnni.decode.fast.kb21 V4TransitionNeighbor_Tall_608x1728 max-regret=2.0270% max-cv=3.4124%
+            {0x0100007000014000ULL, {1, 4}}, // CB=14 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=7.9650%
+            {0x0100007c000002c0ULL, {22, 4}}, // CB=14 M=1 704x1984 rocm.nvnni.decode.fast.kb22 V4TransitionNeighbor_Tall_704x1984 max-regret=0.5405% max-cv=1.4350%
+            {0x0100008000000200ULL, {22, 4}}, // CB=14 M=1 512x2048 rocm.nvnni.decode.fast.kb22 35BMoE_Expert_GateUp max-regret=0.0000% max-cv=3.3932%
+            {0x0100008000000800ULL, {22, 4}}, // CB=14 M=1 2048x2048 rocm.nvnni.decode.fast.kb22 3B_AttnOut max-regret=0.0000% max-cv=3.4010%
+            {0x0100008000000a00ULL, {22, 4}}, // CB=14 M=1 2560x2048 rocm.nvnni.decode.fast.kb22 3B_QKV max-regret=0.0000% max-cv=9.0713%
+            {0x0100008000001000ULL, {24, 4}}, // CB=14 M=1 4096x2048 rocm.nvnni.decode.fast.kb24 Qwen36MoE_GDN_ZProjection max-regret=1.2605% max-cv=2.4556%
+            {0x0100008000002000ULL, {8, 4}}, // CB=14 M=1 8192x2048 rocm.nvnni.decode.fast.kb8 Qwen36MoE_GDN_QKVProjection max-regret=0.0000% max-cv=29.6263%
+            {0x0100008000002b00ULL, {4, 4}}, // CB=14 M=1 11008x2048 rocm.nvnni.decode.fast.kb4 3B_FFN_Up max-regret=0.0000% max-cv=4.0374%
+            {0x0100008000025180ULL, {1, 4}}, // CB=14 M=1 151936x2048 rocm.nvnni.decode.fast.kb1 3B_LM_Head max-regret=0.0000% max-cv=6.2224%
+            {0x010000a000000940ULL, {27, 4}}, // CB=14 M=1 2368x2560 rocm.nvnni.decode.fast.kb27 V4FastSealed_Balanced_2368x2560 max-regret=0.0000% max-cv=1.3821%
+            {0x010000a400000348ULL, {33, 4}}, // CB=14 M=1 840x2624 rocm.nvnni.decode.fast.kb33 V3TransitionRefine_Tall_840x2624 max-regret=2.4876% max-cv=19.8629%
+            {0x010000b000005800ULL, {2, 4}}, // CB=14 M=1 22528x2816 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=2.5715%
+            {0x010000b8000003a0ULL, {32, 4}}, // CB=14 M=1 928x2944 rocm.nvnni.decode.fast.kb32 V3Transition_Tall_928x2944 max-regret=0.0000% max-cv=1.4956%
+            {0x010000e000000e00ULL, {23, 4}}, // CB=14 M=1 3584x3584 rocm.nvnni.decode.fast.kb23 7B_AttnOut max-regret=0.0000% max-cv=6.1696%
+            {0x010000e000001200ULL, {16, 4}}, // CB=14 M=1 4608x3584 rocm.nvnni.decode.fast.kb16 7B_QKV max-regret=0.0000% max-cv=4.2012%
+            {0x010000e000004a00ULL, {4, 4}}, // CB=14 M=1 18944x3584 rocm.nvnni.decode.fast.kb4 7B_FFN_Up max-regret=0.0000% max-cv=1.2546%
+            {0x010000e000025200ULL, {1, 4}}, // CB=14 M=1 152064x3584 rocm.nvnni.decode.fast.kb1 7B_LM_Head max-regret=0.0000% max-cv=1.3192%
+            {0x010000e000028000ULL, {1, 4}}, // CB=14 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=1.3447%
+            {0x010000fc00001440ULL, {19, 4}}, // CB=14 M=1 5184x4032 rocm.nvnni.decode.fast.kb19 DevNeighbor_7B_QKV max-regret=0.9288% max-cv=2.6146%
+            {0x010000fc00005340ULL, {3, 4}}, // CB=14 M=1 21312x4032 rocm.nvnni.decode.fast.kb3 DevNeighbor_7B_FFN_Up max-regret=0.0000% max-cv=35.2614%
+            {0x0100012000001400ULL, {18, 4}}, // CB=14 M=1 5120x4608 rocm.nvnni.decode.fast.kb18 V4FastSealed_Balanced_5120x4608 max-regret=0.3367% max-cv=3.2329%
+            {0x0100013000000380ULL, {33, 4}}, // CB=14 M=1 896x4864 rocm.nvnni.decode.fast.kb33 0.5B_FFN_Dn max-regret=0.8621% max-cv=44.0272%
+            {0x0100014000000400ULL, {32, 4}}, // CB=14 M=1 1024x5120 rocm.nvnni.decode.fast.kb32 Qwen36_GDN_TimeProjection max-regret=0.0000% max-cv=4.1641%
+            {0x0100014000001400ULL, {18, 4}}, // CB=14 M=1 5120x5120 rocm.nvnni.decode.fast.kb18 32B_AttnOut max-regret=0.0000% max-cv=2.3635%
+            {0x0100014000001800ULL, {18, 4}}, // CB=14 M=1 6144x5120 rocm.nvnni.decode.fast.kb18 Qwen36_GDN_ZProjection max-regret=0.0000% max-cv=16.1849%
+            {0x0100014000001c00ULL, {16, 4}}, // CB=14 M=1 7168x5120 rocm.nvnni.decode.fast.kb16 32B_QKV max-regret=0.0000% max-cv=1.3776%
+            {0x0100014000002800ULL, {5, 4}}, // CB=14 M=1 10240x5120 rocm.nvnni.decode.fast.kb5 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=2.7220%
+            {0x0100014000003000ULL, {5, 4}}, // CB=14 M=1 12288x5120 rocm.nvnni.decode.fast.kb5 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=2.2335%
+            {0x0100014000003600ULL, {5, 4}}, // CB=14 M=1 13824x5120 rocm.nvnni.decode.fast.kb5 14B_FFN_Up max-regret=0.0000% max-cv=1.6459%
+            {0x0100014000004400ULL, {4, 4}}, // CB=14 M=1 17408x5120 rocm.nvnni.decode.fast.kb4 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=2.3375%
+            {0x0100014000006c00ULL, {2, 4}}, // CB=14 M=1 27648x5120 rocm.nvnni.decode.fast.kb2 32B_FFN_Up max-regret=0.0000% max-cv=1.2268%
+            {0x0100014000025200ULL, {1, 4}}, // CB=14 M=1 152064x5120 rocm.nvnni.decode.fast.kb1 32B_LM_Head max-regret=0.0000% max-cv=1.6976%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=14 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=0.8533%
+            {0x0100016000000600ULL, {36, 4}}, // CB=14 M=1 1536x5632 rocm.nvnni.decode.fast.kb36 V4FastSealed_Tall_1536x5632 max-regret=0.0000% max-cv=5.8491%
+            {0x010001600000b000ULL, {2, 4}}, // CB=14 M=1 45056x5632 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=1.5145%
+            {0x0100018000001400ULL, {22, 4}}, // CB=14 M=1 5120x6144 rocm.nvnni.decode.fast.kb22 Qwen36_GDN_OutputProjection max-regret=0.0000% max-cv=1.8860%
+            {0x0100022000002600ULL, {8, 4}}, // CB=14 M=1 9728x8704 rocm.nvnni.decode.fast.kb8 V4FastSealed_Balanced_9728x8704 max-regret=0.0000% max-cv=2.1859%
+            {0x0100023000000600ULL, {35, 4}}, // CB=14 M=1 1536x8960 rocm.nvnni.decode.fast.kb35 1.5B_FFN_Dn max-regret=0.0000% max-cv=1.8221%
+            {0x010002b000000800ULL, {43, 4}}, // CB=14 M=1 2048x11008 rocm.nvnni.decode.fast.kb43 3B_FFN_Dn max-regret=0.0000% max-cv=24.9564%
+            {0x0100030000000e80ULL, {30, 4}}, // CB=14 M=1 3712x12288 rocm.nvnni.decode.fast.kb30 V4FastSealed_Tall_3712x12288 max-regret=0.0000% max-cv=23.1490%
+            {0x0100036000001400ULL, {21, 4}}, // CB=14 M=1 5120x13824 rocm.nvnni.decode.fast.kb21 14B_FFN_Dn max-regret=5.9390% max-cv=5.5719%
+            {0x0100044000001400ULL, {24, 4}}, // CB=14 M=1 5120x17408 rocm.nvnni.decode.fast.kb24 Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=5.3218%
+            {0x010004a000000e00ULL, {16, 4}}, // CB=14 M=1 3584x18944 rocm.nvnni.decode.fast.kb16 7B_FFN_Dn max-regret=0.0000% max-cv=31.8351%
+            {0x010004c800001680ULL, {20, 4}}, // CB=14 M=1 5760x19584 rocm.nvnni.decode.fast.kb20 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=2.9155%
+            {0x0100064000001d00ULL, {16, 4}}, // CB=14 M=1 7424x25600 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.0811%
+            {0x010006c000001400ULL, {12, 4}}, // CB=14 M=1 5120x27648 rocm.nvnni.decode.fast.kb12 32B_FFN_Dn max-regret=0.0000% max-cv=4.4550%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 15)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {8, 4}}, // CB=15 M=1 128x256 rocm.nvnni.decode.fast.kb8 Integration_Tall_128x256 max-regret=0.0000% max-cv=14.8278%
+            {0x01000010000000bfULL, {8, 4}}, // CB=15 M=1 191x256 rocm.nvnni.decode.fast.kb8 Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=15.2240%
+            {0x01000010000000c0ULL, {8, 4}}, // CB=15 M=1 192x256 rocm.nvnni.decode.fast.kb8 Integration_Balanced_192x256 max-regret=0.0000% max-cv=10.2899%
+            {0x0100001000000280ULL, {5, 4}}, // CB=15 M=1 640x256 rocm.nvnni.decode.fast.kb5 V3Development_Wide_640x256 max-regret=6.3636% max-cv=15.4635%
+            {0x0100001000001080ULL, {6, 4}}, // CB=15 M=1 4224x256 rocm.nvnni.decode.fast.kb6 FastSealed_VeryWide_4224x256 max-regret=4.2735% max-cv=5.8636%
+            {0x0100001200000090ULL, {9, 4}}, // CB=15 M=1 144x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Tall_128x256 max-regret=6.4516% max-cv=17.3917%
+            {0x01000012000000a0ULL, {9, 4}}, // CB=15 M=1 160x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_160x288 max-regret=0.0000% max-cv=16.5473%
+            {0x01000012000000d7ULL, {9, 4}}, // CB=15 M=1 215x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=7.6883% max-cv=16.1456%
+            {0x01000012000000d8ULL, {5, 4}}, // CB=15 M=1 216x288 rocm.nvnni.decode.fast.kb5 DevNeighbor_Integration_Balanced_192x256 max-regret=4.1096% max-cv=8.4191%
+            {0x0100001200000280ULL, {6, 4}}, // CB=15 M=1 640x288 rocm.nvnni.decode.fast.kb6 V4FastSealed_Wide_640x288 max-regret=4.4643% max-cv=2.4916%
+            {0x0100001200001400ULL, {5, 4}}, // CB=15 M=1 5120x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_VeryWide_5120x288 max-regret=0.5952% max-cv=85.8002%
+            {0x0100001200002400ULL, {1, 4}}, // CB=15 M=1 9216x288 rocm.nvnni.decode.fast.kb1 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=15.0922%
+            {0x0100001400000060ULL, {6, 4}}, // CB=15 M=1 96x320 rocm.nvnni.decode.fast.kb6 V3FastSealed_Tall_96x320 max-regret=6.3063% max-cv=18.4949%
+            {0x0100001400000070ULL, {10, 4}}, // CB=15 M=1 112x320 rocm.nvnni.decode.fast.kb10 V3Development_Tall_112x320 max-regret=0.0000% max-cv=21.7908%
+            {0x0100001400000100ULL, {6, 4}}, // CB=15 M=1 256x320 rocm.nvnni.decode.fast.kb6 V3Development_Balanced_256x320 max-regret=1.7241% max-cv=4.4646%
+            {0x0100001400000110ULL, {5, 4}}, // CB=15 M=1 272x320 rocm.nvnni.decode.fast.kb5 V4FastSealed_Balanced_272x320 max-regret=5.3571% max-cv=6.3768%
+            {0x0100001400000320ULL, {4, 4}}, // CB=15 M=1 800x320 rocm.nvnni.decode.fast.kb4 V3VerifierSealed_Wide_800x320 max-regret=6.1404% max-cv=16.0708%
+            {0x0100001600000120ULL, {11, 4}}, // CB=15 M=1 288x352 rocm.nvnni.decode.fast.kb11 V3VerifierSealed_Balanced_288x352 max-regret=0.0000% max-cv=14.6304%
+            {0x0100001c00000100ULL, {14, 4}}, // CB=15 M=1 256x448 rocm.nvnni.decode.fast.kb14 V3Development_Tall_256x448 max-regret=0.0000% max-cv=14.9026%
+            {0x0100001c00000800ULL, {12, 4}}, // CB=15 M=1 2048x448 rocm.nvnni.decode.fast.kb12 V4FastSealed_Wide_2048x448 max-regret=5.7851% max-cv=5.3647%
+            {0x0100001c00004000ULL, {1, 4}}, // CB=15 M=1 16384x448 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_16384x448 max-regret=0.0000% max-cv=2.8408%
+            {0x0100002000000800ULL, {8, 4}}, // CB=15 M=1 2048x512 rocm.nvnni.decode.fast.kb8 35BMoE_Expert_Down max-regret=0.0000% max-cv=1.9070%
+            {0x01000024000001b0ULL, {18, 4}}, // CB=15 M=1 432x576 rocm.nvnni.decode.fast.kb18 DevNeighbor_Integration_Balanced_384x512 max-regret=0.8197% max-cv=3.5414%
+            {0x0100002c00000260ULL, {11, 4}}, // CB=15 M=1 608x704 rocm.nvnni.decode.fast.kb11 V4FastSealed_Balanced_608x704 max-regret=0.0000% max-cv=3.5246%
+            {0x0100002c00001200ULL, {4, 4}}, // CB=15 M=1 4608x704 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_4608x704 max-regret=3.7269% max-cv=2.4628%
+            {0x01000034000001a0ULL, {10, 4}}, // CB=15 M=1 416x832 rocm.nvnni.decode.fast.kb10 V4FastSealed_Tall_416x832 max-regret=2.3622% max-cv=2.6172%
+            {0x0100003800000380ULL, {14, 4}}, // CB=15 M=1 896x896 rocm.nvnni.decode.fast.kb14 0.5B_AttnOut max-regret=0.0000% max-cv=4.2385%
+            {0x0100003800000480ULL, {11, 4}}, // CB=15 M=1 1152x896 rocm.nvnni.decode.fast.kb11 0.5B_QKV max-regret=0.0000% max-cv=18.4597%
+            {0x0100003800001300ULL, {10, 4}}, // CB=15 M=1 4864x896 rocm.nvnni.decode.fast.kb10 0.5B_FFN_Up max-regret=0.5051% max-cv=12.3262%
+            {0x010000380000a000ULL, {2, 4}}, // CB=15 M=1 40960x896 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_40960x896 max-regret=0.0000% max-cv=25.5603%
+            {0x0100003800025180ULL, {1, 4}}, // CB=15 M=1 151936x896 rocm.nvnni.decode.fast.kb1 0.5B_LM_Head max-regret=0.0000% max-cv=28.2552%
+            {0x0100004000000510ULL, {18, 4}}, // CB=15 M=1 1296x1024 rocm.nvnni.decode.fast.kb18 DevNeighbor_0.5B_QKV max-regret=3.0075% max-cv=6.8497%
+            {0x0100004000001560ULL, {16, 4}}, // CB=15 M=1 5472x1024 rocm.nvnni.decode.fast.kb16 DevNeighbor_0.5B_FFN_Up max-regret=3.2468% max-cv=83.9860%
+            {0x0100005000000320ULL, {16, 4}}, // CB=15 M=1 800x1280 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_800x1280 max-regret=0.7353% max-cv=4.5245%
+            {0x0100005800000500ULL, {15, 4}}, // CB=15 M=1 1280x1408 rocm.nvnni.decode.fast.kb15 V4FastSealed_Balanced_1280x1408 max-regret=1.4389% max-cv=5.3799%
+            {0x0100005800002c00ULL, {4, 4}}, // CB=15 M=1 11264x1408 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_11264x1408 max-regret=0.0000% max-cv=17.9575%
+            {0x0100006000000600ULL, {17, 4}}, // CB=15 M=1 1536x1536 rocm.nvnni.decode.fast.kb17 1.5B_AttnOut max-regret=2.1232% max-cv=5.4222%
+            {0x0100006000000800ULL, {12, 4}}, // CB=15 M=1 2048x1536 rocm.nvnni.decode.fast.kb12 1.5B_QKV max-regret=0.5348% max-cv=15.1833%
+            {0x0100006000002300ULL, {6, 4}}, // CB=15 M=1 8960x1536 rocm.nvnni.decode.fast.kb6 1.5B_FFN_Up max-regret=0.0000% max-cv=17.9669%
+            {0x0100006000025180ULL, {1, 4}}, // CB=15 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.0000% max-cv=8.1273%
+            {0x0100006c00000260ULL, {18, 4}}, // CB=15 M=1 608x1728 rocm.nvnni.decode.fast.kb18 V4TransitionNeighbor_Tall_608x1728 max-regret=0.0000% max-cv=11.5597%
+            {0x0100007000014000ULL, {1, 4}}, // CB=15 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=27.3685%
+            {0x0100007c000002c0ULL, {16, 4}}, // CB=15 M=1 704x1984 rocm.nvnni.decode.fast.kb16 V4TransitionNeighbor_Tall_704x1984 max-regret=0.0000% max-cv=1.2109%
+            {0x0100008000000200ULL, {13, 4}}, // CB=15 M=1 512x2048 rocm.nvnni.decode.fast.kb13 35BMoE_Expert_GateUp max-regret=0.6897% max-cv=3.5369%
+            {0x0100008000000800ULL, {13, 4}}, // CB=15 M=1 2048x2048 rocm.nvnni.decode.fast.kb13 3B_AttnOut max-regret=0.0000% max-cv=5.6583%
+            {0x0100008000000a00ULL, {18, 4}}, // CB=15 M=1 2560x2048 rocm.nvnni.decode.fast.kb18 3B_QKV max-regret=1.9802% max-cv=6.2567%
+            {0x0100008000001000ULL, {13, 4}}, // CB=15 M=1 4096x2048 rocm.nvnni.decode.fast.kb13 Qwen36MoE_GDN_ZProjection max-regret=1.8182% max-cv=4.1376%
+            {0x0100008000002000ULL, {8, 4}}, // CB=15 M=1 8192x2048 rocm.nvnni.decode.fast.kb8 Qwen36MoE_GDN_QKVProjection max-regret=0.0000% max-cv=13.1263%
+            {0x0100008000002b00ULL, {4, 4}}, // CB=15 M=1 11008x2048 rocm.nvnni.decode.fast.kb4 3B_FFN_Up max-regret=0.0000% max-cv=3.0235%
+            {0x0100008000025180ULL, {1, 4}}, // CB=15 M=1 151936x2048 rocm.nvnni.decode.fast.kb1 3B_LM_Head max-regret=0.0000% max-cv=8.6784%
+            {0x010000a000000940ULL, {14, 4}}, // CB=15 M=1 2368x2560 rocm.nvnni.decode.fast.kb14 V4FastSealed_Balanced_2368x2560 max-regret=2.9412% max-cv=2.2180%
+            {0x010000a400000348ULL, {14, 4}}, // CB=15 M=1 840x2624 rocm.nvnni.decode.fast.kb14 V3TransitionRefine_Tall_840x2624 max-regret=1.3028% max-cv=1.0918%
+            {0x010000b000005800ULL, {2, 4}}, // CB=15 M=1 22528x2816 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=27.8335%
+            {0x010000b8000003a0ULL, {17, 4}}, // CB=15 M=1 928x2944 rocm.nvnni.decode.fast.kb17 V3Transition_Tall_928x2944 max-regret=0.5236% max-cv=0.9943%
+            {0x010000e000000e00ULL, {16, 4}}, // CB=15 M=1 3584x3584 rocm.nvnni.decode.fast.kb16 7B_AttnOut max-regret=1.1905% max-cv=2.6228%
+            {0x010000e000001200ULL, {19, 4}}, // CB=15 M=1 4608x3584 rocm.nvnni.decode.fast.kb19 7B_QKV max-regret=1.4760% max-cv=18.7156%
+            {0x010000e000004a00ULL, {4, 4}}, // CB=15 M=1 18944x3584 rocm.nvnni.decode.fast.kb4 7B_FFN_Up max-regret=0.0000% max-cv=33.3321%
+            {0x010000e000025200ULL, {1, 4}}, // CB=15 M=1 152064x3584 rocm.nvnni.decode.fast.kb1 7B_LM_Head max-regret=0.0000% max-cv=2.5842%
+            {0x010000e000028000ULL, {1, 4}}, // CB=15 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=1.9989%
+            {0x010000fc00001440ULL, {16, 4}}, // CB=15 M=1 5184x4032 rocm.nvnni.decode.fast.kb16 DevNeighbor_7B_QKV max-regret=0.0000% max-cv=16.2343%
+            {0x010000fc00005340ULL, {3, 4}}, // CB=15 M=1 21312x4032 rocm.nvnni.decode.fast.kb3 DevNeighbor_7B_FFN_Up max-regret=0.0000% max-cv=28.4159%
+            {0x0100012000001400ULL, {18, 4}}, // CB=15 M=1 5120x4608 rocm.nvnni.decode.fast.kb18 V4FastSealed_Balanced_5120x4608 max-regret=0.0000% max-cv=17.1445%
+            {0x0100013000000380ULL, {17, 4}}, // CB=15 M=1 896x4864 rocm.nvnni.decode.fast.kb17 0.5B_FFN_Dn max-regret=1.1299% max-cv=5.8499%
+            {0x0100014000000400ULL, {27, 4}}, // CB=15 M=1 1024x5120 rocm.nvnni.decode.fast.kb27 Qwen36_GDN_TimeProjection max-regret=0.5263% max-cv=13.0047%
+            {0x0100014000001400ULL, {18, 4}}, // CB=15 M=1 5120x5120 rocm.nvnni.decode.fast.kb18 32B_AttnOut max-regret=0.0000% max-cv=3.3139%
+            {0x0100014000001800ULL, {16, 4}}, // CB=15 M=1 6144x5120 rocm.nvnni.decode.fast.kb16 Qwen36_GDN_ZProjection max-regret=0.0000% max-cv=2.4227%
+            {0x0100014000001c00ULL, {16, 4}}, // CB=15 M=1 7168x5120 rocm.nvnni.decode.fast.kb16 32B_QKV max-regret=0.0000% max-cv=17.9590%
+            {0x0100014000002800ULL, {5, 4}}, // CB=15 M=1 10240x5120 rocm.nvnni.decode.fast.kb5 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=3.2697%
+            {0x0100014000003000ULL, {5, 4}}, // CB=15 M=1 12288x5120 rocm.nvnni.decode.fast.kb5 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=1.1593%
+            {0x0100014000003600ULL, {5, 4}}, // CB=15 M=1 13824x5120 rocm.nvnni.decode.fast.kb5 14B_FFN_Up max-regret=0.0000% max-cv=3.1844%
+            {0x0100014000004400ULL, {4, 4}}, // CB=15 M=1 17408x5120 rocm.nvnni.decode.fast.kb4 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=24.1140%
+            {0x0100014000006c00ULL, {2, 4}}, // CB=15 M=1 27648x5120 rocm.nvnni.decode.fast.kb2 32B_FFN_Up max-regret=0.0000% max-cv=29.5626%
+            {0x0100014000025200ULL, {1, 4}}, // CB=15 M=1 152064x5120 rocm.nvnni.decode.fast.kb1 32B_LM_Head max-regret=0.0000% max-cv=1.0943%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=15 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=0.5568%
+            {0x0100016000000600ULL, {30, 4}}, // CB=15 M=1 1536x5632 rocm.nvnni.decode.fast.kb30 V4FastSealed_Tall_1536x5632 max-regret=1.2097% max-cv=3.4039%
+            {0x010001600000b000ULL, {2, 4}}, // CB=15 M=1 45056x5632 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=9.2080%
+            {0x0100018000001400ULL, {18, 4}}, // CB=15 M=1 5120x6144 rocm.nvnni.decode.fast.kb18 Qwen36_GDN_OutputProjection max-regret=0.0000% max-cv=2.0205%
+            {0x0100022000002600ULL, {8, 4}}, // CB=15 M=1 9728x8704 rocm.nvnni.decode.fast.kb8 V4FastSealed_Balanced_9728x8704 max-regret=0.0000% max-cv=2.9357%
+            {0x0100023000000600ULL, {35, 4}}, // CB=15 M=1 1536x8960 rocm.nvnni.decode.fast.kb35 1.5B_FFN_Dn max-regret=0.0000% max-cv=14.6252%
+            {0x010002b000000800ULL, {43, 4}}, // CB=15 M=1 2048x11008 rocm.nvnni.decode.fast.kb43 3B_FFN_Dn max-regret=0.0000% max-cv=2.4043%
+            {0x0100030000000e80ULL, {32, 4}}, // CB=15 M=1 3712x12288 rocm.nvnni.decode.fast.kb32 V4FastSealed_Tall_3712x12288 max-regret=0.0000% max-cv=0.5174%
+            {0x0100036000001400ULL, {24, 4}}, // CB=15 M=1 5120x13824 rocm.nvnni.decode.fast.kb24 14B_FFN_Dn max-regret=0.1792% max-cv=14.9114%
+            {0x0100044000001400ULL, {16, 4}}, // CB=15 M=1 5120x17408 rocm.nvnni.decode.fast.kb16 Qwen36_FFN_DownProjection max-regret=1.3223% max-cv=4.9788%
+            {0x010004a000000e00ULL, {16, 4}}, // CB=15 M=1 3584x18944 rocm.nvnni.decode.fast.kb16 7B_FFN_Dn max-regret=0.0000% max-cv=31.6462%
+            {0x010004c800001680ULL, {19, 4}}, // CB=15 M=1 5760x19584 rocm.nvnni.decode.fast.kb19 DevNeighbor_Qwen36_FFN_DownProjection max-regret=1.9787% max-cv=5.9479%
+            {0x0100064000001d00ULL, {16, 4}}, // CB=15 M=1 7424x25600 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.1054%
+            {0x010006c000001400ULL, {12, 4}}, // CB=15 M=1 5120x27648 rocm.nvnni.decode.fast.kb12 32B_FFN_Dn max-regret=0.0000% max-cv=29.0722%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 16)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {4, 4}}, // CB=16 M=1 128x256 rocm.nvnni.decode.fast.kb4 Integration_Tall_128x256 max-regret=0.8850% max-cv=5.7227%
+            {0x01000010000000bfULL, {4, 4}}, // CB=16 M=1 191x256 rocm.nvnni.decode.fast.kb4 Generic_Tall_BoundaryBelow max-regret=0.8641% max-cv=5.8643%
+            {0x01000010000000c0ULL, {4, 4}}, // CB=16 M=1 192x256 rocm.nvnni.decode.fast.kb4 Integration_Balanced_192x256 max-regret=1.7699% max-cv=18.9905%
+            {0x0100001000000280ULL, {4, 4}}, // CB=16 M=1 640x256 rocm.nvnni.decode.fast.kb4 V3Development_Wide_640x256 max-regret=0.0000% max-cv=10.0756%
+            {0x0100001000001080ULL, {4, 4}}, // CB=16 M=1 4224x256 rocm.nvnni.decode.fast.kb4 FastSealed_VeryWide_4224x256 max-regret=0.0000% max-cv=2.9332%
+            {0x0100001200000090ULL, {9, 4}}, // CB=16 M=1 144x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Tall_128x256 max-regret=12.0690% max-cv=21.8388%
+            {0x01000012000000a0ULL, {9, 4}}, // CB=16 M=1 160x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_160x288 max-regret=0.0000% max-cv=14.8210%
+            {0x01000012000000d7ULL, {5, 4}}, // CB=16 M=1 215x288 rocm.nvnni.decode.fast.kb5 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=4.2240%
+            {0x01000012000000d8ULL, {9, 4}}, // CB=16 M=1 216x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Balanced_192x256 max-regret=0.0000% max-cv=21.1279%
+            {0x0100001200000280ULL, {9, 4}}, // CB=16 M=1 640x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Wide_640x288 max-regret=0.0000% max-cv=7.2515%
+            {0x0100001200001400ULL, {5, 4}}, // CB=16 M=1 5120x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_VeryWide_5120x288 max-regret=0.0000% max-cv=6.4516%
+            {0x0100001200002400ULL, {1, 4}}, // CB=16 M=1 9216x288 rocm.nvnni.decode.fast.kb1 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=4.4982%
+            {0x0100001400000060ULL, {10, 4}}, // CB=16 M=1 96x320 rocm.nvnni.decode.fast.kb10 V3FastSealed_Tall_96x320 max-regret=0.0000% max-cv=3.8977%
+            {0x0100001400000070ULL, {6, 4}}, // CB=16 M=1 112x320 rocm.nvnni.decode.fast.kb6 V3Development_Tall_112x320 max-regret=0.6667% max-cv=5.3405%
+            {0x0100001400000100ULL, {10, 4}}, // CB=16 M=1 256x320 rocm.nvnni.decode.fast.kb10 V3Development_Balanced_256x320 max-regret=0.0000% max-cv=6.0481%
+            {0x0100001400000110ULL, {5, 4}}, // CB=16 M=1 272x320 rocm.nvnni.decode.fast.kb5 V4FastSealed_Balanced_272x320 max-regret=0.0054% max-cv=15.4052%
+            {0x0100001400000320ULL, {5, 4}}, // CB=16 M=1 800x320 rocm.nvnni.decode.fast.kb5 V3VerifierSealed_Wide_800x320 max-regret=0.0000% max-cv=5.5073%
+            {0x0100001600000120ULL, {4, 4}}, // CB=16 M=1 288x352 rocm.nvnni.decode.fast.kb4 V3VerifierSealed_Balanced_288x352 max-regret=2.6490% max-cv=79.2483%
+            {0x0100001c00000100ULL, {7, 4}}, // CB=16 M=1 256x448 rocm.nvnni.decode.fast.kb7 V3Development_Tall_256x448 max-regret=0.0000% max-cv=4.8627%
+            {0x0100001c00000800ULL, {14, 4}}, // CB=16 M=1 2048x448 rocm.nvnni.decode.fast.kb14 V4FastSealed_Wide_2048x448 max-regret=5.6000% max-cv=5.5600%
+            {0x0100001c00004000ULL, {1, 4}}, // CB=16 M=1 16384x448 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_16384x448 max-regret=0.0000% max-cv=6.1374%
+            {0x0100002000000800ULL, {6, 4}}, // CB=16 M=1 2048x512 rocm.nvnni.decode.fast.kb6 35BMoE_Expert_Down max-regret=1.2346% max-cv=2.2898%
+            {0x01000024000001b0ULL, {6, 4}}, // CB=16 M=1 432x576 rocm.nvnni.decode.fast.kb6 DevNeighbor_Integration_Balanced_384x512 max-regret=0.0000% max-cv=4.4113%
+            {0x0100002c00000260ULL, {13, 4}}, // CB=16 M=1 608x704 rocm.nvnni.decode.fast.kb13 V4FastSealed_Balanced_608x704 max-regret=2.3810% max-cv=12.4491%
+            {0x0100002c00001200ULL, {6, 4}}, // CB=16 M=1 4608x704 rocm.nvnni.decode.fast.kb6 V4FastSealed_Wide_4608x704 max-regret=0.0000% max-cv=5.4461%
+            {0x01000034000001a0ULL, {13, 4}}, // CB=16 M=1 416x832 rocm.nvnni.decode.fast.kb13 V4FastSealed_Tall_416x832 max-regret=0.0000% max-cv=4.0884%
+            {0x0100003800000380ULL, {14, 4}}, // CB=16 M=1 896x896 rocm.nvnni.decode.fast.kb14 0.5B_AttnOut max-regret=0.0000% max-cv=5.9727%
+            {0x0100003800000480ULL, {10, 4}}, // CB=16 M=1 1152x896 rocm.nvnni.decode.fast.kb10 0.5B_QKV max-regret=0.7407% max-cv=4.4826%
+            {0x0100003800001300ULL, {7, 4}}, // CB=16 M=1 4864x896 rocm.nvnni.decode.fast.kb7 0.5B_FFN_Up max-regret=0.4926% max-cv=15.0679%
+            {0x010000380000a000ULL, {2, 4}}, // CB=16 M=1 40960x896 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_40960x896 max-regret=0.0000% max-cv=34.6425%
+            {0x0100003800025180ULL, {1, 4}}, // CB=16 M=1 151936x896 rocm.nvnni.decode.fast.kb1 0.5B_LM_Head max-regret=0.0000% max-cv=22.9539%
+            {0x0100004000000510ULL, {16, 4}}, // CB=16 M=1 1296x1024 rocm.nvnni.decode.fast.kb16 DevNeighbor_0.5B_QKV max-regret=0.0000% max-cv=5.8196%
+            {0x0100004000001560ULL, {8, 4}}, // CB=16 M=1 5472x1024 rocm.nvnni.decode.fast.kb8 DevNeighbor_0.5B_FFN_Up max-regret=0.0000% max-cv=4.9700%
+            {0x0100005000000320ULL, {16, 4}}, // CB=16 M=1 800x1280 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_800x1280 max-regret=0.7188% max-cv=4.6266%
+            {0x0100005800000500ULL, {10, 4}}, // CB=16 M=1 1280x1408 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_1280x1408 max-regret=3.4483% max-cv=4.6154%
+            {0x0100005800002c00ULL, {4, 4}}, // CB=16 M=1 11264x1408 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_11264x1408 max-regret=0.0000% max-cv=3.3695%
+            {0x0100006000000600ULL, {17, 4}}, // CB=16 M=1 1536x1536 rocm.nvnni.decode.fast.kb17 1.5B_AttnOut max-regret=0.6579% max-cv=12.6702%
+            {0x0100006000000800ULL, {12, 4}}, // CB=16 M=1 2048x1536 rocm.nvnni.decode.fast.kb12 1.5B_QKV max-regret=0.5263% max-cv=3.2178%
+            {0x0100006000002300ULL, {6, 4}}, // CB=16 M=1 8960x1536 rocm.nvnni.decode.fast.kb6 1.5B_FFN_Up max-regret=0.0000% max-cv=23.3025%
+            {0x0100006000025180ULL, {1, 4}}, // CB=16 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.0000% max-cv=7.0668%
+            {0x0100006c00000260ULL, {18, 4}}, // CB=16 M=1 608x1728 rocm.nvnni.decode.fast.kb18 V4TransitionNeighbor_Tall_608x1728 max-regret=0.0000% max-cv=16.4651%
+            {0x0100007000014000ULL, {1, 4}}, // CB=16 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=33.0993%
+            {0x0100007c000002c0ULL, {22, 4}}, // CB=16 M=1 704x1984 rocm.nvnni.decode.fast.kb22 V4TransitionNeighbor_Tall_704x1984 max-regret=2.0092% max-cv=2.1771%
+            {0x0100008000000200ULL, {16, 4}}, // CB=16 M=1 512x2048 rocm.nvnni.decode.fast.kb16 35BMoE_Expert_GateUp max-regret=0.0000% max-cv=16.4008%
+            {0x0100008000000800ULL, {13, 4}}, // CB=16 M=1 2048x2048 rocm.nvnni.decode.fast.kb13 3B_AttnOut max-regret=0.0000% max-cv=5.0645%
+            {0x0100008000000a00ULL, {16, 4}}, // CB=16 M=1 2560x2048 rocm.nvnni.decode.fast.kb16 3B_QKV max-regret=0.0000% max-cv=4.6229%
+            {0x0100008000001000ULL, {11, 4}}, // CB=16 M=1 4096x2048 rocm.nvnni.decode.fast.kb11 Qwen36MoE_GDN_ZProjection max-regret=0.0000% max-cv=20.3107%
+            {0x0100008000002000ULL, {8, 4}}, // CB=16 M=1 8192x2048 rocm.nvnni.decode.fast.kb8 Qwen36MoE_GDN_QKVProjection max-regret=0.0000% max-cv=11.2370%
+            {0x0100008000002b00ULL, {4, 4}}, // CB=16 M=1 11008x2048 rocm.nvnni.decode.fast.kb4 3B_FFN_Up max-regret=0.0000% max-cv=4.9739%
+            {0x0100008000025180ULL, {1, 4}}, // CB=16 M=1 151936x2048 rocm.nvnni.decode.fast.kb1 3B_LM_Head max-regret=0.0000% max-cv=6.6180%
+            {0x010000a000000940ULL, {16, 4}}, // CB=16 M=1 2368x2560 rocm.nvnni.decode.fast.kb16 V4FastSealed_Balanced_2368x2560 max-regret=0.5376% max-cv=57.9119%
+            {0x010000a400000348ULL, {17, 4}}, // CB=16 M=1 840x2624 rocm.nvnni.decode.fast.kb17 V3TransitionRefine_Tall_840x2624 max-regret=0.0000% max-cv=3.4025%
+            {0x010000b000005800ULL, {2, 4}}, // CB=16 M=1 22528x2816 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=32.3823%
+            {0x010000b8000003a0ULL, {24, 4}}, // CB=16 M=1 928x2944 rocm.nvnni.decode.fast.kb24 V3Transition_Tall_928x2944 max-regret=0.5051% max-cv=2.5931%
+            {0x010000e000000e00ULL, {12, 4}}, // CB=16 M=1 3584x3584 rocm.nvnni.decode.fast.kb12 7B_AttnOut max-regret=0.0000% max-cv=22.6849%
+            {0x010000e000001200ULL, {9, 4}}, // CB=16 M=1 4608x3584 rocm.nvnni.decode.fast.kb9 7B_QKV max-regret=0.0000% max-cv=22.9828%
+            {0x010000e000004a00ULL, {4, 4}}, // CB=16 M=1 18944x3584 rocm.nvnni.decode.fast.kb4 7B_FFN_Up max-regret=0.0000% max-cv=2.3344%
+            {0x010000e000025200ULL, {1, 4}}, // CB=16 M=1 152064x3584 rocm.nvnni.decode.fast.kb1 7B_LM_Head max-regret=0.0000% max-cv=0.6847%
+            {0x010000e000028000ULL, {1, 4}}, // CB=16 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=1.7729%
+            {0x010000fc00001440ULL, {8, 4}}, // CB=16 M=1 5184x4032 rocm.nvnni.decode.fast.kb8 DevNeighbor_7B_QKV max-regret=0.3248% max-cv=14.9636%
+            {0x010000fc00005340ULL, {3, 4}}, // CB=16 M=1 21312x4032 rocm.nvnni.decode.fast.kb3 DevNeighbor_7B_FFN_Up max-regret=0.0000% max-cv=31.4687%
+            {0x0100012000001400ULL, {9, 4}}, // CB=16 M=1 5120x4608 rocm.nvnni.decode.fast.kb9 V4FastSealed_Balanced_5120x4608 max-regret=0.0000% max-cv=21.4079%
+            {0x0100013000000380ULL, {26, 4}}, // CB=16 M=1 896x4864 rocm.nvnni.decode.fast.kb26 0.5B_FFN_Dn max-regret=0.0000% max-cv=3.3843%
+            {0x0100014000000400ULL, {23, 4}}, // CB=16 M=1 1024x5120 rocm.nvnni.decode.fast.kb23 Qwen36_GDN_TimeProjection max-regret=0.0000% max-cv=15.4135%
+            {0x0100014000001400ULL, {9, 4}}, // CB=16 M=1 5120x5120 rocm.nvnni.decode.fast.kb9 32B_AttnOut max-regret=0.0000% max-cv=26.0091%
+            {0x0100014000001800ULL, {10, 4}}, // CB=16 M=1 6144x5120 rocm.nvnni.decode.fast.kb10 Qwen36_GDN_ZProjection max-regret=0.7634% max-cv=1.5666%
+            {0x0100014000001c00ULL, {8, 4}}, // CB=16 M=1 7168x5120 rocm.nvnni.decode.fast.kb8 32B_QKV max-regret=0.0000% max-cv=1.4203%
+            {0x0100014000002800ULL, {5, 4}}, // CB=16 M=1 10240x5120 rocm.nvnni.decode.fast.kb5 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=2.7205%
+            {0x0100014000003000ULL, {5, 4}}, // CB=16 M=1 12288x5120 rocm.nvnni.decode.fast.kb5 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=29.1291%
+            {0x0100014000003600ULL, {5, 4}}, // CB=16 M=1 13824x5120 rocm.nvnni.decode.fast.kb5 14B_FFN_Up max-regret=0.0000% max-cv=3.9538%
+            {0x0100014000004400ULL, {4, 4}}, // CB=16 M=1 17408x5120 rocm.nvnni.decode.fast.kb4 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=2.3482%
+            {0x0100014000006c00ULL, {2, 4}}, // CB=16 M=1 27648x5120 rocm.nvnni.decode.fast.kb2 32B_FFN_Up max-regret=0.0000% max-cv=34.7882%
+            {0x0100014000025200ULL, {1, 4}}, // CB=16 M=1 152064x5120 rocm.nvnni.decode.fast.kb1 32B_LM_Head max-regret=0.0000% max-cv=2.4750%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=16 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=2.3318%
+            {0x0100016000000600ULL, {26, 4}}, // CB=16 M=1 1536x5632 rocm.nvnni.decode.fast.kb26 V4FastSealed_Tall_1536x5632 max-regret=0.0000% max-cv=5.3308%
+            {0x010001600000b000ULL, {2, 4}}, // CB=16 M=1 45056x5632 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=1.6570%
+            {0x0100018000001400ULL, {9, 4}}, // CB=16 M=1 5120x6144 rocm.nvnni.decode.fast.kb9 Qwen36_GDN_OutputProjection max-regret=0.0000% max-cv=3.7837%
+            {0x0100022000002600ULL, {8, 4}}, // CB=16 M=1 9728x8704 rocm.nvnni.decode.fast.kb8 V4FastSealed_Balanced_9728x8704 max-regret=0.0000% max-cv=1.9592%
+            {0x0100023000000600ULL, {35, 4}}, // CB=16 M=1 1536x8960 rocm.nvnni.decode.fast.kb35 1.5B_FFN_Dn max-regret=0.0000% max-cv=20.7529%
+            {0x010002b000000800ULL, {43, 4}}, // CB=16 M=1 2048x11008 rocm.nvnni.decode.fast.kb43 3B_FFN_Dn max-regret=0.0000% max-cv=23.6006%
+            {0x0100030000000e80ULL, {12, 4}}, // CB=16 M=1 3712x12288 rocm.nvnni.decode.fast.kb12 V4FastSealed_Tall_3712x12288 max-regret=0.1927% max-cv=3.7661%
+            {0x0100036000001400ULL, {9, 4}}, // CB=16 M=1 5120x13824 rocm.nvnni.decode.fast.kb9 14B_FFN_Dn max-regret=0.0000% max-cv=24.9694%
+            {0x0100044000001400ULL, {8, 4}}, // CB=16 M=1 5120x17408 rocm.nvnni.decode.fast.kb8 Qwen36_FFN_DownProjection max-regret=2.9621% max-cv=3.7341%
+            {0x010004a000000e00ULL, {16, 4}}, // CB=16 M=1 3584x18944 rocm.nvnni.decode.fast.kb16 7B_FFN_Dn max-regret=0.0000% max-cv=2.1782%
+            {0x010004c800001680ULL, {8, 4}}, // CB=16 M=1 5760x19584 rocm.nvnni.decode.fast.kb8 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=2.4263%
+            {0x0100064000001d00ULL, {15, 4}}, // CB=16 M=1 7424x25600 rocm.nvnni.decode.fast.kb15 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.3390%
+            {0x010006c000001400ULL, {12, 4}}, // CB=16 M=1 5120x27648 rocm.nvnni.decode.fast.kb12 32B_FFN_Dn max-regret=0.0000% max-cv=29.1340%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 17)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {8, 4}}, // CB=17 M=1 128x256 rocm.nvnni.decode.fast.kb8 Integration_Tall_128x256 max-regret=0.0000% max-cv=5.6066%
+            {0x01000010000000bfULL, {8, 4}}, // CB=17 M=1 191x256 rocm.nvnni.decode.fast.kb8 Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=2.4253%
+            {0x01000010000000c0ULL, {8, 4}}, // CB=17 M=1 192x256 rocm.nvnni.decode.fast.kb8 Integration_Balanced_192x256 max-regret=0.0000% max-cv=24.1581%
+            {0x0100001000000280ULL, {8, 4}}, // CB=17 M=1 640x256 rocm.nvnni.decode.fast.kb8 V3Development_Wide_640x256 max-regret=0.0000% max-cv=26.0909%
+            {0x0100001000001080ULL, {5, 4}}, // CB=17 M=1 4224x256 rocm.nvnni.decode.fast.kb5 FastSealed_VeryWide_4224x256 max-regret=2.9070% max-cv=7.2547%
+            {0x0100001200000090ULL, {9, 4}}, // CB=17 M=1 144x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Tall_128x256 max-regret=0.0000% max-cv=24.0245%
+            {0x01000012000000a0ULL, {9, 4}}, // CB=17 M=1 160x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_160x288 max-regret=0.0000% max-cv=7.5202%
+            {0x01000012000000d7ULL, {9, 4}}, // CB=17 M=1 215x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=0.0000% max-cv=7.3960%
+            {0x01000012000000d8ULL, {5, 4}}, // CB=17 M=1 216x288 rocm.nvnni.decode.fast.kb5 DevNeighbor_Integration_Balanced_192x256 max-regret=4.0650% max-cv=1.9975%
+            {0x0100001200000280ULL, {7, 4}}, // CB=17 M=1 640x288 rocm.nvnni.decode.fast.kb7 V4FastSealed_Wide_640x288 max-regret=5.7377% max-cv=6.3192%
+            {0x0100001200001400ULL, {9, 4}}, // CB=17 M=1 5120x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_VeryWide_5120x288 max-regret=1.1364% max-cv=2.9957%
+            {0x0100001200002400ULL, {1, 4}}, // CB=17 M=1 9216x288 rocm.nvnni.decode.fast.kb1 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=8.8979%
+            {0x0100001400000060ULL, {10, 4}}, // CB=17 M=1 96x320 rocm.nvnni.decode.fast.kb10 V3FastSealed_Tall_96x320 max-regret=0.0000% max-cv=10.3362%
+            {0x0100001400000070ULL, {10, 4}}, // CB=17 M=1 112x320 rocm.nvnni.decode.fast.kb10 V3Development_Tall_112x320 max-regret=0.0000% max-cv=17.9488%
+            {0x0100001400000100ULL, {7, 4}}, // CB=17 M=1 256x320 rocm.nvnni.decode.fast.kb7 V3Development_Balanced_256x320 max-regret=6.6116% max-cv=20.4094%
+            {0x0100001400000110ULL, {10, 4}}, // CB=17 M=1 272x320 rocm.nvnni.decode.fast.kb10 V4FastSealed_Balanced_272x320 max-regret=0.0000% max-cv=10.0526%
+            {0x0100001400000320ULL, {10, 4}}, // CB=17 M=1 800x320 rocm.nvnni.decode.fast.kb10 V3VerifierSealed_Wide_800x320 max-regret=0.0000% max-cv=18.4062%
+            {0x0100001600000120ULL, {6, 4}}, // CB=17 M=1 288x352 rocm.nvnni.decode.fast.kb6 V3VerifierSealed_Balanced_288x352 max-regret=4.0984% max-cv=3.8732%
+            {0x0100001c00000100ULL, {7, 4}}, // CB=17 M=1 256x448 rocm.nvnni.decode.fast.kb7 V3Development_Tall_256x448 max-regret=1.5873% max-cv=6.4482%
+            {0x0100001c00000800ULL, {8, 4}}, // CB=17 M=1 2048x448 rocm.nvnni.decode.fast.kb8 V4FastSealed_Wide_2048x448 max-regret=0.7519% max-cv=75.9017%
+            {0x0100001c00004000ULL, {1, 4}}, // CB=17 M=1 16384x448 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_16384x448 max-regret=0.0000% max-cv=5.7326%
+            {0x0100002000000800ULL, {16, 4}}, // CB=17 M=1 2048x512 rocm.nvnni.decode.fast.kb16 35BMoE_Expert_Down max-regret=0.0000% max-cv=2.7967%
+            {0x01000024000001b0ULL, {11, 4}}, // CB=17 M=1 432x576 rocm.nvnni.decode.fast.kb11 DevNeighbor_Integration_Balanced_384x512 max-regret=1.5151% max-cv=36.0214%
+            {0x0100002c00000260ULL, {12, 4}}, // CB=17 M=1 608x704 rocm.nvnni.decode.fast.kb12 V4FastSealed_Balanced_608x704 max-regret=0.0000% max-cv=3.8862%
+            {0x0100002c00001200ULL, {11, 4}}, // CB=17 M=1 4608x704 rocm.nvnni.decode.fast.kb11 V4FastSealed_Wide_4608x704 max-regret=0.0000% max-cv=4.1592%
+            {0x01000034000001a0ULL, {16, 4}}, // CB=17 M=1 416x832 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_416x832 max-regret=1.4599% max-cv=3.1023%
+            {0x0100003800000380ULL, {14, 4}}, // CB=17 M=1 896x896 rocm.nvnni.decode.fast.kb14 0.5B_AttnOut max-regret=0.0000% max-cv=11.5026%
+            {0x0100003800000480ULL, {17, 4}}, // CB=17 M=1 1152x896 rocm.nvnni.decode.fast.kb17 0.5B_QKV max-regret=1.3793% max-cv=2.7200%
+            {0x0100003800001300ULL, {10, 4}}, // CB=17 M=1 4864x896 rocm.nvnni.decode.fast.kb10 0.5B_FFN_Up max-regret=0.0000% max-cv=2.9743%
+            {0x010000380000a000ULL, {2, 4}}, // CB=17 M=1 40960x896 rocm.nvnni.decode.fast.kb2 V4FastSealed_VeryWide_40960x896 max-regret=0.0000% max-cv=27.5038%
+            {0x0100003800025180ULL, {1, 4}}, // CB=17 M=1 151936x896 rocm.nvnni.decode.fast.kb1 0.5B_LM_Head max-regret=0.0000% max-cv=26.4855%
+            {0x0100004000000510ULL, {17, 4}}, // CB=17 M=1 1296x1024 rocm.nvnni.decode.fast.kb17 DevNeighbor_0.5B_QKV max-regret=0.6897% max-cv=11.1511%
+            {0x0100004000001560ULL, {11, 4}}, // CB=17 M=1 5472x1024 rocm.nvnni.decode.fast.kb11 DevNeighbor_0.5B_FFN_Up max-regret=0.0000% max-cv=2.9468%
+            {0x0100005000000320ULL, {20, 4}}, // CB=17 M=1 800x1280 rocm.nvnni.decode.fast.kb20 V4FastSealed_Tall_800x1280 max-regret=0.0000% max-cv=9.7032%
+            {0x0100005800000500ULL, {24, 4}}, // CB=17 M=1 1280x1408 rocm.nvnni.decode.fast.kb24 V4FastSealed_Balanced_1280x1408 max-regret=1.9481% max-cv=4.5971%
+            {0x0100005800002c00ULL, {4, 4}}, // CB=17 M=1 11264x1408 rocm.nvnni.decode.fast.kb4 V4FastSealed_Wide_11264x1408 max-regret=0.0000% max-cv=19.6045%
+            {0x0100006000000600ULL, {16, 4}}, // CB=17 M=1 1536x1536 rocm.nvnni.decode.fast.kb16 1.5B_AttnOut max-regret=0.0000% max-cv=3.2826%
+            {0x0100006000000800ULL, {16, 4}}, // CB=17 M=1 2048x1536 rocm.nvnni.decode.fast.kb16 1.5B_QKV max-regret=0.0000% max-cv=3.4467%
+            {0x0100006000002300ULL, {6, 4}}, // CB=17 M=1 8960x1536 rocm.nvnni.decode.fast.kb6 1.5B_FFN_Up max-regret=0.0000% max-cv=3.1909%
+            {0x0100006000025180ULL, {1, 4}}, // CB=17 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.0000% max-cv=5.6799%
+            {0x0100006c00000260ULL, {18, 4}}, // CB=17 M=1 608x1728 rocm.nvnni.decode.fast.kb18 V4TransitionNeighbor_Tall_608x1728 max-regret=0.0000% max-cv=7.6395%
+            {0x0100007000014000ULL, {1, 4}}, // CB=17 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=3.7524%
+            {0x0100007c000002c0ULL, {21, 4}}, // CB=17 M=1 704x1984 rocm.nvnni.decode.fast.kb21 V4TransitionNeighbor_Tall_704x1984 max-regret=0.0000% max-cv=6.6914%
+            {0x0100008000000200ULL, {32, 4}}, // CB=17 M=1 512x2048 rocm.nvnni.decode.fast.kb32 35BMoE_Expert_GateUp max-regret=0.0000% max-cv=5.3196%
+            {0x0100008000000800ULL, {25, 4}}, // CB=17 M=1 2048x2048 rocm.nvnni.decode.fast.kb25 3B_AttnOut max-regret=0.9091% max-cv=4.2297%
+            {0x0100008000000a00ULL, {16, 4}}, // CB=17 M=1 2560x2048 rocm.nvnni.decode.fast.kb16 3B_QKV max-regret=0.0000% max-cv=5.6125%
+            {0x0100008000001000ULL, {13, 4}}, // CB=17 M=1 4096x2048 rocm.nvnni.decode.fast.kb13 Qwen36MoE_GDN_ZProjection max-regret=0.4049% max-cv=2.6411%
+            {0x0100008000002000ULL, {8, 4}}, // CB=17 M=1 8192x2048 rocm.nvnni.decode.fast.kb8 Qwen36MoE_GDN_QKVProjection max-regret=0.0000% max-cv=14.3277%
+            {0x0100008000002b00ULL, {4, 4}}, // CB=17 M=1 11008x2048 rocm.nvnni.decode.fast.kb4 3B_FFN_Up max-regret=0.0000% max-cv=35.7476%
+            {0x0100008000025180ULL, {1, 4}}, // CB=17 M=1 151936x2048 rocm.nvnni.decode.fast.kb1 3B_LM_Head max-regret=0.0000% max-cv=1.4285%
+            {0x010000a000000940ULL, {27, 4}}, // CB=17 M=1 2368x2560 rocm.nvnni.decode.fast.kb27 V4FastSealed_Balanced_2368x2560 max-regret=0.0000% max-cv=2.3293%
+            {0x010000a400000348ULL, {28, 4}}, // CB=17 M=1 840x2624 rocm.nvnni.decode.fast.kb28 V3TransitionRefine_Tall_840x2624 max-regret=0.0000% max-cv=4.6983%
+            {0x010000b000005800ULL, {2, 4}}, // CB=17 M=1 22528x2816 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=25.3581%
+            {0x010000b8000003a0ULL, {33, 4}}, // CB=17 M=1 928x2944 rocm.nvnni.decode.fast.kb33 V3Transition_Tall_928x2944 max-regret=1.8605% max-cv=3.5494%
+            {0x010000e000000e00ULL, {23, 4}}, // CB=17 M=1 3584x3584 rocm.nvnni.decode.fast.kb23 7B_AttnOut max-regret=2.0000% max-cv=35.6927%
+            {0x010000e000001200ULL, {14, 4}}, // CB=17 M=1 4608x3584 rocm.nvnni.decode.fast.kb14 7B_QKV max-regret=0.7220% max-cv=7.2288%
+            {0x010000e000004a00ULL, {4, 4}}, // CB=17 M=1 18944x3584 rocm.nvnni.decode.fast.kb4 7B_FFN_Up max-regret=0.0000% max-cv=1.8256%
+            {0x010000e000025200ULL, {1, 4}}, // CB=17 M=1 152064x3584 rocm.nvnni.decode.fast.kb1 7B_LM_Head max-regret=0.0000% max-cv=3.4518%
+            {0x010000e000028000ULL, {1, 4}}, // CB=17 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=2.5119%
+            {0x010000fc00001440ULL, {16, 4}}, // CB=17 M=1 5184x4032 rocm.nvnni.decode.fast.kb16 DevNeighbor_7B_QKV max-regret=0.3300% max-cv=24.1667%
+            {0x010000fc00005340ULL, {3, 4}}, // CB=17 M=1 21312x4032 rocm.nvnni.decode.fast.kb3 DevNeighbor_7B_FFN_Up max-regret=0.0000% max-cv=32.2811%
+            {0x0100012000001400ULL, {12, 4}}, // CB=17 M=1 5120x4608 rocm.nvnni.decode.fast.kb12 V4FastSealed_Balanced_5120x4608 max-regret=0.0000% max-cv=24.5280%
+            {0x0100013000000380ULL, {39, 4}}, // CB=17 M=1 896x4864 rocm.nvnni.decode.fast.kb39 0.5B_FFN_Dn max-regret=0.4831% max-cv=2.1856%
+            {0x0100014000000400ULL, {33, 4}}, // CB=17 M=1 1024x5120 rocm.nvnni.decode.fast.kb33 Qwen36_GDN_TimeProjection max-regret=0.9375% max-cv=3.7798%
+            {0x0100014000001400ULL, {15, 4}}, // CB=17 M=1 5120x5120 rocm.nvnni.decode.fast.kb15 32B_AttnOut max-regret=0.0000% max-cv=7.4610%
+            {0x0100014000001800ULL, {11, 4}}, // CB=17 M=1 6144x5120 rocm.nvnni.decode.fast.kb11 Qwen36_GDN_ZProjection max-regret=0.0000% max-cv=1.7846%
+            {0x0100014000001c00ULL, {10, 4}}, // CB=17 M=1 7168x5120 rocm.nvnni.decode.fast.kb10 32B_QKV max-regret=0.0000% max-cv=3.0083%
+            {0x0100014000002800ULL, {5, 4}}, // CB=17 M=1 10240x5120 rocm.nvnni.decode.fast.kb5 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=2.7876%
+            {0x0100014000003000ULL, {5, 4}}, // CB=17 M=1 12288x5120 rocm.nvnni.decode.fast.kb5 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=1.1009%
+            {0x0100014000003600ULL, {5, 4}}, // CB=17 M=1 13824x5120 rocm.nvnni.decode.fast.kb5 14B_FFN_Up max-regret=0.0000% max-cv=2.3576%
+            {0x0100014000004400ULL, {4, 4}}, // CB=17 M=1 17408x5120 rocm.nvnni.decode.fast.kb4 Qwen36_FFN_GateUp max-regret=0.0000% max-cv=1.3260%
+            {0x0100014000006c00ULL, {2, 4}}, // CB=17 M=1 27648x5120 rocm.nvnni.decode.fast.kb2 32B_FFN_Up max-regret=0.0000% max-cv=2.2288%
+            {0x0100014000025200ULL, {1, 4}}, // CB=17 M=1 152064x5120 rocm.nvnni.decode.fast.kb1 32B_LM_Head max-regret=0.0000% max-cv=3.7525%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=17 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=2.4609%
+            {0x0100016000000600ULL, {36, 4}}, // CB=17 M=1 1536x5632 rocm.nvnni.decode.fast.kb36 V4FastSealed_Tall_1536x5632 max-regret=0.0000% max-cv=2.7275%
+            {0x010001600000b000ULL, {2, 4}}, // CB=17 M=1 45056x5632 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=1.5173%
+            {0x0100018000001400ULL, {14, 4}}, // CB=17 M=1 5120x6144 rocm.nvnni.decode.fast.kb14 Qwen36_GDN_OutputProjection max-regret=0.0000% max-cv=0.9240%
+            {0x0100022000002600ULL, {8, 4}}, // CB=17 M=1 9728x8704 rocm.nvnni.decode.fast.kb8 V4FastSealed_Balanced_9728x8704 max-regret=0.0000% max-cv=17.9804%
+            {0x0100023000000600ULL, {35, 4}}, // CB=17 M=1 1536x8960 rocm.nvnni.decode.fast.kb35 1.5B_FFN_Dn max-regret=0.0000% max-cv=17.4315%
+            {0x010002b000000800ULL, {43, 4}}, // CB=17 M=1 2048x11008 rocm.nvnni.decode.fast.kb43 3B_FFN_Dn max-regret=0.0000% max-cv=22.9368%
+            {0x0100030000000e80ULL, {16, 4}}, // CB=17 M=1 3712x12288 rocm.nvnni.decode.fast.kb16 V4FastSealed_Tall_3712x12288 max-regret=1.5111% max-cv=4.1806%
+            {0x0100036000001400ULL, {18, 4}}, // CB=17 M=1 5120x13824 rocm.nvnni.decode.fast.kb18 14B_FFN_Dn max-regret=0.0000% max-cv=4.4088%
+            {0x0100044000001400ULL, {15, 4}}, // CB=17 M=1 5120x17408 rocm.nvnni.decode.fast.kb15 Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=2.2091%
+            {0x010004a000000e00ULL, {16, 4}}, // CB=17 M=1 3584x18944 rocm.nvnni.decode.fast.kb16 7B_FFN_Dn max-regret=0.0000% max-cv=27.0208%
+            {0x010004c800001680ULL, {14, 4}}, // CB=17 M=1 5760x19584 rocm.nvnni.decode.fast.kb14 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=1.0079%
+            {0x0100064000001d00ULL, {15, 4}}, // CB=17 M=1 7424x25600 rocm.nvnni.decode.fast.kb15 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.0429%
+            {0x010006c000001400ULL, {12, 4}}, // CB=17 M=1 5120x27648 rocm.nvnni.decode.fast.kb12 32B_FFN_Dn max-regret=0.0000% max-cv=2.9301%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    if (codebook_id == 19)
+    {
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kCommonExactOverlay[] = {
+            {0x0100001000000080ULL, {8, 4}}, // CB=19 M=1 128x256 rocm.nvnni.decode.fast.kb8 Integration_Tall_128x256 max-regret=3.7383% max-cv=28.2042%
+            {0x01000010000000bfULL, {5, 4}}, // CB=19 M=1 191x256 rocm.nvnni.decode.fast.kb5 Generic_Tall_BoundaryBelow max-regret=3.8095% max-cv=21.3207%
+            {0x01000010000000c0ULL, {8, 4}}, // CB=19 M=1 192x256 rocm.nvnni.decode.fast.kb8 Integration_Balanced_192x256 max-regret=2.8302% max-cv=16.4738%
+            {0x0100001000000280ULL, {6, 4}}, // CB=19 M=1 640x256 rocm.nvnni.decode.fast.kb6 V3Development_Wide_640x256 max-regret=2.8571% max-cv=18.1270%
+            {0x0100001000001080ULL, {1, 4}}, // CB=19 M=1 4224x256 rocm.nvnni.decode.fast.kb1 FastSealed_VeryWide_4224x256 max-regret=0.0000% max-cv=27.2022%
+            {0x0100001200000090ULL, {1, 4}}, // CB=19 M=1 144x288 rocm.nvnni.decode.fast.kb1 DevNeighbor_Integration_Tall_128x256 max-regret=4.9645% max-cv=16.3119%
+            {0x01000012000000a0ULL, {8, 4}}, // CB=19 M=1 160x288 rocm.nvnni.decode.fast.kb8 V4FastSealed_Tall_160x288 max-regret=4.6729% max-cv=19.5223%
+            {0x01000012000000d7ULL, {9, 4}}, // CB=19 M=1 215x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Generic_Tall_BoundaryBelow max-regret=1.8692% max-cv=16.4112%
+            {0x01000012000000d8ULL, {9, 4}}, // CB=19 M=1 216x288 rocm.nvnni.decode.fast.kb9 DevNeighbor_Integration_Balanced_192x256 max-regret=13.3803% max-cv=18.7624%
+            {0x0100001200000280ULL, {5, 4}}, // CB=19 M=1 640x288 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_640x288 max-regret=14.8148% max-cv=51.5755%
+            {0x0100001200001400ULL, {9, 4}}, // CB=19 M=1 5120x288 rocm.nvnni.decode.fast.kb9 V4FastSealed_VeryWide_5120x288 max-regret=14.2857% max-cv=9.0434%
+            {0x0100001200002400ULL, {1, 4}}, // CB=19 M=1 9216x288 rocm.nvnni.decode.fast.kb1 DevNeighbor_Generic_VeryWide_Small max-regret=0.0000% max-cv=6.4942%
+            {0x0100001400000060ULL, {10, 4}}, // CB=19 M=1 96x320 rocm.nvnni.decode.fast.kb10 V3FastSealed_Tall_96x320 max-regret=3.7383% max-cv=41.7077%
+            {0x0100001400000070ULL, {4, 4}}, // CB=19 M=1 112x320 rocm.nvnni.decode.fast.kb4 V3Development_Tall_112x320 max-regret=0.9259% max-cv=16.4626%
+            {0x0100001400000100ULL, {6, 4}}, // CB=19 M=1 256x320 rocm.nvnni.decode.fast.kb6 V3Development_Balanced_256x320 max-regret=0.9346% max-cv=18.0921%
+            {0x0100001400000110ULL, {4, 4}}, // CB=19 M=1 272x320 rocm.nvnni.decode.fast.kb4 V4FastSealed_Balanced_272x320 max-regret=1.8692% max-cv=17.1432%
+            {0x0100001400000320ULL, {5, 4}}, // CB=19 M=1 800x320 rocm.nvnni.decode.fast.kb5 V3VerifierSealed_Wide_800x320 max-regret=11.8182% max-cv=49.4904%
+            {0x0100001600000120ULL, {9, 4}}, // CB=19 M=1 288x352 rocm.nvnni.decode.fast.kb9 V3VerifierSealed_Balanced_288x352 max-regret=3.7037% max-cv=11.9318%
+            {0x0100001c00000100ULL, {7, 4}}, // CB=19 M=1 256x448 rocm.nvnni.decode.fast.kb7 V3Development_Tall_256x448 max-regret=0.0000% max-cv=26.0583%
+            {0x0100001c00000800ULL, {5, 4}}, // CB=19 M=1 2048x448 rocm.nvnni.decode.fast.kb5 V4FastSealed_Wide_2048x448 max-regret=0.6667% max-cv=27.3027%
+            {0x0100001c00004000ULL, {1, 4}}, // CB=19 M=1 16384x448 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_16384x448 max-regret=0.0000% max-cv=7.0915%
+            {0x0100002000000800ULL, {6, 4}}, // CB=19 M=1 2048x512 rocm.nvnni.decode.fast.kb6 35BMoE_Expert_Down max-regret=2.5210% max-cv=24.9200%
+            {0x01000024000001b0ULL, {10, 4}}, // CB=19 M=1 432x576 rocm.nvnni.decode.fast.kb10 DevNeighbor_Integration_Balanced_384x512 max-regret=2.7027% max-cv=77.3705%
+            {0x0100002c00000260ULL, {8, 4}}, // CB=19 M=1 608x704 rocm.nvnni.decode.fast.kb8 V4FastSealed_Balanced_608x704 max-regret=0.8621% max-cv=10.8500%
+            {0x0100002c00001200ULL, {2, 4}}, // CB=19 M=1 4608x704 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_4608x704 max-regret=2.8985% max-cv=16.3823%
+            {0x01000034000001a0ULL, {17, 4}}, // CB=19 M=1 416x832 rocm.nvnni.decode.fast.kb17 V4FastSealed_Tall_416x832 max-regret=6.0345% max-cv=16.4225%
+            {0x0100003800000380ULL, {6, 4}}, // CB=19 M=1 896x896 rocm.nvnni.decode.fast.kb6 0.5B_AttnOut max-regret=2.5000% max-cv=18.5495%
+            {0x0100003800000480ULL, {7, 4}}, // CB=19 M=1 1152x896 rocm.nvnni.decode.fast.kb7 0.5B_QKV max-regret=0.0000% max-cv=13.6870%
+            {0x0100003800001300ULL, {2, 4}}, // CB=19 M=1 4864x896 rocm.nvnni.decode.fast.kb2 0.5B_FFN_Up max-regret=5.4054% max-cv=9.3005%
+            {0x010000380000a000ULL, {1, 4}}, // CB=19 M=1 40960x896 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_40960x896 max-regret=6.9879% max-cv=48.6170%
+            {0x0100003800025180ULL, {1, 4}}, // CB=19 M=1 151936x896 rocm.nvnni.decode.fast.kb1 0.5B_LM_Head max-regret=0.0000% max-cv=4.4018%
+            {0x0100004000000510ULL, {7, 4}}, // CB=19 M=1 1296x1024 rocm.nvnni.decode.fast.kb7 DevNeighbor_0.5B_QKV max-regret=2.3810% max-cv=23.4839%
+            {0x0100004000001560ULL, {6, 4}}, // CB=19 M=1 5472x1024 rocm.nvnni.decode.fast.kb6 DevNeighbor_0.5B_FFN_Up max-regret=3.2680% max-cv=25.9776%
+            {0x0100005000000320ULL, {10, 4}}, // CB=19 M=1 800x1280 rocm.nvnni.decode.fast.kb10 V4FastSealed_Tall_800x1280 max-regret=20.7547% max-cv=18.5086%
+            {0x0100005800000500ULL, {5, 4}}, // CB=19 M=1 1280x1408 rocm.nvnni.decode.fast.kb5 V4FastSealed_Balanced_1280x1408 max-regret=2.4540% max-cv=58.4904%
+            {0x0100005800002c00ULL, {2, 4}}, // CB=19 M=1 11264x1408 rocm.nvnni.decode.fast.kb2 V4FastSealed_Wide_11264x1408 max-regret=0.0000% max-cv=4.6245%
+            {0x0100006000000600ULL, {12, 4}}, // CB=19 M=1 1536x1536 rocm.nvnni.decode.fast.kb12 1.5B_AttnOut max-regret=2.9412% max-cv=28.6215%
+            {0x0100006000000800ULL, {6, 4}}, // CB=19 M=1 2048x1536 rocm.nvnni.decode.fast.kb6 1.5B_QKV max-regret=1.1561% max-cv=20.2209%
+            {0x0100006000002300ULL, {3, 4}}, // CB=19 M=1 8960x1536 rocm.nvnni.decode.fast.kb3 1.5B_FFN_Up max-regret=0.0000% max-cv=6.8997%
+            {0x0100006000025180ULL, {1, 4}}, // CB=19 M=1 151936x1536 rocm.nvnni.decode.fast.kb1 1.5B_LM_Head max-regret=0.0000% max-cv=1.8770%
+            {0x0100006c00000260ULL, {12, 4}}, // CB=19 M=1 608x1728 rocm.nvnni.decode.fast.kb12 V4TransitionNeighbor_Tall_608x1728 max-regret=1.5625% max-cv=22.8249%
+            {0x0100007000014000ULL, {1, 4}}, // CB=19 M=1 81920x1792 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_81920x1792 max-regret=0.0000% max-cv=1.1770%
+            {0x0100007c000002c0ULL, {20, 4}}, // CB=19 M=1 704x1984 rocm.nvnni.decode.fast.kb20 V4TransitionNeighbor_Tall_704x1984 max-regret=6.0606% max-cv=3.9040%
+            {0x0100008000000200ULL, {28, 4}}, // CB=19 M=1 512x2048 rocm.nvnni.decode.fast.kb28 35BMoE_Expert_GateUp max-regret=11.4504% max-cv=17.7996%
+            {0x0100008000000800ULL, {6, 4}}, // CB=19 M=1 2048x2048 rocm.nvnni.decode.fast.kb6 3B_AttnOut max-regret=3.3784% max-cv=53.8783%
+            {0x0100008000000a00ULL, {8, 4}}, // CB=19 M=1 2560x2048 rocm.nvnni.decode.fast.kb8 3B_QKV max-regret=6.0109% max-cv=29.1769%
+            {0x0100008000001000ULL, {4, 4}}, // CB=19 M=1 4096x2048 rocm.nvnni.decode.fast.kb4 Qwen36MoE_GDN_ZProjection max-regret=2.9762% max-cv=5.8192%
+            {0x0100008000002000ULL, {3, 4}}, // CB=19 M=1 8192x2048 rocm.nvnni.decode.fast.kb3 Qwen36MoE_GDN_QKVProjection max-regret=0.0000% max-cv=37.0789%
+            {0x0100008000002b00ULL, {2, 4}}, // CB=19 M=1 11008x2048 rocm.nvnni.decode.fast.kb2 3B_FFN_Up max-regret=0.0000% max-cv=4.6041%
+            {0x0100008000025180ULL, {1, 4}}, // CB=19 M=1 151936x2048 rocm.nvnni.decode.fast.kb1 3B_LM_Head max-regret=0.0000% max-cv=0.7412%
+            {0x010000a000000940ULL, {12, 4}}, // CB=19 M=1 2368x2560 rocm.nvnni.decode.fast.kb12 V4FastSealed_Balanced_2368x2560 max-regret=5.0633% max-cv=34.9775%
+            {0x010000a400000348ULL, {11, 4}}, // CB=19 M=1 840x2624 rocm.nvnni.decode.fast.kb11 V3TransitionRefine_Tall_840x2624 max-regret=2.2989% max-cv=18.7069%
+            {0x010000b000005800ULL, {1, 4}}, // CB=19 M=1 22528x2816 rocm.nvnni.decode.fast.kb1 V4FastSealed_Wide_22528x2816 max-regret=0.0000% max-cv=11.1131%
+            {0x010000b8000003a0ULL, {17, 4}}, // CB=19 M=1 928x2944 rocm.nvnni.decode.fast.kb17 V3Transition_Tall_928x2944 max-regret=2.7211% max-cv=21.1463%
+            {0x010000e000000e00ULL, {4, 4}}, // CB=19 M=1 3584x3584 rocm.nvnni.decode.fast.kb4 7B_AttnOut max-regret=1.9048% max-cv=39.2659%
+            {0x010000e000001200ULL, {4, 4}}, // CB=19 M=1 4608x3584 rocm.nvnni.decode.fast.kb4 7B_QKV max-regret=0.4167% max-cv=39.7270%
+            {0x010000e000004a00ULL, {1, 4}}, // CB=19 M=1 18944x3584 rocm.nvnni.decode.fast.kb1 7B_FFN_Up max-regret=0.0000% max-cv=11.6339%
+            {0x010000e000025200ULL, {1, 4}}, // CB=19 M=1 152064x3584 rocm.nvnni.decode.fast.kb1 7B_LM_Head max-regret=0.0000% max-cv=0.5182%
+            {0x010000e000028000ULL, {1, 4}}, // CB=19 M=1 163840x3584 rocm.nvnni.decode.fast.kb1 V4FastSealed_VeryWide_163840x3584 max-regret=0.0000% max-cv=0.2274%
+            {0x010000fc00001440ULL, {4, 4}}, // CB=19 M=1 5184x4032 rocm.nvnni.decode.fast.kb4 DevNeighbor_7B_QKV max-regret=0.0000% max-cv=5.9580%
+            {0x010000fc00005340ULL, {1, 4}}, // CB=19 M=1 21312x4032 rocm.nvnni.decode.fast.kb1 DevNeighbor_7B_FFN_Up max-regret=0.0000% max-cv=43.6723%
+            {0x0100012000001400ULL, {4, 4}}, // CB=19 M=1 5120x4608 rocm.nvnni.decode.fast.kb4 V4FastSealed_Balanced_5120x4608 max-regret=0.2940% max-cv=37.4582%
+            {0x0100013000000380ULL, {16, 4}}, // CB=19 M=1 896x4864 rocm.nvnni.decode.fast.kb16 0.5B_FFN_Dn max-regret=4.7619% max-cv=26.5134%
+            {0x0100014000000400ULL, {16, 4}}, // CB=19 M=1 1024x5120 rocm.nvnni.decode.fast.kb16 Qwen36_GDN_TimeProjection max-regret=8.2051% max-cv=23.0521%
+            {0x0100014000001400ULL, {4, 4}}, // CB=19 M=1 5120x5120 rocm.nvnni.decode.fast.kb4 32B_AttnOut max-regret=0.3125% max-cv=36.6927%
+            {0x0100014000001800ULL, {4, 4}}, // CB=19 M=1 6144x5120 rocm.nvnni.decode.fast.kb4 Qwen36_GDN_ZProjection max-regret=0.0000% max-cv=47.7641%
+            {0x0100014000001c00ULL, {4, 4}}, // CB=19 M=1 7168x5120 rocm.nvnni.decode.fast.kb4 32B_QKV max-regret=0.0000% max-cv=4.3558%
+            {0x0100014000002800ULL, {3, 4}}, // CB=19 M=1 10240x5120 rocm.nvnni.decode.fast.kb3 Qwen36_GDN_InnerProjection max-regret=0.0000% max-cv=12.6449%
+            {0x0100014000003000ULL, {2, 4}}, // CB=19 M=1 12288x5120 rocm.nvnni.decode.fast.kb2 Qwen36_Attn_QKVProjection max-regret=0.0000% max-cv=11.3109%
+            {0x0100014000003600ULL, {2, 4}}, // CB=19 M=1 13824x5120 rocm.nvnni.decode.fast.kb2 14B_FFN_Up max-regret=0.0000% max-cv=2.7124%
+            {0x0100014000004400ULL, {1, 4}}, // CB=19 M=1 17408x5120 rocm.nvnni.decode.fast.kb1 Qwen36_FFN_GateUp max-regret=0.1170% max-cv=10.4439%
+            {0x0100014000006c00ULL, {1, 4}}, // CB=19 M=1 27648x5120 rocm.nvnni.decode.fast.kb1 32B_FFN_Up max-regret=0.0000% max-cv=9.5001%
+            {0x0100014000025200ULL, {1, 4}}, // CB=19 M=1 152064x5120 rocm.nvnni.decode.fast.kb1 32B_LM_Head max-regret=0.0000% max-cv=0.3027%
+            {0x010001400003ca00ULL, {1, 4}}, // CB=19 M=1 248320x5120 rocm.nvnni.decode.fast.kb1 Qwen36_LM_Head max-regret=0.0000% max-cv=0.2552%
+            {0x0100016000000600ULL, {9, 4}}, // CB=19 M=1 1536x5632 rocm.nvnni.decode.fast.kb9 V4FastSealed_Tall_1536x5632 max-regret=1.6251% max-cv=28.8864%
+            {0x010001600000b000ULL, {1, 4}}, // CB=19 M=1 45056x5632 rocm.nvnni.decode.fast.kb1 V4FastSealed_Wide_45056x5632 max-regret=0.0000% max-cv=0.9946%
+            {0x0100018000001400ULL, {5, 4}}, // CB=19 M=1 5120x6144 rocm.nvnni.decode.fast.kb5 Qwen36_GDN_OutputProjection max-regret=0.2764% max-cv=49.7985%
+            {0x0100022000002600ULL, {3, 4}}, // CB=19 M=1 9728x8704 rocm.nvnni.decode.fast.kb3 V4FastSealed_Balanced_9728x8704 max-regret=0.0000% max-cv=2.5860%
+            {0x0100023000000600ULL, {10, 4}}, // CB=19 M=1 1536x8960 rocm.nvnni.decode.fast.kb10 1.5B_FFN_Dn max-regret=1.1364% max-cv=38.6826%
+            {0x010002b000000800ULL, {8, 4}}, // CB=19 M=1 2048x11008 rocm.nvnni.decode.fast.kb8 3B_FFN_Dn max-regret=0.0000% max-cv=38.5149%
+            {0x0100030000000e80ULL, {5, 4}}, // CB=19 M=1 3712x12288 rocm.nvnni.decode.fast.kb5 V4FastSealed_Tall_3712x12288 max-regret=0.1942% max-cv=2.9955%
+            {0x0100036000001400ULL, {4, 4}}, // CB=19 M=1 5120x13824 rocm.nvnni.decode.fast.kb4 14B_FFN_Dn max-regret=1.1142% max-cv=2.3203%
+            {0x0100044000001400ULL, {5, 4}}, // CB=19 M=1 5120x17408 rocm.nvnni.decode.fast.kb5 Qwen36_FFN_DownProjection max-regret=0.4796% max-cv=2.5533%
+            {0x010004a000000e00ULL, {5, 4}}, // CB=19 M=1 3584x18944 rocm.nvnni.decode.fast.kb5 7B_FFN_Dn max-regret=0.4298% max-cv=2.6521%
+            {0x010004c800001680ULL, {4, 4}}, // CB=19 M=1 5760x19584 rocm.nvnni.decode.fast.kb4 DevNeighbor_Qwen36_FFN_DownProjection max-regret=0.0000% max-cv=1.5465%
+            {0x0100064000001d00ULL, {3, 4}}, // CB=19 M=1 7424x25600 rocm.nvnni.decode.fast.kb3 V4FastSealed_Tall_7424x25600 max-regret=0.0000% max-cv=1.3018%
+            {0x010006c000001400ULL, {4, 4}}, // CB=19 M=1 5120x27648 rocm.nvnni.decode.fast.kb4 32B_FFN_Dn max-regret=0.0793% max-cv=2.0484%
+        };
+        if (findROCmNativeVNNIDecodeDispatchEntry(
+                kCommonExactOverlay, key, out))
+            return true;
+    }
+    // END COMMON ROCM NATIVEVNNI DECODE EXACT OVERLAY
     // BEGIN ROCM_NATIVE_VNNI_KNOWN_SHAPE_OVERLAY
     if (codebook_id == 5 && key == 0x0100008000000200ULL) { out = ROCmNativeVNNIDecodeDispatchConfig{16, 8}; return true; } // CB=5 (Q4_1) M=1 512x2048 KB16/TW8 35BMoE_Expert_GateUp 21.440us
     if (codebook_id == 5 && key == 0x0100002000000800ULL) { out = ROCmNativeVNNIDecodeDispatchConfig{8, 4}; return true; } // CB=5 (Q4_1) M=1 2048x512 KB8/TW4 35BMoE_Expert_Down 18.720us
@@ -2534,7 +4056,110 @@ inline bool selectROCmNativeVNNIDecodeGenerated(
         if (findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out))
             return true;
     }
-    return selectROCmNativeVNNIDecodeAspectFallback(codebook_id, m, n, k, out);
+    // BEGIN COMMON ROCM NATIVEVNNI DECODE GENERIC SUPPLEMENT
+    if (selectROCmNativeVNNIDecodeAspectFallback(
+            codebook_id, m, n, k, out))
+        return true;
+    if (m == 1 && n > 0 && k > 0 && (k % 32) == 0)
+    {
+        const long long supplement_work_items =
+            static_cast<long long>(n) * static_cast<long long>(k);
+        if (codebook_id == 19)
+        {
+            if (n >= 16LL * k)
+            {
+                static constexpr ROCmNativeVNNIDecodeAspectRule kRules[] = {
+                    {1081344LL, {1, 4}},
+                    {1474560LL, {9, 4}},
+                    {1271398400LL, {1, 4}},
+                };
+                out = pickROCmNativeVNNIDecodeAspectRule(
+                    kRules, supplement_work_items);
+                return true;
+            }
+            else if (n >= 2LL * k)
+            {
+                static constexpr ROCmNativeVNNIDecodeAspectRule kRules[] = {
+                    {163840LL, {6, 4}},
+                    {917504LL, {5, 4}},
+                    {1048576LL, {6, 4}},
+                    {4358144LL, {2, 4}},
+                    {5603328LL, {6, 4}},
+                    {8388608LL, {4, 4}},
+                    {13762560LL, {3, 4}},
+                    {15859712LL, {2, 4}},
+                    {16777216LL, {3, 4}},
+                    {22544384LL, {2, 4}},
+                    {52428800LL, {3, 4}},
+                    {62914560LL, {2, 4}},
+                    {67895296LL, {1, 4}},
+                    {70778880LL, {2, 4}},
+                    {253755392LL, {1, 4}},
+                };
+                out = pickROCmNativeVNNIDecodeAspectRule(
+                    kRules, supplement_work_items);
+                return true;
+            }
+            else if (4LL * n >= 3LL * k)
+            {
+                static constexpr ROCmNativeVNNIDecodeAspectRule kRules[] = {
+                    {49152LL, {8, 4}},
+                    {62208LL, {9, 4}},
+                    {81920LL, {6, 4}},
+                    {87040LL, {4, 4}},
+                    {101376LL, {9, 4}},
+                    {248832LL, {10, 4}},
+                    {428032LL, {8, 4}},
+                    {802816LL, {6, 4}},
+                    {1327104LL, {7, 4}},
+                    {1802240LL, {5, 4}},
+                    {2359296LL, {12, 4}},
+                    {4194304LL, {6, 4}},
+                    {5242880LL, {8, 4}},
+                    {6062080LL, {12, 4}},
+                    {36700160LL, {4, 4}},
+                    {84672512LL, {3, 4}},
+                };
+                out = pickROCmNativeVNNIDecodeAspectRule(
+                    kRules, supplement_work_items);
+                return true;
+            }
+            else if (true)
+            {
+                static constexpr ROCmNativeVNNIDecodeAspectRule kRules[] = {
+                    {30720LL, {10, 4}},
+                    {32768LL, {8, 4}},
+                    {35840LL, {4, 4}},
+                    {41472LL, {1, 4}},
+                    {46080LL, {8, 4}},
+                    {48896LL, {5, 4}},
+                    {61920LL, {9, 4}},
+                    {114688LL, {7, 4}},
+                    {346112LL, {17, 4}},
+                    {1024000LL, {10, 4}},
+                    {1048576LL, {28, 4}},
+                    {1050624LL, {12, 4}},
+                    {1396736LL, {20, 4}},
+                    {2204160LL, {11, 4}},
+                    {2732032LL, {17, 4}},
+                    {5242880LL, {16, 4}},
+                    {8650752LL, {9, 4}},
+                    {13762560LL, {10, 4}},
+                    {22544384LL, {8, 4}},
+                    {67895296LL, {5, 4}},
+                    {70778880LL, {4, 4}},
+                    {89128960LL, {5, 4}},
+                    {141557760LL, {4, 4}},
+                    {190054400LL, {3, 4}},
+                };
+                out = pickROCmNativeVNNIDecodeAspectRule(
+                    kRules, supplement_work_items);
+                return true;
+            }
+        }
+    }
+    // END COMMON ROCM NATIVEVNNI DECODE GENERIC SUPPLEMENT
+    return false;
 }
 
 } // namespace llaminar2::rocm::generated

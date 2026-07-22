@@ -10,6 +10,7 @@ production runtime cannot distinguish.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 from collections import OrderedDict
@@ -138,3 +139,23 @@ def infer_format_from_filename(path) -> str | None:
         if candidate.lower().replace("_", "") in name:
             return candidate
     return None
+
+
+def main() -> int:
+    """Expose the canonical all-format inventory to shell transactions."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--labels",
+        action="store_true",
+        help="Print the ordered comma-separated production format inventory",
+    )
+    args = parser.parse_args()
+    if not args.labels:
+        parser.error("use --labels")
+    print(",".join(spec.label for spec in FORMAT_SPECS))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

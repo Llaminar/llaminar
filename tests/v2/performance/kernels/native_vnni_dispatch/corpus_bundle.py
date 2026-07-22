@@ -31,6 +31,12 @@ MANIFEST_NAME = "corpus.manifest.json"
 LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1\n"
 SUPPORTED_BACKENDS = frozenset(("cpu", "cpu-prefill", "cuda", "rocm"))
 _IGNORED_DIRECTORY_NAMES = frozenset(("fit-cache", "policy_fit_cache"))
+_IDENTITY_NEUTRAL_REFRESH_FLAGS = frozenset(("--resume-cpu-partials",))
+_IDENTITY_NEUTRAL_REFRESH_OPTIONS = frozenset((
+    "--cpu-batch-limit",
+    "--cpu-minimum-promotion-samples",
+    "--cpu-minimum-promotion-warmups",
+))
 _PRODUCTION_REQUIRED_PAYLOADS: dict[str, tuple[str, ...]] = {
     "cuda": (
         "CUDANativeVNNIGemvDispatchHeuristicGenerated.inc",
@@ -65,6 +71,17 @@ _PRODUCTION_REQUIRED_PAYLOADS: dict[str, tuple[str, ...]] = {
         "rocm_decode_policy.json",
     ),
     "cpu": (
+        "CPUNativeVNNIDecodePolicyGenerated.inc",
+        "cpu_decode_m1.development.csv",
+        "cpu_decode_m1.development.timing.csv",
+        "cpu_decode_m1.sealed.csv",
+        "cpu_decode_m1.sealed.timing.csv",
+        "cpu_decode_m1_common_observations.csv",
+        "cpu_decode_profiler_requests.json",
+        "cpu_decode_profiler_evidence.json",
+        "cpu_decode_final_profiler_requests.json",
+        "cpu_decode_final_profiler_evidence.json",
+        "cpu_decode_m1_policy.json",
         "CPUNativeVNNIVerifierRowsPolicyGenerated.inc",
         "cpu_verifier_rows.development.csv",
         "cpu_verifier_rows.development.timing.csv",
@@ -215,14 +232,83 @@ def _manifest_digest(payload: dict[str, object]) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def canonical_refresh_arguments(
+    refresh_arguments: Sequence[str],
+) -> tuple[str, ...]:
+    """Remove execution controls that cannot change measured evidence.
+
+    A resumable corpus workspace represents the kernel shapes, candidates, and
+    measurement protocol selected by the refresh arguments.  Checkpoint size
+    and permission to reuse already-complete atomic records only control how
+    that same transaction is scheduled.  Keeping those controls in the corpus
+    identity would strand valid work whenever an operator changed checkpoint
+    size or resumed an interrupted run.
+
+    Both conventional ``--option value`` and GNU-style ``--option=value``
+    spellings are accepted because the public turnkey script forwards either
+    form without rewriting it.
+    """
+
+    canonical: list[str] = []
+    index = 0
+    while index < len(refresh_arguments):
+        argument = refresh_arguments[index]
+        if argument in _IDENTITY_NEUTRAL_REFRESH_FLAGS:
+            index += 1
+            continue
+        if argument in _IDENTITY_NEUTRAL_REFRESH_OPTIONS:
+            if index + 1 >= len(refresh_arguments):
+                raise CorpusBundleError(
+                    f"missing value for execution-only refresh option: {argument}"
+                )
+            index += 2
+            continue
+        if any(
+            argument.startswith(option + "=")
+            for option in _IDENTITY_NEUTRAL_REFRESH_OPTIONS
+        ):
+            index += 1
+            continue
+        canonical.append(argument)
+        index += 1
+    return tuple(canonical)
+
+
 def configuration_digest(refresh_arguments: Sequence[str]) -> str:
-    """Return an unambiguous identity for forwarded collection arguments."""
+    """Return an identity for evidence-affecting collection arguments."""
 
     encoded = json.dumps(
-        list(refresh_arguments),
+        list(canonical_refresh_arguments(refresh_arguments)),
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("ascii")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def inventory_generation_digest(
+    inventory_sources: Sequence[Path],
+    repository_root: Path,
+) -> str:
+    """Hash the resolved shapes and backend-specific measurement sources.
+
+    The historical two-file inventory ID is the resolved shape-manifest
+    digest.  Turnkey backends may add declarative measurement-plan sources;
+    those bytes must select a new resumable workspace without invalidating
+    unrelated backend corpora.
+    """
+
+    sources = tuple(sorted(
+        (_source_record(path, repository_root) for path in inventory_sources),
+        key=lambda record: record["path"],
+    ))
+    encoded = json.dumps(
+        {
+            "shape_inventory_digest": load_shape_manifest().digest(),
+            "sources": sources,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
@@ -232,6 +318,31 @@ def required_payloads(backend: str, profile: str) -> tuple[str, ...]:
     if profile != "all":
         return ()
     return _PRODUCTION_REQUIRED_PAYLOADS[backend]
+
+
+def missing_required_payloads(
+    directory: Path,
+    *,
+    backend: str,
+    profile: str,
+) -> tuple[str, ...]:
+    """Return production artifacts absent from one resumable workspace.
+
+    This lightweight status check is the handshake between a bounded refresh
+    and the turnkey publisher. It intentionally uses the same payload walker
+    as sealing, so a malformed file, symlink, or unfinished atomic rename is
+    reported as an error instead of being mistaken for a clean checkpoint.
+    """
+
+    if backend not in SUPPORTED_BACKENDS:
+        raise CorpusBundleError(f"unsupported corpus backend: {backend}")
+    if not directory.is_dir():
+        raise CorpusBundleError(f"corpus directory does not exist: {directory}")
+    present = {
+        path.relative_to(directory).as_posix()
+        for path in _iter_payloads(directory)
+    }
+    return tuple(sorted(set(required_payloads(backend, profile)) - present))
 
 
 def _validate_backend_completeness(
@@ -303,6 +414,9 @@ def seal_corpus(
     if not sources:
         raise CorpusBundleError("at least one shape inventory source is required")
     shape_inventory_digest = load_shape_manifest().digest()
+    authenticated_refresh_arguments = canonical_refresh_arguments(
+        refresh_arguments
+    )
     payload: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "backend": backend,
@@ -311,8 +425,10 @@ def seal_corpus(
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "shape_inventory_digest": shape_inventory_digest,
         "shape_inventory_sources": sources,
-        "refresh_arguments": list(refresh_arguments),
-        "configuration_digest": configuration_digest(refresh_arguments),
+        "refresh_arguments": list(authenticated_refresh_arguments),
+        "configuration_digest": configuration_digest(
+            authenticated_refresh_arguments
+        ),
         "files": [entry.to_json() for entry in sorted(files)],
     }
     payload["corpus_id"] = _manifest_digest(payload)
@@ -481,9 +597,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify.add_argument("--repository-root", type=Path, required=True)
     verify.add_argument("--allow-historical-inventory", action="store_true")
 
-    subparsers.add_parser("inventory-id")
+    inventory = subparsers.add_parser("inventory-id")
+    inventory.add_argument("--repository-root", type=Path)
+    inventory.add_argument("--inventory-source", type=Path, action="append")
     configuration = subparsers.add_parser("configuration-id")
     configuration.add_argument("--refresh-argument", action="append", default=[])
+    complete = subparsers.add_parser("collection-complete")
+    complete.add_argument("--directory", type=Path, required=True)
+    complete.add_argument(
+        "--backend",
+        choices=sorted(SUPPORTED_BACKENDS),
+        required=True,
+    )
+    complete.add_argument("--profile", default="all")
+    complete.add_argument("--quiet", action="store_true")
 
     arguments = parser.parse_args(argv)
     if arguments.command == "seal":
@@ -505,9 +632,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(payload["corpus_id"])
     elif arguments.command == "inventory-id":
-        print(load_shape_manifest().digest())
-    else:
+        if arguments.inventory_source:
+            print(inventory_generation_digest(
+                tuple(arguments.inventory_source),
+                arguments.repository_root or Path.cwd(),
+            ))
+        else:
+            # Preserve existing CUDA, ROCm, and CPU-decode corpus paths.
+            print(load_shape_manifest().digest())
+    elif arguments.command == "configuration-id":
         print(configuration_digest(tuple(arguments.refresh_argument)))
+    else:
+        try:
+            missing = missing_required_payloads(
+                arguments.directory,
+                backend=arguments.backend,
+                profile=arguments.profile,
+            )
+        except CorpusBundleError as error:
+            if not arguments.quiet:
+                print(f"corpus collection status error: {error}")
+            return 2
+        if missing:
+            if not arguments.quiet:
+                print("missing production payloads: " + ", ".join(missing))
+            return 1
     return 0
 
 

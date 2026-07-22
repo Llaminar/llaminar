@@ -36,13 +36,16 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -82,6 +85,21 @@ extern "C" bool rocmGemv_native_vnni_query_serial_m1_config(
     int K,
     int *kb,
     int *target_waves_per_cu);
+extern "C" bool rocmGemv_native_vnni_query_generated_config(
+    uint8_t codebook_id,
+    int M,
+    int N,
+    int K,
+    int *kb,
+    int *target_waves_per_cu);
+extern "C" double rocmGemv_native_vnni_measure_generated_config_ns(
+    uint8_t codebook_id,
+    int M,
+    const int *Ns,
+    const int *Ks,
+    int query_count,
+    int iterations,
+    uint64_t *out_checksum);
 #endif
 
 using namespace llaminar2;
@@ -704,6 +722,158 @@ namespace
             sq_sum += (t - mean) * (t - mean);
         stddev = std::sqrt(sq_sum / static_cast<double>(times_us.size()));
     }
+
+#ifdef HAVE_ROCM
+    /**
+     * @test Keep ROCm generated decode dispatch within a few host nanoseconds.
+     *
+     * This host-only test invokes the exact cached policy query used by the
+     * production NativeVNNI launcher. It never initializes HIP. The repeated
+     * key models graph construction or eager launch; graph replay itself does
+     * not call the host selector. Rotating production geometries model graph
+     * bucket capture and mixed-projection eager execution. A loop-only control
+     * carries identical indexing and compiler-fence overhead so the reported
+     * median isolates policy lookup cost.
+     *
+     * Codebook 5 is intentionally used until the regenerated ROCm policy has
+     * certified codebook-19 totality. A generated miss remains a hard miss;
+     * this benchmark must never manufacture a Q8 policy to make itself pass.
+     */
+    TEST(ROCmNativeVNNIPerfOffline, GeneratedDecodeDispatchCacheLatency)
+    {
+        struct Query
+        {
+            int n;
+            int k;
+        };
+
+        constexpr uint8_t codebook_id = 5;
+        constexpr int iterations = 100000;
+        constexpr int samples = 7;
+        constexpr std::array<Query, 1> hot = {{{512, 2048}}};
+        constexpr std::array<Query, 8> working_set = {{
+            {512, 2048},
+            {2048, 512},
+            {2048, 2048},
+            {4096, 2048},
+            {8192, 2048},
+            {1024, 5120},
+            {6144, 5120},
+            {5120, 17408},
+        }};
+
+        for (const Query &query : working_set)
+        {
+            int kb = 0;
+            int target_waves = 0;
+            ASSERT_TRUE(rocmGemv_native_vnni_query_generated_config(
+                codebook_id,
+                1,
+                query.n,
+                query.k,
+                &kb,
+                &target_waves))
+                << "missing ROCm NativeVNNI policy for "
+                << query.n << 'x' << query.k;
+        }
+
+        const auto measure = [&](const auto &queries)
+        {
+            std::array<double, samples> net_ns{};
+            std::array<int, queries.size()> ns{};
+            std::array<int, queries.size()> ks{};
+            for (size_t index = 0; index < queries.size(); ++index)
+            {
+                ns[index] = queries[index].n;
+                ks[index] = queries[index].k;
+            }
+
+            for (int sample = 0; sample < samples; ++sample)
+            {
+                uint64_t checksum = 0;
+                net_ns[static_cast<size_t>(sample)] =
+                    rocmGemv_native_vnni_measure_generated_config_ns(
+                        codebook_id,
+                        1,
+                        ns.data(),
+                        ks.data(),
+                        static_cast<int>(queries.size()),
+                        iterations,
+                        &checksum);
+                EXPECT_NE(checksum, 0u);
+            }
+
+            std::sort(net_ns.begin(), net_ns.end());
+            return net_ns[net_ns.size() / 2];
+        };
+
+        const double hot_ns = measure(hot);
+        const double working_set_ns = measure(working_set);
+
+        EXPECT_LT(hot_ns, 10.0);
+        EXPECT_LT(working_set_ns, 20.0);
+        std::cout
+            << "[ROCmNativeVNNI][DISPATCH_CACHE_LATENCY] hot_ns="
+            << hot_ns
+            << " working_set_ns=" << working_set_ns
+            << std::endl;
+    }
+
+    /**
+     * @test Prove generated M=1 policy totality for every execution codebook.
+     *
+     * Exact overlays are additive and therefore cannot establish generic
+     * dispatch coverage. Probe unseen valid geometries in every aspect regime
+     * through the same host-only production query. Q8_0, Q8_1, and Q8_K all
+     * normalize to execution codebook 19, so that one runtime identity must be
+     * covered just as completely as every compressed codebook.
+     */
+    TEST(ROCmNativeVNNIPerfOffline, GeneratedDecodeDispatchIsCodebookAndGeometryTotal)
+    {
+        constexpr std::array<uint8_t, 16> codebooks = {
+            0, 4, 5, 6, 7, 8, 9, 10,
+            11, 12, 13, 14, 15, 16, 17, 19,
+        };
+        struct Query
+        {
+            int n;
+            int k;
+        };
+        constexpr std::array<Query, 4> unseen_geometries = {{
+            {64, 1024},
+            {1024, 1024},
+            {4096, 1024},
+            {32768, 1024},
+        }};
+
+        for (uint8_t codebook : codebooks)
+        {
+            for (const Query &query : unseen_geometries)
+            {
+                int kb = 0;
+                int target_waves = 0;
+                ASSERT_TRUE(rocmGemv_native_vnni_query_generated_config(
+                    codebook,
+                    1,
+                    query.n,
+                    query.k,
+                    &kb,
+                    &target_waves))
+                    << "missing generated ROCm policy for CB="
+                    << static_cast<int>(codebook)
+                    << " N=" << query.n
+                    << " K=" << query.k;
+                EXPECT_GT(kb, 0);
+                EXPECT_GT(target_waves, 0);
+            }
+        }
+
+        int kb = 0;
+        int target_waves = 0;
+        EXPECT_FALSE(rocmGemv_native_vnni_query_generated_config(
+            18, 1, 1024, 1024, &kb, &target_waves));
+    }
+#endif
 
     // =============================================================================
     // Test fixture

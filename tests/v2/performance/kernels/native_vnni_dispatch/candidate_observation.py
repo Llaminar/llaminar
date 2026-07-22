@@ -17,13 +17,36 @@ from .corpus import ObservationCorpus
 from .schema import NativeVNNIObservation, OBSERVATION_COLUMNS
 
 
-OPTIONAL_OBSERVATION_COLUMNS = frozenset({"adaptive_timing_evidence"})
+OPTIONAL_OBSERVATION_COLUMNS = frozenset({
+    "launch_k_tiles",
+    "launch_n_block_chunks",
+    "adaptive_timing_evidence",
+})
 
 
 # Large policy corpora are already resident in the analyzer.  Fork workers
 # inherit this immutable tuple copy-on-write, so each task carries only row
 # bounds and a shard pathname instead of repeatedly pickling observation rows.
 _PARALLEL_WRITE_OBSERVATIONS: tuple[NativeVNNIObservation, ...] = ()
+
+
+def _physical_core_count() -> int:
+    """Return affinity-visible physical cores for offline CSV processing."""
+
+    try:
+        visible_cpus = tuple(sorted(os.sched_getaffinity(0)))
+    except AttributeError:
+        visible_cpus = tuple(range(os.cpu_count() or 1))
+    physical = set()
+    for cpu in visible_cpus:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package = (topology / "physical_package_id").read_text().strip()
+            core = (topology / "core_id").read_text().strip()
+        except OSError:
+            return max(1, len(visible_cpus))
+        physical.add((package, core))
+    return max(1, len(physical))
 
 
 def _observation_csv_row(
@@ -75,33 +98,149 @@ def _write_observations_serial(
         writer.writerow(_observation_csv_row(observation))
 
 
-def read_observation_rows(
-    paths: Iterable[Path],
-) -> tuple[NativeVNNIObservation, ...]:
-    """Parse and validate strict common-schema CSV shards exactly once."""
+def _validated_observation_header(path: Path) -> tuple[tuple[str, ...], int]:
+    """Return one strict CSV header and the first data-row byte offset."""
 
+    with path.open("rb") as handle:
+        encoded_header = handle.readline()
+        data_offset = handle.tell()
+    try:
+        header = next(csv.reader([encoded_header.decode("utf-8")]))
+    except (UnicodeDecodeError, csv.Error) as error:
+        raise ValueError(f"{path}: invalid common observation header") from error
+    missing = (
+        set(OBSERVATION_COLUMNS).difference(header)
+        - OPTIONAL_OBSERVATION_COLUMNS
+    )
+    unexpected = set(header).difference(OBSERVATION_COLUMNS)
+    if missing or unexpected:
+        raise ValueError(
+            f"{path}: common observation header mismatch: "
+            f"missing={sorted(missing)} unexpected={sorted(unexpected)}"
+        )
+    return tuple(header), data_offset
+
+
+def _observation_file_ranges(
+    path: Path,
+    data_offset: int,
+    partition_count: int,
+) -> tuple[tuple[int, int], ...]:
+    """Split a canonical one-row-per-line CSV at complete row boundaries."""
+
+    file_size = path.stat().st_size
+    data_size = max(0, file_size - data_offset)
+    if data_size == 0:
+        return ()
+    partition_count = min(partition_count, data_size)
+    boundaries = [data_offset]
+    with path.open("rb") as handle:
+        for partition_index in range(1, partition_count):
+            target = data_offset + data_size * partition_index // partition_count
+            handle.seek(target)
+            handle.readline()
+            boundary = handle.tell()
+            if boundary < file_size:
+                boundaries.append(boundary)
+    boundaries.append(file_size)
+    boundaries = sorted(set(boundaries))
+    return tuple(
+        (begin, end)
+        for begin, end in zip(boundaries, boundaries[1:])
+        if begin < end
+    )
+
+
+def _read_observation_range(
+    task: tuple[Path, tuple[str, ...], int, int],
+) -> tuple[NativeVNNIObservation, ...]:
+    """Parse and validate one complete-line CSV byte range in a worker."""
+
+    path, fieldnames, begin, end = task
+    with path.open("rb") as handle:
+        handle.seek(begin)
+        encoded = handle.read(end - begin)
+    try:
+        text = encoded.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{path}:byte-{begin}: invalid UTF-8") from error
+    reader = csv.DictReader(
+        io.StringIO(text, newline=""),
+        fieldnames=fieldnames,
+    )
     rows = []
-    for path in paths:
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            missing = (
-                set(OBSERVATION_COLUMNS).difference(reader.fieldnames or ())
-                - OPTIONAL_OBSERVATION_COLUMNS
-            )
-            unexpected = set(reader.fieldnames or ()).difference(OBSERVATION_COLUMNS)
-            if missing or unexpected:
-                raise ValueError(
-                    f"{path}: common observation header mismatch: "
-                    f"missing={sorted(missing)} unexpected={sorted(unexpected)}"
-                )
-            for row_number, raw in enumerate(reader, start=2):
-                try:
-                    rows.append(NativeVNNIObservation.from_mapping(raw))
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(f"{path}:{row_number}: {exc}") from exc
+    for local_row, raw in enumerate(reader):
+        try:
+            rows.append(NativeVNNIObservation.from_mapping(raw))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"{path}:byte-{begin}:row-{local_row}: {error}"
+            ) from error
     return tuple(rows)
 
 
+def read_observation_rows(
+    paths: Iterable[Path],
+    *,
+    workers: int | None = None,
+    parallel_threshold_bytes: int = 16 * 1024 * 1024,
+) -> tuple[NativeVNNIObservation, ...]:
+    """Parse strict CSV shards in deterministic physical-core partitions.
+
+    Generated observation CSVs guarantee one canonical record per physical
+    line. Large inputs are therefore split only after a newline and decoded by
+    fork workers. The parent receives validated row tuples in file/range order,
+    preserving the serial corpus exactly while removing the former GIL-bound
+    parse stage from fit-only replays.
+    """
+
+    path_list = tuple(paths)
+    headers = []
+    total_bytes = 0
+    for path in path_list:
+        header, data_offset = _validated_observation_header(path)
+        headers.append((path, header, data_offset))
+        total_bytes += max(0, path.stat().st_size - data_offset)
+
+    if workers is None:
+        workers = int(os.environ.get(
+            "LLAMINAR_NATIVE_VNNI_IO_WORKERS",
+            str(_physical_core_count()),
+        ))
+    if workers < 1:
+        raise ValueError("observation CSV worker count must be positive")
+    worker_count = min(workers, _physical_core_count())
+    if worker_count <= 1 or total_bytes < parallel_threshold_bytes:
+        rows = []
+        for path, _header, _data_offset in headers:
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                for row_number, raw in enumerate(reader, start=2):
+                    try:
+                        rows.append(NativeVNNIObservation.from_mapping(raw))
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"{path}:{row_number}: {exc}") from exc
+        return tuple(rows)
+
+    target_bytes = max(1, (total_bytes + worker_count - 1) // worker_count)
+    tasks = []
+    for path, header, data_offset in headers:
+        data_size = max(0, path.stat().st_size - data_offset)
+        partitions = max(1, (data_size + target_bytes - 1) // target_bytes)
+        tasks.extend(
+            (path, header, begin, end)
+            for begin, end in _observation_file_ranges(
+                path, data_offset, partitions
+            )
+        )
+    if not tasks:
+        return ()
+    with ProcessPoolExecutor(
+        max_workers=min(worker_count, len(tasks)),
+        mp_context=multiprocessing.get_context("fork"),
+    ) as executor:
+        partitions = tuple(executor.map(_read_observation_range, tasks))
+    return tuple(row for partition in partitions for row in partition)
 def read_observation_csv(paths: Iterable[Path]) -> ObservationCorpus:
     """Read strict CSV shards and build a candidate-consistent corpus index."""
 
@@ -130,7 +269,7 @@ def write_observation_csv(
     if workers is None:
         workers = int(os.environ.get(
             "LLAMINAR_NATIVE_VNNI_IO_WORKERS",
-            str(min(16, len(os.sched_getaffinity(0)))),
+            str(_physical_core_count()),
         ))
     if workers < 1:
         raise ValueError("observation CSV worker count must be positive")

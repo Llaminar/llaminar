@@ -17,6 +17,7 @@
 #include "../../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../../utils/PreparedWeightTestHarness.h"
 #include "../../../../utils/TestTensorFactory.h"
+#include "../../native_vnni_dispatch/NativeVNNIShapeManifest.h"
 
 #include <algorithm>
 #include <cctype>
@@ -90,6 +91,10 @@ namespace llaminar2::test::native_vnni_gemm_perf
          { return TestTensorFactory::createIQ1_MRandom({n, k}); }},
         {"Q8_0", 19, [](size_t n, size_t k)
          { return TestTensorFactory::createQ8_0Random({n, k}); }},
+        {"Q8_1", 20, [](size_t n, size_t k)
+         { return TestTensorFactory::createQ8_1Random({n, k}); }},
+        {"Q8_K", 21, [](size_t n, size_t k)
+         { return TestTensorFactory::createQ8_KRandom({n, k}); }},
     };
 
     struct Shape
@@ -99,93 +104,35 @@ namespace llaminar2::test::native_vnni_gemm_perf
         int k;
     };
 
-    inline const std::vector<Shape> kQwenShapes = {
-        // Qwen3.6-35B-A3B MoE expert FFN shapes (d_model=2048, expert_intermediate=512).
-        // These are the production hot-path GEMMs for the grouped MoE prefill/decode
-        // kernels (gate/up: N=512,K=2048; down: N=2048,K=512). The dense NativeVNNI
-        // kernel exercised here shares the same per-codebook decode_groups helpers as
-        // the grouped MoE kernel, so this is a valid A/B harness for decode tuning.
-        {"35BMoE_Expert_GateUp", 512, 2048},
-        {"35BMoE_Expert_Down", 2048, 512},
-        // Qwen3.6 MoE hybrid GDN verifier projections (hidden=2048).
-        // These buckets are distinct from the dense 27B GDN shapes and must be
-        // trained explicitly so M=2..4 verifier rows do not inherit dense-only
-        // dispatch decisions.
-        {"Qwen36MoE_GDN_QKVProjection", 8192, 2048},
-        {"Qwen36MoE_GDN_ZProjection", 4096, 2048},
-        {"0.5B_Attn", 896, 896},
-        {"0.5B_FFN_Up", 4864, 896},
-        {"0.5B_FFN_Down", 896, 4864},
-        {"0.5B_LM_Head", 151936, 896},
-        {"0.5B_TP2_Attn_QKV", 448, 896},
-        {"0.5B_TP2_Attn_Wo", 896, 448},
-        {"0.5B_TP2_FFN_Up", 2432, 896},
-        {"0.5B_TP2_FFN_Down", 896, 2432},
-        {"0.5B_TP2_LM_Head", 75968, 896},
-        {"0.5B_TP4_Attn_QKV", 224, 896},
-        {"0.5B_TP4_Attn_Wo", 896, 224},
-        {"0.5B_TP4_FFN_Up", 1216, 896},
-        {"0.5B_TP4_FFN_Down", 896, 1216},
-        {"0.5B_TP4_LM_Head", 37984, 896},
-        {"3B_Attn", 2048, 2048},
-        {"3B_FFN_Up", 11008, 2048},
-        {"3B_FFN_Down", 2048, 11008},
-        {"3B_LM_Head", 151936, 2048},
-        {"3B_TP2_Attn_QKV", 1024, 2048},
-        {"3B_TP2_Attn_Wo", 2048, 1024},
-        {"3B_TP2_FFN_Up", 5504, 2048},
-        {"3B_TP2_FFN_Down", 2048, 5504},
-        {"3B_TP2_LM_Head", 75968, 2048},
-        {"3B_TP4_Attn_QKV", 512, 2048},
-        {"3B_TP4_Attn_Wo", 2048, 512},
-        {"3B_TP4_FFN_Up", 2752, 2048},
-        {"3B_TP4_FFN_Down", 2048, 2752},
-        {"3B_TP4_LM_Head", 37984, 2048},
-        {"7B_Attn", 3584, 3584},
-        {"7B_FFN_Up", 18944, 3584},
-        {"7B_FFN_Down", 3584, 18944},
-        {"7B_LM_Head", 152064, 3584},
-        {"7B_TP2_Attn_QKV", 1792, 3584},
-        {"7B_TP2_Attn_Wo", 3584, 1792},
-        {"7B_TP2_FFN_Up", 9472, 3584},
-        {"7B_TP2_FFN_Down", 3584, 9472},
-        {"7B_TP2_LM_Head", 76032, 3584},
-        {"7B_TP4_Attn_QKV", 896, 3584},
-        {"7B_TP4_Attn_Wo", 3584, 896},
-        {"7B_TP4_FFN_Up", 4736, 3584},
-        {"7B_TP4_FFN_Down", 3584, 4736},
-        {"7B_TP4_LM_Head", 38016, 3584},
-        {"9B_Attn", 4096, 4096},
-        {"9B_FFN_Up", 12288, 4096},
-        {"9B_FFN_Down", 4096, 12288},
-        {"9B_LM_Head", 248320, 4096},
-        {"Qwen36_Attn_Q", 5120, 5120},
-        {"Qwen36_Attn_KV", 1024, 5120},
-        {"Qwen36_Attn_Wo", 5120, 5120},
-        {"Qwen36_FFN_GateUp", 17408, 5120},
-        {"Qwen36_FFN_Down", 5120, 17408},
-        {"Qwen36_GDN_Inner", 10240, 5120},
-        {"Qwen36_GDN_Z", 6144, 5120},
-        {"Qwen36_GDN_Time", 1024, 5120},
-        {"Qwen36_GDN_Out", 5120, 6144},
-        {"Qwen36_LM_Head", 248320, 5120},
-        {"14B_Attn", 5120, 5120},
-        {"14B_FFN_Up", 13824, 5120},
-        {"14B_FFN_Down", 5120, 13824},
-        {"14B_LM_Head", 152064, 5120},
-        {"14B_TP2_Attn_QKV", 2560, 5120},
-        {"14B_TP2_Attn_Wo", 5120, 2560},
-        {"14B_TP2_FFN_Up", 6912, 5120},
-        {"14B_TP2_FFN_Down", 5120, 6912},
-        {"14B_TP2_LM_Head", 76032, 5120},
-        {"14B_TP4_Attn_QKV", 1280, 5120},
-        {"14B_TP4_Attn_Wo", 5120, 1280},
-        {"14B_TP4_FFN_Up", 3456, 5120},
-        {"14B_TP4_FFN_Down", 5120, 3456},
-        {"14B_TP4_LM_Head", 38016, 5120},
-    };
+    /**
+     * @brief Return every production exact-overlay geometry from the shared
+     * NativeVNNI manifest.
+     *
+     * The shell planner applies the semantic prefill subset, including the
+     * deliberate LM-head exclusion. The executable must still be able to
+     * resolve every planner-selected name. Constructing this inventory from
+     * the common manifest prevents CUDA from silently retaining a smaller,
+     * backend-private list when a released Qwen geometry is added.
+     */
+    inline const std::vector<Shape> kQwenShapes = []
+    {
+        std::vector<Shape> result;
+        for (const auto &shape :
+             llaminar2::test::native_vnni_dispatch::nativeVnniShapeManifest())
+        {
+            if (shape.role != "production" || !shape.exact_overlay)
+                continue;
+            result.push_back({shape.name, shape.N, shape.K});
+        }
+        if (result.empty())
+            throw std::runtime_error(
+                "CUDA NativeVNNI manifest has no production exact overlays");
+        return result;
+    }();
 
-    inline const std::vector<int> kPrefillMValues = defaultNativeVNNIDispatchTrainingRows();
+    // M=1 belongs to decode and M=2..16/31 belongs to the grouped verifier
+    // transaction. This harness measures only ordinary prefill/GEMM buckets.
+    inline const std::vector<int> kPrefillMValues = defaultPrefillGraphBucketSizes();
 
     struct RunConfig
     {

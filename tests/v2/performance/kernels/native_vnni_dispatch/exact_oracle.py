@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import math
+import multiprocessing
+import os
 import statistics
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Iterable, Mapping
 
@@ -12,10 +15,36 @@ from .corpus import (
     ObservationCorpus,
     RuntimeKey,
     SurfaceKey,
+    _physical_core_count,
     observed_surfaces,
     runtime_key,
 )
 from .schema import ExecutionMode, NativeVNNIObservation, SemanticContract
+
+
+# Exact runtime keys are independent optimization problems. Fork workers read
+# the immutable corpus through copy-on-write mappings, while their task payload
+# contains only a small key. This avoids pickling trainer-scale row inventories
+# into every worker.
+_PARALLEL_EXACT_CORPUS: ObservationCorpus | None = None
+_PARALLEL_EXACT_REQUIRED_SURFACES: Mapping[
+    RuntimeKey, frozenset[SurfaceKey]
+] = {}
+_PARALLEL_EXACT_SERIAL_HASHES: Mapping[RuntimeKey, str] = {}
+
+
+def _build_exact_winner_for_key(key: RuntimeKey) -> tuple[RuntimeKey, "ExactWinner"]:
+    """Build one exact winner from the fork-inherited immutable corpus."""
+
+    if _PARALLEL_EXACT_CORPUS is None:
+        raise RuntimeError("parallel exact-winner corpus was not initialized")
+    winner = build_exact_winner(
+        _PARALLEL_EXACT_CORPUS.rows_for_runtime_key(key),
+        required_surfaces=_PARALLEL_EXACT_REQUIRED_SURFACES.get(key),
+        current_serial_m1_hash=_PARALLEL_EXACT_SERIAL_HASHES.get(key),
+        runtime_key_override=key,
+    )
+    return key, winner
 
 
 @dataclass(frozen=True)
@@ -220,14 +249,53 @@ def build_exact_winners(
     required_surfaces: Mapping[RuntimeKey, frozenset[SurfaceKey]] | None = None,
     serial_m1_hashes: Mapping[RuntimeKey, str] | None = None,
 ) -> dict[RuntimeKey, ExactWinner]:
-    """Construct exact winners for every runtime key in a validated corpus."""
+    """Construct exact winners across affinity-visible physical CPU cores.
 
-    result: dict[RuntimeKey, ExactWinner] = {}
-    for key in corpus.runtime_keys():
-        result[key] = build_exact_winner(
-            corpus.rows_for_runtime_key(key),
-            required_surfaces=(required_surfaces or {}).get(key),
-            current_serial_m1_hash=(serial_m1_hashes or {}).get(key),
-            runtime_key_override=key,
-        )
-    return result
+    Winner selection has no cross-key mutable state. Large production corpora
+    therefore distribute sorted runtime keys across fork workers and collect
+    results in input order, preserving the byte-stable policy order. Small
+    corpora remain serial to avoid process startup overhead. The optional
+    ``LLAMINAR_NATIVE_VNNI_EXACT_WINNER_WORKERS`` override is still capped at
+    the physical core count.
+    """
+
+    keys = corpus.runtime_keys()
+    requested_workers = int(os.environ.get(
+        "LLAMINAR_NATIVE_VNNI_EXACT_WINNER_WORKERS",
+        str(_physical_core_count()),
+    ))
+    if requested_workers < 1:
+        raise ValueError("exact-winner worker count must be positive")
+    worker_count = min(
+        requested_workers,
+        _physical_core_count(),
+        max(1, len(keys) // 16),
+    )
+    if worker_count == 1:
+        return {
+            key: build_exact_winner(
+                corpus.rows_for_runtime_key(key),
+                required_surfaces=(required_surfaces or {}).get(key),
+                current_serial_m1_hash=(serial_m1_hashes or {}).get(key),
+                runtime_key_override=key,
+            )
+            for key in keys
+        }
+
+    global _PARALLEL_EXACT_CORPUS
+    global _PARALLEL_EXACT_REQUIRED_SURFACES
+    global _PARALLEL_EXACT_SERIAL_HASHES
+    _PARALLEL_EXACT_CORPUS = corpus
+    _PARALLEL_EXACT_REQUIRED_SURFACES = required_surfaces or {}
+    _PARALLEL_EXACT_SERIAL_HASHES = serial_m1_hashes or {}
+    try:
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=multiprocessing.get_context("fork"),
+        ) as executor:
+            pairs = tuple(executor.map(_build_exact_winner_for_key, keys))
+    finally:
+        _PARALLEL_EXACT_CORPUS = None
+        _PARALLEL_EXACT_REQUIRED_SURFACES = {}
+        _PARALLEL_EXACT_SERIAL_HASHES = {}
+    return dict(pairs)
