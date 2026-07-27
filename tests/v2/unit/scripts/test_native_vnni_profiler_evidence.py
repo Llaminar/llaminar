@@ -26,6 +26,8 @@ if str(KERNEL_PERF_ROOT) not in sys.path:
 from native_vnni_dispatch.candidate_registry import (  # noqa: E402
     cpu_native_vnni_decode_registry,
     cuda_native_vnni_gemv_registry,
+    rocm_native_vnni_decode_formula_registry,
+    rocm_native_vnni_decode_registry,
 )
 from native_vnni_dispatch.candidate_observation import (  # noqa: E402
     read_observation_rows,
@@ -39,34 +41,46 @@ from native_vnni_dispatch.cuda_shape_resolved import (  # noqa: E402
     project_cuda_shape_resolved_candidates,
     resolve_cuda_concrete_candidate_id,
 )
+from native_vnni_dispatch.rocm_shape_resolved import (  # noqa: E402
+    project_rocm_shape_resolved_candidates,
+    resolve_rocm_concrete_candidate_id,
+)
 from native_vnni_dispatch.format_registry import format_spec  # noqa: E402
 from native_vnni_dispatch.profiler_collectors import (  # noqa: E402
     CollectorOptions,
     _append_checkpoint_journal,
     _apply_device_placement,
     _build_cpu_process_batches,
-    _build_cuda_process_batches,
+    _build_gpu_process_batches,
     build_argument_parser as build_profiler_collector_argument_parser,
     _collect_cpu,
     _collect_cpu_batch,
     _collect_cuda_batch,
+    _collect_rocm_batch,
     _cpu_batch_environment,
     _cuda_batch_environment,
+    _rocm_batch_environment,
     _partition_cuda_batch_dispatches,
     _parse_cpu_lane_lists,
+    _resolve_gpu_process_batch_size,
     _load_incremental_evidence,
     _NCUDispatchRecord,
     _profile_environment,
     _tool_command,
     _trainer_arguments,
+    _validate_gpu_process_batch_size,
     _write_binary_provenance,
     _write_checkpoint,
     _write_cpu_batch_plan,
-    _write_cuda_batch_plan,
+    _write_gpu_batch_plan,
     collect_request,
     parse_ncu_csv,
     parse_perf_stat,
+    parse_rocprof_batch_csvs,
     parse_rocprof_csvs,
+)
+from native_vnni_dispatch.profiler_checkpoint import (  # noqa: E402
+    recover_complete_checkpoint,
 )
 from native_vnni_dispatch.profiler_evidence import (  # noqa: E402
     EXPECTED_PROFILER_TOOL,
@@ -87,6 +101,7 @@ from native_vnni_dispatch.profiler_evidence import (  # noqa: E402
     compose_profiler_evidence,
     compact_profiler_observation_witnesses,
     metric_definitions,
+    _ordered_compose_source_paths,
     _profiler_requests_for_observations,
     profiler_feature_rows,
     profiler_request_for_observation,
@@ -304,6 +319,53 @@ def cpu_decode_observation(
     return result
 
 
+def rocm_decode_observation(
+    *,
+    candidate_id: str = "rocm.nvnni.decode.fast.kb1",
+    n: int = 2048,
+    k: int = 4096,
+) -> NativeVNNIObservation:
+    """Build one registry-authentic ROCm M=1 physical timing observation."""
+
+    candidate = rocm_native_vnni_decode_registry().resolve(candidate_id)
+    spec = format_spec("Q4_0")
+    result = dataclasses.replace(
+        cuda_observation(),
+        backend=Backend.ROCM,
+        architecture_class="unit-gfx906-native-vnni-v1",
+        device_name="unit-rocm-device",
+        driver_runtime="unit-rocm-runtime",
+        threading_or_stream_mode="hip_explicit_non_default_stream",
+        prepared_family_id=spec.prepared_family("rocm"),
+        packing_abi=spec.packing_abi("rocm"),
+        runtime_codebook_id=spec.runtime_codebook("rocm"),
+        shape_group_id=f"rocm-decode:unit-shape:n{n}:k{k}",
+        shape_name="unit-rocm-decode-shape",
+        projection_n_vector=(n,),
+        aggregate_n=n,
+        k=k,
+        aspect_ratio=float(n) / float(k),
+        aspect_bucket=classify_aspect(n, k),
+        work_items=n * k,
+        n_tail_class=f"n_mod_256={n % 256}",
+        k_tail_class=f"k_mod_256={k % 256}",
+        alignment_class="rocm_gpu_prepared_native_vnni_16b_aligned",
+        candidate_id=candidate.candidate_id,
+        effective_candidate_id=candidate.effective_candidate_id,
+        candidate_family=candidate.candidate_family,
+        config_json=candidate.config_json,
+        arithmetic_fingerprint=candidate.arithmetic_fingerprint,
+        serial_m1_policy_id="rocm.production.serial.m1",
+        serial_m1_policy_hash="sha256:rocm-serial-policy",
+        candidate_policy_hash=candidate.candidate_policy_hash(),
+        ordered_reduction=candidate.ordered_reduction,
+        uses_atomic_reduction=candidate.uses_atomic_reduction,
+        observed_candidate_id=candidate.effective_candidate_id,
+    )
+    result.validate()
+    return result
+
+
 def complete_metrics(
     backend: Backend,
     *,
@@ -343,6 +405,23 @@ def cuda_dispatch(
         grid=(16, 1, 1),
         block=(128, 1, 1),
         metrics=complete_metrics(Backend.CUDA, scale=metric_scale),
+    )
+
+
+def rocm_dispatch(
+    index: int = 0,
+    name: str = "nativeVnniGemvKPartKernel",
+) -> ProfiledDispatch:
+    """Create one complete synthetic ROCm profiler dispatch."""
+
+    return ProfiledDispatch(
+        dispatch_index=index,
+        dispatch_kind=ProfiledDispatchKind.GPU_KERNEL,
+        kernel_name=name,
+        kernel_fingerprint="sha256:" + f"{index + 1:064x}",
+        grid=(16, 1, 1),
+        block=(128, 1, 1),
+        metrics=complete_metrics(Backend.ROCM),
     )
 
 
@@ -457,7 +536,7 @@ def profiler_model_fixture(
 
 
 class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
-    """Prove timing isolation, request identity, and complete profile coverage."""
+    """Prove timing isolation, request identity, and stratified profile use."""
 
     def setUp(self) -> None:
         """Keep unit tests independent of native threads and GPU execution."""
@@ -581,14 +660,14 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         self.assertEqual(evidence.canonical_mapping(), evidence_mapping)
 
     def test_cpu_decode_request_resolves_first_class_candidate_surface(self) -> None:
-        """Every Fast M=1 timing candidate must own one profiler request."""
+        """CPU decode sampling retains three informative timing strata."""
 
         manifest = build_profiler_request_manifest(ObservationCorpus(tuple(
             cpu_decode_observation(candidate_id=candidate.candidate_id)
             for candidate in cpu_native_vnni_decode_registry().entries
         )))
 
-        self.assertEqual(len(manifest.requests), 5)
+        self.assertEqual(len(manifest.requests), 3)
         self.assertEqual(
             {request.candidate_registry_surface for request in manifest.requests},
             {"cpu_native_vnni_decode"},
@@ -596,6 +675,104 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         self.assertEqual(
             {request.operation_kind for request in manifest.requests},
             {"NativeVNNIFastM1Projection"},
+        )
+
+    def test_manifest_profiles_fast_middle_and_slow_five_percent_per_cell(
+        self,
+    ) -> None:
+        """Every format/shape/M contest contributes all three timing bands."""
+
+        candidates = tuple(
+            candidate
+            for candidate in cuda_native_vnni_gemv_registry().entries
+            if candidate.effective_candidate_id == candidate.candidate_id
+            and SemanticContract.FAST in candidate.supported_contracts
+        )[:40]
+        self.assertEqual(len(candidates), 40)
+        observations = []
+        expected_digests = set()
+        expected_rank_indices = {0, 1, 19, 20, 38, 39}
+        for source_format in ("Q4_0", "Q5_0"):
+            for shape_index, (m, n, k) in enumerate((
+                (1, 2048, 4096),
+                (2, 3072, 6144),
+            )):
+                contest = []
+                for rank, candidate in enumerate(candidates):
+                    median_us = 10.0 + rank
+                    row = dataclasses.replace(
+                        cuda_observation(
+                            source_format=source_format,
+                            candidate_id=candidate.candidate_id,
+                        ),
+                        shape_group_id=(
+                            f"stratified:{source_format}:shape-{shape_index}:m{m}"
+                        ),
+                        shape_name=f"stratified-shape-{shape_index}",
+                        execution_mode=ExecutionMode.GRAPH_CAPTURED,
+                        m=m,
+                        projection_n_vector=(n,),
+                        aggregate_n=n,
+                        k=k,
+                        aspect_ratio=float(n) / float(k),
+                        aspect_bucket=classify_aspect(n, k),
+                        work_items=n * k,
+                        min_us=median_us - 0.25,
+                        median_us=median_us,
+                        p95_us=median_us + 0.25,
+                        timing_sample_hash=f"fnv1a64:{rank:016x}",
+                    )
+                    row.validate()
+                    contest.append(row)
+                    observations.append(row)
+                expected_digests.update(
+                    contest[index].digest() for index in expected_rank_indices
+                )
+
+        corpus = ObservationCorpus(tuple(observations))
+        serial_entries = profiler_evidence._stratified_profiler_observation_entries(
+            corpus,
+            workers=1,
+        )
+        with mock.patch.object(
+            profiler_evidence,
+            "_physical_core_count",
+            return_value=2,
+        ):
+            parallel_entries = (
+                profiler_evidence._stratified_profiler_observation_entries(
+                    corpus,
+                    workers=2,
+                )
+            )
+        self.assertEqual(
+            [
+                (launch_key, row.digest())
+                for launch_key, row in parallel_entries
+            ],
+            [
+                (launch_key, row.digest())
+                for launch_key, row in serial_entries
+            ],
+        )
+
+        manifest = build_profiler_request_manifest(corpus)
+
+        self.assertEqual(len(manifest.requests), 24)
+        self.assertEqual(
+            {request.observation_digest for request in manifest.requests},
+            expected_digests,
+        )
+        self.assertEqual(
+            {
+                (request.source_format, request.shape_name, request.m)
+                for request in manifest.requests
+            },
+            {
+                (source_format, f"stratified-shape-{shape_index}", m)
+                for source_format in ("Q4_0", "Q5_0")
+                for shape_index, m in ((0, 1), (1, 2))
+            },
         )
 
     def test_manifest_separates_distinct_prepared_codebook_kernels(self) -> None:
@@ -951,7 +1128,7 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             record,
         )
         self.assertIn(
-            "metric.gpu.registers_per_thread.maximum_log1p",
+            "metric.gpu.compute.registers_per_thread.maximum_log1p",
             record,
         )
 
@@ -969,7 +1146,7 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             masked,
         )
         self.assertIn(
-            "metric.gpu.registers_per_thread.maximum_log1p",
+            "metric.gpu.compute.registers_per_thread.maximum_log1p",
             masked,
         )
         self.assertFalse(any(
@@ -987,22 +1164,22 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             "metric.gpu.decode.effective_gbytes_per_second_log1p",
             auxiliary_targets,
         )
-        self.assertIn("profile.dispatch_count", model_inputs)
+        self.assertNotIn("profile.dispatch_count", model_inputs)
         self.assertNotIn("profile.dispatch_count", auxiliary_targets)
         self.assertIn(
-            "metric.gpu.compute_throughput_pct_of_peak.fraction_mean",
+            "metric.gpu.compute.compute_throughput_pct_of_peak.fraction_mean",
             auxiliary_targets,
         )
         self.assertNotIn(
-            "metric.gpu.alu_pipe_utilization_pct.fraction_mean",
+            "metric.gpu.compute.alu_pipe_utilization_pct.fraction_mean",
             auxiliary_targets,
         )
-        self.assertIn(
-            "metric.gpu.registers_per_thread.maximum_log1p",
+        self.assertNotIn(
+            "metric.gpu.compute.registers_per_thread.maximum_log1p",
             model_inputs,
         )
-        self.assertNotIn(
-            "metric.gpu.registers_per_thread.maximum_log1p",
+        self.assertIn(
+            "metric.gpu.compute.registers_per_thread.maximum_log1p",
             auxiliary_targets,
         )
         self.assertFalse(any(
@@ -1049,7 +1226,7 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
                 0.0,
             )
             self.assertIn(
-                "metric.gpu.registers_per_thread.maximum_log1p",
+                "metric.gpu.compute.registers_per_thread.maximum_log1p",
                 record,
             )
             self.assertNotIn(
@@ -1312,8 +1489,8 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
                 3,
             )
 
-    def test_catalog_rejects_missing_codebook_specific_profile(self) -> None:
-        """One codebook's counters cannot satisfy another codebook's gate."""
+    def test_catalog_does_not_lend_counters_to_unprofiled_codebook(self) -> None:
+        """One codebook's counters cannot populate another descriptor."""
 
         q4 = cuda_observation(source_format="Q4_0")
         q5 = cuda_observation(source_format="Q5_0")
@@ -1330,23 +1507,25 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             ObservationCorpus((q4,)), q4_requests, evidence
         )
 
-        with self.assertRaisesRegex(
-            ValueError,
-            (
-                r"omits physical candidate .*"
-                + q5.prepared_family_id
-                + rf"/cb{q5.runtime_codebook_id}"
-            ),
-        ):
-            build_profiler_feature_catalog(
-                corpus,
-                rows,
-                request_manifest_digest=q4_requests.digest(),
-                evidence_manifest_digest=evidence.digest(),
-            )
+        catalog = build_profiler_feature_catalog(
+            corpus,
+            rows,
+            request_manifest_digest=q4_requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+        )
 
-    def test_additive_catalog_merge_requires_complete_physical_coverage(self) -> None:
-        """Old and new counter transactions cover one expanded corpus jointly."""
+        self.assertIn("profile.dispatch_count", catalog.descriptor_for(q4).features)
+        self.assertNotIn(
+            "profile.dispatch_count",
+            catalog.descriptor_for(q5).features,
+        )
+        self.assertNotEqual(
+            catalog.descriptor_for(q4).key.prepared_family_id,
+            catalog.descriptor_for(q5).key.prepared_family_id,
+        )
+
+    def test_additive_catalog_merge_replaces_static_with_measured_evidence(self) -> None:
+        """A later isolated transaction upgrades only its physical candidate."""
 
         q4 = cuda_observation(source_format="Q4_0")
         q5 = cuda_observation(source_format="Q5_0")
@@ -1371,8 +1550,15 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         q4_catalog = catalog_for(q4)
         q5_catalog = catalog_for(q5)
         expanded = ObservationCorpus((q4, q5))
-        with self.assertRaisesRegex(ValueError, "omits physical candidate"):
-            merge_profiler_feature_catalogs(expanded, (q4_catalog,))
+        q4_only = merge_profiler_feature_catalogs(expanded, (q4_catalog,))
+        self.assertIn(
+            "profile.dispatch_count",
+            q4_only.descriptor_for(q4).features,
+        )
+        self.assertNotIn(
+            "profile.dispatch_count",
+            q4_only.descriptor_for(q5).features,
+        )
 
         merged = merge_profiler_feature_catalogs(
             expanded,
@@ -1455,6 +1641,36 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             2,
         )
 
+    def test_compose_cli_parses_smallest_request_manifest_first(self) -> None:
+        """Large source objects must not inflate every later parser fork."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            triples = []
+            for name, size in (("large", 4096), ("small", 32), ("middle", 512)):
+                observation = root / f"{name}.csv"
+                request = root / f"{name}.requests.json"
+                evidence = root / f"{name}.evidence.json"
+                observation.write_text(name, encoding="utf-8")
+                request.write_bytes(b"x" * size)
+                evidence.write_text(name, encoding="utf-8")
+                triples.append((observation, request, evidence))
+
+            ordered = _ordered_compose_source_paths(
+                [str(item[0]) for item in triples],
+                [str(item[1]) for item in triples],
+                [str(item[2]) for item in triples],
+            )
+
+        self.assertEqual(
+            [item[1].name for item in ordered],
+            [
+                "small.requests.json",
+                "middle.requests.json",
+                "large.requests.json",
+            ],
+        )
+
     def test_additive_composition_normalizes_compatible_feature_schemas(
         self,
     ) -> None:
@@ -1521,10 +1737,15 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         old_corpus = ObservationCorpus((old,))
         covered = build_profiler_request_manifest(old_corpus)
 
-        observations, requests = build_missing_profiler_request_transaction(
-            ObservationCorpus((old, new)),
-            (covered,),
-        )
+        with mock.patch.object(
+            profiler_evidence,
+            "_profiler_requests_for_observations",
+            wraps=profiler_evidence._profiler_requests_for_observations,
+        ) as parallel_request_builder:
+            observations, requests = build_missing_profiler_request_transaction(
+                ObservationCorpus((old, new)),
+                (covered,),
+            )
 
         self.assertIsNotNone(observations)
         self.assertIsNotNone(requests)
@@ -1533,6 +1754,7 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         self.assertEqual(len(observations), 1)
         self.assertEqual(len(requests.requests), 1)
         self.assertEqual(requests.requests[0].aggregate_n, 3072)
+        parallel_request_builder.assert_called_once()
 
         with mock.patch.object(
             profiler_evidence,
@@ -1985,13 +2207,19 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             tuple(complete_evidence(request) for request in requests.requests),
         )
 
-        compact = compact_profiler_observation_witnesses(
-            observations,
-            requests,
-            evidence,
-        )
+        with mock.patch.object(
+            profiler_evidence,
+            "_parallel_export_observation_digests",
+            wraps=profiler_evidence._parallel_export_observation_digests,
+        ) as parallel_digests:
+            compact = compact_profiler_observation_witnesses(
+                observations,
+                requests,
+                evidence,
+            )
 
         self.assertEqual(len(compact), 3)
+        self.assertEqual(parallel_digests.call_count, 2)
         self.assertEqual(compact.digest(), observations.digest())
         self.assertEqual(
             len(profiler_feature_rows(compact, requests, evidence)),
@@ -2004,7 +2232,10 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             else row
             for row in observations
         ))
-        with self.assertRaisesRegex(ValueError, "omits requested timing"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "omits 1 requested timing observations",
+        ):
             compact_profiler_observation_witnesses(
                 modified,
                 requests,
@@ -2048,8 +2279,10 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         self.assertEqual(len(recovered), 1)
         self.assertEqual(recovered.digest(), observations.digest())
 
-    def test_profiler_model_requires_every_launchable_candidate(self) -> None:
-        """A partially profiled candidate matrix must never train a policy."""
+    def test_profiler_model_totalizes_unprofiled_candidates_without_counters(
+        self,
+    ) -> None:
+        """Stratified evidence keeps every launchable candidate dispatchable."""
 
         corpus, _costs, requests, evidence, rows, _catalog = (
             profiler_model_fixture()
@@ -2061,13 +2294,86 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             if row.observation.candidate_id != omitted_candidate
         )
 
-        with self.assertRaisesRegex(ValueError, "omits physical candidate"):
-            build_profiler_feature_catalog(
-                corpus,
-                incomplete_rows,
-                request_manifest_digest=requests.digest(),
-                evidence_manifest_digest=evidence.digest(),
+        catalog = build_profiler_feature_catalog(
+            corpus,
+            incomplete_rows,
+            request_manifest_digest=requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+        )
+        omitted = next(
+            row for row in corpus if row.candidate_id == omitted_candidate
+        )
+        descriptor = catalog.descriptor_for(omitted)
+        self.assertNotIn("profile.dispatch_count", descriptor.features)
+        self.assertTrue(
+            any(name.startswith("config.") for name in descriptor.features)
+        )
+
+    def test_stratified_profiler_teacher_trains_only_on_measured_rows(self) -> None:
+        """Sparse counters supervise sampled strata and predict every candidate."""
+
+        corpus, costs, requests, evidence, rows, _catalog = (
+            profiler_model_fixture()
+        )
+        sampled_shapes = {
+            "profile-model-shape-0",
+            "profile-model-shape-4",
+        }
+        sampled_rows = tuple(
+            row
+            for row in rows
+            if row.observation.shape_group_id in sampled_shapes
+        )
+        catalog = build_profiler_feature_catalog(
+            corpus,
+            sampled_rows,
+            request_manifest_digest=requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+        )
+        calls = []
+
+        def capture_surrogate(training_matrix, targets, prediction_matrix, *, device):
+            calls.append((
+                len(training_matrix),
+                len(prediction_matrix),
+                targets.shape[1],
+                device,
+            ))
+            return np.full(
+                len(prediction_matrix),
+                float(np.mean(targets[:, 0], dtype=np.float64)),
+                dtype=np.float64,
             )
+
+        record_index = build_profiler_model_record_index(
+            costs,
+            corpus,
+            catalog,
+            workers=1,
+        )
+        try:
+            with mock.patch.object(
+                profiler_model,
+                "_fit_profiler_surrogate",
+                side_effect=capture_surrogate,
+            ):
+                predicted = apply_profiler_regret_predictions(
+                    costs,
+                    corpus,
+                    catalog,
+                    model_record_index=record_index,
+                    _surrogate_device="cpu",
+                )
+        finally:
+            record_index.close()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], 4)
+        self.assertEqual(calls[0][1], len(costs))
+        self.assertGreater(calls[0][2], 1)
+        self.assertTrue(
+            all(row.profiler_predicted_regret is not None for row in predicted)
+        )
 
     def test_profiler_model_ignores_metrics_without_auxiliary_signal(self) -> None:
         """Config-only separability must not masquerade as counter influence."""
@@ -2345,6 +2651,28 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             changed.model_digest_for((selected,)),
         )
 
+    def test_complete_profiler_pool_reuses_cached_catalog_digest(self) -> None:
+        """A full transfer pool must not reserialize every descriptor."""
+
+        corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        expected = catalog.model_digest
+        # Normalized catalog publication and loading retain this authenticated
+        # value, which is the production condition exercised by a fit replay.
+        catalog.__dict__["model_input_digest"] = catalog.model_input_digest
+        rebound = catalog.rebind(corpus)
+        self.assertEqual(
+            rebound.__dict__["model_input_digest"],
+            catalog.model_input_digest,
+        )
+        with mock.patch.object(
+            profiler_model.ProfilerFeatureCatalog,
+            "model_digest_for_descriptors",
+            side_effect=AssertionError("full catalog was redundantly encoded"),
+        ):
+            actual = rebound.model_digest_for(corpus.observations)
+
+        self.assertEqual(actual, expected)
+
     def test_profiler_pool_digests_are_identical_across_worker_counts(
         self,
     ) -> None:
@@ -2433,7 +2761,7 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             names,
         )
         self.assertIn(
-            "metric.gpu.registers_per_thread.maximum_log1p",
+            "metric.gpu.compute.registers_per_thread.maximum_log1p",
             names,
         )
         self.assertFalse(any(
@@ -2444,6 +2772,70 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         ))
         self.assertNotIn("metric.gpu.duration_ns.mean", names)
         self.assertNotIn("metric.gpu.duration_ns.sum", names)
+
+    def test_gpu_catalog_separates_compute_reduction_and_preparation(self) -> None:
+        """Preparation noise cannot become CUDA/ROCm candidate economy signal."""
+
+        observation = cuda_observation()
+        corpus = ObservationCorpus((observation,))
+        requests = build_profiler_request_manifest(corpus)
+
+        def catalog(quantize_scale: float):
+            dispatches = (
+                cuda_dispatch(
+                    0,
+                    "quantizeActivationsQ8_blockwise_v4_kernel",
+                    metric_scale=quantize_scale,
+                ),
+                cuda_dispatch(
+                    1,
+                    "nativeVnniGemvKernel",
+                    metric_scale=2.0,
+                ),
+                cuda_dispatch(
+                    2,
+                    "nativeVnniKPartReduceKernel",
+                    metric_scale=3.0,
+                ),
+            )
+            evidence = evidence_manifest(
+                requests,
+                (complete_evidence(requests.requests[0], dispatches),),
+            )
+            return build_profiler_feature_catalog(
+                corpus,
+                profiler_feature_rows(corpus, requests, evidence),
+                request_manifest_digest=requests.digest(),
+                evidence_manifest_digest=evidence.digest(),
+            ).descriptor_for(observation).features
+
+        baseline = catalog(100.0)
+        perturbed = catalog(10_000.0)
+
+        self.assertEqual(baseline, perturbed)
+        self.assertEqual(baseline["profile.dispatch_count"], math.log1p(2.0))
+        self.assertEqual(
+            baseline["profile.compute_dispatch_count"], math.log1p(1.0)
+        )
+        self.assertEqual(
+            baseline["profile.reduction_dispatch_count"], math.log1p(1.0)
+        )
+        self.assertEqual(
+            baseline[
+                "metric.gpu.compute.registers_per_thread.maximum_log1p"
+            ],
+            math.log1p(4.0),
+        )
+        self.assertEqual(
+            baseline[
+                "metric.gpu.reduction.registers_per_thread.maximum_log1p"
+            ],
+            math.log1p(6.0),
+        )
+        self.assertNotIn(
+            "metric.gpu.preparation.registers_per_thread.maximum_log1p",
+            baseline,
+        )
 
     def test_decode_and_prefill_normalize_profiler_time_by_distinct_work(self) -> None:
         """Use bytes/second for GEMV and operations/second for GEMM evidence."""
@@ -2544,6 +2936,14 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         )
         self.assertIn("metric.gpu.fetch_to_expected_byte_ratio", rocm_decode)
         self.assertIn("metric.gpu.vgpr_count.maximum_log1p", rocm_decode)
+        self.assertIn(
+            "metric.gpu.valu_instructions_per_workitem.mean_log1p",
+            rocm_decode,
+        )
+        self.assertIn(
+            "metric.gpu.flat_vmem_instructions_per_workitem.mean_log1p",
+            rocm_decode,
+        )
         self.assertIn(
             "metric.gpu.prefill.effective_gops_log1p",
             rocm_prefill,
@@ -3959,6 +4359,46 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
 
         self.assertEqual(direct, expected)
 
+    def test_rocm_formula_reuses_clamped_physical_profiler_descriptor(self) -> None:
+        """A requested KB formula must consume its measured clamped launch."""
+
+        formula = rocm_native_vnni_decode_formula_registry().resolve(
+            "rocm.nvnni.decode.fast.clamped_formula.kb64"
+        )
+        concrete_id = resolve_rocm_concrete_candidate_id(formula, 256)
+        self.assertEqual(concrete_id, "rocm.nvnni.decode.fast.kb8")
+        physical = rocm_decode_observation(candidate_id=concrete_id, k=256)
+        physical_corpus = ObservationCorpus((physical,))
+        requests = build_profiler_request_manifest(physical_corpus)
+        evidence = evidence_manifest(requests, (
+            complete_evidence(
+                requests.requests[0],
+                dispatches=(rocm_dispatch(),),
+            ),
+        ))
+        catalog = build_profiler_feature_catalog(
+            physical_corpus,
+            profiler_feature_rows(physical_corpus, requests, evidence),
+            request_manifest_digest=requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+        )
+        projected = project_rocm_shape_resolved_candidates(physical_corpus)
+        formula_observation = next(
+            row for row in projected if row.candidate_id == formula.candidate_id
+        )
+
+        concrete_descriptor = catalog.descriptor_for(physical)
+        formula_descriptor = catalog.rebind(projected).descriptor_for(
+            formula_observation
+        )
+        self.assertIs(formula_descriptor, concrete_descriptor)
+        self.assertEqual(
+            formula_observation.effective_candidate_id,
+            physical.effective_candidate_id,
+        )
+        with self.assertRaisesRegex(ValueError, "not a physical profiler launch"):
+            profiler_request_for_observation(formula_observation)
+
     def test_request_and_evidence_manifests_authenticate_round_trip(self) -> None:
         requests = build_profiler_request_manifest(
             ObservationCorpus((cuda_observation(),))
@@ -4130,13 +4570,16 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
                 uses_atomic_reduction=candidate.uses_atomic_reduction,
                 observed_candidate_id=candidate.effective_candidate_id,
             )
-            with self.assertRaisesRegex(ValueError, "omits physical candidate"):
-                load_profiler_feature_catalog(
-                    ObservationCorpus((*target, unknown)),
-                    request_path,
-                    evidence_path,
-                    source_corpus=source,
-                )
+            extended = load_profiler_feature_catalog(
+                ObservationCorpus((*target, unknown)),
+                request_path,
+                evidence_path,
+                source_corpus=source,
+            )
+            self.assertNotIn(
+                "profile.dispatch_count",
+                extended.descriptor_for(unknown).features,
+            )
 
     def test_profiler_catalog_cache_reuses_only_identical_source_artifacts(self) -> None:
         """Repeat fits bypass giant JSON parsing without weakening provenance."""
@@ -4197,6 +4640,32 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             self.assertEqual(lazy.digest, first.digest)
             self.assertEqual(lazy.descriptors, first.descriptors)
 
+            default_cache = evidence_path.with_name(
+                evidence_path.name + ".normalized-catalog-v2.jsonl"
+            )
+            derived = load_profiler_feature_catalog(
+                source,
+                request_path,
+                evidence_path,
+                source_corpus=source,
+            )
+            self.assertTrue(default_cache.is_file())
+            with mock.patch(
+                "native_vnni_dispatch.profiler_model.read_profiler_request_manifest",
+                side_effect=AssertionError("request JSON was reparsed"),
+            ), mock.patch(
+                "native_vnni_dispatch.profiler_model.read_profiler_evidence_manifest",
+                side_effect=AssertionError("evidence JSON was reparsed"),
+            ):
+                reused_derived = load_profiler_feature_catalog(
+                    source,
+                    request_path,
+                    evidence_path,
+                    source_corpus=source,
+                )
+            self.assertEqual(reused_derived.digest, derived.digest)
+            self.assertEqual(reused_derived.descriptors, derived.descriptors)
+
     def test_profiler_manifests_parallel_decode_matches_serial_order(self) -> None:
         """Offline pools must preserve exact request and dispatch inventories."""
 
@@ -4242,6 +4711,116 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         self.assertEqual(parallel_evidence, serial_evidence)
         self.assertEqual(parallel_requests.digest(), requests.digest())
         self.assertEqual(parallel_evidence.digest(), evidence.digest())
+
+    def test_legacy_pretty_evidence_parallel_decode_matches_canonical(self) -> None:
+        """Old indented evidence uses physical cores without changing identity."""
+
+        _source, _costs, _requests, evidence, *_unused = profiler_model_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-evidence.json"
+            path.write_text(
+                json.dumps(
+                    evidence.canonical_mapping(),
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertIsNone(
+                profiler_evidence._read_canonical_manifest_document(
+                    path,
+                    "evidence",
+                    workers=2,
+                    parallel_threshold=1,
+                )
+            )
+            self.assertIsNotNone(
+                profiler_evidence._read_pretty_manifest_document(
+                    path,
+                    "evidence",
+                    workers=2,
+                    parallel_threshold=1,
+                )
+            )
+            decoded = read_profiler_evidence_manifest(
+                path,
+                workers=2,
+                parallel_threshold=1,
+            )
+
+        self.assertEqual(decoded, evidence)
+        self.assertEqual(decoded.digest(), evidence.digest())
+
+    def test_legacy_pretty_evidence_parallel_decode_rejects_tampering(self) -> None:
+        """Whitespace compatibility cannot weaken semantic authentication."""
+
+        _source, _costs, _requests, evidence, *_unused = profiler_model_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-evidence.json"
+            encoded = json.dumps(
+                evidence.canonical_mapping(),
+                indent=2,
+                sort_keys=True,
+            ) + "\n"
+            needle = f'"profiler_pass_count": {evidence.evidence[0].profiler_pass_count}'
+            replacement = (
+                f'"profiler_pass_count": '
+                f'{evidence.evidence[0].profiler_pass_count + 1}'
+            )
+            self.assertIn(needle, encoded)
+            path.write_text(encoded.replace(needle, replacement, 1), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "digest does not match"):
+                read_profiler_evidence_manifest(
+                    path,
+                    workers=2,
+                    parallel_threshold=1,
+                )
+
+    def test_compact_witnesses_migrates_authenticated_pretty_evidence(self) -> None:
+        """One legacy decode leaves later fit phases on the mmap fast path."""
+
+        source, _costs, requests, evidence, *_unused = profiler_model_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observation_path = root / "observations.csv"
+            request_path = root / "requests.json"
+            evidence_path = root / "legacy-evidence.json"
+            output_path = root / "witnesses.csv"
+            write_observation_csv(observation_path, source.observations)
+            write_profiler_request_manifest(request_path, requests)
+            evidence_path.write_text(
+                json.dumps(
+                    evidence.canonical_mapping(),
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            original_digest = evidence.digest()
+
+            result = profiler_evidence.main((
+                "compact-witnesses",
+                "--observation",
+                str(observation_path),
+                "--requests",
+                str(request_path),
+                "--evidence",
+                str(evidence_path),
+                "--output",
+                str(output_path),
+            ))
+
+            self.assertEqual(result, 0)
+            self.assertTrue(output_path.is_file())
+            self.assertTrue(evidence_path.read_bytes().startswith(b'{"'))
+            self.assertEqual(
+                read_profiler_evidence_manifest(evidence_path).digest(),
+                original_digest,
+            )
 
     def test_observation_csv_parallel_parse_matches_serial_order(self) -> None:
         """CSV byte partitions preserve every validated canonical row."""
@@ -4634,6 +5213,140 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             self.assertFalse(journal.exists())
             self.assertEqual(manifest.evidence, (item,))
 
+    def test_profiler_checkpoint_parallel_resume_matches_serial(self) -> None:
+        """Line-aligned journal workers preserve deterministic evidence."""
+
+        observations = ObservationCorpus(tuple(
+            cuda_observation(candidate_id=candidate.candidate_id)
+            for candidate in cuda_native_vnni_gemv_registry().entries[:8]
+        ))
+        requests = build_profiler_request_manifest(observations)
+        items = tuple(
+            complete_evidence(request) for request in requests.requests
+        )
+        self.assertGreaterEqual(len(items), 3)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            serial_output = root / "serial.json"
+            parallel_output = root / "parallel.json"
+            _append_checkpoint_journal(serial_output, requests, items)
+            _append_checkpoint_journal(parallel_output, requests, items)
+
+            serial = _load_incremental_evidence(
+                serial_output,
+                requests,
+                resume=True,
+                workers=1,
+                parallel_threshold_bytes=1,
+            )
+            parallel = _load_incremental_evidence(
+                parallel_output,
+                requests,
+                resume=True,
+                workers=2,
+                parallel_threshold_bytes=1,
+            )
+
+        self.assertEqual(
+            {
+                request_id: evidence.canonical_mapping()
+                for request_id, evidence in parallel.items()
+            },
+            {
+                request_id: evidence.canonical_mapping()
+                for request_id, evidence in serial.items()
+            },
+        )
+
+    def test_interrupted_checkpoint_publishes_only_uncovered_terminal_records(
+        self,
+    ) -> None:
+        """Corpus regeneration preserves paid launches without rebinding them."""
+
+        observations = ObservationCorpus((
+            cuda_observation(),
+            cuda_observation(
+                candidate_id="cuda.nvnni.decode.fast_m1.wide.tn128.cpt2"
+            ),
+        ))
+        requests = build_profiler_request_manifest(observations)
+        paid_request = requests.requests[0]
+        paid_evidence = complete_evidence(paid_request)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_observations = root / "source.csv"
+            source_requests = root / "source.requests.json"
+            source_evidence = root / "source.evidence.json"
+            write_observation_csv(
+                source_observations,
+                observations.observations,
+            )
+            write_profiler_request_manifest(source_requests, requests)
+            _append_checkpoint_journal(
+                source_evidence,
+                requests,
+                (paid_evidence,),
+            )
+
+            recovered_observations = root / "recovered.csv"
+            recovered_requests = root / "recovered.requests.json"
+            recovered_evidence = root / "recovered.evidence.json"
+            report = recover_complete_checkpoint(
+                source_observations=source_observations,
+                source_requests=source_requests,
+                source_evidence=source_evidence,
+                covered_requests=(),
+                output_observations=recovered_observations,
+                output_requests=recovered_requests,
+                output_evidence=recovered_evidence,
+            )
+
+            self.assertEqual(report.source_record_count, 1)
+            self.assertEqual(report.terminal_record_count, 1)
+            self.assertEqual(report.covered_record_count, 0)
+            self.assertEqual(report.recovered_record_count, 1)
+            recovered_request_manifest = read_profiler_request_manifest(
+                recovered_requests
+            )
+            recovered_evidence_manifest = read_profiler_evidence_manifest(
+                recovered_evidence
+            )
+            self.assertEqual(
+                recovered_request_manifest.requests,
+                (paid_request,),
+            )
+            self.assertEqual(
+                recovered_evidence_manifest.evidence,
+                (paid_evidence,),
+            )
+            self.assertTrue(validate_profiler_evidence_coverage(
+                recovered_request_manifest,
+                recovered_evidence_manifest,
+            ).complete)
+
+            covered_observation = dataclasses.replace(
+                observations.observations[0],
+                run_id="profile-unit-regenerated-run",
+                corpus_id="sha256:profile-unit-regenerated-corpus",
+            )
+            covered_manifest = build_profiler_request_manifest(
+                ObservationCorpus((covered_observation,))
+            )
+            covered_path = root / "covered.requests.json"
+            write_profiler_request_manifest(covered_path, covered_manifest)
+            omitted = recover_complete_checkpoint(
+                source_observations=source_observations,
+                source_requests=source_requests,
+                source_evidence=source_evidence,
+                covered_requests=(covered_path,),
+                output_observations=root / "omitted.csv",
+                output_requests=root / "omitted.requests.json",
+                output_evidence=root / "omitted.evidence.json",
+            )
+            self.assertEqual(omitted.covered_record_count, 1)
+            self.assertEqual(omitted.recovered_record_count, 0)
+            self.assertFalse((root / "omitted.requests.json").exists())
+
     def test_cuda_collector_environment_selects_exactly_one_surface(self) -> None:
         request = profiler_request_for_observation(cuda_observation())
         environment = _profile_environment(request, Path("/tmp/profile-unit"))
@@ -4964,7 +5677,7 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             source_codebook_id=8,
         )
 
-        batches = _build_cuda_process_batches(
+        batches = _build_gpu_process_batches(
             (base, second, later_cell, other_format), maximum_size=3
         )
 
@@ -4974,7 +5687,7 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             {request.request_id for request in packed.requests},
             {"cuda-batch-a", "cuda-batch-b", "cuda-batch-c"},
         )
-        split = _build_cuda_process_batches(
+        split = _build_gpu_process_batches(
             (base, second, later_cell), maximum_size=2
         )
         self.assertEqual(
@@ -5001,7 +5714,7 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             aggregate_n=512,
             projection_n_vector=(512,),
         )
-        batch = _build_cuda_process_batches((base, later), 8)[0]
+        batch = _build_gpu_process_batches((base, later), 8)[0]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             raw_directories = {}
@@ -5010,7 +5723,7 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
                 raw.mkdir()
                 raw_directories[request.request_id] = raw
             plan = root / "requests.tsv"
-            digest = _write_cuda_batch_plan(plan, batch, raw_directories)
+            digest = _write_gpu_batch_plan(plan, batch, raw_directories)
             environment = _cuda_batch_environment(
                 batch, plan, digest, root / "batch"
             )
@@ -5042,7 +5755,74 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             "--raw-directory", "raw",
             "--backend", "cuda",
         ])
-        self.assertEqual(args.gpu_process_batch_size, 4096)
+        self.assertIsNone(args.gpu_process_batch_size)
+        self.assertEqual(
+            _resolve_gpu_process_batch_size(
+                Backend.CUDA,
+                args.gpu_process_batch_size,
+            ),
+            512,
+        )
+
+    def test_rocm_profiler_default_resets_before_corrupt_lifetime(self) -> None:
+        """ROCm defaults to the longest process lifetime proven stable."""
+
+        self.assertEqual(
+            _resolve_gpu_process_batch_size(Backend.ROCM, None),
+            256,
+        )
+
+    def test_rocm_profiler_rejects_unvalidated_process_lifetime(self) -> None:
+        """ROCm graph packet state must be reset at a process boundary."""
+
+        _validate_gpu_process_batch_size(Backend.ROCM, 256)
+        _validate_gpu_process_batch_size(Backend.CUDA, 4096)
+        with self.assertRaisesRegex(ValueError, "capped at 256 requests"):
+            _validate_gpu_process_batch_size(Backend.ROCM, 257)
+
+    def test_rocm_graph_only_resume_batches_reset_before_257th_graph(self) -> None:
+        """A graph-only retry cannot inherit the balanced corpus batch size."""
+
+        base = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            backend=Backend.ROCM,
+            execution_mode=ExecutionMode.GRAPH_CAPTURED,
+            source_format="IQ1_M",
+            source_codebook_id=17,
+            runtime_codebook_id=17,
+            prepared_family_id="rocm:native-vnni:IQ1_M",
+            candidate_id="rocm.nvnni.decode.fast.kb1",
+            effective_candidate_id="rocm.nvnni.decode.fast.kb1",
+        )
+        requests = tuple(
+            dataclasses.replace(
+                base,
+                request_id=f"rocm-graph-{index}",
+                observation_digest="sha256:" + f"{index:064x}"[-64:],
+                shape_name=f"shape-{index // 64}",
+                shape_group_id=f"shape-{index // 64}",
+                candidate_id=f"rocm.nvnni.decode.fast.kb{index % 64 + 1}",
+                effective_candidate_id=(
+                    f"rocm.nvnni.decode.fast.kb{index % 64 + 1}"
+                ),
+            )
+            for index in range(300)
+        )
+
+        batches = _build_gpu_process_batches(
+            requests,
+            maximum_size=256,
+            maximum_graph_captured=256,
+        )
+
+        self.assertEqual(sorted(len(batch.requests) for batch in batches), [44, 256])
+        self.assertTrue(all(
+            sum(
+                request.execution_mode == ExecutionMode.GRAPH_CAPTURED
+                for request in batch.requests
+            ) <= 256
+            for batch in batches
+        ))
 
     def test_cpu_profiler_batch_preserves_completed_members_after_later_failure(
         self,
@@ -5362,8 +6142,8 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             path = Path(directory) / "rocprof.csv"
             path.write_text(
                 "KernelName,Index,wgr,arch_vgpr,sgpr,lds,scr,DurationNs,"
-                "GPUBusy,VALUBusy,MemUnitBusy\n"
-                "nativeVnni,0,256,64,48,8192,0,2500,92,73,66\n",
+                "GPUBusy,VALUBusy,MemUnitBusy,VALUInsts,FlatVMemInsts\n"
+                "nativeVnni,0,256,64,48,8192,0,2500,92,73,66,287,12.5\n",
                 encoding="utf-8",
             )
             dispatches = parse_rocprof_csvs((path,), request)
@@ -5372,6 +6152,14 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         self.assertEqual(metrics["gpu.vgpr_count"].value, 64.0)
         self.assertEqual(metrics["gpu.sgpr_count"].value, 48.0)
         self.assertEqual(metrics["gpu.gpu_busy_pct"].value, 92.0)
+        self.assertEqual(
+            metrics["gpu.valu_instructions_per_workitem"].value,
+            287.0,
+        )
+        self.assertEqual(
+            metrics["gpu.flat_vmem_instructions_per_workitem"].value,
+            12.5,
+        )
         self.assertEqual(dispatches[0].block, (256, 1, 1))
 
     def test_rocprof_counter_ranges_join_to_physical_trace_by_dispatch_order(self) -> None:
@@ -5425,6 +6213,116 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         self.assertEqual(second["gpu.gpu_busy_pct"].value, 95.0)
         self.assertEqual(second["gpu.vgpr_count"].value, 64.0)
 
+    def test_rocprof_batch_ranges_partition_every_counter_pass_exactly(self) -> None:
+        """Two differently sized pipelines cannot exchange ROCm counters."""
+
+        base = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            request_id="rocm-batch-a",
+            backend=Backend.ROCM,
+        )
+        second = dataclasses.replace(
+            base,
+            request_id="rocm-batch-b",
+            observation_digest="sha256:" + "9" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace_dir = root / "trace"
+            first_pass = root / "counters-0"
+            second_pass = root / "counters-1"
+            trace_dir.mkdir()
+            first_pass.mkdir()
+            second_pass.mkdir()
+            trace_header = (
+                "Kernel_Name,Dispatch_Id,Start_Timestamp,End_Timestamp,"
+                "LDS_Block_Size,Scratch_Size,VGPR_Count,SGPR_Count,"
+                "Workgroup_Size_X,Workgroup_Size_Y,Workgroup_Size_Z,"
+                "Grid_Size_X,Grid_Size_Y,Grid_Size_Z\n"
+            )
+            (trace_dir / "profile_kernel_trace.csv").write_text(
+                trace_header
+                + "physicalQuantizeA,1,100,120,0,0,8,24,64,1,1,32,1,1\n"
+                + "physicalComputeA,2,130,200,2048,0,40,48,256,1,1,8,1,1\n"
+                + "physicalQuantizeB,3,210,230,0,0,8,24,64,1,1,32,1,1\n"
+                + "physicalComputeB,4,240,330,4096,0,60,56,256,1,1,16,1,1\n"
+                + "physicalReduceB,5,340,370,0,0,20,32,128,1,1,4,1,1\n",
+                encoding="utf-8",
+            )
+            counter_header = (
+                "Kernel_Name,Dispatch_Id,Counter_Name,Counter_Value,"
+                "Start_Timestamp,End_Timestamp,Workgroup_Size,Grid_Size,"
+                "LDS_Block_Size,Scratch_Size,VGPR_Count,SGPR_Count\n"
+            )
+
+            def counter_pass(
+                metrics: tuple[tuple[str, tuple[float, ...]], ...]
+            ) -> str:
+                rows = []
+                aliases = (
+                    "rocm-batch-a",
+                    "rocm-batch-a",
+                    "rocm-batch-b",
+                    "rocm-batch-b",
+                    "rocm-batch-b",
+                )
+                for name, values in metrics:
+                    for dispatch_id, (request_id, value) in enumerate(
+                        zip(aliases, values), start=10
+                    ):
+                        rows.append(
+                            f"NativeVNNIProfile::{request_id},{dispatch_id},"
+                            f"{name},{value},100,200,64,896,0,0,20,48\n"
+                        )
+                return counter_header + "".join(rows)
+
+            (first_pass / "profile_counter_collection.csv").write_text(
+                counter_pass((
+                    ("GPUBusy", (11, 12, 21, 22, 23)),
+                    ("VALUBusy", (31, 32, 41, 42, 43)),
+                    ("MemUnitBusy", (51, 52, 61, 62, 63)),
+                )),
+                encoding="utf-8",
+            )
+            (second_pass / "profile_counter_collection.csv").write_text(
+                counter_pass(((
+                    "VALUInsts", (101, 102, 201, 202, 203)
+                ),)),
+                encoding="utf-8",
+            )
+            partitioned = parse_rocprof_batch_csvs(
+                root.rglob("*.csv"), (base, second)
+            )
+
+        self.assertEqual(
+            [item.kernel_name for item in partitioned["rocm-batch-a"]],
+            ["physicalQuantizeA", "physicalComputeA"],
+        )
+        self.assertEqual(
+            [item.kernel_name for item in partitioned["rocm-batch-b"]],
+            ["physicalQuantizeB", "physicalComputeB", "physicalReduceB"],
+        )
+        self.assertEqual(
+            [item.dispatch_index for item in partitioned["rocm-batch-b"]],
+            [0, 1, 2],
+        )
+        first_compute = {
+            metric.metric_id: metric
+            for metric in partitioned["rocm-batch-a"][1].metrics
+        }
+        second_compute = {
+            metric.metric_id: metric
+            for metric in partitioned["rocm-batch-b"][1].metrics
+        }
+        self.assertEqual(first_compute["gpu.gpu_busy_pct"].value, 12.0)
+        self.assertEqual(
+            first_compute["gpu.valu_instructions_per_workitem"].value, 102.0
+        )
+        self.assertEqual(second_compute["gpu.gpu_busy_pct"].value, 22.0)
+        self.assertEqual(
+            second_compute["gpu.valu_instructions_per_workitem"].value, 202.0
+        )
+
     def test_missing_profiler_tool_is_typed_evidence_not_silent_omission(self) -> None:
         request = profiler_request_for_observation(cuda_observation())
         with tempfile.TemporaryDirectory() as directory:
@@ -5462,6 +6360,65 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             payload["profiler_binary_digest"],
             "sha256:c984df6010ad99eefdd2fee14a48d0d649d78029f26a2fddb0b2fbf86dd8f17e",
         )
+
+
+def _flatten_test_suite(suite: unittest.TestSuite) -> list[unittest.TestCase]:
+    """Return every leaf test in deterministic unittest discovery order."""
+
+    leaves: list[unittest.TestCase] = []
+    for test in suite:
+        if isinstance(test, unittest.TestSuite):
+            leaves.extend(_flatten_test_suite(test))
+        else:
+            leaves.append(test)
+    return leaves
+
+
+def load_tests(
+    loader: unittest.TestLoader,
+    tests: unittest.TestSuite,
+    pattern: str | None,
+) -> unittest.TestSuite:
+    """Select one disjoint CTest shard without changing standalone execution.
+
+    The profiler-evidence regression module deliberately covers the complete
+    CPU/CUDA/ROCm evidence contract and therefore contains many focused tests.
+    CTest launches several copies with distinct shard indices so those tests can
+    run concurrently under the normal unit-test timeout. Running this file
+    directly leaves both variables unset and still executes the full suite.
+    """
+
+    del loader, pattern
+    shard_index_text = os.environ.get("LLAMINAR_UNIT_SHARD_INDEX")
+    shard_count_text = os.environ.get("LLAMINAR_UNIT_SHARD_COUNT")
+    if shard_index_text is None and shard_count_text is None:
+        return tests
+    if shard_index_text is None or shard_count_text is None:
+        raise ValueError(
+            "LLAMINAR_UNIT_SHARD_INDEX and LLAMINAR_UNIT_SHARD_COUNT must be set together"
+        )
+
+    try:
+        shard_index = int(shard_index_text)
+        shard_count = int(shard_count_text)
+    except ValueError as error:
+        raise ValueError("unit-test shard values must be integers") from error
+    if shard_count <= 0:
+        raise ValueError("LLAMINAR_UNIT_SHARD_COUNT must be positive")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError(
+            "LLAMINAR_UNIT_SHARD_INDEX must be in [0, LLAMINAR_UNIT_SHARD_COUNT)"
+        )
+
+    # Sorting by the fully qualified test id makes membership independent of
+    # Python dictionary ordering and unittest's internal suite nesting. A
+    # round-robin partition keeps shard cardinalities within one test.
+    leaves = sorted(_flatten_test_suite(tests), key=lambda test: test.id())
+    return unittest.TestSuite(
+        test
+        for ordinal, test in enumerate(leaves)
+        if ordinal % shard_count == shard_index
+    )
 
 
 if __name__ == "__main__":

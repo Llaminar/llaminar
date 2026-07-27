@@ -1713,6 +1713,26 @@ namespace llaminar2
         return runner ? runner->getMTPLogitsLocalInfo() : LogitsLocalInfo{};
     }
 
+    LogitsLocalInfo GlobalOrchestrator::consumeMTPLogitsLocalInfoForSampling()
+    {
+        if (!is_pipeline_tail_)
+            return {};
+        IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner
+                   ? runner->consumeMTPLogitsLocalInfoForSampling()
+                   : LogitsLocalInfo{};
+    }
+
+    LogitsLocalInfo GlobalOrchestrator::consumeMTPLogitsLocalInfoForHostGather()
+    {
+        if (!is_pipeline_tail_)
+            return {};
+        IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner
+                   ? runner->consumeMTPLogitsLocalInfoForHostGather()
+                   : LogitsLocalInfo{};
+    }
+
     bool GlobalOrchestrator::hasAllPositionLogitsLocal() const
     {
         if (!is_pipeline_tail_)
@@ -1727,6 +1747,26 @@ namespace llaminar2
             return {};
         const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
         return runner ? runner->getAllPositionLogitsLocalInfo() : LogitsLocalInfo{};
+    }
+
+    LogitsLocalInfo GlobalOrchestrator::consumeAllPositionLogitsLocalInfoForSampling()
+    {
+        if (!is_pipeline_tail_)
+            return {};
+        IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner
+                   ? runner->consumeAllPositionLogitsLocalInfoForSampling()
+                   : LogitsLocalInfo{};
+    }
+
+    LogitsLocalInfo GlobalOrchestrator::consumeAllPositionLogitsLocalInfoForHostGather()
+    {
+        if (!is_pipeline_tail_)
+            return {};
+        IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner
+                   ? runner->consumeAllPositionLogitsLocalInfoForHostGather()
+                   : LogitsLocalInfo{};
     }
 
     bool GlobalOrchestrator::publishGroupedDecodeEquivalentMTPSpecStateBatch(
@@ -2067,6 +2107,30 @@ namespace llaminar2
         {
             const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
             return runner ? runner->getLogitsLocalInfo() : LogitsLocalInfo{};
+        }
+        return {};
+    }
+
+    LogitsLocalInfo GlobalOrchestrator::consumeLogitsLocalInfoForSampling()
+    {
+        if (is_pipeline_tail_)
+        {
+            IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+            return runner
+                       ? runner->consumeLogitsLocalInfoForSampling()
+                       : LogitsLocalInfo{};
+        }
+        return {};
+    }
+
+    LogitsLocalInfo GlobalOrchestrator::consumeLogitsLocalInfoForHostGather()
+    {
+        if (is_pipeline_tail_)
+        {
+            IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+            return runner
+                       ? runner->consumeLogitsLocalInfoForHostGather()
+                       : LogitsLocalInfo{};
         }
         return {};
     }

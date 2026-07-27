@@ -17,7 +17,6 @@
 #include "stages/HiddenStateRowsSelectStage.h"
 #include "stages/LMHeadStage.h"
 #include "stages/MoEExpertDispatchStage.h"
-#include "stages/MoERoutedExpertPartialReduceStage.h"
 #include "stages/MoELocalExpertStage.h"
 #include "stages/MoESparseDispatchStage.h"
 #include "stages/MoESparseReturnReduceStage.h"
@@ -125,12 +124,6 @@ namespace llaminar2
         const MoEExpertDispatchStage::Params &params)
     {
         return std::make_unique<MoEExpertDispatchStage>(params);
-    }
-
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoERoutedExpertPartialReduce(
-        const MoERoutedExpertPartialReduceStage::Params &params)
-    {
-        return std::make_unique<MoERoutedExpertPartialReduceStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoESparseDispatch(

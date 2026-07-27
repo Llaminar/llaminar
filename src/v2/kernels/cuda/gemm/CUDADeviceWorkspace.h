@@ -34,7 +34,6 @@ extern "C"
     typedef struct CUDAPrefillContext_ CUDAPrefillContext;
 
     /** Per-device cuBLAS workspace (handle + FP16 staging). */
-    typedef struct CUDACuBLASContext_ CUDACuBLASContext;
 
     // -----------------------------------------------------------------
     // GEMV context lifetime
@@ -47,7 +46,7 @@ extern "C"
         size_t kpar_partials_bytes);
 
     // -----------------------------------------------------------------
-    // Row-major weight transpose lifetime (per CUDAPackedWeights)
+    // Row-major weight transpose lifetime (per quantized GEMM kernel weight)
     // -----------------------------------------------------------------
     CUDARowMajorWeights *cudaRowMajorWeights_create(
         const uint8_t *d_payload_col,
@@ -58,7 +57,21 @@ extern "C"
         int payload_bytes,
         int cuda_device_id,
         void *stream);
+    CUDARowMajorWeights *cudaRowMajorWeights_createForCodebook(
+        const uint8_t *d_payload_col,
+        const uint16_t *d_scales_col,
+        const uint16_t *d_mins_col,
+        const uint32_t *d_emins_col,
+        int N,
+        int K,
+        uint8_t codebook_id,
+        int cuda_device_id,
+        void *stream);
     void cudaRowMajorWeights_destroy(CUDARowMajorWeights *rm);
+    bool cudaNativeVNNIGemvTuned_policyRequiresRowMajor(
+        uint8_t codebook_id,
+        int N,
+        int K);
 
     // -----------------------------------------------------------------
     // Prefill context lifetime
@@ -85,8 +98,6 @@ extern "C"
     // -----------------------------------------------------------------
     // cuBLAS context lifetime
     // -----------------------------------------------------------------
-    CUDACuBLASContext *cudaCuBLASContext_create(int cuda_device_id);
-    void cudaCuBLASContext_destroy(CUDACuBLASContext *ctx);
 
 #ifdef __cplusplus
 }

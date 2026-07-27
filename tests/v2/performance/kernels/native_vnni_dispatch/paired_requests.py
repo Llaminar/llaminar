@@ -749,8 +749,8 @@ def build_paired_request_plan(
     already satisfies the installation p95 threshold.
     """
 
-    if not 0.0 < max_regret < 1.0:
-        raise ValueError("max_regret must be strictly between zero and one")
+    if not 0.0 < max_regret <= 1.0:
+        raise ValueError("max_regret must be in (0, 1]")
     backends = {row.backend for row in development}
     if len(backends) != 1 or next(iter(backends)) not in {
         Backend.CPU,

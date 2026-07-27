@@ -20,6 +20,7 @@
 #include "../tensors/TensorSlice.h"
 #include "../kernels/KernelFactory.h"
 #include "../backends/BackendManager.h"
+#include "../transfer/TransferEngine.h"
 
 // GPU weight loading pipeline
 #include "gpu_pipeline/LoadOrchestrator.h"
@@ -211,6 +212,9 @@ namespace llaminar2
             if (!binding.tensor || binding.tensor->shape().size() != 2)
                 return false;
             if (binding.identity.role == WeightRole::Embedding ||
+                binding.identity.role == WeightRole::OutputNorm ||
+                binding.identity.role == WeightRole::GDNSsmParam ||
+                binding.identity.role == WeightRole::MoERouter ||
                 binding.identity.role == WeightRole::Norm ||
                 binding.identity.role == WeightRole::Bias)
             {
@@ -218,11 +222,16 @@ namespace llaminar2
             }
             if (!include_expert_jobs && isRoutedExpertBinding(binding))
                 return false;
-            if (binding.prepared.has_value() && binding.prepared->device == device)
-                return true;
 
             try
             {
+                /*
+                 * A prepared-kind hint describes the representation expected
+                 * after preparation; it is not permission to reinterpret a
+                 * schema-declared norm, bias, router, or recurrent parameter as
+                 * GEMM. The model's structural classification remains
+                 * authoritative even when a stale hint is present.
+                 */
                 return manager.isGemmWeight(binding.identity.canonical_name);
             }
             catch (const std::exception &)
@@ -2767,7 +2776,6 @@ namespace llaminar2
 
         size_t loaded_tensors = 0;
         size_t total_uploads = 0;
-        size_t load_failures = 0;
 
         for (const auto &device : devices)
         {
@@ -2790,8 +2798,9 @@ namespace llaminar2
                 if (!tensor)
                 {
                     markPrepState(name, device, WeightPrepState::FAILED, is_gemm_weight, "getWeightForDevice failed during preload");
-                    ++load_failures;
-                    continue;
+                    throw std::runtime_error(
+                        "[WeightManager] Required weight '" + name +
+                        "' could not be materialized for " + device.to_string());
                 }
 
                 markPrepState(name, device, WeightPrepState::LOADED_HOST, is_gemm_weight, "weight loaded for device");
@@ -2822,9 +2831,11 @@ namespace llaminar2
 
                 if (device.type != DeviceType::CPU)
                 {
-                    if (tensor->ensureOnDevice(device))
+                    const auto upload =
+                        TransferEngine::instance().upload(tensor.get(), device);
+                    if (upload.success)
                     {
-                        markPrepState(name, device, WeightPrepState::UPLOADED_DEVICE, is_gemm_weight, "preload ensureOnDevice completed");
+                        markPrepState(name, device, WeightPrepState::UPLOADED_DEVICE, is_gemm_weight, "preload TransferEngine upload completed");
                         if (!is_gemm_weight)
                         {
                             markPrepState(name, device, WeightPrepState::READY, false, "preload non-GEMM ready");
@@ -2833,10 +2844,11 @@ namespace llaminar2
                     }
                     else
                     {
-                        markPrepState(name, device, WeightPrepState::FAILED, is_gemm_weight, "preload ensureOnDevice failed");
-                        ++load_failures;
-                        LOG_WARN("[WeightManager] Failed to upload preloaded tensor "
-                                 << name << " to " << device.to_string());
+                        markPrepState(name, device, WeightPrepState::FAILED, is_gemm_weight, "preload TransferEngine upload failed");
+                        throw std::runtime_error(
+                            "[WeightManager] Required weight '" + name +
+                            "' failed upload to " + device.to_string() +
+                            ": " + upload.error);
                     }
                 }
             }
@@ -2844,7 +2856,6 @@ namespace llaminar2
 
         LOG_DEBUG("[WeightManager] Preload complete: loaded=" << loaded_tensors
                                                               << ", uploads=" << total_uploads
-                                                              << ", failures=" << load_failures
                                                               << (seeded_from_loader ? " (seeded from loader names)" : ""));
         return true;
     }
@@ -2966,7 +2977,13 @@ namespace llaminar2
         bool non_gemm_ok = true;
         if (is_gpu)
         {
-            non_gemm_ok = uploadNonGemmWeights(device, layer_filter);
+            non_gemm_ok = frozen_weights
+                              ? uploadFrozenNonGemmWeights(
+                                    device,
+                                    *frozen_weights,
+                                    layer_filter,
+                                    include_expert_jobs)
+                              : uploadNonGemmWeights(device, layer_filter);
             if (!non_gemm_ok)
             {
                 LOG_ERROR("[WeightManager] Non-GEMM weight upload failed for " << device_name);
@@ -5145,7 +5162,6 @@ namespace llaminar2
                     job.N = static_cast<int>(tensor->rows());
                     job.K = static_cast<int>(tensor->cols());
                     job.is_asymmetric = false;
-                    job.advise_mmap_dontneed_after_staging = tensor->is_mmap_data();
                     orchestrator->addWeightJob(target_device.ordinal, job);
                 }
                 continue;
@@ -5181,7 +5197,6 @@ namespace llaminar2
             job.N = static_cast<int>(tensor->rows());
             job.K = static_cast<int>(tensor->cols());
             job.is_asymmetric = vnni->is_asymmetric;
-            job.advise_mmap_dontneed_after_staging = tensor->is_mmap_data();
 
             orchestrator->addWeightJob(target_device.ordinal, job);
         }
@@ -5205,7 +5220,6 @@ namespace llaminar2
                     job.N = static_cast<int>(mj.view->rows());
                     job.K = static_cast<int>(mj.view->cols());
                     job.is_asymmetric = false;
-                    job.advise_mmap_dontneed_after_staging = mj.view->is_mmap_data();
                     orchestrator->addWeightJob(target_device.ordinal, job);
                 }
                 continue;
@@ -5241,7 +5255,6 @@ namespace llaminar2
             job.N = static_cast<int>(moe_jobs[i].view->rows());
             job.K = static_cast<int>(moe_jobs[i].view->cols());
             job.is_asymmetric = vnni->is_asymmetric;
-            job.advise_mmap_dontneed_after_staging = moe_jobs[i].view->is_mmap_data();
 
             orchestrator->addWeightJob(target_device.ordinal, job);
         }
@@ -5696,6 +5709,127 @@ namespace llaminar2
         return total_registered == planned_count;
     }
 
+    bool WeightManager::uploadFrozenNonGemmWeights(
+        DeviceId target_device,
+        const FrozenModelWeightSet &frozen_weights,
+        const std::function<bool(const std::string &)> &layer_filter,
+        bool include_expert_jobs)
+    {
+        (void)include_expert_jobs;
+
+        if (!target_device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "WeightManager::uploadFrozenNonGemmWeights requires a GPU target");
+        }
+
+        size_t uploaded_count = 0;
+        std::unordered_set<TensorBase *> visited;
+        visited.reserve(frozen_weights.bindings().size());
+
+        for (const auto &binding : frozen_weights.bindings())
+        {
+            if (!bindingTargetsDevice(binding, target_device))
+                continue;
+
+            const std::string &name = binding.identity.canonical_name;
+            if (layer_filter && !layer_filter(name))
+                continue;
+
+            if (!binding.tensor)
+            {
+                throw std::runtime_error(
+                    "[WeightManager] Frozen binding targeting " +
+                    target_device.to_string() +
+                    " has no tensor: " + name);
+            }
+
+            /*
+             * Dense GEMM bindings are prepared into backend-native packed
+             * storage by packGemmWeightsViaPipeline(). Routed experts are
+             * prepared into expert slabs by the explicit expert pipeline.
+             * Neither representation consumes the binding's raw tensor pointer.
+             */
+            if (shouldPrepareFrozenGemmBinding(
+                    *this,
+                    binding,
+                    target_device,
+                    /*include_expert_jobs=*/true) ||
+                isRoutedExpertBinding(binding) ||
+                name.find("_exps.weight") != std::string::npos)
+            {
+                continue;
+            }
+
+            TensorBase *tensor = binding.tensor;
+            if (!visited.insert(tensor).second)
+                continue;
+
+            if (tensor->debugName().empty())
+                tensor->setDebugName(name);
+
+            const auto upload =
+                TransferEngine::instance().upload(tensor, target_device);
+            if (!upload.success)
+            {
+                markPrepState(
+                    name,
+                    target_device,
+                    WeightPrepState::FAILED,
+                    false,
+                    "frozen non-GEMM binding upload failed");
+                throw std::runtime_error(
+                    "[WeightManager] Exact frozen non-GEMM binding '" + name +
+                    "' failed upload to " + target_device.to_string() +
+                    ": " + upload.error);
+            }
+
+            if (!tensor->gpu_data_ptr() ||
+                !tensor->is_on_device(target_device))
+            {
+                /*
+                 * HOST_RESIDENT tensors have an explicit backend-owned
+                 * representation (for example prepared embeddings) and are not
+                 * raw graph weights. Every other exact non-GEMM binding must
+                 * expose valid storage on its declared device now.
+                 */
+                if (tensor->memoryResidency() != MemoryResidency::HOST_RESIDENT)
+                {
+                    markPrepState(
+                        name,
+                        target_device,
+                        WeightPrepState::FAILED,
+                        false,
+                        "frozen non-GEMM binding lacks exact device residency");
+                    throw std::runtime_error(
+                        "[WeightManager] Exact frozen non-GEMM binding '" + name +
+                        "' was not resident on " + target_device.to_string() +
+                        " after preparation");
+                }
+                continue;
+            }
+
+            markPrepState(
+                name,
+                target_device,
+                WeightPrepState::UPLOADED_DEVICE,
+                false,
+                "exact frozen non-GEMM binding uploaded");
+            markPrepState(
+                name,
+                target_device,
+                WeightPrepState::READY,
+                false,
+                "exact frozen non-GEMM binding ready");
+            ++uploaded_count;
+        }
+
+        LOG_DEBUG("[WeightManager] Uploaded " << uploaded_count
+                                               << " exact frozen non-GEMM bindings to "
+                                               << target_device.to_string());
+        return true;
+    }
+
     bool WeightManager::uploadNonGemmWeights(
         DeviceId target_device,
         std::function<bool(const std::string &)> layer_filter)
@@ -5793,13 +5927,17 @@ namespace llaminar2
             // Set debug name so transfers can be traced
             device_tensor->setDebugName(name);
 
-            // Upload to GPU using ensureOnDevice (no GEMM packing needed)
-            if (device_tensor->ensureOnDevice(target_device))
+            // Non-GEMM weights still use the sole transfer authority; they do
+            // not need the GEMM packing pipeline, but they must obey the same
+            // explicit placement and failure contract.
+            const auto upload =
+                TransferEngine::instance().upload(device_tensor, target_device);
+            if (upload.success)
             {
                 size_t rows = device_tensor->shape()[0];
                 size_t cols = device_tensor->shape().size() > 1 ? device_tensor->shape()[1] : 1;
                 size_t bytes = rows * cols * sizeof(float);
-                markPrepState(name, target_device, WeightPrepState::UPLOADED_DEVICE, false, "non-GEMM ensureOnDevice completed");
+                markPrepState(name, target_device, WeightPrepState::UPLOADED_DEVICE, false, "non-GEMM TransferEngine upload completed");
                 markPrepState(name, target_device, WeightPrepState::READY, false, "non-GEMM ready");
                 LOG_TRACE("[WeightManager] Uploaded non-GEMM weight: " << name
                                                                        << " [" << rows << "x" << cols << "] = " << bytes << " bytes");
@@ -5807,8 +5945,11 @@ namespace llaminar2
             }
             else
             {
-                markPrepState(name, target_device, WeightPrepState::FAILED, false, "non-GEMM ensureOnDevice failed");
-                LOG_WARN("[WeightManager] Failed to upload non-GEMM weight: " << name);
+                markPrepState(name, target_device, WeightPrepState::FAILED, false, "non-GEMM TransferEngine upload failed");
+                throw std::runtime_error(
+                    "[WeightManager] Required non-GEMM weight '" + name +
+                    "' failed upload to " + target_device.to_string() +
+                    ": " + upload.error);
             }
         }
 
@@ -6909,9 +7050,9 @@ namespace llaminar2
             // For host-resident REPLICATE weights (e.g., token_embd.weight),
             // all devices share identical host data — no clone needed.
             // Non-host-resident REPLICATE weights (norms, biases) need per-device
-            // clones because each device calls ensureOnDevice() which allocates
-            // separate GPU memory and releaseAllHostWeightData() may free host data
-            // after the first device uploads (breaking the second device's upload).
+            // clones because TransferEngine allocates separate GPU storage for
+            // each device. releaseAllHostWeightData() may free host data after
+            // the first upload, which would otherwise break the second upload.
             std::shared_ptr<TensorBase> cached;
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);

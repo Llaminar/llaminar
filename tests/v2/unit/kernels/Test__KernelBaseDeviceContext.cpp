@@ -84,7 +84,7 @@ public:
     // Synchronization
     void synchronize() override {}
     void synchronizeStream(void * /*stream*/) override {}
-    void insertStreamDependency(void * /*dependent_stream*/, void * /*dependency_stream*/) override {}
+    bool insertStreamDependency(void * /*dependent_stream*/, void * /*dependency_stream*/) override { return true; }
 
     // Graph Capture
     std::unique_ptr<IGPUGraphCapture> createGraphCapture() override { return nullptr; }
@@ -178,9 +178,9 @@ TEST_F(Test__CUDAKernelBaseDeviceContext, SetDeviceContext_CanClear)
     EXPECT_EQ(kernel_->deviceContext(), nullptr);
 }
 
-TEST_F(Test__CUDAKernelBaseDeviceContext, GetStream_ReturnsNullWithoutContext)
+TEST_F(Test__CUDAKernelBaseDeviceContext, GetStreamRejectsMissingOwnershipBeforeLaunch)
 {
-    EXPECT_EQ(kernel_->getStream(), nullptr);
+    EXPECT_THROW(kernel_->getStream(), std::runtime_error);
 }
 
 TEST_F(Test__CUDAKernelBaseDeviceContext, GetStream_ReturnsContextStream)
@@ -259,9 +259,9 @@ TEST_F(Test__ROCmKernelBaseDeviceContext, SetDeviceContext_CanClear)
     EXPECT_EQ(kernel_->deviceContext(), nullptr);
 }
 
-TEST_F(Test__ROCmKernelBaseDeviceContext, GetStream_ReturnsNullWithoutContext)
+TEST_F(Test__ROCmKernelBaseDeviceContext, GetStreamRejectsMissingOwnershipBeforeLaunch)
 {
-    EXPECT_EQ(kernel_->getStream(), nullptr);
+    EXPECT_THROW(kernel_->getStream(), std::runtime_error);
 }
 
 TEST_F(Test__ROCmKernelBaseDeviceContext, GetStream_ReturnsContextStream)

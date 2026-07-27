@@ -2425,7 +2425,6 @@ namespace llaminar2
                 job.N = static_cast<int>(view->rows());
                 job.K = static_cast<int>(view->cols());
                 job.is_asymmetric = vnni->is_asymmetric;
-                job.advise_mmap_dontneed_after_staging = view->is_mmap_data();
 
                 orchestrator->addWeightJob(gpu_ordinal, job);
             }

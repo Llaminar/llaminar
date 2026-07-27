@@ -1,19 +1,21 @@
 /**
  * @file Test__TensorBase_AuthoritativeDevice.cpp
  * @brief Unit tests for TensorBase authoritative device tracking
- * 
+ *
  * Tests the new multi-device coherence API:
  * - getAuthoritativeDevice()
  * - isHostAuthoritative()
  * - isDeviceAuthoritative()
- * 
+ *
  * These methods enable direct GPU-to-GPU transfers without host staging.
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include "v2/tensors/TensorClasses.h"
 #include "v2/backends/DeviceId.h"
 #include "v2/backends/BackendManager.h"
+#include "../../utils/ScopedGPUStream.h"
 
 using namespace llaminar2;
 
@@ -22,33 +24,48 @@ protected:
     void SetUp() override {
         // Create a simple FP32 tensor for testing (32 rows x 64 cols)
         tensor_ = std::make_unique<FP32Tensor>(std::vector<size_t>{32, 64});
-        
+
         // Initialize with known pattern
         float* data = tensor_->mutable_data();
         for (size_t i = 0; i < tensor_->numel(); ++i) {
             data[i] = static_cast<float>(i);
         }
-        
+
         // Check for available GPU backends
 #ifdef HAVE_CUDA
         if (getCUDABackend() != nullptr) {
             cuda_available_ = true;
             cuda_device_ = DeviceId::cuda(0);
+            cuda_stream_ =
+                std::make_unique<llaminar2::test::ScopedGPUStream>(cuda_device_);
         }
 #endif
 #ifdef HAVE_ROCM
         if (getROCmBackend() != nullptr) {
             rocm_available_ = true;
             rocm_device_ = DeviceId::rocm(0);
+            rocm_stream_ =
+                std::make_unique<llaminar2::test::ScopedGPUStream>(rocm_device_);
         }
 #endif
     }
-    
+
+    void *streamFor(DeviceId device) const {
+        if (device.type == DeviceType::CUDA && cuda_stream_)
+            return cuda_stream_->get();
+        if (device.type == DeviceType::ROCm && rocm_stream_)
+            return rocm_stream_->get();
+        throw std::runtime_error(
+            "No explicit integration-test stream for requested GPU");
+    }
+
     std::unique_ptr<FP32Tensor> tensor_;
     bool cuda_available_ = false;
     bool rocm_available_ = false;
     DeviceId cuda_device_ = DeviceId::cpu();
     DeviceId rocm_device_ = DeviceId::cpu();
+    std::unique_ptr<llaminar2::test::ScopedGPUStream> cuda_stream_;
+    std::unique_ptr<llaminar2::test::ScopedGPUStream> rocm_stream_;
 };
 
 // =============================================================================
@@ -69,23 +86,23 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, InitialState_NotDeviceAuthoritative
 }
 
 // =============================================================================
-// transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) Tests
+// TransferEngine Device-Write Publication Tests
 // =============================================================================
 
 TEST_F(Test__TensorBase_AuthoritativeDevice, MarkDeviceDirty_SetsAuthoritative_CUDA) {
     if (!cuda_available_) {
         GTEST_SKIP() << "No CUDA device available";
     }
-    
+
     // Upload to GPU
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    
+
     // Before mark_device_dirty, host is still authoritative
     EXPECT_TRUE(tensor_->isHostAuthoritative());
-    
+
     // Mark device dirty
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(cuda_device_));
+
     // Now device should be authoritative
     EXPECT_FALSE(tensor_->isHostAuthoritative());
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
@@ -96,16 +113,16 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, MarkDeviceDirty_SetsAuthoritative_R
     if (!rocm_available_) {
         GTEST_SKIP() << "No ROCm device available";
     }
-    
+
     // Upload to GPU
     ASSERT_TRUE(tensor_->ensureOnDevice(rocm_device_));
-    
+
     // Before mark_device_dirty, host is still authoritative
     EXPECT_TRUE(tensor_->isHostAuthoritative());
-    
+
     // Mark device dirty
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(rocm_device_));
+
     // Now device should be authoritative
     EXPECT_FALSE(tensor_->isHostAuthoritative());
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(rocm_device_));
@@ -120,15 +137,15 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, EnsureOnHost_ClearsAuthoritative_CU
     if (!cuda_available_) {
         GTEST_SKIP() << "No CUDA device available";
     }
-    
+
     // Upload and mark dirty
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(cuda_device_));
     ASSERT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
-    
+
     // Sync back to host
     ASSERT_TRUE(tensor_->ensureOnHost());
-    
+
     // Host should now be authoritative
     EXPECT_TRUE(tensor_->isHostAuthoritative());
     EXPECT_FALSE(tensor_->getAuthoritativeDevice().has_value());
@@ -138,15 +155,15 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, EnsureOnHost_ClearsAuthoritative_RO
     if (!rocm_available_) {
         GTEST_SKIP() << "No ROCm device available";
     }
-    
+
     // Upload and mark dirty
     ASSERT_TRUE(tensor_->ensureOnDevice(rocm_device_));
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(rocm_device_));
     ASSERT_TRUE(tensor_->isDeviceAuthoritative(rocm_device_));
-    
+
     // Sync back to host
     ASSERT_TRUE(tensor_->ensureOnHost());
-    
+
     // Host should now be authoritative
     EXPECT_TRUE(tensor_->isHostAuthoritative());
     EXPECT_FALSE(tensor_->getAuthoritativeDevice().has_value());
@@ -160,13 +177,13 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, EnsureOnDevice_DoesNotChangeAuthori
     if (!cuda_available_) {
         GTEST_SKIP() << "No CUDA device available";
     }
-    
+
     // Initially host authoritative
     EXPECT_TRUE(tensor_->isHostAuthoritative());
-    
+
     // Upload to GPU (H2D copy)
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    
+
     // Host should STILL be authoritative (we just made a copy to GPU)
     EXPECT_TRUE(tensor_->isHostAuthoritative());
     EXPECT_FALSE(tensor_->isDeviceAuthoritative(cuda_device_));
@@ -180,29 +197,29 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, CrossVendor_AuthoritativeTracking) 
     if (!cuda_available_ || !rocm_available_) {
         GTEST_SKIP() << "Need both CUDA and ROCm for cross-vendor test";
     }
-    
+
     // Start: host authoritative
     EXPECT_TRUE(tensor_->isHostAuthoritative());
-    
+
     // Upload to CUDA
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
     EXPECT_TRUE(tensor_->isHostAuthoritative());  // Still host
-    
+
     // Mark CUDA dirty
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(cuda_device_));
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
     EXPECT_FALSE(tensor_->isDeviceAuthoritative(rocm_device_));
-    
+
     // Sync to host
     ASSERT_TRUE(tensor_->ensureOnHost());
     EXPECT_TRUE(tensor_->isHostAuthoritative());
-    
+
     // Upload to ROCm
     ASSERT_TRUE(tensor_->ensureOnDevice(rocm_device_));
     EXPECT_TRUE(tensor_->isHostAuthoritative());  // Still host
-    
+
     // Mark ROCm dirty
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(rocm_device_));
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(rocm_device_));
     EXPECT_FALSE(tensor_->isDeviceAuthoritative(cuda_device_));
 }
@@ -215,11 +232,11 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, IsDeviceAuthoritative_WrongDevice_R
     if (!cuda_available_) {
         GTEST_SKIP() << "No CUDA device available";
     }
-    
+
     // Upload and mark dirty on CUDA:0
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(cuda_device_));
+
     // Check for different device
     DeviceId other_cuda = DeviceId::cuda(99);  // Non-existent
     EXPECT_FALSE(tensor_->isDeviceAuthoritative(other_cuda));
@@ -230,14 +247,14 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, MultipleMarkDirty_LastWins) {
     if (!cuda_available_) {
         GTEST_SKIP() << "No CUDA device available";
     }
-    
+
     // Upload to CUDA
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(cuda_device_));
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
-    
+
     // Mark dirty again (should still be same device)
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(cuda_device_));
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
 }
 
@@ -248,14 +265,14 @@ TEST_F(Test__TensorBase_AuthoritativeDevice, MultipleMarkDirty_LastWins) {
 TEST_F(Test__TensorBase_AuthoritativeDevice, HostOnlyTensor_AlwaysHostAuthoritative) {
     // A tensor that's never uploaded to GPU should always be host authoritative
     auto host_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{16, 32});
-    
+
     EXPECT_TRUE(host_tensor->isHostAuthoritative());
     EXPECT_FALSE(host_tensor->getAuthoritativeDevice().has_value());
-    
+
     // Multiple reads shouldn't change authoritative state
     [[maybe_unused]] const float* data = host_tensor->data();
     EXPECT_TRUE(host_tensor->isHostAuthoritative());
-    
+
     // Multiple writes shouldn't change authoritative state
     [[maybe_unused]] float* mdata = host_tensor->mutable_data();
     EXPECT_TRUE(host_tensor->isHostAuthoritative());

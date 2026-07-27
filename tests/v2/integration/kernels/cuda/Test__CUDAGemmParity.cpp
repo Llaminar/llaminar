@@ -21,6 +21,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
@@ -32,7 +33,7 @@
 #include "backends/ComputeBackend.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/compute_stages/ComputeStageUtils.h"
-#include "execution/local_execution/coherence/GpuCoherence.h"        // For gpu_output(), with_gpu_coherence()
+#include "execution/local_execution/coherence/GpuCoherence.h"        // Direct-kernel test coherence
 #include "execution/local_execution/device/DeviceWorkspaceManager.h" // For workspace binding
 #include "execution/compute_stages/stages/GDNProjectionStage.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
@@ -733,7 +734,7 @@ namespace
                 kernel->setGPUStream(static_cast<void *>(stream));
         }
 
-        const bool body_ok = fn();
+        const bool body_ok = fn(static_cast<void *>(stream));
         const cudaError_t sync_status = cudaStreamSynchronize(stream);
 
         for (ITensorGemm *kernel : kernels)
@@ -808,9 +809,10 @@ namespace
             std::memcpy(C_tensor->mutable_data(), C_host, (size_t)M * N * sizeof(float));
         bool ok = withExplicitCudaGemmStream(
             {kernel},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(gpu_device, {A_tensor.get()}, {C_tensor.get()},
+                                          static_cast<void *>(stream),
                                           [&]
                                           {
                                               return kernel->multiply_tensor(
@@ -851,12 +853,13 @@ namespace
 
         bool ok = withExplicitCudaGemmStream(
             {kernel},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                     gpu_device,
                     {A_tensor.get()},
                     {C_tensor.get()},
+                    static_cast<void *>(stream),
                     [&]
                     {
                         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
@@ -937,7 +940,7 @@ namespace
         ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess)
             << "device=" << device.to_string();
 
-        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(output, stream);
         result.assign(
             output->data(),
             output->data() + static_cast<size_t>(M) * static_cast<size_t>(N));
@@ -1481,9 +1484,10 @@ namespace
 
         bool ok = withExplicitCudaGemmStream(
             {kernel},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(gpu_device, {gate_tensor.get(), up_tensor.get()}, {C_tensor.get()},
+                                          static_cast<void *>(stream),
                                           [&]
                                           {
                                               if (M > 1)
@@ -2102,6 +2106,78 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
     ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+/**
+ * @test Exercise heuristic-only ordinary prefill for every quantized source
+ * format accepted by the production preparation pipeline.
+ *
+ * M=32 lies immediately above the grouped-verifier regime and therefore enters
+ * the ordinary prefill launcher. The test intentionally leaves tile, split-K,
+ * BK256, and Stream-K controls in production Auto mode. Each source tensor is
+ * prepared through the real KernelFactory path, executed on CUDA, and compared
+ * with the CPU implementation using the format's established quantized parity
+ * threshold. This catches both a missing generated-prefill include dependency
+ * and codebook aliases that fail to reach the total heuristic.
+ */
+TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillHeuristicAllFormatsMatchesCPU)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    constexpr int M = 32;
+    constexpr int N = 384;
+    constexpr int K = 512;
+    ScopedCudaPrefillModes modes;
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    for (const auto &format : cudaSmallMNativeFormats())
+    {
+        SCOPED_TRACE(format.name);
+        auto weights = format.create(N, K);
+        ASSERT_NE(weights, nullptr);
+        auto input = randomFP32(static_cast<size_t>(M) * K);
+
+        std::vector<float> cpu_output(static_cast<size_t>(M) * N, 0.0f);
+        auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+            weights.get(), KernelDeviceType::CPU);
+        ASSERT_NE(cpu_kernel, nullptr) << format.name << " CPU reference kernel";
+        ASSERT_TRUE(cpuMultiplyToVector(
+            cpu_kernel.get(), input.data(), cpu_output.data(), M, N, K));
+
+        ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
+        auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+        ASSERT_NE(cuda_kernel, nullptr) << format.name << " CUDA prepared kernel";
+        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+        std::vector<float> cuda_output(static_cast<size_t>(M) * N, 0.0f);
+        ASSERT_TRUE(cudaMultiplyViaTensor(
+            cuda_kernel,
+            input.data(),
+            cuda_output.data(),
+            M,
+            N,
+            K,
+            gpu_device_));
+
+        const ParityResult parity = checkParity(
+            cuda_output.data(),
+            cpu_output.data(),
+            cuda_output.size(),
+            format.cosine_threshold,
+            0.20);
+        EXPECT_TRUE(parity.passed)
+            << format.name << " heuristic prefill cosine="
+            << parity.cosine_similarity << " relative_l2="
+            << parity.relative_l2_error;
+
+        cleanupWorkspaceIfNeeded(cuda_kernel);
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+    }
+#endif
 }
 
 // ============================================================================
@@ -3172,12 +3248,13 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSing
 
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_qkv, cuda_z},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                 gpu_device_,
                 {A_m4.get()},
                 {qkv_m4.get(), z_m4.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     return cuda_qkv->multiply_fused_verifier_rows_decode_equivalent(
@@ -3204,12 +3281,13 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSing
 
         ASSERT_TRUE(withExplicitCudaGemmStream(
             {cuda_qkv, cuda_z},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                     gpu_device_,
                     {A_m1.get()},
                     {qkv_m1.get(), z_m1.get()},
+                    static_cast<void *>(stream),
                     [&]
                     {
                         return cuda_qkv->multiply_fused_tensor(A_m1.get(), m1_projections, 1, K);
@@ -3285,12 +3363,13 @@ TEST_F(Test__CUDAGemmParity, Q5KQ4K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSi
 
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_qkv, cuda_z},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                 gpu_device_,
                 {A_m4.get()},
                 {qkv_m4.get(), z_m4.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     return cuda_qkv->multiply_fused_verifier_rows_decode_equivalent(
@@ -3317,12 +3396,13 @@ TEST_F(Test__CUDAGemmParity, Q5KQ4K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSi
 
         ASSERT_TRUE(withExplicitCudaGemmStream(
             {cuda_qkv, cuda_z},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                     gpu_device_,
                     {A_m1.get()},
                     {qkv_m1.get(), z_m1.get()},
+                    static_cast<void *>(stream),
                     [&]
                     {
                         return cuda_qkv->multiply_fused_tensor(A_m1.get(), m1_projections, 1, K);
@@ -3560,12 +3640,13 @@ TEST_F(Test__CUDAGemmParity, Q4_K_FusedVerifierSmallM_2RowsTwoProjections)
 
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_kernel0, cuda_kernel1},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                 gpu_device_,
                 {A_tensor.get()},
                 {C0_tensor.get(), C1_tensor.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     return cuda_kernel0->multiply_fused_tensor(
@@ -3718,6 +3799,7 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
         gpu_device_,
         {input.get()},
         {output_qkv.get(), output_z.get(), output_alpha.get(), output_beta.get()},
+        static_cast<void *>(stream),
         [&]
         {
             return stage.execute(&ctx);
@@ -3756,10 +3838,10 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
     ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
     ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 
-    output_qkv->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    output_z->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(output_qkv, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_z, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_alpha, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_beta, stream);
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 
     stage.unbindWorkspace();
@@ -3966,6 +4048,7 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MixedCodebooks_M4MatchesFo
             gpu_device_,
             {input.get()},
             {outputs->qkv.get(), outputs->z.get(), outputs->alpha.get(), outputs->beta.get()},
+            static_cast<void *>(stream),
             [&]
             {
                 return stage.execute(&ctx);
@@ -4131,6 +4214,7 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoEQ6K_RuntimeMMatchesSeri
             gpu_device_,
             {input.get()},
             {outputs->qkv.get(), outputs->z.get(), outputs->alpha.get(), outputs->beta.get()},
+            static_cast<void *>(stream),
             [&]
             {
                 return stage.execute(&ctx);
@@ -4295,6 +4379,7 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoELocalTPShardQ6K_Runtime
             gpu_device_,
             {input.get()},
             {outputs->qkv.get(), outputs->z.get(), outputs->alpha.get(), outputs->beta.get()},
+            static_cast<void *>(stream),
             [&]
             {
                 return stage.execute(&ctx);
@@ -4554,6 +4639,7 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
                 gpu_device_,
                 {input.get()},
                 {outputs->qkv.get(), outputs->z.get(), outputs->alpha.get(), outputs->beta.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     return stage.execute(&ctx);
@@ -4713,6 +4799,157 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELMHeadGroupedVerifierRowsMatchSerialDe
     prepared.kernel->setGPUStream(nullptr);
 }
 
+/**
+ * @brief Reproduce the real Qwen3.6 MoE GDN QKV verifier transaction.
+ *
+ * The focused verifier-forward suite first observed CUDA drift after layer
+ * zero's 8192x2048 Q6_K projection, at row two, while rows zero and one
+ * remained byte-identical. Layer zero is a GDN layer: `attn_qkv.weight` is one
+ * fused projection rather than the three separate tensors used by a
+ * full-attention layer. This regression therefore retains the exact GGUF
+ * payload bytes, scales, and minima consumed by `GDNProjectionStage`.
+ *
+ * The grouped call is the production API and performs one activation
+ * quantization followed by one grouped GEMV. The M=1 loop is test-only: each
+ * row is independently quantized through the ordinary serial decode API and
+ * acts solely as the byte-exact oracle.
+ */
+TEST_F(Test__CUDAGemmParity,
+       RealQwen36MoEGDNQKVGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    SKIP_IF_NO_CUDA();
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+
+    const std::filesystem::path model_path = qwen36MoEModelPath();
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen 3.6 MoE model not found at " << model_path
+                     << "; set LLAMINAR_QWEN36_MOE_MODEL to run this real-weight regression";
+    }
+
+    auto model_ctx = loadQwen36ModelForGpuWeights(model_path);
+    ASSERT_NE(model_ctx, nullptr);
+
+    auto qkv = model_ctx->getWeightForDevice(
+        "blk.0.attn_qkv.weight", DeviceId::cpu());
+    ASSERT_NE(qkv, nullptr);
+    ASSERT_EQ(qkv->native_type(), TensorType::Q6_K);
+
+    const int n = static_cast<int>(qkv->rows());
+    const int k = static_cast<int>(qkv->cols());
+    ASSERT_EQ(n, 8192);
+    ASSERT_EQ(k, 2048);
+
+    const ModelContextId model_id{36367};
+    auto prepared = llaminar2::test::makeGpuPreparedGemm(
+        gpuPreparationTensor(qkv.get()),
+        gpu_device_,
+        "blk.0.attn_qkv.weight",
+        model_id);
+    ASSERT_NE(prepared.kernel, nullptr);
+    ASSERT_TRUE(setupSharedWorkspace(
+        {prepared.kernel},
+        /*max_m=*/4,
+        {n},
+        k));
+
+    for (const int m : {2, 3, 4})
+    {
+        const auto input_values =
+            randomFP32(static_cast<size_t>(m) * static_cast<size_t>(k));
+        auto input = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{
+                static_cast<size_t>(m),
+                static_cast<size_t>(k)});
+        std::memcpy(
+            input->mutable_data(),
+            input_values.data(),
+            input_values.size() * sizeof(float));
+
+        auto grouped_qkv = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{
+                static_cast<size_t>(m),
+                static_cast<size_t>(n)});
+        std::vector<TensorProjectionDesc> grouped_projections = {
+            {prepared.kernel, grouped_qkv.get(), n, nullptr, "GDN_QKV"}};
+
+        ASSERT_TRUE(withExplicitCudaGemmStream(
+            {prepared.kernel},
+            [&](void *stream)
+            {
+                return with_gpu_coherence(
+                    gpu_device_,
+                    {input.get()},
+                    {grouped_qkv.get()},
+                    stream,
+                    [&]
+                    {
+                        return prepared.kernel->
+                            multiply_fused_verifier_rows_decode_equivalent(
+                                input.get(),
+                                grouped_projections,
+                                m,
+                                k,
+                                nullptr,
+                                workspace_.get());
+                    });
+            }))
+            << "real Qwen3.6 MoE grouped GDN QKV projection failed at M="
+            << m;
+
+        for (int row = 0; row < m; ++row)
+        {
+            auto serial_input = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{size_t{1}, static_cast<size_t>(k)});
+            std::memcpy(
+                serial_input->mutable_data(),
+                input_values.data() +
+                    static_cast<size_t>(row) * static_cast<size_t>(k),
+                static_cast<size_t>(k) * sizeof(float));
+            auto serial_qkv = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{size_t{1}, static_cast<size_t>(n)});
+            std::vector<TensorProjectionDesc> serial_projections = {
+                {prepared.kernel, serial_qkv.get(), n, nullptr, "GDN_QKV_serial"}};
+
+            ASSERT_TRUE(withExplicitCudaGemmStream(
+                {prepared.kernel},
+                [&](void *stream)
+                {
+                    return with_gpu_coherence(
+                        gpu_device_,
+                        {serial_input.get()},
+                        {serial_qkv.get()},
+                        stream,
+                        [&]
+                        {
+                            return prepared.kernel->multiply_fused_tensor(
+                                serial_input.get(),
+                                serial_projections,
+                                /*m=*/1,
+                                k,
+                                nullptr,
+                                workspace_.get());
+                        });
+                }))
+                << "real Qwen3.6 MoE serial GDN QKV projection failed at M="
+                << m << " row=" << row;
+
+            expectBitwiseEqualFloatRow(
+                (std::string("real Qwen36 MoE GDN QKV M=") +
+                 std::to_string(m) +
+                 " row=" + std::to_string(row))
+                    .c_str(),
+                grouped_qkv->data() +
+                    static_cast<size_t>(row) * static_cast<size_t>(n),
+                serial_qkv->data(),
+                static_cast<size_t>(n));
+        }
+    }
+
+    cleanupSharedWorkspace({prepared.kernel});
+    EXPECT_FALSE(prepared.kernel->hasDynamicStateActive());
+}
+
 TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedProjection_AllNativeFormats)
 {
     const int K = 256;
@@ -4773,12 +5010,13 @@ TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedProjection_AllNativeFormats)
 
             ASSERT_TRUE(withExplicitCudaGemmStream(
                 {cuda_kernel0, cuda_kernel1},
-                [&]
+                [&](void *stream)
                 {
                     return with_gpu_coherence(
                         gpu_device_,
                         {A_tensor.get()},
                         {C0_tensor.get(), C1_tensor.get()},
+                        static_cast<void *>(stream),
                         [&]
                         {
                             return cuda_kernel0->multiply_fused_verifier_rows_decode_equivalent(
@@ -4837,12 +5075,13 @@ TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedProjection_AllNativeFormats)
 
                 ASSERT_TRUE(withExplicitCudaGemmStream(
                     {cuda_kernel0, cuda_kernel1},
-                    [&]
+                    [&](void *stream)
                     {
                         return with_gpu_coherence(
                             gpu_device_,
                             {A_row.get()},
                             {C0_serial.get(), C1_serial.get()},
+                            static_cast<void *>(stream),
                             [&]
                             {
                                 return cuda_kernel0->multiply_fused_tensor(
@@ -4975,12 +5214,13 @@ TEST_F(Test__CUDAGemmParity, MTP_FP32FloatingFusedProjection_RuntimeMMatchesSeri
 
         ASSERT_TRUE(withExplicitCudaGemmStream(
             {cuda_alpha, cuda_beta},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                     gpu_device_,
                     {A_grouped.get()},
                     {alpha_grouped.get(), beta_grouped.get()},
+                    static_cast<void *>(stream),
                     [&]
                     {
                         return cuda_alpha->multiply_fused_verifier_rows_decode_equivalent(
@@ -5007,12 +5247,13 @@ TEST_F(Test__CUDAGemmParity, MTP_FP32FloatingFusedProjection_RuntimeMMatchesSeri
 
             ASSERT_TRUE(withExplicitCudaGemmStream(
                 {cuda_alpha, cuda_beta},
-                [&]
+                [&](void *stream)
                 {
                     return with_gpu_coherence(
                         gpu_device_,
                         {A_row.get()},
                         {alpha_serial.get(), beta_serial.get()},
+                        static_cast<void *>(stream),
                         [&]
                         {
                             return cuda_alpha->multiply_fused_tensor(
@@ -5118,8 +5359,10 @@ TEST_F(Test__CUDAGemmParity, MTP_FP16BF16FloatingFusedProjection_RuntimeMMatches
         auto *cuda_beta = prepared_beta.kernel;
         ASSERT_NE(cuda_alpha, nullptr);
         ASSERT_NE(cuda_beta, nullptr);
-        ASSERT_FALSE(cuda_alpha->supports_fused_projection())
-            << "Generic fused FP16/BF16 projection should stay disabled until the large fused path exists";
+        ASSERT_TRUE(cuda_alpha->supports_fused_projection())
+            << "FP16/BF16 grouped verifier projection is a required production path";
+        ASSERT_TRUE(cuda_beta->supports_fused_projection())
+            << "Every projection in the FP16/BF16 group must support the production grouped route";
 
         ASSERT_TRUE(setupSharedWorkspace(
             {cuda_alpha, cuda_beta},
@@ -5146,12 +5389,13 @@ TEST_F(Test__CUDAGemmParity, MTP_FP16BF16FloatingFusedProjection_RuntimeMMatches
 
             ASSERT_TRUE(withExplicitCudaGemmStream(
                 {cuda_alpha, cuda_beta},
-                [&]
+                [&](void *stream)
                 {
                     return with_gpu_coherence(
                         gpu_device_,
                         {A_grouped.get()},
                         {alpha_grouped.get(), beta_grouped.get()},
+                        static_cast<void *>(stream),
                         [&]
                         {
                             return cuda_alpha->multiply_fused_verifier_rows_decode_equivalent(
@@ -5175,12 +5419,13 @@ TEST_F(Test__CUDAGemmParity, MTP_FP16BF16FloatingFusedProjection_RuntimeMMatches
 
                 ASSERT_TRUE(withExplicitCudaGemmStream(
                     {cuda_alpha, cuda_beta},
-                    [&]
+                    [&](void *stream)
                     {
                         return with_gpu_coherence(
                             gpu_device_,
                             {A_row.get()},
                             {alpha_serial.get(), beta_serial.get()},
+                            static_cast<void *>(stream),
                             [&]
                             {
                                 return cuda_alpha->multiply_tensor(
@@ -5314,12 +5559,13 @@ TEST_F(Test__CUDAGemmParity, MTP_FloatingSwiGLUDown_RuntimeMMatchesSerialDecodeR
 
             ASSERT_TRUE(withExplicitCudaGemmStream(
                 {cuda_down},
-                [&]
+                [&](void *stream)
                 {
                     return with_gpu_coherence(
                         gpu_device_,
                         {gate_grouped.get(), up_grouped.get()},
                         {down_grouped.get()},
+                        static_cast<void *>(stream),
                         [&]
                         {
                             return cuda_down->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
@@ -5348,12 +5594,13 @@ TEST_F(Test__CUDAGemmParity, MTP_FloatingSwiGLUDown_RuntimeMMatchesSerialDecodeR
 
                 ASSERT_TRUE(withExplicitCudaGemmStream(
                     {cuda_down},
-                    [&]
+                    [&](void *stream)
                     {
                         return with_gpu_coherence(
                             gpu_device_,
                             {gate_row.get(), up_row.get()},
                             {down_serial.get()},
+                            static_cast<void *>(stream),
                             [&]
                             {
                                 return cuda_down->multiply_tensor_with_fused_swiglu(
@@ -5459,12 +5706,13 @@ TEST_F(Test__CUDAGemmParity, MTP_M1FusedProjectionSerialDecodeIsBitwiseStable_Q4
      */
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_kernel0, cuda_kernel1},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                        gpu_device_,
                        {input.get()},
                        {first0.get(), first1.get()},
+                       static_cast<void *>(stream),
                        [&]
                        {
                            return cuda_kernel0->multiply_fused_tensor(
@@ -5474,6 +5722,7 @@ TEST_F(Test__CUDAGemmParity, MTP_M1FusedProjectionSerialDecodeIsBitwiseStable_Q4
                        gpu_device_,
                        {input.get()},
                        {second0.get(), second1.get()},
+                       static_cast<void *>(stream),
                        [&]
                        {
                            return cuda_kernel0->multiply_fused_tensor(
@@ -5526,12 +5775,13 @@ TEST_F(Test__CUDAGemmParity, MTP_M1SingleFusedProjectionSerialDecodeIsBitwiseSta
 
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_kernel},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                        gpu_device_,
                        {input.get()},
                        {first.get()},
+                       static_cast<void *>(stream),
                        [&]
                        {
                            return cuda_kernel->multiply_fused_tensor(
@@ -5541,6 +5791,7 @@ TEST_F(Test__CUDAGemmParity, MTP_M1SingleFusedProjectionSerialDecodeIsBitwiseSta
                        gpu_device_,
                        {input.get()},
                        {second.get()},
+                       static_cast<void *>(stream),
                        [&]
                        {
                            return cuda_kernel->multiply_fused_tensor(
@@ -5589,12 +5840,13 @@ TEST_F(Test__CUDAGemmParity, MTP_M1TensorProjectionSerialDecodeIsBitwiseStable_Q
      */
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_kernel},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                        gpu_device_,
                        {input.get()},
                        {first.get()},
+                       static_cast<void *>(stream),
                        [&]
                        {
                            return cuda_kernel->multiply_tensor(
@@ -5604,6 +5856,7 @@ TEST_F(Test__CUDAGemmParity, MTP_M1TensorProjectionSerialDecodeIsBitwiseStable_Q
                        gpu_device_,
                        {input.get()},
                        {second.get()},
+                       static_cast<void *>(stream),
                        [&]
                        {
                            return cuda_kernel->multiply_tensor(
@@ -5667,6 +5920,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40M1GEMVRepeatFromSameQuantizedActivationIsBit
         gpu_device_,
         {input.get()},
         {first.get(), second.get()},
+        static_cast<void *>(stream),
         [&]
         {
             const float *d_A = static_cast<const float *>(input->gpu_data_ptr());
@@ -5801,6 +6055,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40SmallMGEMVRepeatFromSameQuantizedActivationI
         gpu_device_,
         {input.get()},
         {warmup.get(), first.get(), second.get()},
+        static_cast<void *>(stream),
         [&]
         {
             const float *d_A = static_cast<const float *>(input->gpu_data_ptr());
@@ -5944,6 +6199,7 @@ TEST_F(Test__CUDAGemmParity, MTP_BlockwiseActivationQuantizeM1RepeatIsBitwiseSta
         gpu_device_,
         {input.get()},
         {},
+        static_cast<void *>(stream),
         [&]
         {
             const float *d_A = static_cast<const float *>(input->gpu_data_ptr());
@@ -6047,24 +6303,30 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
                 std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
             auto C_serial = std::make_unique<FP32Tensor>(
                 std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+            auto C_serial_captured = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
 
             ASSERT_TRUE(with_gpu_coherence(
                 gpu_device_,
                 {A_tensor.get()},
-                {C_specialized.get(), C_captured.get(), C_serial.get()},
+                {C_specialized.get(), C_captured.get(), C_serial.get(),
+                 C_serial_captured.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     const float *d_A = static_cast<const float *>(A_tensor->gpu_data_ptr());
                     float *d_C_specialized = static_cast<float *>(C_specialized->gpu_data_ptr());
                     float *d_C_captured = static_cast<float *>(C_captured->gpu_data_ptr());
                     float *d_C_serial = static_cast<float *>(C_serial->gpu_data_ptr());
+                    float *d_C_serial_captured =
+                        static_cast<float *>(C_serial_captured->gpu_data_ptr());
                     auto *d_A_int8 = static_cast<int8_t *>(
                         workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
                     auto *d_scales_A = static_cast<float *>(
                         workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
 
                     if (!d_A || !d_C_specialized || !d_C_captured || !d_C_serial ||
-                        !d_A_int8 || !d_scales_A)
+                        !d_C_serial_captured || !d_A_int8 || !d_scales_A)
                         return false;
 
                     if (!cudaQuantGemm_quantizeActivationsBlockwise(
@@ -6137,8 +6399,48 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
                         stream,
                         gemv_ctx,
                         &rowmajor);
+                    /*
+                     * Graph-captured and eager policies are independently
+                     * trained execution domains and may choose different
+                     * serial M=1 reduction geometries. Build the captured
+                     * oracle in the same graph so grouped publication is
+                     * compared with the serial decode path it must actually
+                     * equal in production. This row loop is test-only oracle
+                     * construction; production still launches only grouped
+                     * verifier kernels.
+                     */
+                    bool captured_serial_launch = captured_launch;
+                    for (int row = 0; captured_serial_launch && row < M; ++row)
+                    {
+                        const int8_t *row_A =
+                            d_A_int8 + static_cast<size_t>(row) * static_cast<size_t>(K);
+                        const float *row_scales =
+                            d_scales_A + static_cast<size_t>(row) * static_cast<size_t>(K / 32);
+                        float *row_C = d_C_serial_captured +
+                            static_cast<size_t>(row) * static_cast<size_t>(N);
+                        captured_serial_launch = cudaNativeVNNIGemvTuned_fp32(
+                            row_A,
+                            static_cast<const uint8_t *>(desc.payload),
+                            static_cast<const uint16_t *>(desc.scales),
+                            static_cast<const uint16_t *>(desc.mins),
+                            static_cast<const uint32_t *>(desc.emins),
+                            row_C,
+                            row_scales,
+                            N,
+                            K,
+                            1.0f,
+                            0.0f,
+                            nullptr,
+                            nullptr,
+                            desc.codebook_id,
+                            gpu_device_.ordinal,
+                            stream,
+                            gemv_ctx,
+                            &rowmajor);
+                    }
                     const cudaError_t capture_end = cudaStreamEndCapture(stream, &graph);
-                    if (!captured_launch || capture_end != cudaSuccess || !graph)
+                    if (!captured_launch || !captured_serial_launch ||
+                        capture_end != cudaSuccess || !graph)
                     {
                         if (graph)
                             cudaGraphDestroy(graph);
@@ -6210,6 +6512,28 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
                     static_cast<size_t>(N));
                 expectBitwiseEqualFloatRow(
                     (label + " captured").c_str(),
+                    C_captured->data() +
+                        static_cast<size_t>(row) * static_cast<size_t>(N),
+                    C_serial_captured->data() +
+                        static_cast<size_t>(row) * static_cast<size_t>(N),
+                    static_cast<size_t>(N));
+                /*
+                 * A production decode shape executes eagerly once to warm lazy
+                 * kernel state, then runs captured thereafter. Cross the
+                 * execution surfaces as well as comparing each surface to
+                 * itself: this prevents generated eager and captured policies
+                 * from introducing different FP32 reduction trees at that
+                 * lifecycle boundary.
+                 */
+                expectBitwiseEqualFloatRow(
+                    (label + " eager-grouped-vs-captured-serial").c_str(),
+                    C_specialized->data() +
+                        static_cast<size_t>(row) * static_cast<size_t>(N),
+                    C_serial_captured->data() +
+                        static_cast<size_t>(row) * static_cast<size_t>(N),
+                    static_cast<size_t>(N));
+                expectBitwiseEqualFloatRow(
+                    (label + " captured-grouped-vs-eager-serial").c_str(),
                     C_captured->data() +
                         static_cast<size_t>(row) * static_cast<size_t>(N),
                     C_serial->data() +
@@ -6309,6 +6633,91 @@ TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedProjection_AllNativeFormats_Large
         cleanupWorkspaceIfNeeded(kernel);
         EXPECT_FALSE(kernel->hasDynamicStateActive())
             << format.name << " large-K sweep leaked CUDA dynamic state";
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+    }
+}
+
+/**
+ * @brief Prove every native codebook at the Qwen3.6 35B MoE attention shape.
+ *
+ * The compact all-format sweep covers every verifier depth but does not cover
+ * the highly rectangular `Q=8192, K=2048` projection used by the production
+ * MoE attention graph. Generated dispatch can select different serial K
+ * partitioning and grouped row-reuse geometry at that point. In particular,
+ * M=3 and M=4 exercise the third and fourth accumulator slots in a four-row
+ * grouped CTA, which a two-row-only geometry cannot certify.
+ *
+ * Production-sized weights make a complete M=2..16 sweep unnecessarily
+ * expensive here. The canonical compact suite owns M totality; this companion
+ * gate uses the shared boundary inventory to cover row-tile tails, exact tile
+ * fills, the default maximum, and the extended-depth path for every codebook.
+ */
+TEST_F(Test__CUDAGemmParity,
+       MTP_RuntimeM_FusedProjection_AllNativeFormats_Qwen36MoEQKVMatchesSerialDecode)
+{
+    constexpr int N = 8192;
+    constexpr int K = 2048;
+
+    for (const auto &format : cudaSmallMNativeFormats())
+    {
+        auto weights = format.create(N, K);
+        ASSERT_NE(weights, nullptr)
+            << "Failed to create " << format.name
+            << " Qwen3.6 MoE Q projection weights";
+
+        auto *kernel = getPreparedKernel(weights.get(), gpu_device_);
+        ASSERT_NE(kernel, nullptr) << format.name << " CUDA kernel";
+        ASSERT_TRUE(setupWorkspaceIfNeeded(
+            kernel,
+            kGroupedVerifierBoundaryRows.back(),
+            N,
+            K))
+            << format.name << " Qwen3.6 MoE QKV verifier workspace";
+
+        for (const int M : kGroupedVerifierBoundaryRows)
+        {
+            const auto input = randomFP32(static_cast<size_t>(M) * K);
+            std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
+            ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+                kernel,
+                input.data(),
+                grouped.data(),
+                M,
+                N,
+                K,
+                gpu_device_,
+                workspace_.get()))
+                << format.name
+                << " grouped Qwen3.6 MoE Q projection M=" << M;
+
+            for (int row = 0; row < M; ++row)
+            {
+                std::vector<float> serial(static_cast<size_t>(N), 0.0f);
+                ASSERT_TRUE(cudaMultiplyViaTensor(
+                    kernel,
+                    input.data() + static_cast<size_t>(row) * K,
+                    serial.data(),
+                    /*M=*/1,
+                    N,
+                    K,
+                    gpu_device_))
+                    << format.name << " serial Qwen3.6 MoE Q decode M="
+                    << M << " row=" << row;
+
+                expectBitwiseEqualFloatRow(
+                    (std::string(format.name) + " Qwen3.6 MoE Q M=" +
+                     std::to_string(M) + " row=" + std::to_string(row))
+                        .c_str(),
+                    grouped.data() + static_cast<size_t>(row) * N,
+                    serial.data(),
+                    serial.size());
+            }
+        }
+
+        cleanupWorkspaceIfNeeded(kernel);
+        EXPECT_FALSE(kernel->hasDynamicStateActive())
+            << format.name
+            << " Qwen3.6 MoE QKV sweep leaked CUDA dynamic state";
         llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
     }
 }
@@ -6441,12 +6850,13 @@ TEST_F(Test__CUDAGemmParity, MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVN
 
         ASSERT_TRUE(withExplicitCudaGemmStream(
             {cuda_kernel0, cuda_kernel1},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                     gpu_device_,
                     {A_tensor.get()},
                     {C0_tensor.get(), C1_tensor.get()},
+                    static_cast<void *>(stream),
                     [&]
                     {
                         return cuda_kernel0->multiply_fused_verifier_rows_decode_equivalent(
@@ -6575,12 +6985,13 @@ TEST_F(Test__CUDAGemmParity, IQ3S_Qwen36MoESharedExpert_M234MatchesSingleRowDeco
 
         ASSERT_TRUE(withExplicitCudaGemmStream(
             {cuda_gate, cuda_up, cuda_down},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                            gpu_device_,
                            {input_m.get()},
                            {gate_m.get(), up_m.get()},
+                           static_cast<void *>(stream),
                            [&]
                            {
                                return cuda_gate->multiply_fused_verifier_rows_decode_equivalent(
@@ -6590,6 +7001,7 @@ TEST_F(Test__CUDAGemmParity, IQ3S_Qwen36MoESharedExpert_M234MatchesSingleRowDeco
                            gpu_device_,
                            {gate_m.get(), up_m.get()},
                            {down_m.get()},
+                           static_cast<void *>(stream),
                            [&]
                            {
                                return cuda_down->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
@@ -6621,12 +7033,13 @@ TEST_F(Test__CUDAGemmParity, IQ3S_Qwen36MoESharedExpert_M234MatchesSingleRowDeco
 
             ASSERT_TRUE(withExplicitCudaGemmStream(
                 {cuda_gate, cuda_up, cuda_down},
-                [&]
+                [&](void *stream)
                 {
                     return with_gpu_coherence(
                                gpu_device_,
                                {input_row.get()},
                                {gate_row.get(), up_row.get()},
+                               static_cast<void *>(stream),
                                [&]
                                {
                                    return cuda_gate->multiply_fused_verifier_rows_decode_equivalent(
@@ -6636,6 +7049,7 @@ TEST_F(Test__CUDAGemmParity, IQ3S_Qwen36MoESharedExpert_M234MatchesSingleRowDeco
                                gpu_device_,
                                {gate_row.get(), up_row.get()},
                                {down_row.get()},
+                               static_cast<void *>(stream),
                                [&]
                                {
                                    return cuda_down->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
@@ -6759,12 +7173,13 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M4FusedProjectionMatchesFourSi
 
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_gate, cuda_up},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                 gpu_device_,
                 {A_m4.get()},
                 {gate_m4.get(), up_m4.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     return cuda_gate->multiply_fused_verifier_rows_decode_equivalent(
@@ -6791,12 +7206,13 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M4FusedProjectionMatchesFourSi
 
         ASSERT_TRUE(withExplicitCudaGemmStream(
             {cuda_gate, cuda_up},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                     gpu_device_,
                     {A_m1.get()},
                     {gate_m1.get(), up_m1.get()},
+                    static_cast<void *>(stream),
                     [&]
                     {
                         return cuda_gate->multiply_fused_tensor(
@@ -6889,12 +7305,13 @@ TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M4FusedProjectionMatchesFo
 
         ASSERT_TRUE(withExplicitCudaGemmStream(
             {cuda_gate, cuda_up},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                     gpu_device_,
                     {A_m4.get()},
                     {gate_m4.get(), up_m4.get()},
+                    static_cast<void *>(stream),
                     [&]
                     {
                         return cuda_gate->multiply_fused_verifier_rows_decode_equivalent(
@@ -6921,12 +7338,13 @@ TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M4FusedProjectionMatchesFo
 
             ASSERT_TRUE(withExplicitCudaGemmStream(
                 {cuda_gate, cuda_up},
-                [&]
+                [&](void *stream)
                 {
                     return with_gpu_coherence(
                         gpu_device_,
                         {A_m1.get()},
                         {gate_m1.get(), up_m1.get()},
+                        static_cast<void *>(stream),
                         [&]
                         {
                             return cuda_gate->multiply_fused_tensor(
@@ -7044,12 +7462,13 @@ TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M2FusedProjectionMatchesTw
 
         ASSERT_TRUE(withExplicitCudaGemmStream(
             {cuda_gate, cuda_up},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                     gpu_device_,
                     {A_m2.get()},
                     {gate_m2.get(), up_m2.get()},
+                    static_cast<void *>(stream),
                     [&]
                     {
                         return cuda_gate->multiply_fused_verifier_rows_decode_equivalent(
@@ -7076,12 +7495,13 @@ TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M2FusedProjectionMatchesTw
 
             ASSERT_TRUE(withExplicitCudaGemmStream(
                 {cuda_gate, cuda_up},
-                [&]
+                [&](void *stream)
                 {
                     return with_gpu_coherence(
                         gpu_device_,
                         {A_m1.get()},
                         {gate_m1.get(), up_m1.get()},
+                        static_cast<void *>(stream),
                         [&]
                         {
                             return cuda_gate->multiply_fused_tensor(
@@ -7174,12 +7594,13 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M2FusedProjectionMatchesTwoSin
 
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_gate, cuda_up},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                 gpu_device_,
                 {A_m2.get()},
                 {gate_m2.get(), up_m2.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     return cuda_gate->multiply_fused_verifier_rows_decode_equivalent(
@@ -7206,12 +7627,13 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M2FusedProjectionMatchesTwoSin
 
         ASSERT_TRUE(withExplicitCudaGemmStream(
             {cuda_gate, cuda_up},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                     gpu_device_,
                     {A_m1.get()},
                     {gate_m1.get(), up_m1.get()},
+                    static_cast<void *>(stream),
                     [&]
                     {
                         return cuda_gate->multiply_fused_tensor(
@@ -7308,6 +7730,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
         gpu_device_,
         {A_m2.get()},
         {gate_m2.get(), up_m2.get()},
+        static_cast<void *>(stream),
         [&]
         {
             return cuda_gate->multiply_fused_verifier_rows_decode_equivalent(
@@ -7330,6 +7753,7 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
         gpu_device_,
         {A_m1.get()},
         {gate_m1.get(), up_m1.get()},
+        static_cast<void *>(stream),
         [&]
         {
             return cuda_gate->multiply_fused_tensor(A_m1.get(), m1_projections, 1, K);
@@ -7418,6 +7842,7 @@ TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
         gpu_device_,
         {A_m2.get()},
         {gate_m2.get(), up_m2.get()},
+        static_cast<void *>(stream),
         [&]
         {
             return cuda_gate->multiply_fused_verifier_rows_decode_equivalent(
@@ -7440,6 +7865,7 @@ TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
         gpu_device_,
         {A_m1.get()},
         {gate_m1.get(), up_m1.get()},
+        static_cast<void *>(stream),
         [&]
         {
             return cuda_gate->multiply_fused_tensor(A_m1.get(), m1_projections, 1, K);
@@ -8275,12 +8701,13 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
     // Use with_gpu_coherence for automatic input/output coherence management
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_kernel},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                 gpu_device_,
                 {input_tensor.get()}, // inputs
                 {output_cuda.get()},  // outputs (will be marked dirty after kernel)
+                static_cast<void *>(stream),
                 [&]
                 {
                     return cuda_kernel->multiply_tensor(
@@ -8415,12 +8842,13 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
     std::cout << "Running SEPARATE path (3x multiply_tensor)...\n";
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                 gpu_device_,
                 {input_tensor.get()},
                 {output_q_separate.get(), output_k_separate.get(), output_v_separate.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     return cuda_kernel_q->multiply_tensor(
@@ -8450,12 +8878,13 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
     // Call fused method with coherence wrapper
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                 gpu_device_,
                 {input_tensor.get()},
                 {output_q_fused.get(), output_k_fused.get(), output_v_fused.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     return cuda_kernel_q->multiply_fused_tensor(
@@ -8623,12 +9052,13 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
 
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                 gpu_device_,
                 {input_tensor.get()},
                 {output_q_fused.get(), output_k_fused.get(), output_v_fused.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     return cuda_kernel_q->multiply_fused_tensor(
@@ -8748,12 +9178,13 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
     // Run kernel twice — should produce identical results
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_kernel},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                 gpu_device_,
                 {input_tensor.get()},
                 {output_a.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     return cuda_kernel->multiply_tensor(
@@ -8764,12 +9195,13 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
 
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_kernel},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                 gpu_device_,
                 {input_tensor.get()},
                 {output_b.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     return cuda_kernel->multiply_tensor(
@@ -8856,12 +9288,13 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
         // Use with_gpu_coherence for clean coherence handling
         ASSERT_TRUE(withExplicitCudaGemmStream(
             {kernel},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                     gpu_device_,
                     {input.get()},
                     {output.get()},
+                    static_cast<void *>(stream),
                     [&]
                     {
                         return kernel->multiply_tensor(
@@ -8963,12 +9396,13 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
         // Use with_gpu_coherence for clean coherence handling
         ASSERT_TRUE(withExplicitCudaGemmStream(
             {kernel},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                     gpu_device_,
                     {input.get()},
                     {output_cuda.get()},
+                    static_cast<void *>(stream),
                     [&]
                     {
                         return kernel->multiply_tensor(
@@ -9121,12 +9555,13 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
 
     ASSERT_TRUE(withExplicitCudaGemmStream(
         {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
-        [&]
+        [&](void *stream)
         {
             return with_gpu_coherence(
                 gpu_device_,
                 {input.get()},
                 {output_q.get(), output_k.get(), output_v.get()},
+                static_cast<void *>(stream),
                 [&]
                 {
                     return cuda_kernel_q->multiply_fused_tensor(
@@ -9320,12 +9755,13 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
 
         ASSERT_TRUE(withExplicitCudaGemmStream(
             {kernel_q, kernel_k, kernel_v},
-            [&]
+            [&](void *stream)
             {
                 return with_gpu_coherence(
                     gpu_device_,
                     {input.get()},
                     {out_q.get(), out_k.get(), out_v.get()},
+                    static_cast<void *>(stream),
                     [&]
                     {
                         return kernel_q->multiply_fused_tensor(

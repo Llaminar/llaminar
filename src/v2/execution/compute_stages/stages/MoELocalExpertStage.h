@@ -59,8 +59,16 @@ namespace llaminar2
             std::vector<ITensorGemm *> prepared_gate_gemm;
             std::vector<ITensorGemm *> prepared_up_gemm;
             std::vector<ITensorGemm *> prepared_down_gemm;
+            /// Retains extracted per-expert views used by non-store engines.
+            std::vector<std::shared_ptr<TensorBase>> expert_gate_views;
+            std::vector<std::shared_ptr<TensorBase>> expert_up_views;
+            std::vector<std::shared_ptr<TensorBase>> expert_down_views;
             /// Keeps MoE batch-constructed kernel objects alive alongside the stage.
             std::vector<std::shared_ptr<ITensorGemm>> moe_owned_kernels;
+            /// Retains backend-native packed slabs when ownership is stage-local.
+            std::shared_ptr<void> moe_packed_gate_lifetime;
+            std::shared_ptr<void> moe_packed_up_lifetime;
+            std::shared_ptr<void> moe_packed_down_lifetime;
             /// Pointer to model-context-owned PreparedWeightStore.  Not owned here.
             PreparedWeightStore *prepared_store = nullptr;
             /// Pointer to model-context-owned ExpertGemmRegistry.  Not owned here.
@@ -77,6 +85,21 @@ namespace llaminar2
         };
 
         static_assert(StageParamsRequired<Params>);
+
+        /**
+         * @brief Resolve every participant-local expert engine at graph build.
+         *
+         * Production execution never extracts expert views or constructs GEMM
+         * engines. Graph builders must call this method after assigning the
+         * participant mask and before moving @p params into a stage.
+         *
+         * Existing complete registry-provided tables are retained. Otherwise
+         * the shared expert-weight service prepares the active engines and
+         * publishes stable slab references/lifetimes into @p params.
+         *
+         * @return true when every active expert has gate, up, and down engines.
+         */
+        static bool prepareExpertGemmEngines(Params &params);
 
         explicit MoELocalExpertStage(Params params);
 

@@ -163,6 +163,30 @@ namespace llaminar2
         /// @brief Resolve a backend through the injected test resolver or global BackendManager.
         IBackend *resolveBackend(DeviceId device) const;
 
+        /**
+         * @brief Copy one local-logits span through its declared ownership path.
+         *
+         * GPU spans require a device pointer, a resolvable backend, and the
+         * explicit stream returned by a consuming runner API. Missing metadata
+         * or failed DMA is fatal to the gather; this method never falls through
+         * to TensorBase::data() for a GPU tensor. CPU spans are copied directly
+         * from their host-resident tensor.
+         *
+         * @param dst Host destination.
+         * @param src Source pointer for this span. For GPU data this may point
+         *        at a row within info.gpu_ptr.
+         * @param bytes Number of bytes to copy.
+         * @param info Ownership and stream metadata for the source tensor.
+         * @param fast Whether the backend's validated hot D2H path may be used.
+         * @return true after a complete copy; false on any contract violation.
+         */
+        bool copyLocalSpanToHost(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            const LogitsLocalInfo &info,
+            bool fast) const;
+
         std::unique_ptr<TensorBase> buffer_;
         size_t vocab_size_ = 0;
         BackendResolver backend_resolver_ = nullptr; ///< Optional test hook for backend selection.

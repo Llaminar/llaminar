@@ -37,6 +37,8 @@ namespace llaminar2 {
  * @param d_mins       Output VNNI mins [blocks_per_row * N] (FP16), nullptr for symmetric
  * @param N            Number of output features (rows in weight matrix)
  * @param K            Number of input features (columns in weight matrix)
+ * @param output_N     Row stride of the complete packed destination
+ * @param output_row_offset First destination row represented by this source chunk
  * @param stream       HIP stream to launch on (nullptr = default stream)
  * @return true on successful kernel launch, false on error or unsupported format
  */
@@ -54,6 +56,21 @@ bool launchVnniRepack(
  *
  * @param d_emins      Output VNNI effective mins (uint32_t), nullptr except for Q2_K
  * @see launchVnniRepack (7-param overload) for other parameters
+ */
+bool launchVnniRepack(
+    RepackFormat format,
+    const void* d_raw_blocks,
+    uint8_t* d_payload,
+    uint16_t* d_scales,
+    uint16_t* d_mins,
+    uint32_t* d_emins,
+    int N, int K,
+    int output_N,
+    int output_row_offset,
+    void* stream);
+
+/**
+ * @brief Full-matrix compatibility overload for callers without row chunks.
  */
 bool launchVnniRepack(
     RepackFormat format,

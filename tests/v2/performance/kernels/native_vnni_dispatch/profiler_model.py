@@ -68,7 +68,7 @@ def _cache_payload_digest(payload: Mapping[str, object]) -> str:
 
 
 PROFILER_CATALOG_NORMALIZATION_VERSION = (
-    "native-vnni-profiler-extra-trees-v16-calibrated-hardware-targets"
+    "native-vnni-profiler-extra-trees-v18-stratified-static-totality"
 )
 PROFILER_SURROGATE_VERSION = (
     "native-vnni-profiler-xgboost-cuda-hist-v21-vectorized-targets"
@@ -297,7 +297,42 @@ _GPU_PERCENT_METRICS = frozenset((
 _GPU_RATE_METRICS = frozenset((
     "gpu.executed_ipc_active",
     "gpu.warp_cycles_per_issued_instruction",
+    "gpu.valu_instructions_per_workitem",
+    "gpu.flat_vmem_instructions_per_workitem",
 ))
+_GPU_CANDIDATE_DISPATCH_ROLES = ("compute", "reduction")
+
+
+def _gpu_candidate_dispatch_role(kernel_name: str) -> str:
+    """Classify one physical GPU launch by its candidate-economy role.
+
+    The selected region contains the complete production invocation. Activation
+    quantization is intentionally inside that region so raw evidence proves the
+    real launch sequence, but it is common preparation rather than work selected
+    by the GEMV/GEMM candidate. Mixing its counters into candidate descriptors
+    lets profiler noise from an invariant launch masquerade as dispatch signal.
+
+    Reduction/finalization launches are candidate-owned and remain explicit:
+    their resource pressure and traffic can differ sharply from the primary
+    compute kernel, especially for K-part decode and grouped verifier routes.
+    """
+
+    normalized = kernel_name.casefold()
+    if any(token in normalized for token in (
+        "quantize",
+        "quantise",
+        "activation_prep",
+        "prepare_activations",
+    )):
+        return "preparation"
+    if any(token in normalized for token in (
+        "reduce",
+        "reduction",
+        "finalize",
+        "finalise",
+    )):
+        return "reduction"
+    return "compute"
 
 
 class CandidateCostLike(Protocol):
@@ -746,6 +781,8 @@ def _estimated_work(observation: NativeVNNIObservation) -> tuple[float, float, f
 def _normalized_metric_features(
     observation: NativeVNNIObservation,
     metric_values: Mapping[str, list[float]],
+    *,
+    include_gpu_dispatch_metrics: bool = True,
 ) -> dict[str, float]:
     """Derive regime-aware rates without exposing raw absolute counters.
 
@@ -844,28 +881,29 @@ def _normalized_metric_features(
                     f"metric.cpu.{regime}.{name}_{unit_name}_log1p"
                 ] = _signed_log1p(normalized)
 
-    for metric_id in sorted(_GPU_STATIC_RESOURCE_METRICS):
-        values = metric_values.get(metric_id, ())
-        if values:
-            features[f"metric.{metric_id}.maximum_log1p"] = _signed_log1p(
-                max(values)
-            )
-    for metric_id in sorted(_GPU_PERCENT_METRICS):
-        values = metric_values.get(metric_id, ())
-        if values:
-            fractions = [value / 100.0 for value in values]
-            features[f"metric.{metric_id}.fraction_mean"] = (
-                sum(fractions) / len(fractions)
-            )
-            features[f"metric.{metric_id}.fraction_maximum"] = max(fractions)
-    for metric_id in sorted(_GPU_RATE_METRICS):
-        values = metric_values.get(metric_id, ())
-        if values:
-            transformed = [_signed_log1p(value) for value in values]
-            features[f"metric.{metric_id}.mean_log1p"] = (
-                sum(transformed) / len(transformed)
-            )
-            features[f"metric.{metric_id}.maximum_log1p"] = max(transformed)
+    if include_gpu_dispatch_metrics:
+        for metric_id in sorted(_GPU_STATIC_RESOURCE_METRICS):
+            values = metric_values.get(metric_id, ())
+            if values:
+                features[f"metric.{metric_id}.maximum_log1p"] = _signed_log1p(
+                    max(values)
+                )
+        for metric_id in sorted(_GPU_PERCENT_METRICS):
+            values = metric_values.get(metric_id, ())
+            if values:
+                fractions = [value / 100.0 for value in values]
+                features[f"metric.{metric_id}.fraction_mean"] = (
+                    sum(fractions) / len(fractions)
+                )
+                features[f"metric.{metric_id}.fraction_maximum"] = max(fractions)
+        for metric_id in sorted(_GPU_RATE_METRICS):
+            values = metric_values.get(metric_id, ())
+            if values:
+                transformed = [_signed_log1p(value) for value in values]
+                features[f"metric.{metric_id}.mean_log1p"] = (
+                    sum(transformed) / len(transformed)
+                )
+                features[f"metric.{metric_id}.maximum_log1p"] = max(transformed)
 
     duration_ns = _sum_metric(metric_values, "gpu.duration_ns")
     if duration_ns is not None and duration_ns > 0.0:
@@ -944,6 +982,93 @@ def _normalized_metric_features(
     return features
 
 
+def _gpu_dispatch_role_features(
+    role: str,
+    rows: tuple[ProfilerFeatureRow, ...],
+) -> dict[str, float]:
+    """Summarize one candidate-owned GPU launch role without cross-role mixing.
+
+    Static resources use the role maximum because every launch in that role
+    must be schedulable. Dynamic percentages and rates use profiler-duration
+    weighting, so a tiny reduction kernel cannot receive equal influence to a
+    long primary compute launch merely because both appear once in the trace.
+    The one-shot duration itself remains diagnostic and is never a fit target.
+    """
+
+    if role not in _GPU_CANDIDATE_DISPATCH_ROLES:
+        raise ValueError(f"unsupported GPU candidate dispatch role {role!r}")
+    prefix = f"metric.gpu.{role}"
+    features: dict[str, float] = {}
+
+    def measured(metric_id: str) -> list[tuple[float, float | None]]:
+        values = []
+        for row in rows:
+            value = row.metric_values.get(metric_id)
+            if value is None or not math.isfinite(value):
+                continue
+            duration = row.metric_values.get("gpu.duration_ns")
+            duration_weight = (
+                float(duration)
+                if duration is not None
+                and math.isfinite(duration)
+                and duration > 0.0
+                else None
+            )
+            values.append((float(value), duration_weight))
+        return values
+
+    def duration_weighted_mean(
+        values: list[tuple[float, float | None]],
+    ) -> float:
+        weighted = tuple(
+            (value, weight)
+            for value, weight in values
+            if weight is not None
+        )
+        if len(weighted) == len(values) and weighted:
+            total_weight = sum(weight for _value, weight in weighted)
+            if total_weight > 0.0:
+                return sum(
+                    value * weight for value, weight in weighted
+                ) / total_weight
+        return sum(value for value, _weight in values) / float(len(values))
+
+    for metric_id in sorted(_GPU_STATIC_RESOURCE_METRICS):
+        values = measured(metric_id)
+        if values:
+            name = metric_id.removeprefix("gpu.")
+            features[f"{prefix}.{name}.maximum_log1p"] = _signed_log1p(
+                max(value for value, _weight in values)
+            )
+    for metric_id in sorted(_GPU_PERCENT_METRICS):
+        values = measured(metric_id)
+        if values:
+            name = metric_id.removeprefix("gpu.")
+            fractions = [
+                (value / 100.0, weight) for value, weight in values
+            ]
+            features[f"{prefix}.{name}.fraction_mean"] = (
+                duration_weighted_mean(fractions)
+            )
+            features[f"{prefix}.{name}.fraction_maximum"] = max(
+                value for value, _weight in fractions
+            )
+    for metric_id in sorted(_GPU_RATE_METRICS):
+        values = measured(metric_id)
+        if values:
+            name = metric_id.removeprefix("gpu.")
+            transformed = [
+                (_signed_log1p(value), weight) for value, weight in values
+            ]
+            features[f"{prefix}.{name}.mean_log1p"] = (
+                duration_weighted_mean(transformed)
+            )
+            features[f"{prefix}.{name}.maximum_log1p"] = max(
+                value for value, _weight in transformed
+            )
+    return features
+
+
 @dataclass(frozen=True)
 class ProfilerCandidateDescriptor:
     """One authenticated exact physical invocation's profiler features.
@@ -971,7 +1096,13 @@ class ProfilerCandidateDescriptor:
 
 @dataclass(frozen=True)
 class ProfilerFeatureCatalog:
-    """Complete exact-launch descriptors bound to one timing corpus."""
+    """Total exact-launch descriptors bound to one timing corpus.
+
+    Stratified profiling contributes dynamic counters for the fastest, middle,
+    and slowest candidate strata. Every other launch remains dispatchable and
+    receives a static descriptor derived from authenticated timing evidence.
+    Static descriptors never borrow or synthesize hardware counters.
+    """
 
     corpus_digest: str
     request_manifest_digest: str
@@ -1070,6 +1201,14 @@ class ProfilerFeatureCatalog:
         for observation in observations:
             descriptor = self.descriptor_for(observation)
             descriptors[descriptor.key] = descriptor
+        if len(descriptors) == len(self.descriptors):
+            # Every key came from ``self.descriptors``. Equal cardinality
+            # therefore proves this transfer pool reaches the complete catalog,
+            # whose authenticated model-input digest was already computed while
+            # publishing or loading the normalized cache. Re-encoding the same
+            # six-figure descriptor array here used to consume minutes on one
+            # CPU core before an otherwise GPU-resident fit could begin.
+            return self.model_digest
         return self.model_digest_for_descriptors(descriptors)
 
     @staticmethod
@@ -1125,7 +1264,7 @@ class ProfilerFeatureCatalog:
         self,
         observation: NativeVNNIObservation,
     ) -> ProfilerCandidateDescriptor:
-        """Resolve one timing row to its separately profiled exact launch."""
+        """Resolve one timing row to its exact measured-or-static launch."""
 
         key = _physical_key(observation)
         descriptor = self.descriptors.get(key)
@@ -1149,12 +1288,24 @@ class ProfilerFeatureCatalog:
         synthesizes counters or weakens source-manifest validation.
         """
 
+        descriptors = dict(self.descriptors)
+        _add_static_profiler_descriptors(corpus, descriptors)
         rebound = ProfilerFeatureCatalog(
             corpus_digest=corpus.digest(),
             request_manifest_digest=self.request_manifest_digest,
             evidence_manifest_digest=self.evidence_manifest_digest,
-            descriptors=self.descriptors,
+            descriptors=descriptors,
         )
+        cached_model_input_digest = self.__dict__.get("model_input_digest")
+        if (
+            cached_model_input_digest is not None
+            and len(descriptors) == len(self.descriptors)
+        ):
+            # Rebinding changes timing-corpus provenance but not one byte of the
+            # normalized descriptor table. Preserve only that descriptor-only
+            # identity; the full catalog digest remains corpus-sensitive and is
+            # intentionally recomputed for the rebound value.
+            rebound.__dict__["model_input_digest"] = cached_model_input_digest
         for observation in corpus:
             if observation.supported and observation.generic_eligible:
                 rebound.descriptor_for(observation)
@@ -1562,8 +1713,76 @@ def _profiler_candidate_descriptor(
         raise ValueError(
             f"{request_id}: profiler dispatches changed CPU N-block geometry"
         )
+    features = _static_profiler_candidate_features(observation)
+    candidate_rows = rows
+    role_rows: dict[str, list[ProfilerFeatureRow]] = defaultdict(list)
+    if observation.backend != Backend.CPU:
+        for dispatch in rows:
+            role_rows[
+                _gpu_candidate_dispatch_role(dispatch.kernel_name)
+            ].append(dispatch)
+        candidate_rows = tuple(
+            dispatch
+            for role in _GPU_CANDIDATE_DISPATCH_ROLES
+            for dispatch in role_rows.get(role, ())
+        )
+        if not candidate_rows:
+            raise ValueError(
+                f"{request_id}: GPU candidate has preparation launches only"
+            )
+        for role in _GPU_CANDIDATE_DISPATCH_ROLES:
+            owned_rows = tuple(role_rows.get(role, ()))
+            features[f"profile.{role}_dispatch_count"] = _signed_log1p(
+                float(len(owned_rows))
+            )
+            if owned_rows:
+                features.update(_gpu_dispatch_role_features(role, owned_rows))
+    features["profile.dispatch_count"] = _signed_log1p(
+        float(len(candidate_rows))
+    )
+    metric_values: dict[str, list[float]] = defaultdict(list)
+    role_ordinals: dict[str, int] = defaultdict(int)
+    for dispatch in candidate_rows:
+        role = (
+            "cpu"
+            if observation.backend == Backend.CPU
+            else _gpu_candidate_dispatch_role(dispatch.kernel_name)
+        )
+        role_ordinal = role_ordinals[role]
+        role_ordinals[role] += 1
+        features[
+            f"profile.dispatch_kind.{role}.{role_ordinal}"
+        ] = dispatch.dispatch_kind.value
+        if dispatch.block is not None:
+            features[f"profile.block_threads.{role}.{role_ordinal}"] = (
+                _signed_log1p(float(math.prod(dispatch.block)))
+            )
+        for metric_id, value in dispatch.metric_values.items():
+            if value is not None and math.isfinite(value):
+                metric_values[metric_id].append(float(value))
+    if not metric_values:
+        raise ValueError(f"{request_id}: candidate has no available profiler metrics")
+    features.update(_normalized_metric_features(
+        observation,
+        metric_values,
+        include_gpu_dispatch_metrics=observation.backend == Backend.CPU,
+    ))
+    key = _physical_key(observation)
+    return ProfilerCandidateDescriptor(
+        key=key,
+        anchor_m=observation.m,
+        anchor_n=observation.aggregate_n,
+        anchor_k=observation.k,
+        features=features,
+    )
+
+
+def _static_profiler_candidate_features(
+    observation: NativeVNNIObservation,
+) -> dict[str, float | str]:
+    """Return runtime-visible candidate facts available without profiling."""
+
     features: dict[str, float | str] = {
-        "profile.dispatch_count": _signed_log1p(float(len(rows))),
         "profile.execution_regime": _execution_regime(
             observation.operation_kind, observation.m
         ),
@@ -1574,29 +1793,36 @@ def _profiler_candidate_descriptor(
         features["profile.launch_n_block_chunks"] = _signed_log1p(
             float(observation.launch_n_block_chunks)
         )
-    metric_values: dict[str, list[float]] = defaultdict(list)
-    for dispatch in rows:
-        features[
-            f"profile.dispatch_kind.{dispatch.dispatch_index}"
-        ] = dispatch.dispatch_kind.value
-        if dispatch.block is not None:
-            features[f"profile.block_threads.{dispatch.dispatch_index}"] = (
-                _signed_log1p(float(math.prod(dispatch.block)))
-            )
-        for metric_id, value in dispatch.metric_values.items():
-            if value is not None and math.isfinite(value):
-                metric_values[metric_id].append(float(value))
-    if not metric_values:
-        raise ValueError(f"{request_id}: candidate has no available profiler metrics")
-    features.update(_normalized_metric_features(observation, metric_values))
+    return features
+
+
+def _static_profiler_candidate_descriptor(
+    observation: NativeVNNIObservation,
+) -> ProfilerCandidateDescriptor:
+    """Build one exact descriptor without inventing profiler measurements."""
+
     key = _physical_key(observation)
     return ProfilerCandidateDescriptor(
         key=key,
         anchor_m=observation.m,
         anchor_n=observation.aggregate_n,
         anchor_k=observation.k,
-        features=features,
+        features=_static_profiler_candidate_features(observation),
     )
+
+
+def _add_static_profiler_descriptors(
+    corpus: ObservationCorpus,
+    descriptors: dict[PhysicalCandidateKey, ProfilerCandidateDescriptor],
+) -> None:
+    """Make catalog dispatch coverage total while preserving sampled evidence."""
+
+    for observation in corpus:
+        if not observation.supported or not observation.generic_eligible:
+            continue
+        key = _physical_key(observation)
+        if key not in descriptors:
+            descriptors[key] = _static_profiler_candidate_descriptor(observation)
 
 
 def _build_profiler_descriptor_range(
@@ -1677,14 +1903,15 @@ def build_profiler_feature_catalog(
                 f"{key.canonical_tuple()}"
             )
 
+    _add_static_profiler_descriptors(corpus, descriptors)
     catalog = ProfilerFeatureCatalog(
         corpus_digest=corpus.digest(),
         request_manifest_digest=request_manifest_digest,
         evidence_manifest_digest=evidence_manifest_digest,
         descriptors=descriptors,
     )
-    # Every eligible physical invocation in development must have evidence. A
-    # sparse profiler sidecar cannot silently become a partially informed fit.
+    # Every eligible invocation must resolve, including deliberately unprofiled
+    # candidates represented by static-only descriptors.
     for observation in corpus:
         if observation.supported and observation.generic_eligible:
             catalog.descriptor_for(observation)
@@ -1707,12 +1934,19 @@ def load_profiler_feature_catalog(
     is lazy: an authenticated normalized-cache hit is already bound to the raw
     request/evidence file digests, so repeat fits can rebind it without parsing
     the redundant observation witness. A cache miss reads and authenticates the
-    source normally before publishing a replacement cache.
+    source normally before publishing a replacement cache. Callers that do not
+    nominate a cache share a derived sidecar beside the evidence manifest; this
+    lets the mandatory pre-fit diagnostic pay normalization once and the fitter
+    consume exactly those authenticated descriptors.
     """
 
     if source_corpus is not None and source_corpus_path is not None:
         raise ValueError(
             "profiler source_corpus and source_corpus_path are mutually exclusive"
+        )
+    if cache_path is None:
+        cache_path = evidence_manifest_path.with_name(
+            evidence_manifest_path.name + ".normalized-catalog-v2.jsonl"
         )
     request_file_digest = _file_sha256(request_manifest_path)
     evidence_file_digest = _file_sha256(evidence_manifest_path)
@@ -1781,14 +2015,10 @@ def merge_profiler_feature_catalogs(
     A newly implemented physical candidate needs a new isolated counter launch,
     but unchanged candidates do not. Each input catalog has already proved its
     own timing-corpus, request-manifest, and evidence-manifest identities. This
-    function unions only their exact physical descriptors, rejects
-    conflicting duplicate evidence, content-addresses the complete provenance
-    set, and finally re-establishes complete coverage against ``corpus``.
-
-    The coverage check happens after the union. Consequently, neither an old
-    catalog that lacks a new candidate nor a new incremental catalog that lacks
-    old candidates is usable alone; together they must describe every supported
-    generic launch in the expanded fit corpus.
+    function unions their exact physical descriptors, prefers newly measured
+    evidence over a prior static-only placeholder, rejects conflicting measured
+    duplicates, content-addresses the complete provenance set, and finally
+    re-establishes total dispatch coverage against ``corpus``.
     """
 
     sources = tuple(catalogs)
@@ -1800,10 +2030,18 @@ def merge_profiler_feature_catalogs(
         for key, descriptor in catalog.descriptors.items():
             previous = descriptors.setdefault(key, descriptor)
             if previous != descriptor:
+                previous_measured = _descriptor_has_profile_measurements(previous)
+                descriptor_measured = _descriptor_has_profile_measurements(descriptor)
+                if previous_measured != descriptor_measured:
+                    if descriptor_measured:
+                        descriptors[key] = descriptor
+                    continue
                 raise ValueError(
                     "additive profiler catalogs disagree for exact physical launch "
                     f"{key.canonical_tuple()}"
                 )
+
+    _add_static_profiler_descriptors(corpus, descriptors)
 
     provenance = sorted({
         (
@@ -2444,6 +2682,10 @@ def _model_record(
     anchor_log2_m = math.log2(descriptor.anchor_m)
     anchor_log2_n = math.log2(descriptor.anchor_n)
     anchor_log2_k = math.log2(descriptor.anchor_k)
+    dynamic_metrics_available = any(
+        _is_anchor_dynamic_profiler_feature(name)
+        for name in descriptor.features
+    )
     record: dict[str, float | str] = {
         **runtime,
         **_cpu_decode_schedule_features(key, descriptor.features),
@@ -2481,7 +2723,9 @@ def _model_record(
         "profile.anchor.abs_delta_log2_k": abs(
             runtime["runtime.log2_k"] - anchor_log2_k
         ),
-        "profile.anchor.dynamic_metrics_available": 1.0,
+        "profile.anchor.dynamic_metrics_available": float(
+            dynamic_metrics_available
+        ),
     }
     for name, value in descriptor.features.items():
         record[name] = value
@@ -2525,27 +2769,53 @@ def _is_anchor_dynamic_profiler_feature(name: str) -> bool:
     )
     return not any(
         name.startswith(f"metric.{metric_id}.")
+        or any(
+            name.startswith(
+                f"metric.gpu.{role}.{metric_id.removeprefix('gpu.')}."
+            )
+            for role in _GPU_CANDIDATE_DISPATCH_ROLES
+        )
         for metric_id in static_metric_ids
     )
+
+
+def _descriptor_has_profile_measurements(
+    descriptor: ProfilerCandidateDescriptor,
+) -> bool:
+    """Return whether a descriptor owns one isolated profiler launch."""
+
+    return "profile.dispatch_count" in descriptor.features
 
 
 def _profiler_model_input_record(
     record: Mapping[str, float | str],
 ) -> dict[str, float | str]:
-    """Return runtime/static inputs available for every unseen work point.
+    """Return dispatch-time inputs available for every unseen work point.
 
     Exact dynamic counters are training evidence, not runtime-visible inputs.
     Feeding them into training while masking them for a held point creates a
     missing-feature distribution shift and lets the forest key directly on a
-    paid measurement. The multi-output target below carries their explanatory
-    signal without requiring a profiler at dispatch time.
+    paid measurement. Under stratified profiling, even static resource counters
+    exist only for sampled launches, so those stay auxiliary evidence too.
+    Candidate configuration and analytical schedule geometry are total. The
+    multi-output target carries profiler signal without requiring a profiler at
+    dispatch time or revealing which candidates happened to be sampled.
     """
 
+    exact_profile_fields = {
+        "profile.execution_regime",
+        "profile.candidate_family",
+        "profile.launch_n_block_chunks",
+    }
     return {
         name: value
         for name, value in record.items()
-        if not name.startswith("profile.anchor.")
-        and not _is_anchor_dynamic_profiler_feature(name)
+        if name.startswith(("runtime.", "schedule.", "config."))
+        or name in exact_profile_fields
+        or (
+            name.startswith("interaction.")
+            and ".config." in name
+        )
     }
 
 
@@ -2566,7 +2836,14 @@ def _profiler_auxiliary_target_record(
         name: value
         for name, value in record.items()
         if isinstance(value, float)
-        and _is_anchor_dynamic_profiler_feature(name)
+        # Static resources such as registers and shared memory are not runtime
+        # inputs under stratified profiling: only sampled candidates own them.
+        # They remain valuable auxiliary labels for learning resource economy
+        # from total candidate configuration and analytical geometry.
+        and (
+            _is_anchor_dynamic_profiler_feature(name)
+            or name.startswith("metric.")
+        )
         and not name.startswith("interaction.")
         and name != "profile.anchor.dynamic_metrics_available"
         # This bit says whether duration-derived counters passed the control
@@ -2618,8 +2895,9 @@ def _auxiliary_metric_reliability_weight(name: str) -> float:
     signal, L1 traffic to be useful but somewhat noisier, and sparse LLC misses
     to be diagnostic rather than authoritative. Duration-derived cycle/rate
     features are admitted only after the reliability gate and remain below the
-    deterministic work counters. GPU metrics retain equal provisional weight
-    until their backend-specific repeatability probes calibrate this table.
+    deterministic work counters. GPU weights distinguish direct inefficiency
+    counters from utilization context; the saturated GPUBusy region marker is
+    explicitly excluded.
     """
 
     if any(token in name for token in (
@@ -2629,6 +2907,24 @@ def _auxiliary_metric_reliability_weight(name: str) -> float:
         "observed_fetch_gbytes_per_second",
     )):
         return 0.0
+    if "registers_per_thread" in name:
+        # ncu/rocprof expose register allocation as one static scalar rather
+        # than a repeated rate. Its maximum view is therefore the canonical
+        # value, not a duplicate role aggregate.
+        return 0.75
+    if any(token in name for token in (
+        "static_shared_memory_bytes",
+        "dynamic_shared_memory_bytes",
+        "static_lds_bytes",
+        "dynamic_lds_bytes",
+    )):
+        return 0.5
+    # Role aggregators retain maximum views for diagnostics, but mean and
+    # maximum are identical for the common one-launch role and highly
+    # correlated otherwise. Only the duration-weighted mean may influence the
+    # auxiliary target budget, giving each latent hardware counter one vote.
+    if ".fraction_maximum" in name or ".maximum_log1p" in name:
+        return 0.0
     if "instructions_" in name:
         return 1.0
     if "l1d_load" in name:
@@ -2637,17 +2933,34 @@ def _auxiliary_metric_reliability_weight(name: str) -> float:
         return 0.25
     if name.startswith("metric.cpu."):
         return 0.5
-    if name == "metric.gpu.compute_throughput_pct_of_peak.fraction_mean":
+    if ".gpu_busy_pct." in name:
+        # GPUBusy reports whether any graphics/compute work was active during
+        # the selected region. Isolated NativeVNNI launches saturate it at
+        # 100%, so it carries no candidate-ranking information.
+        return 0.0
+    if ".compute_throughput_pct_of_peak.fraction_mean" in name:
         return 1.0
-    if name == "metric.gpu.dram_throughput_pct_of_peak.fraction_mean":
+    if ".dram_throughput_pct_of_peak.fraction_mean" in name:
         return 1.0
-    if name == "metric.gpu.achieved_occupancy_pct.fraction_mean":
+    if ".achieved_occupancy_pct.fraction_mean" in name:
         return 0.25
+    if any(token in name for token in (
+        ".valu_utilization_pct.",
+        ".l2_cache_hit_pct.",
+    )):
+        return 0.25
+    if any(token in name for token in (
+        ".memory_unit_stalled_pct.",
+        ".lds_bank_conflict_pct.",
+        "fetch_to_expected_byte_ratio",
+        "write_to_output_byte_ratio",
+        "wavefronts_per_million_outputs",
+    )):
+        return 0.75
     if any(token in name for token in (
         "alu_pipe_utilization_pct",
         "fma_pipe_utilization_pct",
         "tensor_pipe_utilization_pct",
-        ".fraction_maximum",
     )):
         return 0.0
     return 0.5
@@ -3045,12 +3358,15 @@ def _compact_profiler_regret_prediction_values(
     excluded_profiler_geometries: frozenset[tuple[int, int]],
     surrogate_device: str,
 ) -> np.ndarray | None:
-    """Fit one surface and return aligned regret values without row objects.
+    """Fit one profiler-teacher surface and return aligned regret values.
 
-    Row selection preserves the exact source order consumed by the former
-    ``DictVectorizer`` path.  Auxiliary target centering is expressed as
-    vector reductions over stable contest IDs; a metric contributes only when
-    every candidate in that runtime/shape contest owns an unmasked value.
+    Canonical timing trains the primary policy over every candidate elsewhere
+    in the pipeline. This auxiliary teacher intentionally trains only on the
+    fastest/middle/slowest profiler strata. A pivot metric selects genuinely
+    profiled rows, candidate-relative counters are centered among the sampled
+    competitors in each contest, and compatible metrics share one multi-output
+    fit. Unprofiled rows remain prediction targets but never receive zero-filled
+    or borrowed hardware measurements.
     """
 
     if training_row_indices is None:
@@ -3104,9 +3420,13 @@ def _compact_profiler_regret_prediction_values(
     group_count = (
         int(contest_ids.max()) + 1 if len(contest_ids) else 0
     )
-    contest_sizes = np.bincount(contest_ids, minlength=group_count)
-    varying_auxiliary: list[tuple[str, float, float, np.ndarray]] = []
+    auxiliary_candidates: list[
+        tuple[str, float, np.ndarray, np.ndarray]
+    ] = []
     for column, name in enumerate(index.auxiliary_feature_names):
+        reliability = _auxiliary_metric_reliability_weight(name)
+        if reliability <= 0.0:
+            continue
         values = np.asarray(
             index.auxiliary_matrix[training_rows, column],
             dtype=np.float64,
@@ -3117,29 +3437,55 @@ def _compact_profiler_regret_prediction_values(
             weights=available.astype(np.float64),
             minlength=group_count,
         )
-        complete = available_counts == contest_sizes
         sums = np.bincount(
             contest_ids,
             weights=np.where(available, values, 0.0),
             minlength=group_count,
         )
         means = np.zeros(group_count, dtype=np.float64)
-        populated = complete & (contest_sizes > 0)
-        means[populated] = sums[populated] / contest_sizes[populated]
-        admitted = available & complete[contest_ids]
-        centered = np.zeros(len(values), dtype=np.float64)
+        populated = available_counts >= 2.0
+        means[populated] = sums[populated] / available_counts[populated]
+        admitted = available & populated[contest_ids]
+        if np.count_nonzero(admitted) < 2:
+            continue
+        centered = np.full(len(values), np.nan, dtype=np.float64)
         centered[admitted] = values[admitted] - means[contest_ids[admitted]]
-        mean = float(np.mean(centered, dtype=np.float64))
-        variance = float(np.var(centered, dtype=np.float64))
+        variance = float(np.var(centered[admitted], dtype=np.float64))
+        if variance > 1.0e-18:
+            auxiliary_candidates.append(
+                (name, reliability, admitted, centered)
+            )
+    if not auxiliary_candidates:
+        return None
+
+    # Prefer a reliable metric spanning the largest sampled population. Every
+    # additional output must be present on that same population; this keeps one
+    # dense multi-output target matrix without treating missing evidence as 0.
+    pivot = max(
+        auxiliary_candidates,
+        key=lambda item: (
+            item[1] * float(np.count_nonzero(item[2])),
+            np.count_nonzero(item[2]),
+            item[0],
+        ),
+    )
+    profiled_rows = np.flatnonzero(pivot[2])
+    varying_auxiliary: list[tuple[str, float, float, np.ndarray]] = []
+    for name, reliability, admitted, centered in auxiliary_candidates:
+        if not np.all(admitted[profiled_rows]):
+            continue
+        sampled_values = centered[profiled_rows]
+        mean = float(np.mean(sampled_values, dtype=np.float64))
+        variance = float(np.var(sampled_values, dtype=np.float64))
         if variance > 1.0e-18:
             varying_auxiliary.append(
-                (name, mean, math.sqrt(variance), centered)
+                (name, mean, math.sqrt(variance), sampled_values)
             )
     if not varying_auxiliary:
         return None
 
     regret_targets = np.asarray(
-        index.regret_targets[training_rows],
+        index.regret_targets[training_rows[profiled_rows]],
         dtype=np.float64,
     )
     regret_mean = float(np.mean(regret_targets, dtype=np.float64))
@@ -3160,7 +3506,7 @@ def _compact_profiler_regret_prediction_values(
         for name, _mean, _scale, _values in varying_auxiliary
     }
     targets = np.empty(
-        (training_count, 1 + len(varying_auxiliary)),
+        (len(profiled_rows), 1 + len(varying_auxiliary)),
         dtype=np.float64,
     )
     targets[:, 0] = (regret_targets - regret_mean) / regret_scale
@@ -3178,7 +3524,7 @@ def _compact_profiler_regret_prediction_values(
         order="C",
     )
     predictions = _fit_profiler_surrogate(
-        training_matrix,
+        np.asarray(training_matrix[profiled_rows], order="C"),
         targets,
         prediction_matrix,
         device=surrogate_device,

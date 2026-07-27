@@ -46,18 +46,10 @@ namespace llaminar2
                 return "plan_copy_apply";
             case DeviceMoERebalanceStagePhase::CollectState:
                 return "collect_state";
-            case DeviceMoERebalanceStagePhase::CollectAndGatherState:
-                return "collect_and_gather_state";
             case DeviceMoERebalanceStagePhase::PlanAndCopy:
                 return "plan_and_copy";
             case DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband:
                 return "plan_and_copy_after_sideband";
-            case DeviceMoERebalanceStagePhase::PlanProbeAfterSideband:
-                return "plan_probe_after_sideband";
-            case DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload:
-                return "gather_commands_and_copy_prepared_payload";
-            case DeviceMoERebalanceStagePhase::CopyPreparedPayload:
-                return "copy_prepared_payload";
             case DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband:
                 return "pack_collective_payload_after_sideband";
             case DeviceMoERebalanceStagePhase::UnpackCollectivePayloadAfterSideband:
@@ -158,6 +150,59 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceMoERebalanceTransferState::prepareForCapture(
+        DeviceId device,
+        const std::string &name_suffix,
+        void *capture_stream)
+    {
+        if (!capture_stream)
+        {
+            LOG_ERROR("[DeviceMoERebalanceTransferState] Graph launch preparation requires an explicit capture stream"
+                      << " device=" << device.to_string()
+                      << " lane=" << suffixFor(name_suffix));
+            return false;
+        }
+        if (!ensure(device, name_suffix))
+            return false;
+
+        IWorkerGPUContext *gpu_ctx = nullptr;
+        try
+        {
+            gpu_ctx = &GPUDeviceContextPool::instance().getContext(device);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[DeviceMoERebalanceTransferState] Failed to resolve GPU context for pre-capture transfer-lane fence"
+                      << " device=" << device.to_string()
+                      << " lane=" << suffixFor(name_suffix)
+                      << ": " << e.what());
+            return false;
+        }
+        if (!gpu_ctx || !transfer_stream_ || !transfer_done_event_)
+        {
+            LOG_ERROR("[DeviceMoERebalanceTransferState] Pre-capture transfer-lane fence requires initialized resources"
+                      << " device=" << device.to_string()
+                      << " lane=" << suffixFor(name_suffix));
+            return false;
+        }
+
+        /*
+         * Publish all previously submitted auxiliary work before capture begins.
+         * This edge is outside the new graph. The stage's ordinary
+         * computeReady/transferDone event pair then becomes part of the captured
+         * graph and orders each payload transaction during replay.
+         */
+        if (!gpu_ctx->recordEventChecked(transfer_done_event_, transfer_stream_) ||
+            !gpu_ctx->waitEventChecked(transfer_done_event_, capture_stream))
+        {
+            LOG_ERROR("[DeviceMoERebalanceTransferState] Failed to queue pre-capture transfer-lane event fence"
+                      << " device=" << device.to_string()
+                      << " lane=" << suffixFor(name_suffix));
+            return false;
+        }
+        return true;
+    }
+
     void DeviceMoERebalanceTransferState::release()
     {
         if (event_backend_ && event_device_ordinal_ >= 0)
@@ -188,6 +233,15 @@ namespace llaminar2
     }
 
     MoEDeviceRebalanceStage::~MoEDeviceRebalanceStage() = default;
+
+    void MoEDeviceRebalanceStage::invalidateKernelDynamicState()
+    {
+        if (!owned_moe_kernel_)
+            return;
+
+        owned_moe_kernel_->resetDynamicState();
+        owned_moe_kernel_->setGPUStream(nullptr);
+    }
 
     std::string MoEDeviceRebalanceStage::localHistogramBufferName() const
     {
@@ -406,14 +460,12 @@ namespace llaminar2
     {
         return params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
                params_.phase == DeviceMoERebalanceStagePhase::CollectState ||
-               params_.phase == DeviceMoERebalanceStagePhase::CollectAndGatherState ||
                params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopy;
     }
 
     bool MoEDeviceRebalanceStage::gathersStateInline() const
     {
         return params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
-               params_.phase == DeviceMoERebalanceStagePhase::CollectAndGatherState ||
                params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopy;
     }
 
@@ -421,17 +473,14 @@ namespace llaminar2
     {
         return params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
                params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopy ||
-               params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband ||
-               params_.phase == DeviceMoERebalanceStagePhase::PlanProbeAfterSideband;
+               params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband;
     }
 
     bool MoEDeviceRebalanceStage::runsPlanning() const
     {
         if (params_.phase == DeviceMoERebalanceStagePhase::JoinTransfer)
             return false;
-        if (params_.phase == DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload ||
-            params_.phase == DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband ||
-            params_.phase == DeviceMoERebalanceStagePhase::CopyPreparedPayload ||
+        if (params_.phase == DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband ||
             params_.phase == DeviceMoERebalanceStagePhase::UnpackCollectivePayloadAfterSideband)
         {
             return false;
@@ -443,6 +492,55 @@ namespace llaminar2
     {
         return params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
                params_.phase == DeviceMoERebalanceStagePhase::Apply;
+    }
+
+    DeviceMoERebalanceStatusPublicationContract
+    MoEDeviceRebalanceStage::statusPublicationContract() const
+    {
+        DeviceMoERebalanceStatusPublicationContract contract;
+        const bool publishes_transfer_status = usesTransferSlotApply();
+        const bool publishes_ready_apply_status = usesReadyWaveApply();
+
+        /*
+         * Keep this switch exhaustive. Adding a new phase must make its status
+         * ownership explicit here before diagnostics are allowed to interpret
+         * shared workspace. This prevents a newly allocated buffer from being
+         * mistaken for a record produced by an unrelated graph transaction.
+         */
+        switch (params_.phase)
+        {
+            case DeviceMoERebalanceStagePhase::PlanCopyApply:
+                contract.copy_status = publishes_transfer_status;
+                contract.apply_status = publishes_ready_apply_status;
+                break;
+            case DeviceMoERebalanceStagePhase::PlanAndCopy:
+                /*
+                 * The current inline transport helper both publishes transfer
+                 * completion and polls the newly ready wave on its transfer
+                 * stream. A later split Apply stage may poll another buffered
+                 * wave, but that does not erase this phase's own publication.
+                 */
+                contract.copy_status = publishes_transfer_status;
+                contract.apply_status = publishes_transfer_status;
+                break;
+            case DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband:
+                contract.copy_status = publishes_transfer_status;
+                break;
+            case DeviceMoERebalanceStagePhase::UnpackCollectivePayloadAfterSideband:
+                contract.copy_status = publishes_transfer_status;
+                contract.apply_status =
+                    publishes_transfer_status &&
+                    publishes_ready_apply_status;
+                break;
+            case DeviceMoERebalanceStagePhase::Apply:
+                contract.apply_status = publishes_ready_apply_status;
+                break;
+            case DeviceMoERebalanceStagePhase::CollectState:
+            case DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband:
+            case DeviceMoERebalanceStagePhase::JoinTransfer:
+                break;
+        }
+        return contract;
     }
 
     std::string MoEDeviceRebalanceStage::workspaceSuffix() const
@@ -633,10 +731,7 @@ namespace llaminar2
         uint64_t *local = nullptr;
         uint64_t *gathered = nullptr;
         DeviceMoERebalanceStatus *status = nullptr;
-        const bool needs_status_workspace =
-            runsPlanning() ||
-            params_.phase ==
-                DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload;
+        const bool needs_status_workspace = runsPlanning();
         if (needs_status_workspace)
         {
             status = static_cast<DeviceMoERebalanceStatus *>(
@@ -750,16 +845,22 @@ namespace llaminar2
             }
         }
 
-        IMoEKernel *moe_kernel = KernelFactory::getOrCreateMoEKernel(params_.device_id);
+        if (!owned_moe_kernel_)
+            owned_moe_kernel_ = KernelFactory::createMoEKernel(params_.device_id);
+        IMoEKernel *moe_kernel = owned_moe_kernel_.get();
         if (!moe_kernel)
         {
             LOG_ERROR("[MoEDeviceRebalanceStage] Failed to get MoE kernel for "
                       << params_.device_id.to_string());
             return false;
         }
-        moe_kernel->setGPUStream(stream);
+        const MoEKernelLaunchContext compute_launch{
+            .stream = stream,
+            .workspace = bound_workspace_,
+        };
 
         if (!moe_kernel->initializeDeviceRebalanceGraphController(
+                compute_launch,
                 controller_state,
                 params_.config))
         {
@@ -780,9 +881,9 @@ namespace llaminar2
                  {"collects_state", boolString(collectsState())},
                  {"gathers_state_inline", boolString(gathersStateInline())},
                  {"uses_sideband_state",
-                  boolString(params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband ||
-                             params_.phase == DeviceMoERebalanceStagePhase::PlanProbeAfterSideband ||
-                             params_.phase == DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload)},
+                  boolString(
+                      params_.phase ==
+                          DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband)},
                  {"uses_transfer_slots", boolString(usesTransferSlotApply())},
                  {"command_buffer_count", std::to_string(commandBufferCount())}});
             if (runsPlanning())
@@ -824,6 +925,7 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx = nullptr;
         DeviceMoERebalanceTransferState *transfer_state = nullptr;
         void *transfer_stream = nullptr;
+        MoEKernelLaunchContext transfer_launch{};
         if (usesTransferSlotApply())
         {
             if (!ensureAsyncTransferState())
@@ -840,6 +942,10 @@ namespace llaminar2
             }
 
             transfer_stream = transfer_state->transferStream();
+            transfer_launch = MoEKernelLaunchContext{
+                .stream = transfer_stream,
+                .workspace = bound_workspace_,
+            };
 
             try
             {
@@ -867,7 +973,8 @@ namespace llaminar2
             }
         }
 
-        auto project_domain_commands = [&]() -> bool
+        auto project_domain_commands =
+            [&](const MoEKernelLaunchContext &launch) -> bool
         {
             if (!usesTransferSlotApply())
                 return true;
@@ -877,6 +984,7 @@ namespace llaminar2
                 return false;
             }
             if (!moe_kernel->projectDeviceRebalanceDomainCommands(
+                    launch,
                     gathered_plan_entries,
                     gathered_command_headers,
                     static_cast<uint32_t>(transferPlanCapacity()),
@@ -887,7 +995,10 @@ namespace llaminar2
                     static_cast<uint32_t>(payloadSlotCapacity()),
                     static_cast<uint32_t>(commandBufferCount()),
                     gathered_wave_states,
-                    wave_state))
+                    wave_state,
+                    runtime_layers,
+                    params_.local_transfer_slots,
+                    params_.local_transfer_slot_count))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to project gathered root commands into local apply ABI");
                 return false;
@@ -941,38 +1052,17 @@ namespace llaminar2
                           << context << " transfer stream back to the stage stream");
                 return false;
             }
-            moe_kernel->setGPUStream(stream);
             return true;
         };
 
         auto has_incoming_payload_edges = [&]() -> bool
         {
-            if (!usesCollectivePayloadLane())
-                return false;
-            if (params_.payload_edge_mask == 0ULL)
-                return true;
-            const uint32_t destination =
-                static_cast<uint32_t>(params_.tp_device_idx);
-            const uint32_t participant_count =
-                std::min<uint32_t>(
-                    params_.config.participant_count,
-                    static_cast<uint32_t>(kDeviceMoEMaxParticipants));
-            for (uint32_t source = 0; source < participant_count; ++source)
-            {
-                if (source == destination)
-                    continue;
-                const uint64_t edge_bit =
-                    moe_rebalance_policy::directedParticipantEdgeBit(
-                        source,
-                        destination,
-                        static_cast<uint32_t>(kDeviceMoEMaxParticipants));
-                if ((params_.payload_edge_mask & edge_bit) != 0ULL)
-                    return true;
-            }
-            return false;
+            return usesCollectivePayloadLane();
         };
 
-        auto apply_published_transfer_wave = [&](const char *context) -> bool
+        auto apply_published_transfer_wave =
+            [&](const MoEKernelLaunchContext &launch,
+                const char *context) -> bool
         {
             if (!usesReadyWaveApply())
                 return true;
@@ -983,6 +1073,7 @@ namespace llaminar2
                 return false;
             }
             if (!moe_kernel->applyReadyDeviceRebalanceWave(
+                    launch,
                     runtime_layers,
                     plan_entries,
                     plan_count,
@@ -1030,31 +1121,28 @@ namespace llaminar2
             return true;
         };
 
-        auto copy_prepared_payload = [&](bool transfer_stream_already_ordered) -> bool
+        /**
+         * Snapshot the source side of the current projected command buffer.
+         *
+         * This helper is deliberately separate from payload transport. The
+         * runtime expert directory is mutable: ordinary decode can evict and
+         * replace a cache slot after this graph transaction completes.
+         * Therefore source selection and source dereference remain adjacent
+         * inside one replay, turning every selected source into immutable bytes
+         * before payload transport begins.
+         */
+        auto prepare_local_payload = [&]() -> bool
         {
             if (!usesCollectivePayloadLane())
             {
-                LOG_ERROR("[MoEDeviceRebalanceStage] Prepared payload copy requires a collective payload lane");
-                return false;
-            }
-            if (!gpu_ctx || !transfer_state)
-            {
-                LOG_ERROR("[MoEDeviceRebalanceStage] Prepared payload copy requires transfer stream state");
+                LOG_ERROR("[MoEDeviceRebalanceStage] Payload preparation requires a collective payload lane");
                 return false;
             }
 
-            if (!transfer_stream_already_ordered &&
-                (!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
-                 !gpu_ctx->waitEventChecked(transfer_state->computeReadyEvent(), transfer_stream)))
-            {
-                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue prepared payload compute-to-transfer dependency");
-                return false;
-            }
-
-            moe_kernel->setGPUStream(transfer_stream);
             if (usesCompactTransferSlots())
             {
                 if (!moe_kernel->packDeviceRebalanceSourceDescriptors(
+                        transfer_launch,
                         runtime_layers,
                         plan_entries,
                         command_header,
@@ -1069,6 +1157,7 @@ namespace llaminar2
                 }
 
                 if (!moe_kernel->packDeviceRebalanceCompactPayloads(
+                        transfer_launch,
                         plan_entries,
                         command_header,
                         static_cast<uint32_t>(transferPlanCapacity()),
@@ -1088,6 +1177,7 @@ namespace llaminar2
             else
             {
                 if (!moe_kernel->packDeviceRebalanceCollectivePayloads(
+                        transfer_launch,
                         gathered_plan_entries,
                         gathered_command_headers,
                         static_cast<uint32_t>(transferPlanCapacity()),
@@ -1104,74 +1194,52 @@ namespace llaminar2
                     return false;
                 }
             }
+            return true;
+        };
 
-            if (params_.payload_edge_mask != 0ULL)
+        /**
+         * Transport and apply a command buffer whose source payload is stable.
+         *
+         * @param transfer_stream_already_ordered
+         *     True when command metadata projection has already established the
+         *     compute-to-transfer event edge for this invocation.
+         *
+         * There is intentionally no "prepare if needed" parameter. Callers
+         * that own a prepare-and-transfer transaction must invoke
+         * `prepare_local_payload()` explicitly first. As a result this helper,
+         * and therefore the transport portion of the transaction, has no
+         * executable branch that can dereference the live runtime directory.
+         */
+        auto transfer_prepared_payload =
+            [&](bool transfer_stream_already_ordered) -> bool
+        {
+            if (!usesCollectivePayloadLane())
             {
-                std::vector<CollectiveP2POp> p2p_ops;
-                const size_t local_payload_bytes = collectivePayloadLocalBytes();
-                const uint32_t participant_count =
-                    std::min<uint32_t>(
-                        params_.config.participant_count,
-                        static_cast<uint32_t>(kDeviceMoEMaxParticipants));
-                for (uint32_t source = 0; source < participant_count; ++source)
-                {
-                    for (uint32_t destination = 0;
-                         destination < participant_count;
-                         ++destination)
-                    {
-                        if (source == destination)
-                            continue;
-                        const uint64_t edge_bit =
-                            moe_rebalance_policy::directedParticipantEdgeBit(
-                                source,
-                                destination,
-                                static_cast<uint32_t>(kDeviceMoEMaxParticipants));
-                        if ((params_.payload_edge_mask & edge_bit) == 0ULL)
-                            continue;
-
-                        if (source == static_cast<uint32_t>(params_.tp_device_idx))
-                        {
-                            CollectiveP2POp op;
-                            op.kind = CollectiveP2POpKind::Send;
-                            op.send_buffer = local_transfer_payload;
-                            op.count = local_payload_bytes;
-                            op.dtype = CollectiveDataType::INT8;
-                            op.peer = static_cast<int>(destination);
-                            p2p_ops.push_back(op);
-                        }
-                        if (destination == static_cast<uint32_t>(params_.tp_device_idx))
-                        {
-                            CollectiveP2POp op;
-                            op.kind = CollectiveP2POpKind::Recv;
-                            op.recv_buffer =
-                                gathered_transfer_payload +
-                                static_cast<size_t>(source) * local_payload_bytes;
-                            op.count = local_payload_bytes;
-                            op.dtype = CollectiveDataType::INT8;
-                            op.peer = static_cast<int>(source);
-                            p2p_ops.push_back(op);
-                        }
-                    }
-                }
-
-                if (!params_.tp_ctx->groupedP2PRawOnStream(
-                        p2p_ops,
-                        params_.tp_device_idx,
-                        transfer_stream,
-                        workspaceSuffix() + "_transfer_payload_p2p"))
-                {
-                    LOG_ERROR("[MoEDeviceRebalanceStage] Directed transfer-payload grouped P2P failed");
-                    return false;
-                }
+                LOG_ERROR("[MoEDeviceRebalanceStage] Prepared payload transfer requires a collective payload lane");
+                return false;
             }
-            else if (!params_.tp_ctx->allgatherRawOnStream(
-                         local_transfer_payload,
-                         gathered_transfer_payload,
-                         collectivePayloadLocalBytes(),
-                         CollectiveDataType::INT8,
-                         params_.tp_device_idx,
-                         transfer_stream,
-                         workspaceSuffix() + "_transfer_payload"))
+            if (!gpu_ctx || !transfer_state)
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Prepared payload transfer requires transfer stream state");
+                return false;
+            }
+
+            if (!transfer_stream_already_ordered &&
+                (!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
+                 !gpu_ctx->waitEventChecked(transfer_state->computeReadyEvent(), transfer_stream)))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue prepared payload compute-to-transfer dependency");
+                return false;
+            }
+
+            if (!params_.tp_ctx->allgatherRawOnStream(
+                    local_transfer_payload,
+                    gathered_transfer_payload,
+                    collectivePayloadLocalBytes(),
+                    CollectiveDataType::INT8,
+                    params_.tp_device_idx,
+                    transfer_stream,
+                    workspaceSuffix() + "_transfer_payload"))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-payload allgather failed");
                 return false;
@@ -1179,6 +1247,7 @@ namespace llaminar2
 
             if (has_incoming_payload_edges() &&
                 !moe_kernel->unpackDeviceRebalanceCollectivePayloads(
+                    transfer_launch,
                     plan_entries,
                     plan_count,
                     static_cast<uint32_t>(transferPlanCapacity()),
@@ -1201,6 +1270,7 @@ namespace llaminar2
                 return false;
 
             if (!moe_kernel->publishDeviceRebalanceTransferComplete(
+                    transfer_launch,
                     controller_state,
                     command_header,
                     wave_state,
@@ -1215,86 +1285,13 @@ namespace llaminar2
                 return false;
             }
 
-            if (!apply_published_transfer_wave("prepared payload copy"))
+            if (!apply_published_transfer_wave(
+                    transfer_launch,
+                    "prepared payload transfer"))
                 return false;
 
-            return join_transfer_stream_to_capture_stream("prepared payload copy");
+            return join_transfer_stream_to_capture_stream("prepared payload transfer");
         };
-
-        if (params_.phase == DeviceMoERebalanceStagePhase::CopyPreparedPayload)
-            return copy_prepared_payload(/*transfer_stream_already_ordered=*/false);
-
-        if (params_.phase ==
-            DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload)
-        {
-            if (!usesTransferSlotApply())
-            {
-                LOG_ERROR("[MoEDeviceRebalanceStage] GatherCommandsAndCopyPreparedPayload requires transfer slots");
-                return false;
-            }
-            if ((!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
-                 !gpu_ctx->waitEventChecked(transfer_state->computeReadyEvent(), transfer_stream)))
-            {
-                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue command-metadata compute-to-transfer dependency");
-                return false;
-            }
-
-            moe_kernel->setGPUStream(transfer_stream);
-            static_assert((sizeof(DeviceMoERebalancePlanEntry) % sizeof(int32_t)) == 0);
-            static_assert((sizeof(DeviceMoERebalanceCommandBufferHeader) % sizeof(int32_t)) == 0);
-            static_assert((sizeof(DeviceMoERebalanceWaveState) % sizeof(int32_t)) == 0);
-            const size_t plan_int32_words =
-                (commandBufferCount() * transferPlanCapacity() *
-                 sizeof(DeviceMoERebalancePlanEntry)) /
-                sizeof(int32_t);
-            const size_t header_int32_words =
-                (commandBufferCount() * sizeof(DeviceMoERebalanceCommandBufferHeader)) /
-                sizeof(int32_t);
-            const size_t wave_int32_words =
-                (commandBufferCount() * sizeof(DeviceMoERebalanceWaveState)) /
-                sizeof(int32_t);
-            if (!params_.tp_ctx->allgatherRawOnStream(
-                    plan_entries,
-                    gathered_plan_entries,
-                    plan_int32_words,
-                    CollectiveDataType::INT32,
-                    params_.tp_device_idx,
-                    transfer_stream,
-                    workspaceSuffix() + "_transfer_plan"))
-            {
-                LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-plan allgather failed");
-                return false;
-            }
-            if (!params_.tp_ctx->allgatherRawOnStream(
-                    command_header,
-                    gathered_command_headers,
-                    header_int32_words,
-                    CollectiveDataType::INT32,
-                    params_.tp_device_idx,
-                    transfer_stream,
-                    workspaceSuffix() + "_transfer_header"))
-            {
-                LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-header allgather failed");
-                return false;
-            }
-            if (!params_.tp_ctx->allgatherRawOnStream(
-                    wave_state,
-                    gathered_wave_states,
-                    wave_int32_words,
-                    CollectiveDataType::INT32,
-                    params_.tp_device_idx,
-                    transfer_stream,
-                    workspaceSuffix() + "_transfer_wave"))
-            {
-                LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-wave allgather failed");
-                return false;
-            }
-
-            if (!project_domain_commands())
-                return false;
-
-            return copy_prepared_payload(/*transfer_stream_already_ordered=*/true);
-        }
 
         if (params_.phase == DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband)
         {
@@ -1303,10 +1300,11 @@ namespace llaminar2
                 LOG_ERROR("[MoEDeviceRebalanceStage] PackCollectivePayloadAfterSideband requires fixed payload transfer slots");
                 return false;
             }
-            if (!project_domain_commands())
+            if (!project_domain_commands(compute_launch))
                 return false;
 
             if (!moe_kernel->packDeviceRebalanceCollectivePayloads(
+                    compute_launch,
                     gathered_plan_entries,
                     gathered_command_headers,
                     static_cast<uint32_t>(transferPlanCapacity()),
@@ -1345,9 +1343,9 @@ namespace llaminar2
                 return false;
             }
 
-            moe_kernel->setGPUStream(transfer_stream);
             if (has_incoming_payload_edges() &&
                 !moe_kernel->unpackDeviceRebalanceCollectivePayloads(
+                    transfer_launch,
                     plan_entries,
                     plan_count,
                     static_cast<uint32_t>(transferPlanCapacity()),
@@ -1370,6 +1368,7 @@ namespace llaminar2
                 return false;
 
             if (!moe_kernel->publishDeviceRebalanceTransferComplete(
+                    transfer_launch,
                     controller_state,
                     command_header,
                     wave_state,
@@ -1384,7 +1383,9 @@ namespace llaminar2
                 return false;
             }
 
-            if (!apply_published_transfer_wave("sideband collective payload unpack"))
+            if (!apply_published_transfer_wave(
+                    transfer_launch,
+                    "sideband collective payload unpack"))
                 return false;
 
             if (!gpu_ctx->recordEventChecked(transfer_state->transferDoneEvent(),
@@ -1399,7 +1400,6 @@ namespace llaminar2
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to join sideband transfer stream back to the stage stream");
                 return false;
             }
-            moe_kernel->setGPUStream(stream);
             return true;
         }
 
@@ -1408,6 +1408,7 @@ namespace llaminar2
             if (collectsState())
             {
                 if (!moe_kernel->packDeviceRebalanceHistograms(
+                        compute_launch,
                         runtime_layers,
                         local,
                         params_.config,
@@ -1422,6 +1423,7 @@ namespace llaminar2
                 if (usesFixedPayloadTransfer())
                 {
                     if (!moe_kernel->packDeviceRebalanceDirectory(
+                            compute_launch,
                             runtime_layers,
                             local_directory,
                             params_.config))
@@ -1454,6 +1456,7 @@ namespace llaminar2
             if (runsController())
             {
                 if (!moe_kernel->runDeviceRebalanceController(
+                        compute_launch,
                         runtime_layers,
                         gathered,
                         status,
@@ -1471,9 +1474,6 @@ namespace llaminar2
                     return false;
                 }
 
-                if (params_.phase == DeviceMoERebalanceStagePhase::PlanProbeAfterSideband)
-                    return true;
-
                 if (usesTransferSlotApply())
                 {
                     if ((!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
@@ -1482,8 +1482,6 @@ namespace llaminar2
                         LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue compute-to-transfer stream dependency");
                         return false;
                     }
-                    moe_kernel->setGPUStream(transfer_stream);
-
                     {
                         static_assert((sizeof(DeviceMoERebalancePlanEntry) % sizeof(int32_t)) == 0);
                         static_assert((sizeof(DeviceMoERebalanceCommandBufferHeader) % sizeof(int32_t)) == 0);
@@ -1532,7 +1530,7 @@ namespace llaminar2
                             return false;
                         }
 
-                        if (!project_domain_commands())
+                        if (!project_domain_commands(transfer_launch))
                             return false;
 
                         if (params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband)
@@ -1542,28 +1540,39 @@ namespace llaminar2
                             return true;
                         }
 
-                        if (!copy_prepared_payload(/*transfer_stream_already_ordered=*/true))
+                        /*
+                         * Inline producer phases prepare and transport
+                         * atomically. Keeping the calls adjacent preserves
+                         * immutable source ownership without giving the
+                         * transport helper a route back to runtime state.
+                         */
+                        if (!prepare_local_payload())
+                            return false;
+                        if (!transfer_prepared_payload(
+                                /*transfer_stream_already_ordered=*/true))
                             return false;
                     }
                 }
             }
         }
 
-        if (runsApply() && usesReadyWaveApply())
+        /*
+         * An inline transfer transaction publishes and applies its ready wave
+         * inside `transfer_prepared_payload()` on the transfer stream.  Polling
+         * again here would be a second state-machine transition in the same
+         * graph replay: the first poll consumes the ready wave, while the
+         * redundant poll observes no work and can overwrite the terminal apply
+         * record.  Non-transfer deferred-apply configurations still need this
+         * compute-stream apply step because they have no transport helper.
+         */
+        const bool inline_transfer_already_applied =
+            usesTransferSlotApply() && runsController();
+        if (runsApply() &&
+            usesReadyWaveApply() &&
+            !inline_transfer_already_applied)
         {
-            const bool must_wait_for_inline_transfer =
-                usesTransferSlotApply() &&
-                (params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
-                 commandBufferCount() < 2u);
-            if (must_wait_for_inline_transfer &&
-                !gpu_ctx->waitEventChecked(transfer_state->transferDoneEvent(), stream))
-            {
-                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue transfer-to-apply stream dependency");
-                return false;
-            }
-            moe_kernel->setGPUStream(stream);
-
             if (!moe_kernel->applyReadyDeviceRebalanceWave(
+                    compute_launch,
                     runtime_layers,
                     plan_entries,
                     plan_count,
@@ -1661,6 +1670,18 @@ namespace llaminar2
         }
     }
 
+    bool MoEDeviceRebalanceStage::isCollectiveStage() const
+    {
+        /*
+         * Inline state gathering always launches the histogram allgather.
+         * Transfer-backed controller phases additionally gather command, wave,
+         * payload, and completion records. Sideband pack/unpack, Apply,
+         * JoinTransfer, and CollectState remain participant-local.
+         */
+        return gathersStateInline() ||
+               (runsController() && usesTransferSlotApply());
+    }
+
     bool MoEDeviceRebalanceStage::isGraphCapturable() const
     {
         if (!validateDeviceMoERebalanceConfig(params_.config))
@@ -1700,44 +1721,20 @@ namespace llaminar2
         setGPUStream(stream);
         if (!usesTransferSlotApply())
             return true;
-        if (!ensureAsyncTransferState())
-            return false;
         auto *transfer_state = transferState();
-
-        /*
-         * Transfer-slot rebalance captures a multi-stream transaction: the
-         * public graph stream publishes command readiness, an auxiliary stream
-         * runs command metadata collectives and payload copies, then the public
-         * stream waits on the transfer completion event.  HIP/CUDA stream
-         * capture must start from a clean auxiliary stream; otherwise a stale
-         * collective or payload kernel from an earlier request can become an
-         * implicit predecessor of the newly captured graph without being
-         * represented in the graph topology.  This is a short correctness fence
-         * at graph-capture setup time, not a production collective timeout.
-         */
-        IWorkerGPUContext *gpu_ctx = nullptr;
-        try
+        if (!transfer_state)
         {
-            gpu_ctx = &GPUDeviceContextPool::instance().getContext(params_.device_id);
-        }
-        catch (const std::exception &e)
-        {
-            LOG_ERROR("[MoEDeviceRebalanceStage] Failed to resolve GPU context for pre-capture transfer-stream fence"
-                      << " stage=" << suffixFor(params_.stage_name)
-                      << " device=" << params_.device_id.to_string()
-                      << ": " << e.what());
-            return false;
-        }
-        if (!gpu_ctx || !transfer_state || !transfer_state->transferStream())
-        {
-            LOG_ERROR("[MoEDeviceRebalanceStage] Pre-capture transfer-stream fence requires transfer stream state"
+            LOG_ERROR("[MoEDeviceRebalanceStage] Pre-capture transfer-stream fence requires shared transfer state"
                       << " stage=" << suffixFor(params_.stage_name)
                       << " device=" << params_.device_id.to_string());
             return false;
         }
-        if (!gpu_ctx->synchronizeStreamChecked(transfer_state->transferStream()))
+        if (!transfer_state->prepareForCapture(
+                params_.device_id,
+                workspaceSuffix(),
+                stream))
         {
-            LOG_ERROR("[MoEDeviceRebalanceStage] Pre-capture transfer-stream fence failed"
+            LOG_ERROR("[MoEDeviceRebalanceStage] Pre-capture transfer-stream event fence failed"
                       << " stage=" << suffixFor(params_.stage_name)
                       << " phase=" << phaseName(params_.phase)
                       << " device=" << params_.device_id.to_string()
@@ -1746,7 +1743,7 @@ namespace llaminar2
         }
         PerfStatsCollector::addCounter(
             "moe_rebalance",
-            "device_rebalance_precapture_transfer_stream_fence",
+            "device_rebalance_precapture_transfer_stream_event_fence",
             1.0,
             "decode",
             params_.device_id.to_string(),

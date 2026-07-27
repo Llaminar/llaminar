@@ -479,6 +479,13 @@ namespace llaminar2
             void *stream,
             void *out_condition_tokens_device,
             void *out_position_ids_device) override;
+        bool enqueuePrepareMTPVerifierPositionIds(
+            const void *base_positions_device,
+            int request_count,
+            int padded_seq_len,
+            int device_id,
+            void *stream,
+            void *out_position_ids_device) override;
         bool enqueueInitializeMTPDeviceLogicalState(
             const void *sampled_tokens_device,
             const void *target_positions_device,
@@ -494,6 +501,9 @@ namespace llaminar2
             void *out_publication_ok_flags_device) override;
 
         // GPU-side sparse logit penalty application
+        bool prepareLogitPenaltyWorkspace(
+            int vocab_size,
+            int device_id) override;
         bool applyLogitPenaltiesF32(void *logits_device,
                                     const int *token_ids_host,
                                     const float *penalties_host,
@@ -575,12 +585,21 @@ namespace llaminar2
         };
         std::vector<SampleTokenDeviceBuffers> sample_token_buffers_;
 
-        // Per-device penalty upload buffers (lazily allocated)
+        /**
+         * @brief Persistent per-device sparse-penalty publication storage.
+         *
+         * The first call reserves a full-vocabulary token/value pair so later
+         * decode steps cannot reallocate in the hot path. `ready_event` orders
+         * reuse when successive logits producers use different streams.
+         */
         struct PenaltyDeviceBuffers
         {
-            void *token_ids_ptr = nullptr;   // int[] on device
-            void *penalties_ptr = nullptr;    // float[] on device
+            void *token_ids_ptr = nullptr;  ///< int[allocated_count] on device.
+            void *penalties_ptr = nullptr;  ///< float[allocated_count] on device.
             int allocated_count = 0;
+            void *ready_event = nullptr;    ///< Event recorded after the penalty kernel.
+            void *producer_stream = nullptr; ///< Stream owning the newest publication.
+            bool publication_valid = false;
         };
         std::vector<PenaltyDeviceBuffers> penalty_buffers_;
     };

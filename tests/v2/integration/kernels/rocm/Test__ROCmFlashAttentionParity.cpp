@@ -43,6 +43,7 @@
 #include "transfer/TransferEngine.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
+#include "../../../utils/ScopedGPUStream.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -1298,6 +1299,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_Qwen35LongKVLen)
         gpu_device,
         {q_tensor.get(), k_tensor.get(), v_tensor.get()},
         {output_tensor.get()},
+        static_cast<void *>(stream),
         [&]
         {
             return rocm_kernel.compute_tensor(
@@ -1425,6 +1427,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_Qwen35TwoKVHeads
         gpu_device,
         {q_tensor.get(), k_tensor.get(), v_tensor.get()},
         {output_tensor.get()},
+        static_cast<void *>(stream),
         [&]
         {
             return rocm_kernel.compute_tensor(
@@ -1557,6 +1560,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_MultiRowContinua
         gpu_device,
         {q_tensor.get(), k_tensor.get(), v_tensor.get()},
         {output_tensor.get()},
+        static_cast<void *>(stream),
         [&]
         {
             return rocm_kernel.compute_tensor(
@@ -1945,13 +1949,9 @@ void Test__ROCmFlashAttentionParity::runAttentionStageFP16CacheQwen36RoPEOnReadR
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
         const float *grouped_row = grouped_output.data() + static_cast<size_t>(row) * q_cols;
-        const double cosine = cosineSimilarity(grouped_row, m1_output.data(), q_cols);
-        const double l2_error = relativeL2Error(grouped_row, m1_output.data(), q_cols);
-        const double max_error = maxAbsError(grouped_row, m1_output.data(), q_cols);
         const std::string label = "AttentionStage FP16 cache Qwen3.6 M" +
                                   std::to_string(seq_len) +
                                   " RoPE-on-read vs M1";
-        printComparisonStats(label.c_str(), cosine, l2_error, max_error, q_cols);
         EXPECT_TRUE(expectBitwiseEqualFP32Rows(grouped_row, m1_output.data(), q_cols,
                                                label + " row " + std::to_string(row)));
     }
@@ -2221,15 +2221,10 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
         const float *grouped_row = grouped_output.data() + static_cast<size_t>(row) * q_cols;
-        const double cosine = cosineSimilarity(grouped_row, m1_output.data(), q_cols);
-        const double l2_error = relativeL2Error(grouped_row, m1_output.data(), q_cols);
-        const double max_error = maxAbsError(grouped_row, m1_output.data(), q_cols);
         const std::string generated_label =
             "Captured append+attention FP16 cache Qwen3.6 M" +
             std::to_string(seq_len) +
             " RoPE-on-read vs M1";
-        printComparisonStats(label ? label : generated_label.c_str(),
-                             cosine, l2_error, max_error, q_cols);
         EXPECT_TRUE(expectBitwiseEqualFP32Rows(
             grouped_row, m1_output.data(), q_cols,
             (label ? std::string(label) : generated_label) + " row " + std::to_string(row)));
@@ -2306,6 +2301,64 @@ TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwe
         /*n_kv_heads=*/1,
         /*head_dim=*/256,
         "Captured append+attention FP16 cache Qwen3.6 ROCm LocalTP M4 RoPE-on-read vs M1");
+}
+
+/**
+ * @brief Prove every supported ROCm grouped-attention depth against serial decode.
+ *
+ * The grouped launcher is shared by MTP verifier rows and short prefix-cache
+ * suffix prefills. Those suffixes can contain any row count through sixteen,
+ * so testing only M=2..4 allowed a stale launcher cap to contradict the
+ * device-parameter, workspace, and graph contracts. Sweep every legal depth
+ * through the real captured append-plus-attention production sequence.
+ *
+ * Native FP16 and Q8_1 cache storage are both covered. Q8_1 follows the real
+ * converted FP16 RoPE-on-read path, and both LocalTP head offsets verify that
+ * global GQA ownership remains correct on either shard. Every grouped FP32
+ * output row must match the corresponding ROCm M=1 decode row byte-for-byte.
+ */
+TEST_F(
+    Test__ROCmFlashAttentionParity,
+    CapturedAppendThenAttention_AllNativeKVFormats_Qwen36LocalTPM2To16RoPEOnReadRowsMatchSerialDecode)
+{
+    constexpr int kFinalKVLength = 39;
+    constexpr int kLocalHeads = 8;
+    constexpr int kLocalKVHeads = 1;
+    constexpr int kHeadDim = 256;
+    constexpr int kGlobalGQARep = 16;
+    constexpr std::array<ActivationPrecision, 2> kCacheFormats = {
+        ActivationPrecision::FP16,
+        ActivationPrecision::Q8_1,
+    };
+
+    for (const ActivationPrecision cache_precision : kCacheFormats)
+    {
+        for (const int head_start : {0, kLocalHeads})
+        {
+            for (int verifier_rows = 2;
+                 verifier_rows <=
+                     attention::kMaxGroupedVerifierAttentionRows;
+                 ++verifier_rows)
+            {
+                SCOPED_TRACE(
+                    "cache_precision=" +
+                    std::to_string(static_cast<int>(cache_precision)) +
+                    " head_start=" + std::to_string(head_start) +
+                    " verifier_rows=" + std::to_string(verifier_rows));
+                runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+                    mpi_ctx_,
+                    verifier_rows,
+                    kFinalKVLength - verifier_rows,
+                    kLocalHeads,
+                    kLocalKVHeads,
+                    kHeadDim,
+                    "Captured ROCm all-M grouped verifier attention vs M1",
+                    cache_precision,
+                    head_start,
+                    kGlobalGQARep);
+            }
+        }
+    }
 }
 
 TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPM2RoPEOnReadRowsMatchSerialDecode)
@@ -3075,11 +3128,14 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeFP16KV_Qwen35LongPrefill
 
     const DeviceId gpu_device = DeviceId::rocm(0);
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    llaminar2::test::ScopedGPUStream stream(gpu_device);
+    rocm_kernel.setGPUStream(stream.get());
 
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device,
         {q_tensor.get(), k_tensor.get(), v_tensor.get()},
         {output_tensor.get()},
+        stream.get(),
         [&]
         {
             return rocm_kernel.compute_tensor(
@@ -3228,6 +3284,7 @@ TEST_F(
             900.0f + static_cast<float>(row));
     }
     const DeviceId gpu_device = DeviceId::rocm(0);
+    llaminar2::test::ScopedGPUStream stream(gpu_device);
 
     auto makeFP32 = [](const std::vector<float> &values, int rows, int width)
         -> std::shared_ptr<TensorBase>
@@ -3293,10 +3350,12 @@ TEST_F(
 
         llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32>
             batch_kernel(0);
+        batch_kernel.setGPUStream(stream.get());
         ASSERT_TRUE(with_gpu_coherence(
             gpu_device,
             {q_batch.get(), k_batch.get(), v_batch.get()},
             {output_batch.get()},
+            stream.get(),
             [&]
             {
                 return batch_kernel.compute_tensor(
@@ -3350,10 +3409,12 @@ TEST_F(
 
             llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32>
                 single_kernel(0);
+            single_kernel.setGPUStream(stream.get());
             ASSERT_TRUE(with_gpu_coherence(
                 gpu_device,
                 {q_single.get(), k_single.get(), v_single.get()},
                 {output_single.get()},
+                stream.get(),
                 [&]
                 {
                     return single_kernel.compute_tensor(
@@ -3397,13 +3458,14 @@ TEST_F(
  * sequence-zero substitution immediately visible. The graph is replayed
  * twice without recapture, growing every request beyond the live length seen
  * during capture. Every ordinary ROCm ring storage type is exercised, and
- * each request's FP32 output must be byte-for-byte identical to an isolated
- * batch-one invocation of the same production attention kernel over the same
- * native cache bytes after both launches.
+ * each output row must be byte-for-byte identical to a real batch-one M=1
+ * decode over the same native cache prefix after both launches.  This is the
+ * actual grouped-verifier contract; an isolated multirow prefill is not a
+ * serial-decode oracle because it is free to use another reduction order.
  */
 TEST_F(
     Test__ROCmFlashAttentionParity,
-    CapturedGrowingRequestBatchAllStandardKVFormatsMatchesIsolatedPrefillBytes)
+    CapturedGrowingRequestBatchAllStandardKVFormatsMatchesSerialDecodeRows)
 {
     if (!hasROCm())
     {
@@ -3628,74 +3690,147 @@ TEST_F(
         ASSERT_TRUE(serial_workspace.allocate(serial_requirements));
         serial_kernel.bindWorkspace(&serial_workspace);
 
-        for (int request = 0; request < batch_size; ++request)
+        auto expectSerialDecodeRows =
+            [&](const std::vector<float> &grouped_output,
+                int completed_blocks,
+                const std::string &phase)
         {
-            const size_t q_begin =
-                static_cast<size_t>(request) * request_q_elements;
-            const size_t kv_begin =
-                static_cast<size_t>(request) * request_kv_elements;
-            const std::vector<float> q_request(
-                q_host.begin() + static_cast<std::ptrdiff_t>(q_begin),
-                q_host.begin() + static_cast<std::ptrdiff_t>(
-                                     q_begin + request_q_elements));
-            const std::vector<float> k_request(
-                k_host.begin() + static_cast<std::ptrdiff_t>(kv_begin),
-                k_host.begin() + static_cast<std::ptrdiff_t>(
-                                     kv_begin + request_kv_elements));
-            const std::vector<float> v_request(
-                v_host.begin() + static_cast<std::ptrdiff_t>(kv_begin),
-                v_host.begin() + static_cast<std::ptrdiff_t>(
-                                     kv_begin + request_kv_elements));
-            auto q_single = makeFP32(q_request, seq_len, q_cols);
-            auto k_single = makeNativeKV(
-                k_request, seq_len, kv_cols, format.precision);
-            auto v_single = makeNativeKV(
-                v_request, seq_len, kv_cols, format.precision);
-            auto output_single = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(seq_len), q_cols});
-            ASSERT_NE(k_single, nullptr);
-            ASSERT_NE(v_single, nullptr);
-            ASSERT_TRUE(transfer.uploadFull(q_single.get(), device, stream).success);
-            ASSERT_TRUE(transfer.uploadFull(k_single.get(), device, stream).success);
-            ASSERT_TRUE(transfer.uploadFull(v_single.get(), device, stream).success);
-            ASSERT_TRUE(transfer.uploadFull(output_single.get(), device, stream).success);
+            for (int request = 0; request < batch_size; ++request)
+            {
+                const size_t q_request_begin =
+                    static_cast<size_t>(request) * request_q_elements;
+                const size_t kv_request_begin =
+                    static_cast<size_t>(request) * request_kv_elements;
+                const auto k_block_begin =
+                    k_host.begin() +
+                    static_cast<std::ptrdiff_t>(kv_request_begin);
+                const auto k_block_end =
+                    k_block_begin +
+                    static_cast<std::ptrdiff_t>(request_kv_elements);
+                const auto v_block_begin =
+                    v_host.begin() +
+                    static_cast<std::ptrdiff_t>(kv_request_begin);
+                const auto v_block_end =
+                    v_block_begin +
+                    static_cast<std::ptrdiff_t>(request_kv_elements);
 
-            ASSERT_TRUE(serial_kernel.compute_tensor(
-                q_single.get(), k_single.get(), v_single.get(),
-                output_single.get(),
-                /*batch_size=*/1,
-                seq_len,
-                seq_len,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                /*causal=*/true,
-                /*window_size=*/-1,
-                /*workspace_scores=*/nullptr,
-                /*workspace_mask=*/nullptr,
-                &mpi_ctx_,
-                /*device_idx=*/0,
-                /*head_start=*/0,
-                /*local_n_heads=*/n_heads,
-                /*local_n_kv_heads=*/n_kv_heads,
-                /*gqa_n_rep=*/n_heads / n_kv_heads));
-            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                for (int row = 0; row < seq_len; ++row)
+                {
+                    const size_t q_row_begin =
+                        q_request_begin + static_cast<size_t>(row) * q_cols;
+                    const std::vector<float> q_row(
+                        q_host.begin() +
+                            static_cast<std::ptrdiff_t>(q_row_begin),
+                        q_host.begin() +
+                            static_cast<std::ptrdiff_t>(q_row_begin + q_cols));
 
-            std::vector<float> expected(request_q_elements, 0.0f);
-            ASSERT_EQ(
-                hipMemcpyAsync(
-                    expected.data(), output_single->gpu_data_ptr(),
-                    request_q_elements * sizeof(float),
-                    hipMemcpyDeviceToHost, stream),
-                hipSuccess);
-            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            EXPECT_TRUE(expectBitwiseEqualFP32Rows(
-                actual.data() + q_begin,
-                expected.data(),
-                request_q_elements,
-                std::string("captured ROCm request-batch cache ") +
-                    format.name + " request=" + std::to_string(request)));
-        }
+                    std::vector<float> k_prefix;
+                    std::vector<float> v_prefix;
+                    const int visible_rows =
+                        completed_blocks * seq_len + row + 1;
+                    k_prefix.reserve(
+                        static_cast<size_t>(visible_rows) * kv_cols);
+                    v_prefix.reserve(
+                        static_cast<size_t>(visible_rows) * kv_cols);
+                    for (int block = 0; block < completed_blocks; ++block)
+                    {
+                        k_prefix.insert(
+                            k_prefix.end(), k_block_begin, k_block_end);
+                        v_prefix.insert(
+                            v_prefix.end(), v_block_begin, v_block_end);
+                    }
+                    k_prefix.insert(
+                        k_prefix.end(),
+                        k_block_begin,
+                        k_block_begin +
+                            static_cast<std::ptrdiff_t>(
+                                static_cast<size_t>(row + 1) * kv_cols));
+                    v_prefix.insert(
+                        v_prefix.end(),
+                        v_block_begin,
+                        v_block_begin +
+                            static_cast<std::ptrdiff_t>(
+                                static_cast<size_t>(row + 1) * kv_cols));
+
+                    auto q_single = makeFP32(q_row, /*rows=*/1, q_cols);
+                    auto k_single = makeNativeKV(
+                        k_prefix,
+                        static_cast<size_t>(visible_rows),
+                        kv_cols,
+                        format.precision);
+                    auto v_single = makeNativeKV(
+                        v_prefix,
+                        static_cast<size_t>(visible_rows),
+                        kv_cols,
+                        format.precision);
+                    auto output_single = std::make_shared<FP32Tensor>(
+                        std::vector<size_t>{1, q_cols});
+                    ASSERT_NE(k_single, nullptr);
+                    ASSERT_NE(v_single, nullptr);
+                    ASSERT_TRUE(
+                        transfer.uploadFull(
+                            q_single.get(), device, stream)
+                            .success);
+                    ASSERT_TRUE(
+                        transfer.uploadFull(
+                            k_single.get(), device, stream)
+                            .success);
+                    ASSERT_TRUE(
+                        transfer.uploadFull(
+                            v_single.get(), device, stream)
+                            .success);
+                    ASSERT_TRUE(
+                        transfer.uploadFull(
+                            output_single.get(), device, stream)
+                            .success);
+
+                    ASSERT_TRUE(serial_kernel.compute_tensor(
+                        q_single.get(),
+                        k_single.get(),
+                        v_single.get(),
+                        output_single.get(),
+                        /*batch_size=*/1,
+                        /*seq_len=*/1,
+                        visible_rows,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        /*causal=*/true,
+                        /*window_size=*/-1,
+                        /*workspace_scores=*/nullptr,
+                        /*workspace_mask=*/nullptr,
+                        &mpi_ctx_,
+                        /*device_idx=*/0,
+                        /*head_start=*/0,
+                        /*local_n_heads=*/n_heads,
+                        /*local_n_kv_heads=*/n_kv_heads,
+                        /*gqa_n_rep=*/n_heads / n_kv_heads));
+
+                    std::vector<float> expected(q_cols, 0.0f);
+                    ASSERT_EQ(
+                        hipMemcpyAsync(
+                            expected.data(),
+                            output_single->gpu_data_ptr(),
+                            q_cols * sizeof(float),
+                            hipMemcpyDeviceToHost,
+                            stream),
+                        hipSuccess);
+                    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                    EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+                        grouped_output.data() + q_row_begin,
+                        expected.data(),
+                        q_cols,
+                        phase + " " + format.name +
+                            " request=" + std::to_string(request) +
+                            " row=" + std::to_string(row)));
+                }
+            }
+        };
+
+        expectSerialDecodeRows(
+            actual,
+            /*completed_blocks=*/0,
+            "captured initial ROCm request batch");
 
         /*
          * Replay the identical graph without touching host-side attention
@@ -3710,6 +3845,99 @@ TEST_F(
         EXPECT_EQ(kv_cache->get_cached_tokens(0, 0), 2 * seq_len);
         EXPECT_EQ(kv_cache->get_cached_tokens(0, 1), 2 * seq_len);
 
+        /*
+         * Prove the cache-to-attention handoff before comparing arithmetic.
+         * A native-format append or fixed-stride gather bug can otherwise look
+         * exactly like a batch-dependent attention reduction.  The expected
+         * tensor is quantized once from the logical two-block history, while
+         * the actual bytes are copied from the same resident gather view that
+         * the production attention stage consumes.
+         */
+        std::vector<float> grown_k_host;
+        std::vector<float> grown_v_host;
+        grown_k_host.reserve(2 * kv_elements);
+        grown_v_host.reserve(2 * kv_elements);
+        for (int request = 0; request < batch_size; ++request)
+        {
+            const size_t kv_begin =
+                static_cast<size_t>(request) * request_kv_elements;
+            const auto k_begin =
+                k_host.begin() + static_cast<std::ptrdiff_t>(kv_begin);
+            const auto k_end =
+                k_begin + static_cast<std::ptrdiff_t>(request_kv_elements);
+            const auto v_begin =
+                v_host.begin() + static_cast<std::ptrdiff_t>(kv_begin);
+            const auto v_end =
+                v_begin + static_cast<std::ptrdiff_t>(request_kv_elements);
+            grown_k_host.insert(grown_k_host.end(), k_begin, k_end);
+            grown_k_host.insert(grown_k_host.end(), k_begin, k_end);
+            grown_v_host.insert(grown_v_host.end(), v_begin, v_end);
+            grown_v_host.insert(grown_v_host.end(), v_begin, v_end);
+        }
+
+        auto expected_grown_k = makeNativeKV(
+            grown_k_host,
+            static_cast<size_t>(batch_size * 2 * seq_len),
+            kv_cols,
+            format.precision);
+        auto expected_grown_v = makeNativeKV(
+            grown_v_host,
+            static_cast<size_t>(batch_size * 2 * seq_len),
+            kv_cols,
+            format.precision);
+        ASSERT_NE(expected_grown_k, nullptr);
+        ASSERT_NE(expected_grown_v, nullptr);
+
+        ITensor *gathered_k = nullptr;
+        ITensor *gathered_v = nullptr;
+        ASSERT_TRUE(kv_cache->get_kv_batched_device_view(
+            /*layer=*/0,
+            /*first_seq_idx=*/0,
+            batch_size,
+            &gathered_k,
+            &gathered_v,
+            stream));
+        ASSERT_NE(gathered_k, nullptr);
+        ASSERT_NE(gathered_v, nullptr);
+        ASSERT_EQ(gathered_k->size_bytes(), expected_grown_k->size_bytes());
+        ASSERT_EQ(gathered_v->size_bytes(), expected_grown_v->size_bytes());
+
+        std::vector<uint8_t> gathered_k_bytes(gathered_k->size_bytes());
+        std::vector<uint8_t> gathered_v_bytes(gathered_v->size_bytes());
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                gathered_k_bytes.data(),
+                gathered_k->gpu_data_ptr(),
+                gathered_k_bytes.size(),
+                hipMemcpyDeviceToHost,
+                stream),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                gathered_v_bytes.data(),
+                gathered_v->gpu_data_ptr(),
+                gathered_v_bytes.size(),
+                hipMemcpyDeviceToHost,
+                stream),
+            hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        EXPECT_EQ(
+            std::memcmp(
+                gathered_k_bytes.data(),
+                expected_grown_k->raw_data(),
+                gathered_k_bytes.size()),
+            0)
+            << "Captured growing K gather changed native bytes for "
+            << format.name;
+        EXPECT_EQ(
+            std::memcmp(
+                gathered_v_bytes.data(),
+                expected_grown_v->raw_data(),
+                gathered_v_bytes.size()),
+            0)
+            << "Captured growing V gather changed native bytes for "
+            << format.name;
+
         std::vector<float> grown_actual(q_elements, 0.0f);
         ASSERT_EQ(
             hipMemcpyAsync(
@@ -3717,85 +3945,10 @@ TEST_F(
                 q_elements * sizeof(float), hipMemcpyDeviceToHost, stream),
             hipSuccess);
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-
-        for (int request = 0; request < batch_size; ++request)
-        {
-            const size_t q_begin =
-                static_cast<size_t>(request) * request_q_elements;
-            const size_t kv_begin =
-                static_cast<size_t>(request) * request_kv_elements;
-            const std::vector<float> q_request(
-                q_host.begin() + static_cast<std::ptrdiff_t>(q_begin),
-                q_host.begin() + static_cast<std::ptrdiff_t>(
-                                     q_begin + request_q_elements));
-            const std::vector<float> k_block(
-                k_host.begin() + static_cast<std::ptrdiff_t>(kv_begin),
-                k_host.begin() + static_cast<std::ptrdiff_t>(
-                                     kv_begin + request_kv_elements));
-            const std::vector<float> v_block(
-                v_host.begin() + static_cast<std::ptrdiff_t>(kv_begin),
-                v_host.begin() + static_cast<std::ptrdiff_t>(
-                                     kv_begin + request_kv_elements));
-
-            std::vector<float> k_history;
-            std::vector<float> v_history;
-            k_history.reserve(2 * request_kv_elements);
-            v_history.reserve(2 * request_kv_elements);
-            k_history.insert(k_history.end(), k_block.begin(), k_block.end());
-            k_history.insert(k_history.end(), k_block.begin(), k_block.end());
-            v_history.insert(v_history.end(), v_block.begin(), v_block.end());
-            v_history.insert(v_history.end(), v_block.begin(), v_block.end());
-
-            auto q_single = makeFP32(q_request, seq_len, q_cols);
-            auto k_single = makeNativeKV(
-                k_history, 2 * seq_len, kv_cols, format.precision);
-            auto v_single = makeNativeKV(
-                v_history, 2 * seq_len, kv_cols, format.precision);
-            auto output_single = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(seq_len), q_cols});
-            ASSERT_NE(k_single, nullptr);
-            ASSERT_NE(v_single, nullptr);
-            ASSERT_TRUE(transfer.uploadFull(q_single.get(), device, stream).success);
-            ASSERT_TRUE(transfer.uploadFull(k_single.get(), device, stream).success);
-            ASSERT_TRUE(transfer.uploadFull(v_single.get(), device, stream).success);
-            ASSERT_TRUE(transfer.uploadFull(output_single.get(), device, stream).success);
-
-            ASSERT_TRUE(serial_kernel.compute_tensor(
-                q_single.get(), k_single.get(), v_single.get(),
-                output_single.get(),
-                /*batch_size=*/1,
-                seq_len,
-                /*kv_len=*/2 * seq_len,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                /*causal=*/true,
-                /*window_size=*/-1,
-                /*workspace_scores=*/nullptr,
-                /*workspace_mask=*/nullptr,
-                &mpi_ctx_,
-                /*device_idx=*/0,
-                /*head_start=*/0,
-                /*local_n_heads=*/n_heads,
-                /*local_n_kv_heads=*/n_kv_heads,
-                /*gqa_n_rep=*/n_heads / n_kv_heads));
-            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-
-            std::vector<float> expected(request_q_elements, 0.0f);
-            ASSERT_EQ(
-                hipMemcpyAsync(
-                    expected.data(), output_single->gpu_data_ptr(),
-                    request_q_elements * sizeof(float),
-                    hipMemcpyDeviceToHost, stream),
-                hipSuccess);
-            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            EXPECT_TRUE(expectBitwiseEqualFP32Rows(
-                grown_actual.data() + q_begin,
-                expected.data(),
-                request_q_elements,
-                std::string("captured growing ROCm request-batch cache ") +
-                    format.name + " request=" + std::to_string(request)));
-        }
+        expectSerialDecodeRows(
+            grown_actual,
+            /*completed_blocks=*/1,
+            "captured grown ROCm request batch");
 
         ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
         ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
@@ -4214,11 +4367,14 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeFP16KV_Qwen2ScaleStress)
 
     const DeviceId gpu_device = DeviceId::rocm(0);
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    llaminar2::test::ScopedGPUStream stream(gpu_device);
+    rocm_kernel.setGPUStream(stream.get());
 
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device,
         {q_tensor.get(), k_tensor.get(), v_tensor.get()},
         {output_tensor.get()},
+        stream.get(),
         [&]
         {
             return rocm_kernel.compute_tensor(
@@ -4289,11 +4445,14 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeQ81KV_Qwen2ScaleStress)
 
     const DeviceId gpu_device = DeviceId::rocm(0);
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    llaminar2::test::ScopedGPUStream stream(gpu_device);
+    rocm_kernel.setGPUStream(stream.get());
 
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device,
         {q_tensor.get(), k_tensor.get(), v_tensor.get()},
         {output_tensor.get()},
+        stream.get(),
         [&]
         {
             return rocm_kernel.compute_tensor(
@@ -4398,11 +4557,14 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3ContextParity)
 
     const DeviceId gpu_device = DeviceId::rocm(0);
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    llaminar2::test::ScopedGPUStream stream(gpu_device);
+    rocm_kernel.setGPUStream(stream.get());
 
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device,
         {q_tensor.get(), k_tensor.get(), v_tensor.get()},
         {output_tensor.get()},
+        stream.get(),
         [&]
         {
             return rocm_kernel.compute_tensor(
@@ -4440,14 +4602,28 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3InputSensitivit
         GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
     }
 
-    auto stage_ctx = ModelContext::createForPPStage(TEST_MODEL_PATH, 0, 4, true, false);
+    /*
+     * The public GPU forward contract terminates at graph-declared logits.
+     * Although this test inspects intermediate layer-3 snapshots, constructing
+     * an embedding-plus-layers-only PP fragment and asking it to masquerade as
+     * a complete inference forward would leave no legal device publication
+     * boundary. Own the real final norm and LM head in this diagnostic graph so
+     * snapshot capture exercises an ordinary, fully declared GPU forward.
+     */
+    auto stage_ctx =
+        ModelContext::createForPPStage(
+            TEST_MODEL_PATH,
+            /*first_layer=*/0,
+            /*last_layer=*/4,
+            /*has_embedding=*/true,
+            /*has_lm_head=*/true);
     ASSERT_NE(stage_ctx, nullptr);
 
     FactoryPPStageConfig config;
     config.first_layer = 0;
     config.last_layer = 4;
     config.has_embedding = true;
-    config.has_lm_head = false;
+    config.has_lm_head = true;
     ASSERT_TRUE(config.isValid());
 
     auto cpu_runner = createPPStageRunner(stage_ctx, DeviceId::cpu(), config);

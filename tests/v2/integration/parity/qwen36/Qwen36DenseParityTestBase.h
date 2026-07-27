@@ -1773,6 +1773,84 @@ namespace llaminar2::test::parity::qwen36
         return std::nullopt;
     }
 
+    /**
+     * @brief Read an exact multiline value from the line-oriented snapshot metadata format.
+     *
+     * The Python snapshot generators write prompts as human-readable text:
+     * the first physical line begins with `prompt:`, while every remaining
+     * prompt line is written verbatim until the following `token_ids:` field.
+     * `readStringFromMetadata()` is intentionally a scalar-field reader and
+     * therefore cannot authenticate such a prompt; using it here truncated the
+     * expected value at the first newline and made every valid long-context
+     * corpus appear stale.
+     *
+     * This parser preserves every embedded newline and every continuation-line
+     * byte. It removes only a terminal carriage return so metadata written with
+     * CRLF line endings compares identically on Linux. The field must be
+     * terminated by the named next key. A missing terminator is treated as a
+     * malformed corpus rather than accepting a partially written metadata file.
+     *
+     * @param metadata_path Metadata file produced by a parity snapshot generator.
+     * @param key Name of the multiline field, without the trailing colon.
+     * @param terminator_key Name of the scalar field immediately following it.
+     * @return The exact logical field value, or `std::nullopt` when the file or
+     *         requested field is incomplete.
+     */
+    inline std::optional<std::string> readMultilineStringFromMetadata(
+        const std::filesystem::path &metadata_path,
+        const std::string &key,
+        const std::string &terminator_key)
+    {
+        std::ifstream file(metadata_path);
+        if (!file.is_open())
+        {
+            return std::nullopt;
+        }
+
+        const std::string prefix = key + ":";
+        const std::string terminator_prefix = terminator_key + ":";
+        std::string line;
+        while (std::getline(file, line))
+        {
+            if (line.rfind(prefix, 0) != 0)
+            {
+                continue;
+            }
+
+            if (!line.empty() && line.back() == '\r')
+            {
+                line.pop_back();
+            }
+
+            std::string value = line.substr(prefix.size());
+            const size_t first_content = value.find_first_not_of(" \t");
+            value = first_content == std::string::npos
+                        ? std::string{}
+                        : value.substr(first_content);
+
+            while (std::getline(file, line))
+            {
+                if (!line.empty() && line.back() == '\r')
+                {
+                    line.pop_back();
+                }
+                if (line.rfind(terminator_prefix, 0) == 0)
+                {
+                    return value;
+                }
+
+                // A physical continuation line represents an embedded newline,
+                // including when the first prompt line itself was empty.
+                value.push_back('\n');
+                value += line;
+            }
+
+            return std::nullopt;
+        }
+
+        return std::nullopt;
+    }
+
     inline bool metadataLooksUsable(
         const std::filesystem::path &metadata_path,
         const std::string &expected_prompt,
@@ -1780,7 +1858,10 @@ namespace llaminar2::test::parity::qwen36
     {
         constexpr int kRequiredQwen36DenseSnapshotVersion = 4;
         const auto version = readStringFromMetadata(metadata_path, "snapshot_version");
-        const auto prompt = readStringFromMetadata(metadata_path, "prompt");
+        const auto prompt = readMultilineStringFromMetadata(
+            metadata_path,
+            "prompt",
+            "token_ids");
         const auto token_ids = readTokenListFromMetadata(metadata_path, "token_ids");
         const auto decode_tokens = readTokenListFromMetadata(metadata_path, "decode_tokens");
         int parsed_version = 0;
@@ -4815,9 +4896,28 @@ namespace llaminar2::test::parity::qwen36
             true,
             row_plan.compact_logit_row_count));
         ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
-        ASSERT_TRUE(runner->forward(
-            verifier_tokens.data(),
-            static_cast<int>(verifier_tokens.size())))
+        bool grouped_forward_ok = false;
+        if (device.is_gpu())
+        {
+            const void *verifier_tokens_device =
+                runner->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+                    verifier_tokens.data(),
+                    static_cast<int>(verifier_tokens.size()),
+                    static_cast<int>(verifier_tokens.size() - 1));
+            ASSERT_NE(verifier_tokens_device, nullptr)
+                << "dense GPU grouped verifier must bind its arena-owned token row";
+            grouped_forward_ok = runner->forwardWithDeviceTokenIds(
+                verifier_tokens.data(),
+                verifier_tokens_device,
+                static_cast<int>(verifier_tokens.size()));
+        }
+        else
+        {
+            grouped_forward_ok = runner->forward(
+                verifier_tokens.data(),
+                static_cast<int>(verifier_tokens.size()));
+        }
+        ASSERT_TRUE(grouped_forward_ok)
             << "dense grouped all-position verifier forward failed";
 
         std::map<std::string, DenseStageSnapshot> grouped_snapshots;

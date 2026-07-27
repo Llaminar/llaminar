@@ -73,6 +73,51 @@ DEBUG_ENV_SOURCE = REPO_ROOT / "src" / "v2" / "utils" / "DebugEnv.h"
 class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
     """Exercise exact-KB emission and typed grouped-verifier dispatch."""
 
+    @staticmethod
+    def load_analyzer_module():
+        """Load the analyzer as a module for focused pure-policy regressions."""
+
+        module_name = "cuda_native_vnni_analyzer_reachability_test_module"
+        spec = importlib.util.spec_from_file_location(module_name, ANALYZER)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot import CUDA analyzer from {ANALYZER}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_freeze_cli_reports_missing_input_without_obsolete_state(self) -> None:
+        """The current freeze parser must not inspect retired M1 input flags."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ANALYZER),
+                    "--freeze-generic",
+                    "--profile",
+                    "production",
+                    "--development-profiler-requests",
+                    "/dev/null",
+                    "--development-profiler-evidence",
+                    "/dev/null",
+                    "--output",
+                    str(Path(directory) / "dispatch.inc"),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "--freeze-generic requires development --input shards",
+            result.stderr,
+        )
+        self.assertNotIn("AttributeError", result.stderr)
+
     def test_economical_kblock_geometry_is_cached_by_k(self) -> None:
         """Coverage validation must not recompute one K geometry per row."""
 
@@ -127,6 +172,58 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
                 "cuda.nvnni.decode.verifier.inherit_serial_m1"
             )
         self.assertIn("mma.sync.aligned.m16n8k32", runtime)
+
+    def test_grouped_completeness_prunes_tiles_dominated_at_runtime_m(self) -> None:
+        """The analyzer must expect exactly the trainer's launchable row tiles."""
+
+        module = self.load_analyzer_module()
+        registry = __import__(
+            "native_vnni_dispatch.candidate_registry",
+            fromlist=["cuda_native_vnni_gemv_registry"],
+        ).cuda_native_vnni_gemv_registry()
+        grouped = {
+            int(candidate.config_json["grouped_rows"]): candidate.candidate_id
+            for candidate in registry.entries
+            if candidate.config_json.get("family") == "inherit_serial_m1"
+        }
+        expected_maximum = {
+            2: 2,
+            3: 4,
+            4: 4,
+            5: 8,
+            8: 8,
+            9: 16,
+            16: 16,
+            31: 32,
+        }
+        for m, maximum in expected_maximum.items():
+            with self.subTest(m=m):
+                reachable = {
+                    candidate_id
+                    for rows, candidate_id in grouped.items()
+                    if module._grouped_row_tile_is_reachable(rows, m)
+                }
+                self.assertEqual(
+                    reachable,
+                    {
+                        candidate_id
+                        for rows, candidate_id in grouped.items()
+                        if rows <= maximum
+                    },
+                )
+
+    def test_paired_refinement_requires_serial_byte_equality(self) -> None:
+        """Paired confirmation must never certify a merely close candidate."""
+
+        trainer = TRAINER_SOURCE.read_text(encoding="utf-8")
+        self.assertIn(
+            "evidence.comparison.mismatch_count == 0",
+            trainer,
+        )
+        self.assertIn(
+            '<< " serial_byte_mismatches="',
+            trainer,
+        )
 
     @staticmethod
     def row(
@@ -505,7 +602,11 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
         )
         self.assertIn("queryGraphCapturedExecution", runtime)
         self.assertIn(
-            "graph_captured, 1, N, K, shape, tuning",
+            "kCanonicalDecodePolicyGraphCaptured",
+            runtime,
+        )
+        self.assertIn(
+            "eager warmup deliberately selects that same",
             runtime,
         )
         self.assertNotIn("diagnosticM1OracleCandidate", runtime)
@@ -718,6 +819,17 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
         source = ANALYZER.read_text(encoding="utf-8")
         self.assertIn("def freeze_fast_policy(", source)
         self.assertIn("def certify_fast_policy(", source)
+        freeze_source = source[
+            source.index("def freeze_fast_policy("):
+            source.index("def certify_fast_policy(")
+        ]
+        self.assertIn("projected_domain_cache_keys", freeze_source)
+        self.assertIn("domain_corpus_provider=", freeze_source)
+        self.assertIn("domain_corpus_digest_provider=", freeze_source)
+        self.assertNotIn(
+            "development = project_cuda_shape_resolved_candidates",
+            freeze_source,
+        )
         self.assertIn("validate_frozen_policy_file", source)
         self.assertIn("validate_certified_m1_artifacts", source)
         self.assertNotIn("def compile_fast_policy(", source)
@@ -734,6 +846,8 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
         self.assertIn("--frozen-policy-json", source)
         self.assertIn("--certified-m1-policy-json", source)
         self.assertIn("--policy-json", source)
+        self.assertIn("--fit-cache-dir", source)
+        self.assertIn("PolicyFitCache(directory=fit_cache_directory)", source)
 
     def test_formula_tree_emitter_produces_compilable_mode_aware_cpp(self) -> None:
         """A rational tree leaf must resolve a concrete exact KB in C++."""

@@ -149,6 +149,17 @@ TEST(Test__PrefixStateSnapshot, MoveLeavesSourceEmptyForNestedPayloadHandles)
     source.provenance = PrefixStateProvenance::PayloadCheckpoint;
     source.cached_tokens = 8;
     source.mtp_cached_tokens = {7, 6};
+    DeviceKVSequenceStateCheckpoint main_sequence_state;
+    main_sequence_state.cache_depth = -1;
+    main_sequence_state.sequence_index = 0;
+    main_sequence_state.metadata_layer_count = 2;
+    main_sequence_state.bytes = 16;
+    main_sequence_state.device = DeviceId::cuda(0);
+    main_sequence_state.storage =
+        std::make_shared<std::vector<uint8_t>>(main_sequence_state.bytes);
+    main_sequence_state.ready_event =
+        std::make_shared<std::vector<uint8_t>>(1);
+    source.device_sequence_state_checkpoints.push_back(main_sequence_state);
     source.blocks.push_back(makeBlock(0, 0, 4, true, true, true, false));
     source.blocks.push_back(makeBlock(1, 4, 4, true, true, true, true));
     source.mtp_blocks.push_back(makeBlock(2, 0, 7, false, false, false, false));
@@ -164,6 +175,7 @@ TEST(Test__PrefixStateSnapshot, MoveLeavesSourceEmptyForNestedPayloadHandles)
     EXPECT_EQ(source.provenance, PrefixStateProvenance::Unknown);
     EXPECT_EQ(source.cached_tokens, 0);
     EXPECT_TRUE(source.mtp_cached_tokens.empty());
+    EXPECT_TRUE(source.device_sequence_state_checkpoints.empty());
     EXPECT_TRUE(source.blocks.empty());
     EXPECT_TRUE(source.mtp_blocks.empty());
     EXPECT_TRUE(source.participant_snapshots.empty());
@@ -171,6 +183,16 @@ TEST(Test__PrefixStateSnapshot, MoveLeavesSourceEmptyForNestedPayloadHandles)
     EXPECT_TRUE(moved.valid);
     EXPECT_EQ(moved.provenance, PrefixStateProvenance::PayloadCheckpoint);
     EXPECT_EQ(moved.cached_tokens, 8);
+    ASSERT_EQ(moved.device_sequence_state_checkpoints.size(), 1u);
+    EXPECT_EQ(moved.device_sequence_state_checkpoints.front().cache_depth, -1);
+    EXPECT_EQ(moved.device_sequence_state_checkpoints.front().sequence_index, 0);
+    EXPECT_EQ(moved.device_sequence_state_checkpoints.front().metadata_layer_count, 2);
+    EXPECT_EQ(moved.device_sequence_state_checkpoints.front().bytes, 16u);
+    EXPECT_TRUE(moved.device_sequence_state_checkpoints.front().valid());
+    EXPECT_EQ(moved.device_sequence_state_checkpoints.front().storage,
+              main_sequence_state.storage);
+    EXPECT_EQ(moved.device_sequence_state_checkpoints.front().ready_event,
+              main_sequence_state.ready_event);
     ASSERT_EQ(moved.blocks.size(), 2u);
     EXPECT_EQ(moved.blocks.back().hybrid_payload, source_block_payload);
     ASSERT_EQ(moved.participant_snapshots.size(), 1u);
@@ -180,10 +202,13 @@ TEST(Test__PrefixStateSnapshot, MoveLeavesSourceEmptyForNestedPayloadHandles)
     assigned = std::move(moved);
 
     EXPECT_FALSE(moved.valid);
+    EXPECT_TRUE(moved.device_sequence_state_checkpoints.empty());
     EXPECT_TRUE(moved.blocks.empty());
     EXPECT_TRUE(moved.participant_snapshots.empty());
     EXPECT_TRUE(assigned.valid);
     EXPECT_EQ(assigned.cached_tokens, 8);
+    ASSERT_EQ(assigned.device_sequence_state_checkpoints.size(), 1u);
+    EXPECT_TRUE(assigned.device_sequence_state_checkpoints.front().valid());
     ASSERT_EQ(assigned.blocks.size(), 2u);
     EXPECT_EQ(assigned.blocks.back().hybrid_payload, source_block_payload);
 }

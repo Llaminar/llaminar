@@ -109,12 +109,14 @@ namespace llaminar2
         // Create tensor with regular constructor first (no host allocation for mapped)
         auto tensor = std::make_unique<FP32Tensor>(shape, target_device);
 
-        // Try to initialize as mapped tensor via base class
+        // Mapped allocation is an explicit placement contract. Returning a
+        // regular tensor here would silently move the caller onto a different
+        // storage and synchronization architecture.
         if (!tensor->initMappedMemory(bytes, target_device))
         {
-            LOG_WARN("[FP32Tensor::createMapped] Failed to allocate mapped memory ("
-                     << bytes << " bytes), using regular allocation");
-            // tensor already has regular host allocation, just return it
+            LOG_ERROR("[FP32Tensor::createMapped] Failed to allocate required mapped memory ("
+                      << bytes << " bytes) on " << target_device.toString());
+            return nullptr;
         }
 
         return tensor;
@@ -132,9 +134,15 @@ namespace llaminar2
 
         LOG_TRACE("[FP32Tensor::data] Called for tensor, host_valid=" << ::llaminar2::isHostValid(coherence_state_) << " device_valid=" << ::llaminar2::isDeviceValid(coherence_state_) << " gpu_data_ptr_=" << (gpu_data_ptr_ ? "set" : "null") << " is_mapped_=" << is_mapped_);
 
-        // Use base class to ensure host has current data
-        // For mapped tensors, ensureOnHost() is a no-op (data is always available)
-        const_cast<FP32Tensor *>(this)->ensureOnHost();
+        // Host access is a terminal observation boundary.  Returning the old
+        // host allocation after a failed device publication would silently
+        // turn an ordering defect into incorrect inference output, so surface
+        // the coherence failure immediately.
+        if (!const_cast<FP32Tensor *>(this)->ensureOnHost())
+        {
+            throw std::runtime_error(
+                "FP32Tensor::data could not acquire authoritative host data");
+        }
 
         // Mapped tensors use mapped_host_ptr_ from base class
         if (is_mapped_ && mapped_host_ptr_)
@@ -153,9 +161,14 @@ namespace llaminar2
     {
         assertValid("FP32Tensor::mutable_data");
 
-        // Ensure host has current data before modification
-        // For mapped tensors, ensureOnHost() is a no-op
-        ensureOnHost();
+        // A mutable host view cannot be granted while newer device data has no
+        // valid completion publication.  Mutating stale storage here would
+        // destroy the only recoverable copy and conceal the producer defect.
+        if (!ensureOnHost())
+        {
+            throw std::runtime_error(
+                "FP32Tensor::mutable_data could not acquire authoritative host data");
+        }
 
         // For non-mapped tensors: Invalidate GPU copy since host will be modified
         // For mapped tensors: Both host and device share memory, no invalidation needed

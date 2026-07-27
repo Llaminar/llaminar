@@ -3677,6 +3677,36 @@ __global__ void cuda_prepare_mtp_batched_sidecar_inputs_kernel(
 }
 
 /**
+ * @brief Expand canonical request positions into a grouped verifier matrix.
+ *
+ * Each request owns one device-resident next-position scalar in its KV cache.
+ * Grouped verification needs one absolute position per physical graph row. A
+ * flattened thread index covers the request-major matrix and derives both
+ * coordinates without any host-visible cursor:
+ *
+ * `position[request, token] = live_kv_count[request] + token`.
+ *
+ * Padded columns are populated as well. Attention and stateful stages mask those
+ * columns with the request's real sequence length, while keeping the position
+ * buffer's physical geometry identical to the captured verifier graph.
+ */
+__global__ void cuda_prepare_mtp_verifier_position_ids_kernel(
+    const int32_t *__restrict__ base_positions,
+    int request_count,
+    int padded_seq_len,
+    int32_t *__restrict__ out_position_ids)
+{
+    const int flat_row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_rows = request_count * padded_seq_len;
+    if (flat_row >= total_rows)
+        return;
+
+    const int request = flat_row / padded_seq_len;
+    const int token = flat_row - request * padded_seq_len;
+    out_position_ids[flat_row] = base_positions[request] + token;
+}
+
+/**
  * @brief Publish the first device-owned logical rows from terminal prefill samples.
  *
  * Request admission has already copied prompt positions into persistent device
@@ -5743,6 +5773,52 @@ extern "C"
         {
             fprintf(stderr,
                     "CUDA batched MTP sidecar input preparation failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Enqueue device-resident grouped-verifier position expansion.
+     */
+    bool cudaOps_prepare_mtp_verifier_position_ids(
+        const int32_t *base_positions,
+        int request_count,
+        int padded_seq_len,
+        int32_t *out_position_ids,
+        int device_idx,
+        void *stream)
+    {
+        if (!base_positions ||
+            request_count <= 0 ||
+            padded_seq_len <= 0 ||
+            !out_position_ids ||
+            !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads_per_block = 128;
+        const int total_rows = request_count * padded_seq_len;
+        const int blocks =
+            (total_rows + threads_per_block - 1) / threads_per_block;
+        cuda_prepare_mtp_verifier_position_ids_kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            base_positions,
+            request_count,
+            padded_seq_len,
+            out_position_ids);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "CUDA grouped MTP verifier position preparation failed: %s\n",
                     cudaGetErrorString(err));
             return false;
         }

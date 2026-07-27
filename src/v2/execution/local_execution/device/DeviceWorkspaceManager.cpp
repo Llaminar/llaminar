@@ -24,11 +24,45 @@ namespace llaminar2
     namespace
     {
         std::atomic<uint64_t> g_next_workspace_manager_id{1};
+
+        size_t mixPublicationHash(size_t seed, std::uint64_t word) noexcept
+        {
+            const size_t value = std::hash<std::uint64_t>{}(word);
+            return seed ^ (value + size_t{0x9e3779b9U} +
+                           (seed << 6U) + (seed >> 2U));
+        }
+    }
+
+    size_t PersistentWorkspacePublicationKeyHash::operator()(
+        const PersistentWorkspacePublicationKey &key) const noexcept
+    {
+        size_t hash = 0;
+        hash = mixPublicationHash(hash, key.word0);
+        hash = mixPublicationHash(hash, key.word1);
+        hash = mixPublicationHash(hash, key.word2);
+        hash = mixPublicationHash(hash, key.word3);
+        return hash;
     }
 
     // =========================================================================
     // Construction / Destruction
     // =========================================================================
+
+    PersistentWorkspaceSlotLease::~PersistentWorkspaceSlotLease()
+    {
+        auto registry = registry_.lock();
+        if (!registry)
+            return;
+
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        auto domain_it = registry->occupied_slots.find(domain_);
+        if (domain_it == registry->occupied_slots.end() ||
+            slot_ >= domain_it->second.size())
+        {
+            return;
+        }
+        domain_it->second[slot_] = false;
+    }
 
     DeviceWorkspaceManager::DeviceWorkspaceManager(DeviceId device, size_t budget_bytes)
         : device_(device),
@@ -287,6 +321,14 @@ namespace llaminar2
 
     void DeviceWorkspaceManager::release()
     {
+        /*
+         * Invalidate the ownership namespace before releasing device memory.
+         * Existing leases contain weak references, so their later destruction
+         * is harmless and cannot mutate the registry for a future allocation.
+         */
+        persistent_slot_registry_ =
+            std::make_shared<detail::PersistentWorkspaceSlotRegistry>();
+
         if (!allocated_)
         {
             return;
@@ -361,6 +403,187 @@ namespace llaminar2
             names.push_back(pair.first);
         }
         return names;
+    }
+
+    void *DeviceWorkspaceManager::getPersistentSlotBuffer(
+        const std::string &name,
+        size_t slot_capacity,
+        size_t slot,
+        size_t payload_bytes) const
+    {
+        if (name.empty() || slot_capacity == 0 || slot >= slot_capacity ||
+            payload_bytes == 0)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Invalid persistent slot address "
+                      "request for buffer '" << name << "' (slots="
+                      << slot_capacity << ", slot=" << slot
+                      << ", payload_bytes=" << payload_bytes << ")");
+            return nullptr;
+        }
+
+        void *base = getBuffer(name);
+        const size_t total_bytes = getBufferSize(name);
+        if (!base || total_bytes < slot_capacity)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Persistent slot buffer '"
+                      << name << "' is missing or too small (bytes="
+                      << total_bytes << ", slots=" << slot_capacity << ")");
+            return nullptr;
+        }
+
+        const size_t slot_stride = total_bytes / slot_capacity;
+        if (payload_bytes > slot_stride)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Persistent slot payload exceeds "
+                      "the fixed stride in buffer '" << name << "' (payload="
+                      << payload_bytes << ", stride=" << slot_stride
+                      << ", slot=" << slot << ")");
+            return nullptr;
+        }
+
+        const size_t offset = slot * slot_stride;
+        if (offset > total_bytes || payload_bytes > total_bytes - offset)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Persistent slot address exceeds "
+                      "buffer '" << name << "' (offset=" << offset
+                      << ", payload=" << payload_bytes
+                      << ", bytes=" << total_bytes << ")");
+            return nullptr;
+        }
+
+        return static_cast<char *>(base) + offset;
+    }
+
+    std::shared_ptr<PersistentWorkspaceSlotLease>
+    DeviceWorkspaceManager::acquirePersistentSlot(
+        const std::string &domain,
+        size_t slot_capacity)
+    {
+        if (domain.empty() || slot_capacity == 0)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Persistent slot acquisition "
+                      "requires a non-empty domain and positive capacity");
+            return nullptr;
+        }
+
+        auto registry = persistent_slot_registry_;
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        auto &slots = registry->occupied_slots[domain];
+        if (slots.empty())
+        {
+            slots.resize(slot_capacity, false);
+        }
+        else if (slots.size() != slot_capacity)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Persistent slot domain '"
+                      << domain << "' changed capacity from " << slots.size()
+                      << " to " << slot_capacity);
+            return nullptr;
+        }
+
+        for (size_t slot = 0; slot < slots.size(); ++slot)
+        {
+            if (slots[slot])
+                continue;
+            slots[slot] = true;
+            return std::shared_ptr<PersistentWorkspaceSlotLease>(
+                new PersistentWorkspaceSlotLease(registry, domain, slot));
+        }
+
+        LOG_ERROR("[DeviceWorkspaceManager] Persistent slot domain '"
+                  << domain << "' exhausted all " << slot_capacity << " slots");
+        return nullptr;
+    }
+
+    PersistentWorkspacePublicationResult
+    DeviceWorkspaceManager::getOrCreatePersistentPublication(
+        const std::string &domain,
+        const PersistentWorkspacePublicationKey &key,
+        size_t slot_capacity,
+        const PersistentWorkspacePublicationFactory &factory)
+    {
+        if (domain.empty() || slot_capacity == 0 || !factory)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Immutable publication requires "
+                      "a non-empty domain, positive capacity, and factory");
+            return {};
+        }
+
+        auto registry = persistent_slot_registry_;
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        auto &slots = registry->occupied_slots[domain];
+        if (slots.empty())
+        {
+            slots.resize(slot_capacity, false);
+        }
+        else if (slots.size() != slot_capacity)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Persistent publication domain '"
+                      << domain << "' changed capacity from " << slots.size()
+                      << " to " << slot_capacity);
+            return {};
+        }
+
+        auto &publications = registry->immutable_publications[domain];
+        const auto existing = publications.find(key);
+        if (existing != publications.end())
+        {
+            if (!existing->second.publication ||
+                existing->second.slot >= slots.size() ||
+                !slots[existing->second.slot])
+            {
+                LOG_ERROR("[DeviceWorkspaceManager] Immutable publication registry "
+                          "is internally inconsistent for domain '" << domain << "'");
+                return {};
+            }
+            return {
+                .publication = existing->second.publication,
+                .slot = existing->second.slot,
+                .created = false,
+            };
+        }
+
+        const auto free_slot = std::find(slots.begin(), slots.end(), false);
+        if (free_slot == slots.end())
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Persistent publication domain '"
+                      << domain << "' exhausted all " << slot_capacity << " slots");
+            return {};
+        }
+
+        const size_t slot =
+            static_cast<size_t>(std::distance(slots.begin(), free_slot));
+        slots[slot] = true;
+
+        std::shared_ptr<void> publication;
+        try
+        {
+            publication = factory(slot);
+        }
+        catch (...)
+        {
+            slots[slot] = false;
+            throw;
+        }
+        if (!publication)
+        {
+            slots[slot] = false;
+            LOG_ERROR("[DeviceWorkspaceManager] Immutable publication factory "
+                      "failed for domain '" << domain << "' slot " << slot);
+            return {};
+        }
+
+        publications.emplace(
+            key,
+            detail::PersistentWorkspacePublicationRecord{
+                .slot = slot,
+                .publication = publication,
+            });
+        return {
+            .publication = std::move(publication),
+            .slot = slot,
+            .created = true,
+        };
     }
 
     // =========================================================================

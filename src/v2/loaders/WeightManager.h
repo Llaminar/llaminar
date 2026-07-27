@@ -969,6 +969,26 @@ namespace llaminar2
             const FrozenModelWeightSet *frozen_weights = nullptr,
             bool include_expert_jobs = true);
 
+        /**
+         * @brief Upload exact non-GEMM tensors owned by a frozen binding set.
+         *
+         * Frozen graph bindings may own freshly materialized replicated slices
+         * or derived tensors that are intentionally absent from the broad
+         * loader cache. This binding-driven pass uploads those exact objects
+         * before execution so graph stages never repair missing residency.
+         *
+         * @param target_device GPU targeted by the frozen bindings.
+         * @param frozen_weights Immutable bindings used by the graph.
+         * @param layer_filter Optional canonical-name filter.
+         * @param include_expert_jobs Retained for preparation-policy symmetry;
+         *        routed expert tensors remain owned by the expert pipeline.
+         */
+        bool uploadFrozenNonGemmWeights(
+            DeviceId target_device,
+            const FrozenModelWeightSet &frozen_weights,
+            const std::function<bool(const std::string &)> &layer_filter,
+            bool include_expert_jobs);
+
         // =========================================================================
         // Per-device tensor cache for multi-device scenarios (LOCAL TP)
         // =========================================================================

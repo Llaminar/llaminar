@@ -569,13 +569,13 @@ class CPUNativeVNNIPrefillGenericRefinementTest(unittest.TestCase):
                         root / "observations.csv",
                     )
 
-    def test_deep_cpu_refinement_excludes_32b_class_geometries(self) -> None:
-        """M=512 refinement remains inside the small-model work envelope."""
+    def test_deep_cpu_refinement_excludes_7b_and_larger_geometries(self) -> None:
+        """M=128 refinement remains inside the below-7B work envelope."""
 
         with tempfile.TemporaryDirectory() as temporary:
             fit = Path(temporary) / "fit.json"
             domain = self._domain()
-            domain["m"] = 512
+            domain["m"] = 128
             policy = {
                 "policy_abi": "native-vnni-dispatch-v1",
                 "learner_version": "test",
@@ -599,7 +599,7 @@ class CPUNativeVNNIPrefillGenericRefinementTest(unittest.TestCase):
                 self._routes(),
                 load_cpu_prefill_split_manifest(),
             )
-            cap = cpu_prefill_maximum_weight_elements_for_m(512)
+            cap = cpu_prefill_maximum_weight_elements_for_m(128)
             manifest = load_shape_manifest()
             self.assertTrue(all(
                 manifest.by_name(name).work_items <= cap

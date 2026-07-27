@@ -27,6 +27,7 @@
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/moe/DeviceMoETransferSlotDirectory.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
@@ -154,6 +155,46 @@ TEST_F(ComputeStagesTest, GEMMStage_TypeAndBackend)
     EXPECT_EQ(stage.type(), ComputeStageType::GEMM);
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
+}
+
+/**
+ * @brief Prove prefill LLEP reserves metadata for every destination request.
+ *
+ * Local planning and payload transport have intentionally different capacity
+ * domains. Each participant can request a full payload bucket for its local
+ * destination bank, so the allgather projection must hold the sum of those
+ * requests even though each source still sends at most one local bucket.
+ */
+TEST_F(ComputeStagesTest, PrefillLLEPMergedPlanCapacityCoversEveryParticipantBucket)
+{
+    DeviceMoERebalanceConfig config;
+    config.participant_count = 2;
+
+    EXPECT_EQ(
+        deviceMoEPrefillLLEPMergedPlanCapacity(
+            config,
+            /*local_plan_capacity=*/32u,
+            /*payload_slots_per_participant=*/32u),
+        64u)
+        << "CUDA2/ROCm2 projection must not force two destination-local "
+           "32-command plans into one 32-command output buffer.";
+
+    config.participant_count = 4;
+    EXPECT_EQ(
+        deviceMoEPrefillLLEPMergedPlanCapacity(
+            config,
+            /*local_plan_capacity=*/96u,
+            /*payload_slots_per_participant=*/32u),
+        128u);
+
+    config.participant_count = 3;
+    EXPECT_EQ(
+        deviceMoEPrefillLLEPMergedPlanCapacity(
+            config,
+            /*local_plan_capacity=*/256u,
+            /*payload_slots_per_participant=*/16u),
+        256u)
+        << "A larger topology-derived local plan remains authoritative.";
 }
 
 TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
@@ -487,6 +528,61 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
     EXPECT_FALSE(stage.supportsBackend(ComputeBackendType::CPU));
 }
 
+/**
+ * @brief Proves status ownership is phase-driven rather than buffer-driven.
+ *
+ * The atomic maintenance transaction owns both copy and apply publication,
+ * while nodes embedded in the monolithic decode graph retain explicit,
+ * phase-local ownership. This matrix keeps every live stage phase explicit
+ * without launching GPU work.
+ */
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_StatusPublicationContractIsPhaseComplete)
+{
+    struct ExpectedContract
+    {
+        DeviceMoERebalanceStagePhase phase;
+        bool copy_status;
+        bool apply_status;
+    };
+    constexpr ExpectedContract expected[] = {
+        {DeviceMoERebalanceStagePhase::PlanCopyApply, true, true},
+        {DeviceMoERebalanceStagePhase::CollectState, false, false},
+        {DeviceMoERebalanceStagePhase::PlanAndCopy, true, true},
+        {DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband, false, false},
+        {DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband, true, false},
+        {DeviceMoERebalanceStagePhase::UnpackCollectivePayloadAfterSideband, true, true},
+        {DeviceMoERebalanceStagePhase::Apply, false, true},
+        {DeviceMoERebalanceStagePhase::JoinTransfer, false, false},
+    };
+
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 2;
+    config.top_k = 1;
+    config.participant_count = 2;
+
+    for (const auto &cell : expected)
+    {
+        MoEDeviceRebalanceStage::Params params;
+        params.device_id = DeviceId::cuda(0);
+        params.config = config;
+        params.stage_name = "status_contract";
+        params.local_transfer_slots =
+            reinterpret_cast<DeviceMoEExpertDirectoryEntry *>(0x1000);
+        params.local_transfer_slot_count = 1;
+        params.transfer_mode =
+            DeviceMoERebalanceTransferMode::CompactTransferSlots;
+        params.phase = cell.phase;
+
+        const MoEDeviceRebalanceStage stage(params);
+        const auto contract = stage.statusPublicationContract();
+        EXPECT_EQ(contract.copy_status, cell.copy_status)
+            << "phase=" << static_cast<int>(cell.phase);
+        EXPECT_EQ(contract.apply_status, cell.apply_status)
+            << "phase=" << static_cast<int>(cell.phase);
+    }
+}
+
 TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_PrepareGraphLaunchRequiresExplicitStream)
 {
     DeviceMoERebalanceConfig config;
@@ -507,7 +603,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_PrepareGraphLaunchRequiresExpl
         << "Graph-captured rebalance must hard-fail rather than falling back to a default stream";
 }
 
-TEST_F(ComputeStagesTest, MoEDeviceRebalanceDirectoryAllowsMixedProjectionFormats)
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceTransferCapacityRetargetsMixedProjectionFormats)
 {
     uint8_t payload = 0;
     uint16_t scales = 0;
@@ -528,29 +624,137 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceDirectoryAllowsMixedProjectionFormat
         return desc;
     };
 
-    DeviceMoEExpertDirectoryEntry entry;
-    entry.descriptor.gate = descFor(/*codebook_id=*/4, false, false);
-    entry.descriptor.up = descFor(/*codebook_id=*/4, false, false);
-    entry.descriptor.down = descFor(/*codebook_id=*/10, true, false);
-    entry.descriptor.logical_expert_id = 1;
-    entry.flags =
+    DeviceMoEExpertDirectoryEntry source;
+    source.descriptor.gate = descFor(/*codebook_id=*/19, false, false);
+    source.descriptor.up = descFor(/*codebook_id=*/10, true, true);
+    source.descriptor.down = descFor(/*codebook_id=*/14, true, false);
+    source.descriptor.logical_expert_id = 1;
+    source.flags =
         static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
         static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::TransferSlot);
-    entry.participant = 0;
+    source.participant = 0;
+    ASSERT_TRUE(deviceMoEDirectoryCopyReady(source));
 
-    EXPECT_FALSE(deviceMoEDirectoryCopyReady(entry))
-        << "The down projection codebook requires emins even when gate/up do not";
+    DeviceMoEExpertDirectoryEntry destination;
+    destination.descriptor.gate = descFor(/*codebook_id=*/4, true, true);
+    destination.descriptor.up = descFor(/*codebook_id=*/4, true, true);
+    destination.descriptor.down = descFor(/*codebook_id=*/4, true, true);
+    for (DeviceNativeVNNIMatrixDesc *projection : {
+             &destination.descriptor.gate,
+             &destination.descriptor.up,
+             &destination.descriptor.down})
+    {
+        projection->allocation_payload_bytes_per_block = 32;
+        projection->allocation_has_mins = 1;
+        projection->allocation_has_emins = 1;
+    }
 
-    entry.descriptor.down.emins = &emins;
-    EXPECT_TRUE(deviceMoEDirectoryCopyReady(entry))
-        << "Gate/up/down projection formats should be validated independently";
+    const uint8_t *const gate_payload = destination.descriptor.gate.payload;
+    const void *const gate_scales = destination.descriptor.gate.scales;
+    const uint8_t gate_capacity =
+        destination.descriptor.gate.allocation_payload_bytes_per_block;
+    ASSERT_TRUE(deviceMoEDirectoryFitsTransferCapacity(source, destination))
+        << "One persistent transfer slot must accept every observed layer codebook that fits its immutable allocation";
 
-    DeviceMoEExpertDirectoryEntry dst = entry;
-    dst.payload_bytes_per_block = 99;
-    dst.is_asymmetric = 0;
-    dst.has_emins = 0;
-    EXPECT_TRUE(deviceMoEDirectoryFormatsCompatible(entry, dst))
-        << "Compatibility is the per-projection NativeVNNI descriptor contract, not legacy expert-wide summary fields";
+    deviceMoERetargetTransferDirectoryFormats(destination, source);
+    EXPECT_EQ(destination.descriptor.gate.codebook_id, 19u);
+    EXPECT_EQ(destination.descriptor.up.codebook_id, 10u);
+    EXPECT_EQ(destination.descriptor.down.codebook_id, 14u);
+    EXPECT_EQ(destination.descriptor.gate.payload, gate_payload);
+    EXPECT_EQ(destination.descriptor.gate.scales, gate_scales);
+    EXPECT_EQ(
+        destination.descriptor.gate.allocation_payload_bytes_per_block,
+        gate_capacity)
+        << "Retargeting format metadata must never alter graph-captured allocation identity";
+
+    destination.descriptor.gate.allocation_payload_bytes_per_block = 16;
+    EXPECT_FALSE(deviceMoEDirectoryFitsTransferCapacity(source, destination))
+        << "A Q8 source must fail closed when the stable destination allocation is too small";
+}
+
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromStorageCapacity)
+{
+    using ProjectionSpec = DeviceMoETransferSlotDirectory::ProjectionSpec;
+    auto spec =
+        [](const char *label,
+           int payload_bytes,
+           bool has_mins,
+           bool has_emins,
+           uint8_t codebook_id)
+    {
+        ProjectionSpec result;
+        result.label = label;
+        result.N = 4;
+        result.K = 32;
+        result.payload_bytes_per_block = payload_bytes;
+        result.is_asymmetric = has_mins;
+        result.has_emins = has_emins;
+        result.codebook_id = codebook_id;
+        return result;
+    };
+
+    const std::vector<ProjectionSpec> q4_layer{
+        spec("gate", 16, false, false, 4),
+        spec("up", 16, false, false, 4),
+        spec("down", 16, false, false, 4)};
+    const std::vector<ProjectionSpec> mixed_layer{
+        spec("gate", 32, false, false, 19),
+        spec("up", 8, true, true, 10),
+        spec("down", 9, true, false, 14)};
+
+    const auto profile =
+        DeviceMoETransferSlotDirectory::profileForLayerFormats(
+            {q4_layer, mixed_layer});
+    ASSERT_EQ(profile.allocation_specs.size(), 3u);
+    EXPECT_EQ(profile.allocation_specs[0].payload_bytes_per_block, 32);
+    EXPECT_EQ(profile.allocation_specs[1].payload_bytes_per_block, 16);
+    EXPECT_TRUE(profile.allocation_specs[1].is_asymmetric);
+    EXPECT_TRUE(profile.allocation_specs[1].has_emins);
+    EXPECT_EQ(profile.allocation_specs[2].payload_bytes_per_block, 16);
+    EXPECT_TRUE(profile.allocation_specs[2].is_asymmetric);
+
+    EXPECT_EQ(profile.max_wire_payload_bytes, 252u)
+        << "The collective wire slot should match the largest real layer payload";
+
+    constexpr size_t kBlocksPerProjection = 4;
+    constexpr size_t kCapacityBytesPerBlock =
+        (32 + 2) + (16 + 2 + 2 + 4) + (16 + 2 + 2);
+    EXPECT_EQ(
+        kBlocksPerProjection * kCapacityBytesPerBlock,
+        312u)
+        << "Component-wise storage capacity may exceed every realizable wire payload without inflating collectives";
+}
+
+/**
+ * @brief Prove persistent cache occupancy cannot consume arrival-wave storage.
+ *
+ * Qwen3.6-35B has forty routed MoE layers. The failing CUDA2/ROCm2 E2E case
+ * allowed two persistent replicas per layer and moved at most thirty-two
+ * experts per transaction with two configured transfer buffers. The directory
+ * must therefore own 80 persistent slots plus two disjoint 32-slot staging
+ * waves; capping the entire directory at 32 leaves no legal destination after
+ * warmup and makes request-boundary maintenance fail.
+ */
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceTransferDirectorySeparatesActiveAndStagingCapacity)
+{
+    const auto capacity =
+        DeviceMoETransferSlotDirectory::planBufferedCapacity(
+            /*requested_active_slots=*/80,
+            /*transfer_wave_slots=*/32,
+            /*transfer_buffer_count=*/2);
+
+    EXPECT_EQ(capacity.active_slots, 80u);
+    EXPECT_EQ(capacity.staging_slots, 64u);
+    EXPECT_EQ(capacity.total_slots, 144u);
+
+    EXPECT_THROW(
+        DeviceMoETransferSlotDirectory::planBufferedCapacity(
+            /*requested_active_slots=*/200,
+            /*transfer_wave_slots=*/32,
+            /*transfer_buffer_count=*/2),
+        std::invalid_argument)
+        << "An unaddressable directory must fail during graph construction, not "
+           "publish a partial or fallback transfer plan.";
 }
 
 TEST_F(ComputeStagesTest, GEMMStage_EstimatedFlops)

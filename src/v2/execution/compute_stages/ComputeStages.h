@@ -45,7 +45,6 @@
 
 // MoE stages
 #include "stages/MoEExpertDispatchStage.h"
-#include "stages/MoERoutedExpertPartialReduceStage.h"
 #include "stages/MoELocalExpertStage.h"
 #include "stages/MoESparseDispatchStage.h"
 #include "stages/MoESparseReturnReduceStage.h"

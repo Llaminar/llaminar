@@ -388,8 +388,12 @@ namespace llaminar2
         const float *getAllPositionLogits() const override;
         bool hasMTPLogitsLocal() const override;
         LogitsLocalInfo getMTPLogitsLocalInfo() const override;
+        LogitsLocalInfo consumeMTPLogitsLocalInfoForSampling() override;
+        LogitsLocalInfo consumeMTPLogitsLocalInfoForHostGather() override;
         bool hasAllPositionLogitsLocal() const override;
         LogitsLocalInfo getAllPositionLogitsLocalInfo() const override;
+        LogitsLocalInfo consumeAllPositionLogitsLocalInfoForSampling() override;
+        LogitsLocalInfo consumeAllPositionLogitsLocalInfoForHostGather() override;
         /**
          * @brief Publish accepted grouped verifier rows through GlobalTP children.
          */
@@ -474,6 +478,8 @@ namespace llaminar2
         DeviceId primaryDeviceId() const override;
         bool hasLogitsLocal() const override;
         LogitsLocalInfo getLogitsLocalInfo() const override;
+        LogitsLocalInfo consumeLogitsLocalInfoForSampling() override;
+        LogitsLocalInfo consumeLogitsLocalInfoForHostGather() override;
 
         // =================================================================
         // Query API

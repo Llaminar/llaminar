@@ -1,8 +1,14 @@
+/**
+ * @file Test__RamPrefixStorageBackend.cpp
+ * @brief Unit coverage for typed RAM prefix payloads and readiness ownership.
+ */
+
 #include <gtest/gtest.h>
 
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
 
 #include <algorithm>
+#include <cstdint>
 
 using namespace llaminar2;
 
@@ -79,14 +85,41 @@ TEST(Test__RamPrefixStorageBackend, RejectsBlocksThatDoNotFit)
     EXPECT_EQ(backend.usedBytes(), 0u);
 }
 
-TEST(Test__RamPrefixStorageBackend, HydrateToRamReturnsSameHandle)
+/**
+ * @brief Proves readiness publication is a two-phase, single-use contract.
+ *
+ * Unit tests never execute GPU work. Opaque non-null values stand in for an
+ * event and stream so this test can validate the ownership state machine
+ * without constructing a backend context.
+ */
+TEST(Test__RamPrefixStorageBackend, PayloadReadinessRequiresPreparationBeforePublication)
 {
-    RamPrefixStorageBackend backend(128);
-    auto handle = backend.allocate(keyFor(1), makeLayout());
-    ASSERT_TRUE(handle.valid());
+    PrefixPayloadReadiness readiness;
+    auto event_owner = std::make_shared<uint8_t>(0u);
+    void *stream = reinterpret_cast<void *>(static_cast<uintptr_t>(0x1234u));
 
-    PrefixBlockHandle hydrated;
-    ASSERT_TRUE(backend.hydrateToRam(handle, &hydrated));
-    EXPECT_EQ(hydrated.key, handle.key);
-    EXPECT_EQ(hydrated.kv_storage, handle.kv_storage);
+    EXPECT_FALSE(readiness.prepared());
+    EXPECT_FALSE(readiness.published());
+    EXPECT_FALSE(readiness.publishRecorded())
+        << "An unprepared event must never become visible to consumers.";
+
+    ASSERT_TRUE(readiness.prepare(
+        std::static_pointer_cast<void>(event_owner),
+        DeviceId::cuda(0),
+        stream));
+    EXPECT_TRUE(readiness.prepared());
+    EXPECT_FALSE(readiness.published());
+    EXPECT_EQ(readiness.event(), event_owner.get());
+    EXPECT_EQ(readiness.producerDevice(), DeviceId::cuda(0));
+    EXPECT_EQ(readiness.producerStream(), stream);
+
+    EXPECT_FALSE(readiness.prepare(
+        std::static_pointer_cast<void>(event_owner),
+        DeviceId::cuda(0),
+        stream))
+        << "A handle has exactly one producer event and stream.";
+    ASSERT_TRUE(readiness.publishRecorded());
+    EXPECT_TRUE(readiness.published());
+    EXPECT_FALSE(readiness.publishRecorded())
+        << "Publishing one recorded event twice would hide lifecycle misuse.";
 }

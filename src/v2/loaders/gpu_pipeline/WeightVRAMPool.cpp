@@ -50,6 +50,7 @@ namespace llaminar2
           staging_region_bytes_(other.staging_region_bytes_),
           staging_slot_count_(other.staging_slot_count_),
           max_staging_slot_bytes_(other.max_staging_slot_bytes_),
+          staging_slot_stride_bytes_(other.staging_slot_stride_bytes_),
           backend_(other.backend_),
           device_id_(other.device_id_),
           allocated_(other.allocated_),
@@ -65,6 +66,7 @@ namespace llaminar2
         other.staging_region_bytes_ = 0;
         other.staging_slot_count_ = 0;
         other.max_staging_slot_bytes_ = 0;
+        other.staging_slot_stride_bytes_ = 0;
         other.backend_ = nullptr;
     }
 
@@ -80,6 +82,7 @@ namespace llaminar2
             staging_region_bytes_ = other.staging_region_bytes_;
             staging_slot_count_ = other.staging_slot_count_;
             max_staging_slot_bytes_ = other.max_staging_slot_bytes_;
+            staging_slot_stride_bytes_ = other.staging_slot_stride_bytes_;
             backend_ = other.backend_;
             device_id_ = other.device_id_;
             allocated_ = other.allocated_;
@@ -94,6 +97,7 @@ namespace llaminar2
             other.staging_region_bytes_ = 0;
             other.staging_slot_count_ = 0;
             other.max_staging_slot_bytes_ = 0;
+            other.staging_slot_stride_bytes_ = 0;
             other.backend_ = nullptr;
         }
         return *this;
@@ -227,7 +231,24 @@ namespace llaminar2
             {
                 max_staging = std::min(max_staging, staging_slot_bytes);
             }
-            staging_region_bytes_ = max_staging * staging_slot_count;
+
+            /**
+             * Slot capacity and slot stride are intentionally different
+             * quantities. Capacity controls row chunking and therefore stays
+             * inside the configured staging budget. Stride controls pointer
+             * geometry and is rounded up independently so lane 1 and later
+             * cannot inherit an odd or otherwise under-aligned address.
+             *
+             * This matters for packed GGUF formats such as Q6_K and IQ3_S:
+             * their kernels issue 16-, 32-, and wider-bit source loads. A
+             * 512 MiB budget shared by two devices and then divided across
+             * three lanes yields an odd 89,478,485-byte capacity. Using that
+             * value as the old physical stride made the first non-zero lane
+             * fault with cudaErrorMisalignedAddress.
+             */
+            staging_slot_stride_bytes_ = alignUp(max_staging, kAlignment);
+            staging_region_bytes_ =
+                staging_slot_stride_bytes_ * static_cast<size_t>(staging_slot_count);
         }
         staging_slot_count_ = staging_slot_count;
         max_staging_slot_bytes_ = max_staging;
@@ -262,6 +283,7 @@ namespace llaminar2
                     staging_region_bytes_ = 0;
                     staging_slot_count_ = 0;
                     max_staging_slot_bytes_ = 0;
+                    staging_slot_stride_bytes_ = 0;
                     return false;
                 }
                 logVramTrace(backend_, device_id_, "weight_pool.after_persistent_allocate", weight_region_bytes_);
@@ -284,6 +306,7 @@ namespace llaminar2
                     staging_region_bytes_ = 0;
                     staging_slot_count_ = 0;
                     max_staging_slot_bytes_ = 0;
+                    staging_slot_stride_bytes_ = 0;
                     return false;
                 }
                 logVramTrace(backend_, device_id_, "weight_pool.after_staging_allocate", staging_region_bytes_);
@@ -307,8 +330,9 @@ namespace llaminar2
                 " staging_bytes=" + std::to_string(staging_region_bytes_) +
                 " staging_mib=" + vramBomMiB(staging_region_bytes_) +
                 " staging_slots=" + std::to_string(staging_slot_count_) +
-                " staging_slot_bytes=" + std::to_string(max_staging_slot_bytes_) +
+                " staging_slot_capacity_bytes=" + std::to_string(max_staging_slot_bytes_) +
                 " staging_slot_mib=" + vramBomMiB(max_staging_slot_bytes_) +
+                " staging_slot_stride_bytes=" + std::to_string(staging_slot_stride_bytes_) +
                 " total_bytes=" + std::to_string(total_bytes_) +
                 " total_mib=" + vramBomMiB(total_bytes_));
         for (const auto &name : weight_order_)
@@ -443,6 +467,7 @@ namespace llaminar2
         staging_region_bytes_ = 0;
         staging_slot_count_ = 0;
         max_staging_slot_bytes_ = 0;
+        staging_slot_stride_bytes_ = 0;
     }
 
     uint8_t *WeightVRAMPool::getStagingSlot(int slot_index) const
@@ -452,11 +477,16 @@ namespace llaminar2
         if (max_staging_slot_bytes_ == 0)
             return nullptr;
         auto *base = static_cast<uint8_t *>(d_staging_base_);
-        return base + static_cast<size_t>(slot_index) * max_staging_slot_bytes_;
+        return base + static_cast<size_t>(slot_index) * staging_slot_stride_bytes_;
     }
 
     int WeightVRAMPool::stagingSlotCount() const { return staging_slot_count_; }
 
     size_t WeightVRAMPool::maxStagingSlotBytes() const { return max_staging_slot_bytes_; }
+
+    size_t WeightVRAMPool::stagingSlotStrideBytes() const
+    {
+        return staging_slot_stride_bytes_;
+    }
 
 } // namespace llaminar2

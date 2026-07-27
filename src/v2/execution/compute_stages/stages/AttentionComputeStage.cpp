@@ -12,6 +12,7 @@
 #include "../../../tensors/TQ4Tensor.h"
 #include "../../../tensors/FP16Utils.h"
 #include "../../../tensors/SIMDHelpers.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../kernels/attention/AttentionDeviceParams.h"
@@ -207,62 +208,6 @@ namespace llaminar2
             constexpr uint64_t kPrime = 1099511628211ull;
             h ^= value;
             h *= kPrime;
-        }
-
-        std::shared_ptr<FP32Tensor> makeAttentionScratchFP32(
-            size_t rows,
-            size_t cols,
-            DeviceId device,
-            void *stream)
-        {
-            auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{rows, cols});
-            if (device.is_gpu())
-                tensor->allocateOnDevice(device, stream);
-            return tensor;
-        }
-
-        bool ensureAttentionScratchFP32(
-            std::shared_ptr<FP32Tensor> &tensor,
-            size_t rows,
-            size_t cols,
-            DeviceId device,
-            void *stream,
-            const char *name)
-        {
-            const std::vector<size_t> expected_shape{rows, cols};
-            if (!tensor || tensor->shape() != expected_shape)
-            {
-                if (device.is_gpu() && isGraphCaptureActive())
-                {
-                    LOG_ERROR("[AttentionComputeStage] Cannot allocate verifier scratch tensor '"
-                              << name << "' during graph capture");
-                    return false;
-                }
-                tensor = makeAttentionScratchFP32(rows, cols, device, stream);
-            }
-
-            if (device.is_gpu() && !tensor->gpu_data_ptr())
-            {
-                if (isGraphCaptureActive())
-                {
-                    LOG_ERROR("[AttentionComputeStage] Verifier scratch tensor '"
-                              << name << "' was not device-resident before graph capture");
-                    return false;
-                }
-                if (!tensor->allocateOnDevice(device, stream))
-                {
-                    LOG_ERROR("[AttentionComputeStage] Failed to allocate verifier scratch tensor '"
-                              << name << "' on " << device.to_string());
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        void markAttentionGpuTensorWritten(TensorBase *tensor, DeviceId device, void *stream)
-        {
-            if (tensor && device.is_gpu())
-                tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
         }
 
         bool copyAttentionFP32DeviceRow(
@@ -718,11 +663,8 @@ namespace llaminar2
     bool AttentionComputeStage::execute(IDeviceContext *ctx)
     {
         const bool gpu_stage = params_.device_id.is_gpu();
-        if (gpu_stage && !gpuStream())
-        {
-            LOG_ERROR("[AttentionComputeStage] GPU attention/KV read requires an explicit non-null stage stream");
-            return false;
-        }
+        if (gpu_stage)
+            (void)requireGPUStream();
         if (gpu_stage && params_.kv_cache && !params_.read_kv_from_cache)
         {
             LOG_ERROR("[AttentionComputeStage] GPU attention with a KV cache requires the device-owned post-append cache path"
@@ -812,7 +754,7 @@ namespace llaminar2
                 // - Lazy shadow buffer management inside the cache
                 // This covers both decode (full KV history) and prefill with rope_on_read
                 // (K stored pre-RoPE, needs RoPE applied during read).
-                const bool is_cpu_path = (gpuStream() == nullptr);
+                const bool is_cpu_path = !gpu_stage;
                 if (is_cpu_path && (effective_kv_len > params_.seq_len || params_.apply_rope_to_k))
                 {
                     if (params_.batch_size > 1)
@@ -1123,6 +1065,23 @@ namespace llaminar2
          * The explicit request contract below supports compact per-request rows
          * up to the same sixteen-row bound used by grouped MTP verification.
          */
+        /*
+         * Small independent request batches always use the row-local resident
+         * kernel, including the first prompt block where every cache count is
+         * equal to the query-row count.  The same captured graph may replay
+         * after prefix restore or a later append has grown those device-owned
+         * counts.  Selecting ordinary prefill from the host launch horizon and
+         * grouped decode only after observing a larger host KV length would
+         * make the arithmetic regime depend on stale host state: graph replay
+         * would keep prefill reduction order while an isolated request entered
+         * the serial-decode-equivalent grouped path.
+         *
+         * The grouped request kernel derives every row's visible prefix and
+         * launch policy from canonical cache counts on the execution stream.
+         * Its fixed maximum-stride grid is valid for both initial prefill and
+         * grown-prefix replay, making the regime choice graph-stable and fully
+         * device-owned.
+         */
         const bool gpu_grouped_request_decode =
             gpu_stage &&
             params_.kv_cache &&
@@ -1131,7 +1090,6 @@ namespace llaminar2
             logical_seq_len > 0 &&
             params_.batch_size * logical_seq_len <=
                 attention::kMaxGroupedVerifierAttentionRows &&
-            effective_kv_len > logical_seq_len &&
             params_.causal;
 
         if (gpu_stage && params_.kv_cache && params_.layer_idx >= 0)

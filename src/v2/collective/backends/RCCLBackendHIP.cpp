@@ -261,18 +261,6 @@ namespace llaminar2
             return (err == hipSuccess || err == hipErrorPeerAccessAlreadyEnabled);
         }
 
-        bool hipDeviceSynchronizeWrapper()
-        {
-            hipError_t err = hipDeviceSynchronize();
-            if (err == hipErrorStreamCaptureUnsupported ||
-                err == hipErrorStreamCaptureImplicit)
-            {
-                // Benign: graph capture is active on this device — skip sync.
-                return true;
-            }
-            return (err == hipSuccess);
-        }
-
         // =========================================================================
         // Host Staging Memory Operations (for non-P2P fallback)
         // =========================================================================

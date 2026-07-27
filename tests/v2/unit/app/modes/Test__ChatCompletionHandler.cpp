@@ -898,7 +898,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_AppliesRebalanceHookAfterFinal
     EXPECT_TRUE(response.ok);
 }
 
-TEST_F(Test__ChatCompletionHandler, HandleRequest_DeviceSideRebalanceSkipsHostFinalStepMaintenance)
+TEST_F(Test__ChatCompletionHandler, HandleRequest_UsesUnifiedDecodeBoundaryMaintenance)
 {
     auto handler = makeHandler();
 
@@ -910,12 +910,12 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_DeviceSideRebalanceSkipsHostFi
         .WillByDefault(Return(false));
 
     EXPECT_CALL(*runner_, clearCache()).Times(2);
-    EXPECT_CALL(*runner_, usesDeviceSideMoERebalanceController())
-        .Times(1)
-        .WillOnce(Return(true));
+    EXPECT_CALL(*runner_, usesDeviceSideMoERebalanceController()).Times(0);
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(42, true)));
-    EXPECT_CALL(*runner_, maybeApplyMoERebalance()).Times(0);
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+        .Times(1)
+        .WillOnce(Return(true));
 
     ChatCompletionRequest request;
     request.messages = {ChatMessage("user", "Hello")};
@@ -2323,7 +2323,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_AppliesRebalanceHookAfterFinalComp
     EXPECT_EQ(chunks.back(), "data: [DONE]\n\n");
 }
 
-TEST_F(Test__ChatCompletionHandler, Streaming_DeviceSideRebalanceSkipsHostFinalStepMaintenance)
+TEST_F(Test__ChatCompletionHandler, Streaming_UsesUnifiedDecodeBoundaryMaintenance)
 {
     auto handler = makeHandler();
 
@@ -2334,12 +2334,12 @@ TEST_F(Test__ChatCompletionHandler, Streaming_DeviceSideRebalanceSkipsHostFinalS
     ON_CALL(*tokenizer_, is_stop_token(_))
         .WillByDefault(Return(false));
 
-    EXPECT_CALL(*runner_, usesDeviceSideMoERebalanceController())
-        .Times(1)
-        .WillOnce(Return(true));
+    EXPECT_CALL(*runner_, usesDeviceSideMoERebalanceController()).Times(0);
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(1, true)));
-    EXPECT_CALL(*runner_, maybeApplyMoERebalance()).Times(0);
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+        .Times(1)
+        .WillOnce(Return(true));
 
     ChatCompletionRequest request;
     request.messages = {ChatMessage("user", "test")};

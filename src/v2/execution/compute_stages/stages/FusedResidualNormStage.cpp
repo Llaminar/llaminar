@@ -15,6 +15,7 @@
 
 #include "FusedResidualNormStage.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../kernels/KernelFactory.h"
@@ -342,12 +343,9 @@ namespace llaminar2
             }
 
             // Mark both outputs as device-dirty (GPU is authoritative)
-            residual_base->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                                                 params_.device_id,
-                                                 stream);
-            norm_output_base->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                                                    params_.device_id,
-                                                    stream);
+            const StageGPUExecution gpu = gpuExecution();
+            gpu.publish(residual_base);
+            gpu.publish(norm_output_base);
 
             traceOutput("residual", params_.residual);
             traceOutput("norm_output", params_.norm_output);

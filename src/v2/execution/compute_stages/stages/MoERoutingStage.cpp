@@ -12,6 +12,7 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Assertions.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
@@ -38,33 +39,6 @@ namespace llaminar2
 
     namespace
     {
-        bool ensureRoutingOutputOnStageDevice(
-            TensorBase *tensor,
-            DeviceId device,
-            void *stream,
-            const char *name)
-        {
-            if (!device.is_gpu())
-                return true;
-
-            if (!tensor->ensureOnDevice(device, stream))
-            {
-                LOG_ERROR("[MoERoutingStage] Failed to make routing output '" << name
-                                                                              << "' available on " << device.to_string());
-                return false;
-            }
-
-            if (!tensor->is_on_device(device))
-            {
-                LOG_ERROR("[MoERoutingStage] Routing output '" << name
-                                                               << "' is not resident on " << device.to_string()
-                                                               << " after routing");
-                return false;
-            }
-
-            return true;
-        }
-
         bool supportsGroupedPrefillExecutionBackend(DeviceId device)
         {
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
@@ -163,10 +137,39 @@ namespace llaminar2
         resetSessionStatePreservingCapturedReplay();
     }
 
+    void MoERoutingStage::invalidateKernelDynamicState()
+    {
+        IMoEKernel *kernel =
+            params_.routed_pipeline_kernel_owner &&
+                    params_.routed_pipeline_kernel_owner->kernel
+                ? params_.routed_pipeline_kernel_owner->kernel.get()
+                : owned_moe_kernel_.get();
+        if (!kernel)
+            return;
+
+        kernel->resetDynamicState();
+        kernel->setGPUStream(nullptr);
+    }
+
     IMoEKernel *MoERoutingStage::ensureMoEKernel() const
     {
         if (!moe_kernel_)
-            moe_kernel_ = KernelFactory::getOrCreateMoEKernel(params_.device_id);
+        {
+            if (params_.routed_pipeline_kernel_owner)
+            {
+                if (!params_.routed_pipeline_kernel_owner->kernel)
+                {
+                    params_.routed_pipeline_kernel_owner->kernel =
+                        KernelFactory::createMoEKernel(params_.device_id);
+                }
+                moe_kernel_ = params_.routed_pipeline_kernel_owner->kernel.get();
+            }
+            else
+            {
+                owned_moe_kernel_ = KernelFactory::createMoEKernel(params_.device_id);
+                moe_kernel_ = owned_moe_kernel_.get();
+            }
+        }
         auto *kernel = bindStageStream(moe_kernel_);
         if (bound_workspace_)
         {
@@ -216,7 +219,7 @@ namespace llaminar2
         refreshPinnedEffectiveSeqLen();
         if (gpu_effective_seq_len_state_)
             gpu_effective_seq_len_state_->device_value_uploaded = false;
-        if (params_.device_id.is_gpu() && gpuStream() && bound_workspace_)
+        if (params_.device_id.is_gpu() && hasGPUStream() && bound_workspace_)
             (void)(ensureGpuEffectiveSeqLenStateInitialized() && uploadGpuEffectiveSeqLen());
     }
 
@@ -522,14 +525,6 @@ namespace llaminar2
                  {"seq_len", std::to_string(seq_len)},
                  {"layer", std::to_string(params_.layer_idx)}});
 
-            if (!ensureRoutingOutputOnStageDevice(
-                    full_indices, params_.device_id, gpuStream(), "output_indices") ||
-                !ensureRoutingOutputOnStageDevice(
-                    full_output_weights, params_.device_id, gpuStream(), "output_weights"))
-            {
-                return false;
-            }
-
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
             router_logits_.clear();
 #endif
@@ -772,14 +767,6 @@ namespace llaminar2
                 return false;
             }
 
-            if (!ensureRoutingOutputOnStageDevice(
-                    params_.output_indices, params_.device_id, gpuStream(), "output_indices") ||
-                !ensureRoutingOutputOnStageDevice(
-                    params_.output_weights, params_.device_id, gpuStream(), "output_weights"))
-            {
-                return false;
-            }
-
             LOG_TRACE("[MoERoutingStage] Runtime-routed single token to top-"
                       << top_k << " of " << num_experts << " experts");
             recordRuntimeHistogramTokenBoundary();
@@ -886,20 +873,11 @@ namespace llaminar2
             return false;
         }
 
-        if (!ensureRoutingOutputOnStageDevice(
-                params_.output_indices, params_.device_id, gpuStream(), "output_indices") ||
-            !ensureRoutingOutputOnStageDevice(
-                params_.output_weights, params_.device_id, gpuStream(), "output_weights"))
-        {
-            return false;
-        }
-
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
         /*
-         * Outside graph capture, GPU routeWithTensors() may still publish a host
-         * mirror for richer router snapshots. Captured replay deliberately keeps
-         * routing device-resident; post-graph snapshot draining will publish the
-         * output tensors below instead of relying on these optional host mirrors.
+         * GPU routing always publishes device-authoritative tensors. Snapshot
+         * collection drains those tensors only at its explicit observation
+         * boundary; live routing never manufactures or adopts a host mirror.
          */
         if (!cached_routing_.router_logits.empty())
             router_logits_ = std::move(cached_routing_.router_logits);

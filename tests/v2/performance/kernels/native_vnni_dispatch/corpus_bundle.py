@@ -31,11 +31,15 @@ MANIFEST_NAME = "corpus.manifest.json"
 LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1\n"
 SUPPORTED_BACKENDS = frozenset(("cpu", "cpu-prefill", "cuda", "rocm"))
 _IGNORED_DIRECTORY_NAMES = frozenset(("fit-cache", "policy_fit_cache"))
-_IDENTITY_NEUTRAL_REFRESH_FLAGS = frozenset(("--resume-cpu-partials",))
+_IDENTITY_NEUTRAL_REFRESH_FLAGS = frozenset((
+    "--resume-cpu-partials",
+    "--reuse-rocm-development",
+))
 _IDENTITY_NEUTRAL_REFRESH_OPTIONS = frozenset((
     "--cpu-batch-limit",
     "--cpu-minimum-promotion-samples",
     "--cpu-minimum-promotion-warmups",
+    "--rocm-development-build-change-audit",
 ))
 _PRODUCTION_REQUIRED_PAYLOADS: dict[str, tuple[str, ...]] = {
     "cuda": (

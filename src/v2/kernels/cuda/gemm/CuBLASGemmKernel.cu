@@ -36,6 +36,8 @@ namespace llaminar2
             constexpr const char *kBatchedSameAAArray = "cublas_batched_same_a_a_ptrs";
             constexpr const char *kBatchedSameABArray = "cublas_batched_same_a_b_ptrs";
             constexpr const char *kBatchedSameACArray = "cublas_batched_same_a_c_ptrs";
+            constexpr const char *kBiasMatmulWorkspace = "cublaslt_bias_matmul_workspace";
+            constexpr size_t kBiasMatmulWorkspaceBytes = 4 * 1024 * 1024;
 
             __global__ void prepare_batched_same_a_pointer_arrays_kernel(
                 const float *d_A,
@@ -485,10 +487,37 @@ namespace llaminar2
 
             CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&preference));
 
-            // Request workspace (optional, can improve performance)
-            size_t workspaceSize = 4 * 1024 * 1024; // 4MB workspace
-            void *workspace = nullptr;
-            CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
+            /*
+             * The algorithm workspace is an immutable graph resource.  A bias
+             * projection may execute during warmup, capture, and replay, so
+             * allocating it here would make both address ownership and capture
+             * legality depend on the current call.  The graph planner must bind
+             * the declared buffer before this method can be entered.
+             */
+            const size_t workspaceSize = kBiasMatmulWorkspaceBytes;
+            if (!workspace_)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_with_bias] Required graph workspace is not bound");
+                cublasLtMatmulPreferenceDestroy(preference);
+                cublasLtMatrixLayoutDestroy(Cdesc);
+                cublasLtMatrixLayoutDestroy(Bdesc);
+                cublasLtMatrixLayoutDestroy(Adesc);
+                cublasLtMatmulDescDestroy(operationDesc);
+                return false;
+            }
+            void *workspace = workspace_->getBuffer(kBiasMatmulWorkspace);
+            if (!workspace ||
+                workspace_->getBufferSize(kBiasMatmulWorkspace) < workspaceSize)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_with_bias] Missing or undersized "
+                          << kBiasMatmulWorkspace << " workspace");
+                cublasLtMatmulPreferenceDestroy(preference);
+                cublasLtMatrixLayoutDestroy(Cdesc);
+                cublasLtMatrixLayoutDestroy(Bdesc);
+                cublasLtMatrixLayoutDestroy(Adesc);
+                cublasLtMatmulDescDestroy(operationDesc);
+                return false;
+            }
 
             CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(preference,
                                                                 CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
@@ -506,7 +535,6 @@ namespace llaminar2
             if (returnedResults == 0)
             {
                 LOG_ERROR("[CuBLASGemmKernel::execute_with_bias] No suitable algorithm found");
-                cudaFree(workspace);
                 cublasLtMatmulPreferenceDestroy(preference);
                 cublasLtMatrixLayoutDestroy(Cdesc);
                 cublasLtMatrixLayoutDestroy(Bdesc);
@@ -532,7 +560,6 @@ namespace llaminar2
                                                    static_cast<cudaStream_t>(gpu_stream_)); // Use configured stream
 
             // Cleanup
-            cudaFree(workspace);
             cublasLtMatmulPreferenceDestroy(preference);
             cublasLtMatrixLayoutDestroy(Cdesc);
             cublasLtMatrixLayoutDestroy(Bdesc);
@@ -735,6 +762,8 @@ namespace llaminar2
             reqs.buffers.push_back({kBatchedSameAAArray, bytes, 256, true});
             reqs.buffers.push_back({kBatchedSameABArray, bytes, 256, true});
             reqs.buffers.push_back({kBatchedSameACArray, bytes, 256, true});
+            reqs.buffers.push_back(
+                {kBiasMatmulWorkspace, kBiasMatmulWorkspaceBytes, 256, true});
             return reqs;
         }
 

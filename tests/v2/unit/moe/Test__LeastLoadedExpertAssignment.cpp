@@ -371,6 +371,68 @@ TEST(Test__LeastLoadedExpertAssignment, TransferCapKeepsOverflowRowsResident)
     EXPECT_EQ(fixture.assigned[0] + fixture.assigned[1] + fixture.assigned[2], 400u);
 }
 
+TEST(Test__LeastLoadedExpertAssignment, WorkingSetCapCountsResidentReplicasAlongsideNewTransfers)
+{
+    /*
+     * Participant 1 already contains a transfer-backed replica of expert 1.
+     * Expert 0 is hotter and needs a new transfer into the same participant.
+     * A transfer-count-only budget therefore sees one copy while the published
+     * assignment actually needs two simultaneously valid payload slots.
+     */
+    const std::vector<uint64_t> loads{80, 60, 60, 20};
+    const std::vector<uint32_t> owners{0, 0, 0, 1};
+    const std::vector<uint32_t> resident_masks{0b01u, 0b11u, 0b01u, 0b10u};
+    auto config = configFor(4, 2);
+    config.enable_balanced_skip = false;
+    config.max_weight_transfers = 1;
+
+    PlannerFixture transfer_only(config.expert_count, config.participant_count);
+    ASSERT_TRUE(transfer_only.planWithResidency(
+        loads,
+        owners,
+        resident_masks,
+        config));
+    ASSERT_EQ(transfer_only.status.weight_transfer_count, 1u);
+    ASSERT_EQ(
+        countNonOwnerExpertAssignments(
+            transfer_only.spans.data(),
+            transfer_only.status,
+            1u),
+        2u)
+        << "the regression requires one cached payload plus one new arrival";
+
+    /*
+     * One physical directory slot means the planner must choose between the
+     * cached replica and the new arrival. It must never publish both and ask a
+     * later materialization stage to repair or truncate the plan.
+     */
+    config.max_non_owner_experts_per_participant = 1;
+    PlannerFixture bounded(config.expert_count, config.participant_count);
+    ASSERT_TRUE(bounded.planWithResidency(
+        loads,
+        owners,
+        resident_masks,
+        config));
+
+    EXPECT_EQ(bounded.status.overflow, 0u);
+    EXPECT_EQ(bounded.status.invalid_config, 0u);
+    EXPECT_EQ(bounded.status.weight_transfer_count, 1u);
+    EXPECT_EQ(
+        countNonOwnerExpertAssignments(
+            bounded.spans.data(),
+            bounded.status,
+            1u),
+        1u);
+    EXPECT_EQ(bounded.status.native_rows + bounded.status.spilled_rows, 220u);
+    EXPECT_EQ(bounded.assigned[0] + bounded.assigned[1], 220u);
+
+    ASSERT_GE(bounded.status.span_count, 1u);
+    EXPECT_EQ(bounded.transfers[0].expert, 0u)
+        << "the hotter new arrival wins the sole physical payload slot";
+    EXPECT_EQ(bounded.transfers[0].source_participant, 0u);
+    EXPECT_EQ(bounded.transfers[0].destination_participant, 1u);
+}
+
 TEST(Test__LeastLoadedExpertAssignment, ResidentReplicaDestinationDoesNotRequireWeightTransfer)
 {
     std::vector<uint64_t> loads{80, 20, 0, 0};

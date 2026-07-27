@@ -62,8 +62,8 @@ extern "C"
         int device_idx, void *stream);
 
     // GPU memory helpers (implemented in CUDAGatedDeltaNetKernels.cu)
-    bool cudaGDN_gpu_malloc(float **ptr, size_t count);
-    void cudaGDN_gpu_free(float *ptr);
+    bool cudaGDN_gpu_malloc(float **ptr, size_t count, int device_ordinal);
+    void cudaGDN_gpu_free(float *ptr, int device_ordinal);
     void cudaGDN_gpu_memset_zero(float *ptr, size_t count);
     void cudaGDN_gpu_memset_zero_async(float *ptr, size_t count, void *stream);
     void cudaGDN_gpu_memcpy(float *dst, const float *src, size_t count);
@@ -124,10 +124,10 @@ namespace llaminar2
         ~CUDAShortConvolution()
         {
             cudaGDN_gpu_set_device(device_ordinal_);
-            cudaGDN_gpu_free(gpu_state_);
-            cudaGDN_gpu_free(secondary_gpu_state_);
-            cudaGDN_gpu_free(request_state_bank_);
-            cudaGDN_gpu_free(scratch_);
+            cudaGDN_gpu_free(gpu_state_, device_ordinal_);
+            cudaGDN_gpu_free(secondary_gpu_state_, device_ordinal_);
+            cudaGDN_gpu_free(request_state_bank_, device_ordinal_);
+            cudaGDN_gpu_free(scratch_, device_ordinal_);
         }
 
         void allocateGPUState(int state_size) override { allocateState(state_size); }
@@ -297,7 +297,7 @@ namespace llaminar2
             }
             cudaGDN_gpu_set_device(device_ordinal_);
             float *new_state = nullptr;
-            if (!cudaGDN_gpu_malloc(&new_state, state_size))
+            if (!cudaGDN_gpu_malloc(&new_state, state_size, device_ordinal_))
             {
                 LOG_ERROR("[CUDAShortConvolution] GPU malloc failed for state");
                 return;
@@ -309,7 +309,7 @@ namespace llaminar2
             if (gpu_state_)
             {
                 if (secondary_gpu_state_)
-                    cudaGDN_gpu_free(secondary_gpu_state_);
+                    cudaGDN_gpu_free(secondary_gpu_state_, device_ordinal_);
                 secondary_gpu_state_ = gpu_state_;
                 secondary_state_size_ = state_size_;
             }
@@ -989,7 +989,7 @@ namespace llaminar2
 
             cudaGDN_gpu_set_device(device_ordinal_);
             if (request_state_bank_)
-                cudaGDN_gpu_free(request_state_bank_);
+                cudaGDN_gpu_free(request_state_bank_, device_ordinal_);
             request_state_bank_ = nullptr;
             request_state_bank_state_size_ = required_state_size;
             request_state_bank_capacity_ = request_count;
@@ -997,7 +997,7 @@ namespace llaminar2
             const size_t total_floats =
                 static_cast<size_t>(request_count) *
                 static_cast<size_t>(required_state_size);
-            if (!cudaGDN_gpu_malloc(&request_state_bank_, total_floats))
+            if (!cudaGDN_gpu_malloc(&request_state_bank_, total_floats, device_ordinal_))
             {
                 LOG_ERROR("[CUDAShortConvolution] GPU malloc failed for request conv-state bank");
                 request_state_bank_state_size_ = 0;
@@ -1032,7 +1032,7 @@ namespace llaminar2
                     return false;
                 }
                 cudaGDN_gpu_set_device(device_ordinal_);
-                cudaGDN_gpu_free(scratch_);
+                cudaGDN_gpu_free(scratch_, device_ordinal_);
                 scratch_ = nullptr;
             }
 
@@ -1046,7 +1046,7 @@ namespace llaminar2
 
             scratch_size_ = scratch_size;
             cudaGDN_gpu_set_device(device_ordinal_);
-            if (!cudaGDN_gpu_malloc(&scratch_, scratch_size_))
+            if (!cudaGDN_gpu_malloc(&scratch_, scratch_size_, device_ordinal_))
             {
                 LOG_ERROR("[CUDAShortConvolution] GPU malloc failed for in-place prefill scratch");
                 scratch_ = nullptr;

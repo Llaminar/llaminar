@@ -5,8 +5,8 @@ used by the learner. It therefore reports normalized, provenance-checked
 features rather than inspecting raw ``perf``/Nsight/rocprof counters through a
 second set of formulas. The report answers four pre-fit questions:
 
-* Did every required physical candidate publish profiler evidence?
-* Is each auxiliary metric complete across whole candidate contests?
+* Did every required fastest/middle/slowest stratum publish profiler evidence?
+* Is each auxiliary metric complete across the sampled candidate strata?
 * Does that metric vary between candidates at the same work point?
 * Did CPU duration/concurrency evidence pass its reliability gate?
 
@@ -31,7 +31,6 @@ from .profiler_model import (
     ProfilerCandidateDescriptor,
     ProfilerFeatureCatalog,
     _auxiliary_metric_reliability_weight,
-    _is_anchor_dynamic_profiler_feature,
     load_profiler_feature_catalog,
 )
 
@@ -114,6 +113,79 @@ def _metric_report(
     }
 
 
+def _metric_reports(
+    descriptors: tuple[ProfilerCandidateDescriptor, ...],
+    contests: Mapping[tuple[str, ...], tuple[ProfilerCandidateDescriptor, ...]],
+) -> dict[str, dict[str, object]]:
+    """Summarize all metrics with one pass over sampled contests.
+
+    Calling :func:`_metric_report` independently for every metric repeatedly
+    traversed the same six-figure descriptor catalog. The report is separable:
+    availability is one descriptor-local count, while candidate spans require
+    only metrics shared by the rows in that contest. This transposed traversal
+    preserves the exact formulas with work proportional to real feature data.
+    """
+
+    names = _metric_names(descriptors)
+    availability: Counter[str] = Counter()
+    complete_spans: dict[str, list[float]] = defaultdict(list)
+    multi_candidate_contest_count = 0
+    for descriptor in descriptors:
+        availability.update(
+            name
+            for name, value in descriptor.features.items()
+            if isinstance(value, (int, float)) and name.startswith("metric.")
+        )
+    for rows in contests.values():
+        if len(rows) <= 1:
+            continue
+        multi_candidate_contest_count += 1
+        common = {
+            name
+            for name, value in rows[0].features.items()
+            if isinstance(value, (int, float)) and name.startswith("metric.")
+        }
+        for row in rows[1:]:
+            common.intersection_update(
+                name
+                for name, value in row.features.items()
+                if isinstance(value, (int, float)) and name.startswith("metric.")
+            )
+        for name in common:
+            complete_spans[name].append(
+                _relative_span(float(row.features[name]) for row in rows)
+            )
+
+    reports = {}
+    descriptor_count = len(descriptors)
+    for name in names:
+        spans = complete_spans.get(name, ())
+        varying = tuple(span for span in spans if span > 1.0e-12)
+        reports[name] = {
+            "available_descriptors": availability[name],
+            "availability_rate": availability[name] / descriptor_count,
+            "complete_candidate_contests": len(spans),
+            "complete_candidate_contest_rate": (
+                len(spans) / multi_candidate_contest_count
+                if multi_candidate_contest_count
+                else 0.0
+            ),
+            "varying_complete_contests": len(varying),
+            "varying_complete_contest_rate": (
+                len(varying) / len(spans) if spans else 0.0
+            ),
+            "median_candidate_relative_span": (
+                statistics.median(spans) if spans else 0.0
+            ),
+            "p95_candidate_relative_span": (
+                sorted(spans)[min(len(spans) - 1, int(0.95 * len(spans)))]
+                if spans
+                else 0.0
+            ),
+        }
+    return reports
+
+
 def _metric_expected_direction(name: str) -> str:
     """Describe the reviewed economy direction for one normalized feature."""
 
@@ -124,6 +196,8 @@ def _metric_expected_direction(name: str) -> str:
         "scratch_bytes",
         "spill",
         "warp_cycles_per_issued_instruction",
+        "instructions_per_workitem",
+        "instructions_per_",
         "duration_ns_per_",
         "fetch_to_expected_byte_ratio",
         "write_to_output_byte_ratio",
@@ -207,9 +281,12 @@ def _performance_signal_report(
             continue
         clear_contests += 1
         slowdown_ratios.append(slowest_us / fastest_us)
-        for name in metric_names:
-            if name not in fastest.features or name not in slowest.features:
-                continue
+        common_metrics = (
+            set(fastest.features)
+            .intersection(slowest.features)
+            .intersection(metric_names)
+        )
+        for name in common_metrics:
             fast_value = float(fastest.features[name])
             slow_value = float(slowest.features[name])
             scale = max(abs(fast_value), abs(slow_value), 1.0e-12)
@@ -223,16 +300,11 @@ def _performance_signal_report(
     for name in metric_names:
         pairs = comparisons.get(name, ())
         direction = _metric_expected_direction(name)
-        dynamic = _is_anchor_dynamic_profiler_feature(name)
-        auxiliary_weight = (
-            _auxiliary_metric_reliability_weight(name) if dynamic else 0.0
-        )
+        auxiliary_weight = _auxiliary_metric_reliability_weight(name)
         learner_role = (
             "auxiliary_target"
             if auxiliary_weight > 0.0
             else "diagnostic_only"
-            if dynamic
-            else "runtime_static_input"
         )
         matches = 0
         ties = 0
@@ -321,10 +393,7 @@ def diagnose_profiler_catalog(
         for descriptor in descriptors
         if descriptor.key.backend.value == "cpu"
     )
-    metrics = {
-        name: _metric_report(name, descriptors, contests)
-        for name in _metric_names(descriptors)
-    }
+    metrics = _metric_reports(descriptors, contests)
     report = {
         "catalog_digest": catalog.digest,
         "catalog_model_digest": catalog.model_digest,
@@ -355,13 +424,83 @@ def diagnose_profiler_catalog(
         "metrics": metrics,
     }
     if timing_us_by_key is not None:
-        report["performance_signal"] = _performance_signal_report(
+        performance_signal = _performance_signal_report(
             descriptors,
             contests,
             timing_us_by_key,
             minimum_slowdown_ratio=minimum_slowdown_ratio,
         )
+        report["performance_signal"] = performance_signal
+        report["signal_gate"] = _signal_gate_report(performance_signal)
     return report
+
+
+def _signal_gate_report(
+    performance_signal: Mapping[str, object],
+) -> dict[str, object]:
+    """Decide whether reviewed hardware counters can inform candidate economy.
+
+    The gate deliberately ignores one-shot profiler duration and static
+    resource measurements. Canonical repeated timing already owns the
+    optimization label, while registers, occupancy, and related resources are
+    profiler-only auxiliary targets rather than runtime inputs. At least one
+    reviewed dynamic counter must be complete for most clear candidate
+    contests, visibly vary, and move in its expected economy direction.
+    """
+
+    minimum_contest_coverage = 0.5
+    minimum_relative_gap = 0.01
+    minimum_directional_match_rate = 0.6
+    qualifying_metrics = []
+    metrics = performance_signal.get("metrics", {})
+    if not isinstance(metrics, Mapping):
+        metrics = {}
+    for name, raw_metric in metrics.items():
+        if not isinstance(name, str) or not isinstance(raw_metric, Mapping):
+            continue
+        if raw_metric.get("learner_role") != "auxiliary_target":
+            continue
+        if raw_metric.get("signal_class") != "dynamic_hardware_counter":
+            continue
+        direction = raw_metric.get("expected_direction")
+        if direction not in {"lower_is_better", "higher_is_better"}:
+            continue
+        coverage = float(raw_metric.get("paired_fast_slow_contest_rate", 0.0))
+        gap = float(raw_metric.get(
+            "median_absolute_fast_slow_relative_gap", 0.0
+        ))
+        match = raw_metric.get("directional_match_rate")
+        if match is None:
+            continue
+        if (
+            coverage >= minimum_contest_coverage
+            and gap >= minimum_relative_gap
+            and float(match) >= minimum_directional_match_rate
+        ):
+            qualifying_metrics.append(name)
+
+    clear_contests = int(performance_signal.get(
+        "clear_fast_slow_contests", 0
+    ))
+    reasons = []
+    if clear_contests == 0:
+        reasons.append(
+            "no canonical candidate contest has at least 5% timing separation"
+        )
+    if not qualifying_metrics:
+        reasons.append(
+            "no reviewed auxiliary hardware metric has complete, varying, "
+            "directionally consistent candidate signal"
+        )
+    return {
+        "passed": not reasons,
+        "clear_fast_slow_contests": clear_contests,
+        "minimum_contest_coverage": minimum_contest_coverage,
+        "minimum_relative_gap": minimum_relative_gap,
+        "minimum_directional_match_rate": minimum_directional_match_rate,
+        "qualifying_metrics": sorted(qualifying_metrics),
+        "reasons": reasons,
+    }
 
 
 def _parse_args() -> argparse.Namespace:
@@ -372,6 +511,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--requests", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--require-meaningful-signal",
+        action="store_true",
+        help=(
+            "fail after publishing diagnostics unless reviewed auxiliary "
+            "hardware counters contain usable candidate-ranking signal"
+        ),
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="write --output without echoing the complete JSON report",
+    )
     parser.add_argument(
         "--minimum-slowdown-ratio",
         type=float,
@@ -413,7 +565,13 @@ def main() -> int:
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(encoded)
-    print(encoded, end="")
+    if not args.quiet:
+        print(encoded, end="")
+    if (
+        args.require_meaningful_signal
+        and not report.get("signal_gate", {}).get("passed", False)
+    ):
+        return 2
     return 0
 
 

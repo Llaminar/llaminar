@@ -4,6 +4,8 @@
  */
 
 #include "BufferArena.h"
+
+#include "../transfer/TransferEngine.h"
 #include "CoherenceTracker.h"
 #include "config/CollectiveBackendType.h"
 #include "execution/debug/BufferRole.h"
@@ -426,8 +428,10 @@ namespace llaminar2
                               << bufferIdName(id) << "' on " << b.home_device.toString());
                     return mapped;
                 }
-                LOG_WARN("[BufferArena] Mapped allocation failed for '"
-                         << bufferIdName(id) << "', using regular allocation");
+                throw std::runtime_error(
+                    "[BufferArena] Required mapped allocation failed for '" +
+                    std::string(bufferIdName(id)) + "' on " +
+                    b.home_device.toString());
             }
 
             // Dispatch by dtype string
@@ -645,6 +649,13 @@ namespace llaminar2
     // =========================================================================
     // Runtime coherence
     // =========================================================================
+
+    bool BufferArena::allocateDeviceStorage(BufferId id, DeviceId target)
+    {
+        auto &b = buf(id);
+        TransferEngine::allocateDeviceStorage(b.tensorBase(), target);
+        return true;
+    }
 
     bool BufferArena::prepareForRead(BufferId id, DeviceId target, void *stream)
     {

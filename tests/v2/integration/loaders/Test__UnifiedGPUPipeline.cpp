@@ -39,6 +39,7 @@
 #include "../../src/v2/execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../src/v2/execution/local_execution/coherence/GpuCoherence.h"
 #include "../../utils/TestTensorFactory.h"
+#include "../../utils/ScopedGPUStream.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -222,7 +223,7 @@ protected:
         factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
         loader_ = std::make_unique<ModelLoader>(factory_.get());
 
-        if (!tryLoadModel(*loader_, MOE_MODEL_PATH))
+        if (!tryLoadModelForDevice(*loader_, MOE_MODEL_PATH, device_))
         {
             GTEST_SKIP() << "Failed to load model: " << MOE_MODEL_PATH;
         }
@@ -386,10 +387,13 @@ static void verifyExpertGemmAgainstCpuReference(ITensorGemm *engine,
     const std::vector<float> reference = computeDenseMatmulReference(
         input->data(), expert_view->data(), rows, output_cols, input_cols);
 
+    ScopedGPUStream producer_stream(device);
+    engine->setGPUStream(producer_stream.get());
     ASSERT_TRUE(with_gpu_coherence(
         device,
         {input.get()},
         {output.get()},
+        producer_stream.get(),
         [&]
         {
             return engine->multiply_tensor(input.get(), output.get(), rows, output_cols, input_cols);
@@ -668,10 +672,13 @@ TEST_F(UnifiedGPUPipelineTest, ExpertGemmProducesCorrectOutput)
     std::memset(output->mutable_data(), 0, M * N * sizeof(float));
 
     // Execute GEMM with proper coherence (upload input, mark output device-dirty)
+    ScopedGPUStream producer_stream(device_);
+    gate_engine->setGPUStream(producer_stream.get());
     ASSERT_TRUE(with_gpu_coherence(
         device_,
         {input.get()},
         {output.get()},
+        producer_stream.get(),
         [&]
         {
             return gate_engine->multiply_tensor(

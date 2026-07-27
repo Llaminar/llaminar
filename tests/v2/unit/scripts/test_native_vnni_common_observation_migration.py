@@ -17,6 +17,7 @@ if str(KERNEL_ROOT) not in sys.path:
 
 from native_vnni_dispatch.common_observation_migration import (  # noqa: E402
     ALLOWED_ADDED_COLUMNS,
+    finalize_common_observation_migration,
     validate_common_observation_migration,
 )
 
@@ -109,34 +110,88 @@ class NativeVNNICommonObservationMigrationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unreviewed column set"):
                 validate_common_observation_migration(retained, replayed)
 
-    def test_nonidentical_already_current_replay_fails_closed(self) -> None:
-        """Only the wrapper's preceding byte-identity check may skip migration."""
+    def test_current_schema_corpus_identity_rebind_preserves_evidence(self) -> None:
+        """A regenerated source identity is safe after exact row comparison."""
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             retained = root / "retained.csv"
             replayed = root / "replayed.csv"
             fields = (
+                "corpus_id",
                 "learner_version",
                 "candidate_id",
                 *ALLOWED_ADDED_COLUMNS,
             )
             retained_row = {
+                "corpus_id": "sha256:retained",
                 "learner_version": "v26",
                 "candidate_id": "candidate-a",
                 "launch_k_tiles": "4",
                 "launch_n_block_chunks": "2",
                 "adaptive_timing_evidence": "False",
             }
-            replayed_row = {**retained_row, "candidate_id": "candidate-b"}
+            replayed_row = {**retained_row, "corpus_id": "sha256:replayed"}
             self.write_csv(retained, fields, [retained_row])
             self.write_csv(replayed, fields, [replayed_row])
 
-            with self.assertRaisesRegex(ValueError, "unreviewed column set"):
+            report = validate_common_observation_migration(
+                retained,
+                replayed,
+                allow_current_schema_rebind=True,
+                require_transition=True,
+            )
+
+            self.assertEqual(report.row_count, 1)
+            self.assertEqual(report.retained_learner_version, "v26")
+            self.assertEqual(report.replayed_learner_version, "v26")
+
+            restored = finalize_common_observation_migration(
+                retained,
+                replayed,
+                report,
+            )
+            self.assertTrue(restored)
+            self.assertFalse(retained.exists())
+            with replayed.open(newline="", encoding="utf-8") as handle:
+                installed = next(csv.DictReader(handle))
+            self.assertEqual(installed["corpus_id"], "sha256:retained")
+
+    def test_nonidentical_already_current_replay_fails_closed(self) -> None:
+        """A current-schema rebind may not alter measured or routing fields."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            retained = root / "retained.csv"
+            replayed = root / "replayed.csv"
+            fields = (
+                "corpus_id",
+                "learner_version",
+                "candidate_id",
+                *ALLOWED_ADDED_COLUMNS,
+            )
+            retained_row = {
+                "corpus_id": "sha256:retained",
+                "learner_version": "v26",
+                "candidate_id": "candidate-a",
+                "launch_k_tiles": "4",
+                "launch_n_block_chunks": "2",
+                "adaptive_timing_evidence": "False",
+            }
+            replayed_row = {
+                **retained_row,
+                "corpus_id": "sha256:replayed",
+                "candidate_id": "candidate-b",
+            }
+            self.write_csv(retained, fields, [retained_row])
+            self.write_csv(replayed, fields, [replayed_row])
+
+            with self.assertRaisesRegex(ValueError, "changed measured evidence"):
                 validate_common_observation_migration(
                     retained,
                     replayed,
-                    require_learner_transition=True,
+                    allow_current_schema_rebind=True,
+                    require_transition=True,
                 )
 
 

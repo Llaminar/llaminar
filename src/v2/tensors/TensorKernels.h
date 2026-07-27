@@ -46,7 +46,25 @@ namespace llaminar2
         int k = 0;
         uint32_t blocks_per_row = 0;
         uint8_t codebook_id = 0;
-        uint8_t reserved[3] = {0, 0, 0};
+        /**
+         * @brief Payload bytes available per quantization block in this allocation.
+         *
+         * Ordinary immutable weight descriptors leave this field at zero because
+         * their allocation exactly matches @ref codebook_id. Reusable transfer
+         * slots set it explicitly so a slot can retain stable pointers while its
+         * active codebook metadata is retargeted for each arriving expert.
+         */
+        uint8_t allocation_payload_bytes_per_block = 0;
+
+        /**
+         * @brief Whether this allocation owns a per-block minimums array.
+         */
+        uint8_t allocation_has_mins = 0;
+
+        /**
+         * @brief Whether this allocation owns a per-block extended-minimums array.
+         */
+        uint8_t allocation_has_emins = 0;
 
         bool valid() const
         {
@@ -621,7 +639,7 @@ namespace llaminar2
          *
          * **Device Handling**:
          * - Input tensor: ensureOnDevice() called if needed
-         * - Output tensors: ensureOnDevice() called, transitionTo(DEVICE_AUTHORITATIVE) after write
+         * - Output tensors: allocated on device, then published through TransferEngine after write
          * - Weight tensors: managed by the kernel (already packed/uploaded)
          *
          * **For CPU execution**: Falls back to host pointers transparently
@@ -1392,6 +1410,21 @@ namespace llaminar2
          * clone, detach, or materialize lazy state just to answer this query.
          */
         virtual size_t packedWeightBytes() const { return 0; }
+
+        /**
+         * @brief Report whether the source weight tensor may release its bytes.
+         *
+         * Returning true is a strong lifetime guarantee: every subsequent
+         * execution must use engine-owned or independently retained prepared
+         * storage and must never dereference the TensorBase supplied during
+         * construction. The conservative default is false.
+         *
+         * Graph builders and weight services use this capability before
+         * retiring large raw MoE slabs. It prevents floating-point GEMM engines,
+         * which intentionally retain a tensor view, from being mistaken for
+         * self-contained packed NativeVNNI engines.
+         */
+        virtual bool canReleaseSourceWeightTensor() const { return false; }
 
         // =============================================================================
         // Weight Dimension Accessors (for Tensor Parallelism)

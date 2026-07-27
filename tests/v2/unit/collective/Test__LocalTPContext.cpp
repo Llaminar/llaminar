@@ -211,7 +211,7 @@ TEST_F(Test__LocalTPContext, GpuGraphPolicyAllowsNCCLCapturedCollectivesByDefaul
     EXPECT_EQ(reason, "nccl_captured_collectives_enabled");
 }
 
-TEST_F(Test__LocalTPContext, GpuGraphPolicyAllowsExplicitRCCLSegmentedCollectivesWhenCaptureDisabled)
+TEST_F(Test__LocalTPContext, GpuGraphPolicyRejectsSegmentedOverrideForHomogeneousRCCL)
 {
     ScopedEnvVar graphs("LLAMINAR_GPU_GRAPHS", "1");
     ScopedEnvVar capture_collectives("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "0");
@@ -222,8 +222,8 @@ TEST_F(Test__LocalTPContext, GpuGraphPolicyAllowsExplicitRCCLSegmentedCollective
         CollectiveBackendType::RCCL,
         &reason);
 
-    EXPECT_TRUE(supported);
-    EXPECT_EQ(reason, "rccl_segmented_collectives_enabled");
+    EXPECT_FALSE(supported);
+    EXPECT_EQ(reason, "homogeneous_collectives_require_full_graph_capture");
 }
 
 TEST_F(Test__LocalTPContext, GpuGraphPolicyRejectsLocalTPWhenNoCollectiveGraphPathIsEnabled)
@@ -238,7 +238,7 @@ TEST_F(Test__LocalTPContext, GpuGraphPolicyRejectsLocalTPWhenNoCollectiveGraphPa
         &reason);
 
     EXPECT_FALSE(supported);
-    EXPECT_EQ(reason, "gpu_graphs_without_collective_capture_or_segmented_replay");
+    EXPECT_EQ(reason, "homogeneous_collectives_require_full_graph_capture");
 }
 
 TEST_F(Test__LocalTPContext, AllreduceOnStreamRejectsNullStream)
@@ -450,6 +450,23 @@ TEST_F(Test__LocalTPContext, FP16TransportFailuresFailBeforeFP32GroupedAllreduce
 
     const size_t fp32_path = source.find("Standard FP32 allreduce path");
     ASSERT_NE(fp32_path, std::string::npos);
+    const size_t scratch_requirement =
+        source.find("requireReservedFp16Scratch(", source.find("bool LocalTPContext::allreduceOnStream("));
+    ASSERT_NE(scratch_requirement, std::string::npos);
+    ASSERT_LT(scratch_requirement, fp32_path);
+
+    const size_t requirement_impl =
+        source.find("void *LocalTPContext::requireReservedFp16Scratch(");
+    const size_t reservation_impl =
+        source.find("bool LocalTPContext::reserveCollectiveResources(", requirement_impl);
+    ASSERT_NE(requirement_impl, std::string::npos);
+    ASSERT_NE(reservation_impl, std::string::npos);
+    const std::string requirement_body =
+        source.substr(requirement_impl, reservation_impl - requirement_impl);
+    EXPECT_NE(requirement_body.find("requestAbort();"), std::string::npos);
+    EXPECT_NE(requirement_body.find("throw std::runtime_error"), std::string::npos);
+    EXPECT_NE(requirement_body.find("allocation-free"), std::string::npos);
+    EXPECT_EQ(requirement_body.find("->allocate("), std::string::npos);
 
     auto expectHardFailBeforeFP32Path = [&](const char *marker)
     {
@@ -464,7 +481,6 @@ TEST_F(Test__LocalTPContext, FP16TransportFailuresFailBeforeFP32GroupedAllreduce
         EXPECT_EQ(block.find("falling back"), std::string::npos) << marker;
     };
 
-    expectHardFailBeforeFP32Path("FP16 scratch alloc failed");
     expectHardFailBeforeFP32Path("FP32->FP16 cast failed");
     expectHardFailBeforeFP32Path("FP16 allreduce failed");
     expectHardFailBeforeFP32Path("FP16->FP32 cast-back failed");

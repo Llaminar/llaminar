@@ -14,6 +14,7 @@
 #pragma once
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/BackendManager.h"
@@ -200,8 +201,7 @@ namespace
                 return false;
 
             ++execute_count_;
-            output_->transitionToWithEvent(
-                TensorCoherenceState::DEVICE_AUTHORITATIVE, device(), gpuStream());
+            TransferEngine::publishDeviceWrite(output_, device(), gpuStream());
             return true;
         }
 
@@ -223,8 +223,7 @@ namespace
             ++replay_callback_count_;
             if (output_)
             {
-                output_->transitionToWithEvent(
-                    TensorCoherenceState::DEVICE_AUTHORITATIVE, device(), gpuStream());
+                TransferEngine::publishDeviceWrite(output_, device(), gpuStream());
             }
         }
 
@@ -326,6 +325,198 @@ namespace
         PrefillGraphCacheTestHost(DeviceId device, IDeviceContext *ctx)
             : device_(device), ctx_(ctx)
         {
+        }
+
+        ~PrefillGraphCacheTestHost() override
+        {
+            if (!resident_length_backend_)
+                return;
+
+            /*
+             * Integration teardown is an explicit host ownership boundary. The
+             * test has already materialized its final graph output, but drain
+             * once before releasing the admission event and storage so a failed
+             * assertion cannot let asynchronous GPU work outlive this fixture.
+             */
+            if (ctx_)
+                (void)ctx_->synchronize();
+            const int ordinal = device_.toKernelDeviceIndex();
+            if (resident_length_event_)
+                resident_length_backend_->destroyEvent(
+                    resident_length_event_,
+                    ordinal);
+            if (resident_length_device_)
+                resident_length_backend_->free(
+                    resident_length_device_,
+                    ordinal);
+            if (resident_length_host_)
+                resident_length_backend_->freePinned(
+                    resident_length_host_,
+                    ordinal);
+            if (resident_position_ids_device_)
+                resident_length_backend_->free(
+                    resident_position_ids_device_,
+                    ordinal);
+            if (resident_position_ids_host_)
+                resident_length_backend_->freePinned(
+                    resident_position_ids_host_,
+                    ordinal);
+        }
+
+        /**
+         * @brief Admit one real request length into persistent device storage.
+         *
+         * This is the small integration equivalent of
+         * DeviceGraphOrchestrator::admitRequestInputsOnDevice(). The allocation
+         * and readiness event are persistent; each invocation changes only the
+         * pinned source scalar and enqueues one H2D admission copy. The forward
+         * prelude consumes the event with a GPU-side wait, so no host stream or
+         * device synchronization enters the execution path.
+         */
+        bool admitResidentRequestLength(int real_seq_len)
+        {
+            return admitResidentRequestMetadata(
+                real_seq_len,
+                /*position_ids=*/nullptr,
+                /*position_row_count=*/0);
+        }
+
+        /**
+         * @brief Admit real-row count and absolute positions as one GPU transaction.
+         *
+         * The pinned source storage, device destination storage, producer
+         * stream, and publication event all persist for the fixture lifetime.
+         * Replays therefore mutate only buffer contents while every captured
+         * kernel retains the same device address. The event is recorded after
+         * both H2D copies, making one stream wait sufficient to order every
+         * request-metadata consumer.
+         *
+         * @param real_seq_len Number of non-padding rows in the request.
+         * @param position_ids Flattened absolute position rows, or null when
+         *        this invocation only needs resident length metadata.
+         * @param position_row_count Physical number of position rows.
+         * @return true after the complete metadata transaction is enqueued.
+         */
+        bool admitResidentRequestMetadata(
+            int real_seq_len,
+            const int *position_ids,
+            int position_row_count)
+        {
+            if (real_seq_len <= 0 || !device_.is_gpu())
+                return false;
+            if ((position_ids == nullptr) != (position_row_count == 0) ||
+                position_row_count < 0)
+            {
+                return false;
+            }
+
+            if (!resident_length_backend_)
+            {
+                resident_length_backend_ = getBackendFor(device_);
+                if (!resident_length_backend_)
+                    return false;
+
+                const int ordinal = device_.toKernelDeviceIndex();
+                resident_length_device_ =
+                    resident_length_backend_->allocate(
+                        sizeof(int32_t),
+                        ordinal);
+                resident_length_host_ =
+                    static_cast<int32_t *>(
+                        resident_length_backend_->allocatePinned(
+                            sizeof(int32_t),
+                            ordinal));
+                resident_length_event_ =
+                    resident_length_backend_->createEvent(ordinal);
+                IWorkerGPUContext *gpu_ctx = getWorkerGPUContext(device_);
+                if (gpu_ctx)
+                {
+                    /*
+                     * The worker creates its default stream during asynchronous
+                     * context initialization. Reading defaultStream() directly
+                     * from the test thread races that publication and can
+                     * observe a transient null handle. Resolve the stream on
+                     * the owning worker after initialization has completed;
+                     * subsequent admission copies may enqueue against the
+                     * stable CUDA/HIP stream handle from any host thread.
+                     */
+                    gpu_ctx->submitAndWait([&]()
+                    {
+                        resident_length_producer_stream_ =
+                            gpu_ctx->defaultStream();
+                    });
+                }
+                if (!resident_length_device_ ||
+                    !resident_length_host_ ||
+                    !resident_length_event_ ||
+                    !resident_length_producer_stream_)
+                {
+                    return false;
+                }
+            }
+
+            if (position_row_count > 0 &&
+                !ensureResidentPositionCapacity(position_row_count))
+            {
+                return false;
+            }
+
+            *resident_length_host_ = static_cast<int32_t>(real_seq_len);
+            const int ordinal = device_.toKernelDeviceIndex();
+            if (!resident_length_backend_->hostToDeviceOnStream(
+                    resident_length_device_,
+                    resident_length_host_,
+                    sizeof(int32_t),
+                    ordinal,
+                    resident_length_producer_stream_))
+            {
+                return false;
+            }
+
+            if (position_row_count > 0)
+            {
+                static_assert(
+                    sizeof(int) == sizeof(int32_t),
+                    "Resident position admission requires 32-bit host ints");
+                const size_t position_bytes =
+                    static_cast<size_t>(position_row_count) * sizeof(int32_t);
+                std::memcpy(
+                    resident_position_ids_host_,
+                    position_ids,
+                    position_bytes);
+                if (!resident_length_backend_->hostToDeviceOnStream(
+                        resident_position_ids_device_,
+                        resident_position_ids_host_,
+                        position_bytes,
+                        ordinal,
+                        resident_length_producer_stream_))
+                {
+                    return false;
+                }
+            }
+
+            if (!resident_length_backend_->recordEvent(
+                    resident_length_event_,
+                    ordinal,
+                    resident_length_producer_stream_))
+            {
+                return false;
+            }
+            resident_length_pending_ = true;
+            resident_position_ids_pending_ = position_row_count > 0;
+            return true;
+        }
+
+        /// @brief Return the stable device owner used by padded graph kernels.
+        const int32_t *residentRequestLengthDevice() const
+        {
+            return static_cast<const int32_t *>(resident_length_device_);
+        }
+
+        /// @brief Return the stable device owner for admitted absolute positions.
+        const int32_t *residentPositionIdsDevice() const
+        {
+            return static_cast<const int32_t *>(resident_position_ids_device_);
         }
 
         GraphBuildResult buildForwardGraph(const ForwardInput &input) override
@@ -443,6 +634,8 @@ namespace
                 kv_params.batch_size = 1;
                 kv_params.head_dim = kKVProbeHeadDim;
                 kv_params.device_id = device_;
+                kv_params.request_sequence_lengths_device =
+                    input.sequence_lengths_device;
 
                 auto kv_stage = std::make_unique<GPUKVCacheAppendProbeStage>(kv_params);
                 kv_append_stage_ = kv_stage.get();
@@ -465,6 +658,14 @@ namespace
                 row_params.d_model = kHiddenDim;
                 row_params.selected_row_idx = initial_real_seq_len - 1;
                 row_params.device_id = device_;
+                row_params.selection_policy =
+                    input.sequence_lengths_device
+                        ? HiddenStateRowSelectStage::SelectionPolicy::
+                              DeviceResidentRequestLength
+                        : HiddenStateRowSelectStage::SelectionPolicy::
+                              DynamicDeviceScalar;
+                row_params.request_sequence_length_device =
+                    input.sequence_lengths_device;
 
                 auto row_select_stage = std::make_unique<GPUHiddenStateRowSelectProbeStage>(row_params);
                 row_select_stage_ = row_select_stage.get();
@@ -564,17 +765,60 @@ namespace
             return true;
         }
 
-        void syncLogitsAtBoundary(IDeviceContext *ctx) override
+        bool publishLogitsAtBoundary(
+            TensorBase *logits,
+            IDeviceContext *ctx,
+            void *producer_stream) override
         {
             ++sync_logits_calls;
-            if (ctx)
-                ctx->synchronize();
+            if (!ctx || !ctx->isGPU() || !producer_stream ||
+                !logits || logits != output_tensor_)
+                return false;
+
+            /*
+             * Mirror the production device result boundary exactly. Tensor
+             * event records made while capture is active are graph nodes rather
+             * than replay-completion fences, so republish the graph-declared
+             * tensor after executable launch without forcing host visibility.
+             */
+            TransferEngine::publishDeviceWrite(logits, ctx->deviceId(), producer_stream);
+            return true;
         }
 
-        TensorBase *logitsTensor() override { return output_tensor_; }
+        bool prepareLiveStateForForwardGraphExecution(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device) override
+        {
+            if (!resident_length_pending_)
+                return true;
+            if (!resident_length_backend_ ||
+                !resident_length_event_ ||
+                !resident_length_producer_stream_ ||
+                !execution_stream ||
+                execution_device != device_ ||
+                input.sequence_lengths_device != residentRequestLengthDevice() ||
+                (resident_position_ids_pending_ &&
+                 input.position_ids_device != residentPositionIdsDevice()))
+            {
+                return false;
+            }
+
+            if (execution_stream != resident_length_producer_stream_ &&
+                !resident_length_backend_->streamWaitEvent(
+                    execution_stream,
+                    resident_length_event_,
+                    device_.toKernelDeviceIndex()))
+            {
+                return false;
+            }
+            resident_length_pending_ = false;
+            resident_position_ids_pending_ = false;
+            return true;
+        }
 
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
-            bool, IDeviceContext *, int) const override
+            bool, IDeviceContext *) const override
         {
             return {};
         }
@@ -721,6 +965,48 @@ namespace
         PrefillChunkMaintenanceDecision last_maintenance_decision{};
 
     private:
+        /**
+         * @brief Materialize stable pinned/device position storage before launch.
+         *
+         * Capacity may grow only between fixture invocations, before admission
+         * is published. It never changes while an executable is capturing or
+         * replaying. Production obtains the same stronger property from
+         * BufferArena's request-input allocation.
+         */
+        bool ensureResidentPositionCapacity(int required_rows)
+        {
+            if (required_rows <= resident_position_ids_capacity_)
+                return resident_position_ids_device_ && resident_position_ids_host_;
+            if (!resident_length_backend_ || resident_length_pending_)
+                return false;
+
+            const int ordinal = device_.toKernelDeviceIndex();
+            if (resident_position_ids_device_)
+                resident_length_backend_->free(
+                    resident_position_ids_device_,
+                    ordinal);
+            if (resident_position_ids_host_)
+                resident_length_backend_->freePinned(
+                    resident_position_ids_host_,
+                    ordinal);
+            resident_position_ids_device_ = nullptr;
+            resident_position_ids_host_ = nullptr;
+            resident_position_ids_capacity_ = 0;
+
+            const size_t bytes =
+                static_cast<size_t>(required_rows) * sizeof(int32_t);
+            resident_position_ids_device_ =
+                resident_length_backend_->allocate(bytes, ordinal);
+            resident_position_ids_host_ =
+                static_cast<int32_t *>(
+                    resident_length_backend_->allocatePinned(bytes, ordinal));
+            if (!resident_position_ids_device_ || !resident_position_ids_host_)
+                return false;
+
+            resident_position_ids_capacity_ = required_rows;
+            return true;
+        }
+
         DeviceId device_;
         IDeviceContext *ctx_ = nullptr;
         bool use_row_select_probe_ = false; ///< Whether to append HiddenStateRowSelectStage after residual add.
@@ -739,12 +1025,23 @@ namespace
         HiddenStateRowSelectStage *row_select_stage_ = nullptr;
         KVCacheAppendStage *kv_append_stage_ = nullptr;
         RoPEStage *rope_stage_ = nullptr;
+        IBackend *resident_length_backend_ = nullptr; ///< Borrowed backend for request admission.
+        int32_t *resident_length_host_ = nullptr; ///< Persistent pinned scalar copied at admission.
+        void *resident_length_device_ = nullptr; ///< Persistent device INT32 real-row owner.
+        void *resident_length_event_ = nullptr; ///< Exact admission-completion event.
+        void *resident_length_producer_stream_ = nullptr; ///< Stream that publishes admission.
+        bool resident_length_pending_ = false; ///< True until the graph stream consumes the event.
+        int32_t *resident_position_ids_host_ = nullptr; ///< Persistent pinned absolute positions.
+        void *resident_position_ids_device_ = nullptr; ///< Stable device absolute-position rows.
+        int resident_position_ids_capacity_ = 0; ///< Allocated flattened position-row capacity.
+        bool resident_position_ids_pending_ = false; ///< Whether the current event publishes positions.
     };
 
     ForwardGraphSignature bucketedPrefillSignature(
         DeviceId device,
         int seq_len,
-        uint64_t moe_placement_epoch = 0)
+        uint64_t moe_placement_epoch = 0,
+        bool uses_device_sequence_lengths = false)
     {
         ForwardGraphSignature signature;
         signature.seq_len = seq_len;
@@ -759,6 +1056,8 @@ namespace
         signature.pp_has_lm_head = false;
         signature.is_bucketed_prefill = true;
         signature.bucket_seq_len = seq_len;
+        signature.uses_device_sequence_lengths =
+            uses_device_sequence_lengths;
         signature.moe_placement_epoch = moe_placement_epoch;
         return signature;
     }
@@ -905,6 +1204,79 @@ namespace
             device_ctx_.reset();
         }
 
+        /**
+         * @brief Execute one planned prefill chunk through resident length metadata.
+         */
+        bool runResidentPrefillChunk(
+            const ForwardInput &input,
+            const ForwardExecutionEngine::PrefillChunkRuntimePlan &plan,
+            ForwardOutput &output)
+        {
+            if (!host_->admitResidentRequestLength(plan.chunk.real_count))
+                return false;
+            ForwardInput resident_input = input;
+            resident_input.sequence_lengths_device =
+                host_->residentRequestLengthDevice();
+            return engine_->runPrefillChunk(
+                resident_input,
+                plan,
+                output,
+                *host_);
+        }
+
+        /**
+         * @brief Execute a prefill chunk with all mutable GPU metadata resident.
+         *
+         * This is the production-equivalent path used by graph replay
+         * regressions whose result depends on absolute positions. The host
+         * vectors are admission sources only; RoPE receives the persistent
+         * device pointer and the graph stream consumes one publication event.
+         */
+        bool runFullyResidentPrefillChunk(
+            const ForwardInput &input,
+            const ForwardExecutionEngine::PrefillChunkRuntimePlan &plan,
+            ForwardOutput &output)
+        {
+            const auto &positions = plan.chunk.position_ids;
+            if (!host_->admitResidentRequestMetadata(
+                    plan.chunk.real_count,
+                    positions.data(),
+                    static_cast<int>(positions.size())))
+            {
+                return false;
+            }
+            ForwardInput resident_input = input;
+            resident_input.position_ids_device =
+                host_->residentPositionIdsDevice();
+            resident_input.sequence_lengths_device =
+                host_->residentRequestLengthDevice();
+            return engine_->runPrefillChunk(
+                resident_input,
+                plan,
+                output,
+                *host_);
+        }
+
+        /**
+         * @brief Execute one raw server-style prefill through resident metadata.
+         */
+        bool executeResidentPrefill(
+            const ForwardInput &input,
+            ForwardOutput &output)
+        {
+            const int real_seq_len =
+                input.real_seq_len > 0 ? input.real_seq_len : input.seq_len;
+            if (!host_->admitResidentRequestLength(real_seq_len))
+                return false;
+            ForwardInput resident_input = input;
+            resident_input.sequence_lengths_device =
+                host_->residentRequestLengthDevice();
+            return engine_->execute(
+                resident_input,
+                output,
+                *host_);
+        }
+
         DeviceId device_ = DeviceId::cpu();
         std::unique_ptr<IDeviceContext> device_ctx_;
         std::unique_ptr<DeviceGraphExecutor> executor_;
@@ -942,7 +1314,10 @@ namespace
         ASSERT_EQ(plan.chunk.bucket_seq_len, kExactBucketSeqLen);
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
+        const auto signature = bucketedPrefillSignature(
+            device_,
+            kExactBucketSeqLen,
+            host_->placement_epoch);
         const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
 
         ASSERT_TRUE(engine_->runPrefillChunk(base_input, plan, output, *host_));
@@ -1024,7 +1399,10 @@ namespace
         ASSERT_TRUE(plan) << plan.error;
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
+        const auto signature = bucketedPrefillSignature(
+            device_,
+            kExactBucketSeqLen,
+            host_->placement_epoch);
         const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
 
         ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
@@ -1091,7 +1469,10 @@ namespace
         ASSERT_TRUE(plan) << plan.error;
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
+        const auto signature = bucketedPrefillSignature(
+            device_,
+            kExactBucketSeqLen,
+            host_->placement_epoch);
         const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
 
         ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
@@ -1428,7 +1809,11 @@ namespace
         ASSERT_EQ(plan63.chunk.bucket_seq_len, kExactBucketSeqLen);
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
+        const auto signature = bucketedPrefillSignature(
+            device_,
+            kExactBucketSeqLen,
+            host_->placement_epoch,
+            /*uses_device_sequence_lengths=*/true);
         const auto key = prefillGraphKey(
             device_,
             kExactBucketSeqLen,
@@ -1437,7 +1822,7 @@ namespace
             host_->placement_epoch,
             host_->topology_signature);
 
-        ASSERT_TRUE(engine_->runPrefillChunk(input61, plan61, output, *host_));
+        ASSERT_TRUE(runResidentPrefillChunk(input61, plan61, output));
         EXPECT_EQ(host_->build_calls, 1);
         EXPECT_EQ(host_->last_build_seq_len, kExactBucketSeqLen);
         EXPECT_EQ(host_->last_build_real_seq_len, kExactBucketSeqLen - 3);
@@ -1445,7 +1830,13 @@ namespace
         EXPECT_EQ(host_->last_workspace_seq_len, kExactBucketSeqLen);
         ASSERT_NE(host_->rowSelectStage(), nullptr);
         ASSERT_NE(host_->kvAppendStage(), nullptr);
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
+        EXPECT_EQ(
+            host_->rowSelectStage()->selectionPolicyForTesting(),
+            HiddenStateRowSelectStage::SelectionPolicy::
+                DeviceResidentRequestLength);
+        EXPECT_EQ(
+            host_->rowSelectStage()->requestSequenceLengthDeviceForTesting(),
+            host_->residentRequestLengthDevice());
         EXPECT_EQ(host_->kvCachedTokensForTesting(), kExactBucketSeqLen - 3)
             << "First padded cache miss must append only real prompt tokens.";
         EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
@@ -1472,9 +1863,8 @@ namespace
         EXPECT_EQ(after_build->capture_phase, "warmup");
         EXPECT_EQ(after_build->recapture_reason, "none");
 
-        ASSERT_TRUE(engine_->runPrefillChunk(input63, plan63, output, *host_));
+        ASSERT_TRUE(runResidentPrefillChunk(input63, plan63, output));
         EXPECT_EQ(host_->build_calls, 1);
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 2);
         EXPECT_EQ(host_->kvCachedTokensForTesting(), (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1))
             << "Capture launch callback must advance KV metadata by real tokens only.";
         EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
@@ -1495,12 +1885,8 @@ namespace
         EXPECT_EQ(after_capture->capture_phase, "capture");
         EXPECT_EQ(after_capture->recapture_reason, "armed_warmup");
 
-        ASSERT_TRUE(engine_->runPrefillChunk(input61, plan61, output, *host_));
+        ASSERT_TRUE(runResidentPrefillChunk(input61, plan61, output));
         EXPECT_EQ(host_->build_calls, 1);
-        // The monolithic cache test proves the engine delivers updated real-length
-        // metadata before Ready replay. The dedicated row-select graph tests verify
-        // the backend-level selected-row device output for no-recapture replays.
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
         EXPECT_EQ(host_->kvCachedTokensForTesting(),
                   (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1) + (kExactBucketSeqLen - 3))
             << "Ready replay must advance KV metadata by the latest real length, not the bucket length.";
@@ -1526,7 +1912,7 @@ namespace
         EXPECT_EQ(after_replay->capture_phase, "replay");
         EXPECT_EQ(after_replay->recapture_reason, "none");
 
-        ASSERT_TRUE(engine_->runPrefillChunk(input63, plan63, output, *host_));
+        ASSERT_TRUE(runResidentPrefillChunk(input63, plan63, output));
         EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
             << "Second Ready replay must keep GPU KV count mirror aligned.";
         auto after_second_replay = engine_->prefillGraphCacheSnapshot(signature, key);
@@ -1605,24 +1991,30 @@ namespace
         ASSERT_TRUE(plan63.padding_required);
 
         ForwardOutput output;
-        ASSERT_TRUE(engine_->runPrefillChunk(input61, plan61, output, *host_));
+        ASSERT_TRUE(runFullyResidentPrefillChunk(input61, plan61, output));
         ASSERT_NE(host_->ropeStage(), nullptr);
         const auto output_pos128_warmup = captureProbeOutputPrefix(*host_, 512);
         ASSERT_FALSE(output_pos128_warmup.empty());
 
-        ASSERT_TRUE(engine_->runPrefillChunk(input63, plan63, output, *host_));
+        ASSERT_TRUE(runFullyResidentPrefillChunk(input63, plan63, output));
         const auto output_pos512_capture = captureProbeOutputPrefix(*host_, 512);
         ASSERT_FALSE(output_pos512_capture.empty());
         EXPECT_GT(maxAbsDiff(output_pos128_warmup, output_pos512_capture), 1.0e-3)
             << "RoPE probe positions 128..191 and 512..575 must produce distinct output, "
                "otherwise this regression cannot prove metadata freshness.";
 
-        ASSERT_TRUE(engine_->runPrefillChunk(input61, plan61, output, *host_));
+        ASSERT_TRUE(runFullyResidentPrefillChunk(input61, plan61, output));
         const auto output_pos128_replay = captureProbeOutputPrefix(*host_, 512);
         ASSERT_FALSE(output_pos128_replay.empty());
-        EXPECT_LT(maxAbsDiff(output_pos128_warmup, output_pos128_replay), 1.0e-5)
+        const double warmup_replay_diff =
+            maxAbsDiff(output_pos128_warmup, output_pos128_replay);
+        const double capture_replay_diff =
+            maxAbsDiff(output_pos512_capture, output_pos128_replay);
+        EXPECT_LT(warmup_replay_diff, 1.0e-5)
             << "Ready replay must refresh RoPE's workspace position rows back to the current "
-               "chunk instead of reusing the rows captured for the previous real length.";
+               "chunk instead of reusing the rows captured for the previous real length. "
+            << "warmup_replay_diff=" << warmup_replay_diff
+            << " capture_replay_diff=" << capture_replay_diff;
     }
 
     TEST_F(PrefillGraphCacheExecutionTest, ServerStyleRawExecuteReusesPaddedBucketAcrossRealLengths)
@@ -1662,17 +2054,27 @@ namespace
         input63.device = device_;
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen);
+        const auto signature = bucketedPrefillSignature(
+            device_,
+            kExactBucketSeqLen,
+            /*moe_placement_epoch=*/0,
+            /*uses_device_sequence_lengths=*/true);
         const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
 
-        ASSERT_TRUE(engine_->execute(input61, output, *host_));
+        ASSERT_TRUE(executeResidentPrefill(input61, output));
         EXPECT_EQ(host_->build_calls, 1);
         EXPECT_EQ(host_->last_build_seq_len, kExactBucketSeqLen);
         EXPECT_EQ(host_->last_build_real_seq_len, kExactBucketSeqLen - 3);
         EXPECT_EQ(host_->last_build_bucket_seq_len, kExactBucketSeqLen);
         ASSERT_NE(host_->rowSelectStage(), nullptr);
         ASSERT_NE(host_->kvAppendStage(), nullptr);
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
+        EXPECT_EQ(
+            host_->rowSelectStage()->selectionPolicyForTesting(),
+            HiddenStateRowSelectStage::SelectionPolicy::
+                DeviceResidentRequestLength);
+        EXPECT_EQ(
+            host_->rowSelectStage()->requestSequenceLengthDeviceForTesting(),
+            host_->residentRequestLengthDevice());
         EXPECT_EQ(host_->kvCachedTokensForTesting(), kExactBucketSeqLen - 3)
             << "Raw execute cache miss must append only real prompt tokens.";
         EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
@@ -1687,10 +2089,9 @@ namespace
         EXPECT_EQ(after_build->warmup_count, 1u);
         EXPECT_EQ(after_build->capture_count, 0u);
 
-        ASSERT_TRUE(engine_->execute(input63, output, *host_));
+        ASSERT_TRUE(executeResidentPrefill(input63, output));
         EXPECT_EQ(host_->build_calls, 1)
             << "Server-style prompts in one bucket must reuse the cached forward graph.";
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 2);
         EXPECT_EQ(host_->kvCachedTokensForTesting(), (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1))
             << "Capture launch must append by the second request's real length, not the bucket length.";
         EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
@@ -1705,9 +2106,8 @@ namespace
         EXPECT_EQ(after_capture->replay_count, 1);
         EXPECT_GT(after_capture->node_count, 0u);
 
-        ASSERT_TRUE(engine_->execute(input61, output, *host_));
+        ASSERT_TRUE(executeResidentPrefill(input61, output));
         EXPECT_EQ(host_->build_calls, 1);
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
         EXPECT_EQ(host_->kvCachedTokensForTesting(),
                   (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1) + (kExactBucketSeqLen - 3))
             << "Ready replay must advance KV metadata by the latest real length, not the bucket length.";

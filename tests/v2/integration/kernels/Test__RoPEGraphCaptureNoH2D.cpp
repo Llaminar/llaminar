@@ -13,6 +13,7 @@
 #include "execution/compute_stages/stages/RoPEStage.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "kernels/rope/RoPEDeviceParams.h"
 #include "mocks/MockComputeStage.h"
 #include "tensors/Tensors.h"
 
@@ -117,6 +118,7 @@ namespace
 
 #if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
     using StreamT = cudaStream_t;
+    using EventT = cudaEvent_t;
     using GraphT = cudaGraph_t;
     using GraphExecT = cudaGraphExec_t;
 
@@ -135,6 +137,26 @@ namespace
     void createStream(StreamT *stream) { ASSERT_EQ(cudaStreamCreate(stream), cudaSuccess); }
     void destroyStream(StreamT stream) { ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess); }
     void synchronize(StreamT stream) { ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess); }
+    void createEvent(EventT *event) { ASSERT_EQ(cudaEventCreateWithFlags(event, cudaEventDisableTiming), cudaSuccess); }
+    void destroyEvent(EventT event) { ASSERT_EQ(cudaEventDestroy(event), cudaSuccess); }
+    void recordEvent(EventT event, StreamT stream) { ASSERT_EQ(cudaEventRecord(event, stream), cudaSuccess); }
+    void waitEvent(StreamT stream, EventT event) { ASSERT_EQ(cudaStreamWaitEvent(stream, event, 0), cudaSuccess); }
+    bool eventComplete(EventT event)
+    {
+        const cudaError_t result = cudaEventQuery(event);
+        EXPECT_TRUE(result == cudaSuccess || result == cudaErrorNotReady);
+        return result == cudaSuccess;
+    }
+    void allocateDevice(void **ptr, size_t bytes) { ASSERT_EQ(cudaMalloc(ptr, bytes), cudaSuccess); }
+    void freeDevice(void *ptr) { ASSERT_EQ(cudaFree(ptr), cudaSuccess); }
+    void fillDevice(void *ptr, size_t bytes, StreamT stream)
+    {
+        ASSERT_EQ(cudaMemsetAsync(ptr, 0x5a, bytes, stream), cudaSuccess);
+    }
+    void copyDevice(void *dst, const void *src, size_t bytes, StreamT stream)
+    {
+        ASSERT_EQ(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream), cudaSuccess);
+    }
     void upload(void *dst, const void *src, size_t bytes, StreamT stream)
     {
         ASSERT_EQ(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream), cudaSuccess);
@@ -151,6 +173,7 @@ namespace
     void destroyGraph(GraphT graph) { ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess); }
 #else
     using StreamT = hipStream_t;
+    using EventT = hipEvent_t;
     using GraphT = hipGraph_t;
     using GraphExecT = hipGraphExec_t;
 
@@ -169,6 +192,26 @@ namespace
     void createStream(StreamT *stream) { ASSERT_EQ(hipStreamCreate(stream), hipSuccess); }
     void destroyStream(StreamT stream) { ASSERT_EQ(hipStreamDestroy(stream), hipSuccess); }
     void synchronize(StreamT stream) { ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess); }
+    void createEvent(EventT *event) { ASSERT_EQ(hipEventCreateWithFlags(event, hipEventDisableTiming), hipSuccess); }
+    void destroyEvent(EventT event) { ASSERT_EQ(hipEventDestroy(event), hipSuccess); }
+    void recordEvent(EventT event, StreamT stream) { ASSERT_EQ(hipEventRecord(event, stream), hipSuccess); }
+    void waitEvent(StreamT stream, EventT event) { ASSERT_EQ(hipStreamWaitEvent(stream, event, 0), hipSuccess); }
+    bool eventComplete(EventT event)
+    {
+        const hipError_t result = hipEventQuery(event);
+        EXPECT_TRUE(result == hipSuccess || result == hipErrorNotReady);
+        return result == hipSuccess;
+    }
+    void allocateDevice(void **ptr, size_t bytes) { ASSERT_EQ(hipMalloc(ptr, bytes), hipSuccess); }
+    void freeDevice(void *ptr) { ASSERT_EQ(hipFree(ptr), hipSuccess); }
+    void fillDevice(void *ptr, size_t bytes, StreamT stream)
+    {
+        ASSERT_EQ(hipMemsetAsync(ptr, 0x5a, bytes, stream), hipSuccess);
+    }
+    void copyDevice(void *dst, const void *src, size_t bytes, StreamT stream)
+    {
+        ASSERT_EQ(hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, stream), hipSuccess);
+    }
     void upload(void *dst, const void *src, size_t bytes, StreamT stream)
     {
         ASSERT_EQ(hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice, stream), hipSuccess);
@@ -259,6 +302,83 @@ namespace
 #endif
 }
 
+TEST(Test__RoPEGraphCaptureNoH2D, BackToBackScalarPublicationsPreserveEachQueuedValue)
+{
+#if !defined(GPU_CONTEXT_TEST_BACKEND_CUDA) && !defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+    GTEST_SKIP() << "No GPU graph-capture backend selected";
+#else
+    if (!hasDevice())
+        GTEST_SKIP() << "No " << backendName() << " device available";
+    setDevice();
+
+    const auto q_input = makeValues(kSeqLen, kQHeads * kHeadDim, 0.25f);
+    const auto k_input = makeValues(kSeqLen, kKVHeads * kHeadDim, -0.125f);
+    constexpr int first_pos_offset = 7;
+    constexpr int second_pos_offset = 19;
+
+    StreamT graph_stream{};
+    StreamT blocker_stream{};
+    EventT release_event{};
+    createStream(&graph_stream);
+    createStream(&blocker_stream);
+    createEvent(&release_event);
+
+    auto bundle = makeGpuStage(q_input, k_input, graph_stream);
+    auto *device_params = bundle.workspace->getBuffer(RoPEWorkspaceBuffers::DEVICE_PARAMS);
+    ASSERT_NE(device_params, nullptr);
+
+    void *first_snapshot = nullptr;
+    void *second_snapshot = nullptr;
+    void *blocker_buffer = nullptr;
+    allocateDevice(&first_snapshot, sizeof(rope::RoPEDeviceParams));
+    allocateDevice(&second_snapshot, sizeof(rope::RoPEDeviceParams));
+    constexpr size_t blocker_bytes = 128ULL * 1024ULL * 1024ULL;
+    constexpr int blocker_passes = 2048;
+    allocateDevice(&blocker_buffer, blocker_bytes);
+
+    /*
+     * Hold the graph stream behind a finite device workload before either
+     * publication can execute. Both publications are therefore completely
+     * queued before device work starts.
+     *
+     * A mutable pinned H2D source collapses both queued copies to the second
+     * value; launch-by-value device publication preserves the two values.
+     */
+    for (int pass = 0; pass < blocker_passes; ++pass)
+    {
+        fillDevice(blocker_buffer, blocker_bytes, blocker_stream);
+    }
+    recordEvent(release_event, blocker_stream);
+    ASSERT_FALSE(eventComplete(release_event))
+        << "The publication gate completed before both updates could be queued";
+    waitEvent(graph_stream, release_event);
+
+    bundle.stage->updateDynamicParams(first_pos_offset, kSeqLen);
+    ASSERT_TRUE(bundle.stage->prepareGraphLaunch(bundle.ctx.get(), graph_stream));
+    copyDevice(first_snapshot, device_params, sizeof(rope::RoPEDeviceParams), graph_stream);
+
+    bundle.stage->updateDynamicParams(second_pos_offset, kSeqLen);
+    ASSERT_TRUE(bundle.stage->prepareGraphLaunch(bundle.ctx.get(), graph_stream));
+    copyDevice(second_snapshot, device_params, sizeof(rope::RoPEDeviceParams), graph_stream);
+
+    rope::RoPEDeviceParams first_result{};
+    rope::RoPEDeviceParams second_result{};
+    download(&first_result, first_snapshot, sizeof(first_result), graph_stream);
+    download(&second_result, second_snapshot, sizeof(second_result), graph_stream);
+    synchronize(graph_stream);
+
+    EXPECT_EQ(first_result.pos_offset, first_pos_offset);
+    EXPECT_EQ(second_result.pos_offset, second_pos_offset);
+
+    freeDevice(blocker_buffer);
+    freeDevice(second_snapshot);
+    freeDevice(first_snapshot);
+    destroyEvent(release_event);
+    destroyStream(blocker_stream);
+    destroyStream(graph_stream);
+#endif
+}
+
 TEST(Test__RoPEGraphCaptureNoH2D, ContiguousPositionsReplayWithUpdatedDeviceScalar)
 {
 #if !defined(GPU_CONTEXT_TEST_BACKEND_CUDA) && !defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
@@ -278,6 +398,7 @@ TEST(Test__RoPEGraphCaptureNoH2D, ContiguousPositionsReplayWithUpdatedDeviceScal
 
     auto bundle = makeGpuStage(q_input, k_input, stream);
     bundle.stage->updateDynamicParams(first_pos_offset, kSeqLen);
+    ASSERT_TRUE(bundle.stage->prepareGraphLaunch(bundle.ctx.get(), stream));
 
     // Warmup initializes invariant device tables outside graph capture.
     ASSERT_TRUE(bundle.stage->execute(bundle.ctx.get()));
@@ -296,6 +417,7 @@ TEST(Test__RoPEGraphCaptureNoH2D, ContiguousPositionsReplayWithUpdatedDeviceScal
     ASSERT_NE(graph, nullptr);
     instantiate(&graph_exec, graph);
 
+    ASSERT_TRUE(bundle.stage->prepareGraphLaunch(bundle.ctx.get(), stream));
     launch(graph_exec, stream);
     synchronize(stream);
     const auto first_ref = computeCpuReference(q_input, k_input, first_pos_offset);
@@ -305,6 +427,7 @@ TEST(Test__RoPEGraphCaptureNoH2D, ContiguousPositionsReplayWithUpdatedDeviceScal
     uploadTensor(*bundle.q, q_input, stream);
     uploadTensor(*bundle.k, k_input, stream);
     bundle.stage->updateDynamicParams(second_pos_offset, kSeqLen);
+    ASSERT_TRUE(bundle.stage->prepareGraphLaunch(bundle.ctx.get(), stream));
     launch(graph_exec, stream);
     synchronize(stream);
     const auto second_ref = computeCpuReference(q_input, k_input, second_pos_offset);

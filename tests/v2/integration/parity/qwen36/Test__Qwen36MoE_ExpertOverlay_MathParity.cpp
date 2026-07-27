@@ -29,6 +29,7 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <map>
@@ -102,78 +103,120 @@ namespace
         bool require_prompt_metadata_match = false;
     };
 
-    std::string qwen36MoELongNeedleParityPrompt()
+    /**
+     * @brief Require long-context parity to exercise its named rebalance path.
+     *
+     * Token parity alone cannot distinguish a healthy Dynamic/LLEP lane from a
+     * graph that never planned or applied expert movement. These assertions
+     * consume request-local PerfStats after the generic parity epilogue has
+     * published the final device status. They deliberately validate planner,
+     * transport/apply, and health counters independently so a future failure
+     * identifies the missing phase.
+     *
+     * @param config Concrete backend and MoE runtime policy under test.
+     * @param records Request-local maintenance records collected during the
+     *        prefill plus 32 committed decode steps.
+     */
+    void expectLongContextMoERebalancePerfPath(
+        const ExpertOverlayParityConfig &config,
+        const std::vector<PerfStatRecord> &records)
     {
-        auto deterministic_code = [](const std::string &ns, int index)
+        const std::string context =
+            config.name + " long-context rebalance";
+
+        expectPerfCounterPositive(
+            records,
+            "moe_rebalance",
+            "device_maintenance_graph_launches",
+            context);
+        expectPerfCounterPositive(
+            records,
+            "moe_rebalance",
+            "device_maintenance_graph_diagnostic_exports",
+            context);
+        expectPerfCounterPositive(
+            records,
+            "moe_rebalance",
+            "device_rebalance_controller_maintenance_launches",
+            context);
+        /*
+         * Planner status is intentionally per wave: the last maintenance tick
+         * may reject an uneconomical transfer after an earlier wave moved
+         * experts successfully. Controller/apply counters retain request-level
+         * evidence and therefore certify end-to-end movement without requiring
+         * the final wave itself to be non-empty.
+         */
+        expectPerfCounterPositive(
+            records,
+            "moe_rebalance",
+            "device_rebalance_controller_decode_apply_hits",
+            context);
+        expectPerfCounterPositive(
+            records,
+            "moe_rebalance",
+            "device_rebalance_wave_copied_arrivals_total",
+            context);
+        expectPerfCounterPositive(
+            records,
+            "moe_rebalance",
+            "device_rebalance_wave_applied_arrivals_total",
+            context);
+        expectPerfCounterPositive(
+            records,
+            "moe_rebalance",
+            "device_rebalance_wave_applied_layer_count_total",
+            context);
+
+        if (config.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
         {
-            static const std::array<const char *, 12> a = {
-                "amber", "basil", "cedar", "delta", "ember", "fable",
-                "garnet", "harbor", "iris", "juniper", "kelp", "laurel"};
-            static const std::array<const char *, 12> b = {
-                "atlas", "beacon", "cobalt", "dawn", "elm", "fjord",
-                "grove", "haven", "ion", "jasmine", "keystone", "lagoon"};
-            static const std::array<const char *, 8> c = {
-                "north", "south", "east", "west", "upper", "lower", "inner", "outer"};
-
-            int seed = 0;
-            for (char ch : ns)
-                seed += static_cast<unsigned char>(ch);
-
-            std::ostringstream oss;
-            oss << a[(index + seed) % a.size()] << ' '
-                << b[((index / static_cast<int>(a.size())) + seed) % b.size()] << ' '
-                << c[((index / static_cast<int>(a.size() * b.size())) + seed) % c.size()];
-            return oss.str();
-        };
-
-        constexpr int kRecordCount = 64;
-        const std::map<std::string, int> sentinel_positions = {
-            {"alpha", 3},
-            {"middle", kRecordCount / 2},
-            {"omega", kRecordCount - 4},
-        };
-        const std::map<std::string, std::string> sentinels = {
-            {"alpha", "LCJSON-ALPHA-314159"},
-            {"middle", "LCJSON-MIDDLE-271828"},
-            {"omega", "LCJSON-OMEGA-161803"},
-        };
-
-        std::ostringstream prompt;
-        prompt << "Task: read the ledger and return one minified JSON object.\n"
-               << "The only allowed keys are alpha, middle, and omega.\n"
-               << "Every allowed key must be present exactly once. Never use an empty key.\n"
-               << "The ledger contains many filler facts plus three named sentinel values.\n";
-
-        for (int index = 0; index < kRecordCount; ++index)
+            expectDynamicRebalancePlacementPositive(records, context);
+        }
+        else if (config.moe_rebalance.mode == MoERebalanceRuntimeMode::LLEP)
         {
-            bool inserted = false;
-            for (const auto &[key, position] : sentinel_positions)
-            {
-                if (index == position)
-                {
-                    prompt << "Ledger item " << std::setw(4) << std::setfill('0') << index
-                           << std::setfill(' ') << ": REQUIRED_JSON_FIELD " << key
-                           << " has exact value " << sentinels.at(key) << ".\n";
-                    inserted = true;
-                    break;
-                }
-            }
-
-            if (!inserted)
-            {
-                prompt << "Ledger item " << std::setw(4) << std::setfill('0') << index
-                       << std::setfill(' ') << ": filler code "
-                       << deterministic_code("LCJSON-FILL", index)
-                       << "; phase stable; checksum " << (7000 + index)
-                       << "; this is not one of the requested values.\n";
-            }
+            expectPerfCounterPositive(
+                records,
+                "moe_rebalance",
+                "device_rebalance_llep_assignment_span_count",
+                context);
+            expectPerfCounterPositive(
+                records,
+                "moe_rebalance",
+                "device_rebalance_llep_weight_transfer_count",
+                context);
+            expectPerfCounterPositive(
+                records,
+                "moe_rebalance",
+                "device_rebalance_planned_arrivals",
+                context);
+            expectPerfCounterPositive(
+                records,
+                "moe_rebalance",
+                "device_rebalance_copy_copied_arrivals",
+                context);
+            expectPerfCounterPositive(
+                records,
+                "moe_rebalance",
+                "device_rebalance_apply_applied_arrivals",
+                context);
         }
 
-        prompt << "Return exactly one minified JSON object and no prose.\n"
-               << "The object shape is {\"alpha\":\"VALUE_FROM_LEDGER\","
-               << "\"middle\":\"VALUE_FROM_LEDGER\",\"omega\":\"VALUE_FROM_LEDGER\"}.\n"
-               << "Use the exact REQUIRED_JSON_FIELD values from the ledger.";
-        return prompt.str();
+        for (const char *error_counter : {
+                 "device_rebalance_copy_missing_source_descriptors",
+                 "device_rebalance_apply_missing_source_descriptors",
+                 "device_rebalance_copy_missing_destination_slots",
+                 "device_rebalance_apply_missing_destination_slots",
+                 "device_rebalance_copy_descriptor_mismatches",
+                 "device_rebalance_apply_descriptor_mismatches",
+                 "device_rebalance_copy_invalid_plan_entries",
+                 "device_rebalance_apply_invalid_plan_entries",
+                 "device_rebalance_controller_last_error_code"})
+        {
+            expectPerfCounterZero(
+                records,
+                "moe_rebalance",
+                error_counter,
+                context);
+        }
     }
 
     ExpertOverlayParityConfig baseConfig(
@@ -186,7 +229,7 @@ namespace
         ExpertOverlayParityConfig config;
         config.name = name;
         config.devices = std::move(devices);
-        config.parallelism = Parallelism::None;
+        config.parallelism = Parallelism::LocalTP;
         config.collective = backend;
         config.thresholds = qwen36MoEOverlayThresholds();
         config.model_path = "/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf";
@@ -242,15 +285,26 @@ namespace
         config.max_seq_len = 4096;
         config.decode_snapshots_only = true;
         config.require_prompt_metadata_match = true;
-        if (config.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
+        const auto rebalance_mode = config.moe_rebalance.mode;
+        if (rebalance_mode != MoERebalanceRuntimeMode::Dynamic &&
+            rebalance_mode != MoERebalanceRuntimeMode::LLEP)
         {
-            config.moe_rebalance_exercise.enabled = true;
-            config.moe_rebalance_exercise.require_device_side_controller = true;
-            config.moe_rebalance_exercise.request_every_decode_steps = 4;
-            config.moe_rebalance_exercise.min_decode_steps = 8;
-            config.moe_rebalance_exercise.require_movement_epoch_advance = true;
-            config.moe_rebalance_exercise.min_movement_epoch_delta = 1;
+            throw std::invalid_argument(
+                "long-context expert-overlay parity requires Dynamic or LLEP rebalance mode");
         }
+
+        /*
+         * Both planners are maintained at the same committed decode boundary.
+         * Keeping this exercise mode-independent is important: a token-parity
+         * pass cannot prove that either planner launched, transferred payloads,
+         * or published its device-owned result.
+         */
+        config.moe_rebalance_exercise.enabled = true;
+        config.moe_rebalance_exercise.require_device_side_controller = true;
+        config.moe_rebalance_exercise.request_every_decode_steps = 4;
+        config.moe_rebalance_exercise.min_decode_steps = 8;
+        config.moe_rebalance_exercise.require_movement_epoch_advance = true;
+        config.moe_rebalance_exercise.min_movement_epoch_delta = 1;
         return config;
     }
 
@@ -568,6 +622,7 @@ namespace
 
     std::shared_ptr<ModelContext> getOrCreateOverlayModelContext(
         const ExpertOverlayParityConfig &config,
+        const std::shared_ptr<IMPIContext> &mpi_ctx,
         const std::function<void(const std::shared_ptr<ModelContext> &)> &configure)
     {
         auto &cache = overlayModelContextCache();
@@ -588,12 +643,35 @@ namespace
             llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
-        auto model_ctx = ModelContext::create(
-            config.model_path,
-            nullptr,
-            nullptr,
-            nullptr,
-            WeightDistributionStrategy::SHARDED);
+        const bool gpu_only = std::all_of(
+            config.devices.begin(),
+            config.devices.end(),
+            [](ParityDeviceType device)
+            {
+                return device == ParityDeviceType::CUDA ||
+                       device == ParityDeviceType::ROCm;
+            });
+        if (!gpu_only)
+        {
+            throw std::invalid_argument(
+                "expert-overlay parity model context requires GPU-only participants");
+        }
+
+        /*
+         * The legacy ModelContext::create overload defaults to a CPU target. That
+         * makes ModelLoader NUMA-bind and first-touch every page in the GGUF
+         * before the bounded GPU upload ring can consume its first weight. Use
+         * the explicit configuration so GPU-only parity follows production's
+         * demand-paged mmap path and keeps host staging within its configured
+         * budget.
+         */
+        const ModelContextConfig model_config{
+            .mpi_ctx = mpi_ctx,
+            .strategy = WeightDistributionStrategy::SHARDED,
+            .use_mmap = true,
+            .target_is_gpu = true,
+        };
+        auto model_ctx = ModelContext::create(config.model_path, model_config);
         if (model_ctx)
         {
             configure(model_ctx);
@@ -787,6 +865,7 @@ protected:
             std::lock_guard<std::mutex> lock(overlayPipelineCacheMutex());
             model_ctx_ = getOrCreateOverlayModelContext(
                 GetParam(),
+                mpi_ctx_,
                 [this](const std::shared_ptr<ModelContext> &ctx)
                 {
                     configureModel(ctx);
@@ -928,6 +1007,42 @@ protected:
 
     std::shared_ptr<MoERoutedExpertPlacementPlan> overlay_plan_;
 };
+
+TEST(Qwen36MoEExpertOverlayPerfStats, DynamicMovementAcceptsEitherProductionDecisionForm)
+{
+    const PerfStatRecord accepted_replica{
+        .kind = PerfStatRecord::Kind::Counter,
+        .domain = "moe_rebalance",
+        .name = "device_rebalance_selected_replicas",
+        .value = 2.0,
+    };
+    const PerfStatRecord accepted_ownership_swap{
+        .kind = PerfStatRecord::Kind::Counter,
+        .domain = "moe_rebalance",
+        .name = "device_rebalance_dynamic_ownership_swap_accepts",
+        .value = 1.0,
+    };
+    const PerfStatRecord rejected_attempt{
+        .kind = PerfStatRecord::Kind::Counter,
+        .domain = "moe_rebalance",
+        .name = "device_rebalance_dynamic_ownership_swap_attempts",
+        .value = 7.0,
+    };
+
+    EXPECT_EQ(
+        dynamicRebalanceAcceptedPlacementCount({accepted_replica}),
+        2.0);
+    EXPECT_EQ(
+        dynamicRebalanceAcceptedPlacementCount({accepted_ownership_swap}),
+        1.0);
+    EXPECT_EQ(
+        dynamicRebalanceAcceptedPlacementCount(
+            {accepted_replica, accepted_ownership_swap}),
+        3.0);
+    EXPECT_EQ(
+        dynamicRebalanceAcceptedPlacementCount({rejected_attempt}),
+        0.0);
+}
 
 TEST(Qwen36MoEExpertOverlayPipelineCacheKey, IncludesResolvedPrefillShapeAndGraphBucketPolicy)
 {
@@ -1080,11 +1195,21 @@ TEST_P(Qwen36MoEExpertOverlayParityTest, LongContextDecodeParity)
     }
     if (!decodeWorkAvailable())
         GTEST_SKIP() << "Decode snapshots or decode token metadata are unavailable";
+    ASSERT_TRUE(PerfStatsCollector::isEnabled())
+        << "Long-context ExpertOverlay parity requires PerfStats counter "
+           "collection so Dynamic/LLEP planner, movement, and health paths "
+           "are certified.";
+    PerfStatsCollector::reset();
     DecodeParitySummary summary;
     {
         auto scope = profileParityScope("expert_overlay.run_decode_parity");
         summary = runDecodeParity();
     }
+    const auto rebalance_records =
+        PerfStatsCollector::snapshot({"moe_rebalance"});
+    expectLongContextMoERebalancePerfPath(
+        GetParam(),
+        rebalance_records);
     {
         auto scope = profileParityScope("expert_overlay.assert_decode_parity");
         assertDecodeParity(summary);
@@ -1146,6 +1271,50 @@ TEST_P(Qwen36MoEExpertOverlayParityTest, SnapshotInfrastructure)
         }
     }
     EXPECT_TRUE(has_ffn_residual) << "Missing FFN_RESIDUAL snapshot";
+}
+
+/**
+ * @brief Proves that a valid multiline long-context corpus is reusable.
+ *
+ * Long-context prompts are persisted over several physical metadata lines.
+ * This regression deliberately uses the same representation as the Python
+ * oracle generator and verifies both the positive authentication case and a
+ * prompt-drift rejection. It performs no model load or GPU work.
+ */
+TEST(Qwen36MoEExpertOverlayMetadata, MultilinePromptAuthenticatesWithoutRegeneration)
+{
+    const std::filesystem::path metadata_path =
+        std::filesystem::temp_directory_path() /
+        ("llaminar_qwen36_multiline_metadata_" +
+         std::to_string(static_cast<long long>(::getpid())) +
+         ".txt");
+    const std::string prompt =
+        "Read the ledger exactly.\n"
+        "Ledger item 0001: alpha.\n"
+        "Return one JSON object.";
+
+    {
+        std::ofstream metadata(metadata_path, std::ios::trunc);
+        ASSERT_TRUE(metadata.is_open()) << "failed to create " << metadata_path;
+        metadata << "snapshot_version: 4\n"
+                 << "prompt: Read the ledger exactly.\n"
+                 << "Ledger item 0001: alpha.\n"
+                 << "Return one JSON object.\n"
+                 << "token_ids: 1,2,3\n"
+                 << "decode_steps: 2\n"
+                 << "decode_tokens: 4,5\n";
+    }
+
+    EXPECT_EQ(
+        readMultilineStringFromMetadata(metadata_path, "prompt", "token_ids"),
+        std::optional<std::string>{prompt});
+    EXPECT_TRUE(metadataLooksUsable(metadata_path, prompt, 2));
+    EXPECT_FALSE(metadataLooksUsable(metadata_path, prompt + "\nchanged", 2));
+
+    std::error_code remove_error;
+    std::filesystem::remove(metadata_path, remove_error);
+    EXPECT_FALSE(remove_error) << "failed to remove " << metadata_path
+                               << ": " << remove_error.message();
 }
 
 INSTANTIATE_TEST_SUITE_P(

@@ -11,6 +11,7 @@
  * that releases temporary staging resources while preserving persistent pool state.
  */
 
+#include <array>
 #include <cstdlib>
 
 namespace llaminar2
@@ -187,6 +188,36 @@ namespace llaminar2
         EXPECT_EQ(orch.totalPendingBytes(0), raw_bytes);
         ASSERT_NE(orch.getPool(0), nullptr);
         EXPECT_EQ(orch.getPool(0)->maxStagingSlotBytes(), 2 * bytes_per_row);
+    }
+
+    TEST(Test__LoadOrchestrator, OrdersJobsByMappedSourceAddressAndPreservesAliases)
+    {
+        std::array<uint8_t, 256> mapped_file{};
+        std::vector<WeightJob> jobs(5);
+
+        jobs[0].name = "late";
+        jobs[0].host_raw_data = mapped_file.data() + 192;
+        jobs[1].name = "early_alias_a";
+        jobs[1].host_raw_data = mapped_file.data() + 32;
+        jobs[2].name = "middle";
+        jobs[2].host_raw_data = mapped_file.data() + 128;
+        jobs[3].name = "early_alias_b";
+        jobs[3].host_raw_data = mapped_file.data() + 32;
+        jobs[4].name = "invalid";
+        jobs[4].host_raw_data = nullptr;
+
+        const size_t backward_jumps =
+            orderWeightJobsForSequentialHostAccess(jobs);
+
+        EXPECT_EQ(backward_jumps, 2u);
+        ASSERT_EQ(jobs.size(), 5u);
+        EXPECT_EQ(jobs[0].name, "early_alias_a");
+        EXPECT_EQ(jobs[1].name, "early_alias_b")
+            << "Stable source ordering must preserve tied-weight aliases";
+        EXPECT_EQ(jobs[2].name, "middle");
+        EXPECT_EQ(jobs[3].name, "late");
+        EXPECT_EQ(jobs[4].name, "invalid")
+            << "Null sources stay last for processJobs() validation";
     }
 
     TEST(Test__LoadOrchestrator, RejectsBudgetSmallerThanOneRawRow)

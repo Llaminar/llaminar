@@ -14,13 +14,15 @@ namespace llaminar2
      * @brief Stateless helper that owns GPU graph capture/replay phase orchestration logic.
      *
      * This controller extracts the warmup/capture/replay state machine from `DeviceGraphExecutor`
-     * so executor code stays focused on fallback policy and node-level primitives.
+     * so executor code stays focused on mandatory execution policy and
+     * node-level primitives.
      *
      * Design notes for junior developers:
      * - All methods are static to keep this utility side-effect free outside passed-in state.
      * - Mutable execution state lives in `DeviceGraphExecutor::GraphSegmentCache`.
      *   A cache with one capturable unit and no manual units is a full-graph
-     *   replay plan; multiple units or manual units are segmented replay.
+     *   replay plan. Segmented replay is valid only for a proven mixed-device
+     *   graph that contains heterogeneous collectives.
      * - Executor-provided hooks let this controller call back into execution/coherence behavior
      *   without creating circular ownership.
      */
@@ -36,8 +38,6 @@ namespace llaminar2
             bool success = false;
             /// True when verify mode intentionally skipped non-idempotent replay comparison.
             bool skipped_non_idempotent = false;
-            /// True when normal launch failed and caller should use fast-decode fallback.
-            bool launch_failure_fallback = false;
         };
 
         /**
@@ -49,8 +49,6 @@ namespace llaminar2
             bool success = false;
             /// Propagated verify-mode skip marker.
             bool skipped_non_idempotent = false;
-            /// Propagated fallback hint for normal launch failure.
-            bool launch_failure_fallback = false;
         };
 
         /**
@@ -60,8 +58,6 @@ namespace llaminar2
         {
             /// True when all segments in capture phase completed successfully.
             bool success = false;
-            /// True when caller should abandon segmented path and execute fast decode.
-            bool fallback_to_fast_decode = false;
             /// True when caller should reset `GraphSegmentCache` resources.
             bool reset_cache = false;
         };
@@ -73,8 +69,6 @@ namespace llaminar2
         {
             /// True when replay phase completed successfully.
             bool success = false;
-            /// True when caller should trigger fast-decode fallback.
-            bool launch_failure_fallback = false;
         };
 
         /**
@@ -94,8 +88,13 @@ namespace llaminar2
             std::function<bool(ComputeNode &, void *)> record_snapshot_copies;
             /// Runs post-launch lifecycle hooks (dirty marking, callbacks, step bookkeeping).
             std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> post_launch;
-            /// Optional domain-level fence immediately before HIP/CUDA beginCapture().
-            DeviceGraphExecutor::GraphCaptureBoundaryHook before_begin_capture;
+            /**
+             * Optional domain-level fence at both capture entry and capture exit.
+             *
+             * One callback owns both transitions so callers cannot configure a
+             * begin-only LocalTP lifecycle accidentally.
+             */
+            DeviceGraphExecutor::GraphCaptureBoundaryHook capture_boundary;
         };
 
         /**
@@ -132,6 +131,18 @@ namespace llaminar2
             /// Monotonic segmented decode step index.
             uint64_t decode_step = 0;
         };
+
+        /**
+         * @brief Return the canonical PerfStats label for a replay phase.
+         * @param phase Typed warmup, capture, or replay phase.
+         * @return Stable label consumed by graph-lifecycle validators.
+         *
+         * Every graph launch path, including optimized direct launches, must
+         * publish one of these labels. Keeping the vocabulary here prevents a
+         * launch optimization from creating a private phase name that silently
+         * disappears from lifecycle validation.
+         */
+        static const char *phaseName(Phase phase);
 
         /**
          * @brief Advance decode replay step and select warmup/capture/replay phase.
@@ -181,20 +192,25 @@ namespace llaminar2
             DeviceGraphExecutor::GraphSegmentCache &segment_cache,
             const std::unordered_set<std::string> *collective_nodes,
             bool has_collective_nodes,
-            bool collectives_graph_capturable = false);
+            bool collectives_graph_capturable = false,
+            DeviceGraphExecutor::GraphReplayPlanPolicy plan_policy =
+                DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
 
         /**
-         * @brief Build segmented execution plan for warmup/capture/replay phases.
+         * @brief Build and validate the execution plan for warmup/capture/replay.
          *
-         * Splits graph order into alternating capturable/manual segments and applies
-         * collective safeguards plus optional max-stage partitioning.
+         * Homogeneous domains must produce one full graph. A caller-proven
+         * heterogeneous collective domain may produce alternating captured and
+         * manual units where cross-device execution prevents monolithic capture.
          */
         static void buildWarmupSegments(
             ComputeGraph &graph,
             DeviceGraphExecutor::GraphSegmentCache &segment_cache,
             const std::unordered_set<std::string> *collective_nodes,
             bool has_collective_nodes,
-            bool collectives_graph_capturable = false);
+            bool collectives_graph_capturable = false,
+            DeviceGraphExecutor::GraphReplayPlanPolicy plan_policy =
+                DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
 
         /**
          * @brief Precompute `onGraphReplayed()` callback lists for capturable segments.
@@ -261,7 +277,7 @@ namespace llaminar2
             int segment_index,
             uint64_t current_step,
             const std::string &perf_context,
-            const DeviceGraphExecutor::GraphCaptureBoundaryHook &before_begin_capture_cb,
+            const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
@@ -282,7 +298,15 @@ namespace llaminar2
          * @brief Finalize one captured segment during Phase-2 capture.
          *
          * Handles instantiate/launch path for non-collective graphs and Phase-2
-         * execute-node semantics for collective graphs.
+         * execute-node semantics for collective graphs. A segment advertised as
+         * capturable must produce at least one native graph node; zero-node
+         * capture is a violated stage/stream ownership contract and fails.
+         *
+         * @param full_graph_capture True when this segment is the complete
+         *        homogeneous graph rather than one unit of an explicitly
+         *        admitted heterogeneous collective plan.
+         * @param perf_context Stable graph-owner context attached to the
+         *        executable-node PerfStats evidence.
          */
         static bool finalizeCapturePhaseCapturableSegment(
             ComputeGraph &graph,
@@ -291,6 +315,8 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             void *capture_stream,
             bool has_collective_nodes,
+            bool full_graph_capture,
+            const std::string &perf_context,
             uint64_t current_step,
             const std::function<bool(ComputeNode &)> &execute_node_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
@@ -336,7 +362,7 @@ namespace llaminar2
             uint64_t current_step,
             const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
-            const DeviceGraphExecutor::GraphCaptureBoundaryHook &before_begin_capture_cb,
+            const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
@@ -359,7 +385,7 @@ namespace llaminar2
             const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
             const std::function<bool(ComputeNode &)> &execute_node_cb,
-            const DeviceGraphExecutor::GraphCaptureBoundaryHook &before_begin_capture_cb,
+            const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 

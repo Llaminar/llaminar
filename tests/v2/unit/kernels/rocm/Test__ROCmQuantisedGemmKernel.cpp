@@ -47,6 +47,36 @@ namespace
         void SetUp() override {}
     };
 
+    /**
+     * @test A ROCm GEMM launch cannot begin without an exact producer stream.
+     *
+     * This is intentionally CPU-only: the null input/output arguments would
+     * normally fail validation, but the stream contract must fail first. That
+     * ordering prevents any future launch branch from performing device work
+     * and only discovering at publication time that its producer stream is
+     * unknown.
+     */
+    TEST_F(
+        ROCmQuantisedGemmKernelUnitTest,
+        LaunchRequiresExplicitProducerStreamBeforeValidation)
+    {
+        ROCmPackedWeights packed;
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+
+        EXPECT_THROW(
+            kernel.multiply_tensor(
+                nullptr,
+                nullptr,
+                1,
+                1,
+                1),
+            std::runtime_error);
+
+        int stream_sentinel = 0;
+        kernel.setGPUStream(&stream_sentinel);
+        EXPECT_EQ(kernel.requireGPUStream(), &stream_sentinel);
+    }
+
     std::filesystem::path repoRoot()
     {
 #ifdef LLAMINAR_REPO_ROOT

@@ -31,6 +31,8 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
+#include "../../../utils/ScopedGPUStream.h"
 #include <chrono>
 #include <vector>
 #include <thread>
@@ -230,6 +232,7 @@ TEST_F(Test__ROCmEventSynchronization, MappedTensorCoherenceUsesEvents)
 {
     // Create a mapped tensor
     DeviceId rocm_device = DeviceId::rocm(device_id_);
+    llaminar2::test::ScopedGPUStream producer_stream(rocm_device);
     auto tensor = FP32Tensor::createMapped({1024, 1024}, rocm_device); // 4MB
 
     if (!tensor || !tensor->isMapped())
@@ -238,11 +241,11 @@ TEST_F(Test__ROCmEventSynchronization, MappedTensorCoherenceUsesEvents)
     }
 
     // Ensure tensor is on device
-    ASSERT_TRUE(tensor->ensureOnDevice(rocm_device));
+    ASSERT_TRUE(tensor->ensureOnDevice(rocm_device, producer_stream.get()));
 
     // Simulate a GPU write by marking device dirty
     // In real usage, this would be done after a kernel writes to the tensor
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor, producer_stream.get());
 
     // Queue some slow work AFTER the tensor was marked dirty
     // If ensureOnHost uses stream sync, it will wait for this slow work

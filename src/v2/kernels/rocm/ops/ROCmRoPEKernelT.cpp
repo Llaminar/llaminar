@@ -26,6 +26,7 @@
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../kernels/rope/RoPEDeviceParams.h"
 #include <hip/hip_runtime.h>
+#include <stdexcept>
 #include <string>
 
 // Forward declare extern "C" HIP wrappers (v2 - with inv_freq parameter)
@@ -141,6 +142,11 @@ extern "C"
         int head_dim,
         float freq_base,
         int device_idx, void *stream);
+    bool hipOps_rope_publish_device_params(
+        llaminar2::rope::RoPEDeviceParams *device_params,
+        int pos_offset,
+        int device_idx,
+        void *stream);
 }
 
 namespace
@@ -163,30 +169,30 @@ namespace
         return status == hipStreamCaptureStatusActive;
     }
 
-    bool uploadHIPRoPEDeviceParams(
+    bool publishHIPRoPEDeviceParams(
         llaminar2::DeviceWorkspaceManager *workspace,
-        llaminar2::rope::RoPEDeviceParams *host_params,
         hipStream_t stream,
         bool &device_valid,
         int &device_offset,
         int pos_offset,
+        int device_idx,
         const char *context)
     {
         device_valid = false;
 
         if (!stream)
         {
-            LOG_ERROR("[" << context << "] Cannot upload RoPE params on a null/default HIP stream");
+            LOG_ERROR("[" << context << "] Cannot publish RoPE params on a null/default HIP stream");
             return false;
         }
         if (!workspace)
         {
-            LOG_ERROR("[" << context << "] Cannot upload RoPE params without a bound workspace");
+            LOG_ERROR("[" << context << "] Cannot publish RoPE params without a bound workspace");
             return false;
         }
         if (isHIPStreamCapturing(stream, context))
         {
-            LOG_ERROR("[" << context << "] Refusing to record RoPE-param H2D inside HIP graph capture");
+            LOG_ERROR("[" << context << "] Refusing to record mutable RoPE-param publication inside HIP graph capture");
             return false;
         }
 
@@ -198,13 +204,13 @@ namespace
             return false;
         }
 
-        const hipError_t copy_err =
-            hipMemcpyAsync(d_params, host_params, sizeof(llaminar2::rope::RoPEDeviceParams),
-                           hipMemcpyHostToDevice, stream);
-        if (copy_err != hipSuccess)
+        if (!hipOps_rope_publish_device_params(
+                static_cast<llaminar2::rope::RoPEDeviceParams *>(d_params),
+                pos_offset,
+                device_idx,
+                stream))
         {
-            LOG_ERROR("[" << context << "] hipMemcpyAsync failed for RoPE params: "
-                          << hipGetErrorString(copy_err));
+            LOG_ERROR("[" << context << "] Device-owned RoPE-param publication failed");
             return false;
         }
 
@@ -317,28 +323,15 @@ namespace llaminar2
         // ROCmRoPEKernelT<FP32> Implementation
         // =========================================================================
 
-        ROCmRoPEKernelT<ActivationPrecision::FP32>::~ROCmRoPEKernelT()
-        {
-            if (h_device_params_)
-            {
-                (void)hipHostFree(h_device_params_);
-                h_device_params_ = nullptr;
-            }
-        }
-
         void ROCmRoPEKernelT<ActivationPrecision::FP32>::setDynamicPosOffset(int pos_offset)
         {
-            if (!h_device_params_)
-            {
-                (void)hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
-            }
-            if (h_device_params_)
-            {
-                h_device_params_->pos_offset = pos_offset;
-                uploadHIPRoPEDeviceParams(
-                    workspace_, h_device_params_, static_cast<hipStream_t>(gpu_stream_),
+            if (!publishHIPRoPEDeviceParams(
+                    workspace_, static_cast<hipStream_t>(gpu_stream_),
                     dynamic_pos_device_valid_, dynamic_pos_offset_, pos_offset,
-                    "ROCmRoPEKernelT<FP32>");
+                    device_idx_, "ROCmRoPEKernelT<FP32>"))
+            {
+                throw std::runtime_error(
+                    "ROCmRoPEKernelT<FP32> failed to publish device-owned dynamic position");
             }
         }
 
@@ -718,28 +711,15 @@ namespace llaminar2
         // ROCmRoPEKernelT<BF16> Implementation
         // =========================================================================
 
-        ROCmRoPEKernelT<ActivationPrecision::BF16>::~ROCmRoPEKernelT()
-        {
-            if (h_device_params_)
-            {
-                (void)hipHostFree(h_device_params_);
-                h_device_params_ = nullptr;
-            }
-        }
-
         void ROCmRoPEKernelT<ActivationPrecision::BF16>::setDynamicPosOffset(int pos_offset)
         {
-            if (!h_device_params_)
-            {
-                (void)hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
-            }
-            if (h_device_params_)
-            {
-                h_device_params_->pos_offset = pos_offset;
-                uploadHIPRoPEDeviceParams(
-                    workspace_, h_device_params_, static_cast<hipStream_t>(gpu_stream_),
+            if (!publishHIPRoPEDeviceParams(
+                    workspace_, static_cast<hipStream_t>(gpu_stream_),
                     dynamic_pos_device_valid_, dynamic_pos_offset_, pos_offset,
-                    "ROCmRoPEKernelT<BF16>");
+                    device_idx_, "ROCmRoPEKernelT<BF16>"))
+            {
+                throw std::runtime_error(
+                    "ROCmRoPEKernelT<BF16> failed to publish device-owned dynamic position");
             }
         }
 
@@ -1107,28 +1087,15 @@ namespace llaminar2
         // ROCmRoPEKernelT<FP16> Implementation
         // =========================================================================
 
-        ROCmRoPEKernelT<ActivationPrecision::FP16>::~ROCmRoPEKernelT()
-        {
-            if (h_device_params_)
-            {
-                (void)hipHostFree(h_device_params_);
-                h_device_params_ = nullptr;
-            }
-        }
-
         void ROCmRoPEKernelT<ActivationPrecision::FP16>::setDynamicPosOffset(int pos_offset)
         {
-            if (!h_device_params_)
-            {
-                (void)hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
-            }
-            if (h_device_params_)
-            {
-                h_device_params_->pos_offset = pos_offset;
-                uploadHIPRoPEDeviceParams(
-                    workspace_, h_device_params_, static_cast<hipStream_t>(gpu_stream_),
+            if (!publishHIPRoPEDeviceParams(
+                    workspace_, static_cast<hipStream_t>(gpu_stream_),
                     dynamic_pos_device_valid_, dynamic_pos_offset_, pos_offset,
-                    "ROCmRoPEKernelT<FP16>");
+                    device_idx_, "ROCmRoPEKernelT<FP16>"))
+            {
+                throw std::runtime_error(
+                    "ROCmRoPEKernelT<FP16> failed to publish device-owned dynamic position");
             }
         }
 

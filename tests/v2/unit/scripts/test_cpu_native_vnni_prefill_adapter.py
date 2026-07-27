@@ -270,7 +270,7 @@ class CPUNativeVNNIPrefillAdapterTest(unittest.TestCase):
 
         self.assertTrue(observation.supported)
 
-    def test_normalized_n_block_request_is_retained_but_not_supported(self) -> None:
+    def test_retired_n_major_nbc16_candidate_is_rejected(self) -> None:
         row = self.row()
         row["candidate_id"] = (
             "cpu.nvnni.prefill.two_row_tiles.nbc16.full_k"
@@ -281,10 +281,8 @@ class CPUNativeVNNIPrefillAdapterTest(unittest.TestCase):
         row["n_block_chunks"] = "16"
         row["correctness_pass"] = "0"
 
-        observation = adapt_cpu_prefill_row(row, self.context())
-
-        self.assertFalse(observation.supported)
-        self.assertFalse(observation.forced_route_ok)
+        with self.assertRaisesRegex(ValueError, "unknown forceable candidate"):
+            adapt_cpu_prefill_row(row, self.context())
 
     def test_k_tiled_route_cannot_claim_full_k_correctness(self) -> None:
         row = self.row()

@@ -19,10 +19,12 @@
 #include <vector>
 #include "BufferId.h"
 #include "BufferAccess.h"
+#include "../loaders/WeightPlan.h"
 
 namespace llaminar2
 {
     class ITensor;
+    class PreparedWeightStore;
 }
 
 namespace llaminar2
@@ -51,6 +53,22 @@ namespace llaminar2
     };
 
     /**
+     * @brief Device-owned prepared weight consumed by a stage.
+     *
+     * The source tensor describes model identity and shape but is not the byte
+     * storage read by the GPU kernel. The PreparedWeightStore and
+     * PreparedWeightRef name that storage exactly, including its device. This
+     * prevents the executor from inferring prepared residency from mutable
+     * source-tensor flags or attempting to upload a host-only source tensor.
+     */
+    struct PreparedWeightBinding
+    {
+        ITensor *source_tensor = nullptr;
+        const PreparedWeightStore *store = nullptr;
+        PreparedWeightRef ref;
+    };
+
+    /**
      * @brief Complete I/O contract for a compute stage.
      *
      * Built via fluent builder methods in stage constructors:
@@ -65,7 +83,8 @@ namespace llaminar2
     {
         std::vector<BufferBinding> inputs;     ///< Read-only activation buffers (arena-managed)
         std::vector<BufferBinding> outputs;    ///< Write-only output buffers (arena-managed)
-        std::vector<ITensor *> weight_tensors; ///< Read-only model weights (external, NOT in arena)
+        std::vector<ITensor *> weight_tensors; ///< Raw model-weight tensors read directly by a stage
+        std::vector<PreparedWeightBinding> prepared_weights; ///< Device-owned prepared model weights
         std::vector<BufferBinding> inouts;     ///< Read-write (e.g., allreduce in-place, arena-managed)
         std::vector<WorkspaceDesc> workspaces; ///< Scratch buffers
 
@@ -75,13 +94,15 @@ namespace llaminar2
         /// True if this contract has any bindings at all
         bool empty() const
         {
-            return inputs.empty() && outputs.empty() && weight_tensors.empty() && inouts.empty();
+            return inputs.empty() && outputs.empty() && weight_tensors.empty() &&
+                   prepared_weights.empty() && inouts.empty();
         }
 
         /// Total number of buffer bindings (excluding workspaces)
         size_t bindingCount() const
         {
-            return inputs.size() + outputs.size() + weight_tensors.size() + inouts.size();
+            return inputs.size() + outputs.size() + weight_tensors.size() +
+                   prepared_weights.size() + inouts.size();
         }
 
         // ── Fluent builder methods ──────────────────────────────────────────
@@ -102,6 +123,26 @@ namespace llaminar2
         {
             if (tensor)
                 weight_tensors.push_back(tensor);
+            return *this;
+        }
+
+        /**
+         * @brief Declare a prepared representation instead of a raw tensor read.
+         *
+         * All three values remain in the contract even when malformed so the
+         * executor can issue one deterministic, stage-scoped hard failure during
+         * pre-execution validation.
+         */
+        StageBufferContract &addPreparedWeight(
+            ITensor *source_tensor,
+            const PreparedWeightStore *store,
+            PreparedWeightRef ref)
+        {
+            prepared_weights.push_back({
+                .source_tensor = source_tensor,
+                .store = store,
+                .ref = ref,
+            });
             return *this;
         }
 

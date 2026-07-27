@@ -18,12 +18,14 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/local_execution/collective/CollectiveContext.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/factory/FactoryPPStageConfig.h"
 #include "config/PipelineConfig.h"
 #include "config/TensorParallelConfig.h"
@@ -200,7 +202,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, MockGraphBuilder_ConfigAcc
     EXPECT_EQ(cfg.head_dim, 64);
 }
 
-TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_DisableCapturedCollectivesOverrideKeepsCollectiveDecodeEager)
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_RejectsEagerHomogeneousGpuCollectives)
 {
     ScopedEnvVars env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -213,15 +215,11 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Disabl
     llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
     const IForwardExecutionHost &host = dgo;
 
-    const auto policy = host.buildDecodeCapturePolicy(
-        true,
-        &gpu_ctx,
-        0);
-
-    EXPECT_TRUE(policy.allow_fast_decode);
-    EXPECT_FALSE(policy.collective_segmented_enabled);
-    EXPECT_FALSE(policy.collectives_graph_capturable);
-    EXPECT_FALSE(policy.allow_cached_graph_replay);
+    EXPECT_THROW(
+        host.buildDecodeCapturePolicy(
+            true,
+            &gpu_ctx),
+        std::runtime_error);
 }
 
 TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceGraphControllerDefaultsEnabled)
@@ -359,8 +357,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
 
     const auto policy = host.buildDecodeCapturePolicy(
         true,
-        &gpu_ctx,
-        0);
+        &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_FALSE(policy.collective_segmented_enabled);
@@ -392,8 +389,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
 
     const auto policy = host.buildDecodeCapturePolicy(
         true,
-        &gpu_ctx,
-        0);
+        &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_FALSE(policy.collective_segmented_enabled);
@@ -425,8 +421,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
 
     const auto policy = host.buildDecodeCapturePolicy(
         true,
-        &gpu_ctx,
-        0);
+        &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_TRUE(policy.collectives_graph_capturable);
@@ -460,8 +455,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
 
     const auto policy = host.buildDecodeCapturePolicy(
         true,
-        &gpu_ctx,
-        0);
+        &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_FALSE(policy.collective_segmented_enabled);
@@ -494,8 +488,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
 
     const auto policy = host.buildDecodeCapturePolicy(
         true,
-        &gpu_ctx,
-        0);
+        &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_FALSE(policy.collective_segmented_enabled);
@@ -526,8 +519,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
 
     const auto policy = host.buildDecodeCapturePolicy(
         true,
-        &gpu_ctx,
-        0);
+        &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_FALSE(policy.collective_segmented_enabled);
@@ -558,13 +550,88 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Reject
 
     const auto policy = host.buildDecodeCapturePolicy(
         true,
-        &gpu_ctx,
-        0);
+        &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_FALSE(policy.collective_segmented_enabled);
     EXPECT_FALSE(policy.collectives_graph_capturable);
     EXPECT_FALSE(policy.allow_cached_graph_replay);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_AdmitsSegmentationForMixedExpertOverlayCollectives)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1"},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+
+    auto placement = std::make_shared<MoERoutedExpertPlacementPlan>();
+    placement->enabled = true;
+    RoutedExpertDomain hot;
+    hot.name = "cuda_hot";
+    hot.scope = ExecutionDomainScope::LOCAL;
+    hot.backend = CollectiveBackendType::NCCL;
+    hot.participants = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+    RoutedExpertDomain cold;
+    cold.name = "cpu_cold";
+    cold.scope = ExecutionDomainScope::NODE_LOCAL;
+    cold.backend = CollectiveBackendType::HOST;
+    cold.participants = {
+        GlobalDeviceAddress::cpu(0),
+        GlobalDeviceAddress::cpu(1)};
+    placement->domains = {hot, cold};
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    cfg.moe.routed_expert_plan = placement;
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    const IForwardExecutionHost &host = dgo;
+
+    ASSERT_EQ(std::as_const(dgo).graphBuilder(), mock_builder_.get());
+    const auto &installed_config = std::as_const(dgo).graphBuilder()->config();
+    ASSERT_EQ(installed_config.moe.routed_expert_plan, placement);
+    ASSERT_EQ(installed_config.moe.routed_expert_plan->domains.size(), 2u);
+    ASSERT_EQ(
+        installed_config.moe.routed_expert_plan->domains[0].participants.size(),
+        2u);
+    ASSERT_EQ(
+        installed_config.moe.routed_expert_plan->domains[1].participants.size(),
+        2u);
+    EXPECT_EQ(
+        installed_config.moe.routed_expert_plan->domains[0]
+            .participants[0]
+            .device_type,
+        DeviceType::CUDA);
+    EXPECT_EQ(
+        installed_config.moe.routed_expert_plan->domains[1]
+            .participants[0]
+            .device_type,
+        DeviceType::CPU);
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        true,
+        &gpu_ctx);
+
+    EXPECT_TRUE(policy.collective_segmented_enabled);
+    EXPECT_FALSE(policy.collectives_graph_capturable);
+    EXPECT_EQ(
+        policy.graph_replay_plan_policy,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousCollectiveSegmentation);
+    EXPECT_TRUE(policy.allow_cached_graph_replay);
 }
 
 TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, ExecutorAccessible)

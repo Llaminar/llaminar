@@ -35,17 +35,21 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -54,6 +58,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -229,6 +234,139 @@ namespace
          { return TestTensorFactory::createQ8_KRandom({N, K}); }},
     };
 
+    /**
+     * @brief Reconstruct one quantized tensor from caller-owned GGUF block bytes.
+     *
+     * Profiler-only collection does not compare tensor values, but it must still
+     * exercise the real source-format upload and native-VNNI repack pipeline.
+     * This small factory therefore preserves the exact concrete tensor type and
+     * raw byte layout instead of substituting a prepared or execution-codebook
+     * tensor that would bypass production preparation.
+     *
+     * @param type Runtime tensor format copied from the independently generated
+     *             seed row.
+     * @param shape Logical two-dimensional weight shape `[N, K]`.
+     * @param raw_data Complete row-major GGUF block payload for `shape`.
+     * @return A concrete quantized tensor that owns a copy of `raw_data`.
+     * @throws std::runtime_error when a format is added to the profiler matrix
+     *         without adding its matching concrete constructor here.
+     */
+    static std::unique_ptr<TensorBase> makeProfilerQuantizedTensor(
+        TensorType type,
+        const std::vector<size_t> &shape,
+        const std::vector<uint8_t> &raw_data)
+    {
+        switch (type)
+        {
+        case TensorType::Q4_0:
+            return std::make_unique<Q4_0Tensor>(shape, raw_data);
+        case TensorType::IQ4_NL:
+            return std::make_unique<IQ4_NLTensor>(shape, raw_data);
+        case TensorType::Q4_1:
+            return std::make_unique<Q4_1Tensor>(shape, raw_data);
+        case TensorType::Q5_0:
+            return std::make_unique<Q5_0Tensor>(shape, raw_data);
+        case TensorType::Q5_1:
+            return std::make_unique<Q5_1Tensor>(shape, raw_data);
+        case TensorType::IQ4_XS:
+            return std::make_unique<IQ4_XSTensor>(shape, raw_data);
+        case TensorType::Q4_K:
+            return std::make_unique<Q4_KTensor>(shape, raw_data);
+        case TensorType::Q5_K:
+            return std::make_unique<Q5_KTensor>(shape, raw_data);
+        case TensorType::Q6_K:
+            return std::make_unique<Q6_KTensor>(shape, raw_data);
+        case TensorType::Q3_K:
+            return std::make_unique<Q3_KTensor>(shape, raw_data);
+        case TensorType::Q2_K:
+            return std::make_unique<Q2_KTensor>(shape, raw_data);
+        case TensorType::IQ3_S:
+            return std::make_unique<IQ3_STensor>(shape, raw_data);
+        case TensorType::IQ3_XXS:
+            return std::make_unique<IQ3_XXSTensor>(shape, raw_data);
+        case TensorType::IQ2_S:
+            return std::make_unique<IQ2_STensor>(shape, raw_data);
+        case TensorType::IQ2_XS:
+            return std::make_unique<IQ2_XSTensor>(shape, raw_data);
+        case TensorType::IQ2_XXS:
+            return std::make_unique<IQ2_XXSTensor>(shape, raw_data);
+        case TensorType::IQ1_S:
+            return std::make_unique<IQ1_STensor>(shape, raw_data);
+        case TensorType::IQ1_M:
+            return std::make_unique<IQ1_MTensor>(shape, raw_data);
+        case TensorType::Q8_0:
+            return std::make_unique<Q8_0Tensor>(shape, raw_data);
+        case TensorType::Q8_1:
+            return std::make_unique<Q8_1Tensor>(shape, raw_data);
+        case TensorType::Q8_K:
+            return std::make_unique<Q8_KTensor>(shape, raw_data);
+        default:
+            throw std::runtime_error(
+                "ROCm profiler fixture has no concrete constructor for tensor type " +
+                std::to_string(static_cast<int>(type)));
+        }
+    }
+
+    /**
+     * @brief Build a value-independent profiler weight without full-matrix RNG.
+     *
+     * Kernel resource use, occupancy, dispatch geometry, and memory addresses do
+     * not depend on quantized weight values. Generating an independent Gaussian
+     * value for every logical weight therefore adds no profiler signal. It was
+     * nevertheless responsible for roughly half of direct trainer CPU cycles on
+     * the representative 512-request batch.
+     *
+     * One ordinary random row is still created through the format's established
+     * test factory so every packed field, scale, minimum, and codebook index is
+     * valid. The row's raw GGUF blocks are then tiled across N with an exponential
+     * copy. The resulting tensor has exactly the requested byte footprint and is
+     * passed through the same production upload and GPU repack path as canonical
+     * timing. Canonical timing never calls this helper and retains independently
+     * randomized full matrices for correctness and latency evidence.
+     *
+     * @param format Source-format descriptor selected by the exact profiler plan.
+     * @param N Number of output rows in the projection weight.
+     * @param K Number of logical values in each row.
+     * @return A concrete source-format tensor with `N * K` logical values.
+     */
+    static std::unique_ptr<TensorBase> makeProfilerWeightFixture(
+        const PerfFormatSpec &format,
+        size_t N,
+        size_t K)
+    {
+        auto seed_row = format.create(1, K);
+        if (!seed_row || !seed_row->raw_data())
+            throw std::runtime_error("ROCm profiler seed row has no raw data");
+
+        const size_t row_bytes =
+            llaminar2::test::quantizedRawBytesForGpuPreparedTest(*seed_row);
+        if (row_bytes == 0)
+            throw std::runtime_error("ROCm profiler seed row has zero raw bytes");
+        if (N > std::numeric_limits<size_t>::max() / row_bytes)
+            throw std::overflow_error("ROCm profiler fixture byte count overflow");
+
+        std::vector<uint8_t> raw_data(N * row_bytes);
+        std::memcpy(raw_data.data(), seed_row->raw_data(), row_bytes);
+
+        // Double the initialized prefix on each iteration. This preserves an
+        // exact valid row while reducing setup from O(N*K) random draws to a
+        // bandwidth-bound O(raw bytes) copy.
+        size_t initialized_rows = 1;
+        while (initialized_rows < N)
+        {
+            const size_t copied_rows =
+                std::min(initialized_rows, N - initialized_rows);
+            std::memcpy(
+                raw_data.data() + initialized_rows * row_bytes,
+                raw_data.data(),
+                copied_rows * row_bytes);
+            initialized_rows += copied_rows;
+        }
+
+        return makeProfilerQuantizedTensor(
+            seed_row->native_type(), {N, K}, raw_data);
+    }
+
     using GEMVShape = native_vnni_dispatch::NativeVNNIShapeSpec;
 
     /**
@@ -337,6 +475,266 @@ namespace
                    (M >= 2 &&
                     kind == DecodeCandidateKind::VerifierInheritSerialM1);
         }
+    };
+
+    /**
+     * @brief Return the registry identity represented by a trainer variant.
+     *
+     * Environment filters use short human-readable spellings such as `KB11`,
+     * while profiler requests and generated dispatch policies use stable fully
+     * qualified registry IDs. Keeping this conversion beside `DecodeVariant`
+     * makes exact-plan matching independent of aliases accepted by the command
+     * line parser.
+     */
+    static std::string effectiveDecodeCandidateId(const DecodeVariant &variant)
+    {
+        if (variant.kind == DecodeCandidateKind::VerifierInheritSerialM1)
+            return "rocm.nvnni.decode.verifier.inherit_serial_m1";
+        return "rocm.nvnni.decode.fast.kb" + std::to_string(variant.kb);
+    }
+
+    /** One immutable exact launch in a process-amortized ROCm profile. */
+    struct ROCmProfilerBatchRequest
+    {
+        std::string request_id;
+        std::string operation_kind;
+        std::string source_format;
+        std::string execution_mode;
+        std::string shape_name;
+        int m = 0;
+        std::string projection_n_vector;
+        int aggregate_n = 0;
+        int k = 0;
+        std::string effective_candidate_id;
+        std::string output_path;
+        bool consumed = false;
+    };
+
+    /**
+     * @brief Own the collector-authored exact launch plan for one ROCm process.
+     *
+     * The ordinary trainer is intentionally a Cartesian sweep. Profiling must
+     * be stricter: a broad environment union is permitted only to amortize HIP
+     * context, fixture, and rocprofiler setup. This class intersects every loop
+     * cell with the exact TSV rows, marks each row immediately before its one
+     * selected-region launch, and rejects both duplicate and omitted launches.
+     */
+    class ROCmProfilerBatch
+    {
+    public:
+        static constexpr size_t kMaximumRequestsPerProcess = 256;
+        static constexpr size_t kMaximumGraphRequestsPerProcess = 256;
+
+        explicit ROCmProfilerBatch(const std::string &path)
+        {
+            if (path.empty())
+                return;
+            std::ifstream input(path);
+            if (!input)
+                throw std::runtime_error(
+                    "failed to open ROCm profiler batch plan: " + path);
+            std::string line;
+            if (!std::getline(input, line) || line != kHeader)
+                throw std::runtime_error(
+                    "ROCm profiler batch plan has an invalid schema header");
+
+            std::set<std::string> request_ids;
+            std::set<std::string> output_paths;
+            while (std::getline(input, line))
+            {
+                if (line.empty())
+                    continue;
+                std::vector<std::string> fields;
+                std::stringstream stream(line);
+                std::string field;
+                while (std::getline(stream, field, '\t'))
+                    fields.push_back(field);
+                if (fields.size() != 11)
+                    throw std::runtime_error(
+                        "ROCm profiler batch row must contain eleven TSV fields");
+                ROCmProfilerBatchRequest request{
+                    .request_id = fields[0],
+                    .operation_kind = fields[1],
+                    .source_format = fields[2],
+                    .execution_mode = fields[3],
+                    .shape_name = fields[4],
+                    .m = parsePositive(fields[5], "M"),
+                    .projection_n_vector = fields[6],
+                    .aggregate_n = parsePositive(fields[7], "N"),
+                    .k = parsePositive(fields[8], "K"),
+                    .effective_candidate_id = fields[9],
+                    .output_path = fields[10],
+                };
+                if (request.request_id.empty() ||
+                    request.operation_kind.empty() ||
+                    request.source_format.empty() ||
+                    request.execution_mode.empty() ||
+                    request.shape_name.empty() ||
+                    request.projection_n_vector.empty() ||
+                    request.effective_candidate_id.empty() ||
+                    request.output_path.empty())
+                {
+                    throw std::runtime_error(
+                        "ROCm profiler batch row contains an empty identity field");
+                }
+                if (!request_ids.insert(request.request_id).second)
+                    throw std::runtime_error(
+                        "ROCm profiler batch request IDs must be unique");
+                if (!output_paths.insert(request.output_path).second)
+                    throw std::runtime_error(
+                        "ROCm profiler batch output paths must be unique");
+                requests_.push_back(std::move(request));
+            }
+            if (requests_.empty())
+                throw std::runtime_error("ROCm profiler batch plan is empty");
+            const size_t graph_requests = static_cast<size_t>(std::count_if(
+                requests_.begin(),
+                requests_.end(),
+                [](const ROCmProfilerBatchRequest &request)
+                { return request.execution_mode == "graph_captured"; }));
+            if (requests_.size() > kMaximumRequestsPerProcess ||
+                graph_requests > kMaximumGraphRequestsPerProcess)
+            {
+                throw std::runtime_error(
+                    "ROCm profiler batch exceeds the validated ROCm 7.1 "
+                    "selected-region lifetime: requests=" +
+                    std::to_string(requests_.size()) +
+                    " graph_requests=" + std::to_string(graph_requests) +
+                    " limits=" + std::to_string(kMaximumRequestsPerProcess) +
+                    "/" + std::to_string(kMaximumGraphRequestsPerProcess));
+            }
+        }
+
+        /** Return whether this invocation owns a collector-authored plan. */
+        [[nodiscard]] bool enabled() const noexcept
+        {
+            return !requests_.empty();
+        }
+
+        /** Return the exact number of required selected-region launches. */
+        [[nodiscard]] size_t size() const noexcept
+        {
+            return requests_.size();
+        }
+
+        /** Return whether any planned cell uses one prepared format/shape. */
+        [[nodiscard]] bool containsShape(
+            std::string_view source_format,
+            std::string_view shape_name) const
+        {
+            return std::any_of(
+                requests_.begin(), requests_.end(),
+                [&](const ROCmProfilerBatchRequest &request)
+                {
+                    return request.source_format == source_format &&
+                           request.shape_name == shape_name;
+                });
+        }
+
+        /** Return exact candidate IDs requested for one physical work cell. */
+        [[nodiscard]] std::set<std::string> candidateIds(
+            std::string_view source_format,
+            std::string_view shape_name,
+            std::string_view execution_mode,
+            int m,
+            int n,
+            int k) const
+        {
+            std::set<std::string> result;
+            for (const ROCmProfilerBatchRequest &request : requests_)
+            {
+                if (matchesCell(
+                        request, source_format, shape_name, execution_mode,
+                        m, n, k))
+                {
+                    result.insert(request.effective_candidate_id);
+                }
+            }
+            return result;
+        }
+
+        /** Claim one request immediately before its production launch. */
+        ROCmProfilerBatchRequest *claim(
+            std::string_view source_format,
+            std::string_view shape_name,
+            std::string_view execution_mode,
+            int m,
+            int n,
+            int k,
+            std::string_view effective_candidate_id)
+        {
+            ROCmProfilerBatchRequest *result = nullptr;
+            for (ROCmProfilerBatchRequest &request : requests_)
+            {
+                if (!matchesCell(
+                        request, source_format, shape_name, execution_mode,
+                        m, n, k) ||
+                    request.effective_candidate_id != effective_candidate_id)
+                {
+                    continue;
+                }
+                if (result)
+                    throw std::runtime_error(
+                        "ROCm profiler batch has duplicate exact launch identities");
+                result = &request;
+            }
+            if (!result)
+                return nullptr;
+            if (result->consumed)
+                throw std::runtime_error(
+                    "ROCm profiler batch request was claimed more than once: " +
+                    result->request_id);
+            result->consumed = true;
+            return result;
+        }
+
+        /** Fail a successful process that omitted any planned launch. */
+        void requireComplete() const
+        {
+            for (const ROCmProfilerBatchRequest &request : requests_)
+            {
+                if (!request.consumed)
+                    throw std::runtime_error(
+                        "ROCm profiler batch omitted request " +
+                        request.request_id);
+            }
+        }
+
+    private:
+        static constexpr std::string_view kHeader =
+            "request_id\toperation_kind\tsource_format\texecution_mode\t"
+            "shape_name\tm\tprojection_n_vector\taggregate_n\tk\t"
+            "effective_candidate_id\toutput_path";
+
+        static int parsePositive(const std::string &value, const char *name)
+        {
+            size_t consumed = 0;
+            const int parsed = std::stoi(value, &consumed);
+            if (consumed != value.size() || parsed <= 0)
+                throw std::runtime_error(
+                    std::string("ROCm profiler batch has invalid ") + name);
+            return parsed;
+        }
+
+        static bool matchesCell(
+            const ROCmProfilerBatchRequest &request,
+            std::string_view source_format,
+            std::string_view shape_name,
+            std::string_view execution_mode,
+            int m,
+            int n,
+            int k)
+        {
+            return request.operation_kind == "NativeVNNIDecodeProjection" &&
+                   request.source_format == source_format &&
+                   request.execution_mode == execution_mode &&
+                   request.m == m && request.aggregate_n == n &&
+                   request.k == k &&
+                   request.projection_n_vector == std::to_string(n) &&
+                   request.shape_name == shape_name;
+        }
+
+        std::vector<ROCmProfilerBatchRequest> requests_;
     };
 
 #ifdef HAVE_ROCM
@@ -646,7 +1044,14 @@ namespace
             packed.native_vnni_mins.assign(total_blocks, uint16_t{0});
         if (info->has_emins)
             packed.native_vnni_emins.assign(total_blocks, uint32_t{0});
-        packed.native_vnni_codebook_id = info->codebook_id;
+        // GPU preparation deliberately erases the source-layout distinction
+        // between Q8_0, Q8_1, and Q8_K after packVnniBlock() has converted each
+        // source block into the common signed-INT8 payload plus FP16 scale.
+        // Publish the same execution identity as WeightManager and
+        // ROCmWeightPacker; retaining source IDs 20/21 here asks the production
+        // launcher for codebooks that cannot exist after device preparation.
+        packed.native_vnni_codebook_id =
+            canonicalDeviceVnniCodebookId(info->codebook_id);
         packed.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
         packed.N = N;
         packed.K = K;
@@ -1123,7 +1528,7 @@ namespace
                     return result;
                 }
                 (void)hipStreamSynchronize(stream);
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output, stream);
 
                 const size_t out_elems =
                     static_cast<size_t>(M) * static_cast<size_t>(shape.N);
@@ -1278,6 +1683,10 @@ namespace
         std::vector<float> output;
         int kb = 0;
         int target_waves = 0;
+        int observed_kb = 0;
+        int observed_target_waves = 0;
+        uint64_t observed_route_count = 0;
+        std::string observed_path = "missing";
         bool route_counter_ok = false;
         std::string output_digest;
     };
@@ -1482,6 +1891,10 @@ namespace
                                   observed_count >= static_cast<uint64_t>(M) &&
                                   observed_kb == result.kb &&
                                   observed_waves == result.target_waves;
+        result.observed_kb = observed_kb;
+        result.observed_target_waves = observed_waves;
+        result.observed_route_count = observed_count;
+        result.observed_path = observed_path.empty() ? "missing" : observed_path;
         result.output_digest =
             llaminar2::test::trainer::nativeByteDigest(result.output);
         result.valid = result.route_counter_ok;
@@ -1623,6 +2036,94 @@ namespace
                                   !(M >= 2 &&
                                     result.observed_path == "atomic_reduce");
 
+        if (!profiler_request_id.empty())
+        {
+            /*
+             * The canonical timing corpus already proved byte correctness,
+             * repeatability, and latency for this exact physical candidate.
+             * A profiler process exists solely to gather counters from one
+             * additional production launch. Repeating D2H validation and the
+             * event-timed sample loop on every rocprof counter pass would add
+             * no evidence and adds measurable avoidable collection overhead.
+             *
+             * Keep a small, fixed amount of preconditioning so the selected
+             * launch does not observe first-use caches or lazy runtime setup.
+             * These launches execute while rocprof collection is paused. The
+             * explicit stream synchronization is local to this request and is
+             * the only boundary needed before opening its ROCTx range.
+             */
+            constexpr int kProfilerPreconditioningLaunches = 2;
+            if (!result.route_counter_ok)
+            {
+                cleanup();
+                return fail("profiler_route");
+            }
+            for (int launch = 0;
+                 launch < kProfilerPreconditioningLaunches;
+                 ++launch)
+            {
+                if (!execute_once())
+                {
+                    cleanup();
+                    return fail("profiler_precondition_launch");
+                }
+            }
+            if (hipStreamSynchronize(stream) != hipSuccess)
+            {
+                cleanup();
+                return fail("profiler_precondition_sync");
+            }
+
+            /*
+             * rocprofiler-sdk selected-region collection remains paused during
+             * all setup and preconditioning. Resume for exactly one launch,
+             * then pause before leaving its request-specific range. The launch
+             * is terminal for this graph executable because ROCm 7.1 profiler
+             * interception mutates HIP graph packet bookkeeping.
+             */
+            const std::string profiler_range =
+                "NativeVNNIProfile::" + profiler_request_id;
+            if (roctxRangePushA(profiler_range.c_str()) < 0)
+            {
+                cleanup();
+                return fail("profiler_range_push");
+            }
+            if (roctxProfilerResume(0) != 0)
+            {
+                (void)roctxRangePop();
+                cleanup();
+                return fail("profiler_resume");
+            }
+            const bool launch_ok = execute_once();
+            const hipError_t synchronize_status = hipStreamSynchronize(stream);
+            const int pause_status = roctxProfilerPause(0);
+            const int range_level = roctxRangePop();
+            if (!launch_ok || synchronize_status != hipSuccess || pause_status != 0)
+            {
+                cleanup();
+                return fail("profiler_target_launch");
+            }
+            if (range_level < 0)
+            {
+                cleanup();
+                return fail("profiler_range_pop");
+            }
+            result.isolated_profile_launches = 1;
+            std::fprintf(
+                stderr,
+                "[NativeVNNIProfiler][ROCm] request=%s candidate=%s "
+                "mode=%s M=%d N=%d K=%d launches=1\n",
+                profiler_request_id.c_str(),
+                variant.name.c_str(),
+                decodeExecutionModeName(execution_mode),
+                M,
+                N,
+                K);
+            cleanup();
+            result.valid = true;
+            return result;
+        }
+
         std::vector<float> first_output;
         if (!copyTrainerOutputToHost(
                 output.get(),
@@ -1677,55 +2178,6 @@ namespace
             return fail("warmup_sync");
         }
 
-        if (!profiler_request_id.empty())
-        {
-            /*
-             * rocprofiler-sdk selected-region collection remains paused during
-             * preparation, graph capture, serial-oracle work, correctness, and
-             * warmup. Resume only for this extra production launch and pause
-             * again after its explicit-stream completion. The launch is not
-             * inserted into the canonical timing sample vector below.
-             */
-            const std::string profiler_range =
-                "NativeVNNIProfile::" + profiler_request_id;
-            if (roctxRangePushA(profiler_range.c_str()) < 0)
-            {
-                cleanup();
-                return fail("profiler_range_push");
-            }
-            if (roctxProfilerResume(0) != 0)
-            {
-                (void)roctxRangePop();
-                cleanup();
-                return fail("profiler_resume");
-            }
-            const bool launch_ok = execute_once();
-            const hipError_t synchronize_status = hipStreamSynchronize(stream);
-            const int pause_status = roctxProfilerPause(0);
-            const int range_level = roctxRangePop();
-            if (!launch_ok || synchronize_status != hipSuccess || pause_status != 0)
-            {
-                cleanup();
-                return fail("profiler_target_launch");
-            }
-            if (range_level < 0)
-            {
-                cleanup();
-                return fail("profiler_range_pop");
-            }
-            result.isolated_profile_launches = 1;
-            std::fprintf(
-                stderr,
-                "[NativeVNNIProfiler][ROCm] request=%s candidate=%s "
-                "mode=%s M=%d N=%d K=%d launches=1\n",
-                profiler_request_id.c_str(),
-                variant.name.c_str(),
-                decodeExecutionModeName(execution_mode),
-                M,
-                N,
-                K);
-        }
-
         hipEvent_t start = nullptr;
         hipEvent_t stop = nullptr;
         if (hipEventCreate(&start) != hipSuccess ||
@@ -1764,6 +2216,7 @@ namespace
         }
         (void)hipEventDestroy(start);
         (void)hipEventDestroy(stop);
+
         std::sort(
             result.timing_samples_us.begin(),
             result.timing_samples_us.end());
@@ -1830,6 +2283,13 @@ namespace
 
             auto r = benchmarkFormat(fmt, shape, M, int8_us, weights.get(), &gpu_w, 0);
 
+            ASSERT_GT(r.min_us, 0.0)
+                << fmt.name << '/' << shape.name
+                << " did not execute the production NativeVNNI path";
+            ASSERT_TRUE(r.correctness_pass)
+                << fmt.name << '/' << shape.name
+                << " failed its FP32-reference correctness gate";
+
             char buf_bpw[16], buf_kb[16], buf_min[16], buf_mean[16];
             char buf_speedup[16], buf_keff[16], buf_bw[16], buf_eff[16], buf_cos[16];
             snprintf(buf_bpw, sizeof(buf_bpw), "%.1f", r.bpw);
@@ -1880,6 +2340,15 @@ namespace
         const std::vector<int> m_values = getDecodeMValues();
         const std::string profiler_request_id =
             native_vnni_dispatch::profilerRequestId();
+        const std::string profiler_batch_path =
+            native_vnni_dispatch::profilerEnvironment(
+                native_vnni_dispatch::kProfilerBatchPathEnvironment);
+        ASSERT_TRUE(
+            profiler_request_id.empty() || profiler_batch_path.empty())
+            << "ROCm profiler request and batch modes are mutually exclusive";
+        ROCmProfilerBatch profiler_batch(profiler_batch_path);
+        const bool profiler_only =
+            !profiler_request_id.empty() || profiler_batch.enabled();
         if (!profiler_request_id.empty())
         {
             ASSERT_EQ(format_filters.size(), 1u)
@@ -1941,10 +2410,20 @@ namespace
             {
                 if (!shouldRunName(shape_filters, shape.name))
                     continue;
+                if (profiler_batch.enabled() &&
+                    !profiler_batch.containsShape(fmt.name, shape.name))
+                {
+                    continue;
+                }
 
-                auto weights = fmt.create(
-                    static_cast<size_t>(shape.N),
-                    static_cast<size_t>(shape.K));
+                auto weights = profiler_only
+                                   ? makeProfilerWeightFixture(
+                                         fmt,
+                                         static_cast<size_t>(shape.N),
+                                         static_cast<size_t>(shape.K))
+                                   : fmt.create(
+                                         static_cast<size_t>(shape.N),
+                                         static_cast<size_t>(shape.K));
                 ASSERT_NE(weights, nullptr) << fmt.name << '/' << shape.name;
                 const auto &format_metadata =
                     llaminar2::test::quantizedVerifierFormat(fmt.name);
@@ -1976,6 +2455,34 @@ namespace
                     if (executed_cases >= max_cases)
                         break;
 
+                    size_t applicable_candidates = 0;
+                    if (profiler_batch.enabled())
+                    {
+                        for (const DecodeExecutionMode execution_mode :
+                             execution_modes)
+                        {
+                            applicable_candidates += profiler_batch.candidateIds(
+                                fmt.name,
+                                shape.name,
+                                decodeExecutionModeName(execution_mode),
+                                M,
+                                shape.N,
+                                shape.K)
+                                                         .size();
+                        }
+                        if (applicable_candidates == 0)
+                            continue;
+                    }
+                    else
+                    {
+                        applicable_candidates = static_cast<size_t>(
+                            std::count_if(
+                                variants.begin(),
+                                variants.end(),
+                                [M](const DecodeVariant &variant)
+                                { return variant.appliesToM(M); }));
+                    }
+
                     auto input = TestTensorFactory::createFP32Random(
                         {static_cast<size_t>(M), static_cast<size_t>(shape.K)},
                         -0.35f,
@@ -1994,14 +2501,14 @@ namespace
                             0);
                     ASSERT_TRUE(serial.valid)
                         << fmt.name << '/' << shape.name << " M=" << M
-                        << " serial M1 oracle failed: " << serial.failure_reason;
+                        << " serial M1 oracle failed: " << serial.failure_reason
+                        << " queried={kb=" << serial.kb
+                        << ",waves=" << serial.target_waves
+                        << "} observed={kb=" << serial.observed_kb
+                        << ",waves=" << serial.observed_target_waves
+                        << ",count=" << serial.observed_route_count
+                        << ",path=" << serial.observed_path << '}';
 
-                    const size_t applicable_candidates = static_cast<size_t>(
-                        std::count_if(
-                            variants.begin(),
-                            variants.end(),
-                            [M](const DecodeVariant &variant)
-                            { return variant.appliesToM(M); }));
                     ASSERT_GT(applicable_candidates, 0u)
                         << "No candidate selected for the required "
                         << (M == 1 ? "Fast M=1" : "VerifierSerialM1Bitwise")
@@ -2009,16 +2516,61 @@ namespace
 
                     std::vector<VariantRow> rows;
                     rows.reserve(applicable_candidates * execution_modes.size());
+                    std::vector<bool> active_modes(
+                        execution_modes.size(), false);
                     for (size_t mode_index = 0;
                          mode_index < execution_modes.size();
                          ++mode_index)
                     {
                         const DecodeExecutionMode execution_mode =
                             execution_modes[mode_index];
+                        const std::string execution_mode_name =
+                            decodeExecutionModeName(execution_mode);
+                        const std::set<std::string> requested_candidate_ids =
+                            profiler_batch.enabled()
+                                ? profiler_batch.candidateIds(
+                                      fmt.name,
+                                      shape.name,
+                                      execution_mode_name,
+                                      M,
+                                      shape.N,
+                                      shape.K)
+                                : std::set<std::string>{};
+                        if (profiler_batch.enabled() &&
+                            requested_candidate_ids.empty())
+                        {
+                            continue;
+                        }
                         for (const auto &variant : variants)
                         {
                             if (!variant.appliesToM(M))
                                 continue;
+                            const std::string effective_candidate_id =
+                                effectiveDecodeCandidateId(variant);
+                            if (profiler_batch.enabled() &&
+                                !requested_candidate_ids.contains(
+                                    effective_candidate_id))
+                            {
+                                continue;
+                            }
+                            std::string target_profiler_request_id =
+                                profiler_request_id;
+                            if (profiler_batch.enabled())
+                            {
+                                ROCmProfilerBatchRequest *request =
+                                    profiler_batch.claim(
+                                        fmt.name,
+                                        shape.name,
+                                        execution_mode_name,
+                                        M,
+                                        shape.N,
+                                        shape.K,
+                                        effective_candidate_id);
+                                ASSERT_NE(request, nullptr)
+                                    << "ROCm profiler batch omitted exact candidate "
+                                    << effective_candidate_id;
+                                target_profiler_request_id = request->request_id;
+                            }
                             DecodeCandidateTrainerEvidence result =
                                 runProductionDecodeCandidate(
                                     *kernel,
@@ -2034,26 +2586,33 @@ namespace
                                     weight_bytes,
                                     trainer_warmups,
                                     trainer_samples,
-                                    profiler_request_id,
+                                    target_profiler_request_id,
                                     0);
                             ASSERT_TRUE(result.valid)
                                 << fmt.name << '/' << shape.name << " M=" << M
                                 << ' ' << variant.name << ' '
                                 << decodeExecutionModeName(execution_mode)
                                 << " candidate failed: " << result.failure_reason;
+                            const bool isolated_profiler_request =
+                                !target_profiler_request_id.empty();
                             const bool verifier_exact =
-                                M == 1 || result.comparison.bitwiseEqual();
+                                isolated_profiler_request || M == 1 ||
+                                result.comparison.bitwiseEqual();
                             const bool eligible =
-                                result.route_counter_ok &&
-                                result.repeat_byte_mismatches == 0 &&
-                                result.numerical_correctness &&
-                                verifier_exact;
+                                isolated_profiler_request
+                                    ? result.route_counter_ok &&
+                                          result.isolated_profile_launches == 1
+                                    : result.route_counter_ok &&
+                                          result.repeat_byte_mismatches == 0 &&
+                                          result.numerical_correctness &&
+                                          verifier_exact;
                             rows.push_back(VariantRow{
                                 variant,
                                 execution_mode,
                                 mode_index,
                                 std::move(result),
                                 eligible});
+                            active_modes[mode_index] = true;
                             isolated_profile_launches +=
                                 rows.back().result.isolated_profile_launches;
                         }
@@ -2063,11 +2622,19 @@ namespace
                     for (size_t row_index = 0; row_index < rows.size(); ++row_index)
                     {
                         const auto &candidate = rows[row_index];
-                        if (!candidate.eligible ||
-                            candidate.result.timing.median <= 0.0)
+                        if (!candidate.eligible)
                             continue;
                         int &best_index =
                             best_indices[candidate.execution_mode_index];
+                        if (profiler_batch.enabled() ||
+                            !profiler_request_id.empty())
+                        {
+                            if (best_index < 0)
+                                best_index = static_cast<int>(row_index);
+                            continue;
+                        }
+                        if (candidate.result.timing.median <= 0.0)
+                            continue;
                         if (best_index < 0 ||
                             candidate.result.timing.median <
                                 rows[static_cast<size_t>(best_index)].result.timing.median)
@@ -2167,6 +2734,8 @@ namespace
                          mode_index < execution_modes.size();
                          ++mode_index)
                     {
+                        if (!active_modes[mode_index])
+                            continue;
                         const int best_index = best_indices[mode_index];
                         if (best_index < 0)
                         {
@@ -2235,6 +2804,12 @@ namespace
         {
             ASSERT_EQ(isolated_profile_launches, 1)
                 << "each ROCm profiler request must execute one target launch";
+        }
+        else if (profiler_batch.enabled())
+        {
+            EXPECT_NO_THROW(profiler_batch.requireComplete());
+            ASSERT_EQ(isolated_profile_launches, profiler_batch.size())
+                << "every ROCm profiler batch member must execute once";
         }
 #endif
     }
@@ -2537,6 +3112,12 @@ namespace
         for (const auto &r : results)
         {
             const float gate = cosine_gate_for(r.format_name);
+            EXPECT_GT(r.min_us, 0.0)
+                << r.format_name << "/" << r.shape_name
+                << " did not execute the production NativeVNNI path";
+            EXPECT_TRUE(r.correctness_pass)
+                << r.format_name << "/" << r.shape_name
+                << " failed its FP32-reference correctness gate";
             EXPECT_GE(r.cosine_sim, gate)
                 << r.format_name << "/" << r.shape_name
                 << " cosine=" << r.cosine_sim

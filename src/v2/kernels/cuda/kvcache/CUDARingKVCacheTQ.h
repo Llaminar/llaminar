@@ -328,6 +328,16 @@ namespace llaminar2
         void free_entry(TQEntry &entry);
 
         /**
+         * @brief Release every device allocation owned by this cache instance.
+         *
+         * Construction installs a scope guard that calls this method if any
+         * later allocation or initialization fails. The destructor uses the
+         * same path, so partial construction and ordinary teardown cannot
+         * drift into different ownership rules.
+         */
+        void releaseOwnedDeviceStorage() noexcept;
+
+        /**
          * @brief Publish every `[layer, request]` TQ ring pointer before capture.
          * @param stream Explicit initialization stream ordering the H2D publish.
          * @return true when both cache-owned device tables are ready.

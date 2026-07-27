@@ -4,6 +4,7 @@
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
 
 #include <algorithm>
+#include <cstring>
 #include <utility>
 
 namespace llaminar2
@@ -20,9 +21,39 @@ namespace llaminar2
     {
     }
 
-    bool PrefixStateCache::insert(PrefixBlockHandle handle)
+    bool PrefixStateCache::insert(
+        PrefixBlockHandle handle,
+        PrefixBlockHandle device_hot_handle)
     {
-        return insertResident(std::move(handle), /*count_store=*/true);
+        const bool install_device_hot = device_hot_handle.valid();
+        if (install_device_hot &&
+            (device_hot_handle.tier != PrefixStorageTier::DeviceHot ||
+             device_hot_handle.key != handle.key ||
+             !device_hot_handle.layout.compatiblePayloadShape(handle.layout) ||
+             !device_hot_backend_))
+        {
+            if (device_hot_backend_)
+                device_hot_backend_->release(device_hot_handle);
+            return false;
+        }
+
+        if (!insertResident(std::move(handle), /*count_store=*/true))
+        {
+            if (install_device_hot && device_hot_backend_)
+                device_hot_backend_->release(device_hot_handle);
+            return false;
+        }
+
+        if (install_device_hot)
+        {
+            if (!installDeviceHotCopy(
+                    std::move(device_hot_handle),
+                    /*repromotion=*/false))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     bool PrefixStateCache::insertResident(PrefixBlockHandle handle,
@@ -68,52 +99,91 @@ namespace llaminar2
         }
         stats_.ram_bytes = used_bytes_;
         addResidentStats(entry.block.handle);
-        auto [entry_it, inserted] = entries_.emplace(entry.block.handle.key, std::move(entry));
-        if (inserted)
+        entries_.emplace(entry.block.handle.key, std::move(entry));
+        (void)preserve_disk_entry;
+        return true;
+    }
+
+    bool PrefixStateCache::installDiscoveredDiskEntries(
+        uint64_t fingerprint,
+        const PrefixPayloadLayout &layout,
+        std::string *error)
+    {
+        if (!disk_backend_)
+            return true;
+
+        const auto discovered =
+            disk_backend_->compatibleEntries(fingerprint, layout, error);
+        for (const PrefixBlockHandle &handle : discovered)
         {
-            promoteResidentToDeviceHot(entry_it->second);
+            if (!handle.valid() || handle.tier != PrefixStorageTier::Disk)
+                continue;
+            auto [iterator, inserted] =
+                disk_entries_.emplace(handle.key, handle);
+            if (!inserted)
+            {
+                const uint64_t previous = iterator->second.total_bytes;
+                stats_.disk_bytes =
+                    stats_.disk_bytes > previous
+                        ? stats_.disk_bytes - previous
+                        : 0;
+                iterator->second = handle;
+            }
+            stats_.disk_bytes += handle.total_bytes;
         }
-        if (!preserve_disk_entry)
+        return true;
+    }
+
+    bool PrefixStateCache::installDeviceHotCopy(
+        PrefixBlockHandle device_hot_handle,
+        bool repromotion)
+    {
+        if (!device_hot_backend_ ||
+            !device_hot_handle.valid() ||
+            device_hot_handle.tier != PrefixStorageTier::DeviceHot)
         {
-            removeDiskEntry(resident_key);
+            return false;
         }
+
+        /*
+         * Replacing the same key is an installation detail, not capacity
+         * pressure. Keep the eviction counter reserved for true LRU demotions.
+         */
+        removeDeviceHotEntry(
+            device_hot_handle.key,
+            /*capacity_eviction=*/false);
+        device_hot_lru_.push_front(device_hot_handle.key);
+        device_hot_entries_.emplace(
+            device_hot_handle.key,
+            std::move(device_hot_handle));
+        ++stats_.promotions;
+        ++stats_.device_hot_promotions;
+        if (repromotion)
+            ++stats_.device_hot_repromotions;
+        stats_.device_hot_bytes =
+            static_cast<uint64_t>(device_hot_backend_->usedBytes());
+        stats_.device_bytes = stats_.device_hot_bytes;
         return true;
     }
 
     std::optional<PrefixBlockHandle> PrefixStateCache::find(const PrefixCacheKey &key)
     {
         stats_.lookups++;
+        auto hot_it = device_hot_entries_.find(key);
+        if (hot_it != device_hot_entries_.end())
+        {
+            ++stats_.hits;
+            ++stats_.device_hot_direct_hits;
+            touchDeviceHot(key);
+            auto resident_it = entries_.find(key);
+            if (resident_it != entries_.end())
+                touch(resident_it->second);
+            return hot_it->second;
+        }
+
         auto it = entries_.find(key);
         if (it == entries_.end())
         {
-            auto hot_it = device_hot_entries_.find(key);
-            if (hot_it != device_hot_entries_.end() && device_hot_backend_ && ram_backend_)
-            {
-                const PrefixBlockHandle hot_handle = hot_it->second;
-                if (evictUntilFits(hot_handle.total_bytes))
-                {
-                    PrefixBlockHandle hydrated;
-                    std::string error;
-                    if (device_hot_backend_->hydrateToRamBackend(
-                            hot_handle,
-                            *ram_backend_,
-                            &hydrated,
-                            &error) &&
-                        insertResident(hydrated, /*count_store=*/false, /*preserve_disk_entry=*/true))
-                    {
-                        ++stats_.hits;
-                        ++stats_.promotions;
-                        touchDeviceHot(key);
-                        auto hydrated_it = entries_.find(key);
-                        return hydrated_it == entries_.end()
-                                   ? std::optional<PrefixBlockHandle>{}
-                                   : std::optional<PrefixBlockHandle>{hydrated_it->second.block.handle};
-                    }
-                    ram_backend_->release(hydrated);
-                }
-                removeDeviceHotEntry(key);
-            }
-
             auto disk_it = disk_entries_.find(key);
             if (disk_it == disk_entries_.end() || !disk_backend_ || !ram_backend_)
             {
@@ -122,25 +192,90 @@ namespace llaminar2
             }
 
             const PrefixBlockHandle disk_handle = disk_it->second;
-            if (!evictUntilFits(disk_handle.total_bytes))
-            {
-                stats_.misses++;
-                return std::nullopt;
-            }
-
-            PrefixBlockHandle hydrated;
+            PrefixBlockHandle staged;
             std::string error;
-            if (!disk_backend_->readBlockIntoRamBackend(
+            if (!disk_backend_->readBlock(
                     key,
                     disk_handle.layout,
-                    *ram_backend_,
-                    &hydrated,
+                    &staged,
                     &error))
             {
                 ++stats_.disk_read_failures;
                 stats_.misses++;
                 removeDiskEntry(key);
                 return std::nullopt;
+            }
+
+            /*
+             * Verify and stage the requested disk record before demoting a RAM
+             * victim. If every tier is exactly full, that demotion is allowed
+             * to overwrite even this disk record; the already verified staging
+             * owner keeps the requested bytes alive until RAM publication.
+             */
+            if (!evictUntilFits(staged.total_bytes))
+            {
+                stats_.misses++;
+                return std::nullopt;
+            }
+
+            PrefixBlockHandle hydrated =
+                ram_backend_->allocate(key, staged.layout);
+            if (!hydrated.valid())
+            {
+                ++stats_.disk_read_failures;
+                stats_.misses++;
+                return std::nullopt;
+            }
+
+            const auto copy_section =
+                [](void *destination,
+                   const void *source,
+                   size_t bytes) -> bool
+            {
+                if (bytes == 0)
+                    return true;
+                if (!destination || !source)
+                    return false;
+                std::memcpy(destination, source, bytes);
+                return true;
+            };
+            if (!copy_section(
+                    hydrated.kv_payload,
+                    staged.kv_payload,
+                    staged.kvBytes()) ||
+                !copy_section(
+                    hydrated.hybrid_payload,
+                    staged.hybrid_payload,
+                    staged.hybridBytes()) ||
+                !copy_section(
+                    hydrated.mtp_payload,
+                    staged.mtp_payload,
+                    staged.layout.mtpKVBytes()) ||
+                !copy_section(
+                    hydrated.terminal_hidden,
+                    staged.terminal_hidden,
+                    staged.terminalHiddenBytes()) ||
+                !copy_section(
+                    hydrated.terminal_logits,
+                    staged.terminal_logits,
+                    staged.terminalLogitsBytes()))
+            {
+                ram_backend_->release(hydrated);
+                ++stats_.disk_read_failures;
+                stats_.misses++;
+                return std::nullopt;
+            }
+            hydrated.total_bytes = staged.total_bytes;
+            hydrated.has_hybrid_state = staged.has_hybrid_state;
+            hydrated.has_terminal_hidden = staged.has_terminal_hidden;
+            hydrated.has_terminal_logits = staged.has_terminal_logits;
+            hydrated.has_model_runtime_state =
+                staged.has_model_runtime_state;
+            if (staged.model_runtime_state_storage)
+            {
+                hydrated.model_runtime_state_storage =
+                    std::make_shared<std::vector<uint8_t>>(
+                        *staged.model_runtime_state_storage);
             }
 
             if (!insertResident(hydrated, /*count_store=*/false, /*preserve_disk_entry=*/true))
@@ -168,6 +303,7 @@ namespace llaminar2
     bool PrefixStateCache::contains(const PrefixCacheKey &key) const
     {
         return entries_.find(key) != entries_.end() ||
+               device_hot_entries_.find(key) != device_hot_entries_.end() ||
                disk_entries_.find(key) != disk_entries_.end();
     }
 
@@ -206,7 +342,7 @@ namespace llaminar2
         {
             erased = evictResident(key);
         }
-        removeDeviceHotEntry(key);
+        removeDeviceHotEntry(key, /*capacity_eviction=*/false);
         return removeDiskEntry(key) || erased;
     }
 
@@ -268,6 +404,42 @@ namespace llaminar2
         return evictUntilFits(incoming_bytes);
     }
 
+    bool PrefixStateCache::prepareDeviceHotCopy(
+        const PrefixBlockHandle &ram_archive,
+        PrefixBlockHandle *device_hot_handle)
+    {
+        if (!device_hot_handle || !device_hot_backend_ ||
+            !ram_archive.valid() ||
+            ram_archive.total_bytes > device_hot_backend_->budgetBytes())
+        {
+            return false;
+        }
+        if (!evictDeviceHotUntilFits(ram_archive.total_bytes))
+            return false;
+
+        std::string error;
+        return device_hot_backend_->allocateDeviceBlock(
+            ram_archive,
+            device_hot_handle,
+            &error);
+    }
+
+    bool PrefixStateCache::deviceHotCapacityEligible(size_t bytes) const
+    {
+        return device_hot_backend_ &&
+               bytes > 0 &&
+               bytes <= device_hot_backend_->budgetBytes();
+    }
+
+    std::optional<PrefixBlockHandle> PrefixStateCache::deviceHotCopy(
+        const PrefixCacheKey &key) const
+    {
+        const auto it = device_hot_entries_.find(key);
+        return it == device_hot_entries_.end()
+                   ? std::optional<PrefixBlockHandle>{}
+                   : std::optional<PrefixBlockHandle>{it->second};
+    }
+
     void PrefixStateCache::recordRequestLookup(int requested_tokens,
                                                int matched_tokens,
                                                int matched_blocks)
@@ -290,6 +462,21 @@ namespace llaminar2
     std::vector<PrefixCacheKey> PrefixStateCache::keysMostRecentFirst() const
     {
         return std::vector<PrefixCacheKey>(lru_.begin(), lru_.end());
+    }
+
+    bool PrefixStateCache::isRamResident(const PrefixCacheKey &key) const
+    {
+        return entries_.find(key) != entries_.end();
+    }
+
+    bool PrefixStateCache::isDeviceHotResident(const PrefixCacheKey &key) const
+    {
+        return device_hot_entries_.find(key) != device_hot_entries_.end();
+    }
+
+    bool PrefixStateCache::isDiskResident(const PrefixCacheKey &key) const
+    {
+        return disk_entries_.find(key) != disk_entries_.end();
     }
 
     bool PrefixStateCache::evictUntilFits(size_t incoming_bytes)
@@ -343,7 +530,9 @@ namespace llaminar2
                 return false;
             }
             const PrefixCacheKey victim = device_hot_lru_.back();
-            if (!removeDeviceHotEntry(victim))
+            if (!removeDeviceHotEntry(
+                    victim,
+                    /*capacity_eviction=*/true))
             {
                 return false;
             }
@@ -351,39 +540,9 @@ namespace llaminar2
         return true;
     }
 
-    bool PrefixStateCache::promoteResidentToDeviceHot(const Entry &entry)
-    {
-        if (!device_hot_backend_)
-        {
-            return false;
-        }
-
-        const PrefixBlockHandle &handle = entry.block.handle;
-        if (device_hot_entries_.find(handle.key) != device_hot_entries_.end())
-        {
-            return true;
-        }
-        if (!evictDeviceHotUntilFits(handle.total_bytes))
-        {
-            return false;
-        }
-
-        PrefixBlockHandle hot_handle;
-        std::string error;
-        if (!device_hot_backend_->promoteFromRam(handle, &hot_handle, &error))
-        {
-            return false;
-        }
-
-        device_hot_lru_.push_front(hot_handle.key);
-        stats_.promotions++;
-        stats_.device_hot_bytes = static_cast<uint64_t>(device_hot_backend_->usedBytes());
-        stats_.device_bytes = stats_.device_hot_bytes;
-        device_hot_entries_.emplace(hot_handle.key, std::move(hot_handle));
-        return true;
-    }
-
-    bool PrefixStateCache::removeDeviceHotEntry(const PrefixCacheKey &key)
+    bool PrefixStateCache::removeDeviceHotEntry(
+        const PrefixCacheKey &key,
+        bool capacity_eviction)
     {
         auto it = device_hot_entries_.find(key);
         if (it == device_hot_entries_.end())
@@ -408,6 +567,8 @@ namespace llaminar2
                                       ? static_cast<uint64_t>(device_hot_backend_->usedBytes())
                                       : 0;
         stats_.device_bytes = stats_.device_hot_bytes;
+        if (capacity_eviction)
+            ++stats_.device_hot_evictions;
         return true;
     }
 
@@ -453,29 +614,27 @@ namespace llaminar2
             return true;
         }
 
-        const size_t disk_budget = disk_backend_->budgetBytes();
-        if (disk_budget != 0 && stats_.disk_bytes + handle.total_bytes > disk_budget)
-        {
-            ++stats_.disk_write_failures;
-            return false;
-        }
-
-        PrefixBlockHandle disk_handle = disk_backend_->allocate(handle.key, handle.layout);
-        if (!disk_handle.valid())
-        {
-            ++stats_.disk_write_failures;
-            return false;
-        }
-
+        PrefixBlockHandle disk_handle;
+        std::vector<PrefixCacheKey> evicted_keys;
         std::string error;
-        if (!disk_backend_->writeBlock(handle, &error))
+        if (!disk_backend_->writeBlock(
+                handle,
+                &disk_handle,
+                &evicted_keys,
+                &error))
         {
             ++stats_.disk_write_failures;
             return false;
         }
 
+        for (const PrefixCacheKey &evicted : evicted_keys)
+        {
+            forgetDiskEntry(evicted);
+            ++stats_.disk_evictions;
+        }
         stats_.disk_bytes += disk_handle.total_bytes;
         disk_entries_.emplace(disk_handle.key, std::move(disk_handle));
+        ++stats_.ram_to_disk_demotions;
         return true;
     }
 
@@ -495,6 +654,17 @@ namespace llaminar2
         stats_.disk_bytes = stats_.disk_bytes > bytes ? stats_.disk_bytes - bytes : 0;
         disk_entries_.erase(it);
         return true;
+    }
+
+    void PrefixStateCache::forgetDiskEntry(const PrefixCacheKey &key)
+    {
+        auto it = disk_entries_.find(key);
+        if (it == disk_entries_.end())
+            return;
+        const uint64_t bytes = static_cast<uint64_t>(it->second.total_bytes);
+        stats_.disk_bytes =
+            stats_.disk_bytes > bytes ? stats_.disk_bytes - bytes : 0;
+        disk_entries_.erase(it);
     }
 
     void PrefixStateCache::touch(Entry &entry)

@@ -21,6 +21,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 // Include project headers
 #include "tensors/Tensors.h"
@@ -669,7 +670,7 @@ TEST_F(Test__ROCmSwiGLUParity, SwiGLU_FP32_ApplyTensor)
         rows, cols, false, nullptr, 0));
 
     ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
-    rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(rocm_output, stream.get());
     const float *result = rocm_output->data();
 
     ASSERT_FALSE(hasNaNOrInf(result, total));

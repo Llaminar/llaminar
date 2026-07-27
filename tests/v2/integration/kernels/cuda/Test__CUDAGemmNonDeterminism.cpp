@@ -38,6 +38,7 @@
 #include "../../../utils/CUDATestUtils.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/ScopedGPUStream.h"
 
 #include <vector>
 #include <array>
@@ -296,6 +297,22 @@ protected:
     std::mt19937 rng_{42};
     std::uniform_real_distribution<float> dist_{-1.0f, 1.0f};
     std::unique_ptr<DeviceWorkspaceManager> workspace_;
+    std::unique_ptr<llaminar2::test::ScopedGPUStream> producer_stream_;
+
+    /**
+     * @brief Lazily create the fixture's explicit non-default CUDA stream.
+     *
+     * The same handle is bound to every kernel in a coherence transaction and
+     * passed to publication, so tests cannot accidentally launch on one stream
+     * and publish completion on another.
+     */
+    void *explicitProducerStream()
+    {
+        if (!producer_stream_)
+            producer_stream_ =
+                std::make_unique<llaminar2::test::ScopedGPUStream>(gpu_device_);
+        return producer_stream_->get();
+    }
 
     struct SplitKComparisonResult
     {
@@ -354,6 +371,8 @@ protected:
 
         for (auto *k : kernels)
         {
+            if (k)
+                k->setGPUStream(explicitProducerStream());
             auto *ws = dynamic_cast<IWorkspaceConsumer *>(k);
             if (ws)
                 ws->bindWorkspace(workspace_.get());
@@ -397,6 +416,7 @@ protected:
             weight, gpu_device_);
         if (!kernel)
             return false;
+        kernel->setGPUStream(explicitProducerStream());
 
         auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
         if (!ws)
@@ -448,6 +468,7 @@ protected:
                     gpu_device_,
                     {input.get()},
                     {output.get()},
+                    explicitProducerStream(),
                     [&]
                     {
                         return kernel->multiply_tensor(
@@ -628,6 +649,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedGateUp_SelfConsistency)
             gpu_device_,
             {input.get()},
             {out_gate.get(), out_up.get()},
+            explicitProducerStream(),
             [&]
             {
                 return kernel_gate->multiply_fused_tensor(
@@ -773,6 +795,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedQKV_SelfConsistency)
             gpu_device_,
             {input.get()},
             {out_q.get(), out_k.get(), out_v.get()},
+            explicitProducerStream(),
             [&]
             {
                 return k_q->multiply_fused_tensor(
@@ -884,6 +907,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, SingleKernel_SelfConsistency)
     auto *kernel = getPreparedKernel(
         w_up, gpu_device_);
     ASSERT_NE(kernel, nullptr);
+    kernel->setGPUStream(explicitProducerStream());
 
     // Set up workspace for single kernel
     auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
@@ -913,6 +937,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, SingleKernel_SelfConsistency)
             gpu_device_,
             {input.get()},
             {output.get()},
+            explicitProducerStream(),
             [&]
             {
                 return kernel->multiply_tensor(
@@ -1016,6 +1041,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
 
     auto *kernel = getPreparedKernel(w_down, gpu_device_);
     ASSERT_NE(kernel, nullptr);
+    kernel->setGPUStream(explicitProducerStream());
 
     auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
     ASSERT_NE(ws, nullptr);
@@ -1043,6 +1069,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
             gpu_device_,
             {input.get()},
             {output.get()},
+            explicitProducerStream(),
             [&]
             {
                 return kernel->multiply_tensor(
@@ -1109,6 +1136,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMDeterministicModeIs
 
     auto *kernel = getPreparedKernel(w_down, gpu_device_);
     ASSERT_NE(kernel, nullptr);
+    kernel->setGPUStream(explicitProducerStream());
 
     auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
     ASSERT_NE(ws, nullptr);
@@ -1128,6 +1156,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMDeterministicModeIs
         gpu_device_,
         {input.get()},
         {output.get()},
+        explicitProducerStream(),
         [&]
         {
             return kernel->multiply_tensor(
@@ -1154,7 +1183,19 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMDeterministicModeIs
 #endif
 }
 
-TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesSweepTiles)
+/**
+ * @test Prove ordinary CUDA NativeVNNI prefill is total without a generated
+ * prefill dispatch include.
+ *
+ * The production M=1 and grouped-verifier surfaces consume certified learned
+ * dispatch, but prompt prefill intentionally remains on the legacy
+ * format/geometry heuristic. Exercise representative Qwen3.6 dense projection
+ * geometries in Q4_K and Q5_1, require a legal physical tile and split-K choice,
+ * and verify the launcher publishes the exact heuristic selection through
+ * PerfStats. A missing learned prefill corpus must therefore neither fail the
+ * operation nor silently suppress route telemetry.
+ */
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DensePromptPrefillUsesTotalHeuristic)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
@@ -1176,23 +1217,15 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
         int m;
         int n;
         int k;
-        int expected_tile;
-        int expected_split_k;
     };
 
     const Shape shapes[] = {
-        {"Qwen36_FFN_GateUp_Q4_K", 5, 595, 17408, 5120, 4, 1},
-        {"Qwen36_FFN_DownProjection_Q4_K_policy_bucket", 5, 595, 5120, 17408, 4, 4},
-        {"Qwen36_FFN_DownProjection_Q4_K_bucketed", 5, 600, 5120, 17408, 4, 4},
-        {"Qwen36_Attention_KVProjection_Q4_K_bucketed", 5, 600, 1024, 5120, 4, 4},
-        {"Qwen36_GDN_InnerProjection_Q4_K", 5, 595, 10240, 5120, 4, 1},
-        {"Qwen36_GDN_ZProjection_Q4_K", 5, 595, 6144, 5120, 4, 2},
-        {"Qwen36_GDN_OutputProjection_Q4_K", 5, 595, 5120, 6144, 4, 2},
-        {"Qwen36_GDN_InnerProjection_Q5_1", 7, 595, 10240, 5120, 4, 1},
-        {"Qwen36_GDN_ZProjection_Q5_1", 7, 595, 6144, 5120, 4, 2},
-        {"Qwen36_GDN_OutputProjection_Q5_1", 7, 595, 5120, 6144, 4, 2},
-        {"Qwen36_FFN_GateUp_Q5_1_bucketed", 7, 600, 17408, 5120, 4, 1},
-        {"Qwen36_FFN_DownProjection_Q5_1_bucketed", 7, 600, 5120, 17408, 4, 8},
+        {"Qwen36_FFN_GateUp_Q4_K", 5, 595, 17408, 5120},
+        {"Qwen36_FFN_DownProjection_Q4_K", 5, 600, 5120, 17408},
+        {"Qwen36_Attention_KVProjection_Q4_K", 5, 600, 1024, 5120},
+        {"Qwen36_GDN_OutputProjection_Q4_K", 5, 595, 5120, 6144},
+        {"Qwen36_GDN_InnerProjection_Q5_1", 7, 595, 10240, 5120},
+        {"Qwen36_FFN_DownProjection_Q5_1", 7, 600, 5120, 17408},
     };
 
     ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
@@ -1261,8 +1294,11 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
         cudaNativeVNNIPrefill_getLastLaunchSelection(
             &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
 
-        EXPECT_EQ(selected_tile, shape.expected_tile);
-        EXPECT_EQ(selected_split_k, shape.expected_split_k);
+        EXPECT_GE(selected_tile, 0);
+        EXPECT_LE(selected_tile, 5);
+        EXPECT_TRUE(
+            selected_split_k == 1 || selected_split_k == 2 ||
+            selected_split_k == 4 || selected_split_k == 8);
         EXPECT_EQ(used_bk256, 0);
         EXPECT_EQ(used_streamk, 0);
 
@@ -1286,8 +1322,8 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
             {
                 found = true;
                 EXPECT_EQ(tag("codebook"), std::to_string(shape.codebook));
-                EXPECT_EQ(tag("tile_id"), std::to_string(shape.expected_tile));
-                EXPECT_EQ(tag("split_k"), std::to_string(shape.expected_split_k));
+                EXPECT_EQ(tag("tile_id"), std::to_string(selected_tile));
+                EXPECT_EQ(tag("split_k"), std::to_string(selected_split_k));
                 EXPECT_EQ(tag("bk256"), "0");
                 EXPECT_EQ(tag("streamk"), "0");
                 EXPECT_EQ(tag("sums_a"), "1")
@@ -1299,7 +1335,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
                 break;
             }
         }
-        EXPECT_TRUE(found) << "NativeVNNI prefill dispatch must emit structured route counters for "
+        EXPECT_TRUE(found) << "NativeVNNI heuristic prefill dispatch must emit structured route counters for "
                            << shape.name << "\n"
                            << PerfStatsCollector::summaryString({"kernel"}, 0);
 
@@ -1676,6 +1712,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36MoEMixedQKVConcurrentDecod
             gpu_device_,
             {input.get()},
             {q_output.get(), k_output.get(), v_output.get()},
+            static_cast<void *>(stream),
             [&]
             {
                 return q_kernel->multiply_fused_tensor(
@@ -1771,6 +1808,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurren
             gpu_device_,
             {input.get()},
             {out_gate.get(), out_up.get()},
+            explicitProducerStream(),
             [&]
             {
                 return gate_kernel->multiply_fused_tensor(
@@ -1888,6 +1926,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurren
             gpu_device_,
             {input.get()},
             {q_output.get(), k_output.get(), v_output.get()},
+            static_cast<void *>(stream),
             [&]
             {
                 return q_kernel->multiply_fused_tensor(

@@ -40,7 +40,7 @@ from .shape_manifest import load_shape_manifest
 from .segmented_policy import GenericDispatchRule
 
 
-CPU_PREFILL_TRAINING_PLAN_VERSION = "cpu-prefill-exhaustive-plan-v12"
+CPU_PREFILL_TRAINING_PLAN_VERSION = "cpu-prefill-exhaustive-plan-v13"
 CPU_PREFILL_SEALED_WITNESS_PLAN_SCHEMA = (
     "cpu-prefill-sealed-witness-plan-v2"
 )

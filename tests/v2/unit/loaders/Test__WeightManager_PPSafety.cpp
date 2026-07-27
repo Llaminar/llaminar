@@ -17,12 +17,48 @@
 #include <gtest/gtest.h>
 #include <memory>
 
+#include "loaders/PreparedWeightStore.h"
 #include "loaders/WeightManager.h"
 #include "tensors/Tensors.h"
 #include "mocks/MockModelLoader.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
+
+namespace
+{
+    void registerPreparedState(
+        PreparedWeightStore &store,
+        const std::shared_ptr<TensorBase> &tensor)
+    {
+        constexpr uint64_t binding_id = 1;
+        WeightBinding binding;
+        binding.binding_id = binding_id;
+        binding.identity = makeSourceWeightIdentity(
+            "test.prepared",
+            ModelContextId{99},
+            binding_id);
+        binding.tensor = tensor.get();
+        binding.residency.home_device = DeviceId::cpu();
+        binding.residency.resident_device = DeviceId::cpu();
+        binding.immutable = true;
+
+        auto handle =
+            std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
+        handle->tensor = tensor.get();
+        handle->device_id = DeviceId::cpu();
+        handle->kind =
+            llaminar::v2::kernels::KernelFactory::GemmPreparationKind::CPU_PACKED;
+        handle->prepared_weights =
+            std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmWeights>();
+
+        store.registerPreparedGemmHandle(
+            binding,
+            PreparedWeightKind::CpuPackedGemm,
+            DeviceId::cpu(),
+            std::move(handle));
+    }
+}
 
 // ============================================================================
 // TestableWeightManager — opens lifecycle gates for release decision tests
@@ -288,7 +324,8 @@ TEST_F(Test__WeightManager_PPSafety, ReleaseAll_ReleasesHostResidentWithPrepared
     auto tensor = wm.getWeightForDevice("test_weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor, nullptr);
     tensor->setHostResident();
-    tensor->has_prepared_device_state_ = true;
+    PreparedWeightStore prepared_store(ModelContextId{99});
+    registerPreparedState(prepared_store, tensor);
 
     size_t released = wm.releaseAllHostWeightData();
     EXPECT_GE(released, 1);

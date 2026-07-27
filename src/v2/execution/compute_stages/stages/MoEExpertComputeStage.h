@@ -72,6 +72,14 @@ namespace llaminar2
             // Router config (routing done externally by MoERoutingStage)
             int num_experts = 0;
             int top_k = 0;
+            /**
+             * @brief Graph-local kernel owner shared only with this stage's router.
+             *
+             * The router publishes Q8 hidden rows and route metadata into this
+             * device-resident pipeline context. Main decode, MTP sidecars, and
+             * rebalance maintenance each receive different owners.
+             */
+            std::shared_ptr<MoERoutedPipelineKernelOwner> routed_pipeline_kernel_owner;
 
             // Expert weights (3D packed tensors) — used by CPU path
             TensorBase *gate_exps = nullptr; ///< [num_experts, intermediate, d_model]
@@ -225,8 +233,28 @@ namespace llaminar2
             DeviceMoERebalanceTransferMode prefill_llep_transfer_mode =
                 DeviceMoERebalanceTransferMode::ResidentOnly;
             bool prefill_llep_require_transfer_backing = false;
+            /**
+             * @brief Prepend exact prefix-placement payload reconstruction.
+             *
+             * This immutable graph-build flag selects a one-shot captured
+             * transaction. The runtime table already owns the desired transfer
+             * list in persistent device scratch; the stage executes that list
+             * before decode or prefill routing can observe placement.
+             */
+            bool prefix_runtime_device_rehydration = false;
             DeviceMoERebalanceConfig prefill_llep_rebalance_config;
             std::shared_ptr<DeviceMoERebalanceTransferState> prefill_llep_transfer_state;
+            /**
+             * @brief Event identity dedicated to restore-time payload movement.
+             *
+             * A restored suffix can execute rehydration and a new current-batch
+             * LLEP movement in the same layer graph. They share one serialized
+             * transfer stream/workspace lane, but must not alias event objects:
+             * two records of one event inside one captured graph make dependency
+             * ownership ambiguous on CUDA and HIP.
+             */
+            std::shared_ptr<DeviceMoERebalanceTransferState>
+                prefix_runtime_rehydration_transfer_state;
             std::string prefill_llep_workspace_name;
 
             /*
@@ -258,6 +286,16 @@ namespace llaminar2
         bool execute(IDeviceContext *ctx) override;
         bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::MOE_EXPERT_FFN; }
+        /**
+         * @brief Report transfer-backed LLEP collectives embedded in this stage.
+         *
+         * Ordinary grouped expert compute is participant-local and is followed
+         * by an explicit graph collective. Full LLEP prefill is different: its
+         * device-resident movement transaction gathers plans, headers, and
+         * payloads inside this stage. The instance-level contract keeps capture
+         * planning accurate without misclassifying every MoE expert stage.
+         */
+        bool isCollectiveStage() const override;
         std::string name() const override { return "moe_ffn"; }
         size_t estimatedFlops() const override;
 
@@ -283,9 +321,10 @@ namespace llaminar2
                        : MoEDecodeDescriptorSource::StaticDescriptorTable;
         }
 
-        /// Test-only visibility for replica metadata stamped onto rebuilt graphs.
+        /// Test-only visibility for placement metadata stamped onto rebuilt graphs.
         int replicaCountForTesting() const { return params_.replica_set.num_replicated; }
         int replicaParticipantForTesting() const { return params_.my_socket_id; }
+        const std::vector<bool> &expertMaskForTesting() const { return params_.expert_mask; }
         RoutedExpertAssignmentPolicy routedExpertAssignmentPolicyForTesting() const
         {
             return params_.routed_assignment_policy;
@@ -305,6 +344,11 @@ namespace llaminar2
         {
             return params_.prefill_llep_workspace_name;
         }
+        const DeviceMoERebalanceTransferState *
+        prefillLLEPTransferStateForTesting() const
+        {
+            return params_.prefill_llep_transfer_state.get();
+        }
 
         /// With expert-ID apportionment, a participant's output can be all zeros
         /// when no selected experts fall in its local range. The downstream
@@ -318,20 +362,67 @@ namespace llaminar2
         /// mask.size() must == num_experts. Returns false on size mismatch.
         bool updateExpertMask(const std::vector<bool> &mask);
 
-        /// Set replica info for per-token dynamic dispatch.
+        /**
+         * @brief Publish replica placement for per-token dynamic dispatch.
+         *
+         * The expert mask and replica set are two views of one placement
+         * transaction. Every owner and every advertised replica must already
+         * have a prepared local GEMM engine before the replica set becomes
+         * visible to decode. Validating that invariant here turns an incoherent
+         * publication into an immediate, attributable failure instead of a
+         * later null-engine abort inside the token hot path.
+         *
+         * @param replicas Authoritative owner and replica placement.
+         * @param socket_id Domain-local participant represented by this stage.
+         * @throws std::runtime_error if the local expert mask does not contain
+         *         an owner or replica advertised as resident on this participant.
+         */
         void setReplicaSet(const ExpertReplicaSet &replicas, int socket_id)
         {
-            params_.replica_set = replicas;
-            params_.replica_set.rebuildAggregateReplicaFlags();
+            ExpertReplicaSet normalized_replicas = replicas;
+            normalized_replicas.rebuildAggregateReplicaFlags();
+
+            /*
+             * All participants receive the same replica metadata, while each
+             * stage carries only its participant-local residency mask. Check
+             * only the forward implication here: every advertised local owner
+             * or replica must be resident. A mask may intentionally contain
+             * additional cache residents that are not eligible for assignment.
+             */
+            for (size_t expert = 0; expert < normalized_replicas.owner_socket.size(); ++expert)
+            {
+                const bool is_owner =
+                    normalized_replicas.owner_socket[expert] == socket_id;
+                const bool is_replica =
+                    normalized_replicas.hasReplicaOnParticipant(
+                        params_.layer_idx,
+                        static_cast<int>(expert),
+                        socket_id);
+                if ((!is_owner && !is_replica) ||
+                    (expert < params_.expert_mask.size() && params_.expert_mask[expert]))
+                {
+                    continue;
+                }
+
+                throw std::runtime_error(
+                    "MoE replica publication advertised expert " +
+                    std::to_string(expert) + " as resident on participant " +
+                    std::to_string(socket_id) + " for layer " +
+                    std::to_string(params_.layer_idx) +
+                    " before the expert mask and GEMM engines were published");
+            }
+
+            params_.replica_set = std::move(normalized_replicas);
             params_.my_socket_id = socket_id;
             // Pre-build prefill mask: single-lookup replaces multi-branch check
-            if (replicas.num_replicated > 0 && !params_.expert_mask.empty())
+            if (params_.replica_set.num_replicated > 0 && !params_.expert_mask.empty())
                 params_.replica_set.buildPrefillMask(socket_id, params_.expert_mask, params_.layer_idx);
             else
                 params_.replica_set.prefill_mask.clear();
             grouped_gateup_desc_table_dirty_ = true;
             grouped_down_desc_table_dirty_ = true;
             moe_runtime_table_initialized_ = false;
+            invalidateFixedTopologyMaskPublication();
             if (!refreshGraphStablePlacement(/*preserve_capture_ready=*/true))
             {
                 throw std::runtime_error(
@@ -407,9 +498,34 @@ namespace llaminar2
 
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
+        /**
+         * @brief Describe every routed-expert graph-capture readiness invariant.
+         *
+         * Warmup-dependent capture failures are fatal.  Returning the complete
+         * predicate state here lets the capture controller identify whether the
+         * missing prerequisite is the backend kernel, descriptor tables, the
+         * runtime placement bank, runtime prefill scratch, or fixed-mask
+         * publication without adding one-off logging at each caller.
+         *
+         * @return Stable key/value diagnostics intended for fatal logs and
+         * PerfStats failure records.
+         */
+        std::string graphCaptureReadinessDebugString() const override;
         bool supportsWarmupDependentGraphCapture() const override;
         bool supportsLazyPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
+        /**
+         * @brief Preflight transfer-lane resources before a prefill graph launch.
+         *
+         * Transfer-backed LLEP is a multi-stream graph transaction. Preparing
+         * the shared rolling lane here prevents stream/event allocation from
+         * occurring inside stage execution while CUDA/HIP capture is active.
+         */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        bool needsGraphLaunchPreparation() const override
+        {
+            return hasTransferBackedPrefillLLEP();
+        }
         /**
          * @brief Drop per-request fused decode warmup state.
          *
@@ -436,6 +552,16 @@ namespace llaminar2
          */
         void invalidateKernelDynamicState() override
         {
+            IMoEKernel *kernel =
+                params_.routed_pipeline_kernel_owner &&
+                        params_.routed_pipeline_kernel_owner->kernel
+                    ? params_.routed_pipeline_kernel_owner->kernel.get()
+                    : owned_moe_kernel_.get();
+            if (kernel)
+            {
+                kernel->resetDynamicState();
+                kernel->setGPUStream(nullptr);
+            }
             grouped_gateup_desc_table_id_ = -1;
             grouped_gateup_desc_table_num_experts_ = 0;
             grouped_gateup_desc_table_d_model_ = 0;
@@ -455,6 +581,7 @@ namespace llaminar2
             combined_shared_desc_table_d_model_ = 0;
             combined_shared_desc_table_intermediate_ = 0;
             runtime_grouped_decode_warmed_ = false;
+            invalidateFixedTopologyMaskPublication();
         }
 
         /**
@@ -513,8 +640,25 @@ namespace llaminar2
         DeviceWorkspaceManager *getWorkspace() const override;
 
         // Test accessor
-        void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
+        void setMoEKernelForTesting(IMoEKernel *kernel)
+        {
+            params_.routed_pipeline_kernel_owner.reset();
+            owned_moe_kernel_.reset();
+            moe_kernel_ = kernel;
+        }
         void setRuntimeGroupedDecodeWarmedForTesting(bool warmed) { runtime_grouped_decode_warmed_ = warmed; }
+        /**
+         * @brief Mark runtime-prefill scratch as prepared without performing GPU work.
+         *
+         * Unit tests use a host-backed runtime-table sentinel to exercise the
+         * capture predicate.  Real execution may set this state only through
+         * initializeMoERuntimeTableForGroupedPrefill(), which validates every
+         * persistent device pointer and capacity before returning true.
+         */
+        void setRuntimePrefillGroupingAvailableForTesting(bool available)
+        {
+            moe_prefill_runtime_grouping_available_ = available;
+        }
         bool usesCPUDecodeEquivalentVerifierPrefillForTesting() const
         {
             return params_.force_decode_equivalent_verifier_prefill;
@@ -535,6 +679,22 @@ namespace llaminar2
         bool usesFixedTopologyGroupedPrefillForTesting() const
         {
             return canUseFixedTopologyGroupedPrefill();
+        }
+        /**
+         * @brief Report whether grouped verifier routing publishes decode demand.
+         *
+         * This accessor executes no backend work. It exists so unit tests can
+         * prove that the graph's GPU grouped-verifier policy flag reaches the
+         * same publication decision as the CPU decode-equivalent policy flag.
+         */
+        bool publishesGroupedVerifierHistogramsForTesting() const noexcept
+        {
+            return shouldPublishGroupedVerifierHistograms();
+        }
+        bool hasPublishedFixedTopologyMaskForTesting() const noexcept
+        {
+            return fixed_topology_mask_publication_state_ ==
+                   FixedTopologyMaskPublicationState::Published;
         }
         std::vector<int> fixedTopologyPrefillExpertIdsForTesting() const
         {
@@ -566,6 +726,22 @@ namespace llaminar2
         }
 
     private:
+        /**
+         * @brief Lifecycle state for the graph-stable fixed-topology expert mask.
+         *
+         * A mask is ordinary control-plane metadata until it has been copied to
+         * the backend-owned workspace buffer. Graph execution may consume only
+         * the Published state. Workspace rebinding, kernel dynamic-state reset,
+         * and placement changes move the stage back to NeedsPublication so stale
+         * device addresses or stale ownership can never look capture-ready.
+         */
+        enum class FixedTopologyMaskPublicationState : uint8_t
+        {
+            NotRequired,
+            NeedsPublication,
+            Published,
+        };
+
         Params params_;
         bool raw_weights_released_ = false;                       ///< Set by releaseRawExpertWeights()
         DeviceWorkspaceManager *bound_workspace_ = nullptr;       ///< Workspace for expert GEMM engines
@@ -600,7 +776,15 @@ namespace llaminar2
         /// Reusable expert-id list for full-local grouped decode descriptor preparation.
         mutable std::vector<int> all_expert_ids_;
 
-        /// Cached MoE kernel (gather/scatter, SwiGLU fallback)
+        /**
+         * @brief Independently owned launch state for this routed-expert stage.
+         *
+         * A MoE backend caches streams, workspaces, descriptor tables, and
+         * scratch pointers. Keeping it stage-local prevents a concurrently
+         * captured MTP, routing, shared-expert, or maintenance stage from
+         * changing those values between grouped launches.
+         */
+        mutable std::unique_ptr<IMoEKernel> owned_moe_kernel_;
         mutable IMoEKernel *moe_kernel_ = nullptr;
 
         /**
@@ -614,6 +798,10 @@ namespace llaminar2
          * start after that exact route has succeeded.
          */
         mutable bool runtime_grouped_decode_warmed_ = false;
+
+        /// Explicit publication state for the backend-owned fixed-topology mask.
+        FixedTopologyMaskPublicationState fixed_topology_mask_publication_state_ =
+            FixedTopologyMaskPublicationState::NotRequired;
 
         /// Fast path for decode (seq_len=1): avoids token grouping, gather/scatter,
         /// and per-expert heap allocations. Uses routing results directly.
@@ -668,6 +856,23 @@ namespace llaminar2
          */
         bool refreshRuntimeGroupedDecodePlacement(bool preserve_capture_ready);
         bool refreshFixedTopologyGroupedPrefillPlacement();
+        /**
+         * @brief Mark the current fixed-topology mask as requiring publication.
+         *
+         * This transition is called whenever the workspace, kernel dynamic
+         * state, expert ownership, or replica ownership changes. Full-ownership
+         * stages do not need a mask and remain in NotRequired.
+         */
+        void invalidateFixedTopologyMaskPublication() noexcept;
+        /**
+         * @brief Publish the host control-plane mask to backend-owned device storage.
+         *
+         * Publication is legal only outside graph capture and is ordered on the
+         * stage's explicit stream. The subsequent warmup grouping launch observes
+         * that copy on the same stream; graph capture is admitted only after this
+         * method has transitioned the stage to Published.
+         */
+        bool publishFixedTopologyMaskBeforeCapture(IMoEKernel *kernel);
         bool ensureGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
         bool ensureGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
         bool ensureCombinedSharedVerifierResources(IMoEKernel *kernel, int d_model, int intermediate);
@@ -679,6 +884,21 @@ namespace llaminar2
         bool supportsRequestedRoutedAssignmentPolicy() const;
         bool canUseRuntimePrefillGrouping() const;
         bool canUseFixedTopologyGroupedPrefill() const;
+        /**
+         * @brief Decide whether this grouped invocation owns production demand.
+         *
+         * CPU grouped verification enters through
+         * `force_decode_equivalent_verifier_prefill`, while CUDA and ROCm enter
+         * the same economical route through
+         * `force_grouped_verifier_prefill_for_decode`. Both are production
+         * verifier paths and therefore both must update the persistent
+         * device-resident selected/local histograms consumed by maintenance.
+         */
+        bool shouldPublishGroupedVerifierHistograms() const noexcept
+        {
+            return params_.force_decode_equivalent_verifier_prefill ||
+                   params_.force_grouped_verifier_prefill_for_decode;
+        }
         /**
          * @brief True when verifier rows can use the safe routed+shared composite path.
          *
@@ -692,18 +912,31 @@ namespace llaminar2
         bool canUseSafeCombinedSharedVerifierComposite() const;
         TensorBase *effectiveSafeCompositeSharedGateInput() const;
         bool executeSafeCombinedSharedVerifierComposite(IMoEKernel *kernel) const;
-        bool executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const;
+        bool executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens);
         bool hasTransferBackedPrefillLLEP() const;
         bool executeTransferBackedPrefillLLEPMovement(
             IMoEKernel *kernel,
             DeviceMoERebalanceStatus **transfer_status_out,
-            DeviceMoERebalanceApplyStatus **apply_status_out) const;
+            DeviceMoERebalanceApplyStatus **apply_status_out,
+            DeviceMoERebalanceTransferState *transfer_state_override =
+                nullptr) const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
         bool supportsFixedTopologyPrefillGraphCapturePreflight() const;
         bool isFixedTopologyPrefillGraphCapturable() const;
         const std::vector<bool> *fixedTopologyPrefillMask() const;
         bool hasFixedTopologyPrefillExpertMask() const;
         bool usesMaskedFixedTopologyPrefill() const;
+        /**
+         * @brief True when grouped prefill consumes the published fixed mask.
+         *
+         * Runtime-table grouping and fixed-mask grouping are mutually exclusive
+         * placement sources.  LLEP and other runtime-grouped paths consume the
+         * persistent DeviceMoERuntimeTable directly, so requiring or publishing
+         * the static mask for those paths creates a contradictory lifecycle
+         * contract.  Centralizing the distinction here keeps execution,
+         * invalidation, and graph-capture readiness in agreement.
+         */
+        bool usesPublishedFixedTopologyMaskGrouping() const;
         std::vector<int> fixedTopologyPrefillExpertIds() const;
         std::vector<uint8_t> fixedTopologyPrefillExpertMaskBytes() const;
         bool expertComputesLocally(int expert_id) const;
@@ -772,12 +1005,32 @@ namespace llaminar2
             TensorBase *up_w = nullptr;   ///< Shared expert up [intermediate, d_model]
             TensorBase *down_w = nullptr; ///< Shared expert down [d_model, intermediate]
             TensorBase *output = nullptr; ///< Output [seq_len, d_model]
+            /**
+             * @brief Arena-owned gate projection scratch.
+             *
+             * GPU shared-expert execution must never allocate this tensor from
+             * execute(). The graph resolver sizes one reusable MoE scratch pair
+             * for the largest routed/shared intermediate width, and the stage
+             * contract makes the executor establish its device storage before
+             * any projection launch.
+             */
+            TensorBase *gate_scratch = nullptr; ///< [capacity_rows, capacity_intermediate]
+            /**
+             * @brief Arena-owned up projection scratch.
+             *
+             * This buffer has the same graph lifetime and capacity contract as
+             * @ref gate_scratch. Separate buffers are required because fused
+             * gate/up projection streams may write them concurrently.
+             */
+            TensorBase *up_scratch = nullptr; ///< [capacity_rows, capacity_intermediate]
             int seq_len = 0;
             int d_model = 0;
             int intermediate = 0;
 
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
+            BufferId gate_scratch_buffer_id = BufferId::MOE_GATE_SCRATCH;
+            BufferId up_scratch_buffer_id = BufferId::MOE_UP_SCRATCH;
             bool force_grouped_verifier_prefill_for_decode = false;
             bool force_decode_equivalent_verifier_prefill = false;
             /**
@@ -836,6 +1089,11 @@ namespace llaminar2
          */
         void invalidateKernelDynamicState() override
         {
+            if (owned_moe_kernel_)
+            {
+                owned_moe_kernel_->resetDynamicState();
+                owned_moe_kernel_->setGPUStream(nullptr);
+            }
             shared_grouped_gateup_desc_table_id_ = -1;
             shared_grouped_gateup_desc_table_d_model_ = 0;
             shared_grouped_gateup_desc_table_intermediate_ = 0;
@@ -894,8 +1152,25 @@ namespace llaminar2
         mutable std::shared_ptr<void> shared_packed_up_lifetime_;
         mutable std::shared_ptr<void> shared_packed_down_lifetime_;
 
-        mutable std::shared_ptr<FP32Tensor> scratch_gate_;
-        mutable std::shared_ptr<FP32Tensor> scratch_up_;
+        /**
+         * @brief Typed aliases of the arena-owned projection scratch tensors.
+         *
+         * The stage deliberately does not own these pointers. BufferArena owns
+         * their host/device allocations for the complete graph lifetime, which
+         * lets every layer reuse the same stable addresses without one
+         * runtime device allocation per layer during prefill.
+         */
+        FP32Tensor *scratch_gate_ = nullptr;
+        FP32Tensor *scratch_up_ = nullptr;
+        /**
+         * @brief CPU-only construction-time storage for standalone stages.
+         *
+         * Production GPU graphs must supply arena-owned scratch through Params.
+         * CPU unit and standalone execution can own ordinary host tensors
+         * because no device allocation or graph-address lifetime is involved.
+         */
+        std::shared_ptr<FP32Tensor> owned_cpu_scratch_gate_;
+        std::shared_ptr<FP32Tensor> owned_cpu_scratch_up_;
         mutable int scratch_seq_len_ = 0;
         /**
          * @brief True once normal single-token grouped decode has populated
@@ -916,6 +1191,14 @@ namespace llaminar2
         bool shouldUseGroupedDecodeRoute() const;
         bool tryGroupedVerifierPrefill(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool tryGroupedDecode(IMoEKernel *kernel, int d_model, int intermediate) const;
+        /**
+         * @brief Validate the graph-owned scratch capacity before execution.
+         *
+         * GPU callers fail closed when the graph omitted, mistyped, or
+         * undersized either tensor. This method never allocates or resizes
+         * storage, so a malformed graph cannot trigger a hot-path allocation.
+         */
+        bool validatePlannedScratch(int rows, int intermediate) const;
 
         /**
          * @brief Execute shared expert verifier rows with grouped decode math.
@@ -938,13 +1221,20 @@ namespace llaminar2
         mutable int shared_grouped_down_desc_table_d_model_ = 0;
         mutable int shared_grouped_down_desc_table_intermediate_ = 0;
 
-        /// Cached MoE kernel for SwiGLU fallback
+        /**
+         * @brief Shared-FFN-stage-owned MoE launch and descriptor state.
+         */
+        mutable std::unique_ptr<IMoEKernel> owned_moe_kernel_;
         mutable IMoEKernel *moe_kernel_ = nullptr;
         IMoEKernel *ensureMoEKernel() const;
 
     public:
         // Test accessors
-        void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
+        void setMoEKernelForTesting(IMoEKernel *kernel)
+        {
+            owned_moe_kernel_.reset();
+            moe_kernel_ = kernel;
+        }
         void setScratchSeqLenForTesting(int n) { scratch_seq_len_ = n; }
         void setGroupedDecodeWarmedForTesting(bool warmed) { grouped_decode_warmed_ = warmed; }
     };
@@ -1040,6 +1330,10 @@ namespace llaminar2
          * @brief Preserve warmed shared-expert metadata for capture-from-Initialized.
          */
         void resetSessionStatePreservingLazyInitialization() override;
+        /**
+         * @brief Reset the private backend object after a hard graph reset.
+         */
+        void invalidateKernelDynamicState() override;
 
     private:
         struct GpuEffectiveSeqLenState;
@@ -1051,7 +1345,10 @@ namespace llaminar2
         TensorBase *effectiveGateInput() const;
         bool gateInputReadyForGraphCapture() const;
 
-        /// Cached MoE kernel for sigmoid gating
+        /**
+         * @brief Shared-gate-stage-owned MoE launch state.
+         */
+        mutable std::unique_ptr<IMoEKernel> owned_moe_kernel_;
         mutable IMoEKernel *moe_kernel_ = nullptr;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
         int prefill_effective_seq_len_ = 0;
@@ -1066,7 +1363,11 @@ namespace llaminar2
 
     public:
         // Test accessors
-        void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
+        void setMoEKernelForTesting(IMoEKernel *kernel)
+        {
+            owned_moe_kernel_.reset();
+            moe_kernel_ = kernel;
+        }
     };
 
 } // namespace llaminar2

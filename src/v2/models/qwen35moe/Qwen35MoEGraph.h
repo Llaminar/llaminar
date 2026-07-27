@@ -9,12 +9,14 @@
 #pragma once
 
 #include "../qwen35/Qwen35Graph.h"
+#include "../../execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "../../execution/moe/DeviceMoERebalanceController.h"
 #include "../../execution/moe/MoERuntimeTable.h"
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace llaminar2
 {
@@ -60,12 +62,11 @@ namespace llaminar2
             int layer_idx,
             int seq_len,
             int batch_size,
-            DeviceId device) override;
+            DeviceId device,
+            const int32_t *sequence_lengths_device = nullptr) override;
 
         ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
-            DeviceId device,
-            DeviceMoERebalanceMaintenanceGraphKind kind = DeviceMoERebalanceMaintenanceGraphKind::Probe,
-            uint64_t payload_edge_mask = 0) override;
+            DeviceId device) override;
 
         ComputeGraph buildMTPGraph(
             int depth_idx,
@@ -106,6 +107,84 @@ namespace llaminar2
 
         bool capturePrefixCacheRuntimeState(std::vector<uint8_t> &state, void *stream) override;
         bool restorePrefixCacheRuntimeState(const std::vector<uint8_t> &state, void *stream) override;
+        bool prefixCacheRuntimeStateRequiresDeviceRehydration() const override
+        {
+            return prefix_runtime_device_rehydration_pending_;
+        }
+        void completePrefixCacheRuntimeStateDeviceRehydration() override;
+
+        /**
+         * @brief Describe device-retained main-graph layer checkpoints.
+         *
+         * Checkpoints exist only when
+         * `LLAMINAR_MTP_MIRROR_LAYER_DIAGNOSTICS=1` was set before graph
+         * construction. Each tensor contains one terminal activation row
+         * copied by a graph-captured row-select stage. Normal execution never
+         * copies checkpoint data to the host; the mirrored-MTP failure path
+         * reads these tensors only after participant tokens disagree.
+         */
+        struct MirroredLayerCheckpoint
+        {
+            std::string name;       ///< Stable backend-neutral graph boundary name.
+            const TensorBase *tensor = nullptr; ///< One-row device checkpoint.
+        };
+
+        /**
+         * @brief Return all graph variants whose checkpoint tensors were built.
+         *
+         * The returned descriptors borrow graph-owned tensors and remain valid
+         * for this graph builder's lifetime. Results are sorted by name so
+         * participant diagnostics compare identical boundaries by index.
+         */
+        std::vector<MirroredLayerCheckpoint>
+        mirroredLayerCheckpoints() const;
+
+    protected:
+        /**
+         * @brief Retain terminal rows immediately before and after final norm.
+         *
+         * This override is active only for the opt-in mirrored-layer
+         * diagnostic and only for condition-producing main graphs. The
+         * returned node is chained into the LM-head dependency, making
+         * checkpoint completion an explicit part of graph completion.
+         */
+        std::string maybeAddFinalNormDiagnosticCheckpoint(
+            ComputeGraph &graph,
+            const std::string &boundary,
+            TensorBase *source,
+            const std::string &dependency,
+            int total_tokens,
+            DeviceId device,
+            const int32_t *sequence_lengths_device) override;
+
+        /**
+         * @brief Resolve checkpoint row ownership from immutable graph policy.
+         *
+         * Ordinary multi-row GPU prefill may be padded and must use resident
+         * request-length metadata. Grouped verifier, request-condition, and
+         * serial-decode graphs are exact by construction and use their fixed
+         * final physical row. The method throws when an ordinary prefill lacks
+         * the device owner required to make terminal-row selection unambiguous.
+         */
+        HiddenStateRowSelectStage::SelectionPolicy
+        mirroredCheckpointSelectionPolicy(
+            int total_tokens,
+            DeviceId device,
+            const int32_t *sequence_lengths_device) const;
+
+        /**
+         * @brief Bind row ownership to one checkpoint stage parameter block.
+         *
+         * Keeping policy and pointer assignment in one helper prevents a graph
+         * caller from selecting resident-length mode while forgetting to bind
+         * the corresponding device owner, or from attaching mutable request
+         * metadata to an exact fixed-row graph.
+         */
+        void configureMirroredCheckpointRowOwnership(
+            HiddenStateRowSelectStage::Params &params,
+            int total_tokens,
+            DeviceId device,
+            const int32_t *sequence_lengths_device) const;
 
     private:
         struct ScopedMTPGraphContext
@@ -162,17 +241,6 @@ namespace llaminar2
                                                    const std::string &key_suffix = {},
                                                    int num_layers_override = -1,
                                                    bool register_decode_histogram = true);
-        /**
-         * @brief Build a prefix-restore payload resolver for a MoE runtime table.
-         *
-         * The portable prefix blob stores only logical placement and stable
-         * transfer-slot ids.  Qwen35MoEGraph owns the transfer-slot directories
-         * that keep those VRAM payloads alive across a prefix restore with a
-         * model-runtime snapshot, so it supplies the resolver that rehydrates a
-         * local-compute expert descriptor from the graph-owned directory.
-         */
-        MoERuntimeTable::LocalPayloadDescriptorResolver
-        localPayloadDescriptorResolverForRuntimeTable(const MoERuntimeTable *table) const;
         ILocalTPContext *maintenanceTPContextForDomain(
             const std::string &domain_key,
             ILocalTPContext &decode_tp_ctx);
@@ -202,6 +270,27 @@ namespace llaminar2
         std::unordered_map<std::string, GraphSideRebalanceBinding> moe_graph_rebalance_bindings_;
         std::unordered_map<std::string, std::shared_ptr<ILocalTPContext>> moe_maintenance_tp_contexts_;
         std::unordered_set<std::string> moe_runtime_histogram_sync_keys_;
+        /**
+         * @brief One-shot graph regime requested by portable prefix restoration.
+         *
+         * This is graph-construction policy, not a host mirror of live placement.
+         * The actual desired transfers live in each runtime table's persistent
+         * device scratch. The flag remains set until a successful dedicated
+         * graph executes all layer-local rehydration transactions.
+         */
+        bool prefix_runtime_device_rehydration_pending_ = false;
+
+        /**
+         * @brief Persistent one-row buffers populated by optional graph diagnostics.
+         *
+         * The key includes graph regime, runtime M, layer, and boundary. Reusing
+         * a key across recapture preserves the destination address required by
+         * CUDA/HIP graph executables while later launches overwrite the bytes
+         * with the newest point-in-time row.
+         */
+        std::unordered_map<std::string, std::unique_ptr<FP32Tensor>>
+            mirrored_layer_checkpoints_;
+
         bool mtp_graph_context_active_ = false;
         int mtp_graph_depth_idx_ = -1;
     };

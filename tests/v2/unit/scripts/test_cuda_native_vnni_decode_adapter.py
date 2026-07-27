@@ -23,6 +23,9 @@ from tests.v2.performance.kernels.native_vnni_dispatch.adapters.cuda_decode impo
 from tests.v2.performance.kernels.native_vnni_dispatch.exact_oracle import (  # noqa: E402
     candidate_is_eligible,
 )
+from tests.v2.performance.kernels.native_vnni_dispatch.cuda_resume import (  # noqa: E402
+    extract_cuda_development_generation,
+)
 
 
 class CUDANativeVNNIDecodeAdapterTest(unittest.TestCase):
@@ -118,6 +121,23 @@ class CUDANativeVNNIDecodeAdapterTest(unittest.TestCase):
         })
         return row
 
+    @classmethod
+    def tensor_core_verifier_row(cls) -> dict[str, str]:
+        """Model the fixed-W4 production tensor-core evidence ABI."""
+
+        row = cls.verifier_row()
+        candidate = "cuda.nvnni.decode.verifier.tensor_core_mma16"
+        row.update({
+            "candidate_id": candidate,
+            "family": "tensor_core_mma16",
+            "grouped_rows": "0",
+            "observed_candidate_id": candidate,
+            "observed_path": "tensor_core",
+            "observed_tile_n": "8",
+            "observed_cpt": "0",
+        })
+        return row
+
     def test_fast_m1_preserves_exact_kpart_identity(self) -> None:
         observation = adapt_cuda_decode_row(self.fast_row(), self.context())
         self.assertEqual(observation.runtime_codebook_id, 19)
@@ -151,6 +171,117 @@ class CUDANativeVNNIDecodeAdapterTest(unittest.TestCase):
             observation,
             self.context().serial_m1_policy_hash,
         ))
+
+    def test_tensor_core_row_materializes_fixed_w4_registry_geometry(self) -> None:
+        """Retained v1 rows authenticate the sole W4 tensor-core candidate."""
+
+        observation = adapt_cuda_decode_row(
+            self.tensor_core_verifier_row(),
+            self.context(),
+        )
+        self.assertEqual(
+            observation.effective_candidate_id,
+            "cuda.nvnni.decode.verifier.tensor_core_mma16",
+        )
+        self.assertEqual(observation.config_json, {
+            "family": "tensor_core_mma16",
+            "warps_per_block": 4,
+        })
+        self.assertTrue(observation.forced_route_ok)
+        self.assertTrue(candidate_is_eligible(
+            observation,
+            self.context().serial_m1_policy_hash,
+        ))
+
+    def test_tensor_core_row_rejects_inherited_route_telemetry(self) -> None:
+        row = self.tensor_core_verifier_row()
+        row.update({
+            "observed_path": "kpar",
+            "observed_tile_n": "256",
+            "observed_cpt": "4",
+            "correctness_pass": "0",
+        })
+        observation = adapt_cuda_decode_row(row, self.context())
+        self.assertFalse(observation.forced_route_ok)
+        self.assertFalse(candidate_is_eligible(
+            observation,
+            self.context().serial_m1_policy_hash,
+        ))
+
+    def test_resume_extracts_development_bytes_by_sealed_run_identity(self) -> None:
+        """Combined certification output recovers the exact profiler lineage."""
+
+        fields = (
+            "schema_version",
+            "run_id",
+            "backend",
+            "semantic_contract",
+            "git_revision",
+            "build_id",
+            "compiler_id",
+            "architecture_class",
+            "device_name",
+            "driver_runtime",
+            "serial_m1_policy_hash",
+            "config_json",
+        )
+        development = {
+            "schema_version": "fixture-v1",
+            "run_id": "development-generation",
+            "backend": "cuda",
+            "semantic_contract": "Fast",
+            "git_revision": "deadbeef",
+            "build_id": "sha256:development-build",
+            "compiler_id": "nvcc-fixture",
+            "architecture_class": "sm_86",
+            "device_name": "RTX 3090",
+            "driver_runtime": "driver-fixture",
+            "serial_m1_policy_hash": "sha256:development-policy",
+            "config_json": '{"family":"kpar","tile_n":128}',
+        }
+        sealed = {
+            **development,
+            "run_id": "sealed-generation",
+            "build_id": "sha256:sealed-build",
+            "serial_m1_policy_hash": "sha256:sealed-policy",
+        }
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "combined.csv"
+            destination = Path(root) / "development.csv"
+            context = Path(root) / "development.context"
+            with source.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow(development)
+                writer.writerow(sealed)
+                writer.writerow(development)
+            original_lines = source.read_bytes().splitlines(keepends=True)
+
+            counts = extract_cuda_development_generation(
+                source,
+                destination,
+                context,
+                excluded_run_id="sealed-generation",
+            )
+
+            self.assertEqual(counts, (2, 1))
+            self.assertEqual(
+                destination.read_bytes(),
+                original_lines[0] + original_lines[1] + original_lines[3],
+            )
+            self.assertEqual(
+                context.read_text(encoding="utf-8").splitlines(),
+                [
+                    "development-generation",
+                    "deadbeef",
+                    "sha256:development-build",
+                    "nvcc-fixture",
+                    "sm_86",
+                    "RTX 3090",
+                    "driver-fixture",
+                    "sha256:development-policy",
+                ],
+            )
 
     def test_parallel_aggregate_adaptation_matches_serial_order(self) -> None:
         """Byte-range workers must preserve every adapted row and its order."""

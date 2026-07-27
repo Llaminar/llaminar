@@ -38,6 +38,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -109,12 +110,14 @@ namespace
     public:
         int observed_gate_type_id = -1;
 
-        bool route(
-            const float *hidden,
-            const float *gate_weights,
+        bool routeWithTensors(
+            ITensor *hidden,
+            ITensor *gate_weights,
             int seq_len, int d_model,
             int num_experts, int top_k,
             bool normalize_weights,
+            ITensor *output_indices,
+            ITensor *output_weights,
             MoERoutingResult &result) override
         {
             (void)hidden;
@@ -124,6 +127,8 @@ namespace
             (void)num_experts;
             (void)top_k;
             (void)normalize_weights;
+            (void)output_indices;
+            (void)output_weights;
             (void)result;
             return false;
         }
@@ -562,28 +567,58 @@ protected:
     {
         std::shared_ptr<FP32Tensor> indices; // float-cast expert IDs [seq_len * top_k]
         std::shared_ptr<FP32Tensor> weights; // normalized weights [seq_len * top_k]
+        std::shared_ptr<MoERoutedPipelineKernelOwner> kernel_owner;
     };
 
     RoutingResult computeRouting(TensorBase *input, TensorBase *gate_weights,
                                  int seq_len, int d_model, int num_experts, int top_k,
-                                 bool norm_topk_prob = true)
+        bool norm_topk_prob = true)
     {
         using KernelFactory = llaminar::v2::kernels::KernelFactory;
-        auto *kernel = KernelFactory::getOrCreateMoEKernel(DeviceId::cpu());
-        MoERoutingResult routing;
-        kernel->route(input->data(), gate_weights->data(), seq_len, d_model,
-                      num_experts, top_k, norm_topk_prob, routing);
-
+        auto kernel_owner = std::make_shared<MoERoutedPipelineKernelOwner>();
+        kernel_owner->kernel = KernelFactory::createMoEKernel(DeviceId::cpu());
+        IMoEKernel *kernel = kernel_owner->kernel.get();
         const size_t n = static_cast<size_t>(seq_len) * top_k;
         auto indices = std::make_shared<FP32Tensor>(std::vector<size_t>{n, 1});
         auto weights = std::make_shared<FP32Tensor>(std::vector<size_t>{n, 1});
-        for (size_t i = 0; i < n; ++i)
-            indices->mutable_data()[i] = static_cast<float>(routing.expert_indices[i]);
-        std::copy(routing.expert_weights.begin(), routing.expert_weights.end(),
-                  weights->mutable_data());
-        return {indices, weights};
+        MoERoutingResult routing;
+        if (!kernel->routeWithTensors(
+                input,
+                gate_weights,
+                seq_len,
+                d_model,
+                num_experts,
+                top_k,
+                norm_topk_prob,
+                indices.get(),
+                weights.get(),
+                routing))
+        {
+            throw std::runtime_error("CPU routing fixture failed to publish routing tensors");
+        }
+        return {indices, weights, std::move(kernel_owner)};
     }
 };
+
+/**
+ * @brief Prove MoE launch state is never shared implicitly by the factory.
+ *
+ * This is intentionally a CPU-only unit test. The ownership rule is backend
+ * independent, while CUDA and ROCm execution remains in integration tests.
+ */
+TEST(Test__MoEKernelOwnership, FactoryCreatesIndependentLaunchState)
+{
+    using KernelFactory = llaminar::v2::kernels::KernelFactory;
+
+    auto routing_kernel = KernelFactory::createMoEKernel(DeviceId::cpu());
+    auto expert_kernel = KernelFactory::createMoEKernel(DeviceId::cpu());
+
+    ASSERT_NE(routing_kernel, nullptr);
+    ASSERT_NE(expert_kernel, nullptr);
+    EXPECT_NE(routing_kernel.get(), expert_kernel.get())
+        << "Separately captured stages must not alias mutable stream, workspace, "
+           "descriptor-table, or scratch state.";
+}
 
 // =========================================================================
 // SharedExpertFFNStage Tests
@@ -1036,6 +1071,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q4K)
     params.input = input.get();
     params.routing_indices = routing.indices.get();
     params.routing_weights = routing.weights.get();
+    params.routed_pipeline_kernel_owner = routing.kernel_owner;
     params.gate_exps = gate_exps.get();
     params.up_exps = up_exps.get();
     params.down_exps = down_exps.get();
@@ -1100,6 +1136,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q5K)
     params.input = input.get();
     params.routing_indices = routing.indices.get();
     params.routing_weights = routing.weights.get();
+    params.routed_pipeline_kernel_owner = routing.kernel_owner;
     params.gate_exps = gate_exps.get();
     params.up_exps = up_exps.get();
     params.down_exps = down_exps.get();
@@ -1156,6 +1193,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_MultipleTokens)
     params.input = input.get();
     params.routing_indices = routing.indices.get();
     params.routing_weights = routing.weights.get();
+    params.routed_pipeline_kernel_owner = routing.kernel_owner;
     params.gate_exps = gate_exps.get();
     params.up_exps = up_exps.get();
     params.down_exps = down_exps.get();
@@ -1348,6 +1386,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
         auto run_moe = [&](TensorBase *run_input,
                            TensorBase *run_indices,
                            TensorBase *run_weights,
+                           const std::shared_ptr<MoERoutedPipelineKernelOwner> &kernel_owner,
                            TensorBase *run_output,
                            int run_seq)
         {
@@ -1356,6 +1395,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
             params.input = run_input;
             params.routing_indices = run_indices;
             params.routing_weights = run_weights;
+            params.routed_pipeline_kernel_owner = kernel_owner;
             params.expert_gate_views = gate_views;
             params.expert_up_views = up_views;
             params.expert_down_views = down_views;
@@ -1394,6 +1434,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                 input.get(),
                 grouped_routing.indices.get(),
                 grouped_routing.weights.get(),
+                grouped_routing.kernel_owner,
                 grouped_output.get(),
                 seq));
 
@@ -1411,6 +1452,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                     &row_input,
                     row_routing.indices.get(),
                     row_routing.weights.get(),
+                    row_routing.kernel_owner,
                     &row_output,
                     1));
                 std::copy_n(
@@ -1503,6 +1545,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_IQ3
     auto run_moe = [&](TensorBase *run_input,
                        TensorBase *run_indices,
                        TensorBase *run_weights,
+                       const std::shared_ptr<MoERoutedPipelineKernelOwner> &kernel_owner,
                        TensorBase *run_output,
                        int run_seq)
     {
@@ -1511,6 +1554,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_IQ3
         params.input = run_input;
         params.routing_indices = run_indices;
         params.routing_weights = run_weights;
+        params.routed_pipeline_kernel_owner = kernel_owner;
         params.gate_exps = gate_exps.get();
         params.up_exps = up_exps.get();
         params.down_exps = down_exps.get();
@@ -1541,6 +1585,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_IQ3
         ASSERT_TRUE(run_moe(input.get(),
                             routing.indices.get(),
                             routing.weights.get(),
+                            routing.kernel_owner,
                             multi_output.get(),
                             seq));
 
@@ -1559,6 +1604,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_IQ3
                 &row_input,
                 row_routing.indices.get(),
                 row_routing.weights.get(),
+                row_routing.kernel_owner,
                 &row_output,
                 1));
             std::copy_n(row_output.data(),
@@ -1604,6 +1650,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_Qwe
     auto run_moe = [&](TensorBase *run_input,
                        TensorBase *run_indices,
                        TensorBase *run_weights,
+                       const std::shared_ptr<MoERoutedPipelineKernelOwner> &kernel_owner,
                        TensorBase *run_output,
                        int run_seq)
     {
@@ -1612,6 +1659,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_Qwe
         params.input = run_input;
         params.routing_indices = run_indices;
         params.routing_weights = run_weights;
+        params.routed_pipeline_kernel_owner = kernel_owner;
         params.gate_exps = gate_exps.get();
         params.up_exps = up_exps.get();
         params.down_exps = down_exps.get();
@@ -1643,6 +1691,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_Qwe
         ASSERT_TRUE(run_moe(&*input,
                             routing.indices.get(),
                             routing.weights.get(),
+                            routing.kernel_owner,
                             &*multi_output,
                             seq));
 
@@ -1661,6 +1710,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_Qwe
                 &row_input,
                 row_routing.indices.get(),
                 row_routing.weights.get(),
+                row_routing.kernel_owner,
                 &row_output,
                 1));
             std::copy_n(row_output.data(),
@@ -1857,6 +1907,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
     params.input = input.get();
     params.routing_indices = routing.indices.get();
     params.routing_weights = routing.weights.get();
+    params.routed_pipeline_kernel_owner = routing.kernel_owner;
     params.gate_exps = gate_exps.get();
     params.up_exps = up_exps.get();
     params.down_exps = down_exps.get();
@@ -1912,6 +1963,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_NormTopKProbSumsToOne)
         params.input = input.get();
         params.routing_indices = routing.indices.get();
         params.routing_weights = routing.weights.get();
+        params.routed_pipeline_kernel_owner = routing.kernel_owner;
         params.gate_exps = gate_exps.get();
         params.up_exps = up_exps.get();
         params.down_exps = down_exps.get();
@@ -1938,6 +1990,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_NormTopKProbSumsToOne)
         params.input = input.get();
         params.routing_indices = routing.indices.get();
         params.routing_weights = routing.weights.get();
+        params.routed_pipeline_kernel_owner = routing.kernel_owner;
         params.gate_exps = gate_exps.get();
         params.up_exps = up_exps.get();
         params.down_exps = down_exps.get();
@@ -2057,7 +2110,7 @@ TEST_F(MoEExpertComputeStageTest, PendingGpuDirectArrivalRequiresExplicitCompute
         [](void *) {});
     stage.addPendingGpuDirectTransferForTesting(std::move(completion));
 
-    EXPECT_FALSE(stage.execute(cpu_ctx_.get()))
+    EXPECT_THROW((void)stage.execute(cpu_ctx_.get()), std::logic_error)
         << "A pending GPU-direct arrival must not fall back to the default stream";
     EXPECT_EQ(stage.pendingGpuDirectTransferCountForTesting(), 1u)
         << "Failed event consumption must leave the pending arrival visible";
@@ -2110,7 +2163,7 @@ TEST_F(MoEExpertComputeStageTest, RebuiltStageAdoptsPendingGpuDirectArrivalFromS
     stage.addPendingGpuDirectTransfersFromStoreForTesting({1});
 
     ASSERT_EQ(stage.pendingGpuDirectTransferCountForTesting(), 1u);
-    EXPECT_FALSE(stage.execute(cpu_ctx_.get()))
+    EXPECT_THROW((void)stage.execute(cpu_ctx_.get()), std::logic_error)
         << "A rebuilt stage must inherit GPU-direct readiness and require an explicit stream";
 }
 
@@ -2170,6 +2223,34 @@ TEST_F(MoEExpertComputeStageTest, FixedTopologyVerifierReplayStillRejectsReplica
     EXPECT_FALSE(stage.usesFixedTopologyGroupedVerifierReplayForTesting());
 }
 
+TEST_F(MoEExpertComputeStageTest, GpuGroupedVerifierPublishesPersistentDeviceHistograms)
+{
+    /*
+     * This is deliberately a unit-only policy test: constructing a stage with a
+     * CUDA identity does not initialize CUDA or launch backend work. The
+     * production Qwen graph sets the grouped flag for CUDA/ROCm and reserves
+     * `force_decode_equivalent_verifier_prefill` for CPU, so checking only the
+     * latter silently disables every GPU histogram update.
+     */
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 3;
+    params.num_experts = 4;
+    params.top_k = 2;
+    params.force_grouped_verifier_prefill_for_decode = true;
+    params.force_decode_equivalent_verifier_prefill = false;
+
+    MoEExpertComputeStage stage(params);
+    EXPECT_TRUE(stage.publishesGroupedVerifierHistogramsForTesting())
+        << "The real CUDA/ROCm grouped-verifier graph flag must publish "
+           "persistent selected and locally-assigned route demand.";
+
+    params.force_grouped_verifier_prefill_for_decode = false;
+    MoEExpertComputeStage ordinary_prefill(params);
+    EXPECT_FALSE(ordinary_prefill.publishesGroupedVerifierHistogramsForTesting())
+        << "Ordinary prefill is not a decode-demand publication boundary.";
+}
+
 TEST_F(MoEExpertComputeStageTest, SharedExpert_TypeAndName)
 {
     SharedExpertFFNStage::Params params;
@@ -2183,6 +2264,46 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_TypeAndName)
     EXPECT_EQ(stage.name(), "shared_expert_ffn");
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
     EXPECT_GT(stage.estimatedFlops(), 0u);
+}
+
+TEST_F(
+    MoEExpertComputeStageTest,
+    SharedExpertGpuContractPreparesArenaOwnedGateAndUpScratch)
+{
+    constexpr int rows = 4;
+    constexpr int d_model = 8;
+    constexpr int intermediate = 16;
+
+    auto input = TestTensorFactory::createFP32({rows, d_model});
+    auto output = TestTensorFactory::createFP32({rows, d_model});
+    auto gate_scratch =
+        TestTensorFactory::createFP32({rows, intermediate});
+    auto up_scratch =
+        TestTensorFactory::createFP32({rows, intermediate});
+
+    SharedExpertFFNStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.input = input.get();
+    params.output = output.get();
+    params.gate_scratch = gate_scratch.get();
+    params.up_scratch = up_scratch.get();
+    params.seq_len = rows;
+    params.d_model = d_model;
+    params.intermediate = intermediate;
+    params.input_buffer_id = BufferId::NORMALIZED;
+    params.output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
+    params.gate_scratch_buffer_id = BufferId::MOE_GATE_SCRATCH;
+    params.up_scratch_buffer_id = BufferId::MOE_UP_SCRATCH;
+
+    SharedExpertFFNStage stage(params);
+    const StageBufferContract contract = stage.bufferContract();
+
+    ASSERT_EQ(contract.outputs.size(), 3u);
+    EXPECT_EQ(contract.outputs[0].id, BufferId::MOE_SHARED_EXPERT_OUTPUT);
+    EXPECT_EQ(contract.outputs[1].id, BufferId::MOE_GATE_SCRATCH);
+    EXPECT_EQ(contract.outputs[2].id, BufferId::MOE_UP_SCRATCH);
+    EXPECT_TRUE(contract.outputs[1].prepare_write_storage);
+    EXPECT_TRUE(contract.outputs[2].prepare_write_storage);
 }
 
 TEST_F(MoEExpertComputeStageTest, SharedExpert_CudaSmallMDeclaresGateUpSideStreamWorkspace)

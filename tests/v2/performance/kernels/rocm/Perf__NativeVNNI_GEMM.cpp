@@ -26,6 +26,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -55,6 +56,7 @@
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "utils/PrefillGraphBucketDefaults.h"
+#include "../../../utils/ScopedGPUStream.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "fort.hpp"
 
@@ -812,11 +814,12 @@ namespace
                                                   int M, int N, int K, int device_id)
         {
             (void)hipSetDevice(device_id);
+            auto stream = static_cast<hipStream_t>(kernel.requireGPUStream());
 
             // Warmup
             for (int i = 0; i < WARMUP_RUNS; ++i)
                 kernel.multiply_tensor(input, output, M, N, K);
-            (void)hipDeviceSynchronize();
+            (void)hipStreamSynchronize(stream);
 
             // Timed runs
             hipEvent_t start = nullptr, stop = nullptr;
@@ -828,10 +831,9 @@ namespace
 
             for (int i = 0; i < BENCH_RUNS; ++i)
             {
-                (void)hipDeviceSynchronize();
-                (void)hipEventRecord(start);
+                (void)hipEventRecord(start, stream);
                 kernel.multiply_tensor(input, output, M, N, K);
-                (void)hipEventRecord(stop);
+                (void)hipEventRecord(stop, stream);
                 (void)hipEventSynchronize(stop);
 
                 float ms = 0.0f;
@@ -862,6 +864,8 @@ namespace
                 return 0.0;
 
             ROCmQuantisedGemmKernel kernel(&packed, device_id);
+            ScopedGPUStream stream(DeviceId::rocm(device_id));
+            kernel.setGPUStream(stream.get());
             auto reqs = kernel.getWorkspaceRequirements(M, N, K);
             const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);
             auto workspace = std::make_unique<DeviceWorkspaceManager>(
@@ -921,6 +925,8 @@ namespace
 
             // 2. Create kernel + workspace
             ROCmQuantisedGemmKernel kernel(&packed, device_id);
+            ScopedGPUStream stream(DeviceId::rocm(device_id));
+            kernel.setGPUStream(stream.get());
             auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
             const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);
             auto workspace = std::make_unique<DeviceWorkspaceManager>(
@@ -949,7 +955,9 @@ namespace
             {
                 kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
                 (void)hipDeviceSynchronize();
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(
+                    output,
+                    kernel.requireGPUStream());
 
                 if (gpu_weights && gpu_weights->d_weights)
                 {
@@ -1169,6 +1177,8 @@ namespace
                 return result;
 
             ROCmQuantisedGemmKernel kernel(&packed, device_id);
+            ScopedGPUStream stream(DeviceId::rocm(device_id));
+            kernel.setGPUStream(stream.get());
             auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
             const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);
             auto workspace = std::make_unique<DeviceWorkspaceManager>(

@@ -17,14 +17,21 @@ namespace llaminar2
 {
     class IBackend;
     class ILocalTPContext;
+    class IMoEKernel;
     class IMoERuntimeTable;
 
     enum class DeviceMoERebalanceStagePhase
     {
         /**
-         * Compatibility mode: plan, copy arrivals, wait for completion, and
-         * apply them in one stage. Production decode graphs should prefer the
-         * split PlanAndCopy + Apply phases so transfer can overlap with compute.
+         * Atomic maintenance transaction: collect and gather state, run the
+         * controller, publish command metadata, prepare immutable payload
+         * bytes, transport arrivals, and apply the ready wave before recording
+         * one terminal completion edge.
+         *
+         * This is the required standalone maintenance-graph path. It prevents
+         * the host from observing intermediate state or selecting a follow-up
+         * graph while preserving explicit auxiliary-stream overlap inside the
+         * captured transaction.
          */
         PlanCopyApply,
 
@@ -35,15 +42,6 @@ namespace llaminar2
          * compute collective.
          */
         CollectState,
-
-        /**
-         * Graph-capturable maintenance collection phase: pack local histogram
-         * state and all-gather it immediately, but do not run the controller.
-         * The async maintenance graph uses this before Apply so a ready-wave
-         * apply can reset live histograms without erasing the just-observed
-         * planning window.
-         */
-        CollectAndGatherState,
 
         /**
          * Graph-capturable producer phase: pack histograms/directories, run the
@@ -60,33 +58,6 @@ namespace llaminar2
          * state all-gathers.
          */
         PlanAndCopyAfterSideband,
-
-        /**
-         * Graph-capturable maintenance producer phase after histogram state has
-         * already been gathered. This runs the device controller and writes
-         * local command buffers, but deliberately stops before any command
-         * metadata allgather or expert payload movement. The follow-up
-         * MetadataAndPayload graph runs only when the completed probe requested
-         * non-empty payload slots.
-         */
-        PlanProbeAfterSideband,
-
-        /**
-         * Graph-capturable maintenance follow-up phase. This consumes command
-         * metadata prepared by PlanProbeAfterSideband, gathers/projects command
-         * buffers across the rebalance domain, moves only the compact payload
-         * bucket for the active wave, and publishes transfer completion.
-         */
-        GatherCommandsAndCopyPreparedPayload,
-
-        /**
-         * Graph-capturable maintenance payload phase. This consumes already
-         * gathered/projected command metadata, moves the prepared payload bucket,
-         * and publishes transfer completion. New maintenance replay should use
-         * GatherCommandsAndCopyPreparedPayload so no-work probes do not pay the
-         * command-buffer allgather.
-         */
-        CopyPreparedPayload,
 
         /**
          * Pack this participant's requested expert payloads after command
@@ -119,12 +90,87 @@ namespace llaminar2
         JoinTransfer,
     };
 
+    /**
+     * @brief Declares which completion records one rebalance stage publishes.
+     *
+     * Rebalance graphs deliberately share persistent workspace across their
+     * planning and payload transactions. Buffer allocation therefore cannot
+     * prove that a particular graph replay wrote a completion record. This
+     * contract makes publication ownership follow the typed stage phase
+     * instead of the incidental presence of a shared workspace buffer.
+     */
+    struct DeviceMoERebalanceStatusPublicationContract
+    {
+        bool copy_status = false;
+        bool apply_status = false;
+
+        /**
+         * @brief Merge another stage's publications into a graph-wide contract.
+         *
+         * @param other Publication contract for another stage in the same graph.
+         */
+        void merge(
+            const DeviceMoERebalanceStatusPublicationContract &other) noexcept
+        {
+            copy_status = copy_status || other.copy_status;
+            apply_status = apply_status || other.apply_status;
+        }
+    };
+
+    /**
+     * @brief Own one rebalance transaction's persistent GPU ordering events.
+     *
+     * A transfer state may reuse a context-owned auxiliary stream selected by
+     * @p name_suffix, but its event handles must never be shared by unrelated
+     * layers or graph transactions. CUDA and HIP graph nodes retain event
+     * identities, so recording the same event repeatedly for several layers in
+     * one captured graph makes producer/consumer ownership ambiguous. Graph
+     * builders must therefore key this object by the layer-specific transfer
+     * identity while separately selecting a bounded stream/workspace lane.
+     *
+     * The object contains no host mirror of transfer progress. Its events are
+     * device-owned lifetime resources created before capture and destroyed only
+     * when the owning graph lifetime ends.
+     */
     class DeviceMoERebalanceTransferState
     {
     public:
         ~DeviceMoERebalanceTransferState();
 
+        /**
+         * @brief Materialize the persistent auxiliary stream and ordering events.
+         *
+         * This method is suitable for eager execution setup. Graph-captured
+         * callers should use prepareForCapture(), which additionally orders the
+         * public capture stream after work already queued on the transfer lane.
+         *
+         * @param device GPU that owns the stream and event resources.
+         * @param name_suffix Stable name of the shared auxiliary stream lane.
+         * @return true when all persistent resources are available.
+         */
         bool ensure(DeviceId device, const std::string &name_suffix);
+
+        /**
+         * @brief Prepare this transaction's event edges for graph launch.
+         *
+         * Stream and event creation must happen before CUDA/HIP capture begins.
+         * The shared auxiliary stream can retain work from an earlier eager
+         * launch or graph replay. This method records this owner's terminal
+         * event after that stream work and queues a wait on the public capture
+         * stream, making the lifetime boundary explicit without a host or
+         * device synchronization.
+         *
+         * @param device GPU that owns both streams.
+         * @param name_suffix Stable name of the shared auxiliary stream lane.
+         * @param capture_stream Explicit stream on which capture/replay will start.
+         * @return true when resources exist and the device-side ordering edge was
+         *         queued successfully.
+         */
+        bool prepareForCapture(
+            DeviceId device,
+            const std::string &name_suffix,
+            void *capture_stream);
+
         void release();
 
         void *transferStream() const { return transfer_stream_; }
@@ -188,7 +234,6 @@ namespace llaminar2
             uint32_t local_transfer_slot_count = 0;
             uint64_t collective_payload_slot_bytes = 0;
             uint32_t collective_payload_slot_capacity = 0;
-            uint64_t payload_edge_mask = 0;
             std::string stage_name;
             std::string workspace_name;
             DeviceMoERebalanceStagePhase phase = DeviceMoERebalanceStagePhase::PlanCopyApply;
@@ -209,6 +254,15 @@ namespace llaminar2
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::MOE_DEVICE_REBALANCE; }
+        /**
+         * @brief Report whether this phase launches a standalone LocalTP collective.
+         *
+         * Rebalance is phase-split: sideband-only pack/apply phases are local,
+         * while state gathering and transfer-backed planning/transport phases
+         * launch raw NCCL/RCCL operations. Capture policy must inspect this
+         * concrete stage rather than classifying every rebalance phase alike.
+         */
+        bool isCollectiveStage() const override;
         std::string name() const override { return params_.stage_name.empty() ? "moe_device_rebalance" : params_.stage_name; }
         size_t estimatedFlops() const override { return 0; }
         size_t estimatedMemoryBytes() const override;
@@ -216,6 +270,10 @@ namespace llaminar2
         bool isGraphCapturable() const override;
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
         bool needsGraphLaunchPreparation() const override { return usesTransferSlotApply(); }
+        /**
+         * @brief Reset this stage's private MoE launch metadata on hard invalidation.
+         */
+        void invalidateKernelDynamicState() override;
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override { return {}; }
         StageBufferContract bufferContract() const override { return {}; }
@@ -231,10 +289,29 @@ namespace llaminar2
         size_t traceHistogramLayerCount() const { return histogramLayerCount(); }
         size_t traceLocalHistogramEntries() const { return localHistogramEntries(); }
         size_t traceGatheredHistogramEntries() const { return gatheredHistogramEntries(); }
+        /**
+         * @brief Return the completion records owned by this stage phase.
+         *
+         * Diagnostics and lifecycle validation must use this contract before
+         * reading shared status workspace. A record named by the contract is
+         * mandatory and malformed content is fatal. An unnamed record belongs
+         * to another graph transaction and must not be attributed to this one.
+         */
+        DeviceMoERebalanceStatusPublicationContract
+        statusPublicationContract() const;
 
     private:
         Params params_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
+        /**
+         * @brief Rebalance-stage-owned controller and transfer launch state.
+         *
+         * Maintenance graphs use a transfer stream in addition to the compute
+         * stream. Owning the backend object here prevents unrelated MoE stages
+         * from changing its workspace or inherited stream while either graph
+         * is being captured or replayed.
+         */
+        std::unique_ptr<IMoEKernel> owned_moe_kernel_;
 
         std::string localHistogramBufferName() const;
         std::string gatheredHistogramBufferName() const;

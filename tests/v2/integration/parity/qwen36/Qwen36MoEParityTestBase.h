@@ -29,10 +29,12 @@
 #include "kernels/KernelFactory.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/Tokenizer.h"
 
 #include <cnpy.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cmath>
@@ -70,10 +72,27 @@ namespace llaminar2::test::parity::qwen36
         ExpertOverlayRocm2TPHotCpu2LocalTPCold,
     };
 
+    /**
+     * @brief Selects how a focused MoE integration case obtains prompt tokens.
+     *
+     * PyTorchMetadata is required by numeric parity tests that consume external
+     * decode-token or snapshot evidence. ModelTokenizer is for state-lifetime
+     * tests whose oracle is a fresh serial Llaminar request: it parses only GGUF
+     * metadata and uses the production BPE tokenizer, avoiding a full 35B
+     * PyTorch forward whose output the test would otherwise discard.
+     */
+    enum class MoEReferenceInputSource
+    {
+        PyTorchMetadata,
+        ModelTokenizer,
+    };
+
     struct MoEPrefixRestoreParityCase
     {
         std::string name;
         MoEPrefixParityTopology topology = MoEPrefixParityTopology::SingleDevice;
+        MoEReferenceInputSource reference_input_source =
+            MoEReferenceInputSource::PyTorchMetadata;
         std::vector<GlobalDeviceAddress> devices;
         std::vector<std::string> model_envs;
         std::string default_model_path;
@@ -85,6 +104,16 @@ namespace llaminar2::test::parity::qwen36
         int decode_steps = 3;
         int max_seq_len = 96;
         int prefix_restore_prompt_token_limit = 0;
+        /**
+         * @brief Minimum authenticated prompt-token count required by this case.
+         *
+         * Most focused fixtures use a short prompt and retain the default of
+         * one token. Long-context and partial-prefix fixtures raise this bound
+         * so a missing snapshot cannot be "repaired" with a short header-only
+         * prompt that passes string authentication but never exercises the
+         * requested cache geometry.
+         */
+        size_t minimum_prompt_tokens = 1;
         int required_cuda_devices = 0;
         int required_rocm_devices = 0;
         int required_cpu_sockets = 0;
@@ -152,6 +181,106 @@ namespace llaminar2::test::parity::qwen36
                "as AI systems become more prevalent in society. Responsible AI development "
                "requires collaboration between technologists, policymakers, and the public "
                "to ensure these powerful tools benefit humanity as a whole.";
+    }
+
+    /**
+     * @brief Build the deterministic long-ledger prompt shared by MoE parity suites.
+     *
+     * The expert-overlay math, prefix-cache, and MTP suites must authenticate
+     * exactly the same prompt. Keeping the builder in the shared harness makes
+     * a clean checkout self-contained: if metadata is missing, regeneration
+     * receives the complete ledger rather than only its first-line header.
+     *
+     * The filler records are deterministic and deliberately verbose enough to
+     * cross several prefix-cache blocks. Three sentinel records are distributed
+     * near the beginning, middle, and end so the prompt remains useful for
+     * long-context quality checks as well as state-lifetime integration tests.
+     *
+     * @return Complete multiline ledger prompt used by Qwen3.6 MoE long-context tests.
+     */
+    inline std::string qwen36MoELongNeedleParityPrompt()
+    {
+        const auto deterministic_code = [](const std::string &name_space, int index)
+        {
+            static const std::array<const char *, 12> first_words = {
+                "amber", "basil", "cedar", "delta", "ember", "fable",
+                "garnet", "harbor", "iris", "juniper", "kelp", "laurel"};
+            static const std::array<const char *, 12> second_words = {
+                "atlas", "beacon", "cobalt", "dawn", "elm", "fjord",
+                "grove", "haven", "ion", "jasmine", "keystone", "lagoon"};
+            static const std::array<const char *, 8> directions = {
+                "north", "south", "east", "west",
+                "upper", "lower", "inner", "outer"};
+
+            int seed = 0;
+            for (char character : name_space)
+                seed += static_cast<unsigned char>(character);
+
+            std::ostringstream code;
+            code << first_words[(index + seed) % first_words.size()] << ' '
+                 << second_words[
+                        ((index / static_cast<int>(first_words.size())) + seed) %
+                        second_words.size()]
+                 << ' '
+                 << directions[
+                        ((index /
+                          static_cast<int>(
+                              first_words.size() * second_words.size())) +
+                         seed) %
+                        directions.size()];
+            return code.str();
+        };
+
+        constexpr int kRecordCount = 64;
+        const std::map<std::string, int> sentinel_positions = {
+            {"alpha", 3},
+            {"middle", kRecordCount / 2},
+            {"omega", kRecordCount - 4},
+        };
+        const std::map<std::string, std::string> sentinels = {
+            {"alpha", "LCJSON-ALPHA-314159"},
+            {"middle", "LCJSON-MIDDLE-271828"},
+            {"omega", "LCJSON-OMEGA-161803"},
+        };
+
+        std::ostringstream prompt;
+        prompt << "Task: read the ledger and return one minified JSON object.\n"
+               << "The only allowed keys are alpha, middle, and omega.\n"
+               << "Every allowed key must be present exactly once. Never use an empty key.\n"
+               << "The ledger contains many filler facts plus three named sentinel values.\n";
+
+        for (int index = 0; index < kRecordCount; ++index)
+        {
+            bool inserted_sentinel = false;
+            for (const auto &[key, position] : sentinel_positions)
+            {
+                if (index != position)
+                    continue;
+
+                prompt << "Ledger item " << std::setw(4) << std::setfill('0')
+                       << index << std::setfill(' ')
+                       << ": REQUIRED_JSON_FIELD " << key
+                       << " has exact value " << sentinels.at(key) << ".\n";
+                inserted_sentinel = true;
+                break;
+            }
+
+            if (inserted_sentinel)
+                continue;
+
+            prompt << "Ledger item " << std::setw(4) << std::setfill('0')
+                   << index << std::setfill(' ') << ": filler code "
+                   << deterministic_code("LCJSON-FILL", index)
+                   << "; phase stable; checksum " << (7000 + index)
+                   << "; this is not one of the requested values.\n";
+        }
+
+        prompt << "Return exactly one minified JSON object and no prose.\n"
+               << "The object shape is {\"alpha\":\"VALUE_FROM_LEDGER\","
+               << "\"middle\":\"VALUE_FROM_LEDGER\","
+               << "\"omega\":\"VALUE_FROM_LEDGER\"}.\n"
+               << "Use the exact REQUIRED_JSON_FIELD values from the ledger.";
+        return prompt.str();
     }
 
     inline std::chrono::steady_clock::time_point parityPhaseStart()
@@ -1116,7 +1245,27 @@ namespace llaminar2::test::parity::qwen36
         const std::string &model_path,
         const std::filesystem::path &metadata_path)
     {
-        if (metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
+        const auto metadata_matches_case = [&]()
+        {
+            if (!metadataLooksUsable(
+                    metadata_path,
+                    test_case.prompt,
+                    test_case.decode_steps))
+            {
+                return false;
+            }
+
+            /*
+             * Prompt text authentication protects content identity, while the
+             * explicit token bound protects intended workload geometry. Both
+             * are necessary: a header-only prompt is internally consistent but
+             * cannot exercise a 256-row partial prefix-cache hit.
+             */
+            return readTokenListFromMetadata(metadata_path, "token_ids").size() >=
+                   test_case.minimum_prompt_tokens;
+        };
+
+        if (metadata_matches_case())
         {
             return;
         }
@@ -1132,9 +1281,12 @@ namespace llaminar2::test::parity::qwen36
             << metadata_path << "\n"
             << output;
 
-        ASSERT_TRUE(metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
-            << test_case.name << " regenerated MoE metadata is incomplete at "
+        ASSERT_TRUE(metadata_matches_case())
+            << test_case.name
+            << " regenerated MoE metadata does not satisfy prompt identity, "
+               "decode depth, and minimum prompt-token requirements at "
             << metadata_path << "\n"
+            << "minimum_prompt_tokens=" << test_case.minimum_prompt_tokens << "\n"
             << output;
     }
 
@@ -1406,6 +1558,53 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << test_case.name << " model not found: " << *model_path;
         }
 
+        if (test_case.reference_input_source ==
+            MoEReferenceInputSource::ModelTokenizer)
+        {
+            /*
+             * ModelContext parses the GGUF header, metadata, and tensor
+             * directory but does not materialize tensor payloads. Marking the
+             * context as GPU-targeted selects demand paging, so even this
+             * metadata-only operation cannot regress into whole-file CPU NUMA
+             * first-touch on a 35B model.
+             */
+            const ModelContextConfig tokenizer_context_config{
+                .strategy = WeightDistributionStrategy::REPLICATED,
+                .use_mmap = true,
+                .target_is_gpu = true,
+            };
+            auto tokenizer_context =
+                ModelContext::create(*model_path, tokenizer_context_config);
+            ASSERT_NE(tokenizer_context, nullptr)
+                << test_case.name
+                << " could not parse GGUF metadata for prompt tokenization";
+
+            auto tokenizer = createTokenizer(tokenizer_context);
+            ASSERT_NE(tokenizer, nullptr)
+                << test_case.name
+                << " could not construct the production GGUF tokenizer";
+
+            /*
+             * PyTorch's raw-prompt tokenizer does not add an explicit BOS/EOS
+             * pair for this Qwen fixture. Spell that policy out instead of
+             * depending on ITokenizer defaults so the integration geometry is
+             * stable across tokenizer implementations.
+             */
+            const std::vector<int> encoded =
+                tokenizer->encode(
+                    test_case.prompt,
+                    /*add_bos=*/false,
+                    /*add_eos=*/false);
+            prompt_tokens->assign(encoded.begin(), encoded.end());
+            expected_tokens->clear();
+
+            ASSERT_GE(prompt_tokens->size(), test_case.minimum_prompt_tokens)
+                << test_case.name
+                << " production tokenizer produced too few prompt rows for "
+                   "the requested integration geometry";
+            return;
+        }
+
         const std::filesystem::path metadata_path = firstEnvOrDefault(
             test_case.metadata_envs,
             test_case.default_metadata_path);
@@ -1414,6 +1613,9 @@ namespace llaminar2::test::parity::qwen36
         *prompt_tokens = readTokenListFromMetadata(metadata_path, "token_ids");
         const auto pytorch_decode_tokens = readTokenListFromMetadata(metadata_path, "decode_tokens");
         ASSERT_FALSE(prompt_tokens->empty());
+        ASSERT_GE(prompt_tokens->size(), test_case.minimum_prompt_tokens)
+            << test_case.name << " metadata prompt is too short for the requested "
+               "integration geometry";
         ASSERT_GE(pytorch_decode_tokens.size(), static_cast<size_t>(test_case.decode_steps));
 
         expected_tokens->assign(
@@ -1561,6 +1763,63 @@ namespace llaminar2::test::parity::qwen36
             << PerfStatsCollector::summaryString({domain});
     }
 
+    /**
+     * @brief Sum accepted device-owned work from the Dynamic MoE planner.
+     *
+     * Dynamic rebalance has two production decision forms.  With the bounded
+     * hot-expert cache enabled, it may materialize a remote replica.  With that
+     * cache disabled, or after its useful candidates are exhausted, it may
+     * exchange expert ownership between participants.  Both forms publish the
+     * same compact transfer plan and pass through the same copy/apply graph.
+     * Tests must therefore certify accepted placement work without assuming
+     * that the runtime configuration selected one particular Dynamic policy.
+     *
+     * @param records Request-local PerfStats records.
+     * @return Number of accepted replica placements plus accepted ownership
+     *         swaps represented by the records.
+     */
+    inline double dynamicRebalanceAcceptedPlacementCount(
+        const std::vector<PerfStatRecord> &records)
+    {
+        const double ownership_swaps = perfCounterSum(
+            records,
+            "moe_rebalance",
+            "device_rebalance_dynamic_ownership_swap_accepts");
+        const double selected_replicas = perfCounterSum(
+            records,
+            "moe_rebalance",
+            "device_rebalance_selected_replicas");
+        return ownership_swaps + selected_replicas;
+    }
+
+    /**
+     * @brief Require accepted device-owned work from the Dynamic MoE planner.
+     *
+     * @param records Request-local PerfStats records.
+     * @param context Human-readable assertion context.
+     */
+    inline void expectDynamicRebalancePlacementPositive(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &context)
+    {
+        const double ownership_swaps = perfCounterSum(
+            records,
+            "moe_rebalance",
+            "device_rebalance_dynamic_ownership_swap_accepts");
+        const double selected_replicas = perfCounterSum(
+            records,
+            "moe_rebalance",
+            "device_rebalance_selected_replicas");
+
+        EXPECT_GT(dynamicRebalanceAcceptedPlacementCount(records), 0.0)
+            << context
+            << " should publish accepted Dynamic placement work; "
+               "ownership_swap_accepts="
+            << ownership_swaps
+            << " selected_replicas=" << selected_replicas << ".\n"
+            << PerfStatsCollector::summaryString({"moe_rebalance"});
+    }
+
     inline void expectPerfCounterZero(
         const std::vector<PerfStatRecord> &records,
         const std::string &domain,
@@ -1602,31 +1861,39 @@ namespace llaminar2::test::parity::qwen36
      *
      * Dynamic and LLEP use different movement planners.  Token parity can pass
      * even if a planner never moved anything, so phase-split tests require
-     * non-zero mode-specific counters plus zero descriptor/copy health errors.
+     * non-zero mode-specific counters on the request that owns prefill and
+     * movement, plus zero descriptor/copy health errors on every request.
+     *
+     * A full prefix-cache hit deliberately skips prefill, and short MTP parity
+     * requests can end before the next maintenance cadence.  Such restored
+     * requests therefore pass `require_fresh_movement=false`: the preceding
+     * request has already proved movement, while this request proves that
+     * restored state remains healthy and decode-equivalent without inventing a
+     * redundant migration solely to satisfy the test.
+     *
+     * @param test_case Topology and rebalance mode under test.
+     * @param records Request-local PerfStats records.
+     * @param context Human-readable assertion context.
+     * @param require_fresh_movement Whether this request must publish non-zero
+     *        planner/copy/apply counters in addition to health counters.
      */
     inline void expectMoERebalancePerfPath(
         const MoEPrefixRestoreParityCase &test_case,
         const std::vector<PerfStatRecord> &records,
-        const std::string &context)
+        const std::string &context,
+        bool require_fresh_movement = true)
     {
         if (!test_case.moe_rebalance)
             return;
 
         const auto mode = test_case.moe_rebalance->mode;
-        if (mode == MoERebalanceRuntimeMode::Dynamic)
+        if (require_fresh_movement &&
+            mode == MoERebalanceRuntimeMode::Dynamic)
         {
-            expectPerfCounterPositive(
-                records,
-                "moe_rebalance",
-                "device_rebalance_dynamic_ownership_swap_attempts",
-                context);
-            expectPerfCounterPositive(
-                records,
-                "moe_rebalance",
-                "device_rebalance_dynamic_ownership_swap_accepts",
-                context);
+            expectDynamicRebalancePlacementPositive(records, context);
         }
-        else if (mode == MoERebalanceRuntimeMode::LLEP)
+        else if (require_fresh_movement &&
+                 mode == MoERebalanceRuntimeMode::LLEP)
         {
             expectPerfCounterPositive(
                 records,
@@ -1667,6 +1934,24 @@ namespace llaminar2::test::parity::qwen36
                  "device_rebalance_controller_last_error_code"})
         {
             expectPerfCounterZero(records, "moe_rebalance", error_counter, context);
+        }
+
+        /*
+         * Dedicated maintenance streams may overlap host scheduling, but the
+         * first production graph that follows each launch must consume its
+         * completion event.  Gate this assertion on an observed launch so
+         * short fixtures below the maintenance cadence remain valid.
+         */
+        if (perfCounterSum(
+                records,
+                "moe_rebalance",
+                "device_maintenance_graph_launches") > 0.0)
+        {
+            expectPerfCounterPositive(
+                records,
+                "moe_rebalance",
+                "device_maintenance_graph_consumer_event_waits",
+                context);
         }
     }
 
@@ -1791,6 +2076,10 @@ namespace llaminar2::test::parity::qwen36
             hasMTPPerfCounter(
                 records,
                 "grouped_decode_equivalent_greedy_verifier_runs");
+        const bool used_device_owned_verifier_positions =
+            hasMTPPerfCounter(
+                records,
+                "verifier_device_position_expansions");
 
         if (moECaseExpectsGroupedOutcomeDevicePublication(test_case))
         {
@@ -1800,6 +2089,10 @@ namespace llaminar2::test::parity::qwen36
                 << PerfStatsCollector::summaryString({"mtp"});
             EXPECT_TRUE(used_grouped_verifier)
                 << context << " should run grouped greedy MoE verifier rows.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_TRUE(used_device_owned_verifier_positions)
+                << context << " should expand grouped verifier positions from "
+                   "the canonical device KV counts.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
             EXPECT_FALSE(used_retired_serial_replay)
                 << context << " must not use row-serial MoE verifier replay "
@@ -2562,7 +2855,14 @@ namespace llaminar2::test::parity::qwen36
         }
 
         ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
-        ASSERT_EQ(baseline_result.tokens.size(), expected_tokens.size());
+        ASSERT_EQ(
+            baseline_result.tokens.size(),
+            static_cast<size_t>(test_case.decode_steps));
+        if (test_case.reference_input_source ==
+            MoEReferenceInputSource::PyTorchMetadata)
+        {
+            ASSERT_EQ(baseline_result.tokens.size(), expected_tokens.size());
+        }
         EXPECT_EQ(baseline_snapshot.prefix_cache_hits, 0u);
 
         // The dedicated Qwen3.6 MoE math parity suite checks PyTorch logits and
@@ -2734,7 +3034,14 @@ namespace llaminar2::test::parity::qwen36
         baseline->shutdown();
 
         ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
-        ASSERT_EQ(baseline_result.tokens.size(), expected_tokens.size());
+        ASSERT_EQ(
+            baseline_result.tokens.size(),
+            static_cast<size_t>(test_case.decode_steps));
+        if (test_case.reference_input_source ==
+            MoEReferenceInputSource::PyTorchMetadata)
+        {
+            ASSERT_EQ(baseline_result.tokens.size(), expected_tokens.size());
+        }
         EXPECT_EQ(baseline_snapshot.prefix_cache_hits, 0u);
         EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
 
@@ -2760,6 +3067,14 @@ namespace llaminar2::test::parity::qwen36
         phase_start = parityPhaseStart();
         auto first = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
         logMoEParityPhase(test_case, "mtp.first-generate", phase_start);
+        /*
+         * Device-side MoE maintenance deliberately overlaps the host-facing
+         * generation epilogue.  Certification must drain that completed
+         * diagnostic lane before snapshotting PerfStats so plan, payload-copy,
+         * and arrival-apply records all describe this request.  This hook does
+         * not reset inference state and is absent from the inference hot path.
+         */
+        mtp->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
         const auto after_first = mtp->prefixStateProbe();
         const auto first_records = PerfStatsCollector::snapshot(
             {"mtp", "prefix_cache", "moe_rebalance", "kernel"});
@@ -2774,6 +3089,10 @@ namespace llaminar2::test::parity::qwen36
             first_records,
             test_case.name + " first request");
         expectMoEBackendKernelPerfPath(
+            test_case,
+            first_records,
+            test_case.name + " first request");
+        expectMoERebalancePerfPath(
             test_case,
             first_records,
             test_case.name + " first request");
@@ -2793,6 +3112,7 @@ namespace llaminar2::test::parity::qwen36
         phase_start = parityPhaseStart();
         auto second = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
         logMoEParityPhase(test_case, "mtp.second-generate", phase_start);
+        mtp->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
         const auto after_second = mtp->prefixStateProbe();
         const auto second_records = PerfStatsCollector::snapshot(
             {"mtp", "prefix_cache", "moe_rebalance", "kernel"});
@@ -2830,7 +3150,8 @@ namespace llaminar2::test::parity::qwen36
         expectMoERebalancePerfPath(
             test_case,
             second_records,
-            test_case.name + " restored request");
+            test_case.name + " restored request",
+            /*require_fresh_movement=*/false);
         expectMoEBackendKernelPerfPath(
             test_case,
             second_records,
@@ -3066,12 +3387,19 @@ namespace llaminar2::test::parity::qwen36
         auto mtp_result =
             mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
         logMoEParityPhase(test_case, "stochastic-mtp.first-generate", phase_start);
+        mtp->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
         const auto after_first_mtp = mtp->prefixStateProbe();
+        const auto first_mtp_records = PerfStatsCollector::snapshot(
+            {"mtp", "prefix_cache", "moe_rebalance", "kernel"});
         ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
         ASSERT_EQ(mtp_result.tokens.size(), static_cast<size_t>(stochastic_decode_steps));
         EXPECT_EQ(mtp_result.tokens, baseline_result.tokens)
             << "MoE stochastic MTP must match serial stochastic decode for "
                "the same seed on the first request";
+        expectMoERebalancePerfPath(
+            test_case,
+            first_mtp_records,
+            test_case.name + " stochastic first request");
         if (enable_prefix_cache)
         {
             EXPECT_TRUE(after_first_mtp.prefix_cache_ready);
@@ -3086,6 +3414,7 @@ namespace llaminar2::test::parity::qwen36
                 test_case,
                 "stochastic-mtp.prefix-restored-generate",
                 phase_start);
+            mtp->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
             const auto after_restored_mtp = mtp->prefixStateProbe();
             const auto restored_records = PerfStatsCollector::snapshot(
                 {"mtp", "prefix_cache", "moe_rebalance", "kernel"});
@@ -3126,7 +3455,8 @@ namespace llaminar2::test::parity::qwen36
             expectMoERebalancePerfPath(
                 test_case,
                 restored_records,
-                test_case.name + " stochastic restored-prefix request");
+                test_case.name + " stochastic restored-prefix request",
+                /*require_fresh_movement=*/false);
             expectMoEBackendKernelPerfPath(
                 test_case,
                 restored_records,
@@ -3179,6 +3509,7 @@ namespace llaminar2::test::parity::qwen36
         auto reused_mtp_result =
             mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
         logMoEParityPhase(test_case, "stochastic-mtp.reused-generate", phase_start);
+        mtp->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
         const auto after_reused_mtp = mtp->prefixStateProbe();
         const auto phase138_records =
             PerfStatsCollector::snapshot(
@@ -7180,9 +7511,28 @@ namespace llaminar2::test::parity::qwen36
         {
             grouped_snapshot_capture.clear();
         }
-        ASSERT_TRUE(runner->forward(
-            verifier_tokens.data(),
-            static_cast<int>(verifier_tokens.size())))
+        bool grouped_forward_ok = false;
+        if (device.is_gpu())
+        {
+            const void *verifier_tokens_device =
+                runner->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+                    verifier_tokens.data(),
+                    static_cast<int>(verifier_tokens.size()),
+                    static_cast<int>(verifier_tokens.size() - 1));
+            ASSERT_NE(verifier_tokens_device, nullptr)
+                << "MoE GPU grouped verifier must bind its arena-owned token row";
+            grouped_forward_ok = runner->forwardWithDeviceTokenIds(
+                verifier_tokens.data(),
+                verifier_tokens_device,
+                static_cast<int>(verifier_tokens.size()));
+        }
+        else
+        {
+            grouped_forward_ok = runner->forward(
+                verifier_tokens.data(),
+                static_cast<int>(verifier_tokens.size()));
+        }
+        ASSERT_TRUE(grouped_forward_ok)
             << "MoE grouped all-position verifier forward failed";
 
         std::vector<int32_t> grouped_rows(verifier_tokens.size(), -1);

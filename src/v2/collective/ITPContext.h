@@ -186,12 +186,15 @@ namespace llaminar2
                                        size_t count, void *stream,
                                        const std::string &precision = "")
         {
+            (void)tensor;
+            (void)stage_name;
+            (void)count;
             (void)precision;
             if (!stream)
                 throw std::invalid_argument("ITPContext::allreduceOnStream requires a non-null GPU stream");
-            // Default: delegate to normal allreduce, ignoring stream and precision.
-            // Implementations that support real on-stream collectives should override this.
-            return allreduce(tensor, stage_name, count);
+            throw std::logic_error(
+                "ITPContext::allreduceOnStream is not implemented by this context; "
+                "blocking collective fallback is forbidden for GPU execution");
         }
 
         /**

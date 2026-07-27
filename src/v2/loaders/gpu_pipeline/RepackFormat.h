@@ -53,6 +53,8 @@ struct RepackKernels {
                                   uint16_t* d_mins,
                                   uint32_t* d_emins,
                                   int N, int K,
+                                  int output_N,
+                                  int output_row_offset,
                                   void* stream);
 
     VnniRepackFn vnniRepack = nullptr;

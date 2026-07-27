@@ -15,6 +15,7 @@
 #include "../../../kernels/cpu/turboquant/TurboQuantQuantizeTQ8.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantQuantizeTQ4.h"
 #include "../../../kernels/cpu/rotation/ActivationRotation.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/OpenMPUtils.h"
 
 #include "../../../utils/KVCacheProfiler.h"
@@ -120,6 +121,17 @@ namespace llaminar2
             return false;
         }
 
+        void *stage_stream = nullptr;
+        if (params_.device_id.is_gpu())
+        {
+            stage_stream = requireGPUStream();
+            const StageGPUExecution execution = gpuExecution();
+            execution.requirePreparedInput(
+                const_cast<ITensor *>(params_.K));
+            execution.requirePreparedInput(
+                const_cast<ITensor *>(params_.V));
+        }
+
         // Determine the graph-shaped token count first, then narrow to the real
         // prefix for non-captured padded execution. Captured GPU execution keeps
         // head/count and real request lengths entirely in canonical device state.
@@ -154,12 +166,7 @@ namespace llaminar2
             const auto start = std::chrono::high_resolution_clock::now();
 
             bool success = false;
-            void *stream = gpuStream();
-            if (params_.device_id.is_gpu() && !stream)
-            {
-                LOG_ERROR("[KVCacheAppendStage] GPU KV append requires an explicit non-null stage stream");
-                return false;
-            }
+            void *stream = stage_stream;
 
             if (debugEnv().attention.debug_kv_append_source_snapshot &&
                 debugEnv().attention.debugKVAppendSourceLayerSelected(params_.layer_idx))
@@ -284,19 +291,6 @@ namespace llaminar2
                 const size_t k_seq_bytes = static_cast<size_t>(seq_len) * k_cols * k_elem_bytes;
                 const size_t v_seq_bytes = static_cast<size_t>(seq_len) * v_cols * v_elem_bytes;
 
-                auto *k_mut = const_cast<ITensor *>(params_.K);
-                auto *v_mut = const_cast<ITensor *>(params_.V);
-                if (!params_.K->gpu_data_ptr() && !k_mut->ensureOnDevice(target))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Failed to ensure K on GPU for batched append");
-                    return false;
-                }
-                if (!params_.V->gpu_data_ptr() && !v_mut->ensureOnDevice(target))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Failed to ensure V on GPU for batched append");
-                    return false;
-                }
-
                 const auto *k_base_ptr = static_cast<const uint8_t *>(params_.K->gpu_data_ptr());
                 const auto *v_base_ptr = static_cast<const uint8_t *>(params_.V->gpu_data_ptr());
                 if (!k_base_ptr || !v_base_ptr)
@@ -305,15 +299,33 @@ namespace llaminar2
                     return false;
                 }
 
-                const int gpu_ordinal = target.gpu_ordinal();
                 for (int b = 0; b < batch_size; ++b)
                 {
                     const int seq_idx = params_.seq_idx + b;
                     void *k_seq_ptr = const_cast<uint8_t *>(k_base_ptr + static_cast<size_t>(b) * k_seq_bytes);
                     void *v_seq_ptr = const_cast<uint8_t *>(v_base_ptr + static_cast<size_t>(b) * v_seq_bytes);
 
-                    GpuTensorView k_view(k_seq_ptr, static_cast<size_t>(seq_len), k_cols, k_type, gpu_ordinal);
-                    GpuTensorView v_view(v_seq_ptr, static_cast<size_t>(seq_len), v_cols, v_type, gpu_ordinal);
+                    /*
+                     * The parent tensors were joined to stage_stream above.
+                     * These wrappers describe pointer-offset slices of that
+                     * already-ordered storage; they are not independent
+                     * coherence owners and therefore carry the exact device
+                     * and producer stream into the cache boundary.
+                     */
+                    PreparedGpuTensorView k_view(
+                        k_seq_ptr,
+                        static_cast<size_t>(seq_len),
+                        k_cols,
+                        k_type,
+                        target,
+                        stage_stream);
+                    PreparedGpuTensorView v_view(
+                        v_seq_ptr,
+                        static_cast<size_t>(seq_len),
+                        v_cols,
+                        v_type,
+                        target,
+                        stage_stream);
 
                     if (!append_to_cache(seq_idx, &k_view, &v_view, seq_len))
                     {
@@ -373,16 +385,6 @@ namespace llaminar2
                     k_fp16->from_fp32(k_slice->data(), static_cast<size_t>(seq_len) * kv_dim);
                     v_fp16->from_fp32(v_slice->data(), static_cast<size_t>(seq_len) * kv_dim);
 
-                    if (params_.device_id.is_gpu())
-                    {
-                        if (!k_fp16->ensureOnDevice(params_.device_id) ||
-                            !v_fp16->ensureOnDevice(params_.device_id))
-                        {
-                            LOG_ERROR("[KVCacheAppendStage] Failed to upload FP16 converted K/V slices to GPU");
-                            return false;
-                        }
-                    }
-
                     const auto conv_end = std::chrono::high_resolution_clock::now();
                     const uint64_t conv_ns = static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
@@ -408,16 +410,6 @@ namespace llaminar2
                     {
                         LOG_ERROR("[KVCacheAppendStage] Failed to quantize batched K/V slices to Q8_1");
                         return false;
-                    }
-
-                    if (params_.device_id.is_gpu())
-                    {
-                        if (!k_q8->ensureOnDevice(params_.device_id) ||
-                            !v_q8->ensureOnDevice(params_.device_id))
-                        {
-                            LOG_ERROR("[KVCacheAppendStage] Failed to upload Q8_1 converted K/V slices to GPU");
-                            return false;
-                        }
                     }
 
                     const auto conv_end = std::chrono::high_resolution_clock::now();
@@ -670,16 +662,6 @@ namespace llaminar2
             fp16_k_scratch_->from_fp32(k_fp32, static_cast<size_t>(total_tokens) * kv_dim);
             fp16_v_scratch_->from_fp32(v_fp32, static_cast<size_t>(total_tokens) * kv_dim);
 
-            if (params_.device_id.is_gpu())
-            {
-                if (!fp16_k_scratch_->ensureOnDevice(params_.device_id) ||
-                    !fp16_v_scratch_->ensureOnDevice(params_.device_id))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Failed to upload FP16 converted K/V tensors to GPU");
-                    return false;
-                }
-            }
-
             const auto conv_end = std::chrono::high_resolution_clock::now();
             const uint64_t conv_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
@@ -752,16 +734,6 @@ namespace llaminar2
                     !q8_v_scratch_->copyFrom_fp32_rows(v_fp32, static_cast<size_t>(total_tokens)))
                 {
                     LOG_ERROR("[KVCacheAppendStage] Failed to quantize K/V for Q8_1 cache append (in-place)");
-                    return false;
-                }
-            }
-
-            if (params_.device_id.is_gpu())
-            {
-                if (!q8_k_scratch_->ensureOnDevice(params_.device_id) ||
-                    !q8_v_scratch_->ensureOnDevice(params_.device_id))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Failed to upload Q8_1 converted K/V tensors to GPU");
                     return false;
                 }
             }

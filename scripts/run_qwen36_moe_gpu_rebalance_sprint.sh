@@ -69,9 +69,9 @@ Dynamic/observe cases default to --moe-rebalance-window 64 so the standard
 128-token sprint proof crosses at least one rebalance decision window. Override
 with --rebalance-window or LLAMINAR_GPU_MOE_REBALANCE_WINDOW.
 
-Homogeneous two-card LocalTP runs default to capturing NCCL/RCCL collectives
-inside decode GPU graphs. Use --no-capture-collectives to force per-layer manual
-collective segments for overhead diagnostics.
+Homogeneous two-card LocalTP runs capture NCCL/RCCL collectives inside one
+complete decode GPU graph. Manual collective segments are not a supported
+homogeneous execution mode.
 
 Use --defer-captured-collective-sync with --capture-collectives to skip the
 final host stream wait after replaying a fully captured collective decode graph.
@@ -189,8 +189,8 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --no-capture-collectives)
-      capture_collectives=0
-      shift
+      echo "ERROR: homogeneous two-card runs require graph-captured collectives; segmented execution is not supported" >&2
+      exit 2
       ;;
     --defer-captured-collective-sync)
       defer_captured_collective_sync=1
@@ -567,18 +567,20 @@ run_one() {
     fi
   fi
   if [[ "${place}" == "twocard" ]]; then
+    if [[ "${capture_collectives}" == "0" ||
+          "${capture_collectives}" == "false" ||
+          "${capture_collectives}" == "off" ]]; then
+      echo "ERROR: homogeneous two-card runs require graph-captured collectives; segmented execution is not supported" >&2
+      return 2
+    fi
     if [[ "${require_prefill_graph}" != "0" && "${require_prefill_graph}" != "false" && "${require_prefill_graph}" != "off" ]]; then
       run_env+=("LLAMINAR_PREFILL_GRAPH_REQUIRED=1")
     else
       run_env+=("LLAMINAR_PREFILL_GRAPH_REQUIRED=0")
     fi
-    if [[ "${capture_collectives}" != "0" && "${capture_collectives}" != "false" && "${capture_collectives}" != "off" ]]; then
-      run_env+=("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES=1")
-      if [[ -z "${LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED+x}" ]]; then
-        run_env+=("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=0")
-      fi
-    elif [[ -z "${LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED+x}" ]]; then
-      run_env+=("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=1")
+    run_env+=("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES=1")
+    if [[ -z "${LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED+x}" ]]; then
+      run_env+=("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=0")
     fi
     if [[ "${defer_captured_collective_sync}" != "0" && "${defer_captured_collective_sync}" != "false" && "${defer_captured_collective_sync}" != "off" ]]; then
       run_env+=("LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC=1")

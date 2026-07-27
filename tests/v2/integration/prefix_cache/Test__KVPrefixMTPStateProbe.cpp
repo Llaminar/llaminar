@@ -21,6 +21,7 @@
 #include "utils/MPIContext.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/Sampler.h"
+#include "utils/Sha256.h"
 #include "utils/TestTensorFactory.h"
 #include "utils/Tokenizer.h"
 #include "utils/DebugEnv.h"
@@ -175,28 +176,31 @@ namespace
     }
 
     /**
-     * @brief Select the early-layer snapshots needed to localize prefill replay drift.
+     * @brief Select one transformer-layer window for prefill continuity diagnosis.
      *
-     * The long-context state probe already proves that an eager suffix and a
-     * graph-replayed suffix eventually disagree.  This diagnostic narrows the
-     * first changed production operation without enabling snapshots for the
-     * entire 41-layer model.  Snapshot copies are recorded on the stage stream
-     * as graph nodes, so the captured values preserve point-in-time semantics
-     * even when several stages reuse the same arena tensor.
+     * The long-context state probe already identifies the first persistent
+     * state slot that differs. Capturing the graph stages around that slot then
+     * identifies the first arithmetic producer without materializing all
+     * intermediates from the complete 41-layer model. Snapshot copies are
+     * recorded on each stage's producer stream as graph nodes, so the captured
+     * values preserve point-in-time semantics even when later stages reuse the
+     * same arena tensor.
      *
+     * @param first_layer Inclusive first transformer layer to capture.
      * @param last_layer Inclusive final transformer layer to capture.
      * @return Semantic snapshot keys in forward execution order.
      */
-    std::vector<std::string> prefillReplayContinuitySnapshotKeys(int last_layer)
+    std::vector<std::string> prefillReplayContinuitySnapshotKeys(
+        int first_layer,
+        int last_layer)
     {
+        if (first_layer < 0 || last_layer < first_layer)
+            throw std::invalid_argument(
+                "prefill replay snapshot layer window is invalid");
+
         std::vector<std::string> selected;
         for (const std::string &key : requestBatchPrefillSnapshotKeys())
         {
-            if (key == "EMBEDDING")
-            {
-                selected.push_back(key);
-                continue;
-            }
             if (key.rfind("layer", 0) != 0)
                 continue;
 
@@ -204,7 +208,22 @@ namespace
             if (separator == std::string::npos)
                 continue;
             const int layer = std::stoi(key.substr(5, separator - 5));
-            if (layer <= last_layer)
+            if (layer < first_layer || layer > last_layer)
+                continue;
+
+            /*
+             * LLEP is allowed to move routed/shared expert work between LocalTP
+             * participants. Participant-local MoE partials therefore change
+             * even when the semantic result is exact. Compare the explicit
+             * post-collective products instead; treating a valid placement
+             * change as arithmetic drift would point diagnostics at the first
+             * moved expert instead of the first observable model difference.
+             */
+            const bool local_moe_partial =
+                (key.ends_with("_MOE_EXPERT_OUTPUT") ||
+                 key.ends_with("_MOE_SHARED_EXPERT_OUTPUT") ||
+                 key.ends_with("_MOE_COMBINED_OUTPUT"));
+            if (!local_moe_partial)
                 selected.push_back(key);
         }
         return selected;
@@ -219,38 +238,102 @@ namespace
      * in forward order and the first changed IEEE-754 word.
      */
     ::testing::AssertionResult prefillReplaySnapshotsByteIdentical(
-        const std::map<std::string, RequestBatchStageSnapshot> &eager,
-        const std::map<std::string, RequestBatchStageSnapshot> &replayed,
-        const std::vector<std::string> &ordered_keys)
+        const std::map<std::string, RequestBatchStageSnapshot> &full_prefill,
+        const std::map<std::string, RequestBatchStageSnapshot> &suffix_prefill,
+        const std::vector<std::string> &ordered_keys,
+        size_t full_rows,
+        size_t suffix_row_offset,
+        size_t suffix_rows)
     {
+        if (full_rows == 0 || suffix_rows == 0 ||
+            suffix_row_offset + suffix_rows != full_rows)
+        {
+            return ::testing::AssertionFailure()
+                   << "invalid full/suffix snapshot geometry: full_rows="
+                   << full_rows << " suffix_row_offset=" << suffix_row_offset
+                   << " suffix_rows=" << suffix_rows;
+        }
+
         size_t comparable = 0;
         for (const std::string &key : ordered_keys)
         {
-            const auto eager_it = eager.find(key);
-            const auto replay_it = replayed.find(key);
-            if (eager_it == eager.end() || replay_it == replayed.end())
+            const auto full_it = full_prefill.find(key);
+            const auto suffix_it = suffix_prefill.find(key);
+            if (full_it == full_prefill.end() ||
+                suffix_it == suffix_prefill.end())
                 continue;
 
             ++comparable;
-            const auto &left = eager_it->second.data;
-            const auto &right = replay_it->second.data;
-            if (left.size() != right.size())
+            const auto &full = full_it->second.data;
+            const auto &suffix = suffix_it->second.data;
+            const float *expected_suffix = nullptr;
+            size_t compared_elements = 0;
+            size_t diagnostic_row_width = 0;
+            bool compares_terminal_graph_tile = false;
+
+            if (full.size() == suffix.size())
             {
-                return ::testing::AssertionFailure()
-                       << "snapshot size mismatch at " << key
-                       << " eager=" << left.size()
-                       << " replay=" << right.size();
+                /*
+                 * Prefill graph execution tiles a long request through a
+                 * graph-stable row bucket. SnapshotCapture retains the last
+                 * callback for a semantic key, so equal-size captures are the
+                 * terminal tile from each execution. The split point is itself
+                 * graph-bucket aligned in this regression; therefore both
+                 * terminal tiles describe the same absolute token rows and
+                 * compare directly.
+                 */
+                expected_suffix = full.data();
+                compared_elements = full.size();
+                compares_terminal_graph_tile = true;
             }
-            if (std::memcmp(left.data(), right.data(), left.size() * sizeof(float)) == 0)
+            else
+            {
+                if (full.size() % full_rows != 0 ||
+                    suffix.size() % suffix_rows != 0)
+                {
+                    return ::testing::AssertionFailure()
+                           << "snapshot cannot be interpreted as token rows at "
+                           << key << " full_elements=" << full.size()
+                           << " full_rows=" << full_rows
+                           << " suffix_elements=" << suffix.size()
+                           << " suffix_rows=" << suffix_rows;
+                }
+
+                const size_t full_row_width = full.size() / full_rows;
+                const size_t suffix_row_width = suffix.size() / suffix_rows;
+                if (full_row_width == 0 || full_row_width != suffix_row_width)
+                {
+                    return ::testing::AssertionFailure()
+                           << "snapshot row-width mismatch at " << key
+                           << " full_width=" << full_row_width
+                           << " suffix_width=" << suffix_row_width;
+                }
+
+                diagnostic_row_width = full_row_width;
+                expected_suffix =
+                    full.data() + suffix_row_offset * full_row_width;
+                compared_elements = suffix_rows * suffix_row_width;
+            }
+
+            if (std::memcmp(
+                    expected_suffix,
+                    suffix.data(),
+                    compared_elements * sizeof(float)) == 0)
                 continue;
 
-            for (size_t index = 0; index < left.size(); ++index)
+            for (size_t index = 0; index < compared_elements; ++index)
             {
-                uint32_t eager_bits = 0;
-                uint32_t replay_bits = 0;
-                std::memcpy(&eager_bits, &left[index], sizeof(eager_bits));
-                std::memcpy(&replay_bits, &right[index], sizeof(replay_bits));
-                if (eager_bits == replay_bits)
+                uint32_t full_bits = 0;
+                uint32_t suffix_bits = 0;
+                std::memcpy(
+                    &full_bits,
+                    &expected_suffix[index],
+                    sizeof(full_bits));
+                std::memcpy(
+                    &suffix_bits,
+                    &suffix[index],
+                    sizeof(suffix_bits));
+                if (full_bits == suffix_bits)
                     continue;
 
                 auto firstIndexOfBits = [](const std::vector<float> &values,
@@ -272,27 +355,41 @@ namespace
 
                 auto failure = ::testing::AssertionFailure();
                 failure << "first snapshot byte mismatch at " << key
-                        << " index=" << index
-                        << " eager=" << left[index]
-                        << " replay=" << right[index]
-                        << " eager_bits=0x" << std::hex << std::setw(8)
-                        << std::setfill('0') << eager_bits
-                        << " replay_bits=0x" << std::setw(8) << replay_bits
+                        << " layout="
+                        << (compares_terminal_graph_tile
+                                ? "terminal_graph_tile"
+                                : "whole_request_suffix")
+                        << " element=" << index;
+                if (diagnostic_row_width > 0)
+                {
+                    failure << " suffix_row="
+                            << (index / diagnostic_row_width)
+                            << " full_row="
+                            << (suffix_row_offset +
+                                index / diagnostic_row_width)
+                            << " column=" << (index % diagnostic_row_width);
+                }
+                failure
+                        << " full=" << expected_suffix[index]
+                        << " suffix=" << suffix[index]
+                        << " full_bits=0x" << std::hex << std::setw(8)
+                        << std::setfill('0') << full_bits
+                        << " suffix_bits=0x" << std::setw(8) << suffix_bits
                         << std::dec << std::setfill(' ');
 
                 if (key.find("ATTENTION_EFFECTIVE_") != std::string::npos)
                 {
-                    const auto replay_in_eager =
-                        firstIndexOfBits(left, replay_bits);
-                    const auto eager_in_replay =
-                        firstIndexOfBits(right, eager_bits);
-                    failure << " replay_value_in_eager="
-                            << (replay_in_eager
-                                    ? std::to_string(*replay_in_eager)
+                    const auto suffix_in_full =
+                        firstIndexOfBits(full, suffix_bits);
+                    const auto full_in_suffix =
+                        firstIndexOfBits(suffix, full_bits);
+                    failure << " suffix_value_in_full="
+                            << (suffix_in_full
+                                    ? std::to_string(*suffix_in_full)
                                     : std::string("absent"))
-                            << " eager_value_in_replay="
-                            << (eager_in_replay
-                                    ? std::to_string(*eager_in_replay)
+                            << " full_value_in_suffix="
+                            << (full_in_suffix
+                                    ? std::to_string(*full_in_suffix)
                                     : std::string("absent"));
 
                     const size_t layer_separator = key.find('_');
@@ -307,18 +404,20 @@ namespace
                          })
                     {
                         const std::string related_key = layer_prefix + suffix;
-                        const auto eager_related = eager.find(related_key);
-                        const auto replayed_related = replayed.find(related_key);
-                        if (eager_related == eager.end() ||
-                            replayed_related == replayed.end() ||
-                            eager_related->second.data.empty() ||
-                            replayed_related->second.data.empty())
+                        const auto full_related =
+                            full_prefill.find(related_key);
+                        const auto suffix_related =
+                            suffix_prefill.find(related_key);
+                        if (full_related == full_prefill.end() ||
+                            suffix_related == suffix_prefill.end() ||
+                            full_related->second.data.empty() ||
+                            suffix_related->second.data.empty())
                         {
                             continue;
                         }
                         failure << ' ' << related_key
-                                << "[0]=" << eager_related->second.data[0]
-                                << '/' << replayed_related->second.data[0];
+                                << "[0]=" << full_related->second.data[0]
+                                << '/' << suffix_related->second.data[0];
                     }
                 }
                 return failure;
@@ -638,6 +737,8 @@ namespace
         return {};
     }
 
+    std::filesystem::path tempPrefixDiskDir();
+
     std::optional<std::string> firstGpuDeviceSpec()
     {
         auto &dm = DeviceManager::instance();
@@ -650,6 +751,17 @@ namespace
         {
             return std::string("rocm:0");
         }
+        return std::nullopt;
+    }
+
+    std::optional<std::string> explicitGpuDeviceSpec(DeviceType type)
+    {
+        auto &dm = DeviceManager::instance();
+        dm.initialize(-1, false);
+        if (type == DeviceType::CUDA && dm.cuda_device_count() > 0)
+            return std::string("cuda:0");
+        if (type == DeviceType::ROCm && dm.rocm_device_count() > 0)
+            return std::string("rocm:0");
         return std::nullopt;
     }
 
@@ -722,6 +834,300 @@ namespace
         config.prefix_cache.disk_budget_bytes = 32ull * 1024ull * 1024ull;
         config.prefix_cache.disk_dir = disk_dir.string();
         return config;
+    }
+
+    OrchestrationConfig makeSingleGpuConstrainedHotPrefixCacheConfig(
+        const std::string &device_spec,
+        const std::filesystem::path &disk_dir)
+    {
+        OrchestrationConfig config =
+            makeSingleGpuDeviceHotPrefixCacheConfig(
+                device_spec,
+                disk_dir);
+        /*
+         * The dense test model's terminal two-token block is 632,320 bytes.
+         * A 640 KiB budget admits that block but cannot retain it alongside the
+         * smaller nonterminal block, forcing deterministic hot-tier LRU turns.
+         */
+        config.prefix_cache.device_budget_bytes =
+            640ull * 1024ull;
+        return config;
+    }
+
+    void verifyGpuDeviceHotTierRestoresDirectly(
+        const std::string &device_spec)
+    {
+        const auto disk_dir = tempPrefixDiskDir();
+        const auto cleanup = [&]() { std::filesystem::remove_all(disk_dir); };
+
+        auto factory = createOrchestrationRunnerFactory();
+        auto runner = factory->createFromOrchestrationConfig(
+            makeSingleGpuDeviceHotPrefixCacheConfig(device_spec, disk_dir));
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        const std::vector<int32_t> prompt = {1, 2, 3, 4};
+
+        auto first = runner->generate(prompt, 1, greedy);
+        ASSERT_TRUE(first.error.empty()) << first.error;
+        ASSERT_EQ(first.tokens.size(), 1u);
+
+        const auto after_first = runner->prefixStateProbe();
+        EXPECT_TRUE(after_first.prefix_cache_ready);
+        EXPECT_GE(after_first.prefix_cache_inserts, 2u);
+        EXPECT_GE(after_first.prefix_cache_evictions, 1u);
+        EXPECT_GT(after_first.prefix_cache_device_bytes, 0u);
+        EXPECT_GT(after_first.prefix_cache_disk_bytes, 0u);
+        EXPECT_GE(after_first.prefix_cache_promotions, 2u);
+
+        auto second = runner->generate(prompt, 1, greedy);
+        ASSERT_TRUE(second.error.empty()) << second.error;
+        ASSERT_EQ(second.tokens.size(), 1u);
+        EXPECT_EQ(second.tokens.front(), first.tokens.front());
+
+        const auto after_second = runner->prefixStateProbe();
+        EXPECT_GE(after_second.prefix_cache_hits, 2u);
+        EXPECT_GE(after_second.prefix_cache_device_hot_direct_hits, 2u)
+            << "Every restored block should come directly from its VRAM replica";
+        EXPECT_EQ(after_second.prefix_cache_disk_hydrations, 0u)
+            << "A device-hot hit must not materialize an intermediate RAM copy";
+        EXPECT_GT(after_second.prefix_cache_device_bytes, 0u);
+
+        runner.reset();
+        cleanup();
+    }
+
+    void verifyGpuTieredDiskCacheHydrates(
+        const std::string &device_spec)
+    {
+        const auto disk_dir = tempPrefixDiskDir();
+        const auto cleanup = [&]() { std::filesystem::remove_all(disk_dir); };
+
+        auto factory = createOrchestrationRunnerFactory();
+        auto runner = factory->createFromOrchestrationConfig(
+            makeSingleGpuTieredPrefixCacheConfig(device_spec, disk_dir));
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        const std::vector<int32_t> prompt = {1, 2, 3, 4};
+
+        auto first = runner->generate(prompt, 1, greedy);
+        ASSERT_TRUE(first.error.empty()) << first.error;
+        ASSERT_EQ(first.tokens.size(), 1u);
+
+        const auto after_first = runner->prefixStateProbe();
+        EXPECT_TRUE(after_first.prefix_cache_ready);
+        EXPECT_GE(after_first.prefix_cache_inserts, 2u);
+        EXPECT_GE(after_first.prefix_cache_evictions, 1u);
+        EXPECT_GT(after_first.prefix_cache_disk_bytes, 0u);
+
+        auto second = runner->generate(prompt, 1, greedy);
+        ASSERT_TRUE(second.error.empty()) << second.error;
+        ASSERT_EQ(second.tokens.size(), 1u);
+        EXPECT_EQ(second.tokens.front(), first.tokens.front());
+
+        const auto after_second = runner->prefixStateProbe();
+        EXPECT_TRUE(after_second.prefix_cache_ready);
+        EXPECT_GE(after_second.prefix_cache_hits, 2u);
+        EXPECT_GE(after_second.prefix_cache_disk_hydrations, 2u)
+            << "Both 2-token blocks should be served through disk hydration";
+        EXPECT_GT(after_second.prefix_cache_disk_bytes, 0u);
+
+        runner.reset();
+        cleanup();
+    }
+
+    void verifyGpuDiskArchiveSurvivesRunnerRestart(
+        const std::string &device_spec)
+    {
+        const auto disk_dir = tempPrefixDiskDir();
+        const auto cleanup = [&]() { std::filesystem::remove_all(disk_dir); };
+        const auto config =
+            makeSingleGpuTieredPrefixCacheConfig(device_spec, disk_dir);
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        const std::vector<int32_t> prompt = {1, 2, 3, 4};
+        std::vector<int32_t> first_tokens;
+
+        {
+            auto factory = createOrchestrationRunnerFactory();
+            auto runner =
+                factory->createFromOrchestrationConfig(config);
+            ASSERT_NE(runner, nullptr);
+            ASSERT_TRUE(runner->initialize()) << runner->lastError();
+            auto first = runner->generate(prompt, 1, greedy);
+            ASSERT_TRUE(first.error.empty()) << first.error;
+            ASSERT_EQ(first.tokens.size(), 1u);
+            first_tokens = first.tokens;
+            EXPECT_GT(
+                runner->prefixStateProbe().prefix_cache_disk_bytes,
+                0u);
+        }
+
+        std::string digest_error;
+        const auto model_digest =
+            sha256FileHex(kDenseModelPath, &digest_error);
+        ASSERT_TRUE(model_digest.has_value()) << digest_error;
+        const auto archive_path =
+            disk_dir / (*model_digest + ".kvcache");
+        ASSERT_TRUE(std::filesystem::is_regular_file(archive_path));
+
+        {
+            auto factory = createOrchestrationRunnerFactory();
+            auto runner =
+                factory->createFromOrchestrationConfig(config);
+            ASSERT_NE(runner, nullptr);
+            ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+            auto restored = runner->generate(prompt, 1, greedy);
+            ASSERT_TRUE(restored.error.empty()) << restored.error;
+            ASSERT_EQ(restored.tokens.size(), 1u);
+            EXPECT_EQ(restored.tokens, first_tokens);
+            const auto after_restore = runner->prefixStateProbe();
+            EXPECT_GE(after_restore.prefix_cache_disk_hydrations, 1u);
+            EXPECT_GE(after_restore.prefix_cache_matched_tokens, 2u);
+            EXPECT_GT(after_restore.prefix_cache_disk_bytes, 0u)
+                << "The first lookup lazily discovers and indexes committed "
+                   "model archive records";
+        }
+
+        cleanup();
+    }
+
+    void verifyGpuDiskHitRepromotesToDeviceHot(
+        const std::string &device_spec)
+    {
+        const auto disk_dir = tempPrefixDiskDir();
+        const auto cleanup = [&]() { std::filesystem::remove_all(disk_dir); };
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+
+        /*
+         * Three two-token blocks with a one-block RAM budget force the first
+         * two blocks into the durable archive. The terminal block remains in
+         * RAM until runner destruction, so the restarted lookup is deliberately
+         * a four-token partial hit and must continue through ordinary suffix
+         * prefill after restoring the promoted state.
+         */
+        const std::vector<int32_t> prompt = {1, 2, 3, 4, 5, 6};
+        std::vector<int32_t> reference_tokens;
+        {
+            auto factory = createOrchestrationRunnerFactory();
+            auto cold_runner =
+                factory->createFromOrchestrationConfig(
+                    makeSingleGpuTieredPrefixCacheConfig(
+                        device_spec,
+                        disk_dir));
+            ASSERT_NE(cold_runner, nullptr);
+            ASSERT_TRUE(cold_runner->initialize())
+                << cold_runner->lastError();
+            auto reference =
+                cold_runner->generate(prompt, 1, greedy);
+            ASSERT_TRUE(reference.error.empty()) << reference.error;
+            ASSERT_EQ(reference.tokens.size(), 1u);
+            reference_tokens = reference.tokens;
+            EXPECT_GT(
+                cold_runner->prefixStateProbe().prefix_cache_disk_bytes,
+                0u)
+                << "The cold runner should demote nonterminal dense blocks; "
+                   "their archive layout intentionally omits terminal logits";
+        }
+
+        auto factory = createOrchestrationRunnerFactory();
+        auto hot_runner =
+            factory->createFromOrchestrationConfig(
+                makeSingleGpuDeviceHotPrefixCacheConfig(
+                    device_spec,
+                    disk_dir));
+        ASSERT_NE(hot_runner, nullptr);
+        ASSERT_TRUE(hot_runner->initialize())
+            << hot_runner->lastError();
+
+        auto promoted = hot_runner->generate(prompt, 1, greedy);
+        ASSERT_TRUE(promoted.error.empty()) << promoted.error;
+        ASSERT_EQ(promoted.tokens, reference_tokens);
+        const auto after_promotion = hot_runner->prefixStateProbe();
+        EXPECT_GE(after_promotion.prefix_cache_disk_hydrations, 2u);
+        EXPECT_GE(after_promotion.prefix_cache_device_hot_repromotions, 2u)
+            << "Each cold block eligible for VRAM must be promoted, not merely "
+               "uploaded through transient per-layer staging";
+        EXPECT_GT(after_promotion.prefix_cache_device_bytes, 0u);
+
+        const uint64_t hydration_count =
+            after_promotion.prefix_cache_disk_hydrations;
+        auto direct = hot_runner->generate(prompt, 1, greedy);
+        ASSERT_TRUE(direct.error.empty()) << direct.error;
+        ASSERT_EQ(direct.tokens, reference_tokens);
+        const auto after_direct = hot_runner->prefixStateProbe();
+        EXPECT_GE(after_direct.prefix_cache_device_hot_direct_hits, 2u)
+            << "The request after cold promotion must consume persistent VRAM replicas";
+        EXPECT_EQ(
+            after_direct.prefix_cache_disk_hydrations,
+            hydration_count)
+            << "A promoted hot hit must not re-enter the disk/RAM hydration path";
+
+        hot_runner.reset();
+        cleanup();
+    }
+
+    void verifyGpuHotTierPressureCycles(
+        const std::string &device_spec)
+    {
+        const auto disk_dir = tempPrefixDiskDir();
+        const auto cleanup = [&]() { std::filesystem::remove_all(disk_dir); };
+        auto factory = createOrchestrationRunnerFactory();
+        auto runner =
+            factory->createFromOrchestrationConfig(
+                makeSingleGpuConstrainedHotPrefixCacheConfig(
+                    device_spec,
+                    disk_dir));
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        const std::vector<int32_t> prompt = {1, 2, 3, 4};
+
+        auto first = runner->generate(prompt, 1, greedy);
+        ASSERT_TRUE(first.error.empty()) << first.error;
+        ASSERT_EQ(first.tokens.size(), 1u);
+        const auto after_first = runner->prefixStateProbe();
+        EXPECT_GE(after_first.prefix_cache_device_hot_promotions, 2u);
+        EXPECT_GE(after_first.prefix_cache_device_hot_evictions, 1u)
+            << "Publishing the terminal block must demote the older "
+               "nonterminal hot replica";
+        EXPECT_GE(after_first.prefix_cache_ram_to_disk_demotions, 1u);
+
+        auto second = runner->generate(prompt, 1, greedy);
+        ASSERT_TRUE(second.error.empty()) << second.error;
+        ASSERT_EQ(second.tokens, first.tokens);
+        const auto after_second = runner->prefixStateProbe();
+        EXPECT_GE(after_second.prefix_cache_disk_hydrations, 1u);
+        EXPECT_GE(after_second.prefix_cache_device_hot_direct_hits, 1u);
+        EXPECT_GE(after_second.prefix_cache_device_hot_repromotions, 1u);
+        EXPECT_GE(after_second.prefix_cache_device_hot_evictions, 2u);
+
+        /*
+         * The previous request leaves the opposite block hot. A third request
+         * therefore proves that LRU turnover is repeatable in both directions,
+         * rather than merely exercising one startup transition.
+         */
+        auto third = runner->generate(prompt, 1, greedy);
+        ASSERT_TRUE(third.error.empty()) << third.error;
+        ASSERT_EQ(third.tokens, first.tokens);
+        const auto after_third = runner->prefixStateProbe();
+        EXPECT_GE(after_third.prefix_cache_device_hot_direct_hits, 2u);
+        EXPECT_GE(after_third.prefix_cache_device_hot_repromotions, 2u);
+        EXPECT_GE(after_third.prefix_cache_device_hot_evictions, 3u);
+        EXPECT_GT(after_third.prefix_cache_device_bytes, 0u);
+        EXPECT_GT(after_third.prefix_cache_disk_bytes, 0u);
+
+        runner.reset();
+        cleanup();
     }
 
     OrchestrationConfig makeSingleCpuConfig(bool prefix_cache_enabled)
@@ -850,6 +1256,114 @@ namespace
             }
         }
         return total;
+    }
+
+    /**
+     * @brief Prove that portable MoE placement restore ran on every GPU layer.
+     *
+     * The long-context LLEP probes execute two cache-hit regimes: an exact hit
+     * whose first live compute is M=1 decode, and a partial hit whose first live
+     * compute is suffix prefill. Each LocalTP participant owns a model-runtime
+     * table and each table owns one transaction per routed MoE layer. These
+     * counters therefore prove that both graph shapes consumed the dedicated
+     * device-resident rehydration path instead of merely producing coincidentally
+     * equal output through immutable-owner placement.
+     */
+    void expectPortableMoEDeviceRehydrationCoverage(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &backend_name,
+        int participant_count,
+        int routed_layer_count)
+    {
+        SCOPED_TRACE(backend_name + " portable MoE device rehydration");
+        ASSERT_GT(participant_count, 0);
+        ASSERT_GT(routed_layer_count, 0);
+
+        const double expected_transactions =
+            static_cast<double>(participant_count * 2);
+        EXPECT_GE(
+            perfCounterValue(
+                records,
+                "prefix_cache",
+                "moe_portable_runtime_state_restores",
+                "prefix_cache"),
+            expected_transactions)
+            << "Both exact-hit decode and partial-hit suffix prefill must "
+               "restore a portable runtime table on every participant.";
+        EXPECT_GE(
+            perfCounterValue(
+                records,
+                "prefix_cache",
+                "moe_portable_runtime_device_rehydrations",
+                "prefix_cache"),
+            expected_transactions)
+            << "Every adopted restore transaction must publish successful "
+               "device completion before inference continues.";
+
+        const double layer_transactions =
+            perfCounterValue(
+                records,
+                "prefix_cache",
+                "moe_layer_device_payload_rehydrations",
+                "decode") +
+            perfCounterValue(
+                records,
+                "prefix_cache",
+                "moe_layer_device_payload_rehydrations",
+                "prefill");
+        EXPECT_GE(
+            layer_transactions,
+            static_cast<double>(
+                participant_count * routed_layer_count * 2))
+            << "Every routed layer on every participant must execute the "
+               "rehydration transaction in both M=1 and suffix-prefill graphs.";
+    }
+
+    /**
+     * @brief Prove that reusable GPU request-input banks close both event edges.
+     *
+     * Long-context LLEP executes several stable prefill transactions against one
+     * persistent token/position/length arena bank. Correct outputs alone are not
+     * sufficient evidence for its lifetime: an unprotected overwrite can pass
+     * whenever graph execution happens to outrun the next H2D admission. Require
+     * every LocalTP participant to observe writer-to-reader admission, publish
+     * transitive last-reader completion, and wait for that release before at
+     * least one subsequent bank write.
+     */
+    void expectRequestInputReuseCoverage(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &backend_name,
+        int participant_count)
+    {
+        SCOPED_TRACE(backend_name + " request-input bank lifetime");
+        ASSERT_GT(participant_count, 0);
+        const double expected_participants =
+            static_cast<double>(participant_count);
+
+        EXPECT_GE(
+            perfCounterValue(
+                records,
+                "request_admission",
+                "device_input_event_waits",
+                "prefill"),
+            expected_participants)
+            << "Every participant must order its main graph after request admission.";
+        EXPECT_GE(
+            perfCounterValue(
+                records,
+                "request_admission",
+                "device_input_reuse_publications",
+                "prefill"),
+            expected_participants)
+            << "Every participant must publish completion of the complete input-reader chain.";
+        EXPECT_GE(
+            perfCounterValue(
+                records,
+                "request_admission",
+                "device_input_reuse_waits",
+                "prefill"),
+            expected_participants)
+            << "Stable/split prefill must reuse each input bank through the reader-completion event.";
     }
 
     /**
@@ -3649,111 +4163,146 @@ TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_GPUCacheFlagPreservesGreedyInferen
     EXPECT_GT(maxLayerCachedTokens(after_repeated_prompt), 0);
 }
 
-TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_GPUDeviceHotTierHydratesEvictedBlocks)
+TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_CUDADeviceHotTierRestoresEvictedBlocksDirectly)
 {
     if (!std::filesystem::exists(kDenseModelPath))
     {
         GTEST_SKIP() << "Dense probe model not found: " << kDenseModelPath;
     }
 
-    const auto device_spec = firstGpuDeviceSpec();
+    const auto device_spec = explicitGpuDeviceSpec(DeviceType::CUDA);
     if (!device_spec)
     {
-        GTEST_SKIP() << "No CUDA or ROCm GPU available for device-hot prefix-cache probe";
+        GTEST_SKIP() << "No CUDA GPU available for device-hot prefix-cache probe";
     }
-
-    const auto disk_dir = tempPrefixDiskDir();
-    const auto cleanup = [&]() { std::filesystem::remove_all(disk_dir); };
-
-    auto factory = createOrchestrationRunnerFactory();
-    auto runner = factory->createFromOrchestrationConfig(
-        makeSingleGpuDeviceHotPrefixCacheConfig(*device_spec, disk_dir));
-    ASSERT_NE(runner, nullptr);
-    ASSERT_TRUE(runner->initialize()) << runner->lastError();
-
-    SamplingParams greedy;
-    greedy.temperature = 0.0f;
-    const std::vector<int32_t> prompt = {1, 2, 3, 4};
-
-    auto first = runner->generate(prompt, 1, greedy);
-    ASSERT_TRUE(first.error.empty()) << first.error;
-    ASSERT_EQ(first.tokens.size(), 1u);
-
-    const auto after_first = runner->prefixStateProbe();
-    EXPECT_TRUE(after_first.prefix_cache_ready);
-    EXPECT_GE(after_first.prefix_cache_inserts, 2u);
-    EXPECT_GE(after_first.prefix_cache_evictions, 1u);
-    EXPECT_GT(after_first.prefix_cache_device_bytes, 0u)
-        << "Tiered GPU cache should keep a device-hot mirror of evicted blocks";
-    EXPECT_GT(after_first.prefix_cache_disk_bytes, 0u)
-        << "RAM eviction should still persist a durable disk copy";
-    EXPECT_GE(after_first.prefix_cache_promotions, 2u);
-
-    auto second = runner->generate(prompt, 1, greedy);
-    ASSERT_TRUE(second.error.empty()) << second.error;
-    ASSERT_EQ(second.tokens.size(), 1u);
-    EXPECT_EQ(second.tokens.front(), first.tokens.front());
-
-    const auto after_second = runner->prefixStateProbe();
-    EXPECT_GE(after_second.prefix_cache_hits, 2u);
-    EXPECT_EQ(after_second.prefix_cache_disk_hydrations, 0u)
-        << "Device-hot mirrors should hydrate evicted blocks before disk fallback";
-    EXPECT_GT(after_second.prefix_cache_device_bytes, 0u);
-
-    cleanup();
+    verifyGpuDeviceHotTierRestoresDirectly(*device_spec);
 }
 
-TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_GPUTieredDiskCacheHydratesEvictedBlocks)
+TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_ROCmDeviceHotTierRestoresEvictedBlocksDirectly)
+{
+    if (!std::filesystem::exists(kDenseModelPath))
+    {
+        GTEST_SKIP() << "Dense probe model not found: " << kDenseModelPath;
+    }
+    const auto device_spec = explicitGpuDeviceSpec(DeviceType::ROCm);
+    if (!device_spec)
+    {
+        GTEST_SKIP() << "No ROCm GPU available for device-hot prefix-cache probe";
+    }
+    verifyGpuDeviceHotTierRestoresDirectly(*device_spec);
+}
+
+TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_CUDATieredDiskCacheHydratesEvictedBlocks)
 {
     if (!std::filesystem::exists(kDenseModelPath))
     {
         GTEST_SKIP() << "Dense probe model not found: " << kDenseModelPath;
     }
 
-    const auto device_spec = firstGpuDeviceSpec();
+    const auto device_spec = explicitGpuDeviceSpec(DeviceType::CUDA);
     if (!device_spec)
     {
-        GTEST_SKIP() << "No CUDA or ROCm GPU available for tiered prefix-cache probe";
+        GTEST_SKIP() << "No CUDA GPU available for tiered prefix-cache probe";
     }
+    verifyGpuTieredDiskCacheHydrates(*device_spec);
+}
 
-    const auto disk_dir = tempPrefixDiskDir();
-    const auto cleanup = [&]() { std::filesystem::remove_all(disk_dir); };
+TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_ROCmTieredDiskCacheHydratesEvictedBlocks)
+{
+    if (!std::filesystem::exists(kDenseModelPath))
+    {
+        GTEST_SKIP() << "Dense probe model not found: " << kDenseModelPath;
+    }
+    const auto device_spec = explicitGpuDeviceSpec(DeviceType::ROCm);
+    if (!device_spec)
+    {
+        GTEST_SKIP() << "No ROCm GPU available for tiered prefix-cache probe";
+    }
+    verifyGpuTieredDiskCacheHydrates(*device_spec);
+}
 
-    auto factory = createOrchestrationRunnerFactory();
-    auto runner = factory->createFromOrchestrationConfig(
-        makeSingleGpuTieredPrefixCacheConfig(*device_spec, disk_dir));
-    ASSERT_NE(runner, nullptr);
-    ASSERT_TRUE(runner->initialize()) << runner->lastError();
+TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_CUDADiskArchiveSurvivesRunnerRestart)
+{
+    if (!std::filesystem::exists(kDenseModelPath))
+    {
+        GTEST_SKIP() << "Dense probe model not found: " << kDenseModelPath;
+    }
+    const auto device_spec = explicitGpuDeviceSpec(DeviceType::CUDA);
+    if (!device_spec)
+    {
+        GTEST_SKIP() << "No CUDA GPU available for disk restart probe";
+    }
+    verifyGpuDiskArchiveSurvivesRunnerRestart(*device_spec);
+}
 
-    SamplingParams greedy;
-    greedy.temperature = 0.0f;
-    const std::vector<int32_t> prompt = {1, 2, 3, 4};
+TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_ROCmDiskArchiveSurvivesRunnerRestart)
+{
+    if (!std::filesystem::exists(kDenseModelPath))
+    {
+        GTEST_SKIP() << "Dense probe model not found: " << kDenseModelPath;
+    }
+    const auto device_spec = explicitGpuDeviceSpec(DeviceType::ROCm);
+    if (!device_spec)
+    {
+        GTEST_SKIP() << "No ROCm GPU available for disk restart probe";
+    }
+    verifyGpuDiskArchiveSurvivesRunnerRestart(*device_spec);
+}
 
-    auto first = runner->generate(prompt, 1, greedy);
-    ASSERT_TRUE(first.error.empty()) << first.error;
-    ASSERT_EQ(first.tokens.size(), 1u);
+TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_CUDADiskHitRepromotesToDeviceHot)
+{
+    if (!std::filesystem::exists(kDenseModelPath))
+    {
+        GTEST_SKIP() << "Dense probe model not found: " << kDenseModelPath;
+    }
+    const auto device_spec = explicitGpuDeviceSpec(DeviceType::CUDA);
+    if (!device_spec)
+    {
+        GTEST_SKIP() << "No CUDA GPU available for disk-to-hot promotion probe";
+    }
+    verifyGpuDiskHitRepromotesToDeviceHot(*device_spec);
+}
 
-    const auto after_first = runner->prefixStateProbe();
-    EXPECT_TRUE(after_first.prefix_cache_ready);
-    EXPECT_GE(after_first.prefix_cache_inserts, 2u);
-    EXPECT_GE(after_first.prefix_cache_evictions, 1u)
-        << "A one-block RAM budget should force tiered eviction";
-    EXPECT_GT(after_first.prefix_cache_disk_bytes, 0u);
+TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_ROCmDiskHitRepromotesToDeviceHot)
+{
+    if (!std::filesystem::exists(kDenseModelPath))
+    {
+        GTEST_SKIP() << "Dense probe model not found: " << kDenseModelPath;
+    }
+    const auto device_spec = explicitGpuDeviceSpec(DeviceType::ROCm);
+    if (!device_spec)
+    {
+        GTEST_SKIP() << "No ROCm GPU available for disk-to-hot promotion probe";
+    }
+    verifyGpuDiskHitRepromotesToDeviceHot(*device_spec);
+}
 
-    auto second = runner->generate(prompt, 1, greedy);
-    ASSERT_TRUE(second.error.empty()) << second.error;
-    ASSERT_EQ(second.tokens.size(), 1u);
-    EXPECT_EQ(second.tokens.front(), first.tokens.front())
-        << "Disk-hydrated full hits should preserve terminal logits";
+TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_CUDAHotTierPressureCycles)
+{
+    if (!std::filesystem::exists(kDenseModelPath))
+    {
+        GTEST_SKIP() << "Dense probe model not found: " << kDenseModelPath;
+    }
+    const auto device_spec = explicitGpuDeviceSpec(DeviceType::CUDA);
+    if (!device_spec)
+    {
+        GTEST_SKIP() << "No CUDA GPU available for hot-tier pressure probe";
+    }
+    verifyGpuHotTierPressureCycles(*device_spec);
+}
 
-    const auto after_second = runner->prefixStateProbe();
-    EXPECT_TRUE(after_second.prefix_cache_ready);
-    EXPECT_GE(after_second.prefix_cache_hits, 2u);
-    EXPECT_GE(after_second.prefix_cache_disk_hydrations, 2u)
-        << "Both 2-token blocks should be served through disk hydration";
-    EXPECT_GT(after_second.prefix_cache_disk_bytes, 0u);
-
-    cleanup();
+TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_ROCmHotTierPressureCycles)
+{
+    if (!std::filesystem::exists(kDenseModelPath))
+    {
+        GTEST_SKIP() << "Dense probe model not found: " << kDenseModelPath;
+    }
+    const auto device_spec = explicitGpuDeviceSpec(DeviceType::ROCm);
+    if (!device_spec)
+    {
+        GTEST_SKIP() << "No ROCm GPU available for hot-tier pressure probe";
+    }
+    verifyGpuHotTierPressureCycles(*device_spec);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_CPUPrefixCacheFullHitRecordsReuse)
@@ -4698,69 +5247,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmoke)
     EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u);
 }
 
-TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPExplicitSegmentedCollectiveSmoke)
-{
-    ScopedDebugEnv env({
-        {"LLAMINAR_GPU_GRAPHS", "1"},
-        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1"},
-    });
-
-    const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
-    if (!env_model)
-        env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
-    const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
-
-    if (!std::filesystem::exists(model_path))
-    {
-        GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
-    }
-
-    auto &dm = DeviceManager::instance();
-    dm.initialize(-1, false);
-    if (dm.rocm_device_count() < 2)
-    {
-        GTEST_SKIP() << "Need at least two ROCm devices for Qwen3.6 LocalTP segmented MTP smoke";
-    }
-
-    OrchestrationConfig config = OrchestrationConfig::defaults();
-    config.model_path = model_path;
-    config.max_seq_len = 32;
-    config.batch_size = 1;
-    config.tp_degree = 2;
-    config.tp_scope = TPScope::LOCAL;
-    config.tp_devices = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
-    config.pp_degree = 1;
-    config.kv_cache_precision = "auto";
-    config.mtp.enabled = true;
-    config.mtp.draft_tokens = 1;
-
-    auto factory = createOrchestrationRunnerFactory();
-    auto runner = factory->createFromOrchestrationConfig(config);
-    ASSERT_NE(runner, nullptr);
-    ASSERT_TRUE(runner->initialize()) << runner->lastError();
-
-    auto tokenizer = runner->tokenizer();
-    ASSERT_NE(tokenizer, nullptr);
-    const auto encoded = tokenizer->encode("Paris is", /*add_bos=*/false, /*add_eos=*/false);
-    ASSERT_FALSE(encoded.empty());
-    const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
-
-    SamplingParams greedy;
-    greedy.temperature = 0.0f;
-    auto result = runner->generate(prompt, 2, greedy);
-    const auto snapshot = runner->prefixStateProbe();
-    runner->shutdown();
-
-    ASSERT_TRUE(result.error.empty()) << result.error;
-    ASSERT_FALSE(result.tokens.empty());
-    EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
-    EXPECT_GE(snapshot.mtp_draft_steps, 1u);
-    EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
-    EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u);
-}
-
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke)
 {
     ScopedDebugEnv env({
@@ -4894,9 +5380,19 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
                 << ";boundary=" << boundary_start
                 << ":" << boundary_tokens
                 << ";tail=" << tail_start << ":" << tail_tokens;
+    for (int start = 0; start < requested_prompt_tokens; start += 128)
+    {
+        const int tokens = std::min(128, requested_prompt_tokens - start);
+        kv_segments << ";tile_" << std::setw(4) << std::setfill('0') << start
+                    << std::setfill(' ') << "=" << start << ":" << tokens;
+    }
+    const bool stage_continuity_diagnostic_requested =
+        DebugEnv::isTruthyEnv(
+            "LLAMINAR_QWEN36_MOE_OVERLAY_STAGE_CONTINUITY_DIAG");
 
     ScopedDebugEnv env({
-        {"LLAMINAR_LOG_LEVEL", "WARN"},
+        {"LLAMINAR_LOG_LEVEL",
+         stage_continuity_diagnostic_requested ? "INFO" : "WARN"},
         // Match the production LocalTP E2E lane: decode and collective work is
         // graph captured, while this topology deliberately uses unbucketed
         // prefill. Do not disable ROCm/CUDA production scheduling knobs here.
@@ -4905,6 +5401,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
         {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
         {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+        {"LLAMINAR_PERF_STATS_FILTER", "prefix_cache,request_admission"},
         {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
         {"LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS", "1"},
         {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
@@ -4933,6 +5431,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
     {
         GTEST_SKIP() << "Need at least two ROCm devices for Qwen3.6 MoE ExpertOverlay state-continuity probe";
     }
+    PerfStatsCollector::reset();
 
     const int max_seq_len = std::max(
         requested_prompt_tokens + decode_steps + 64,
@@ -4991,13 +5490,16 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
     std::vector<int32_t> seed_prompt;
     std::vector<int32_t> suffix_prompt;
     const bool capture_stage_continuity =
-        DebugEnv::isTruthyEnv("LLAMINAR_QWEN36_MOE_OVERLAY_STAGE_CONTINUITY_DIAG");
+        stage_continuity_diagnostic_requested;
     const std::vector<std::string> stage_continuity_keys =
         capture_stage_continuity
-            ? prefillReplayContinuitySnapshotKeys(/*last_layer=*/7)
+            ? prefillReplayContinuitySnapshotKeys(
+                  /*first_layer=*/31,
+                  /*last_layer=*/39)
             : std::vector<std::string>{};
     std::map<std::string, RequestBatchStageSnapshot> full_prefill_stage_snapshots;
     std::map<std::string, RequestBatchStageSnapshot> split_prefill_stage_snapshots;
+    std::map<std::string, RequestBatchStageSnapshot> restored_prefill_stage_snapshots;
 
     {
         auto baseline = factory->createFromOrchestrationConfig(make_config(false));
@@ -5069,7 +5571,10 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
         ASSERT_TRUE(prefillReplaySnapshotsByteIdentical(
             full_prefill_stage_snapshots,
             split_prefill_stage_snapshots,
-            stage_continuity_keys));
+            stage_continuity_keys,
+            static_cast<size_t>(requested_prompt_tokens),
+            static_cast<size_t>(block_size),
+            static_cast<size_t>(requested_prompt_tokens - block_size)));
     }
 
     {
@@ -5077,6 +5582,12 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
         ASSERT_NE(cached, nullptr);
         ASSERT_TRUE(cached->initialize()) << cached->lastError();
         cached->setSamplingParams(greedy);
+        if (capture_stage_continuity)
+        {
+            cached->setSnapshotCaptureFilter(stage_continuity_keys);
+            cached->enableSnapshotCapture();
+            cached->clearSnapshots();
+        }
 
         ASSERT_TRUE(cached->prefill(seed_prompt))
             << cached->lastError();
@@ -5084,19 +5595,70 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
         ASSERT_TRUE(seed_probe.prefix_cache_ready);
         EXPECT_GE(seed_probe.prefix_cache_inserts, 1u);
 
+        const auto seed_miss_decode = decodeGreedyTokens(
+            *cached,
+            /*steps=*/2,
+            "seed-prefix miss decode");
+        ASSERT_TRUE(seed_miss_decode.error.empty())
+            << seed_miss_decode.error;
+        ASSERT_EQ(seed_miss_decode.tokens.size(), 2u);
+
         cached->clearCache();
+        ASSERT_TRUE(cached->prefill(seed_prompt))
+            << cached->lastError();
+        const auto seed_full_hit_probe = cached->prefixStateProbe();
+        EXPECT_GE(
+            seed_full_hit_probe.prefix_cache_hits +
+                seed_full_hit_probe.prefix_cache_partial_hits,
+            1u);
+        EXPECT_GE(
+            seed_full_hit_probe.prefix_cache_matched_tokens,
+            static_cast<uint64_t>(block_size));
+        const auto seed_full_hit_decode = decodeGreedyTokens(
+            *cached,
+            /*steps=*/2,
+            "seed-prefix full-hit decode");
+        ASSERT_TRUE(seed_full_hit_decode.error.empty())
+            << seed_full_hit_decode.error;
+        EXPECT_EQ(seed_full_hit_decode.tokens, seed_miss_decode.tokens)
+            << "Exact prefix hits must rehydrate live LLEP placement before "
+               "the first M=1 decode graph.";
+
+        cached->clearCache();
+        if (capture_stage_continuity)
+            cached->clearSnapshots();
         ASSERT_TRUE(cached->prefill(prompt))
             << cached->lastError();
         restored_prefill_probe = cached->prefixStateProbe();
+        if (capture_stage_continuity)
+        {
+            restored_prefill_stage_snapshots = captureRequestBatchSnapshots(
+                *cached,
+                stage_continuity_keys);
+        }
         restored_decode = decodeGreedyTokens(
             *cached,
             decode_steps,
             "prefix-restored decode");
         ASSERT_TRUE(restored_decode.error.empty()) << restored_decode.error;
         ASSERT_EQ(restored_decode.tokens.size(), static_cast<size_t>(decode_steps));
+        if (capture_stage_continuity)
+            cached->disableSnapshotCapture();
         cached->shutdown();
     }
     llaminar::v2::kernels::KernelFactory::clearCache();
+    const auto rehydration_records =
+        PerfStatsCollector::snapshot({"prefix_cache", "request_admission"});
+    expectPortableMoEDeviceRehydrationCoverage(
+        rehydration_records,
+        "ROCm",
+        /*participant_count=*/2,
+        /*routed_layer_count=*/40);
+    expectRequestInputReuseCoverage(
+        rehydration_records,
+        "ROCm",
+        /*participant_count=*/2);
+    PerfStatsCollector::reset();
 
     EXPECT_TRUE(restored_prefill_probe.prefix_cache_ready);
     EXPECT_GE(restored_prefill_probe.prefix_cache_hits +
@@ -5129,6 +5691,16 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
             full_prefill_probe,
             restored_prefill_probe,
             compare_options);
+    if (capture_stage_continuity && !full_vs_restored)
+    {
+        ASSERT_TRUE(prefillReplaySnapshotsByteIdentical(
+            split_prefill_stage_snapshots,
+            restored_prefill_stage_snapshots,
+            stage_continuity_keys,
+            static_cast<size_t>(requested_prompt_tokens - block_size),
+            /*suffix_row_offset=*/0,
+            static_cast<size_t>(requested_prompt_tokens - block_size)));
+    }
     ASSERT_TRUE(full_vs_restored)
         << "Qwen3.6 MoE ExpertOverlay LLEP prefix-restored state drifted from "
         << "single-request full prefill: " << full_vs_restored.reason
@@ -5171,9 +5743,19 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
                 << ";boundary=" << boundary_start
                 << ":" << boundary_tokens
                 << ";tail=" << tail_start << ":" << tail_tokens;
+    for (int start = 0; start < requested_prompt_tokens; start += 128)
+    {
+        const int tokens = std::min(128, requested_prompt_tokens - start);
+        kv_segments << ";tile_" << std::setw(4) << std::setfill('0') << start
+                    << std::setfill(' ') << "=" << start << ":" << tokens;
+    }
+    const bool stage_continuity_diagnostic_requested =
+        DebugEnv::isTruthyEnv(
+            "LLAMINAR_QWEN36_MOE_OVERLAY_STAGE_CONTINUITY_DIAG");
 
     ScopedDebugEnv env({
-        {"LLAMINAR_LOG_LEVEL", "WARN"},
+        {"LLAMINAR_LOG_LEVEL",
+         stage_continuity_diagnostic_requested ? "INFO" : "WARN"},
         // Match the production LocalTP E2E lane: decode and collective work is
         // graph captured, while this topology deliberately uses unbucketed
         // prefill. Do not disable ROCm/CUDA production scheduling knobs here.
@@ -5182,6 +5764,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
         {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
         {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+        {"LLAMINAR_PERF_STATS_FILTER", "prefix_cache,request_admission"},
         {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
         {"LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS", "1"},
         {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
@@ -5210,6 +5794,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
     {
         GTEST_SKIP() << "Need at least two CUDA devices for Qwen3.6 MoE ExpertOverlay state-continuity probe";
     }
+    PerfStatsCollector::reset();
 
     const int max_seq_len = std::max(
         requested_prompt_tokens + decode_steps + 64,
@@ -5268,13 +5853,16 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
     std::vector<int32_t> seed_prompt;
     std::vector<int32_t> suffix_prompt;
     const bool capture_stage_continuity =
-        DebugEnv::isTruthyEnv("LLAMINAR_QWEN36_MOE_OVERLAY_STAGE_CONTINUITY_DIAG");
+        stage_continuity_diagnostic_requested;
     const std::vector<std::string> stage_continuity_keys =
         capture_stage_continuity
-            ? prefillReplayContinuitySnapshotKeys(/*last_layer=*/7)
+            ? prefillReplayContinuitySnapshotKeys(
+                  /*first_layer=*/31,
+                  /*last_layer=*/39)
             : std::vector<std::string>{};
     std::map<std::string, RequestBatchStageSnapshot> full_prefill_stage_snapshots;
     std::map<std::string, RequestBatchStageSnapshot> split_prefill_stage_snapshots;
+    std::map<std::string, RequestBatchStageSnapshot> restored_prefill_stage_snapshots;
 
     {
         auto baseline = factory->createFromOrchestrationConfig(make_config(false));
@@ -5346,7 +5934,10 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
         ASSERT_TRUE(prefillReplaySnapshotsByteIdentical(
             full_prefill_stage_snapshots,
             split_prefill_stage_snapshots,
-            stage_continuity_keys));
+            stage_continuity_keys,
+            static_cast<size_t>(requested_prompt_tokens),
+            static_cast<size_t>(block_size),
+            static_cast<size_t>(requested_prompt_tokens - block_size)));
     }
 
     {
@@ -5354,6 +5945,12 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
         ASSERT_NE(cached, nullptr);
         ASSERT_TRUE(cached->initialize()) << cached->lastError();
         cached->setSamplingParams(greedy);
+        if (capture_stage_continuity)
+        {
+            cached->setSnapshotCaptureFilter(stage_continuity_keys);
+            cached->enableSnapshotCapture();
+            cached->clearSnapshots();
+        }
 
         ASSERT_TRUE(cached->prefill(seed_prompt))
             << cached->lastError();
@@ -5361,19 +5958,70 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
         ASSERT_TRUE(seed_probe.prefix_cache_ready);
         EXPECT_GE(seed_probe.prefix_cache_inserts, 1u);
 
+        const auto seed_miss_decode = decodeGreedyTokens(
+            *cached,
+            /*steps=*/2,
+            "seed-prefix miss decode");
+        ASSERT_TRUE(seed_miss_decode.error.empty())
+            << seed_miss_decode.error;
+        ASSERT_EQ(seed_miss_decode.tokens.size(), 2u);
+
         cached->clearCache();
+        ASSERT_TRUE(cached->prefill(seed_prompt))
+            << cached->lastError();
+        const auto seed_full_hit_probe = cached->prefixStateProbe();
+        EXPECT_GE(
+            seed_full_hit_probe.prefix_cache_hits +
+                seed_full_hit_probe.prefix_cache_partial_hits,
+            1u);
+        EXPECT_GE(
+            seed_full_hit_probe.prefix_cache_matched_tokens,
+            static_cast<uint64_t>(block_size));
+        const auto seed_full_hit_decode = decodeGreedyTokens(
+            *cached,
+            /*steps=*/2,
+            "seed-prefix full-hit decode");
+        ASSERT_TRUE(seed_full_hit_decode.error.empty())
+            << seed_full_hit_decode.error;
+        EXPECT_EQ(seed_full_hit_decode.tokens, seed_miss_decode.tokens)
+            << "Exact prefix hits must rehydrate live LLEP placement before "
+               "the first M=1 decode graph.";
+
+        cached->clearCache();
+        if (capture_stage_continuity)
+            cached->clearSnapshots();
         ASSERT_TRUE(cached->prefill(prompt))
             << cached->lastError();
         restored_prefill_probe = cached->prefixStateProbe();
+        if (capture_stage_continuity)
+        {
+            restored_prefill_stage_snapshots = captureRequestBatchSnapshots(
+                *cached,
+                stage_continuity_keys);
+        }
         restored_decode = decodeGreedyTokens(
             *cached,
             decode_steps,
             "prefix-restored decode");
         ASSERT_TRUE(restored_decode.error.empty()) << restored_decode.error;
         ASSERT_EQ(restored_decode.tokens.size(), static_cast<size_t>(decode_steps));
+        if (capture_stage_continuity)
+            cached->disableSnapshotCapture();
         cached->shutdown();
     }
     llaminar::v2::kernels::KernelFactory::clearCache();
+    const auto rehydration_records =
+        PerfStatsCollector::snapshot({"prefix_cache", "request_admission"});
+    expectPortableMoEDeviceRehydrationCoverage(
+        rehydration_records,
+        "CUDA",
+        /*participant_count=*/2,
+        /*routed_layer_count=*/40);
+    expectRequestInputReuseCoverage(
+        rehydration_records,
+        "CUDA",
+        /*participant_count=*/2);
+    PerfStatsCollector::reset();
 
     EXPECT_TRUE(restored_prefill_probe.prefix_cache_ready);
     EXPECT_GE(restored_prefill_probe.prefix_cache_hits +
@@ -5406,6 +6054,16 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
             full_prefill_probe,
             restored_prefill_probe,
             compare_options);
+    if (capture_stage_continuity && !full_vs_restored)
+    {
+        ASSERT_TRUE(prefillReplaySnapshotsByteIdentical(
+            split_prefill_stage_snapshots,
+            restored_prefill_stage_snapshots,
+            stage_continuity_keys,
+            static_cast<size_t>(requested_prompt_tokens - block_size),
+            /*suffix_row_offset=*/0,
+            static_cast<size_t>(requested_prompt_tokens - block_size)));
+    }
     ASSERT_TRUE(full_vs_restored)
         << "Qwen3.6 MoE ExpertOverlay CUDA LLEP prefix-restored state drifted from "
         << "single-request full prefill: " << full_vs_restored.reason

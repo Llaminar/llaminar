@@ -39,6 +39,13 @@ namespace llaminar2
 
 #ifdef HAVE_ROCM
 
+        namespace
+        {
+            constexpr const char *kBiasMatmulWorkspace =
+                "hipblaslt_bias_matmul_workspace";
+            constexpr size_t kBiasMatmulWorkspaceBytes = 4 * 1024 * 1024;
+        } // namespace
+
         // =====================================================================
         // Helper macros for error checking
         // =====================================================================
@@ -203,13 +210,6 @@ namespace llaminar2
 
         HipBLASGemmKernel::~HipBLASGemmKernel()
         {
-            // Free cached workspace
-            if (lt_workspace_)
-            {
-                (void)hipFree(lt_workspace_);
-                lt_workspace_ = nullptr;
-                lt_workspace_size_ = 0;
-            }
             // Only destroy lt_handle_ if we own it
             if (owns_lt_handle_ && lt_handle_)
             {
@@ -232,16 +232,12 @@ namespace llaminar2
               device_id_(other.device_id_),
               precision_(other.precision_),
               owns_handle_(other.owns_handle_),
-              owns_lt_handle_(other.owns_lt_handle_),
-              lt_workspace_(other.lt_workspace_),
-              lt_workspace_size_(other.lt_workspace_size_)
+              owns_lt_handle_(other.owns_lt_handle_)
         {
             other.handle_ = nullptr;
             other.lt_handle_ = nullptr;
             other.owns_handle_ = false;    // Moved-from object shouldn't destroy anything
             other.owns_lt_handle_ = false; // Moved-from object shouldn't destroy anything
-            other.lt_workspace_ = nullptr;
-            other.lt_workspace_size_ = 0;
         }
 
         // Move assignment
@@ -250,10 +246,6 @@ namespace llaminar2
             if (this != &other)
             {
                 // Destroy our resources if we own them
-                if (lt_workspace_)
-                {
-                    (void)hipFree(lt_workspace_);
-                }
                 if (owns_lt_handle_ && lt_handle_)
                 {
                     hipblasLtDestroy(static_cast<hipblasLtHandle_t>(lt_handle_));
@@ -273,15 +265,11 @@ namespace llaminar2
                 precision_ = other.precision_;
                 owns_handle_ = other.owns_handle_;
                 owns_lt_handle_ = other.owns_lt_handle_;
-                lt_workspace_ = other.lt_workspace_;
-                lt_workspace_size_ = other.lt_workspace_size_;
 
                 other.handle_ = nullptr;
                 other.lt_handle_ = nullptr;
                 other.owns_handle_ = false;
                 other.owns_lt_handle_ = false;
-                other.lt_workspace_ = nullptr;
-                other.lt_workspace_size_ = 0;
             }
             return *this;
         }
@@ -506,14 +494,35 @@ namespace llaminar2
 
             HIPBLASLT_CHECK(hipblasLtMatmulPreferenceCreate(&preference));
 
-            // Request workspace (cached to avoid per-call hipMalloc/hipFree)
-            size_t workspaceSize = 4 * 1024 * 1024; // 4MB workspace
-            if (!lt_workspace_ || lt_workspace_size_ < workspaceSize)
+            /*
+             * hipBLASLt may use this workspace during warmup, capture, and
+             * replay. Its address is therefore part of the graph contract and
+             * must be bound before execution rather than lazily allocated here.
+             */
+            const size_t workspaceSize = kBiasMatmulWorkspaceBytes;
+            if (!workspace_)
             {
-                if (lt_workspace_)
-                    (void)hipFree(lt_workspace_);
-                HIP_CHECK(hipMalloc(&lt_workspace_, workspaceSize));
-                lt_workspace_size_ = workspaceSize;
+                HIP_LOG_ERROR(
+                    "[HipBLASGemmKernel::execute_with_bias] Required graph workspace is not bound");
+                hipblasLtMatmulPreferenceDestroy(preference);
+                hipblasLtMatrixLayoutDestroy(Cdesc);
+                hipblasLtMatrixLayoutDestroy(Bdesc);
+                hipblasLtMatrixLayoutDestroy(Adesc);
+                hipblasLtMatmulDescDestroy(operationDesc);
+                return false;
+            }
+            void *workspace = workspace_->getBuffer(kBiasMatmulWorkspace);
+            if (!workspace ||
+                workspace_->getBufferSize(kBiasMatmulWorkspace) < workspaceSize)
+            {
+                HIP_LOG_ERROR(
+                    "[HipBLASGemmKernel::execute_with_bias] Missing or undersized graph workspace");
+                hipblasLtMatmulPreferenceDestroy(preference);
+                hipblasLtMatrixLayoutDestroy(Cdesc);
+                hipblasLtMatrixLayoutDestroy(Bdesc);
+                hipblasLtMatrixLayoutDestroy(Adesc);
+                hipblasLtMatmulDescDestroy(operationDesc);
+                return false;
             }
 
             HIPBLASLT_CHECK(hipblasLtMatmulPreferenceSetAttribute(preference,
@@ -553,10 +562,10 @@ namespace llaminar2
                                                      d_C, Cdesc, // C
                                                      d_C, Cdesc, // D (output, same as C)
                                                      &heuristicResult.algo,
-                                                     lt_workspace_, lt_workspace_size_,
+                                                     workspace, workspaceSize,
                                                      static_cast<hipStream_t>(gpu_stream_));
 
-            // Cleanup (workspace is cached, not freed here)
+            // Cleanup descriptor state; the graph workspace remains setup-owned.
             hipblasLtMatmulPreferenceDestroy(preference);
             hipblasLtMatrixLayoutDestroy(Cdesc);
             hipblasLtMatrixLayoutDestroy(Bdesc);
@@ -570,6 +579,15 @@ namespace llaminar2
             }
 
             return true;
+        }
+
+        WorkspaceRequirements HipBLASGemmKernel::getWorkspaceRequirements(
+            int, int, int) const
+        {
+            WorkspaceRequirements requirements;
+            requirements.buffers.push_back(
+                {kBiasMatmulWorkspace, kBiasMatmulWorkspaceBytes, 256, true});
+            return requirements;
         }
 
         // =====================================================================
@@ -681,6 +699,12 @@ namespace llaminar2
             bool, bool, float, float)
         {
             return false;
+        }
+
+        WorkspaceRequirements HipBLASGemmKernel::getWorkspaceRequirements(
+            int, int, int) const
+        {
+            return WorkspaceRequirements{};
         }
 
         bool HipBLASGemmKernel::execute_with_bias(

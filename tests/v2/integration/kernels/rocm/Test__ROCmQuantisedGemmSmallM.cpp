@@ -4,6 +4,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 #include "execution/compute_stages/stages/GDNProjectionStage.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
@@ -22,6 +23,7 @@
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
+#include "../../../utils/ScopedGPUStream.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/VerifierRowTestInventory.h"
 
@@ -966,7 +968,7 @@ namespace
                     decode_output.get(), d_model, intermediate))
                     << gateup_format.label << "/" << down_format.label << " rowwise down row=" << row;
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-                decode_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+                TransferEngine::publishDeviceWrite(decode_output, device, stream);
                 std::copy(decode_output->data(), decode_output->data() + d_model,
                           rowwise_expected.begin() + static_cast<size_t>(row) * static_cast<size_t>(d_model));
             }
@@ -984,7 +986,7 @@ namespace
                                                                  num_experts, top_k))
                 << gateup_format.label << "/" << down_format.label << " grouped verifier prefill M=" << seq_len;
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            TransferEngine::publishDeviceWrite(grouped_output, device, stream);
 
             expectMoEGroupedVerifierPerfStats((std::string(gateup_format.label) + "/" + down_format.label).c_str(),
                                               seq_len, num_experts, top_k);
@@ -1043,6 +1045,13 @@ namespace
         expectPackedPath(packed, expected_path);
 
         ROCmQuantisedGemmKernel kernel(&packed, 0);
+#ifdef HAVE_ROCM
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+            hipSuccess);
+        kernel.setGPUStream(stream);
+#endif
         auto workspace = bindWorkspace(kernel, M, N, K);
         ASSERT_NE(workspace, nullptr);
 
@@ -1054,9 +1063,9 @@ namespace
 
         ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
 #ifdef HAVE_ROCM
-        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
-        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(output, stream);
 
         std::vector<float> ref(static_cast<size_t>(M) * N);
         cpuFP32GemmRef(input->data(), W_fp32.data(), ref.data(), M, N, K);
@@ -1066,6 +1075,10 @@ namespace
         EXPECT_GT(cos, min_cosine);
 
         kernel.unbindWorkspace();
+#ifdef HAVE_ROCM
+        kernel.setGPUStream(nullptr);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
     }
 
     /**
@@ -1136,7 +1149,7 @@ namespace
 #ifdef HAVE_ROCM
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
-        grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(grouped_output, stream);
         std::vector<float> grouped_values(
             grouped_output->data(),
             grouped_output->data() + static_cast<size_t>(M) * static_cast<size_t>(N));
@@ -1164,7 +1177,7 @@ namespace
 #ifdef HAVE_ROCM
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
-            row_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishCurrentDeviceWrite(row_output, stream);
             std::copy_n(
                 row_output->data(),
                 N,
@@ -1341,7 +1354,9 @@ namespace
 #ifdef HAVE_ROCM
         ASSERT_EQ(hipStreamSynchronize(static_cast<hipStream_t>(stream)), hipSuccess);
 #endif
-        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(
+            output,
+            static_cast<hipStream_t>(stream));
         result.assign(
             output->data(),
             output->data() + static_cast<size_t>(M) * static_cast<size_t>(N));
@@ -1977,11 +1992,10 @@ namespace
 
 #ifdef HAVE_ROCM
         hipStream_t stream = nullptr;
-        if (graph_capture)
-        {
-            ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
-            kernel.setGPUStream(stream);
-        }
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+            hipSuccess);
+        kernel.setGPUStream(stream);
 #endif
 
         auto workspace = bindWorkspace(kernel, M, N, K);
@@ -2045,10 +2059,10 @@ namespace
                 N,
                 K));
 #ifdef HAVE_ROCM
-            ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
         }
-        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(output, stream);
 
         std::vector<float> swiglu(static_cast<size_t>(M) * K);
         for (size_t i = 0; i < swiglu.size(); ++i)
@@ -2197,7 +2211,7 @@ namespace
         FAIL() << "ROCm serial-row oracle requested without HAVE_ROCM";
 #endif
 
-        grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(grouped_output, stream);
         std::vector<float> grouped_values(
             grouped_output->data(),
             grouped_output->data() + static_cast<size_t>(M) * static_cast<size_t>(N));
@@ -2241,7 +2255,7 @@ namespace
 #ifdef HAVE_ROCM
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
-            row_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishCurrentDeviceWrite(row_output, stream);
             std::copy_n(
                 row_output->data(),
                 N,
@@ -2314,6 +2328,16 @@ namespace
         ROCmQuantisedGemmKernel k_kernel(&packed_k, 0);
         ROCmQuantisedGemmKernel v_kernel(&packed_v, 0);
 
+#ifdef HAVE_ROCM
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+            hipSuccess);
+        q_kernel.setGPUStream(stream);
+        k_kernel.setGPUStream(stream);
+        v_kernel.setGPUStream(stream);
+#endif
+
         auto q_workspace = bindWorkspace(q_kernel, M, Nq, K);
         auto k_workspace = bindWorkspace(k_kernel, M, Nk, K);
         auto v_workspace = bindWorkspace(v_kernel, M, Nv, K);
@@ -2355,11 +2379,11 @@ namespace
         ASSERT_TRUE(v_kernel.multiply_tensor(input.get(), separate_v.get(), M, Nv, K,
                                              true, 1.0f, 0.0f, bias_v.get()));
 #ifdef HAVE_ROCM
-        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
-        separate_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        separate_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        separate_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(separate_q, stream);
+        TransferEngine::publishCurrentDeviceWrite(separate_k, stream);
+        TransferEngine::publishCurrentDeviceWrite(separate_v, stream);
 
         std::vector<ITensorGemm::TensorProjectionDesc> projections;
         projections.emplace_back(&q_kernel, fused_q.get(), Nq, bias_q.get(), "q_small_m");
@@ -2369,11 +2393,11 @@ namespace
         ASSERT_TRUE(q_kernel.multiply_fused_verifier_rows_decode_equivalent(
             input.get(), projections, M, K, nullptr, q_workspace.get()));
 #ifdef HAVE_ROCM
-        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
-        fused_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        fused_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        fused_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(fused_q, stream);
+        TransferEngine::publishCurrentDeviceWrite(fused_k, stream);
+        TransferEngine::publishCurrentDeviceWrite(fused_v, stream);
 
         const float q_cos = cosineSim(fused_q->data(), separate_q->data(), static_cast<size_t>(M) * Nq);
         const float k_cos = cosineSim(fused_k->data(), separate_k->data(), static_cast<size_t>(M) * Nk);
@@ -2388,6 +2412,12 @@ namespace
         q_kernel.unbindWorkspace();
         k_kernel.unbindWorkspace();
         v_kernel.unbindWorkspace();
+#ifdef HAVE_ROCM
+        q_kernel.setGPUStream(nullptr);
+        k_kernel.setGPUStream(nullptr);
+        v_kernel.setGPUStream(nullptr);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
     }
 
     template <typename CreateWeights>
@@ -2479,9 +2509,9 @@ namespace
 #ifdef HAVE_ROCM
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
-        fused_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        fused_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        fused_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(fused_q, stream);
+        TransferEngine::publishCurrentDeviceWrite(fused_k, stream);
+        TransferEngine::publishCurrentDeviceWrite(fused_v, stream);
 
         const struct ProjectionCase
         {
@@ -2527,7 +2557,7 @@ namespace
 #ifdef HAVE_ROCM
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
-                serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(serial, stream);
 
                 const float *grouped_row =
                     projection.fused->data() + static_cast<size_t>(row) * static_cast<size_t>(projection.n);
@@ -2587,8 +2617,9 @@ namespace
 
 #ifdef HAVE_ROCM
         hipStream_t stream = nullptr;
-        if (graph_capture)
-            ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+            hipSuccess);
 #endif
 
         std::vector<std::unique_ptr<TensorBase>> weights;
@@ -2607,8 +2638,7 @@ namespace
             expectPackedPath(packed[i], expected_path);
             kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
 #ifdef HAVE_ROCM
-            if (stream)
-                kernels.back()->setGPUStream(stream);
+            kernels.back()->setGPUStream(stream);
 #endif
             workspaces.push_back(bindWorkspace(*kernels.back(), M, Ns[i], K));
             ASSERT_NE(workspaces.back(), nullptr);
@@ -2634,10 +2664,10 @@ namespace
             ASSERT_TRUE(kernels[i]->multiply_tensor(input.get(), separate[i].get(), M, Ns[i], K));
         }
 #ifdef HAVE_ROCM
-        ASSERT_EQ(stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize(), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
         for (auto &output : separate)
-            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishCurrentDeviceWrite(output, stream);
 
         std::unique_ptr<DeviceWorkspaceManager> shared_workspace;
         if (bind_fused_to_shared_workspace)
@@ -2723,13 +2753,13 @@ namespace
         {
             ASSERT_TRUE(launch_fused_group());
 #ifdef HAVE_ROCM
-            ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
         }
 
         for (size_t i = 0; i < Ns.size(); ++i)
         {
-            fused[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishCurrentDeviceWrite(fused[i], stream);
             const float cos = cosineSim(fused[i]->data(),
                                         separate[i]->data(),
                                         static_cast<size_t>(M) * Ns[i]);
@@ -2744,8 +2774,7 @@ namespace
             EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
         if (graph)
             EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
-        if (stream)
-            EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
         for (auto &kernel : kernels)
             kernel->unbindWorkspace();
@@ -2771,8 +2800,9 @@ namespace
 
 #ifdef HAVE_ROCM
         hipStream_t stream = nullptr;
-        if (graph_capture)
-            ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+            hipSuccess);
 #endif
 
         std::vector<std::unique_ptr<TensorBase>> weights;
@@ -2796,8 +2826,7 @@ namespace
             expectPackedPath(packed[i], expected_path);
             kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
 #ifdef HAVE_ROCM
-            if (stream)
-                kernels.back()->setGPUStream(stream);
+            kernels.back()->setGPUStream(stream);
 #endif
             workspaces.push_back(bindWorkspace(*kernels.back(), M, Ns[i], K));
             ASSERT_NE(workspaces.back(), nullptr);
@@ -2881,13 +2910,13 @@ namespace
         {
             ASSERT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K));
 #ifdef HAVE_ROCM
-            ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
         }
 
         for (size_t i = 0; i < Ns.size(); ++i)
         {
-            fused[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishCurrentDeviceWrite(fused[i], stream);
 
             std::vector<float> ref(static_cast<size_t>(M) * static_cast<size_t>(Ns[i]));
             cpuFP32GemmRef(input->data(), weights_fp32[i].data(), ref.data(), M, Ns[i], K);
@@ -2909,8 +2938,7 @@ namespace
             EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
         if (graph)
             EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
-        if (stream)
-            EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
         for (auto &kernel : kernels)
             kernel->unbindWorkspace();
@@ -2933,8 +2961,9 @@ namespace
 
 #ifdef HAVE_ROCM
         hipStream_t stream = nullptr;
-        if (graph_capture)
-            ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+            hipSuccess);
 #endif
 
         std::vector<std::unique_ptr<TensorBase>> weights;
@@ -2953,8 +2982,7 @@ namespace
             expectPackedPath(packed[i], PackedPath::NativeVNNI);
             kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
 #ifdef HAVE_ROCM
-            if (stream)
-                kernels.back()->setGPUStream(stream);
+            kernels.back()->setGPUStream(stream);
 #endif
             workspaces.push_back(bindWorkspace(*kernels.back(), M, Ns[i], K));
             ASSERT_NE(workspaces.back(), nullptr);
@@ -2978,10 +3006,10 @@ namespace
         for (size_t i = 0; i < Ns.size(); ++i)
             ASSERT_TRUE(kernels[i]->multiply_tensor(input.get(), separate[i].get(), M, Ns[i], K));
 #ifdef HAVE_ROCM
-        ASSERT_EQ(stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize(), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
         for (auto &output : separate)
-            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishCurrentDeviceWrite(output, stream);
 
         WorkspaceRequirements combined;
         for (size_t i = 0; i < Ns.size(); ++i)
@@ -3052,13 +3080,13 @@ namespace
         {
             ASSERT_TRUE(launch_fused_group());
 #ifdef HAVE_ROCM
-            ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
         }
 
         for (size_t i = 0; i < Ns.size(); ++i)
         {
-            fused[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishCurrentDeviceWrite(fused[i], stream);
             const float cos = cosineSim(fused[i]->data(),
                                         separate[i]->data(),
                                         static_cast<size_t>(M) * Ns[i]);
@@ -3073,8 +3101,7 @@ namespace
             EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
         if (graph)
             EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
-        if (stream)
-            EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
         for (auto &kernel : kernels)
             kernel->unbindWorkspace();
@@ -3159,7 +3186,7 @@ namespace
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
         for (auto &output : fused)
-            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishCurrentDeviceWrite(output, stream);
 
         for (int row = 0; row < M; ++row)
         {
@@ -3189,7 +3216,7 @@ namespace
 #ifdef HAVE_ROCM
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
-                serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(serial, stream);
 
                 const float *grouped_row =
                     fused[projection]->data() + static_cast<size_t>(row) * static_cast<size_t>(Ns[projection]);
@@ -3370,10 +3397,8 @@ namespace
 
         for (size_t projection = 0; projection < Ns.size(); ++projection)
         {
-            padded_outputs[projection]->transitionTo(
-                TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            isolated_outputs[projection]->transitionTo(
-                TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishDeviceWrite(padded_outputs[projection], DeviceId::rocm(0), stream);
+            TransferEngine::publishDeviceWrite(isolated_outputs[projection], DeviceId::rocm(0), stream);
             const size_t row_width = static_cast<size_t>(Ns[projection]);
             const float *padded_request =
                 padded_outputs[projection]->data() +
@@ -3450,7 +3475,7 @@ namespace
                   hipSuccess);
         ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(output, stream);
 
         std::vector<float> ref(static_cast<size_t>(M) * N);
         cpuFP32GemmRef(input->data(), W_fp32.data(), ref.data(), M, N, K);
@@ -3728,9 +3753,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, ExplicitIQGridTrainerCandidateControlsLDSRou
         << PerfStatsCollector::summaryString(
                {"kernel.rocm_native_vnni_small_m_launch"}, 20);
 
-    output->transitionTo(
-        TensorCoherenceState::DEVICE_AUTHORITATIVE,
-        DeviceId::rocm(0));
+    TransferEngine::publishDeviceWrite(output, DeviceId::rocm(0), stream);
     EXPECT_GT(l2Norm(output->data(), output->numel()), 1.0e-7)
         << "The observed candidate must produce a non-zero output witness";
 
@@ -4075,8 +4098,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, FloatingProjectionAllFormatsRuntimeMMatchSer
                 grouped_input.get(), projections, M, K, nullptr, &workspace))
                 << dtype_tag << " grouped floating projection M=" << M;
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            alpha_grouped->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-            beta_grouped->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            TransferEngine::publishDeviceWrite(alpha_grouped, device, stream);
+            TransferEngine::publishDeviceWrite(beta_grouped, device, stream);
 
             const std::vector<float> alpha_grouped_values(
                 alpha_grouped->data(),
@@ -4126,8 +4149,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, FloatingProjectionAllFormatsRuntimeMMatchSer
                     -1,
                     &workspace));
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-                alpha_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-                beta_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+                TransferEngine::publishDeviceWrite(alpha_serial, device, stream);
+                TransferEngine::publishDeviceWrite(beta_serial, device, stream);
                 std::copy_n(
                     alpha_serial->data(),
                     N,
@@ -4377,9 +4400,7 @@ TEST(
                  alpha_isolated.get(),
                  beta_isolated.get()})
         {
-            output->transitionTo(
-                TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                device);
+            TransferEngine::publishDeviceWrite(output, device, stream);
         }
 
         expectBitwiseFP32RowsEqual(
@@ -4512,7 +4533,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FloatingSwiGLUDownAllFormatsRuntimeMMatchSer
                 &workspace))
                 << dtype_tag << " grouped floating SwiGLU/down M=" << M;
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            TransferEngine::publishDeviceWrite(grouped_output, device, stream);
             const std::vector<float> grouped_values(
                 grouped_output->data(),
                 grouped_output->data() + grouped_output->numel());
@@ -4550,7 +4571,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FloatingSwiGLUDownAllFormatsRuntimeMMatchSer
                     0.0f,
                     &workspace));
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-                row_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+                TransferEngine::publishDeviceWrite(row_output, device, stream);
                 std::copy_n(
                     row_output->data(),
                     N,
@@ -5846,16 +5867,20 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2UsesCanonicalBatche
         DeviceId::rocm(0),
         combined.total_bytes_with_alignment() + 64 * 1024 * 1024);
     ASSERT_TRUE(workspace.allocate(combined));
+    ScopedGPUStream producer_stream(DeviceId::rocm(0));
     for (auto &kernel : kernels)
+    {
         kernel->bindWorkspace(&workspace);
+        kernel->setGPUStream(producer_stream.get());
+    }
 
     auto input = TestTensorFactory::createFP32Random(
         {static_cast<size_t>(M), static_cast<size_t>(K)});
     auto gate = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
     auto up = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
-    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
-    ASSERT_TRUE(gate->allocateOnDevice(DeviceId::rocm(0)));
-    ASSERT_TRUE(up->allocateOnDevice(DeviceId::rocm(0)));
+    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), producer_stream.get()));
+    ASSERT_TRUE(gate->allocateOnDevice(DeviceId::rocm(0), producer_stream.get()));
+    ASSERT_TRUE(up->allocateOnDevice(DeviceId::rocm(0), producer_stream.get()));
 
     std::vector<ITensorGemm::TensorProjectionDesc> projections;
     projections.emplace_back(kernels[0].get(), gate.get(), N, nullptr, "gate");
@@ -5868,7 +5893,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2UsesCanonicalBatche
         input.get(), projections, M, K, nullptr, &workspace))
         << "Canonical batched split-K arena must still provide distinct per-projection partial slices";
 #ifdef HAVE_ROCM
-    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    ASSERT_EQ(
+        hipStreamSynchronize(static_cast<hipStream_t>(producer_stream.get())),
+        hipSuccess);
 #endif
 
     const auto records = PerfStatsCollector::snapshot({"kernel"});
@@ -5936,17 +5963,21 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2RejectsUndersizedDe
         DeviceId::rocm(0),
         combined.total_bytes_with_alignment() + 64 * 1024 * 1024);
     ASSERT_TRUE(workspace.allocate(combined));
+    ScopedGPUStream producer_stream(DeviceId::rocm(0));
     for (auto &kernel : kernels)
+    {
         kernel->bindWorkspace(&workspace);
+        kernel->setGPUStream(producer_stream.get());
+    }
 
     auto input = TestTensorFactory::createFP32Random(
         {static_cast<size_t>(M), static_cast<size_t>(K)});
-    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), producer_stream.get()));
 
     auto gate = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
     auto up = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
-    ASSERT_TRUE(gate->allocateOnDevice(DeviceId::rocm(0)));
-    ASSERT_TRUE(up->allocateOnDevice(DeviceId::rocm(0)));
+    ASSERT_TRUE(gate->allocateOnDevice(DeviceId::rocm(0), producer_stream.get()));
+    ASSERT_TRUE(up->allocateOnDevice(DeviceId::rocm(0), producer_stream.get()));
 
     std::vector<ITensorGemm::TensorProjectionDesc> projections;
     projections.emplace_back(kernels[0].get(), gate.get(), N, nullptr, "gate");
@@ -5955,10 +5986,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2RejectsUndersizedDe
     EXPECT_FALSE(kernels.front()->multiply_fused_verifier_rows_decode_equivalent(
         input.get(), projections, M, K, nullptr, &workspace))
         << "Batched small-M split-K must reject undersized declared partial workspace before HIP launch";
-#ifdef HAVE_ROCM
-    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-#endif
-
     for (auto &kernel : kernels)
         kernel->unbindWorkspace();
 }
@@ -6095,8 +6122,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, Qwen36GDNProjectionStageMixedQuantizedAndRaw
     ASSERT_TRUE(stage.execute(&ctx));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    out_a->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    out_b->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(out_a, stream);
+    TransferEngine::publishCurrentDeviceWrite(out_b, stream);
 
     std::vector<float> ref_a(static_cast<size_t>(M) * N_ALPHA);
     std::vector<float> ref_b(static_cast<size_t>(M) * N_BETA);
@@ -6229,10 +6256,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, Qwen36MoEGDNProjectionStageQ6KVerifierRowsMa
         ASSERT_TRUE(stage.execute(&ctx));
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-        out_qkv->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        out_z->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        out_a->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        out_b->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(out_qkv, stream);
+        TransferEngine::publishCurrentDeviceWrite(out_z, stream);
+        TransferEngine::publishCurrentDeviceWrite(out_a, stream);
+        TransferEngine::publishCurrentDeviceWrite(out_b, stream);
 
         const struct ProjectionCase
         {
@@ -6275,7 +6302,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, Qwen36MoEGDNProjectionStageQ6KVerifierRowsMa
                     &workspace))
                     << "projection=" << projection.name << " row=" << row;
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-                serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(serial, stream);
 
                 const float *grouped_row =
                     projection.grouped->data() + static_cast<size_t>(row) * static_cast<size_t>(projection.n);

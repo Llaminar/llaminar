@@ -54,6 +54,34 @@ namespace llaminar2
             EXPECT_EQ(rows, m);
         }
 
+        TEST(Test__PrefillGraphBucketDefaults,
+             PersistentVerifierWorkspaceDoesNotScaleWithPromptM)
+        {
+            constexpr int n = 17408;
+            constexpr int k = 5120;
+
+            const int verifier_rows =
+                nativeVNNIPersistentVerifierWorkspaceRows(595, n, k);
+            const int direct_prompt_rows =
+                nativeVNNIBatchInvariantTileRows(595, n, k);
+
+            EXPECT_EQ(verifier_rows, kDefaultNativeVNNIVerifierRowCapacity);
+            EXPECT_GT(direct_prompt_rows, verifier_rows);
+        }
+
+        TEST(Test__PrefillGraphBucketDefaults,
+             PersistentVerifierWorkspaceRemainsGroupedForWideGeometry)
+        {
+            constexpr int n = 248320;
+            constexpr int k = 5120;
+
+            const int rows =
+                nativeVNNIPersistentVerifierWorkspaceRows(4096, n, k);
+
+            EXPECT_GE(rows, 2);
+            EXPECT_LE(rows, kDefaultNativeVNNIVerifierRowCapacity);
+        }
+
         TEST(Test__PrefillGraphBucketDefaults, BoundsWideProjectionScratch)
         {
             constexpr int m = 4096;

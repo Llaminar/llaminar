@@ -17,6 +17,7 @@
 
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "backends/BackendManager.h"
+#include "kernels/common/DeviceResidentRouterGateCache.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -602,6 +603,263 @@ TEST_F(Test__DeviceWorkspaceManager, BuffersAreIndependent)
         EXPECT_EQ(static_cast<unsigned char>(a[i]), 0xAA);
         EXPECT_EQ(static_cast<unsigned char>(b[i]), 0xBB);
     }
+}
+
+// ============================================================================
+// Persistent Graph Metadata Slot Tests
+// ============================================================================
+
+TEST_F(Test__DeviceWorkspaceManager, PersistentMetadataLeasesAreExclusiveAndReusable)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+
+    auto first = mgr.acquirePersistentSlot("moe_gateup_descriptors", 2);
+    auto second = mgr.acquirePersistentSlot("moe_gateup_descriptors", 2);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(first->slot(), 0u);
+    EXPECT_EQ(second->slot(), 1u);
+    EXPECT_EQ(
+        mgr.acquirePersistentSlot("moe_gateup_descriptors", 2),
+        nullptr)
+        << "A full graph-metadata domain must fail closed instead of aliasing "
+           "an address already captured by another kernel";
+
+    first.reset();
+    auto replacement = mgr.acquirePersistentSlot("moe_gateup_descriptors", 2);
+    ASSERT_NE(replacement, nullptr);
+    EXPECT_EQ(replacement->slot(), 0u)
+        << "Destroying an owner must return its immutable metadata slot";
+
+    auto independent_domain =
+        mgr.acquirePersistentSlot("moe_down_descriptors", 2);
+    ASSERT_NE(independent_domain, nullptr);
+    EXPECT_EQ(independent_domain->slot(), 0u)
+        << "Separate physical descriptor tables have separate ownership domains";
+}
+
+TEST_F(Test__DeviceWorkspaceManager, PersistentSlotAddressesUseTheDeclaredTableStride)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    WorkspaceRequirements reqs;
+    reqs.buffers.push_back({"persistent_router_table", 1024, 256, true});
+    ASSERT_TRUE(mgr.allocate(reqs));
+
+    auto first = mgr.acquirePersistentSlot("router_gate", 2);
+    auto second = mgr.acquirePersistentSlot("router_gate", 2);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+
+    void *small_payload = mgr.getPersistentSlotBuffer(
+        "persistent_router_table",
+        /*slot_capacity=*/2,
+        first->slot(),
+        /*payload_bytes=*/64);
+    void *large_payload = mgr.getPersistentSlotBuffer(
+        "persistent_router_table",
+        /*slot_capacity=*/2,
+        second->slot(),
+        /*payload_bytes=*/384);
+    ASSERT_NE(small_payload, nullptr);
+    ASSERT_NE(large_payload, nullptr);
+
+    const auto byte_distance =
+        static_cast<char *>(large_payload) -
+        static_cast<char *>(small_payload);
+    EXPECT_EQ(byte_distance, 512)
+        << "Different payload sizes must not change the common slot stride";
+    EXPECT_EQ(
+        mgr.getPersistentSlotBuffer(
+            "persistent_router_table",
+            /*slot_capacity=*/2,
+            second->slot(),
+            /*payload_bytes=*/513),
+        nullptr)
+        << "A payload wider than its fixed slot must fail before publication";
+}
+
+TEST_F(Test__DeviceWorkspaceManager, RouterGateIdentityIgnoresRequestLocalTensorWrappers)
+{
+    constexpr std::uint64_t kWorkspaceGeneration = 37;
+    const void *const device_weight =
+        reinterpret_cast<const void *>(std::uintptr_t{0x100000});
+    const auto expected = DeviceResidentRouterGateCacheKey::make(
+        kWorkspaceGeneration,
+        device_weight,
+        /*model_width=*/2048,
+        /*expert_count=*/256);
+
+    /*
+     * Rebuilt graph views may have arbitrary host addresses. Simulate many
+     * requests and prove none of those wrapper identities can alter the
+     * prepared device-weight key.
+     */
+    for (int request = 0; request < 256; ++request)
+    {
+        int request_local_tensor_wrapper = request;
+        (void)request_local_tensor_wrapper;
+        EXPECT_EQ(
+            DeviceResidentRouterGateCacheKey::make(
+                kWorkspaceGeneration,
+                device_weight,
+                /*model_width=*/2048,
+                /*expert_count=*/256),
+            expected);
+    }
+
+    EXPECT_NE(
+        DeviceResidentRouterGateCacheKey::make(
+            kWorkspaceGeneration + 1,
+            device_weight,
+            /*model_width=*/2048,
+            /*expert_count=*/256),
+        expected);
+    EXPECT_NE(
+        DeviceResidentRouterGateCacheKey::make(
+            kWorkspaceGeneration,
+            reinterpret_cast<const void *>(std::uintptr_t{0x200000}),
+            /*model_width=*/2048,
+            /*expert_count=*/256),
+        expected);
+    EXPECT_NE(
+        DeviceResidentRouterGateCacheKey::make(
+            kWorkspaceGeneration,
+            device_weight,
+            /*model_width=*/4096,
+            /*expert_count=*/256),
+        expected);
+}
+
+TEST_F(Test__DeviceWorkspaceManager, ImmutablePublicationIsSharedAcrossGraphLocalOwners)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    const PersistentWorkspacePublicationKey router_gate{
+        .word0 = mgr.id(),
+        .word1 = 0x100000,
+        .word2 = 2048,
+        .word3 = 256,
+    };
+    int factory_calls = 0;
+
+    /*
+     * A long-context server run constructs many graph-local routed-pipeline
+     * kernel owners. All of them consume the same immutable router conversion;
+     * ownership must therefore converge on one workspace publication rather
+     * than exhausting one slot per graph object.
+     */
+    std::shared_ptr<void> expected_publication;
+    for (int graph_owner = 0; graph_owner < 256; ++graph_owner)
+    {
+        const auto result = mgr.getOrCreatePersistentPublication(
+            "rocm_moe_router_q8_gate_cache",
+            router_gate,
+            /*slot_capacity=*/2,
+            [&](size_t slot) -> std::shared_ptr<void>
+            {
+                ++factory_calls;
+                EXPECT_EQ(slot, 0u);
+                return std::make_shared<int>(17);
+            });
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result.slot, 0u);
+        EXPECT_EQ(result.created, graph_owner == 0);
+        if (!expected_publication)
+            expected_publication = result.publication;
+        EXPECT_EQ(result.publication, expected_publication);
+    }
+    EXPECT_EQ(factory_calls, 1)
+        << "The immutable device bytes must be published once, not once per graph-local kernel";
+
+    const auto second = mgr.getOrCreatePersistentPublication(
+        "rocm_moe_router_q8_gate_cache",
+        PersistentWorkspacePublicationKey{
+            .word0 = mgr.id(),
+            .word1 = 0x200000,
+            .word2 = 2048,
+            .word3 = 256,
+        },
+        /*slot_capacity=*/2,
+        [](size_t slot) -> std::shared_ptr<void>
+        {
+            EXPECT_EQ(slot, 1u);
+            return std::make_shared<int>(23);
+        });
+    ASSERT_TRUE(second);
+    EXPECT_TRUE(second.created);
+    EXPECT_EQ(second.slot, 1u);
+
+    EXPECT_FALSE(mgr.getOrCreatePersistentPublication(
+        "rocm_moe_router_q8_gate_cache",
+        PersistentWorkspacePublicationKey{
+            .word0 = mgr.id(),
+            .word1 = 0x300000,
+            .word2 = 2048,
+            .word3 = 256,
+        },
+        /*slot_capacity=*/2,
+        [](size_t) -> std::shared_ptr<void>
+        {
+            return std::make_shared<int>(29);
+        }))
+        << "A genuinely distinct immutable weight must still fail closed when "
+           "the physical table is full";
+}
+
+TEST_F(Test__DeviceWorkspaceManager, FailedImmutablePublicationRollsBackItsSlot)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    const PersistentWorkspacePublicationKey key{
+        .word0 = mgr.id(),
+        .word1 = 0x100000,
+        .word2 = 2048,
+        .word3 = 256,
+    };
+
+    EXPECT_FALSE(mgr.getOrCreatePersistentPublication(
+        "cuda_moe_router_q8_gate_cache",
+        key,
+        /*slot_capacity=*/1,
+        [](size_t) -> std::shared_ptr<void>
+        {
+            return {};
+        }));
+
+    const auto retry = mgr.getOrCreatePersistentPublication(
+        "cuda_moe_router_q8_gate_cache",
+        key,
+        /*slot_capacity=*/1,
+        [](size_t slot) -> std::shared_ptr<void>
+        {
+            EXPECT_EQ(slot, 0u);
+            return std::make_shared<int>(31);
+        });
+    ASSERT_TRUE(retry);
+    EXPECT_TRUE(retry.created);
+    EXPECT_EQ(retry.slot, 0u)
+        << "A failed event or conversion setup must not poison the immutable publication namespace";
+}
+
+TEST_F(Test__DeviceWorkspaceManager, ReleaseInvalidatesOldMetadataLeaseNamespace)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+
+    auto old_lease = mgr.acquirePersistentSlot("moe_expert_masks", 1);
+    ASSERT_NE(old_lease, nullptr);
+    EXPECT_EQ(old_lease->slot(), 0u);
+
+    mgr.release();
+
+    auto new_lease = mgr.acquirePersistentSlot("moe_expert_masks", 1);
+    ASSERT_NE(new_lease, nullptr);
+    EXPECT_EQ(new_lease->slot(), 0u)
+        << "A replacement device allocation must not inherit occupied slots "
+           "from graph owners tied to the released allocation";
+
+    old_lease.reset();
+    EXPECT_EQ(
+        mgr.acquirePersistentSlot("moe_expert_masks", 1),
+        nullptr)
+        << "Destroying an obsolete lease must not release a slot in the new namespace";
 }
 
 // ============================================================================

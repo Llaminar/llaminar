@@ -855,6 +855,7 @@ namespace llaminar2::test::parity::qwen2
                 config_.token_ids = cfg().token_ids;
             if (cfg().decode_steps > 0)
                 config_.decode_steps = cfg().decode_steps;
+            config_.uses_in_process_local_tp = cfg().is_local_tp();
             config_.moe_rebalance_exercise = cfg().moe_rebalance_exercise;
             config_.graph_snapshot_policy = cfg().graph_snapshot_policy;
         }

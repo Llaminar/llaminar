@@ -31,8 +31,11 @@
 #include "collective/ICollectiveBackend.h"
 #include "collective/LocalTPContext.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "tensors/TensorClasses.h"
+#include "../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
+using namespace llaminar2::test;
 
 namespace
 {
@@ -421,7 +424,704 @@ namespace
         EXPECT_EQ(result.instantiate_status, cudaSuccess) << name;
         EXPECT_NE(result.exec, nullptr) << name;
     }
+
+    /**
+     * @brief Capture one FP16-transport allreduce followed by its first consumer.
+     *
+     * Qwen3.6 MoE's deferred LocalTP combine writes a full FP32 hidden-state
+     * row, transports it through FP16 NCCL scratch, casts the reduced result
+     * back to FP32, and immediately lets the next layer consume that FP32
+     * buffer. A collective-only test can miss an ordering defect if it
+     * synchronizes before inspecting the result. This helper records the
+     * immediate device-to-device consumer in the same graph so the copied
+     * bytes prove that stream ordering survived capture and replay.
+     *
+     * All storage must already exist before this function is called. In
+     * particular, callers must execute one eager FP16 allreduce first so
+     * LocalTPContext's persistent FP16 transport scratch is allocated outside
+     * graph capture.
+     *
+     * @param ctx Shared two-device LocalTP NCCL context.
+     * @param tensor0 Device-0 FP32 collective input and output tensor.
+     * @param tensor1 Device-1 FP32 collective input and output tensor.
+     * @param stream0 Explicit capture stream owned by CUDA device 0.
+     * @param stream1 Explicit capture stream owned by CUDA device 1.
+     * @param consumer0 Preallocated device-0 destination for the first consumer.
+     * @param consumer1 Preallocated device-1 destination for the first consumer.
+     * @param count Number of FP32 elements reduced and copied.
+     * @param result0 Device-0 captured graph resources and status.
+     * @param result1 Device-1 captured graph resources and status.
+     */
+    void captureFP16AllreduceWithImmediateConsumer(
+        ILocalTPContext &ctx,
+        TensorBase *tensor0,
+        TensorBase *tensor1,
+        cudaStream_t stream0,
+        cudaStream_t stream1,
+        float *consumer0,
+        float *consumer1,
+        size_t count,
+        CaptureResult &result0,
+        CaptureResult &result1,
+        const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands0 = nullptr,
+        const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands1 = nullptr)
+    {
+        ASSERT_NE(tensor0, nullptr);
+        ASSERT_NE(tensor1, nullptr);
+        ASSERT_NE(consumer0, nullptr);
+        ASSERT_NE(consumer1, nullptr);
+        ASSERT_EQ(sidebands0 == nullptr, sidebands1 == nullptr)
+            << "Both LocalTP participants must either publish the same sideband "
+               "descriptor sequence or omit sidebands together.";
+
+        Barrier capture_started(2);
+        Barrier collective_recorded(2);
+
+        auto capture_worker =
+            [&](int device,
+                TensorBase *tensor,
+                cudaStream_t stream,
+                float *consumer,
+                CaptureResult *result)
+        {
+            result->begin_status = cudaSetDevice(device);
+            if (result->begin_status == cudaSuccess)
+            {
+                result->begin_status = cudaStreamBeginCapture(
+                    stream,
+                    cudaStreamCaptureModeRelaxed);
+            }
+
+            capture_started.arriveAndWait();
+
+            if (result->begin_status == cudaSuccess)
+            {
+                GraphCaptureGuard guard;
+                if (sidebands0)
+                {
+                    const auto &participant_sidebands =
+                        device == 0 ? *sidebands0 : *sidebands1;
+                    result->collective_ok = ctx.allreduceWithSidebandsOnStream(
+                        tensor,
+                        "layer0_moe_combined_allreduce_with_rebalance_sidebands",
+                        count,
+                        stream,
+                        "fp16",
+                        participant_sidebands,
+                        device);
+                }
+                else
+                {
+                    result->collective_ok = ctx.allreduceOnStream(
+                        tensor,
+                        "layer0_moe_combined_allreduce",
+                        count,
+                        stream,
+                        "fp16");
+                }
+                if (result->collective_ok)
+                {
+                    result->launch_status = cudaMemcpyAsync(
+                        consumer,
+                        tensor->gpu_data_ptr(),
+                        count * sizeof(float),
+                        cudaMemcpyDeviceToDevice,
+                        stream);
+                }
+            }
+
+            /*
+             * CUDA's participant-local NCCL capture records one operation on
+             * each stream. Neither worker may end capture while its peer is
+             * still inside the LocalTP grouped-launch rendezvous.
+             */
+            collective_recorded.arriveAndWait();
+
+            if (result->begin_status == cudaSuccess &&
+                result->launch_status == cudaSuccess &&
+                result->collective_ok)
+            {
+                result->end_status = cudaStreamEndCapture(
+                    stream,
+                    &result->graph);
+            }
+
+            if (result->end_status == cudaSuccess && result->graph)
+            {
+                result->instantiate_status = cudaGraphInstantiate(
+                    &result->exec,
+                    result->graph,
+                    nullptr,
+                    nullptr,
+                    0);
+            }
+        };
+
+        std::thread worker0(
+            capture_worker,
+            0,
+            tensor0,
+            stream0,
+            consumer0,
+            &result0);
+        std::thread worker1(
+            capture_worker,
+            1,
+            tensor1,
+            stream1,
+            consumer1,
+            &result1);
+        worker0.join();
+        worker1.join();
+    }
+
+    /**
+     * @brief Launch one captured LocalTP graph per CUDA participant.
+     *
+     * RankOrchestrator launches participant graphs from one worker thread per
+     * device. The launch barrier below reproduces that ownership and avoids
+     * accidentally validating only a sequential host-launch schedule.
+     *
+     * @param result0 Device-0 captured graph.
+     * @param result1 Device-1 captured graph.
+     * @param stream0 Device-0 replay stream.
+     * @param stream1 Device-1 replay stream.
+     */
+    void replayCapturedGraphPair(
+        CaptureResult &result0,
+        CaptureResult &result1,
+        cudaStream_t stream0,
+        cudaStream_t stream1)
+    {
+        Barrier launch_ready(2);
+
+        auto replay_worker =
+            [&](int device,
+                CaptureResult *result,
+                cudaStream_t stream)
+        {
+            result->launch_status = cudaSetDevice(device);
+            launch_ready.arriveAndWait();
+            if (result->launch_status == cudaSuccess)
+                result->launch_status = cudaGraphLaunch(result->exec, stream);
+            if (result->launch_status == cudaSuccess)
+                result->launch_status = cudaStreamSynchronize(stream);
+        };
+
+        std::thread worker0(replay_worker, 0, &result0, stream0);
+        std::thread worker1(replay_worker, 1, &result1, stream1);
+        worker0.join();
+        worker1.join();
+    }
 } // namespace
+
+/**
+ * @brief Captured FP16 NCCL output must be live for its immediate consumer.
+ *
+ * This regression models the deferred Qwen3.6 MoE branch topology that first
+ * exposed stale continuation state:
+ *
+ * `local routed+shared FP32 -> FP16 NCCL allreduce -> FP32 -> next layer`
+ *
+ * Two replays use different integer-valued inputs. Integer values are exactly
+ * representable in FP16, so any mismatch is lifecycle or ordering corruption,
+ * not an allowed transport-rounding difference. The second replay is
+ * essential: a graph that accidentally republishes warmup bytes can pass a
+ * one-shot test while still poisoning production continuation state.
+ */
+TEST(
+    Test__LocalTPNCCLGraphCapture,
+    NCCLFP16AllreduceGraph_ImmediateConsumerObservesEveryReplay)
+{
+    auto *cuda_backend = getCUDABackend();
+    ASSERT_NE(cuda_backend, nullptr);
+    if (cuda_backend->deviceCount() < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ CUDA GPUs, found "
+                     << cuda_backend->deviceCount();
+    }
+
+    constexpr size_t kPromptRows = 9;
+    constexpr size_t kQwen36MoEHiddenDim = 2048;
+    constexpr size_t kElementCount =
+        kPromptRows * kQwen36MoEHiddenDim;
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+    auto ctx = createLocalTPContext(
+        devices,
+        {},
+        CollectiveBackendType::NCCL);
+    ASSERT_NE(ctx, nullptr);
+
+    auto tensor0 = TestTensorFactory::createFP32({kElementCount});
+    auto tensor1 = TestTensorFactory::createFP32({kElementCount});
+    TestTensorFactory::fillValue(tensor0.get(), 1.0f);
+    TestTensorFactory::fillValue(tensor1.get(), 2.0f);
+    ASSERT_TRUE(tensor0->ensureOnDevice(DeviceId::cuda(0)));
+    ASSERT_TRUE(tensor1->ensureOnDevice(DeviceId::cuda(1)));
+
+    cudaStream_t stream0 = nullptr;
+    cudaStream_t stream1 = nullptr;
+    float *consumer0 = nullptr;
+    float *consumer1 = nullptr;
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(
+        cudaStreamCreateWithFlags(&stream0, cudaStreamNonBlocking),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMalloc(
+            reinterpret_cast<void **>(&consumer0),
+            kElementCount * sizeof(float)),
+        cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    ASSERT_EQ(
+        cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMalloc(
+            reinterpret_cast<void **>(&consumer1),
+            kElementCount * sizeof(float)),
+        cudaSuccess);
+
+    /*
+     * Allocate the LocalTPContext FP16 scratch before capture. Production does
+     * the same during graph warmup; no allocation or deallocation is permitted
+     * in the captured hot path.
+     */
+    bool warmup0 = false;
+    bool warmup1 = false;
+    std::thread warmup_worker0(
+        [&]
+        {
+            ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+            warmup0 = ctx->allreduceOnStream(
+                tensor0.get(),
+                "warmup_moe_combined_allreduce",
+                kElementCount,
+                stream0,
+                "fp16");
+        });
+    std::thread warmup_worker1(
+        [&]
+        {
+            ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+            warmup1 = ctx->allreduceOnStream(
+                tensor1.get(),
+                "warmup_moe_combined_allreduce",
+                kElementCount,
+                stream1,
+                "fp16");
+        });
+    warmup_worker0.join();
+    warmup_worker1.join();
+    ASSERT_TRUE(warmup0);
+    ASSERT_TRUE(warmup1);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream0), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream1), cudaSuccess);
+
+    CaptureResult result0;
+    CaptureResult result1;
+    captureFP16AllreduceWithImmediateConsumer(
+        *ctx,
+        tensor0.get(),
+        tensor1.get(),
+        stream0,
+        stream1,
+        consumer0,
+        consumer1,
+        kElementCount,
+        result0,
+        result1);
+    expectCapturedGraphReady(result0, "fp16_allreduce_graph0");
+    expectCapturedGraphReady(result1, "fp16_allreduce_graph1");
+    ASSERT_FALSE(::testing::Test::HasFailure());
+
+    auto replay_and_expect =
+        [&](float value0, float value1)
+    {
+        const std::vector<float> input0(kElementCount, value0);
+        const std::vector<float> input1(kElementCount, value1);
+        std::vector<float> output0(kElementCount, 0.0f);
+        std::vector<float> output1(kElementCount, 0.0f);
+
+        ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                tensor0->gpu_data_ptr(),
+                input0.data(),
+                kElementCount * sizeof(float),
+                cudaMemcpyHostToDevice),
+            cudaSuccess);
+        ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                tensor1->gpu_data_ptr(),
+                input1.data(),
+                kElementCount * sizeof(float),
+                cudaMemcpyHostToDevice),
+            cudaSuccess);
+
+        replayCapturedGraphPair(
+            result0,
+            result1,
+            stream0,
+            stream1);
+        ASSERT_EQ(result0.launch_status, cudaSuccess)
+            << cudaGetErrorString(result0.launch_status);
+        ASSERT_EQ(result1.launch_status, cudaSuccess)
+            << cudaGetErrorString(result1.launch_status);
+
+        ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                output0.data(),
+                consumer0,
+                kElementCount * sizeof(float),
+                cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                output1.data(),
+                consumer1,
+                kElementCount * sizeof(float),
+                cudaMemcpyDeviceToHost),
+            cudaSuccess);
+
+        const float expected = value0 + value1;
+        for (size_t element = 0; element < kElementCount; ++element)
+        {
+            ASSERT_FLOAT_EQ(output0[element], expected)
+                << "device0 immediate consumer mismatch at element "
+                << element;
+            ASSERT_FLOAT_EQ(output1[element], expected)
+                << "device1 immediate consumer mismatch at element "
+                << element;
+        }
+    };
+
+    replay_and_expect(4.0f, 5.0f);
+    replay_and_expect(7.0f, 8.0f);
+
+    destroyCaptureResult(result0);
+    destroyCaptureResult(result1);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    EXPECT_EQ(cudaFree(consumer0), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream0), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    EXPECT_EQ(cudaFree(consumer1), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream1), cudaSuccess);
+}
+
+/**
+ * @brief Captured Dynamic-MoE sidebands must remain in the anchor NCCL bundle.
+ *
+ * Dynamic expert publication attaches small device-resident control payloads
+ * to a normal activation allreduce. The production contract is one grouped
+ * NCCL launch containing both the FP16 activation allreduce and every sideband;
+ * a participant-local anchor launch is not sufficient because it silently
+ * leaves the control payload outside the captured graph.
+ *
+ * This test uses the same INT32 allgather semantic as the rebalance histogram
+ * and command sidebands. It checks the activation's immediate consumer and the
+ * gathered sideband after two graph replays with different inputs. The second
+ * replay proves that neither output is merely the eager warmup result.
+ */
+TEST(
+    Test__LocalTPNCCLGraphCapture,
+    NCCLFP16AllreduceWithAllgatherSidebandGraph_EveryReplayPublishesWholeBundle)
+{
+    auto *cuda_backend = getCUDABackend();
+    ASSERT_NE(cuda_backend, nullptr);
+    if (cuda_backend->deviceCount() < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ CUDA GPUs, found "
+                     << cuda_backend->deviceCount();
+    }
+
+    constexpr size_t kPromptRows = 9;
+    constexpr size_t kQwen36MoEHiddenDim = 2048;
+    constexpr size_t kElementCount =
+        kPromptRows * kQwen36MoEHiddenDim;
+    constexpr size_t kSidebandElementCount = 128;
+    constexpr size_t kGatheredSidebandElementCount =
+        2 * kSidebandElementCount;
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+    auto ctx = createLocalTPContext(
+        devices,
+        {},
+        CollectiveBackendType::NCCL);
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_TRUE(ctx->supportsCollectiveSidebandOnStreamGraphCapture());
+
+    auto tensor0 = TestTensorFactory::createFP32({kElementCount});
+    auto tensor1 = TestTensorFactory::createFP32({kElementCount});
+    TestTensorFactory::fillValue(tensor0.get(), 1.0f);
+    TestTensorFactory::fillValue(tensor1.get(), 2.0f);
+    ASSERT_TRUE(tensor0->ensureOnDevice(DeviceId::cuda(0)));
+    ASSERT_TRUE(tensor1->ensureOnDevice(DeviceId::cuda(1)));
+
+    int32_t *sideband_send0 = nullptr;
+    int32_t *sideband_send1 = nullptr;
+    int32_t *sideband_recv0 = nullptr;
+    int32_t *sideband_recv1 = nullptr;
+    allocateAndUpload<int32_t>(
+        0,
+        std::vector<int32_t>(kSidebandElementCount, 11),
+        &sideband_send0);
+    allocateAndUpload<int32_t>(
+        1,
+        std::vector<int32_t>(kSidebandElementCount, 22),
+        &sideband_send1);
+    allocateAndUpload<int32_t>(
+        0,
+        std::vector<int32_t>(kGatheredSidebandElementCount, -1),
+        &sideband_recv0);
+    allocateAndUpload<int32_t>(
+        1,
+        std::vector<int32_t>(kGatheredSidebandElementCount, -1),
+        &sideband_recv1);
+
+    const std::vector<LocalTPCollectiveSidebandBuffer> sidebands0 = {
+        LocalTPCollectiveSidebandBuffer{
+            .kind = LocalTPCollectiveSidebandKind::Allgather,
+            .send_buffer = sideband_send0,
+            .recv_buffer = sideband_recv0,
+            .element_count = kSidebandElementCount,
+            .dtype = CollectiveDataType::INT32,
+            .root_device_index = 0,
+            .name = "moe_rebalance_histogram_sideband"}};
+    const std::vector<LocalTPCollectiveSidebandBuffer> sidebands1 = {
+        LocalTPCollectiveSidebandBuffer{
+            .kind = LocalTPCollectiveSidebandKind::Allgather,
+            .send_buffer = sideband_send1,
+            .recv_buffer = sideband_recv1,
+            .element_count = kSidebandElementCount,
+            .dtype = CollectiveDataType::INT32,
+            .root_device_index = 0,
+            .name = "moe_rebalance_histogram_sideband"}};
+
+    cudaStream_t stream0 = nullptr;
+    cudaStream_t stream1 = nullptr;
+    float *consumer0 = nullptr;
+    float *consumer1 = nullptr;
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(
+        cudaStreamCreateWithFlags(&stream0, cudaStreamNonBlocking),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMalloc(
+            reinterpret_cast<void **>(&consumer0),
+            kElementCount * sizeof(float)),
+        cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    ASSERT_EQ(
+        cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMalloc(
+            reinterpret_cast<void **>(&consumer1),
+            kElementCount * sizeof(float)),
+        cudaSuccess);
+
+    /*
+     * Warmup creates the persistent FP16 transport scratch and exercises the
+     * exact eager grouped bundle before capture. No allocation, host transfer,
+     * or stream synchronization is then needed inside the captured operation.
+     */
+    bool warmup0 = false;
+    bool warmup1 = false;
+    std::thread warmup_worker0(
+        [&]
+        {
+            ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+            warmup0 = ctx->allreduceWithSidebandsOnStream(
+                tensor0.get(),
+                "warmup_moe_combined_allreduce_with_rebalance_sidebands",
+                kElementCount,
+                stream0,
+                "fp16",
+                sidebands0,
+                0);
+        });
+    std::thread warmup_worker1(
+        [&]
+        {
+            ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+            warmup1 = ctx->allreduceWithSidebandsOnStream(
+                tensor1.get(),
+                "warmup_moe_combined_allreduce_with_rebalance_sidebands",
+                kElementCount,
+                stream1,
+                "fp16",
+                sidebands1,
+                1);
+        });
+    warmup_worker0.join();
+    warmup_worker1.join();
+    ASSERT_TRUE(warmup0);
+    ASSERT_TRUE(warmup1);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream0), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream1), cudaSuccess);
+
+    CaptureResult result0;
+    CaptureResult result1;
+    captureFP16AllreduceWithImmediateConsumer(
+        *ctx,
+        tensor0.get(),
+        tensor1.get(),
+        stream0,
+        stream1,
+        consumer0,
+        consumer1,
+        kElementCount,
+        result0,
+        result1,
+        &sidebands0,
+        &sidebands1);
+    expectCapturedGraphReady(result0, "fp16_sideband_bundle_graph0");
+    expectCapturedGraphReady(result1, "fp16_sideband_bundle_graph1");
+    ASSERT_FALSE(::testing::Test::HasFailure());
+
+    auto replay_and_expect =
+        [&](float value0,
+            float value1,
+            int32_t sideband_value0,
+            int32_t sideband_value1)
+    {
+        const std::vector<float> input0(kElementCount, value0);
+        const std::vector<float> input1(kElementCount, value1);
+        const std::vector<int32_t> sideband_input0(
+            kSidebandElementCount,
+            sideband_value0);
+        const std::vector<int32_t> sideband_input1(
+            kSidebandElementCount,
+            sideband_value1);
+        std::vector<float> output0(kElementCount, 0.0f);
+        std::vector<float> output1(kElementCount, 0.0f);
+        std::vector<int32_t> gathered0(kGatheredSidebandElementCount, 0);
+        std::vector<int32_t> gathered1(kGatheredSidebandElementCount, 0);
+
+        ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                tensor0->gpu_data_ptr(),
+                input0.data(),
+                kElementCount * sizeof(float),
+                cudaMemcpyHostToDevice),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                sideband_send0,
+                sideband_input0.data(),
+                kSidebandElementCount * sizeof(int32_t),
+                cudaMemcpyHostToDevice),
+            cudaSuccess);
+        ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                tensor1->gpu_data_ptr(),
+                input1.data(),
+                kElementCount * sizeof(float),
+                cudaMemcpyHostToDevice),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                sideband_send1,
+                sideband_input1.data(),
+                kSidebandElementCount * sizeof(int32_t),
+                cudaMemcpyHostToDevice),
+            cudaSuccess);
+
+        replayCapturedGraphPair(
+            result0,
+            result1,
+            stream0,
+            stream1);
+        ASSERT_EQ(result0.launch_status, cudaSuccess)
+            << cudaGetErrorString(result0.launch_status);
+        ASSERT_EQ(result1.launch_status, cudaSuccess)
+            << cudaGetErrorString(result1.launch_status);
+
+        ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                output0.data(),
+                consumer0,
+                kElementCount * sizeof(float),
+                cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                gathered0.data(),
+                sideband_recv0,
+                kGatheredSidebandElementCount * sizeof(int32_t),
+                cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                output1.data(),
+                consumer1,
+                kElementCount * sizeof(float),
+                cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                gathered1.data(),
+                sideband_recv1,
+                kGatheredSidebandElementCount * sizeof(int32_t),
+                cudaMemcpyDeviceToHost),
+            cudaSuccess);
+
+        const float expected_activation = value0 + value1;
+        for (size_t element = 0; element < kElementCount; ++element)
+        {
+            ASSERT_FLOAT_EQ(output0[element], expected_activation)
+                << "device0 immediate consumer mismatch at element "
+                << element;
+            ASSERT_FLOAT_EQ(output1[element], expected_activation)
+                << "device1 immediate consumer mismatch at element "
+                << element;
+        }
+        for (size_t element = 0; element < kSidebandElementCount; ++element)
+        {
+            ASSERT_EQ(gathered0[element], sideband_value0);
+            ASSERT_EQ(
+                gathered0[kSidebandElementCount + element],
+                sideband_value1);
+            ASSERT_EQ(gathered1[element], sideband_value0);
+            ASSERT_EQ(
+                gathered1[kSidebandElementCount + element],
+                sideband_value1);
+        }
+    };
+
+    replay_and_expect(4.0f, 5.0f, 101, 202);
+    replay_and_expect(7.0f, 8.0f, 303, 404);
+
+    destroyCaptureResult(result0);
+    destroyCaptureResult(result1);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    EXPECT_EQ(cudaFree(consumer0), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream0), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    EXPECT_EQ(cudaFree(consumer1), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream1), cudaSuccess);
+    freeDevicePtr(0, sideband_send0);
+    freeDevicePtr(1, sideband_send1);
+    freeDevicePtr(0, sideband_recv0);
+    freeDevicePtr(1, sideband_recv1);
+}
 
 TEST(Test__LocalTPNCCLGraphCapture, NCCLGroupedP2PMaintenanceGraph_AuxiliaryStream_TimingProbe)
 {
@@ -793,6 +1493,207 @@ TEST(Test__LocalTPNCCLGraphCapture, NCCLRawAllgather_OnStreamGraphCapture_Replay
     freeDevicePtr(1, send_hist_1);
     freeDevicePtr(0, recv_hist_0);
     freeDevicePtr(1, recv_hist_1);
+}
+
+/**
+ * @brief Proves production-sized back-to-back K/V allgathers survive graph replay.
+ *
+ * Phase-split LocalTP prefill compacts one K shard and one V shard, gathers
+ * both payloads on the graph stream, and only then deinterleaves them into the
+ * replicated decode-cache rows.  Small sideband collectives do not exercise
+ * the same launch geometry or expose accidental overlap between the adjacent
+ * receive buffers.  Keep this case symmetric with the RCCL regression and use
+ * the Qwen3.6 long-context size class that originally exposed K-only drift.
+ */
+TEST(Test__LocalTPNCCLGraphCapture, NCCLRawAllgather_GraphCapturedLargeBackToBackKVPayloads_ReplaysCorrectly)
+{
+    auto *cuda_backend = getCUDABackend();
+    ASSERT_NE(cuda_backend, nullptr);
+    if (cuda_backend->deviceCount() < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ CUDA GPUs, found " << cuda_backend->deviceCount();
+    }
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+    auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::NCCL);
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture());
+
+    constexpr size_t tokens = 640;
+    constexpr size_t local_kv_dim = 256;
+    constexpr size_t shard_count = tokens * local_kv_dim;
+
+    float *send_k0 = nullptr;
+    float *send_k1 = nullptr;
+    float *send_v0 = nullptr;
+    float *send_v1 = nullptr;
+    float *recv_k0 = nullptr;
+    float *recv_k1 = nullptr;
+    float *recv_v0 = nullptr;
+    float *recv_v1 = nullptr;
+    allocateAndUpload<float>(0, std::vector<float>(shard_count, 1.0f), &send_k0);
+    allocateAndUpload<float>(1, std::vector<float>(shard_count, 2.0f), &send_k1);
+    allocateAndUpload<float>(0, std::vector<float>(shard_count, 3.0f), &send_v0);
+    allocateAndUpload<float>(1, std::vector<float>(shard_count, 4.0f), &send_v1);
+    allocateAndUpload<float>(0, std::vector<float>(shard_count * 2, -1.0f), &recv_k0);
+    allocateAndUpload<float>(1, std::vector<float>(shard_count * 2, -1.0f), &recv_k1);
+    allocateAndUpload<float>(0, std::vector<float>(shard_count * 2, -1.0f), &recv_v0);
+    allocateAndUpload<float>(1, std::vector<float>(shard_count * 2, -1.0f), &recv_v1);
+
+    cudaStream_t stream0 = nullptr;
+    cudaStream_t stream1 = nullptr;
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream0, cudaStreamNonBlocking), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking), cudaSuccess);
+
+    Barrier ready_to_capture(2);
+    Barrier captured_collectives(2);
+    Barrier ready_to_launch(2);
+    CaptureResult result0;
+    CaptureResult result1;
+
+    auto capture_worker = [&](int device,
+                              const float *send_k,
+                              const float *send_v,
+                              float *recv_k,
+                              float *recv_v,
+                              cudaStream_t stream,
+                              CaptureResult *result)
+    {
+        result->begin_status = cudaSetDevice(device);
+        if (result->begin_status == cudaSuccess)
+        {
+            result->begin_status = cudaStreamBeginCapture(
+                stream,
+                cudaStreamCaptureModeRelaxed);
+        }
+
+        ready_to_capture.arriveAndWait();
+        if (result->begin_status == cudaSuccess)
+        {
+            GraphCaptureGuard guard;
+            const bool k_ok = ctx->allgatherRawOnStream(
+                send_k,
+                recv_k,
+                shard_count,
+                CollectiveDataType::FLOAT32,
+                device,
+                stream,
+                "large_kv_raw_allgather_K");
+            const bool v_ok = ctx->allgatherRawOnStream(
+                send_v,
+                recv_v,
+                shard_count,
+                CollectiveDataType::FLOAT32,
+                device,
+                stream,
+                "large_kv_raw_allgather_V");
+            result->collective_ok = k_ok && v_ok;
+        }
+
+        captured_collectives.arriveAndWait();
+        if (result->begin_status == cudaSuccess && result->collective_ok)
+        {
+            result->end_status = cudaSetDevice(device);
+            if (result->end_status == cudaSuccess)
+                result->end_status = cudaStreamEndCapture(stream, &result->graph);
+        }
+        if (result->end_status == cudaSuccess && result->graph)
+        {
+            result->instantiate_status = cudaGraphInstantiate(
+                &result->exec,
+                result->graph,
+                nullptr,
+                nullptr,
+                0);
+        }
+
+        for (int replay = 0; replay < 2; ++replay)
+        {
+            ready_to_launch.arriveAndWait();
+            if (result->instantiate_status == cudaSuccess && result->exec)
+            {
+                result->launch_status = cudaGraphLaunch(result->exec, stream);
+                if (result->launch_status == cudaSuccess)
+                    result->launch_status = cudaStreamSynchronize(stream);
+            }
+        }
+    };
+
+    std::thread t0(
+        capture_worker,
+        0,
+        send_k0,
+        send_v0,
+        recv_k0,
+        recv_v0,
+        stream0,
+        &result0);
+    std::thread t1(
+        capture_worker,
+        1,
+        send_k1,
+        send_v1,
+        recv_k1,
+        recv_v1,
+        stream1,
+        &result1);
+    t0.join();
+    t1.join();
+
+    expectCapturedGraphReady(result0, "large_kv_graph0");
+    expectCapturedGraphReady(result1, "large_kv_graph1");
+    EXPECT_EQ(result0.launch_status, cudaSuccess);
+    EXPECT_EQ(result1.launch_status, cudaSuccess);
+
+    std::vector<float> k0(shard_count * 2);
+    std::vector<float> k1(shard_count * 2);
+    std::vector<float> v0(shard_count * 2);
+    std::vector<float> v1(shard_count * 2);
+    downloadDeviceVector(0, recv_k0, &k0);
+    downloadDeviceVector(1, recv_k1, &k1);
+    downloadDeviceVector(0, recv_v0, &v0);
+    downloadDeviceVector(1, recv_v1, &v1);
+
+    auto expect_shards = [&](const std::vector<float> &actual,
+                             float first,
+                             float second,
+                             const char *label)
+    {
+        ASSERT_EQ(actual.size(), shard_count * 2) << label;
+        EXPECT_TRUE(std::all_of(
+            actual.begin(),
+            actual.begin() + static_cast<std::ptrdiff_t>(shard_count),
+            [first](float value) { return value == first; }))
+            << label << " first shard";
+        EXPECT_TRUE(std::all_of(
+            actual.begin() + static_cast<std::ptrdiff_t>(shard_count),
+            actual.end(),
+            [second](float value) { return value == second; }))
+            << label << " second shard";
+    };
+    expect_shards(k0, 1.0f, 2.0f, "device0 K");
+    expect_shards(k1, 1.0f, 2.0f, "device1 K");
+    expect_shards(v0, 3.0f, 4.0f, "device0 V");
+    expect_shards(v1, 3.0f, 4.0f, "device1 V");
+
+    destroyCaptureResult(result0);
+    destroyCaptureResult(result1);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream0), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream1), cudaSuccess);
+    freeDevicePtr(0, send_k0);
+    freeDevicePtr(1, send_k1);
+    freeDevicePtr(0, send_v0);
+    freeDevicePtr(1, send_v1);
+    freeDevicePtr(0, recv_k0);
+    freeDevicePtr(1, recv_k1);
+    freeDevicePtr(0, recv_v0);
+    freeDevicePtr(1, recv_v1);
 }
 
 #endif // HAVE_CUDA

@@ -12,6 +12,11 @@
 #include <vector>
 #include <random>
 #include <cmath>
+#include <memory>
+#include <stdexcept>
+#include "backends/DeviceId.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
 #include "kernels/IKVCache.h"
 #include "tensors/GpuTensorView.h"
@@ -27,6 +32,55 @@ namespace
         int count = 0;
         return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
     }
+
+    /**
+     * @brief Binds setup-owned conversion scratch for one cache test lifetime.
+     *
+     * Production graph setup allocates the cache's declared workspace before
+     * append or attention execution. This scope mirrors that ownership order
+     * and always unbinds before releasing the manager, including assertion
+     * exits, so a test can never leave the cache pointing at retired storage.
+     */
+    class ScopedWorkspaceBinding
+    {
+    public:
+        ScopedWorkspaceBinding(
+            IWorkspaceConsumer *consumer,
+            DeviceId device,
+            int graph_rows,
+            int batch_size,
+            int head_dim)
+            : consumer_(consumer)
+        {
+            if (!consumer_)
+                throw std::invalid_argument("CUDA KV cache lacks IWorkspaceConsumer");
+
+            const WorkspaceRequirements requirements =
+                consumer_->getWorkspaceRequirements(
+                    graph_rows, batch_size, head_dim);
+            workspace_ = std::make_unique<DeviceWorkspaceManager>(
+                device,
+                requirements.total_bytes_with_alignment() + 4096);
+            if (!workspace_->allocate(requirements))
+                throw std::runtime_error("Failed to allocate CUDA KV cache workspace");
+            consumer_->bindWorkspace(workspace_.get());
+            if (!consumer_->hasWorkspace())
+                throw std::runtime_error("CUDA KV cache rejected its workspace");
+        }
+
+        ~ScopedWorkspaceBinding()
+        {
+            if (consumer_)
+                consumer_->unbindWorkspace();
+        }
+
+        ScopedWorkspaceBinding(const ScopedWorkspaceBinding &) = delete;
+        ScopedWorkspaceBinding &operator=(const ScopedWorkspaceBinding &) = delete;
+
+    private:
+        IWorkspaceConsumer *consumer_ = nullptr;
+        std::unique_ptr<DeviceWorkspaceManager> workspace_;
+    };
 
     std::vector<float> generateRandomFP32(size_t count, unsigned seed = 42)
     {
@@ -80,6 +134,9 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP16_RoPEChangesK)
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP16, 1, 1, 32, n_kv_heads, head_dim);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        dynamic_cast<IWorkspaceConsumer *>(cache.get()),
+        DeviceId::cuda(0), 32, 1, head_dim);
 
     auto h_K_fp32 = generateRandomFP32(num_tokens * kv_dim, 123);
     auto h_V_fp32 = generateRandomFP32(num_tokens * kv_dim, 456);
@@ -153,6 +210,9 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP16_VUnchangedByRoPE)
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP16, 1, 1, 32, n_kv_heads, head_dim);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        dynamic_cast<IWorkspaceConsumer *>(cache.get()),
+        DeviceId::cuda(0), 32, 1, head_dim);
 
     auto h_V_fp32 = generateRandomFP32(num_tokens * kv_dim, 789);
     auto h_K_fp32 = generateRandomFP32(num_tokens * kv_dim, 101);
@@ -215,6 +275,9 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, Q8_1_RoPEChangesK)
     auto cache = createCUDARingKVCache(
         ActivationPrecision::Q8_1, 1, 1, 32, n_kv_heads, head_dim);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        dynamic_cast<IWorkspaceConsumer *>(cache.get()),
+        DeviceId::cuda(0), 32, 1, head_dim);
 
     // Use FP32Tensor + appendWithStream which handles FP32→Q8_1 conversion
     auto K_tensor = std::make_unique<FP32Tensor>(
@@ -289,6 +352,9 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP32_RoPEConvertsToFP16)
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP32, 1, 1, 32, n_kv_heads, head_dim);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        dynamic_cast<IWorkspaceConsumer *>(cache.get()),
+        DeviceId::cuda(0), 32, 1, head_dim);
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 555);
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 666);

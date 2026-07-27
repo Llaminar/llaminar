@@ -201,7 +201,9 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("validate_native_vnni_generated_dispatch_ids.py", result.stdout)
         self.assertNotIn("native_vnni_dispatch.profiler_collectors", result.stdout)
 
-    def test_gpu_measurement_lanes_partition_formats_without_duplication(self) -> None:
+    def test_gpu_measurement_lanes_partition_work_without_duplication(self) -> None:
+        """CUDA shards formats while ROCm shards finer-grained shapes."""
+
         formats = "Q4_0,Q5_0,Q6_K,Q8_0"
         result = self.run_script(
             "--backend",
@@ -221,22 +223,31 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
         self.assertIn("CUDA measurement lanes: 2 disjoint format shard(s)", stdout)
-        self.assertIn("ROCm measurement lanes: 4 disjoint format shard(s)", stdout)
+        self.assertIn("ROCm measurement lanes: 4 parallel sweep lane(s)", stdout)
         self.assertIn("CUDA_VISIBLE_DEVICES=0", stdout)
         self.assertIn("CUDA_VISIBLE_DEVICES=1", stdout)
         self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q4_0,Q6_K", stdout)
         self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q5_0,Q8_0", stdout)
-        for lane, source_format in enumerate(formats.split(",")):
-            self.assertIn(f"ROCR_VISIBLE_DEVICES={lane}", stdout)
-            self.assertIn(
-                f"LLAMINAR_ROCM_NVNNI_DECODE_FORMATS={source_format}",
-                stdout,
-            )
+        self.assertIn("ROCR_VISIBLE_DEVICES=0", stdout)
+        self.assertIn("ROCR_VISIBLE_DEVICES=1", stdout)
+        self.assertNotIn("ROCR_VISIBLE_DEVICES=2", stdout)
+        self.assertEqual(
+            stdout.count(f"LLAMINAR_ROCM_NVNNI_DECODE_FORMATS={formats}"),
+            2,
+        )
+        self.assertIn(
+            "LLAMINAR_ROCM_NVNNI_DECODE_SHAPES=Qwen36_FFN_DownProjection",
+            stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_ROCM_NVNNI_DECODE_SHAPES=Qwen36_GDN_OutputProjection",
+            stdout,
+        )
         self.assertIn("cuda_decode_sweep.lane0.csv", stdout)
         self.assertIn("cuda_decode_sweep.lane1.csv", stdout)
-        self.assertIn("rocm_decode_sweep.lane3.csv", stdout)
+        self.assertIn("rocm_decode_sweep.lane1.csv", stdout)
         self.assertEqual(stdout.count("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS="), 2)
-        self.assertEqual(stdout.count("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS="), 4)
+        self.assertEqual(stdout.count("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS="), 2)
 
     def test_gpu_measurement_lane_count_must_be_positive(self) -> None:
         result = self.run_script(
@@ -579,6 +590,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("--development-build-change-audit", stdout)
         self.assertIn("--sealed-build-id", stdout)
         self.assertIn("load_cuda_development_context", stdout)
+        self.assertIn("write_cuda_measurement_context", stdout)
         self.assertIn("cuda_decode_m1_common_observations.reuse-source.csv", stdout)
         self.assertIn("cp --reflink=auto", stdout)
         self.assertIn(
@@ -617,6 +629,240 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             "common-observation replay",
             script,
         )
+        self.assertIn("--finalize-retained-identity", script)
+        self.assertIn(
+            'cuda_profiler_observation_source="${cuda_reuse_common_source}"',
+            script,
+        )
+        profiler_call = (
+            'cuda "${cuda_profiler_observation_source}" "${cuda_sweep_bin}"'
+        )
+        self.assertIn(profiler_call, script)
+        self.assertLess(
+            script.index(profiler_call),
+            script.index(
+                "native_vnni_dispatch.common_observation_migration",
+                script.index(profiler_call),
+            ),
+        )
+
+    def test_rocm_audited_development_reuse_opens_only_fresh_phases(self) -> None:
+        """Retained ROCm M1 timing keeps its identity while the seal is fresh."""
+
+        provenance_header = (
+            "run_id,git_revision,build_id,compiler_id,architecture_class,"
+            "device_name,driver_runtime,serial_m1_policy_hash\n"
+        )
+        provenance_row = (
+            "retained-rocm-development,deadbeef,sha256:retained-build,"
+            "HIP fixture,gfx906,MI50,ROCm fixture,sha256:retained-policy\n"
+        )
+        required = {
+            "rocm_decode_fast.development.csv": "header\nrow\n",
+            "rocm_decode_fast.development.timing.csv": "header\nrow\n",
+            "rocm_decode_fast.development-common.csv": (
+                provenance_header + provenance_row
+            ),
+            "rocm_profiler_requests.json": "{}\n",
+            "rocm_profiler_evidence.json": "{}\n",
+        }
+        result = self.run_script_with_output_files(
+            required,
+            "--backend",
+            "rocm",
+            "--profile",
+            "all",
+            "--reuse-rocm-development",
+            "--rocm-development-build-change-audit",
+            "profiler lifetime guard only; candidate arithmetic unchanged",
+            "--rocm-measurement-lanes",
+            "2",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        self.assertIn(
+            "Reusing authenticated ROCm development generation "
+            "retained-rocm-development",
+            stdout,
+        )
+        self.assertNotIn("rocm_decode_fast-development.lane", stdout)
+        self.assertIn("rocm_decode_fast-sealed.lane", stdout)
+        self.assertIn("rocm_decode_verifier.lane", stdout)
+        self.assertIn(
+            "--development-build-change-audit "
+            "profiler\\ lifetime\\ guard\\ only",
+            stdout,
+        )
+        self.assertIn("--build-id sha256:retained-build", stdout)
+        self.assertIn("--sealed-build-id sha256:dry-run-rocm-build", stdout)
+        self.assertEqual(
+            stdout.count("--development-profiler-observations"),
+            2,
+        )
+        self.assertEqual(stdout.count("--generic-max-leaves 1"), 2)
+        self.assertIn("rocm_profiler_observation_witnesses.csv", stdout)
+        self.assertIn("rocm_decode_fast.development-common.csv", stdout)
+        self.assertIn("rocm_decode_fast_common_observations.csv", stdout)
+        self.assertEqual(
+            stdout.count("native_vnni_dispatch.profiler_collectors"),
+            1,
+        )
+        self.assertIn("rocm_final_profiler_requests.json.seed.inprogress", stdout)
+        self.assertIn("rocm_final_profiler_requests.json", stdout)
+
+        script = SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(
+            script.count("seed_backend_profiler_evidence_for_extension \\\n"),
+            2,
+        )
+
+    def test_rocm_audited_resume_reuses_complete_sealed_aggregate(self) -> None:
+        """A post-seal fit failure must not repay four GPU timing lanes."""
+
+        provenance_header = (
+            "run_id,git_revision,build_id,compiler_id,architecture_class,"
+            "device_name,driver_runtime,serial_m1_policy_hash\n"
+        )
+        provenance_row = (
+            "retained-rocm-development,deadbeef,sha256:retained-build,"
+            "HIP fixture,gfx906,MI50,ROCm fixture,sha256:retained-policy\n"
+        )
+        required = {
+            "rocm_decode_fast.development.csv": "header\nrow\n",
+            "rocm_decode_fast.development.timing.csv": "header\nrow\n",
+            "rocm_decode_fast.sealed.csv": "header\nrow\n",
+            "rocm_decode_fast.sealed.timing.csv": "header\nrow\n",
+            "rocm_decode_fast.development-common.csv": (
+                provenance_header + provenance_row
+            ),
+            "rocm_profiler_requests.json": "{}\n",
+            "rocm_profiler_evidence.json": "{}\n",
+        }
+        result = self.run_script_with_output_files(
+            required,
+            "--backend",
+            "rocm",
+            "--profile",
+            "all",
+            "--reuse-rocm-development",
+            "--rocm-development-build-change-audit",
+            "profiler lifetime guard only; candidate arithmetic unchanged",
+            "--rocm-measurement-lanes",
+            "4",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Reusing existing ROCm Fast sealed aggregate",
+            result.stdout,
+        )
+        self.assertNotIn("rocm_decode_fast-sealed.lane", result.stdout)
+        self.assertIn("rocm_decode_verifier.lane", result.stdout)
+
+    def test_rocm_complete_resume_preserves_all_measurement_provenance(self) -> None:
+        """Fit-only continuation reuses development, sealed, and verifier IDs."""
+
+        provenance_header = (
+            "run_id,git_revision,build_id,compiler_id,architecture_class,"
+            "device_name,driver_runtime,serial_m1_policy_hash\n"
+        )
+        development = (
+            "retained-rocm-development,dev-git,sha256:dev-build,HIP fixture,"
+            "gfx906,MI50,ROCm fixture,sha256:dev-policy\n"
+        )
+        sealed = (
+            "retained-rocm-sealed,seal-git,sha256:seal-build,HIP fixture,"
+            "gfx906,MI50,ROCm fixture,sha256:seal-policy\n"
+        )
+        verifier = (
+            "retained-rocm-verifier,verifier-git,sha256:verifier-build,"
+            "HIP fixture,gfx906,MI50,ROCm fixture,sha256:verifier-policy\n"
+        )
+        required = {
+            "rocm_decode_fast.development.csv": "header\nrow\n",
+            "rocm_decode_fast.development.timing.csv": "header\nrow\n",
+            "rocm_decode_fast.sealed.csv": "header\nrow\n",
+            "rocm_decode_fast.sealed.timing.csv": "header\nrow\n",
+            "rocm_decode_verifier.csv": "header\nrow\n",
+            "rocm_decode_verifier.timing.csv": "header\nrow\n",
+            "rocm_decode_fast.development-common.csv": (
+                provenance_header + development
+            ),
+            "rocm_decode_fast_common_observations.csv": (
+                provenance_header + development + sealed
+            ),
+            "rocm_decode_verifier_common_observations.csv": (
+                provenance_header + verifier
+            ),
+            "rocm_profiler_requests.json": "{}\n",
+            "rocm_profiler_evidence.json": "{}\n",
+        }
+        result = self.run_script_with_output_files(
+            required,
+            "--backend",
+            "rocm",
+            "--profile",
+            "all",
+            "--skip-sweep",
+            "--reuse-rocm-development",
+            "--rocm-development-build-change-audit",
+            "profiler process lifetime only",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        self.assertIn(
+            "Reusing authenticated ROCm sealed and verifier generations "
+            "retained-rocm-sealed / retained-rocm-verifier",
+            stdout,
+        )
+        self.assertNotIn("rocm_decode_fast-development.lane", stdout)
+        self.assertNotIn("rocm_decode_fast-sealed.lane", stdout)
+        self.assertNotIn("rocm_decode_verifier.lane", stdout)
+        self.assertIn("--sealed-build-id sha256:seal-build", stdout)
+        self.assertIn("--run-id retained-rocm-verifier", stdout)
+        self.assertIn("--build-id sha256:verifier-build", stdout)
+        self.assertIn(
+            "--serial-m1-policy-hash sha256:verifier-policy",
+            stdout,
+        )
+
+    def test_rocm_development_reuse_requires_an_audit(self) -> None:
+        """A harness rebuild cannot silently relabel retained ROCm timing."""
+
+        result = self.run_script(
+            "--backend",
+            "rocm",
+            "--profile",
+            "all",
+            "--reuse-rocm-development",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "--reuse-rocm-development requires a non-empty "
+            "--rocm-development-build-change-audit",
+            result.stderr,
+        )
+
+    def test_rocm_generic_leaf_budget_is_validated_before_collection(self) -> None:
+        """An impossible generic-tree budget must fail before GPU work."""
+
+        result = self.run_script(
+            "--backend",
+            "rocm",
+            "--profile",
+            "all",
+            "--rocm-generic-max-leaves",
+            "0",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "--rocm-generic-max-leaves must be in [1, 32]",
+            result.stderr,
+        )
 
     def test_cuda_development_reuse_requires_explicit_audit(self) -> None:
         """Cross-build evidence reuse cannot silently relabel an old corpus."""
@@ -633,6 +879,51 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn(
             "requires a non-empty --cuda-development-build-change-audit",
             result.stderr,
+        )
+
+    def test_cuda_generic_leaf_budget_is_validated_before_collection(self) -> None:
+        """An impossible CUDA generic-tree budget must fail before GPU work."""
+
+        result = self.run_script(
+            "--backend",
+            "cuda",
+            "--profile",
+            "all",
+            "--cuda-generic-max-leaves",
+            "0",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "--cuda-generic-max-leaves must be in [1, 32]",
+            result.stderr,
+        )
+
+    def test_cuda_best_effort_leaf_budget_is_transaction_wide(self) -> None:
+        """Planning, M1 certification, and grouped compile share one budget."""
+
+        result = self.run_script(
+            "--backend",
+            "cuda",
+            "--profile",
+            "all",
+            "--install",
+            "--cuda-generic-max-leaves",
+            "1",
+            "--maximum-p95-regret-percent",
+            "100",
+            "--minimum-passing-domain-percent",
+            "0",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("--max-leaves 1"), 1)
+        self.assertEqual(result.stdout.count("--max-regret 1"), 1)
+        self.assertEqual(result.stdout.count("--generic-max-leaves 1"), 3)
+        self.assertNotIn("policy_fit_cache/cuda_decode", result.stdout)
+        self.assertEqual(
+            result.stdout.count("cuda_paired_refinement/fit-cache"),
+            3,
         )
 
     def test_cuda_paired_resume_never_overwrites_retained_generation(self) -> None:
@@ -657,6 +948,63 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("iteration-000.csv", result.stdout)
         self.assertIn("iteration-001.requests.json", result.stdout)
         self.assertIn("iteration-001.csv", result.stdout)
+
+    def test_cuda_m1_seal_resume_collects_only_grouped_phases(self) -> None:
+        """A completed M1 seal must survive a certification-code interruption."""
+
+        result = self.run_script(
+            "--backend",
+            "cuda",
+            "--profile",
+            "all",
+            "--resume-cuda-after-m1-seal",
+            "--cuda-development-build-change-audit",
+            "parallel certification only; CUDA arithmetic unchanged",
+            "--cuda-generic-max-leaves",
+            "2",
+            "--install",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cuda_decode_m1.sealed.csv", result.stdout)
+        self.assertNotIn("cuda_decode_m1-sealed.lane", result.stdout)
+        self.assertIn(
+            "load_cuda_measurement_context", result.stdout
+        )
+        self.assertIn("cuda_decode_verifier.development.csv", result.stdout)
+        self.assertIn("cuda_decode_verifier.sealed.csv", result.stdout)
+
+    def test_cuda_complete_fit_resume_never_relaunches_timing_sweeps(self) -> None:
+        """Post-collection analyzer repairs must reuse every durable CUDA row."""
+
+        retained_corpus = {
+            "cuda_decode_m1.development.csv": "header\nrow\n",
+            "cuda_decode_m1.development.timing.csv": "header\nrow\n",
+            "cuda_decode_m1.sealed.csv": "header\nrow\n",
+            "cuda_decode_m1.sealed.timing.csv": "header\nrow\n",
+            "cuda_decode_verifier.csv": "header\nrow\n",
+            "cuda_decode_verifier.timing.csv": "header\nrow\n",
+        }
+        result = self.run_script_with_output_files(
+            retained_corpus,
+            "--backend",
+            "cuda",
+            "--profile",
+            "all",
+            "--resume-cuda-after-m1-seal",
+            "--cuda-development-build-change-audit",
+            "adapter-only metadata normalization; CUDA arithmetic unchanged",
+            "--skip-sweep",
+            "--cuda-generic-max-leaves",
+            "2",
+            "--install",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("load_cuda_measurement_context", result.stdout)
+        self.assertIn("--verifier-input", result.stdout)
+        self.assertIn("cuda_decode_verifier.csv", result.stdout)
+        self.assertNotIn("LLAMINAR_CUDA_NVNNI_DECODE_CSV=", result.stdout)
 
     def test_rocm_fit_only_reuses_corpus_without_kernel_or_profiler_launch(self) -> None:
         """ROCm fit replay authenticates sidecars and performs no HIP sweep."""
@@ -771,23 +1119,10 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             certification_call.split("finish_backend_collection_target", 1)[0],
         )
 
-    def test_cpu_prefill_fit_only_authenticates_without_measurement(self) -> None:
-        """CPU GEMM fit replay consumes sealed timing and profiler evidence only."""
+    def test_cpu_prefill_fit_only_cannot_install_generated_policy(self) -> None:
+        """Offline prefill evidence must never become a production artifact."""
 
-        required = {
-            "cpu_prefill_sweep.development-v8.csv": "header\nrow\n",
-            "cpu_prefill_sweep.development-v8.timing.csv": "header\nrow\n",
-            "cpu_prefill_sweep.sealed-v8.csv": "header\nrow\n",
-            "cpu_prefill_sweep.sealed-v8.timing.csv": "header\nrow\n",
-            "cpu_prefill_common_observations.v8.csv": CPU_PREFILL_CHECKPOINT,
-            "cpu_prefill_profiler_source_observations.csv": "header\nrow\n",
-            "cpu_prefill_profiler_requests.json": "{}\n",
-            "cpu_prefill_profiler_evidence.json": "{}\n",
-            "cpu_prefill_final_profiler_requests.json": "{}\n",
-            "cpu_prefill_final_profiler_evidence.json": "{}\n",
-        }
-        result = self.run_script_with_output_files(
-            required,
+        result = self.run_script(
             "--backend",
             "cpu-prefill",
             "--profile",
@@ -797,17 +1132,12 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             "--install",
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertGreaterEqual(result.stdout.count("compact-witnesses"), 2)
-        self.assertGreaterEqual(result.stdout.count("export-features"), 2)
-        self.assertIn("analyze_cpu_native_vnni_prefill_trainer.py", result.stdout)
+        self.assertEqual(result.returncode, 2)
         self.assertIn(
-            "cpu_prefill_profiler_observation_witnesses.csv",
-            result.stdout,
+            "ordinary prefill is heuristic-only; cpu-prefill cannot install",
+            result.stderr,
         )
-        self.assertIn("--adapted-full-development-input", result.stdout)
-        self.assertNotIn("native_vnni_dispatch.profiler_collectors", result.stdout)
-        self.assertNotIn("LLAMINAR_CPU_NVNNI_PREFILL_STRONG_CSV=", result.stdout)
+        self.assertNotIn("analyze_cpu_native_vnni_prefill_trainer.py", result.stdout)
 
     def test_dispatch_validator_decodes_cpu_prefill_packed_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1036,6 +1366,12 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
 
         script = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("count-uncovered-requests", script)
+        self.assertIn(
+            "python3 -m native_vnni_dispatch.profiler_checkpoint",
+            script,
+        )
+        self.assertIn('local partial_journal="${partial_evidence}.inprogress.jsonl"', script)
+        self.assertIn('--covered-requests "${covered_request}"', script)
         self.assertIn('delta_request_candidates=("${request_prefix}".delta-*', script)
         self.assertIn(
             '-s "${active_evidence_manifest}.inprogress.jsonl"',
@@ -1064,7 +1400,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             '-s "${active_evidence_manifest}.inprogress.jsonl"', script
         )
         self.assertIn(
-            "native-vnni-profiler-request-v4-exact-point", script
+            "native-vnni-profiler-request-v5-stratified-exact-point", script
         )
         self.assertIn("cuda_exact_profiler_transaction=1", script)
         self.assertIn(
@@ -1091,7 +1427,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("CUDANativeVNNIGemvDispatchHeuristicGenerated.inc", result.stdout)
         self.assertIn("ROCmNativeVNNIDecodeDispatchGenerated.inc", result.stdout)
         self.assertIn("CPUNativeVNNIVerifierRowsPolicyGenerated.inc", result.stdout)
-        self.assertIn("CPUNativeVNNIPrefillPolicyGenerated.inc", result.stdout)
+        self.assertNotIn("CPUNativeVNNIPrefillPolicyGenerated.inc", result.stdout)
         self.assertIn("src/v2/kernels/cuda/gemm", result.stdout)
         self.assertIn("src/v2/kernels/rocm/gemm", result.stdout)
         self.assertIn("src/v2/kernels/cpu/native_vnni", result.stdout)
@@ -1110,25 +1446,25 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         )
         self.assertEqual(
             result.stdout.count("native_vnni_dispatch.profiler_collectors"),
-            8,
+            6,
         )
         self.assertEqual(
             result.stdout.count(
                 "native_vnni_dispatch.profiler_evidence export-features"
             ),
-            8,
+            6,
         )
         self.assertEqual(
             result.stdout.count(
                 "native_vnni_dispatch.profiler_evidence emit-requests"
             ),
-            8,
+            6,
         )
         self.assertEqual(
             result.stdout.count(
                 "native_vnni_dispatch.profiler_evidence compact-witnesses"
             ),
-            8,
+            6,
         )
         self.assertIn("--backend cuda", result.stdout)
         self.assertIn("--backend rocm", result.stdout)
@@ -1256,10 +1592,8 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_M=1,2", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_M=1,2", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_M=2", stdout)
-        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_M=512", stdout)
-        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_M=128", stdout)
-        self.assertIn("PREFILL_SHAPE_NAME=7B_FFN_Up", stdout)
-        self.assertIn("PREFILL_SHAPE_NAME=14B_FFN_Up", stdout)
+        self.assertNotIn("LLAMINAR_CPU_NVNNI_PREFILL_M=", stdout)
+        self.assertNotIn("PREFILL_SHAPE_NAME=", stdout)
         self.assertIn("combine-csv", stdout)
         self.assertIn("cuda_decode_sweep.Q4_0.csv", stdout)
         self.assertIn("cuda_decode_sweep.IQ4_XS.csv", stdout)
@@ -2173,7 +2507,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
-        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_M=64", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_M=32", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_SHAPE_NAME=7B_FFN_Up", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_SHAPE_NAME=0.5B_AttnOut", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_MIN_ITERS=5", stdout)
@@ -2217,11 +2551,11 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
         self.assertIn(
-            "LLAMINAR_CPU_NVNNI_PREFILL_M=64,128,256,512",
+            "LLAMINAR_CPU_NVNNI_PREFILL_M=32,64",
             stdout,
         )
-        self.assertNotIn("LLAMINAR_CPU_NVNNI_PREFILL_M=64,256,1024", stdout)
-        self.assertNotIn(",4096", stdout)
+        self.assertNotIn("LLAMINAR_CPU_NVNNI_PREFILL_M=64,128,256,512", stdout)
+        self.assertNotIn(",256", stdout)
         self.assertIn("avx2-build.avx2-runtime", stdout)
         self.assertIn("avx512-build.avx2-runtime", stdout)
         self.assertIn("TrainerCsv_PrefillSerialRouteManifest", stdout)
@@ -2949,7 +3283,10 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("cannot install an uncertified policy", result.stderr)
+        self.assertIn(
+            "ordinary prefill is heuristic-only; cpu-prefill cannot install",
+            result.stderr,
+        )
 
     def test_cpu_prefill_profiler_ablation_is_diagnostic_only(self) -> None:
         """The timing-only A/B half cannot enter a production freeze."""
@@ -3218,7 +3555,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         )
         self.assertEqual(validated.returncode, 0, validated.stderr)
 
-    def test_cpu_generated_prefill_policy_is_checked_in_and_consumed(self) -> None:
+    def test_production_prefill_is_heuristic_only_on_every_backend(self) -> None:
         source_path = (
             REPO_ROOT
             / "src"
@@ -3228,50 +3565,57 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             / "native_vnni"
             / "CPUNativeVNNIGemv.h"
         )
-        generated_path = source_path.parent / "CPUNativeVNNIPrefillPolicyGenerated.inc"
-
-        self.assertTrue(generated_path.is_file(), "CPU prefill generated policy include is missing")
         source = source_path.read_text(encoding="utf-8")
-        generated_source = generated_path.read_text(encoding="utf-8")
+        cuda_kernel_path = (
+            REPO_ROOT
+            / "src"
+            / "v2"
+            / "kernels"
+            / "cuda"
+            / "gemm"
+            / "CUDANativeVNNIPrefillKernels.cu"
+        )
+        cuda_workspace_path = cuda_kernel_path.parent / "CUDAQuantisedGemmKernel.cpp"
+        rocm_kernel_path = (
+            REPO_ROOT
+            / "src"
+            / "v2"
+            / "kernels"
+            / "rocm"
+            / "gemm"
+            / "ROCmQuantisedGemmKernel_native_VNNI.hip"
+        )
+        cuda_source = cuda_kernel_path.read_text(encoding="utf-8")
+        cuda_workspace_source = cuda_workspace_path.read_text(encoding="utf-8")
+        rocm_source = rocm_kernel_path.read_text(encoding="utf-8")
 
-        self.assertIn("CPUNativeVNNIPrefillPolicyGenerated.inc", source)
-        self.assertIn("selectCPUNativeVNNIPrefillGeneratedPolicy", source)
-        self.assertIn("selectPrefillPolicy(", source)
-        self.assertIn("No certified CPU NativeVNNI prefill policy", source)
-        self.assertIn("verifier_policy_override == VerifierRowsPolicy::Auto", source)
+        retired_paths = (
+            source_path.parent / "CPUNativeVNNIPrefillPolicyGenerated.inc",
+            cuda_kernel_path.parent / "CUDANativeVNNIPrefillDispatchGenerated.inc",
+            rocm_kernel_path.parent / "ROCmNativeVNNIPrefillDispatchGenerated.inc",
+        )
+        for retired_path in retired_paths:
+            self.assertFalse(
+                retired_path.exists(),
+                f"ordinary prefill must not consume generated policy {retired_path}",
+            )
+
+        self.assertNotIn("CPUNativeVNNIPrefillPolicyGenerated.inc", source)
+        self.assertNotIn("selectCPUNativeVNNIPrefillGeneratedPolicy", source)
+        self.assertNotIn("selectPrefillPolicy(", source)
+        self.assertNotIn("No certified CPU NativeVNNI prefill policy", source)
+        self.assertIn("switch (schedule_override)", source)
         self.assertIn("serial_cfg.k_tiles > 1", source)
-        selector_start = source.index(
-            "inline generated::CPUNativeVNNIPrefillPolicy selectPrefillPolicy("
-        )
-        selector_end = source.index(
-            "// =========================================================================",
-            selector_start,
-        )
-        selector_source = source[selector_start:selector_end]
-        self.assertNotIn("computeTileConfig", selector_source)
-        self.assertNotIn("catch", selector_source)
-        self.assertNotIn("return generated::CPUNativeVNNIPrefillPolicy::", selector_source)
+        self.assertIn("VerifierRowsPolicy::Pairwise", source)
 
-        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_POLICY_ABI 2", generated_source)
-        self.assertIn("TwoRowPairGridNbc1", generated_source)
-        self.assertIn("TwoRowPairGridNbc16", generated_source)
-        self.assertIn("enum class CPUNativeVNNIPrefillBuildISA", generated_source)
-        self.assertIn("enum class CPUNativeVNNIPrefillRuntimeISA", generated_source)
-        self.assertIn("if (serial_kpart && m < 3)", generated_source)
-        self.assertIn("CPUNativeVNNIPrefillPolicy::KPartPairwise", generated_source)
-        self.assertIn("CPUNativeVNNIPrefillPolicy::KPartWideRows", generated_source)
-        self.assertIn("if (serial_kpart != true)", generated_source)
-        self.assertIn("threads == 28", generated_source)
+        self.assertNotIn("CUDANativeVNNIPrefillDispatchGenerated.inc", cuda_source)
+        self.assertNotIn("selectPrefillTileGenerated", cuda_source)
+        self.assertNotIn("CUDANativeVNNIPrefillDispatchGenerated.inc", cuda_workspace_source)
+        self.assertIn("choosePrefillTile(M, N, K, prefill_ctx, complexity)", cuda_source)
 
-        validated = subprocess.run(
-            ["python3", str(VALIDATOR), str(generated_path)],
-            cwd=REPO_ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        self.assertEqual(validated.returncode, 0, validated.stderr)
+        self.assertNotIn("ROCmNativeVNNIPrefillDispatchGenerated.inc", rocm_source)
+        self.assertNotIn("selectROCmNativeVNNIPrefillGenerated", rocm_source)
+        self.assertIn("PATTERN S OPTIMIZED DISPATCH", rocm_source)
 
     def test_strong_gpu_trainers_own_the_complete_runtime_m_envelope(self) -> None:
         cuda_trainer = (

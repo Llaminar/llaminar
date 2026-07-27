@@ -228,8 +228,21 @@ namespace llaminar2
          * weights and is therefore not the bounded-memory GPU loading path.
          *
          * Must be called BEFORE loadModel().
-         */
+        */
         void setUseMmap(bool use_mmap) { use_mmap_ = use_mmap; }
+
+        /**
+         * @brief Report whether this loader uses file-backed mapped tensors.
+         *
+         * Model loading policy is applied before the GGUF is opened. Consumers
+         * that size transient host-memory requirements must query the effective
+         * loader state instead of carrying a second copy of the configuration:
+         * a GPU mmap load can stream through the bounded pinned staging ring,
+         * while the non-mmap path materializes ordinary host allocations.
+         *
+         * @return true when tensor payloads are backed by the model-file mmap.
+         */
+        [[nodiscard]] bool usesMmap() const noexcept { return use_mmap_; }
 
         /**
          * @brief Skip page cache eviction during NUMA mmap

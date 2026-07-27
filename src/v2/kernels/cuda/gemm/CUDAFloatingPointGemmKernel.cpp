@@ -623,10 +623,17 @@ namespace llaminar2
                 LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Null input or empty projections");
                 return false;
             }
+            /*
+             * FP16/BF16 weights use the fixed-order grouped projection kernel
+             * for ordinary prefill as well as verifier rows. This is the
+             * production batch-invariant implementation, not a serial replay:
+             * one launch evaluates the projection group with an M-independent
+             * reduction order.
+             */
             if (precision_ != Precision::FP32)
             {
-                LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Only FP32 projection groups are supported");
-                return false;
+                return multiply_fused_verifier_rows_decode_equivalent(
+                    input, projections, m, k, nullptr, workspace);
             }
             if (input->native_type() != TensorType::FP32)
             {

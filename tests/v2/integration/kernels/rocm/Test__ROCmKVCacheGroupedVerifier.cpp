@@ -175,6 +175,33 @@ namespace
         return hipMemcpy(destination, source, bytes, hipMemcpyDeviceToHost) == hipSuccess;
     }
 
+    /** @brief Allocate a HIP assertion buffer outside production cache code. */
+    void *allocateDeviceBytes(size_t bytes)
+    {
+        void *pointer = nullptr;
+        return hipMalloc(&pointer, bytes) == hipSuccess ? pointer : nullptr;
+    }
+
+    /** @brief Release a HIP assertion buffer after the matrix cell completes. */
+    void releaseDeviceBytes(void *pointer)
+    {
+        if (pointer)
+            (void)hipFree(pointer);
+    }
+
+    /** @brief Enqueue the suite's final device-to-host observation copy. */
+    bool copyDeviceBytesAsync(
+        void *destination,
+        const void *source,
+        size_t bytes,
+        void *opaque_stream)
+    {
+        return opaque_stream &&
+               hipMemcpyAsync(
+                   destination, source, bytes, hipMemcpyDeviceToHost,
+                   static_cast<hipStream_t>(opaque_stream)) == hipSuccess;
+    }
+
     bool synchronizeStream(void *opaque_stream)
     {
         return opaque_stream &&
@@ -214,4 +241,28 @@ TEST(Test__ROCmKVCacheGroupedVerifier,
     runAllFormatConvertedDeviceReadSweep(
         DeviceId::rocm(0), "ROCm", stream.opaque(),
         readConvertedBatch, copyDeviceBytes, synchronizeStream);
+}
+
+TEST(Test__ROCmKVCacheGroupedVerifier,
+     AllNativeFormatsDeviceLogicalBlockHarvestRestoreAreByteExact)
+{
+    int device_count = 0;
+    if (hipGetDeviceCount(&device_count) != hipSuccess || device_count < 1)
+        GTEST_SKIP() << "ROCm device unavailable";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    ScopedHipStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    runAllFormatDeviceLogicalBlockSweep(
+        DeviceId::rocm(0),
+        "ROCm",
+        "rocm_device_logical_kv_exports",
+        "rocm_device_logical_kv_imports",
+        "rocm_device_logical_tq_kv_exports",
+        "rocm_device_logical_tq_kv_imports",
+        stream.opaque(),
+        allocateDeviceBytes,
+        releaseDeviceBytes,
+        copyDeviceBytesAsync,
+        synchronizeStream);
 }

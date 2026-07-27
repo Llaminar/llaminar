@@ -97,6 +97,58 @@ namespace llaminar2
         std::vector<PrefixKVLayerProbe> layers;
     };
 
+    /**
+     * @brief Explicitly selects expensive payloads included in a state probe.
+     *
+     * Ordinary request summaries need inventory and logical-position metadata,
+     * but they must not copy complete GPU state to the host.  Deep parity and
+     * failed-mirror diagnostics need a different contract: they select the
+     * exact byte ranges that make persistent-state divergence localizable.
+     *
+     * Keeping this policy as a typed value prevents diagnostics from mutating
+     * process-wide environment variables in the middle of inference.  The
+     * legacy environment-controlled entry points remain available through
+     * @ref fromEnvironment for command-line diagnostics and existing tests.
+     */
+    struct PrefixProbeCapturePolicy
+    {
+        /// Hash every logical K/V token currently retained by each FA layer.
+        bool hash_full_kv_payloads = false;
+
+        /// Hash the established leading/trailing split used by prefix tests.
+        bool hash_default_kv_segments = false;
+
+        /// Number of leading tokens in the established split.
+        int default_kv_segment_split_tokens = 4;
+
+        /// Additional fixed logical ranges to export and hash.
+        std::vector<PrefixKVSegmentProbe> requested_kv_segments;
+
+        /**
+         * @brief Hash only the newest N logical K/V tokens.
+         *
+         * Failed grouped-verifier diagnostics use this bounded export.  The
+         * newest speculative rows reveal the first bad full-attention layer
+         * without copying a multi-thousand-token cache merely to report an
+         * already-failed transaction.
+         */
+        int trailing_kv_tokens = 0;
+
+        /// Export and hash every GPU-resident local/full GDN state bank.
+        bool hash_gdn_device_state = false;
+
+        /// Retain raw CPU-owned GDN values for tolerance-aware diagnostics.
+        bool capture_gdn_values = false;
+
+        /**
+         * @brief Build the compatibility policy selected by diagnostic env vars.
+         *
+         * @return Capture policy corresponding to the existing
+         *         `LLAMINAR_PREFIX_PROBE_*` controls.
+         */
+        static PrefixProbeCapturePolicy fromEnvironment();
+    };
+
     struct PrefixGDNLayerProbe
     {
         int global_layer = 0;
@@ -104,11 +156,22 @@ namespace llaminar2
         size_t conv_values = 0;
         uint64_t recurrence_hash = 0;
         uint64_t conv_hash = 0;
+
+        /**
+         * @brief Full replicated decode-bank hashes.
+         *
+         * LocalTP GPU caches serialize participant-local and full replicated
+         * banks independently.  These fields always describe the full bank
+         * selected by decode/grouped-verifier execution, never a byte range
+         * spanning two adjacent serialized banks.
+         */
         bool device_state_hash_available = false;
         size_t recurrence_device_bytes = 0;
         size_t conv_device_bytes = 0;
         uint64_t recurrence_device_hash = 0;
         uint64_t conv_device_hash = 0;
+
+        /// Participant-local prefill-bank hashes from the same device export.
         bool local_device_state_hash_available = false;
         size_t recurrence_local_device_bytes = 0;
         size_t conv_local_device_bytes = 0;
@@ -192,6 +255,12 @@ namespace llaminar2
         uint64_t prefix_cache_inserts = 0;
         uint64_t prefix_cache_evictions = 0;
         uint64_t prefix_cache_promotions = 0;
+        uint64_t prefix_cache_ram_to_disk_demotions = 0;
+        uint64_t prefix_cache_device_hot_promotions = 0;
+        uint64_t prefix_cache_device_hot_repromotions = 0;
+        uint64_t prefix_cache_device_hot_evictions = 0;
+        uint64_t prefix_cache_disk_evictions = 0;
+        uint64_t prefix_cache_device_hot_direct_hits = 0;
         uint64_t prefix_cache_disk_hydrations = 0;
         uint64_t prefix_cache_terminal_state_hits = 0;
         uint64_t prefix_cache_ram_bytes = 0;
@@ -256,9 +325,41 @@ namespace llaminar2
         int sequence_count = 1,
         void *stream = nullptr);
 
+    /**
+     * @brief Inspect KV state using an invocation-scoped capture policy.
+     *
+     * @param cache Cache whose device-owned logical state is observed.
+     * @param owner Stable diagnostic owner name.
+     * @param device Device that owns @p cache.
+     * @param sequence_count Number of sequence slots to inspect.
+     * @param stream Explicit producer-ordered stream for GPU exports.
+     * @param capture_policy Exact expensive payloads to export.
+     * @return Value-owned cache inventory and selected byte hashes.
+     */
+    PrefixKVCacheProbe inspectKVCacheForPrefixProbe(
+        const IKVCache &cache,
+        std::string owner,
+        DeviceId device,
+        int sequence_count,
+        void *stream,
+        const PrefixProbeCapturePolicy &capture_policy);
+
     std::vector<PrefixGDNLayerProbe> inspectHybridGDNForPrefixProbe(
         const IKVCache &cache,
         void *stream = nullptr);
+
+    /**
+     * @brief Inspect hybrid recurrent state using an explicit capture policy.
+     *
+     * @param cache Hybrid cache whose kernel-owned banks are observed.
+     * @param stream Explicit producer-ordered stream for GPU exports.
+     * @param capture_policy Exact expensive payloads to export.
+     * @return Per-layer host/local-device/full-device state hashes.
+     */
+    std::vector<PrefixGDNLayerProbe> inspectHybridGDNForPrefixProbe(
+        const IKVCache &cache,
+        void *stream,
+        const PrefixProbeCapturePolicy &capture_policy);
 
     uint64_t hashFloatBufferForPrefixProbe(const float *values, size_t count);
     uint64_t hashByteBufferForPrefixProbe(const void *values, size_t bytes);

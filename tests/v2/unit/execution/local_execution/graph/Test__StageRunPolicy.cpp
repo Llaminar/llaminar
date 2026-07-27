@@ -24,6 +24,8 @@
 #include "memory/StageBufferContract.h"
 #include "mocks/MockComputeStage.h"
 #include "mocks/MockCollectiveContext.h"
+#include "mocks/MockWorkerGPUContext.h"
+#include "transfer/TransferEngine.h"
 
 using namespace llaminar2;
 using namespace llaminar2::testing;
@@ -37,17 +39,33 @@ namespace
         explicit CountingFP32Tensor(const std::vector<size_t> &shape)
             : FP32Tensor(shape, DeviceId::cpu()) {}
 
+        ~CountingFP32Tensor() override
+        {
+            /*
+             * The fake device pointer is an opaque unit-test token, never a
+             * backend allocation. Retire it before TensorBase destruction so
+             * the test cannot accidentally call a physical CUDA free.
+             */
+            gpu_data_ptr_ = nullptr;
+            gpu_device_.reset();
+        }
+
         bool ensureOnDevice(DeviceId target_device, void *stream = nullptr) override
         {
             (void)stream;
             ++ensure_on_device_calls;
             last_ensure_device = target_device;
-            transitionTo(TensorCoherenceState::SYNCED);
+            gpu_data_ptr_ = &fake_device_storage_;
+            gpu_device_ = target_device;
+            TransferEngine::publishSynchronized(this);
             return true;
         }
 
         int ensure_on_device_calls = 0;
         DeviceId last_ensure_device;
+
+    private:
+        int fake_device_storage_ = 0;
     };
 }
 
@@ -133,6 +151,13 @@ protected:
     {
         GraphExecutorConfig config;
         config.enable_profiling = true;
+        config.worker_gpu_context_resolver =
+            [](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu()
+                       ? &llaminar2::testing::sharedMockWorkerGPUContext()
+                       : nullptr;
+        };
         executor_ = std::make_unique<DeviceGraphExecutor>(config);
         cpu_ctx_ = std::make_unique<CPUDeviceContext>(DeviceId::cpu());
     }

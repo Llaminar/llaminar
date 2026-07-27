@@ -491,10 +491,10 @@ namespace llaminar2::test
         }
 
         ASSERT_TRUE(table.prepareInactiveBank(0, static_update));
-        EXPECT_EQ(table.hostLayerState(0).banks[1].reserved[0], 0u)
+        EXPECT_EQ(table.hostLayerState(0).banks[1].multi_resident_expert_count, 0u)
             << "Static apportioned placement must not enable hot-cache router-stat work.";
         ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
-        EXPECT_EQ(table.hostLayerState(0).banks[table.hostLayerState(0).active_bank].reserved[0], 0u);
+        EXPECT_EQ(table.hostLayerState(0).banks[table.hostLayerState(0).active_bank].multi_resident_expert_count, 0u);
 
         auto hot_update = static_update;
         hot_update.epoch = 2;
@@ -511,10 +511,10 @@ namespace llaminar2::test
         };
 
         ASSERT_TRUE(table.prepareInactiveBank(0, hot_update));
-        EXPECT_EQ(table.hostLayerState(0).banks[0].reserved[0], 2u)
+        EXPECT_EQ(table.hostLayerState(0).banks[0].multi_resident_expert_count, 2u)
             << "Only multi-resident experts should enable hot-cache router-stat accounting.";
         ASSERT_TRUE(table.flipActiveBank(0, 2, nullptr));
-        EXPECT_EQ(table.hostLayerState(0).banks[table.hostLayerState(0).active_bank].reserved[0], 2u);
+        EXPECT_EQ(table.hostLayerState(0).banks[table.hostLayerState(0).active_bank].multi_resident_expert_count, 2u);
     }
 
     TEST(Test__MoERuntimeTable, FlipActiveBankAdvancesEpochWithoutChangingLayerPointer)
@@ -742,7 +742,67 @@ namespace llaminar2::test
         EXPECT_EQ(restored->reserved_u64[3], 0u);
     }
 
-    TEST(Test__MoERuntimeTable, PortableRuntimeStateRestoresLogicalPlacementViaLiveDescriptors)
+    TEST(Test__MoERuntimeTable, ResetDecodeRuntimeStatePreservesEveryGraphOwnedScratchBinding)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        ASSERT_TRUE(table.prepareInactiveBank(0, updateForEpoch(1, 4)));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        auto &before = table.hostLayerState(0);
+        before.route_expert_ids = reinterpret_cast<int32_t *>(0x1000u);
+        before.route_weights = reinterpret_cast<float *>(0x2000u);
+        before.route_participant_ids = reinterpret_cast<int32_t *>(0x3000u);
+        before.expert_counts = reinterpret_cast<int32_t *>(0x4000u);
+        before.expert_offsets = reinterpret_cast<int32_t *>(0x5000u);
+        before.grouped_token_ids = reinterpret_cast<int32_t *>(0x6000u);
+        before.grouped_route_weights = reinterpret_cast<float *>(0x7000u);
+        before.grouped_gate_scratch = reinterpret_cast<float *>(0x8000u);
+        before.grouped_up_scratch = reinterpret_cast<float *>(0x9000u);
+        before.grouped_output_partials = reinterpret_cast<float *>(0xA000u);
+        before.decode_scratch = reinterpret_cast<void *>(0xB000u);
+        before.reserved_ptrs[0] = reinterpret_cast<void *>(0xC000u);
+        before.reserved_ptrs[1] = reinterpret_cast<void *>(0xD000u);
+        before.reserved_ptrs[2] = reinterpret_cast<void *>(0xE000u);
+        before.reserved_u64[0] = 96u;
+        before.reserved_u64[1] = 96u;
+        before.reserved_u64[2] = 17u;
+        before.reserved_u64[3] = 19u;
+        before.prefill_token_capacity = 48u;
+        before.prefill_route_capacity = 96u;
+        before.decode_histogram[2] = 23u;
+        before.decode_local_histogram[2] = 11u;
+        before.router_hot_cache_used_dispatches = 7u;
+
+        table.resetDecodeRuntimeState();
+
+        const auto &after = table.hostLayerState(0);
+        EXPECT_EQ(after.active_epoch, 0u);
+        EXPECT_EQ(after.route_expert_ids, reinterpret_cast<int32_t *>(0x1000u));
+        EXPECT_EQ(after.route_weights, reinterpret_cast<float *>(0x2000u));
+        EXPECT_EQ(after.route_participant_ids, reinterpret_cast<int32_t *>(0x3000u));
+        EXPECT_EQ(after.expert_counts, reinterpret_cast<int32_t *>(0x4000u));
+        EXPECT_EQ(after.expert_offsets, reinterpret_cast<int32_t *>(0x5000u));
+        EXPECT_EQ(after.grouped_token_ids, reinterpret_cast<int32_t *>(0x6000u));
+        EXPECT_EQ(after.grouped_route_weights, reinterpret_cast<float *>(0x7000u));
+        EXPECT_EQ(after.grouped_gate_scratch, reinterpret_cast<float *>(0x8000u));
+        EXPECT_EQ(after.grouped_up_scratch, reinterpret_cast<float *>(0x9000u));
+        EXPECT_EQ(after.grouped_output_partials, reinterpret_cast<float *>(0xA000u));
+        EXPECT_EQ(after.decode_scratch, reinterpret_cast<void *>(0xB000u));
+        EXPECT_EQ(after.reserved_ptrs[0], reinterpret_cast<void *>(0xC000u));
+        EXPECT_EQ(after.reserved_ptrs[1], reinterpret_cast<void *>(0xD000u));
+        EXPECT_EQ(after.reserved_ptrs[2], reinterpret_cast<void *>(0xE000u));
+        EXPECT_EQ(after.reserved_u64[0], 96u);
+        EXPECT_EQ(after.reserved_u64[1], 96u);
+        EXPECT_EQ(after.prefill_token_capacity, 48u);
+        EXPECT_EQ(after.prefill_route_capacity, 96u);
+        EXPECT_EQ(after.reserved_u64[2], 0u);
+        EXPECT_EQ(after.reserved_u64[3], 0u);
+        EXPECT_EQ(after.decode_histogram[2], 0u);
+        EXPECT_EQ(after.decode_local_histogram[2], 0u);
+        EXPECT_EQ(after.router_hot_cache_used_dispatches, 0u);
+    }
+
+    TEST(Test__MoERuntimeTable, PortableRuntimeStatePreservesTransientLogicalPlacementWithoutPointers)
     {
         MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
 
@@ -802,41 +862,171 @@ namespace llaminar2::test
         std::vector<DeviceMoEPortableLayerRuntimeState> snapshot;
         ASSERT_TRUE(table.capturePortableRuntimeState(snapshot));
         ASSERT_EQ(snapshot.size(), 1u);
+        EXPECT_EQ(snapshot[0].requires_device_payload_rehydration, 1u);
         EXPECT_EQ(snapshot[0].experts[2].local_compute, 1u);
+        EXPECT_EQ(snapshot[0].experts[2].local_slot, 2);
+        EXPECT_EQ(snapshot[0].experts[2].replica_role,
+                  static_cast<uint8_t>(DeviceMoEReplicaRole::Replica));
+        EXPECT_EQ(snapshot[0].experts[2].resident_participant_mask, 0b11u);
         EXPECT_FALSE(hasMoEExpertFlag(snapshot[0].experts[2].flags,
                                       DeviceMoEExpertFlags::TransferSlot))
-            << "The portable blob must not serialize runtime-local transfer-slot identity.";
+            << "Portable placement must never serialize a rolling payload pointer.";
+        EXPECT_EQ(snapshot[0].selected_histogram[2], 17u);
+        EXPECT_EQ(snapshot[0].local_histogram[2], 9u)
+            << "Exact logical placement must retain request-owned routing evidence.";
 
-        ASSERT_TRUE(table.prepareInactiveBank(0, masked_update(3, {1u, 0u, 0u, 1u})));
-        ASSERT_TRUE(table.flipActiveBank(0, 3, nullptr));
-        ASSERT_EQ(table.hostLayerState(0).banks[table.hostLayerState(0).active_bank].local_compute_mask[2], 0u);
+        EXPECT_FALSE(table.restorePortableRuntimeState(snapshot))
+            << "CPU unit tests must not emulate the captured GPU payload-rehydration transaction.";
+    }
 
-        ASSERT_TRUE(table.restorePortableRuntimeState(snapshot));
+    /**
+     * @brief Prove portable placement cannot diverge by participant-local slot ownership.
+     *
+     * A real LLEP replica is globally visible through the resident participant
+     * mask, but its rolling transfer-slot descriptor exists only on the
+     * destination participant. Prefix capture must consequently preserve its
+     * logical placement from a domain-wide invariant, not from the local
+     * TransferSlot flag. This regression models both participants after the
+     * same participant-1 to participant-0 replication wave and requires both
+     * cache blobs to publish the same exact residency plus the same rehydration
+     * requirement.
+     */
+    TEST(Test__MoERuntimeTable, PortableRuntimeStatePreservesRemoteReplicaOnEveryParticipant)
+    {
+        auto placement_for_participant =
+            [](uint32_t epoch,
+               uint32_t participant,
+               bool include_transient_replica)
+        {
+            MoEPlacementUpdate update;
+            update.epoch = epoch;
+            update.expert_count = 4;
+            update.participant_id = participant;
+            update.participant_count = 2;
+            update.experts.resize(4);
+            update.local_compute_mask.assign(4, 0u);
+            update.replica_role.assign(
+                4,
+                static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+            update.resident_participant_mask.assign(4, 0u);
 
-        const auto &restored = table.hostLayerState(0);
-        ASSERT_EQ(restored.active_epoch, 4u);
-        const auto &bank = restored.banks[restored.active_bank];
-        EXPECT_EQ(bank.local_compute_mask[0], 1u);
-        EXPECT_EQ(bank.local_compute_mask[1], 1u);
-        EXPECT_EQ(bank.local_compute_mask[2], 1u);
-        EXPECT_EQ(bank.local_compute_mask[3], 0u);
-        EXPECT_EQ(bank.replica_role[2],
-                  static_cast<uint8_t>(DeviceMoEReplicaRole::Replica));
-        EXPECT_EQ(bank.resident_participant_mask[2], 0b11u);
-        EXPECT_TRUE(hasMoEExpertFlag(bank.experts[2].flags,
-                                     DeviceMoEExpertFlags::TransferSlot))
-            << "Restore should resolve the portable local-compute claim back to the live transfer-slot descriptor.";
-        EXPECT_EQ(bank.experts[2].gate.payload,
-                  expertDesc(2,
-                             1,
-                             2,
-                             DeviceMoEExpertFlags::Valid |
-                                 DeviceMoEExpertFlags::Resident |
-                                 DeviceMoEExpertFlags::LocalCompute |
-                                 DeviceMoEExpertFlags::TransferSlot)
-                      .gate.payload);
-        EXPECT_EQ(restored.decode_histogram[2], 17u);
-        EXPECT_EQ(restored.decode_local_histogram[2], 9u);
+            for (int expert = 0; expert < 4; ++expert)
+            {
+                const int owner = expert / 2;
+                const bool owner_local =
+                    owner == static_cast<int>(participant);
+                update.resident_participant_mask[static_cast<size_t>(expert)] =
+                    1u << static_cast<uint32_t>(owner);
+                if (!owner_local)
+                {
+                    update.experts[static_cast<size_t>(expert)] =
+                        expertOwnerOnlyDesc(expert, owner);
+                    continue;
+                }
+
+                update.experts[static_cast<size_t>(expert)] =
+                    expertDesc(expert, owner, expert);
+                update.local_compute_mask[static_cast<size_t>(expert)] = 1u;
+                update.replica_role[static_cast<size_t>(expert)] =
+                    static_cast<uint8_t>(DeviceMoEReplicaRole::Primary);
+            }
+
+            if (include_transient_replica)
+            {
+                update.transient_placement_observed = true;
+                update.resident_participant_mask[2] = 0b11u;
+                if (participant == 0u)
+                {
+                    update.experts[2] =
+                        expertDesc(
+                            2,
+                            /*owner=*/1,
+                            /*local_slot=*/2,
+                            DeviceMoEExpertFlags::Valid |
+                                DeviceMoEExpertFlags::Resident |
+                                DeviceMoEExpertFlags::LocalCompute |
+                                DeviceMoEExpertFlags::TransferSlot);
+                    update.local_compute_mask[2] = 1u;
+                    update.replica_role[2] =
+                        static_cast<uint8_t>(DeviceMoEReplicaRole::Replica);
+                }
+            }
+            return update;
+        };
+
+        MoERuntimeTable destination(DeviceId::cpu(), 1, 4, 2);
+        MoERuntimeTable source(DeviceId::cpu(), 1, 4, 2);
+
+        ASSERT_TRUE(destination.prepareInactiveBank(
+            0,
+            placement_for_participant(
+                /*epoch=*/1,
+                /*participant=*/0,
+                /*include_transient_replica=*/false)));
+        ASSERT_TRUE(destination.flipActiveBank(0, 1, nullptr));
+        ASSERT_TRUE(source.prepareInactiveBank(
+            0,
+            placement_for_participant(
+                /*epoch=*/1,
+                /*participant=*/1,
+                /*include_transient_replica=*/false)));
+        ASSERT_TRUE(source.flipActiveBank(0, 1, nullptr));
+
+        ASSERT_TRUE(destination.prepareInactiveBank(
+            0,
+            placement_for_participant(
+                /*epoch=*/2,
+                /*participant=*/0,
+                /*include_transient_replica=*/true)));
+        ASSERT_TRUE(destination.flipActiveBank(0, 2, nullptr));
+        ASSERT_TRUE(source.prepareInactiveBank(
+            0,
+            placement_for_participant(
+                /*epoch=*/2,
+                /*participant=*/1,
+                /*include_transient_replica=*/true)));
+        ASSERT_TRUE(source.flipActiveBank(0, 2, nullptr));
+
+        ASSERT_TRUE(deviceMoELayerUsesTransientLocalPayload(
+            destination.hostLayerState(0)));
+        ASSERT_FALSE(deviceMoELayerUsesTransientLocalPayload(
+            source.hostLayerState(0)))
+            << "The source sees global replica residency but owns no rolling "
+               "destination payload slot.";
+
+        std::vector<DeviceMoEPortableLayerRuntimeState> destination_snapshot;
+        std::vector<DeviceMoEPortableLayerRuntimeState> source_snapshot;
+        ASSERT_TRUE(destination.capturePortableRuntimeState(destination_snapshot));
+        ASSERT_TRUE(source.capturePortableRuntimeState(source_snapshot));
+        ASSERT_EQ(destination_snapshot.size(), 1u);
+        ASSERT_EQ(source_snapshot.size(), 1u);
+
+        EXPECT_EQ(
+            destination_snapshot[0].experts[2].resident_participant_mask,
+            0b11u);
+        EXPECT_EQ(
+            source_snapshot[0].experts[2].resident_participant_mask,
+            0b11u);
+        EXPECT_EQ(
+            destination_snapshot[0].experts[2].resident_participant_mask,
+            source_snapshot[0].experts[2].resident_participant_mask)
+            << "Every participant must serialize one identical global "
+               "residency contract for the restored suffix.";
+        EXPECT_EQ(
+            destination_snapshot[0].requires_device_payload_rehydration,
+            1u);
+        EXPECT_EQ(
+            source_snapshot[0].requires_device_payload_rehydration,
+            1u);
+        EXPECT_EQ(destination_snapshot[0].experts[2].local_compute, 1u);
+        EXPECT_EQ(source_snapshot[0].experts[2].local_compute, 1u)
+            << "The immutable owner and reconstructed replica both retain local compute.";
+        EXPECT_FALSE(hasMoEExpertFlag(
+            destination_snapshot[0].experts[2].flags,
+            DeviceMoEExpertFlags::TransferSlot));
+        EXPECT_FALSE(hasMoEExpertFlag(
+            source_snapshot[0].experts[2].flags,
+            DeviceMoEExpertFlags::TransferSlot));
     }
 
     TEST(Test__MoERuntimeTable, PortableRuntimeStateRestoreFailsWhenLocalPayloadIsUnavailable)
@@ -879,7 +1069,7 @@ namespace llaminar2::test
             << "A portable prefix state that requires local expert payloads must fail fast when the live runner has no descriptor to bind.";
     }
 
-    TEST(Test__MoERuntimeTable, PortableRuntimeStateRestoreRebindsLocalPayloadThroughResolver)
+    TEST(Test__MoERuntimeTable, PortableRuntimeStateNeverResolvesTransientTransferSlots)
     {
         MoERuntimeTable source(DeviceId::cpu(), 1, 4, 2);
         auto initial = updateForEpoch(1, 4);
@@ -918,6 +1108,7 @@ namespace llaminar2::test
         std::vector<DeviceMoEPortableLayerRuntimeState> snapshot;
         ASSERT_TRUE(source.capturePortableRuntimeState(snapshot));
         ASSERT_EQ(snapshot.size(), 1u);
+        ASSERT_EQ(snapshot[0].requires_device_payload_rehydration, 1u);
         ASSERT_EQ(snapshot[0].experts[2].local_compute, 1u);
         ASSERT_EQ(snapshot[0].experts[2].local_slot, 2);
 
@@ -945,126 +1136,10 @@ namespace llaminar2::test
             return true;
         };
 
-        ASSERT_TRUE(destination.restorePortableRuntimeState(snapshot, nullptr, resolver))
-            << "Prefix restore must be able to rebind payload descriptors from the graph-owned transfer-slot owner after runtime banks are scrubbed.";
-        EXPECT_TRUE(resolver_called);
-
-        const auto &restored = destination.hostLayerState(0);
-        const auto &bank = restored.banks[restored.active_bank];
-        EXPECT_EQ(bank.local_compute_mask[2], 1u);
-        EXPECT_TRUE(hasMoEExpertFlag(bank.experts[2].flags,
-                                     DeviceMoEExpertFlags::TransferSlot));
-        EXPECT_EQ(bank.experts[2].gate.payload,
-                  expertDesc(2,
-                             1,
-                             2,
-                             DeviceMoEExpertFlags::Valid |
-                                 DeviceMoEExpertFlags::Resident |
-                                 DeviceMoEExpertFlags::TransferSlot)
-                      .gate.payload);
-    }
-
-    TEST(Test__MoERuntimeTable, PortableRuntimeStateRestorePrefersResolverOverStaleReplicaDescriptor)
-    {
-        MoERuntimeTable source(DeviceId::cpu(), 1, 4, 2);
-        auto initial = updateForEpoch(1, 4);
-        initial.participant_id = 0;
-        initial.participant_count = 2;
-        initial.local_compute_mask = {1u, 1u, 0u, 0u};
-        initial.experts[1] = expertDesc(1, 0, 1);
-        initial.experts[2] = expertOwnerOnlyDesc(2, 1);
-        initial.experts[3] = expertOwnerOnlyDesc(3, 1);
-        initial.replica_role = {
-            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
-            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
-            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
-            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
-        };
-        initial.resident_participant_mask = {0b01u, 0b01u, 0b10u, 0b10u};
-        ASSERT_TRUE(source.prepareInactiveBank(0, initial));
-        ASSERT_TRUE(source.flipActiveBank(0, 1, nullptr));
-
-        auto moved = initial;
-        moved.epoch = 2;
-        moved.experts[2] =
-            expertDesc(2,
-                       1,
-                       2,
-                       DeviceMoEExpertFlags::Valid |
-                           DeviceMoEExpertFlags::Resident |
-                           DeviceMoEExpertFlags::LocalCompute |
-                           DeviceMoEExpertFlags::TransferSlot);
-        moved.local_compute_mask[2] = 1u;
-        moved.replica_role[2] = static_cast<uint8_t>(DeviceMoEReplicaRole::Replica);
-        moved.resident_participant_mask[2] = 0b11u;
-        ASSERT_TRUE(source.prepareInactiveBank(0, moved));
-        ASSERT_TRUE(source.flipActiveBank(0, 2, nullptr));
-
-        std::vector<DeviceMoEPortableLayerRuntimeState> snapshot;
-        ASSERT_TRUE(source.capturePortableRuntimeState(snapshot));
-        ASSERT_EQ(snapshot.size(), 1u);
-        ASSERT_EQ(snapshot[0].participant_id, 0u);
-        ASSERT_EQ(snapshot[0].experts[2].owner_participant, 1);
-        ASSERT_EQ(snapshot[0].experts[2].local_compute, 1u);
-        ASSERT_EQ(snapshot[0].experts[2].local_slot, 2);
-
-        MoERuntimeTable destination(DeviceId::cpu(), 1, 4, 2);
-        auto stale_destination = initial;
-        stale_destination.epoch = 7;
-        stale_destination.experts[2] =
-            expertDescAtBase(2,
-                             1,
-                             2,
-                             0x30000000u,
-                             DeviceMoEExpertFlags::Valid |
-                                 DeviceMoEExpertFlags::Resident |
-                                 DeviceMoEExpertFlags::LocalCompute |
-                                 DeviceMoEExpertFlags::TransferSlot);
-        stale_destination.local_compute_mask[2] = 1u;
-        stale_destination.replica_role[2] =
-            static_cast<uint8_t>(DeviceMoEReplicaRole::Replica);
-        stale_destination.resident_participant_mask[2] = 0b11u;
-        ASSERT_TRUE(destination.prepareInactiveBank(0, stale_destination));
-        ASSERT_TRUE(destination.flipActiveBank(0, 7, nullptr));
-
-        const auto rebound_desc =
-            expertDescAtBase(2,
-                             1,
-                             2,
-                             0x50000000u,
-                             DeviceMoEExpertFlags::Valid |
-                                 DeviceMoEExpertFlags::Resident |
-                                 DeviceMoEExpertFlags::TransferSlot);
-        ASSERT_NE(stale_destination.experts[2].gate.payload,
-                  rebound_desc.gate.payload);
-
-        bool resolver_called = false;
-        auto resolver =
-            [&](int layer_idx,
-                int expert,
-                int local_slot,
-                DeviceMoEExpertDescriptor &out) -> bool
-        {
-            resolver_called = true;
-            EXPECT_EQ(layer_idx, 0);
-            EXPECT_EQ(expert, 2);
-            EXPECT_EQ(local_slot, 2);
-            out = rebound_desc;
-            return true;
-        };
-
-        ASSERT_TRUE(destination.restorePortableRuntimeState(snapshot, nullptr, resolver))
-            << "Remote-owned local replicas restored from prefix state must rebind through the graph-owned transfer-slot directory even when an old ready descriptor remains in a runtime bank.";
-        EXPECT_TRUE(resolver_called);
-
-        const auto &restored = destination.hostLayerState(0);
-        const auto &bank = restored.banks[restored.active_bank];
-        EXPECT_EQ(bank.local_compute_mask[2], 1u);
-        EXPECT_TRUE(hasMoEExpertFlag(bank.experts[2].flags,
-                                     DeviceMoEExpertFlags::TransferSlot));
-        EXPECT_EQ(bank.experts[2].gate.payload, rebound_desc.gate.payload);
-        EXPECT_NE(bank.experts[2].gate.payload,
-                  stale_destination.experts[2].gate.payload);
+        ASSERT_FALSE(destination.restorePortableRuntimeState(snapshot, nullptr, resolver));
+        EXPECT_FALSE(resolver_called)
+            << "A portable snapshot must never ask a rolling transfer-slot "
+               "directory to resurrect bytes whose lifetime ended at capture.";
     }
 
     TEST(Test__MoERuntimeTable, RestoreRuntimeSnapshotSkipsUninitializedLayers)
@@ -1133,6 +1208,9 @@ namespace llaminar2::test
         ASSERT_TRUE(table.prepareInactiveBank(0, update));
         ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
         EXPECT_FALSE(deviceMoELayerUsesTransientLocalPayload(table.hostLayerState(0)));
+        EXPECT_EQ(
+            deviceMoELayerActiveTransferSlotExpertCount(table.hostLayerState(0)),
+            0u);
 
         auto transient = updateForEpoch(2, 4);
         transient.participant_id = 0;
@@ -1151,6 +1229,37 @@ namespace llaminar2::test
         EXPECT_TRUE(deviceMoELayerUsesTransientLocalPayload(table.hostLayerState(0)))
             << "Prefix-cache runtime snapshots must not replay metadata-only "
                "references to mutable transfer slot payloads.";
+        EXPECT_EQ(
+            deviceMoELayerActiveTransferSlotExpertCount(table.hostLayerState(0)),
+            1u)
+            << "Only active, valid, resident, locally executable transfer-slot "
+               "experts are applied prefill-movement evidence.";
+
+        const auto config = rebalanceConfig(
+            /*layers=*/1,
+            /*experts=*/4,
+            /*top_k=*/2,
+            /*participant=*/0,
+            /*participants=*/2,
+            /*window_tokens=*/1,
+            /*max_hot_replicas=*/0);
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0u);
+        addGatheredCount(gathered, config, 0, 0, 0, 2u);
+
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0),
+            gathered.data(),
+            config,
+            &status));
+        EXPECT_EQ(status.prefill_active_transfer_slot_experts, 1u)
+            << "Request-boundary status must preserve final-state evidence from "
+               "the preceding prefill publication independently of whether the "
+               "new maintenance wave chooses additional movement.";
     }
 
     TEST(Test__MoERuntimeTable, InvalidLayerBoundsAndUpdatesThrowConsistently)
@@ -2081,7 +2190,7 @@ namespace llaminar2::test
             static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
             static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Resident) |
             static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::LocalCompute);
-        ASSERT_TRUE(deviceMoEPopulateDirectoryFormat(source_entry));
+        ASSERT_TRUE(deviceMoEDirectoryCopyReady(source_entry));
 
         ASSERT_TRUE(applyDeviceMoERebalanceArrivalsHost(
             table.deviceLayerState(0),
@@ -2108,7 +2217,7 @@ namespace llaminar2::test
             static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
             static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Resident) |
             static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::TransferSlot);
-        ASSERT_TRUE(deviceMoEPopulateDirectoryFormat(slot));
+        ASSERT_TRUE(deviceMoEDirectoryCopyReady(slot));
 
         ASSERT_TRUE(applyDeviceMoERebalanceArrivalsHost(
             table.deviceLayerState(0),
@@ -2170,6 +2279,9 @@ namespace llaminar2::test
         EXPECT_EQ(bank.local_compute_mask[0], 1u);
         EXPECT_EQ(bank.replica_role[0], static_cast<uint8_t>(DeviceMoEReplicaRole::Replica));
         EXPECT_EQ(bank.resident_participant_mask[0], 0b011u);
+        EXPECT_EQ(bank.transient_placement_observed, 1u)
+            << "The transfer destination must mark the layer as containing "
+               "request-lifetime placement.";
         EXPECT_EQ(bank.experts[0].local_slot, 17);
         EXPECT_TRUE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::Replicated));
         EXPECT_TRUE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::LocalCompute));
@@ -2242,6 +2354,9 @@ namespace llaminar2::test
             << "the owner remains locally computable but can now yield routes to the replica";
         EXPECT_EQ(bank.replica_role[0], static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
         EXPECT_EQ(bank.resident_participant_mask[0], 0b011u);
+        EXPECT_EQ(bank.transient_placement_observed, 1u)
+            << "The same gathered transfer plan must publish the transient "
+               "placement marker on non-destination participants.";
         EXPECT_TRUE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::Replicated));
         EXPECT_TRUE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::LocalCompute));
     }
@@ -2293,7 +2408,7 @@ namespace llaminar2::test
             static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
             static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Resident) |
             static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::LocalCompute);
-        ASSERT_TRUE(deviceMoEPopulateDirectoryFormat(source_entry));
+        ASSERT_TRUE(deviceMoEDirectoryCopyReady(source_entry));
 
         std::vector<DeviceMoEExpertDirectoryEntry> transfer_slots(1);
         auto &slot = transfer_slots[0];
@@ -2308,7 +2423,7 @@ namespace llaminar2::test
             static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Resident) |
             static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::TransferSlot) |
             static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::CopyComplete);
-        ASSERT_TRUE(deviceMoEPopulateDirectoryFormat(slot));
+        ASSERT_TRUE(deviceMoEDirectoryCopyReady(slot));
 
         DeviceMoERebalanceApplyStatus destination_status;
         ASSERT_TRUE(applyDeviceMoERebalanceArrivalsHost(

@@ -11,6 +11,7 @@
 #include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <limits>
 #include <numeric>
@@ -838,27 +839,20 @@ namespace llaminar2
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
         {
             auto &state = host_layers_[static_cast<size_t>(layer_idx)];
-            const auto &scratch = prefill_route_scratch_.empty()
-                                      ? PrefillRouteScratchAllocation{}
-                                      : prefill_route_scratch_[static_cast<size_t>(layer_idx)];
+            /*
+             * Scratch bindings are model-lifetime graph identities, not
+             * request state.  Capture them from the authoritative live table
+             * before clearing placement.  Looking them up only through the
+             * optional allocation registry lost bindings for runtime tables
+             * whose scratch was attached before a prefix/MTP graph boundary;
+             * the stage-local "warmed" bit then remained true while the device
+             * table advertised a zero route capacity.
+             */
+            const RuntimeScratchBindings scratch =
+                captureRuntimeScratchBindings(state);
 
             resetLayer(state);
-            state.route_expert_ids = scratch.route_expert_ids;
-            state.route_weights = scratch.route_weights;
-            state.route_participant_ids = scratch.route_participant_ids;
-            state.expert_counts = scratch.expert_counts;
-            state.expert_offsets = scratch.expert_offsets;
-            state.grouped_token_ids = scratch.grouped_token_ids;
-            state.grouped_route_weights = scratch.grouped_route_weights;
-            state.reserved_ptrs[0] = scratch.llep_split_ends;
-            state.reserved_ptrs[1] = scratch.llep_assignment_spans;
-            state.reserved_ptrs[2] = scratch.llep_weight_transfers;
-            state.reserved_u64[0] = scratch.llep_plan_capacity;
-            state.reserved_u64[1] = scratch.llep_plan_capacity;
-            state.reserved_u64[2] = 0;
-            state.reserved_u64[3] = 0;
-            state.prefill_token_capacity = scratch.token_capacity;
-            state.prefill_route_capacity = scratch.route_capacity;
+            restoreRuntimeScratchBindings(state, scratch);
         }
 
         if (!mirror_to_device_)
@@ -1067,6 +1061,7 @@ namespace llaminar2
         }
 
         layers.reserve(static_cast<size_t>(num_layers_));
+        uint32_t rehydratable_placement_layers = 0;
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
         {
             const auto &state = source_layers[static_cast<size_t>(layer_idx)];
@@ -1083,7 +1078,56 @@ namespace llaminar2
                 return false;
             }
 
-            const auto &bank = state.banks[state.active_bank];
+            /*
+             * Preserve exact logical placement while excluding every
+             * pointer-bearing transfer-slot descriptor.
+             *
+             * A resident mask is domain-wide state: both the immutable owner
+             * and the replica destination observe the same bits. Only the
+             * destination owns the rolling slot descriptor. Canonicalizing
+             * transient layers to immutable placement made a cache hit resume
+             * with a different row-to-participant assignment than an uncached
+             * split prefill. That changes FP32 reduction association and breaks
+             * byte equality even when every route is present.
+             *
+             * The portable payload now records exact masks and local roles, but
+             * portableMoEExpertFlags() still strips TransferSlot. Restore
+             * reconstructs those bytes from immutable owner weights in a
+             * dedicated captured collective before routing resumes.
+             */
+            const auto &live_bank = state.banks[state.active_bank];
+            const bool local_transient_payload =
+                deviceMoELayerUsesTransientLocalPayload(state);
+            const bool domain_has_transient_placement =
+                live_bank.transient_placement_observed != 0u ||
+                local_transient_payload;
+            const size_t idx = static_cast<size_t>(layer_idx);
+            const DeviceMoELayerRuntime *initial_state = nullptr;
+            if (domain_has_transient_placement)
+            {
+                if (idx >= initial_layer_captured_.size() ||
+                    initial_layer_captured_[idx] == 0u)
+                {
+                    LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                         << ": transient portable capture has no immutable initial placement");
+                    layers.clear();
+                    return false;
+                }
+                initial_state = &initial_host_layers_[idx];
+                if (initial_state->expert_count != static_cast<uint32_t>(num_experts_) ||
+                    initial_state->top_k != static_cast<uint32_t>(top_k_) ||
+                    initial_state->active_bank > 1u ||
+                    deviceMoELayerUsesTransientLocalPayload(*initial_state))
+                {
+                    LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                         << ": immutable initial placement is invalid or contains transient payload");
+                    layers.clear();
+                    return false;
+                }
+                ++rehydratable_placement_layers;
+            }
+
+            const auto &bank = live_bank;
             DeviceMoEPortableLayerRuntimeState captured;
             captured.active_epoch = state.active_epoch;
             captured.expert_count = state.expert_count;
@@ -1111,10 +1155,33 @@ namespace llaminar2
                 dst.replica_role = bank.replica_role[static_cast<size_t>(expert)];
                 dst.resident_participant_mask =
                     bank.resident_participant_mask[static_cast<size_t>(expert)];
+                if (initial_state)
+                {
+                    const auto &initial_bank =
+                        initial_state->banks[initial_state->active_bank];
+                    const auto &initial_desc =
+                        initial_bank.experts[static_cast<size_t>(expert)];
+                    if (dst.owner_participant != initial_desc.owner_participant ||
+                        dst.resident_participant_mask !=
+                            initial_bank.resident_participant_mask[
+                                static_cast<size_t>(expert)])
+                    {
+                        captured.requires_device_payload_rehydration = 1u;
+                    }
+                }
             }
             layers.push_back(std::move(captured));
         }
 
+        if (rehydratable_placement_layers != 0u)
+        {
+            PerfStatsCollector::addCounter(
+                "prefix_cache",
+                "moe_portable_device_rehydration_layers",
+                static_cast<double>(rehydratable_placement_layers),
+                "prefix_cache",
+                device_id_.toString());
+        }
         return true;
     }
 
@@ -1148,6 +1215,159 @@ namespace llaminar2
             }
 
             auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            if (snapshot.requires_device_payload_rehydration != 0u)
+            {
+                /*
+                 * Recreate transient placement from immutable owner payloads.
+                 *
+                 * The cache blob deliberately contains no device pointers. We
+                 * therefore restore the model-lifetime bank now and preload the
+                 * exact owner-to-replica edges into the persistent LLEP transfer
+                 * array. A one-shot captured forward graph consumes this array
+                 * before it assigns any suffix routes. The H2D below is part of
+                 * the explicit RAM/disk prefix import boundary; expert payload
+                 * bytes themselves never leave the GPU domain.
+                 */
+                const size_t idx = static_cast<size_t>(layer_idx);
+                if (!mirror_to_device_ ||
+                    !device_id_.is_gpu() ||
+                    idx >= initial_layer_captured_.size() ||
+                    initial_layer_captured_[idx] == 0u)
+                {
+                    LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                         << ": transient portable restore requires a mirrored GPU table with immutable placement");
+                    return false;
+                }
+
+                const auto scratch = captureRuntimeScratchBindings(state);
+                if (!scratch.reserved_ptrs[2] ||
+                    scratch.reserved_u64[1] == 0u)
+                {
+                    LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                         << ": transient portable restore has no persistent LLEP transfer scratch");
+                    return false;
+                }
+
+                const auto &initial = initial_host_layers_[idx];
+                if (initial.active_bank > 1u ||
+                    initial.expert_count != static_cast<uint32_t>(num_experts_) ||
+                    initial.top_k != static_cast<uint32_t>(top_k_) ||
+                    initial.participant_id != snapshot.participant_id ||
+                    initial.participant_count != snapshot.participant_count ||
+                    initial.participant_count == 0u ||
+                    initial.participant_count > kDeviceMoEMaxParticipants)
+                {
+                    LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                         << ": transient portable restore immutable placement metadata mismatch");
+                    return false;
+                }
+
+                const auto &initial_bank = initial.banks[initial.active_bank];
+                const uint32_t valid_participants =
+                    participantMaskLimit(snapshot.participant_count);
+                const uint32_t local_bit =
+                    participantBit(snapshot.participant_id);
+                std::vector<least_loaded_ep::LeastLoadedExpertWeightTransfer>
+                    transfers;
+                transfers.reserve(static_cast<size_t>(num_experts_));
+
+                for (int expert = 0; expert < num_experts_; ++expert)
+                {
+                    const auto &saved =
+                        snapshot.experts[static_cast<size_t>(expert)];
+                    const auto &initial_desc =
+                        initial_bank.experts[static_cast<size_t>(expert)];
+                    const uint32_t initial_mask =
+                        initial_bank.resident_participant_mask[
+                            static_cast<size_t>(expert)];
+                    const uint32_t desired_mask =
+                        saved.resident_participant_mask;
+
+                    if (saved.logical_expert_id != expert ||
+                        saved.owner_participant !=
+                            initial_desc.owner_participant ||
+                        initial_desc.owner_participant < 0 ||
+                        initial_desc.owner_participant >=
+                            static_cast<int32_t>(snapshot.participant_count) ||
+                        (desired_mask & ~valid_participants) != 0u ||
+                        (desired_mask & initial_mask) != initial_mask ||
+                        (desired_mask &
+                         participantBit(static_cast<uint32_t>(
+                             initial_desc.owner_participant))) == 0u)
+                    {
+                        LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                             << ": transient portable restore cannot derive an immutable-owner replica plan for expert "
+                                                             << expert);
+                        return false;
+                    }
+
+                    const bool expected_local_compute =
+                        (desired_mask & local_bit) != 0u;
+                    if ((saved.local_compute != 0u) !=
+                        expected_local_compute)
+                    {
+                        LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                             << ": transient portable restore local-compute/residency mismatch for expert "
+                                                             << expert);
+                        return false;
+                    }
+
+                    uint32_t arrivals = desired_mask & ~initial_mask;
+                    while (arrivals != 0u)
+                    {
+                        const uint32_t destination =
+                            static_cast<uint32_t>(
+                                std::countr_zero(arrivals));
+                        arrivals &= arrivals - 1u;
+                        transfers.push_back(
+                            least_loaded_ep::LeastLoadedExpertWeightTransfer{
+                                .expert = static_cast<uint32_t>(expert),
+                                .source_participant =
+                                    static_cast<uint32_t>(
+                                        initial_desc.owner_participant),
+                                .destination_participant = destination,
+                                .reserved = 0u});
+                    }
+                }
+
+                if (transfers.empty() ||
+                    transfers.size() >
+                        static_cast<size_t>(scratch.reserved_u64[1]))
+                {
+                    LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                         << ": transient portable restore produced invalid transfer count "
+                                                         << transfers.size()
+                                                         << " capacity="
+                                                         << scratch.reserved_u64[1]);
+                    return false;
+                }
+
+                state = initial;
+                restoreRuntimeScratchBindings(state, scratch);
+                std::copy(snapshot.selected_histogram.begin(),
+                          snapshot.selected_histogram.end(),
+                          state.decode_histogram);
+                std::copy(snapshot.local_histogram.begin(),
+                          snapshot.local_histogram.end(),
+                          state.decode_local_histogram);
+                resetRouterHotCacheCounters(state);
+                state.reserved_u64[2] = 0u;
+                state.reserved_u64[3] =
+                    static_cast<uint64_t>(transfers.size());
+
+                copyHostToMirror(
+                    device_id_,
+                    state.reserved_ptrs[2],
+                    transfers.data(),
+                    transfers.size() *
+                        sizeof(least_loaded_ep::LeastLoadedExpertWeightTransfer),
+                    stream,
+                    layerPrefix(layer_idx) +
+                        "portable restore transfer-plan upload");
+                uploadLayerState(layer_idx, stream);
+                continue;
+            }
+
             MoEPlacementUpdate update;
             update.epoch = std::max<uint32_t>(
                 state.active_epoch + 1u,
@@ -1351,6 +1571,8 @@ namespace llaminar2
         bank = {};
         bank.epoch = update.epoch;
         bank.expert_count = update.expert_count;
+        bank.transient_placement_observed =
+            update.transient_placement_observed ? 1u : 0u;
 
         for (uint32_t expert = 0; expert < update.expert_count; ++expert)
         {
@@ -1360,7 +1582,13 @@ namespace llaminar2
             const uint32_t resident_mask = residentParticipantMaskForUpdate(update, expert);
             bank.resident_participant_mask[expert] = resident_mask;
             if (participantMaskCount(resident_mask) > 1u)
-                ++bank.reserved[0];
+                ++bank.multi_resident_expert_count;
+            if (hasMoEExpertFlag(
+                    update.experts[expert].flags,
+                    DeviceMoEExpertFlags::TransferSlot))
+            {
+                bank.transient_placement_observed = 1u;
+            }
         }
 
         return true;

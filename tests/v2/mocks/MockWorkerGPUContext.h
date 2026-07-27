@@ -35,6 +35,8 @@ namespace llaminar2::testing
     class MockGPUGraphCapture final : public IGPUGraphCapture
     {
     public:
+        explicit MockGPUGraphCapture(void *stream) : stream_(stream) {}
+
         bool beginCapture() override
         {
             if (capturing_)
@@ -68,6 +70,8 @@ namespace llaminar2::testing
             return executable_;
         }
 
+        [[nodiscard]] void *executionStream() const noexcept override { return stream_; }
+
         GraphUpdateResult tryUpdate() override
         {
             return captured_ && executable_
@@ -75,6 +79,7 @@ namespace llaminar2::testing
                        : GraphUpdateResult::NeedsReinstantiate;
         }
 
+        [[nodiscard]] bool supportsExecutableUpdate() const noexcept override { return true; }
         bool hasExecutable() const override { return executable_; }
         size_t nodeCount() const override { return node_count_; }
 
@@ -90,6 +95,7 @@ namespace llaminar2::testing
         int launchCount() const { return launch_count_; }
 
     private:
+        void *stream_ = nullptr;
         bool capturing_ = false;
         bool captured_ = false;
         bool executable_ = false;
@@ -180,19 +186,20 @@ namespace llaminar2::testing
         bool synchronizeChecked() override { return true; }
         void synchronizeStream(void *) override {}
         bool synchronizeStreamChecked(void *stream) override { return stream != nullptr; }
-        void insertStreamDependency(void *, void *) override {}
+        bool insertStreamDependency(void *, void *) override { return true; }
 
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override
         {
             ++graph_capture_create_count_;
-            return std::make_unique<MockGPUGraphCapture>();
+            return std::make_unique<MockGPUGraphCapture>(defaultStream());
         }
 
         std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *stream) override
         {
             if (!stream)
                 return nullptr;
-            return createGraphCapture();
+            ++graph_capture_create_count_;
+            return std::make_unique<MockGPUGraphCapture>(stream);
         }
 
         void setGraphCaptureActive(bool active) override

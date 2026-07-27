@@ -82,6 +82,11 @@ TEST(Test__PrefixMTPConfig, DefaultsAreDisabled)
     EXPECT_EQ(config.prefix_cache.ram_budget_bytes, 4ull * 1024ull * 1024ull * 1024ull);
     EXPECT_EQ(config.prefix_cache.device_budget_bytes, 256ull * 1024ull * 1024ull);
     EXPECT_EQ(config.prefix_cache.disk_budget_bytes, 0u);
+    const char *home = std::getenv("HOME");
+    ASSERT_NE(home, nullptr);
+    EXPECT_EQ(
+        config.prefix_cache.disk_dir,
+        (std::filesystem::path(home) / ".llaminar" / "kvcache").string());
     EXPECT_EQ(config.prefix_cache.terminal_state, PrefixCacheTerminalStateMode::Auto);
     EXPECT_EQ(config.prefix_cache.moe_policy, PrefixCacheMoEPolicy::PlacementFingerprint);
 

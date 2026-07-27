@@ -4,8 +4,8 @@
  *
  * BufferView provides typed, access-controlled views into device-ready memory.
  * Stages receive BufferView handles from StageBoundBuffers — they cannot
- * call data(), ensureOnDevice(), or transitionTo() because BufferView
- * simply doesn't expose those methods.
+ * call data(), ensureOnDevice(), or publish coherence because BufferView
+ * simply does not expose those operations.
  */
 
 #pragma once

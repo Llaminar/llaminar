@@ -191,30 +191,28 @@ public:
         return forward_mtp_from_last_draft_ok_;
     }
 
-    bool forwardMTPFromDeviceDraftForDeviceSampling(
+    bool forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling(
         int draft_sample_slot,
-        int position_id) override
+        int position_offset) override
     {
         ++forward_mtp_from_device_draft_calls_;
         last_device_draft_sample_slot_ = draft_sample_slot;
-        last_device_token_sidecar_position_id_ = position_id;
+        last_device_token_sidecar_position_id_ = position_offset;
         return stochastic_device_ops_ok_ &&
                supports_mtp_device_draft_token_input_ &&
                draft_sample_slot >= 0 &&
-               position_id >= 0;
+               position_offset >= 0;
     }
 
-    bool forwardMTPFromDeviceTargetForDeviceSampling(
-        int target_sample_slot,
-        int position_id) override
+    bool forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(
+        int target_sample_slot) override
     {
         ++forward_mtp_from_device_target_calls_;
         last_device_target_sample_slot_ = target_sample_slot;
-        last_device_token_sidecar_position_id_ = position_id;
+        last_device_token_sidecar_position_id_ = 0;
         return stochastic_device_ops_ok_ &&
                supports_mtp_device_draft_token_input_ &&
-               target_sample_slot >= 0 &&
-               position_id >= 0;
+               target_sample_slot >= 0;
     }
 
     bool supportsMTPSpecStatePublication() const override
@@ -2940,7 +2938,7 @@ public:
 
     bool hasBARBackedOutputs(const std::string & /*stage_name*/) const override { return false; }
     void clearBARBackedOutputs() override {}
-    bool reserveTempBufferBytes(size_t /*bytes*/) override { return true; }
+    bool reserveCollectiveResources(size_t /*bytes*/, size_t /*fp16_scratch_elements*/) override { return true; }
 
     // =====================================================================
     // ILocalTPContext Broadcast (no-op)

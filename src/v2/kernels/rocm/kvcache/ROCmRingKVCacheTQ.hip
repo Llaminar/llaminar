@@ -11,10 +11,12 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include <hip/hip_runtime.h>
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -27,6 +29,152 @@ namespace llaminar2
     extern "C" void hip_kv_sequence_state_advance_dynamic(
         int *d_head, int *d_count, const int *d_append_count,
         int captured_num_tokens, int max_seq_len, hipStream_t stream);
+
+    /**
+     * @brief Gather asymmetric TurboQuant K/V rows into device prefix storage.
+     *
+     * TurboQuant stores K and V with different native row widths. Treating the
+     * payload as raw bytes preserves every quantized code and scale exactly
+     * while allowing one launch to cover both arrays. The canonical ring head
+     * and count remain device-owned inputs, so graph replay never consults a
+     * potentially stale host mirror.
+     */
+    __global__ void rocm_tq_ring_logical_block_export_device_kernel(
+        const uint8_t *__restrict__ ring_k,
+        const uint8_t *__restrict__ ring_v,
+        uint8_t *__restrict__ block_k,
+        uint8_t *__restrict__ block_v,
+        const int *__restrict__ ring_head,
+        const int *__restrict__ cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len,
+        size_t k_row_bytes,
+        size_t v_row_bytes)
+    {
+        const int count = *cached_tokens;
+        const int head = *ring_head;
+        if (count < 0 || count > max_seq_len ||
+            head < 0 || head >= max_seq_len ||
+            logical_token_start < 0 ||
+            logical_token_start > count ||
+            token_count < 0 ||
+            token_count > count - logical_token_start)
+        {
+            return;
+        }
+
+        int tail = (head - count) % max_seq_len;
+        if (tail < 0)
+            tail += max_seq_len;
+
+        const size_t k_bytes =
+            static_cast<size_t>(token_count) * k_row_bytes;
+        const size_t v_bytes =
+            static_cast<size_t>(token_count) * v_row_bytes;
+        const size_t total = k_bytes + v_bytes;
+        for (size_t linear =
+                 static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             linear < total;
+             linear += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const bool is_k = linear < k_bytes;
+            const size_t local = is_k ? linear : linear - k_bytes;
+            const size_t row_bytes = is_k ? k_row_bytes : v_row_bytes;
+            const int token = static_cast<int>(local / row_bytes);
+            const size_t byte_in_row = local % row_bytes;
+            const int physical =
+                (tail + logical_token_start + token) % max_seq_len;
+            const size_t source =
+                static_cast<size_t>(physical) * row_bytes + byte_in_row;
+            if (is_k)
+                block_k[local] = ring_k[source];
+            else
+                block_v[local] = ring_v[source];
+        }
+    }
+
+    /**
+     * @brief Scatter a device-resident TurboQuant block into the live ring.
+     *
+     * The kernel validates the live device metadata before writing. A stale or
+     * out-of-order restore therefore cannot mutate payload storage, and the
+     * stream-ordered publication kernel below will likewise refuse to advance
+     * the metadata.
+     */
+    __global__ void rocm_tq_ring_logical_block_import_device_kernel(
+        uint8_t *__restrict__ ring_k,
+        uint8_t *__restrict__ ring_v,
+        const uint8_t *__restrict__ block_k,
+        const uint8_t *__restrict__ block_v,
+        const int *__restrict__ ring_head,
+        const int *__restrict__ cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len,
+        size_t k_row_bytes,
+        size_t v_row_bytes)
+    {
+        const int count = *cached_tokens;
+        const int head = *ring_head;
+        if (count != logical_token_start ||
+            head != (logical_token_start % max_seq_len))
+        {
+            return;
+        }
+
+        const size_t k_bytes =
+            static_cast<size_t>(token_count) * k_row_bytes;
+        const size_t v_bytes =
+            static_cast<size_t>(token_count) * v_row_bytes;
+        const size_t total = k_bytes + v_bytes;
+        for (size_t linear =
+                 static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             linear < total;
+             linear += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const bool is_k = linear < k_bytes;
+            const size_t local = is_k ? linear : linear - k_bytes;
+            const size_t row_bytes = is_k ? k_row_bytes : v_row_bytes;
+            const int token = static_cast<int>(local / row_bytes);
+            const size_t byte_in_row = local % row_bytes;
+            const int physical = (head + token) % max_seq_len;
+            const size_t destination =
+                static_cast<size_t>(physical) * row_bytes + byte_in_row;
+            if (is_k)
+                ring_k[destination] = block_k[local];
+            else
+                ring_v[destination] = block_v[local];
+        }
+    }
+
+    /**
+     * @brief Publish TQ ring metadata after asynchronous device payload import.
+     *
+     * This one-thread kernel is deliberately separate from the scatter. Stream
+     * ordering guarantees that no consumer can observe the new count before
+     * every payload byte has reached its canonical ring location.
+     */
+    __global__ void rocm_tq_ring_logical_block_import_publish_kernel(
+        int *__restrict__ ring_head,
+        int *__restrict__ cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len)
+    {
+        if (blockIdx.x != 0 || threadIdx.x != 0)
+            return;
+        const int count = *cached_tokens;
+        const int head = *ring_head;
+        if (count != logical_token_start ||
+            head != (logical_token_start % max_seq_len))
+        {
+            return;
+        }
+        const int new_count = logical_token_start + token_count;
+        *cached_tokens = new_count;
+        *ring_head = new_count % max_seq_len;
+    }
 
     ROCmRingKVCacheTQ::ROCmRingKVCacheTQ(
         int n_layers, int batch_size, int max_seq_len,
@@ -54,6 +202,13 @@ namespace llaminar2
         }
         (void)hipSetDevice(device_id_);
 
+        auto construction_cleanup = [this](void *) noexcept
+        {
+            releaseOwnedDeviceStorage();
+        };
+        std::unique_ptr<void, decltype(construction_cleanup)>
+            construction_guard(this, construction_cleanup);
+
         if (head_dim_ == 64)
         {
             tq8_block_size_ = sizeof(TQ8Block<64>);
@@ -66,11 +221,16 @@ namespace llaminar2
         }
         else
         {
-            LOG_ERROR("ROCmRingKVCacheTQ: unsupported head_dim=" << head_dim_);
-            return;
+            throw std::runtime_error(
+                "ROCmRingKVCacheTQ: head_dim must be 64 or 128");
         }
 
-        const uint64_t rotation_seed = tq_ctx ? tq_ctx->rotation().seed : 42;
+        if (!tq_ctx)
+        {
+            throw std::runtime_error(
+                "ROCmRingKVCacheTQ requires TurboQuantContext");
+        }
+        const uint64_t rotation_seed = tq_ctx->rotation().seed;
 
         hipStream_t init_stream = static_cast<hipStream_t>(
             GPUDeviceContextPool::instance().getAMDContext(device_id_).defaultStream());
@@ -83,6 +243,12 @@ namespace llaminar2
 
         const size_t k_entry_bytes = static_cast<size_t>(max_seq_len_) * local_n_kv_heads_ * tq8_block_size_;
         const size_t v_entry_bytes = static_cast<size_t>(max_seq_len_) * local_n_kv_heads_ * tq4_block_size_;
+        auto *const backend = getROCmBackend();
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "ROCmRingKVCacheTQ: ROCm backend unavailable during cache allocation");
+        }
 
         entries_.resize(n_layers_);
 
@@ -92,21 +258,20 @@ namespace llaminar2
 
             for (int s = 0; s < batch_size_; ++s)
             {
-                (void)hipMalloc(&entries_[l][s].d_K, k_entry_bytes);
-                (void)hipMalloc(&entries_[l][s].d_V, v_entry_bytes);
+                auto &entry = entries_[l][s];
+                entry.d_K = backend->allocate(k_entry_bytes, device_id_);
+                entry.d_V = backend->allocate(v_entry_bytes, device_id_);
+                if (!entry.d_K || !entry.d_V ||
+                    hipMemsetAsync(entry.d_K, 0, k_entry_bytes, init_stream) != hipSuccess ||
+                    hipMemsetAsync(entry.d_V, 0, v_entry_bytes, init_stream) != hipSuccess)
+                {
+                    throw std::runtime_error(
+                        "ROCmRingKVCacheTQ: failed to allocate or initialize compressed entry storage");
+                }
             }
         }
         if (!publishBatchedEntryTables(init_stream))
         {
-            for (auto &layer : entries_)
-                for (auto &entry : layer)
-                {
-                    if (entry.d_K)
-                        (void)hipFree(entry.d_K);
-                    if (entry.d_V)
-                        (void)hipFree(entry.d_V);
-                }
-            hip_tq_free_rotations(rotations_);
             throw std::runtime_error(
                 "ROCmRingKVCacheTQ: failed to publish resident batched entry topology");
         }
@@ -123,8 +288,16 @@ namespace llaminar2
             layer_scratch_.resize(n_layers_);
             for (int l = 0; l < n_layers_; ++l)
             {
-                (void)hipMalloc(&layer_scratch_[l].d_K, scratch_bytes);
-                (void)hipMalloc(&layer_scratch_[l].d_V, scratch_bytes);
+                layer_scratch_[l].d_K = static_cast<_Float16 *>(
+                    backend->allocate(scratch_bytes, device_id_));
+                layer_scratch_[l].d_V = static_cast<_Float16 *>(
+                    backend->allocate(scratch_bytes, device_id_));
+                if (!layer_scratch_[l].d_K ||
+                    !layer_scratch_[l].d_V)
+                {
+                    throw std::runtime_error(
+                        "ROCmRingKVCacheTQ: failed to allocate persistent FP16 layer scratch");
+                }
                 layer_scratch_[l].invalidate();
             }
             LOG_DEBUG("ROCmRingKVCacheTQ: per-layer FP16 scratch: "
@@ -136,6 +309,7 @@ namespace llaminar2
             throw std::runtime_error(std::string("ROCmRingKVCacheTQ initialization failed: ") +
                                      hipGetErrorString(init_sync));
 
+        construction_guard.release();
         LOG_DEBUG("ROCmRingKVCacheTQ: created on device " << device_id_
                   << " (" << n_layers_ << " layers, " << batch_size_ << " batch, "
                   << max_seq_len_ << " maxseq, local/total_heads="
@@ -146,33 +320,70 @@ namespace llaminar2
     ROCmRingKVCacheTQ::~ROCmRingKVCacheTQ()
     {
         (void)hipSetDevice(device_id_);
+        releaseOwnedDeviceStorage();
+    }
 
-        for (auto &layer : entries_)
-            for (auto &entry : layer)
-            {
-                if (entry.d_K) (void)hipFree(entry.d_K);
-                if (entry.d_V) (void)hipFree(entry.d_V);
-            }
-
-        batched_k_view_.reset();
-        batched_v_view_.reset();
-        if (d_batched_k_entry_table_)
-            (void)hipFree(d_batched_k_entry_table_);
-        if (d_batched_v_entry_table_)
-            (void)hipFree(d_batched_v_entry_table_);
-        d_batched_k_entry_table_ = nullptr;
-        d_batched_v_entry_table_ = nullptr;
-
-        // Free per-layer scratch
-        for (auto &scratch : layer_scratch_)
+    void ROCmRingKVCacheTQ::releaseOwnedDeviceStorage() noexcept
+    {
+        auto *const backend = getROCmBackend();
+        bool owns_device_storage =
+            d_batched_k_entry_table_ || d_batched_v_entry_table_ ||
+            rotations_.d_rotations || rotations_.d_rotations_t;
+        for (const auto &layer : entries_)
+            for (const auto &entry : layer)
+                owns_device_storage = owns_device_storage || entry.d_K || entry.d_V;
+        for (const auto &scratch : layer_scratch_)
+            owns_device_storage = owns_device_storage || scratch.d_K || scratch.d_V;
+        if (owns_device_storage && !backend)
         {
-            scratch.k_view.reset();
-            scratch.v_view.reset();
-            if (scratch.d_K) (void)hipFree(scratch.d_K);
-            if (scratch.d_V) (void)hipFree(scratch.d_V);
+            LOG_ERROR("[ROCmRingKVCacheTQ] ROCm backend unavailable during cache teardown");
+            std::terminate();
         }
 
-        hip_tq_free_rotations(rotations_);
+        try
+        {
+            batched_k_view_.reset();
+            batched_v_view_.reset();
+            if (d_batched_k_entry_table_)
+                backend->free(d_batched_k_entry_table_, device_id_);
+            if (d_batched_v_entry_table_)
+                backend->free(d_batched_v_entry_table_, device_id_);
+            d_batched_k_entry_table_ = nullptr;
+            d_batched_v_entry_table_ = nullptr;
+
+            for (auto &layer : entries_)
+            {
+                for (auto &entry : layer)
+                {
+                    if (entry.d_K)
+                        backend->free(entry.d_K, device_id_);
+                    if (entry.d_V)
+                        backend->free(entry.d_V, device_id_);
+                    entry.d_K = nullptr;
+                    entry.d_V = nullptr;
+                }
+            }
+
+            for (auto &scratch : layer_scratch_)
+            {
+                scratch.k_view.reset();
+                scratch.v_view.reset();
+                if (scratch.d_K)
+                    backend->free(scratch.d_K, device_id_);
+                if (scratch.d_V)
+                    backend->free(scratch.d_V, device_id_);
+                scratch.d_K = nullptr;
+                scratch.d_V = nullptr;
+            }
+            layer_scratch_.clear();
+
+            hip_tq_free_rotations(rotations_);
+        }
+        catch (...)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ] ROCm backend threw during cache teardown");
+            std::terminate();
+        }
     }
 
     bool ROCmRingKVCacheTQ::publishBatchedEntryTables(hipStream_t stream)
@@ -196,34 +407,28 @@ namespace llaminar2
             }
         }
 
-        hipError_t status = hipMalloc(
-            reinterpret_cast<void **>(&d_batched_k_entry_table_), table_bytes);
-        if (status == hipSuccess)
+        auto *const backend = getROCmBackend();
+        if (!backend)
+            return false;
+
+        d_batched_k_entry_table_ = static_cast<void **>(
+            backend->allocate(table_bytes, device_id_));
+        d_batched_v_entry_table_ = static_cast<void **>(
+            backend->allocate(table_bytes, device_id_));
+        if (!d_batched_k_entry_table_ ||
+            !d_batched_v_entry_table_ ||
+            !backend->hostToDevice(
+                d_batched_k_entry_table_, host_k.data(),
+                table_bytes, device_id_, stream) ||
+            !backend->hostToDevice(
+                d_batched_v_entry_table_, host_v.data(),
+                table_bytes, device_id_, stream))
         {
-            status = hipMalloc(
-                reinterpret_cast<void **>(&d_batched_v_entry_table_),
-                table_bytes);
-        }
-        if (status == hipSuccess)
-        {
-            status = hipMemcpyAsync(
-                d_batched_k_entry_table_, host_k.data(), table_bytes,
-                hipMemcpyHostToDevice, stream);
-        }
-        if (status == hipSuccess)
-        {
-            status = hipMemcpyAsync(
-                d_batched_v_entry_table_, host_v.data(), table_bytes,
-                hipMemcpyHostToDevice, stream);
-        }
-        if (status != hipSuccess)
-        {
-            LOG_ERROR("[ROCmRingKVCacheTQ] Resident entry-table publication failed: "
-                      << hipGetErrorString(status));
+            LOG_ERROR("[ROCmRingKVCacheTQ] Resident entry-table publication failed");
             if (d_batched_k_entry_table_)
-                (void)hipFree(d_batched_k_entry_table_);
+                backend->free(d_batched_k_entry_table_, device_id_);
             if (d_batched_v_entry_table_)
-                (void)hipFree(d_batched_v_entry_table_);
+                backend->free(d_batched_v_entry_table_, device_id_);
             d_batched_k_entry_table_ = nullptr;
             d_batched_v_entry_table_ = nullptr;
             return false;
@@ -523,6 +728,11 @@ namespace llaminar2
         const auto &entry = entries_[layer][desc.seq_idx];
         if (desc.token_count == 0)
         {
+            if (desc.payload_domain ==
+                KVCacheLogicalBlockPayloadDomain::Device)
+            {
+                return true;
+            }
             KVCacheSequenceState state;
             return observeDeviceSequenceState(layer, desc.seq_idx, &state) &&
                    desc.logical_token_start <= state.cached_tokens;
@@ -535,6 +745,61 @@ namespace llaminar2
 
         (void)hipSetDevice(device_id_);
         const auto stream = static_cast<hipStream_t>(desc.stream);
+        if (desc.payload_domain ==
+            KVCacheLogicalBlockPayloadDomain::Device)
+        {
+            if (!d_head_params_ || !d_count_params_)
+                return false;
+
+            const int entry_index =
+                layer * batch_size_ + desc.seq_idx;
+            constexpr int threads = 256;
+            const size_t k_row_bytes =
+                static_cast<size_t>(local_n_kv_heads_) * tq8_block_size_;
+            const size_t v_row_bytes =
+                static_cast<size_t>(local_n_kv_heads_) * tq4_block_size_;
+            const size_t bytes =
+                static_cast<size_t>(desc.token_count) *
+                (k_row_bytes + v_row_bytes);
+            const int blocks = std::max(
+                1,
+                std::min<int>(
+                    65535,
+                    static_cast<int>((bytes + threads - 1) / threads)));
+            hipLaunchKernelGGL(
+                rocm_tq_ring_logical_block_export_device_kernel,
+                dim3(blocks),
+                dim3(threads),
+                0,
+                stream,
+                static_cast<const uint8_t *>(entry.d_K),
+                static_cast<const uint8_t *>(entry.d_V),
+                static_cast<uint8_t *>(dst_k),
+                static_cast<uint8_t *>(dst_v),
+                &d_head_params_[entry_index],
+                &d_count_params_[entry_index],
+                desc.logical_token_start,
+                desc.token_count,
+                max_seq_len_,
+                k_row_bytes,
+                v_row_bytes);
+            const hipError_t launch_error = hipGetLastError();
+            if (launch_error != hipSuccess)
+            {
+                LOG_ERROR("[ROCmRingKVCacheTQ::exportLogicalBlock] device-domain gather launch failed: "
+                          << hipGetErrorString(launch_error));
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "prefix_cache",
+                "rocm_device_logical_tq_kv_exports",
+                1.0,
+                "harvest",
+                "rocm:" + std::to_string(device_id_),
+                {{"tokens", std::to_string(desc.token_count)}});
+            return true;
+        }
+
         KVCacheSequenceState state;
         if (!observeDeviceSequenceState(layer, desc.seq_idx, &state))
             return false;
@@ -589,6 +854,84 @@ namespace llaminar2
         }
         auto &entry = entries_[layer][desc.seq_idx];
         const auto stream = static_cast<hipStream_t>(desc.stream);
+        if (desc.payload_domain ==
+            KVCacheLogicalBlockPayloadDomain::Device)
+        {
+            if (desc.token_count == 0)
+            {
+                if (desc.logical_token_start != 0)
+                    return true;
+                layer_scratch_[layer].invalidate();
+                return setDeviceSequenceState(
+                    layer, desc.seq_idx, 0, 0, stream);
+            }
+            if (!src_k || !src_v || !entry.d_K || !entry.d_V ||
+                !d_head_params_ || !d_count_params_)
+            {
+                return false;
+            }
+
+            const int entry_index =
+                layer * batch_size_ + desc.seq_idx;
+            constexpr int threads = 256;
+            const size_t k_row_bytes =
+                static_cast<size_t>(local_n_kv_heads_) * tq8_block_size_;
+            const size_t v_row_bytes =
+                static_cast<size_t>(local_n_kv_heads_) * tq4_block_size_;
+            const size_t bytes =
+                static_cast<size_t>(desc.token_count) *
+                (k_row_bytes + v_row_bytes);
+            const int blocks = std::max(
+                1,
+                std::min<int>(
+                    65535,
+                    static_cast<int>((bytes + threads - 1) / threads)));
+            hipLaunchKernelGGL(
+                rocm_tq_ring_logical_block_import_device_kernel,
+                dim3(blocks),
+                dim3(threads),
+                0,
+                stream,
+                static_cast<uint8_t *>(entry.d_K),
+                static_cast<uint8_t *>(entry.d_V),
+                static_cast<const uint8_t *>(src_k),
+                static_cast<const uint8_t *>(src_v),
+                &d_head_params_[entry_index],
+                &d_count_params_[entry_index],
+                desc.logical_token_start,
+                desc.token_count,
+                max_seq_len_,
+                k_row_bytes,
+                v_row_bytes);
+            hipLaunchKernelGGL(
+                rocm_tq_ring_logical_block_import_publish_kernel,
+                dim3(1),
+                dim3(1),
+                0,
+                stream,
+                &d_head_params_[entry_index],
+                &d_count_params_[entry_index],
+                desc.logical_token_start,
+                desc.token_count,
+                max_seq_len_);
+            const hipError_t launch_error = hipGetLastError();
+            if (launch_error != hipSuccess)
+            {
+                LOG_ERROR("[ROCmRingKVCacheTQ::importLogicalBlock] device-domain scatter launch failed: "
+                          << hipGetErrorString(launch_error));
+                return false;
+            }
+            layer_scratch_[layer].invalidate();
+            PerfStatsCollector::addCounter(
+                "prefix_cache",
+                "rocm_device_logical_tq_kv_imports",
+                1.0,
+                "restore",
+                "rocm:" + std::to_string(device_id_),
+                {{"tokens", std::to_string(desc.token_count)}});
+            return true;
+        }
+
         if (desc.token_count == 0)
         {
             if (desc.logical_token_start != 0)
@@ -597,11 +940,7 @@ namespace llaminar2
             return setDeviceSequenceState(
                 layer, desc.seq_idx, 0, 0, stream);
         }
-        KVCacheSequenceState state;
-        if (!src_k || !src_v || !entry.d_K || !entry.d_V ||
-            !observeDeviceSequenceState(layer, desc.seq_idx, &state) ||
-            desc.logical_token_start != state.cached_tokens ||
-            state.implementation_head != state.cached_tokens % max_seq_len_)
+        if (!src_k || !src_v || !entry.d_K || !entry.d_V)
         {
             return false;
         }
@@ -626,7 +965,7 @@ namespace llaminar2
         if (!setDeviceSequenceState(
                 layer, desc.seq_idx, new_head, new_count, stream))
             return false;
-        return hipStreamSynchronize(stream) == hipSuccess;
+        return true;
     }
 
     // =========================================================================
@@ -1198,25 +1537,19 @@ namespace llaminar2
 
     void ROCmRingKVCacheTQ::evict_oldest(int layer, int seq_idx, int num_tokens)
     {
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        if (layer < 0 || layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            num_tokens < 0)
             return;
-
-        KVCacheSequenceState state;
-        if (!observeDeviceSequenceState(layer, seq_idx, &state))
-            return;
-        if (num_tokens >= state.cached_tokens)
-        {
-            clear_sequence(layer, seq_idx);
-            return;
-        }
 
         const auto stream = clearStream();
-        if (!setDeviceSequenceState(
-                layer, seq_idx, state.implementation_head,
-                state.cached_tokens - num_tokens, stream) ||
-            hipStreamSynchronize(stream) != hipSuccess)
+        if (!evictOldestDeviceSequenceState(
+                layer,
+                seq_idx,
+                num_tokens,
+                stream))
         {
-            LOG_ERROR("[ROCmRingKVCacheTQ::evict_oldest] Device metadata update failed");
+            LOG_ERROR("[ROCmRingKVCacheTQ::evict_oldest] Device metadata eviction launch failed");
             return;
         }
 

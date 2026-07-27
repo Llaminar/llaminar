@@ -21,6 +21,7 @@
 
 namespace llaminar2
 {
+    class KVCacheAppendStage;
 
     /**
      * @brief Tensor view wrapping external GPU memory
@@ -45,7 +46,30 @@ namespace llaminar2
          */
         GpuTensorView(void *gpu_ptr, size_t rows, size_t cols,
                       TensorType tensor_type, int device_id = 0)
-            : gpu_ptr_(gpu_ptr), rows_(rows), cols_(cols), tensor_type_(tensor_type), device_id_(device_id), shape_({rows, cols})
+            : GpuTensorView(
+                  gpu_ptr,
+                  rows,
+                  cols,
+                  tensor_type,
+                  DeviceId::cuda(device_id))
+        {
+        }
+
+        /**
+         * @brief Construct a backend-qualified pure-device tensor view.
+         *
+         * The older ordinal-only constructor remains CUDA-compatible. ROCm and
+         * heterogeneous infrastructure must use this overload so arena
+         * placement never misidentifies a HIP allocation as CUDA memory.
+         */
+        GpuTensorView(void *gpu_ptr, size_t rows, size_t cols,
+                      TensorType tensor_type, DeviceId device)
+            : gpu_ptr_(gpu_ptr),
+              rows_(rows),
+              cols_(cols),
+              tensor_type_(tensor_type),
+              device_(device),
+              shape_({rows, cols})
         {
         }
 
@@ -85,7 +109,7 @@ namespace llaminar2
         size_t size_bytes() const override { return numel() * element_size_for_type(tensor_type_); }
 
         // Device
-        DeviceId home_device() const override { return DeviceId::cuda(device_id_); }
+        DeviceId home_device() const override { return device_; }
         bool is_on_cpu() const override { return false; }
         bool is_on_gpu() const override { return true; }
 
@@ -121,7 +145,7 @@ namespace llaminar2
         size_t rows_;
         size_t cols_;
         TensorType tensor_type_;
-        int device_id_;
+        DeviceId device_;
         std::vector<size_t> shape_;
 
         static size_t element_size_for_type(TensorType t)
@@ -140,6 +164,62 @@ namespace llaminar2
                 return 4; // Fallback
             }
         }
+    };
+
+    /**
+     * @brief Non-owning view whose producer has already been joined to one stream.
+     *
+     * This type exists for the narrow case where a compute stage first orders a
+     * coherence-aware parent tensor on its executor stream and then passes a
+     * pointer-offset slice to a device kernel. The slice itself cannot own a
+     * second coherence record, so it carries the exact backend-qualified device
+     * and stream on which the parent was prepared.
+     *
+     * Only KVCacheAppendStage may construct this view. Cache adapters must call
+     * isPreparedFor() before consuming it and must never route it back through
+     * TransferEngine as though the non-owning wrapper were a TensorBase owner.
+     * Ordinary GpuTensorView instances do not carry this authority.
+     */
+    class PreparedGpuTensorView final : public GpuTensorView
+    {
+    public:
+        /**
+         * @brief Verify the consumer is the exact producer-ordered boundary.
+         *
+         * @param device Backend-qualified device that will consume the slice.
+         * @param stream Exact consumer stream used by the preparing stage.
+         */
+        bool isPreparedFor(DeviceId device, void *stream) const noexcept
+        {
+            return device == prepared_device_ &&
+                   stream != nullptr &&
+                   stream == prepared_stream_;
+        }
+
+    private:
+        friend class KVCacheAppendStage;
+
+        PreparedGpuTensorView(
+            void *gpu_ptr,
+            size_t rows,
+            size_t cols,
+            TensorType tensor_type,
+            DeviceId device,
+            void *prepared_stream)
+            : GpuTensorView(gpu_ptr, rows, cols, tensor_type, device),
+              prepared_device_(device),
+              prepared_stream_(prepared_stream)
+        {
+            if (!gpu_ptr || !device.is_gpu() || !prepared_stream)
+            {
+                throw std::invalid_argument(
+                    "PreparedGpuTensorView requires device storage, a GPU device, "
+                    "and the exact non-null producer stream");
+            }
+        }
+
+        DeviceId prepared_device_;
+        void *prepared_stream_ = nullptr;
     };
 
 } // namespace llaminar2

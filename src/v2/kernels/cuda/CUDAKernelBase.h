@@ -44,7 +44,7 @@ namespace llaminar2
             workspace_ = workspace;
             if (workspace_)
             {
-                LOG_DEBUG("[CUDAKernelBase] Workspace bound with " << workspace_->bufferCount() << " buffers");
+                LOG_TRACE("[CUDAKernelBase] Workspace bound with " << workspace_->bufferCount() << " buffers");
             }
         }
 
@@ -94,18 +94,44 @@ namespace llaminar2
         void setGPUStream(void *stream) { gpu_stream_ = stream; }
 
         /**
-         * @brief Get the GPU stream for kernel dispatch
+         * @brief Report whether a caller explicitly selected the launch stream.
          *
-         * Returns the explicitly-set GPU stream, falling back to the device
-         * context's default stream if available.
+         * `getStream()` may return a worker-context default. Consumers that
+         * establish transfer or graph ordering must distinguish that fallback
+         * from a stream explicitly owned by the current transaction.
          *
-         * @return cudaStream_t cast to void*, or nullptr if no stream is set
+         * @return true only when `setGPUStream()` received a non-null stream.
+         */
+        [[nodiscard]] bool hasExplicitGPUStream() const noexcept
+        {
+            return gpu_stream_ != nullptr;
+        }
+
+        /**
+         * @brief Get the non-null GPU stream for kernel dispatch.
+         *
+         * Returns the explicitly bound stream, or the worker context's real
+         * non-default stream when the kernel belongs to that context. A kernel
+         * with neither source of stream ownership is not launchable: throwing
+         * here makes the violation happen while C++ evaluates launch arguments,
+         * before CUDA can enqueue work on stream zero.
+         *
+         * @return cudaStream_t cast to a non-null opaque pointer.
+         * @throws std::runtime_error when no owned stream exists.
          */
         void *getStream() const
         {
             if (gpu_stream_)
                 return gpu_stream_;
-            return device_ctx_ ? device_ctx_->defaultStream() : nullptr;
+            if (device_ctx_)
+            {
+                void *stream = device_ctx_->defaultStream();
+                if (stream)
+                    return stream;
+            }
+            throw std::runtime_error(
+                "[CUDAKernelBase] GPU execution requires an explicit or "
+                "worker-context-owned non-null stream");
         }
 
         /**
@@ -121,16 +147,18 @@ namespace llaminar2
          */
         void *requireStream(const char *kernel_name = "CUDAKernel") const
         {
-            void *s = getStream();
-            if (!s)
+            try
+            {
+                return getStream();
+            }
+            catch (const std::runtime_error &)
             {
                 throw std::runtime_error(
                     std::string("[") + kernel_name +
-                    "] No GPU stream set. All CUDA kernels must have an explicit stream "
-                    "bound via setGPUStream() before execution. Running on the default "
-                    "stream causes race conditions with event-based coherence tracking.");
+                    "] No owned GPU stream is available. Bind an explicit "
+                    "stream or a worker context before execution; stream zero "
+                    "cannot participate in event-backed coherence.");
             }
-            return s;
         }
 
         /**

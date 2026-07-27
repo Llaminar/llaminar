@@ -100,6 +100,42 @@ namespace llaminar2
         return std::min(m, static_cast<int>(bounded_rows));
     }
 
+    /**
+     * @brief Plan persistent verifier scratch independently of prompt length.
+     *
+     * A prepared GEMM object is shared by prefill, serial decode, and grouped
+     * verification. Its large-M sizing request therefore describes the prompt
+     * bucket, not the number of verifier rows that must coexist in one K-part
+     * scratch tile. Reserving scratch for every prompt row can consume hundreds
+     * of MiB even though the prefill kernel uses a different workspace.
+     *
+     * The persistent arena covers the complete default verifier capacity, or
+     * the caller's smaller positive row count. Runtime-M implementations tile
+     * larger verifier calls through this same arena, so this planning bound is
+     * an economy decision rather than a semantic M limit.
+     *
+     * @param requested_m Workspace sizing request from the graph or test.
+     * @param n Output width.
+     * @param k Reduction width.
+     * @return Geometry-bounded persistent verifier rows, or zero for invalid
+     *         dimensions.
+     */
+    inline constexpr int nativeVNNIPersistentVerifierWorkspaceRows(
+        int requested_m,
+        int n,
+        int k)
+    {
+        if (requested_m <= 0 || n <= 0 || k <= 0)
+            return 0;
+        const int planned_verifier_rows = std::min(
+            requested_m,
+            kDefaultNativeVNNIVerifierRowCapacity);
+        return nativeVNNIBatchInvariantTileRows(
+            planned_verifier_rows,
+            n,
+            k);
+    }
+
     inline std::vector<int> defaultPrefillGraphBucketSizes()
     {
         return {kDefaultPrefillGraphBucketSizes.begin(),

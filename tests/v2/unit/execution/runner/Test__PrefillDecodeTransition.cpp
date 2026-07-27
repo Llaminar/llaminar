@@ -168,6 +168,7 @@ namespace
         static constexpr int MTP_ARGMAX_TOKEN = 9;
         static constexpr int VERIFY_REJECT_TOKEN = 4;
         static constexpr int DEFERRED_DEVICE_FIRST_TOKEN_SHADOW = -3;
+        static constexpr int DEFERRED_DEVICE_DRAFT_TOKEN_SHADOW = -2;
         static constexpr int kMockResidentOutcomeRequestCapacity = 4;
         static constexpr int kMockVerifierTokenCapacity =
             kMockResidentOutcomeRequestCapacity *
@@ -1734,14 +1735,15 @@ namespace
             return forwardMTPFromLastDraft(draft_condition_token, position_id);
         }
 
-        bool forwardMTPFromDeviceDraftForDeviceSampling(
+        bool forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling(
             int draft_sample_slot,
-            int position_id) override
+            int position_offset) override
         {
-            ++forward_mtp_from_device_draft_for_device_sampling_count_;
+            ++forward_mtp_from_device_draft_at_live_position_for_device_sampling_count_;
             if (!supports_mtp_device_draft_token_input_ ||
                 draft_sample_slot < 0 ||
-                draft_sample_slot >= static_cast<int>(device_draft_sample_tokens_.size()))
+                draft_sample_slot >= static_cast<int>(device_draft_sample_tokens_.size()) ||
+                position_offset < 0)
             {
                 return false;
             }
@@ -1749,15 +1751,18 @@ namespace
                 device_draft_sample_tokens_[static_cast<size_t>(draft_sample_slot)];
             if (token < 0)
                 return false;
-            return forwardMTPFromLastDraft(token, position_id);
+            last_device_draft_live_position_offset_ = position_offset;
+            last_device_draft_resolved_live_position_ =
+                position_ + position_offset;
+            return forwardMTPFromLastDraft(
+                token,
+                last_device_draft_resolved_live_position_);
         }
 
-        bool forwardMTPFromDeviceTargetForDeviceSampling(
-            int target_sample_slot,
-            int position_id) override
+        bool forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(
+            int target_sample_slot) override
         {
-            (void)position_id;
-            ++forward_mtp_from_device_target_for_device_sampling_count_;
+            ++forward_mtp_from_device_target_at_live_position_for_device_sampling_count_;
             if (!supports_mtp_device_draft_token_input_ ||
                 target_sample_slot < 0 ||
                 target_sample_slot >= static_cast<int>(device_target_sample_tokens_.size()))
@@ -1768,6 +1773,7 @@ namespace
                 device_target_sample_tokens_[static_cast<size_t>(target_sample_slot)];
             if (token < 0)
                 return false;
+            last_device_target_live_position_ = position_;
             return forwardMTP(token);
         }
 
@@ -1795,6 +1801,7 @@ namespace
             if (token < 0)
                 return false;
             last_resident_logical_state_sidecar_token_ = token;
+            resident_logical_state_sidecar_tokens_.push_back(token);
             return forwardMTP(token);
         }
 
@@ -2889,6 +2896,35 @@ namespace
 
             device_target_sample_tokens_[static_cast<size_t>(
                 target_sample_slot)] = target_token;
+            return true;
+        }
+
+        bool publishDeviceResidentConditionTokenToTargetSampleSlot(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int target_sample_slot = 0) override
+        {
+            ++resident_condition_token_target_publication_count_;
+            if (!supports_mtp_device_draft_token_input_ ||
+                !logical_state.coversRequest(request_index) ||
+                logical_state.device != primary_device_ ||
+                logical_state.next_condition_tokens_device !=
+                    resident_next_condition_tokens_.data() ||
+                target_sample_slot < 0 ||
+                target_sample_slot >=
+                    static_cast<int>(device_target_sample_tokens_.size()))
+            {
+                return false;
+            }
+
+            const int32_t token =
+                logical_state.next_condition_tokens_device[request_index];
+            if (token < 0)
+                return false;
+            device_target_sample_tokens_[static_cast<size_t>(
+                target_sample_slot)] = token;
+            device_target_sample_ready_[static_cast<size_t>(
+                target_sample_slot)] = true;
             return true;
         }
 
@@ -4277,13 +4313,25 @@ namespace
         {
             return forward_mtp_from_last_draft_for_device_sampling_count_;
         }
-        int forwardMTPFromDeviceDraftForDeviceSamplingCount() const
+        int forwardMTPFromDeviceDraftAtLivePositionForDeviceSamplingCount() const
         {
-            return forward_mtp_from_device_draft_for_device_sampling_count_;
+            return forward_mtp_from_device_draft_at_live_position_for_device_sampling_count_;
         }
-        int forwardMTPFromDeviceTargetForDeviceSamplingCount() const
+        int forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount() const
         {
-            return forward_mtp_from_device_target_for_device_sampling_count_;
+            return forward_mtp_from_device_target_at_live_position_for_device_sampling_count_;
+        }
+        int lastDeviceTargetLivePosition() const
+        {
+            return last_device_target_live_position_;
+        }
+        int lastDeviceDraftLivePositionOffset() const
+        {
+            return last_device_draft_live_position_offset_;
+        }
+        int lastDeviceDraftResolvedLivePosition() const
+        {
+            return last_device_draft_resolved_live_position_;
         }
         int forwardMTPFromResidentLogicalStateForDeviceSamplingCount() const
         {
@@ -4317,6 +4365,10 @@ namespace
         {
             return last_resident_logical_state_sidecar_token_;
         }
+        const std::vector<int32_t> &residentLogicalStateSidecarTokens() const
+        {
+            return resident_logical_state_sidecar_tokens_;
+        }
         int residentAcceptedStateCount(int request_index) const
         {
             if (request_index < 0 ||
@@ -4341,6 +4393,10 @@ namespace
         int stageStochasticTargetTokenCount() const
         {
             return stage_stochastic_target_token_count_;
+        }
+        int residentConditionTokenTargetPublicationCount() const
+        {
+            return resident_condition_token_target_publication_count_;
         }
         const std::vector<int32_t> &lastStagedStochasticDraftTokens() const
         {
@@ -4716,6 +4772,14 @@ namespace
                 enableGroupedOutcomeHostPublication(/*rows=*/4);
                 return;
             }
+            /*
+             * Device-resident sidecar publication is a mandatory GPU MTP
+             * invariant, not an optional capability advertisement. Production
+             * CUDA and ROCm runners cannot enter MTP without this event-ordered
+             * handoff, so a GPU-shaped mock must model it unless a fail-fast
+             * regression explicitly disables the contract below.
+             */
+            supports_mtp_sidecar_stream_handoff_ = true;
         }
         void enableColumnParallelShard(int vocab_start, int vocab_local)
         {
@@ -4750,6 +4814,10 @@ namespace
         void enableMTPSidecarLogitsStreamHandoff()
         {
             supports_mtp_sidecar_stream_handoff_ = true;
+        }
+        void disableMTPSidecarLogitsStreamHandoffForTesting()
+        {
+            supports_mtp_sidecar_stream_handoff_ = false;
         }
         void enableMTPDeviceDraftTokenInput()
         {
@@ -5563,8 +5631,11 @@ namespace
         int forward_mtp_from_last_draft_count_{0};
         int forward_mtp_for_device_sampling_count_{0};
         int forward_mtp_from_last_draft_for_device_sampling_count_{0};
-        int forward_mtp_from_device_draft_for_device_sampling_count_{0};
-        int forward_mtp_from_device_target_for_device_sampling_count_{0};
+        int forward_mtp_from_device_draft_at_live_position_for_device_sampling_count_{0};
+        int forward_mtp_from_device_target_at_live_position_for_device_sampling_count_{0};
+        int last_device_target_live_position_{-1};
+        int last_device_draft_live_position_offset_{-1};
+        int last_device_draft_resolved_live_position_{-1};
         int forward_mtp_and_sample_count_{0};
         int forward_mtp_batch_and_sample_count_{0};
         int advance_mtp_request_batch_condition_on_device_count_{0};
@@ -5618,6 +5689,7 @@ namespace
         int device_probability_verify_row_count_{0};
         int stage_stochastic_draft_tokens_count_{0};
         int stage_stochastic_target_token_count_{0};
+        int resident_condition_token_target_publication_count_{0};
         int device_distribution_request_batch_outcome_count_{0};
         uint64_t last_probability_row_inverse_sample_seed_{0};
         int last_probability_row_inverse_sample_logical_position_{0};
@@ -5656,6 +5728,7 @@ namespace
         int last_device_target_shifted_commit_token_{-1};
         int last_resident_logical_state_shifted_commit_token_{-1};
         int last_resident_logical_state_sidecar_token_{-1};
+        std::vector<int32_t> resident_logical_state_sidecar_tokens_;
         int last_prepare_mtp_verifier_first_token_{-1};
         int last_prepare_mtp_verifier_first_target_sample_slot_{-1};
         int last_prepare_mtp_verifier_first_draft_slot_{-1};
@@ -7705,6 +7778,38 @@ namespace
     }
 
     /**
+     * @brief GPU MTP cannot execute without an event-ordered sidecar handoff.
+     *
+     * The host must never drain the sidecar stream to compensate for a missing
+     * producer event. This regression deliberately removes the mandatory
+     * device contract and proves inference stops before launching a sidecar.
+     */
+    TEST_F(Test__PrefillDecodeTransition, GPUMTPMissingSidecarEventHandoffFailsBeforeDecode)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0));
+        mock->disableMTPSidecarLogitsStreamHandoffForTesting();
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const int forward_count_after_prefill = mock->forwardCallCount();
+
+        GenerationResult step = runner->decodeStep();
+        EXPECT_FALSE(step.success());
+        EXPECT_THAT(
+            step.error,
+            HasSubstr("GPU MTP requires device-resident sidecar stream handoff"));
+        EXPECT_TRUE(step.tokens.empty());
+        EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill);
+        EXPECT_EQ(mock->forwardMTPCount(), 0);
+    }
+
+    /**
      * @brief GPU MTP first-token sampling failures are hard errors.
      *
      * Host logits are intentionally still visible in this regression.  A broken
@@ -8894,6 +8999,7 @@ namespace
             /*mtp_draft_tokens=*/2,
             /*chained_mtp_support=*/true);
         mock->enableMTPSidecarPreservesMainState();
+        mock->enableMTPDeviceDraftTokenInput();
         mock->requireMTPDecodeEquivalentReplay();
         mock->enableDeviceResidentMTPSpecStatePublication();
         mock->setVerifierAcceptedPrefixScript({2});
@@ -8971,6 +9077,7 @@ namespace
                 /*chained_mtp_support=*/true);
             mock->enableMTPSidecarPreservesMainState();
             mock->enableMTPShiftedRowReuseFromSidecar();
+            mock->enableMTPDeviceDraftTokenInput();
             mock->enableDeviceResidentMTPSpecStatePublication();
             mock->setVerifierAcceptedPrefixScript({2});
 
@@ -9008,6 +9115,30 @@ namespace
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
                 << "the promoted penalty-greedy lane must not fall back to "
                    "stepwise decode-equivalent replay";
+            EXPECT_EQ(
+                mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount(),
+                1)
+                << "the first penalty-bearing sidecar must consume the sampled "
+                   "target token and its canonical position without a host "
+                   "token/position pair";
+            EXPECT_EQ(
+                mock->forwardMTPFromDeviceDraftAtLivePositionForDeviceSamplingCount(),
+                1)
+                << "the second penalty-bearing sidecar must consume the first "
+                   "draft token directly from its device slot";
+            EXPECT_EQ(mock->lastDeviceDraftLivePositionOffset(), 1)
+                << "the chained sidecar contributes only its depth offset; "
+                   "the runner owns the live base position";
+            EXPECT_EQ(mock->lastDeviceDraftResolvedLivePosition(),
+                      mock->lastDeviceTargetLivePosition() + 1)
+                << "both sidecars must resolve positions from one live "
+                   "device-owned sequence state";
+            EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0)
+                << "GPU sidecars must not reconstruct the first condition "
+                   "from a host token shadow";
+            EXPECT_EQ(mock->forwardMTPFromLastDraftForDeviceSamplingCount(), 0)
+                << "GPU sidecars must not reconstruct chained token/position "
+                   "inputs from host shadows";
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *row_penalties =
@@ -9064,7 +9195,7 @@ namespace
                    "the runner-owned device target slot until verifier summary.";
             EXPECT_EQ(mock->lastSampleMainLogitsDeviceTargetSlot(), 0);
             EXPECT_EQ(mock->lastSampleMTPLogitsDeviceDraftSlot(), 1);
-            EXPECT_EQ(mock->forwardMTPFromDeviceTargetForDeviceSamplingCount(), 1)
+            EXPECT_EQ(mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount(), 1)
                 << "The first sidecar should consume the deferred target slot "
                    "rather than a host-token condition.";
             EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0)
@@ -9121,7 +9252,9 @@ namespace
                           PerfStatRecord::Kind::Counter,
                           "mtp_token_greedy_device_slot_samples",
                           {{"draft_idx", "1"}}),
-                      nullptr);
+                      nullptr)
+                << "the fused sidecar reports its device-slot sample even when "
+                   "it intentionally omits the host token shadow";
             EXPECT_NE(findPerfRecord(records,
                                      PerfStatRecord::Kind::Counter,
                                      "first_token_greedy_deferred_host_reads"),
@@ -9201,7 +9334,7 @@ namespace
                    "device metadata, not replayed serially";
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
                 << "one grouped verifier forward; no catch-up forwards";
-            EXPECT_EQ(mock->forwardMTPFromDeviceDraftForDeviceSamplingCount(), 1)
+            EXPECT_EQ(mock->forwardMTPFromDeviceDraftAtLivePositionForDeviceSamplingCount(), 1)
                 << "The fused chained sidecar should consume the previous "
                    "draft from the runner-owned device slot instead of a host "
                    "shadow token.";
@@ -9539,7 +9672,7 @@ namespace
             const int resident_sidecar_count_after_step1 =
                 mock->forwardMTPFromResidentLogicalStateForDeviceSamplingCount();
             const int device_target_sidecar_count_after_step1 =
-                mock->forwardMTPFromDeviceTargetForDeviceSamplingCount();
+                mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount();
 
             GenerationResult step2 = runner->decodeStep();
             ASSERT_TRUE(step2.success()) << step2.error;
@@ -9551,7 +9684,7 @@ namespace
                 << "Step two should reuse the already queued first sidecar, "
                    "then enqueue exactly one replacement prelaunch for the "
                    "following step.";
-            EXPECT_EQ(mock->forwardMTPFromDeviceTargetForDeviceSamplingCount(),
+            EXPECT_EQ(mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount(),
                       device_target_sidecar_count_after_step1)
                 << "A matching resident prelaunch must replace the older "
                    "target-slot sidecar replay on the next greedy step.";
@@ -9861,9 +9994,19 @@ namespace
                 MockInferenceRunner::VERIFY_REJECT_TOKEN,
                 MockInferenceRunner::DECODE_ARGMAX_TOKEN,
             });
+            /*
+             * The replay diagnostic first derives the ready token by forwarding
+             * the rejected correction, then restores the verifier base and
+             * replays every grouped output transition. Model the exact serial
+             * sequence 7 -> 4 -> 3: the first sample below is the derived ready
+             * token after correction 4, and the second is the serial result
+             * after grouped token 7. Supplying 3 for both would make the mock
+             * grouped result intentionally non-equivalent and should fail the
+             * byte-exact per-row oracle.
+             */
             mock->setDecodeArgmaxScript({
                 MockInferenceRunner::DECODE_ARGMAX_TOKEN,
-                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                MockInferenceRunner::VERIFY_REJECT_TOKEN,
                 MockInferenceRunner::DECODE_ARGMAX_TOKEN,
                 MockInferenceRunner::DECODE_ARGMAX_TOKEN,
                 MockInferenceRunner::DECODE_ARGMAX_TOKEN,
@@ -10089,6 +10232,7 @@ namespace
             mock->enableMTPSidecarPreservesMainState();
             mock->enableMTPShiftedRowReuseFromSidecar();
             mock->enableMTPSidecarLogitsStreamHandoff();
+            mock->enableMTPDeviceDraftTokenInput();
             mock->requireMTPDecodeEquivalentReplay();
             mock->enableDeviceResidentMTPSpecStatePublication();
             mock->setVerifierAcceptedPrefixScript({1});
@@ -10215,8 +10359,6 @@ namespace
         mock->enableStochasticDeviceSampling();
         mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
         mock->enableMTPDeviceDraftTokenInput();
-        mock->enableMTPDeviceDraftTokenInput();
-        mock->enableMTPDeviceDraftTokenInput();
         mock->enableDeviceResidentMTPSpecStatePublication();
         mock->hideMTPSpecStatePublicationFromPolicy();
         mock->setVerifierAcceptedPrefixScript({1});
@@ -10241,9 +10383,12 @@ namespace
         EXPECT_EQ(mock->setRowIndexedAllPositionCount(), 2);
         EXPECT_EQ(mock->setAllPositionCount(), 2);
         EXPECT_THAT(mock->lastMTPSpecVerifierRows(), ElementsAre(0, 1));
-        EXPECT_EQ(mock->stageStochasticDraftTokensCount(), 1)
-            << "host-visible draft shadows must be explicitly staged into "
-               "runner-owned verifier slots before the compact outcome reducer";
+        EXPECT_EQ(mock->stageStochasticDraftTokensCount(), 0)
+            << "The sidecar publishes directly into runner-owned device slots; "
+               "restaging a host draft shadow would reintroduce an H2D seam.";
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1)
+            << "The compact verifier row must be composed from resident target "
+               "and draft slots on the verifier stream.";
         EXPECT_FALSE(mock->batchOutcomeUsedHostDraftTokens())
             << "the grouped outcome reducer must read device draft slots, not "
                "host draft-token pointers";
@@ -10380,7 +10525,7 @@ namespace
                "complete and no sidecar or verifier graph should run.";
         EXPECT_EQ(mock->forwardMTPCount(), 0);
         EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0);
-        EXPECT_EQ(mock->forwardMTPFromDeviceTargetForDeviceSamplingCount(), 0);
+        EXPECT_EQ(mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount(), 0);
         EXPECT_EQ(mock->setAllPositionCount(), 0);
         EXPECT_EQ(mock->setRowIndexedAllPositionCount(), 0);
         EXPECT_EQ(mock->verifyStochasticRequestBatchOutcomeCount(), 0);
@@ -10496,7 +10641,7 @@ namespace
             << "Strict grouped outcome sampling happens inside the resident "
                "serial-equivalent reducer; first-token sampling is protected by "
                "the deferred counter above.";
-        EXPECT_EQ(mock->forwardMTPFromDeviceTargetForDeviceSamplingCount(), 1);
+        EXPECT_EQ(mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount(), 1);
         EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0)
             << "The grouped sidecar must consume the device target slot, not a host token.";
         EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 1);
@@ -10795,6 +10940,7 @@ namespace
         mock->enableMTPSidecarPreservesMainState();
         mock->enableMTPShiftedRowReuseFromSidecar();
         mock->enableMTPSidecarLogitsStreamHandoff();
+        mock->enableMTPDeviceDraftTokenInput();
         mock->requireMTPDecodeEquivalentReplay();
         mock->enableDeviceResidentMTPSpecStatePublication();
         mock->setVerifierAcceptedPrefixScript({1});
@@ -10997,7 +11143,7 @@ namespace
             EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0)
                 << "the first sidecar should consume the prefill token from the "
                    "device target slot rather than a host-uploaded token";
-            EXPECT_EQ(mock->forwardMTPFromDeviceTargetForDeviceSamplingCount(), 1);
+            EXPECT_EQ(mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount(), 1);
             EXPECT_EQ(mock->forwardMTPFromLastDraftForDeviceSamplingCount(), 0);
             EXPECT_EQ(mock->flushPendingMTPWorkCount(), 0)
                 << "resident sidecar and verifier inputs carry their own stream "
@@ -11055,7 +11201,7 @@ namespace
             const int resident_sidecar_count_after_step1 =
                 mock->forwardMTPFromResidentLogicalStateForDeviceSamplingCount();
             const int device_target_sidecar_count_after_step1 =
-                mock->forwardMTPFromDeviceTargetForDeviceSamplingCount();
+                mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount();
             const int host_condition_sidecar_count_after_step1 =
                 mock->forwardMTPForDeviceSamplingCount();
             EXPECT_EQ(mock->residentSidecarCountAtLastHostBridge(), 1)
@@ -11072,7 +11218,7 @@ namespace
                 << "Step two should reuse the sidecar prelaunched from the "
                    "bonus ready token, then queue the following resident "
                    "sidecar before the host bridge.";
-            EXPECT_EQ(mock->forwardMTPFromDeviceTargetForDeviceSamplingCount(),
+            EXPECT_EQ(mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount(),
                       device_target_sidecar_count_after_step1)
                 << "A resident ready token should supersede the older deferred "
                    "target-slot sidecar input path on the following step.";
@@ -11256,13 +11402,13 @@ namespace
                                     MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0);
-            EXPECT_EQ(mock->forwardMTPFromDeviceTargetForDeviceSamplingCount(), 1)
+            EXPECT_EQ(mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount(), 1)
                 << "the first stochastic sidecar should consume the deferred "
                    "main-model target token from its device slot";
             EXPECT_EQ(mock->deviceTargetShiftedCommitCount(), 0)
                 << "the all-position publication path reuses the first shifted "
                    "row appended by the device-target sidecar";
-            EXPECT_EQ(mock->forwardMTPFromDeviceDraftForDeviceSamplingCount(), 1)
+            EXPECT_EQ(mock->forwardMTPFromDeviceDraftAtLivePositionForDeviceSamplingCount(), 1)
                 << "depth>1 stochastic sidecar chaining should consume the "
                    "previous sampled draft token from the device slot";
             EXPECT_EQ(mock->forwardMTPFromLastDraftForDeviceSamplingCount(), 0)
@@ -11327,7 +11473,7 @@ namespace
             const PerfStatRecord *device_input =
                 findPerfRecordWithTags(records,
                                        PerfStatRecord::Kind::Counter,
-                                       "stochastic_sidecar_device_token_inputs",
+                                       "sidecar_iteration_host_flushes_avoided",
                                        {{"draft_idx", "1"}});
             ASSERT_NE(device_input, nullptr);
             const PerfStatRecord *verifier_device_input =
@@ -11404,7 +11550,7 @@ namespace
                                     MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             EXPECT_EQ(mock->sampleMTPLogitsToDeviceDraftSlotCount(), 2);
-            EXPECT_EQ(mock->forwardMTPFromDeviceDraftForDeviceSamplingCount(), 1)
+            EXPECT_EQ(mock->forwardMTPFromDeviceDraftAtLivePositionForDeviceSamplingCount(), 1)
                 << "The second sidecar should consume the first sampled draft "
                    "directly from the runner-owned device slot.";
             EXPECT_EQ(mock->forwardMTPFromLastDraftForDeviceSamplingCount(), 0)
@@ -11421,18 +11567,22 @@ namespace
                           "mtp_token_greedy_device_slot_deferred_host_reads",
                           {{"draft_idx", "0"}}),
                       nullptr);
-            EXPECT_EQ(findPerfRecordWithTags(
+            EXPECT_NE(findPerfRecordWithTags(
                           records,
                           PerfStatRecord::Kind::Counter,
                           "mtp_token_greedy_device_slot_deferred_host_reads",
                           {{"draft_idx", "1"}}),
-                      nullptr);
-            EXPECT_NE(findPerfRecordWithTags(
+                      nullptr)
+                << "the final grouped draft is already consumed by the "
+                   "device-token verifier row and must not cross to the host";
+            EXPECT_EQ(findPerfRecordWithTags(
                           records,
                           PerfStatRecord::Kind::Counter,
                           "mtp_token_greedy_device_slot_samples",
                           {{"draft_idx", "1"}}),
-                      nullptr);
+                      nullptr)
+                << "the non-fused final draft is represented by the deferred "
+                   "host-read counter, not a host-visible sample counter";
             EXPECT_EQ(findPerfRecord(records,
                                      PerfStatRecord::Kind::Counter,
                                      "mtp_token_greedy_device_slot_failures"),
@@ -11473,6 +11623,7 @@ namespace
             mock->enableMTPSidecarPreservesMainState();
             mock->enableMTPShiftedRowReuseFromSidecar();
             mock->enableMTPSidecarLogitsStreamHandoff();
+            mock->enableMTPDeviceDraftTokenInput();
             mock->enableDeviceResidentMTPSpecStatePublication();
             mock->setVerifierAcceptedPrefixScript({0, 1});
             mock->setDecodeArgmaxScript({MockInferenceRunner::DECODE_ARGMAX_TOKEN});
@@ -11501,7 +11652,9 @@ namespace
             EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0)
                 << "penalty-bearing stochastic sampling is history-dependent, "
                    "so it must not use the deferred sidecar logits handoff";
-            EXPECT_EQ(mock->flushPendingMTPWorkCount(), 2);
+            EXPECT_EQ(mock->flushPendingMTPWorkCount(), 0)
+                << "Penalty kernels and verifier input composition consume the "
+                   "published sidecar event; penalties do not justify a host flush.";
             EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
                 << "the residual correction remains a pending condition until "
                    "the next verifier row consumes it";
@@ -11574,9 +11727,17 @@ namespace
             ASSERT_TRUE(step2.success()) << step2.error;
             EXPECT_THAT(step2.tokens, ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN))
                 << "the pending correction is verifier input, not a newly emitted token";
-            EXPECT_EQ(mock->lastMTPConditionToken(),
-                      MockInferenceRunner::VERIFY_REJECT_TOKEN)
-                << "the sidecar should draft from the rejected correction token";
+            EXPECT_THAT(
+                mock->residentLogicalStateSidecarTokens(),
+                ElementsAre(
+                    MockInferenceRunner::VERIFY_REJECT_TOKEN,
+                    MockInferenceRunner::DECODE_ARGMAX_TOKEN))
+                << "The second step must consume the rejected correction from "
+                   "the resident mailbox, then prelaunch from the newly "
+                   "published ready-token mailbox.";
+            EXPECT_EQ(
+                mock->forwardMTPFromResidentLogicalStateForDeviceSamplingCount(),
+                2);
             EXPECT_EQ(mock->forwardMTPCount(), mtp_count_after_reject + 1);
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_reject + 1)
                 << "pending correction row should skip the standalone condition_forward";
@@ -11909,9 +12070,21 @@ namespace
                       static_cast<size_t>(forward_count_after_prefill));
             EXPECT_THAT(mock->forwardHistory()[static_cast<size_t>(forward_count_after_prefill)],
                         ElementsAre(MockInferenceRunner::DEFERRED_DEVICE_FIRST_TOKEN_SHADOW,
-                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                                    MockInferenceRunner::DEFERRED_DEVICE_DRAFT_TOKEN_SHADOW,
+                                    MockInferenceRunner::DEFERRED_DEVICE_DRAFT_TOKEN_SHADOW,
+                                    MockInferenceRunner::DEFERRED_DEVICE_DRAFT_TOKEN_SHADOW))
+                << "the host verifier row is metadata only; every authoritative "
+                   "token remains in its device sample slot";
+            EXPECT_THAT(
+                std::vector<int32_t>(
+                    mock->deviceVerifierInputTokens().begin(),
+                    mock->deviceVerifierInputTokens().begin() + 4),
+                ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                            MockInferenceRunner::MTP_ARGMAX_TOKEN))
+                << "the grouped verifier graph must receive the complete "
+                   "authoritative token row assembled from device slots";
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             EXPECT_EQ(findPerfRecord(records,
@@ -12182,7 +12355,16 @@ namespace
                    "row-serial correction forward";
             EXPECT_THAT(mock->lastForwardTokens(),
                         ElementsAre(MockInferenceRunner::DEFERRED_DEVICE_FIRST_TOKEN_SHADOW,
-                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                                    MockInferenceRunner::DEFERRED_DEVICE_DRAFT_TOKEN_SHADOW))
+                << "the host verifier row carries only device-token sentinels";
+            EXPECT_THAT(
+                std::vector<int32_t>(
+                    mock->deviceVerifierInputTokens().begin(),
+                    mock->deviceVerifierInputTokens().begin() + 2),
+                ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                            MockInferenceRunner::MTP_ARGMAX_TOKEN))
+                << "the grouped verifier graph consumes the authoritative "
+                   "target and draft tokens from device sample slots";
             EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
 
@@ -13385,11 +13567,11 @@ namespace
         EXPECT_EQ(probe.mtp_accepted_tokens, 3u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, ROCmLocalTPMTPExplicitSegmentedCollectivesUseMirroredResidentPath)
+    TEST_F(Test__PrefillDecodeTransition, ROCmLocalTPMTPFullGraphUsesMirroredResidentPath)
     {
         ScopedEnv gpu_graphs("LLAMINAR_GPU_GRAPHS", "1");
-        ScopedEnv capture_collectives("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "0");
-        ScopedEnv segmented_collectives("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1");
+        ScopedEnv capture_collectives("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1");
+        ScopedEnv segmented_collectives("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0");
 
         auto harness = createLocalTPRunner(
             /*mtp_accept=*/true,
@@ -13417,15 +13599,25 @@ namespace
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
-        EXPECT_EQ(harness.child0->forwardMTPCount(), 1);
-        EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
+        EXPECT_EQ(harness.child0->forwardMTPCount(), 2);
+        EXPECT_EQ(harness.child1->forwardMTPCount(), 2)
+            << "Each child runs the current draft sidecar and prelaunches the "
+               "next sidecar from the published resident ready-token mailbox.";
+        EXPECT_EQ(
+            harness.child0
+                ->forwardMTPFromResidentLogicalStateForDeviceSamplingCount(),
+            1);
+        EXPECT_EQ(
+            harness.child1
+                ->forwardMTPFromResidentLogicalStateForDeviceSamplingCount(),
+            1);
         EXPECT_EQ(harness.child0->sampleMTPLogitsToDeviceDraftSlotCount(), 1);
         EXPECT_EQ(harness.child1->sampleMTPLogitsToDeviceDraftSlotCount(), 1)
-            << "Explicit segmented capture must still use mirrored child "
+            << "Full-graph capture must use mirrored child "
                "device draft-slot sampling rather than rank-local shard logits.";
         EXPECT_EQ(harness.child0->verifyGreedyAllPositionBatchOutcomeCount(), 1);
         EXPECT_EQ(harness.child1->verifyGreedyAllPositionBatchOutcomeCount(), 1)
-            << "ROCm LocalTP with explicit segmented collective graph capture "
+            << "ROCm LocalTP full-graph collective capture "
                "must still use child-local mirrored resident verifier summaries.";
         EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 1);
         EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 1);
@@ -13950,6 +14142,175 @@ namespace
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
+    }
+
+    /**
+     * @brief Prove a GPU depth-zero budget clamp remains device-owned.
+     *
+     * This is a device-free orchestration regression: the mock advertises a
+     * CUDA owner but executes no CUDA work. A max-new-token boundary can reduce
+     * the effective speculative depth to zero after the normal MTP policy has
+     * selected a grouped, device-resident verifier. The emitted token must
+     * remain in its persistent target slot for both shifted-MTP publication and
+     * the main-model state advance; the host scalar exists only as the response
+     * and sampler-history shadow.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           MTPGpuBudgetClampDirectEmitUsesOneDeviceTargetSlotEndToEnd)
+    {
+        auto [runner, mock] =
+            createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
+        mock->setPrimaryDevice(DeviceId::cuda(0));
+        mock->enableMTPTokenCoordination(/*hide_local_logits=*/false);
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        const int forward_count_after_prefill = mock->forwardCallCount();
+
+        runner->setDecodeStepTokenBudget(1);
+        GenerationResult step = runner->decodeStep();
+        runner->setDecodeStepTokenBudget(0);
+
+        ASSERT_TRUE(step.success()) << step.error;
+        EXPECT_THAT(step.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->sampleMainLogitsToDeviceTargetSlotCount(), 1)
+            << "GPU direct emit must persist the sampled output token before "
+               "shifted-state publication.";
+        EXPECT_EQ(mock->deviceTargetShiftedCommitCount(), 1)
+            << "GPU shifted MTP publication must consume the persistent target slot.";
+        EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 1)
+            << "GPU main-state advance must read a device token row.";
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 1)
+            << "The direct-emit main input must be materialized from the same target slot.";
+        EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1);
+        EXPECT_THAT(mock->lastForwardTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+    }
+
+    /**
+     * @brief Prove a cached verifier bonus token remains device-owned at a
+     *        one-token output boundary.
+     *
+     * The first transaction accepts its grouped draft and publishes the bonus
+     * token through the resident logical-state mailbox. The second transaction
+     * has room for that bonus token but no speculative rows. It must snapshot
+     * the resident token D2D into the target arena before shifted-cache commit
+     * retargets the mailbox, then use that same target slot for the main graph.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           MTPGpuBudgetClampPublishesResidentReadyTokenD2D)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false);
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+        mock->enableMTPSidecarPreservesMainState();
+        mock->enableMTPShiftedRowReuseFromSidecar();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->setVerifierAcceptedPrefixScript({1});
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        GenerationResult first = runner->decodeStep();
+        ASSERT_TRUE(first.success()) << first.error;
+        EXPECT_THAT(first.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        const int resident_publications_before =
+            mock->residentConditionTokenTargetPublicationCount();
+        const int resident_commits_before =
+            mock->residentLogicalStateShiftedCommitCount();
+        const int device_target_commits_before =
+            mock->deviceTargetShiftedCommitCount();
+        const int device_first_prepares_before =
+            mock->prepareMTPVerifierInputTokensDeviceFirstCount();
+        const int device_forwards_before =
+            mock->forwardWithDeviceTokenIdsCount();
+
+        runner->setDecodeStepTokenBudget(1);
+        GenerationResult direct = runner->decodeStep();
+        runner->setDecodeStepTokenBudget(0);
+
+        ASSERT_TRUE(direct.success()) << direct.error;
+        ASSERT_THAT(direct.tokens, SizeIs(1));
+        EXPECT_EQ(mock->residentConditionTokenTargetPublicationCount(),
+                  resident_publications_before + 1);
+        EXPECT_EQ(mock->residentLogicalStateShiftedCommitCount(),
+                  resident_commits_before + 1)
+            << "Shifted publication must consume the mailbox-owned token and position.";
+        EXPECT_EQ(mock->deviceTargetShiftedCommitCount(),
+                  device_target_commits_before)
+            << "The target slot preserves the token across mailbox retargeting; "
+               "it must not replace the resident position authority.";
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(),
+                  device_first_prepares_before + 1);
+        EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(),
+                  device_forwards_before + 1);
+        EXPECT_EQ(direct.tokens.front(),
+                  mock->lastResidentLogicalStateShiftedCommitToken());
+    }
+
+    /**
+     * @brief Apply the resident ready-token direct-emit contract symmetrically
+     *        to every mirrored LocalTP participant.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           LocalTPGpuBudgetClampPublishesResidentReadyTokenD2DPerParticipant)
+    {
+        auto harness = createLocalTPRunner(
+            /*mtp_accept=*/true,
+            /*column_parallel_logits=*/true,
+            {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
+            /*mtp_draft_tokens=*/1,
+            {},
+            /*spec_state_publication=*/false);
+        for (MockInferenceRunner *child : {harness.child0, harness.child1})
+        {
+            child->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            child->enableMTPDeviceDraftTokenInput();
+            child->enableMTPSidecarPreservesMainState();
+            child->enableMTPShiftedRowReuseFromSidecar();
+            child->enableMirroredLocalTPMTPHeadForVerifier();
+            child->setVerifierAcceptedPrefixScript({1});
+        }
+
+        ASSERT_TRUE(harness.runner->prefill({1, 2, 3, 4, 5}));
+        GenerationResult first = harness.runner->decodeStep();
+        ASSERT_TRUE(first.success()) << first.error;
+        EXPECT_THAT(first.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        harness.runner->setDecodeStepTokenBudget(1);
+        GenerationResult direct = harness.runner->decodeStep();
+        harness.runner->setDecodeStepTokenBudget(0);
+
+        ASSERT_TRUE(direct.success()) << direct.error;
+        ASSERT_THAT(direct.tokens, SizeIs(1));
+        for (MockInferenceRunner *child : {harness.child0, harness.child1})
+        {
+            EXPECT_EQ(child->residentConditionTokenTargetPublicationCount(), 1);
+            EXPECT_EQ(child->residentLogicalStateShiftedCommitCount(), 1);
+            EXPECT_EQ(child->deviceTargetShiftedCommitCount(), 0);
+            EXPECT_EQ(child->prepareMTPVerifierInputTokensDeviceFirstCount(), 2)
+                << "One preparation belongs to grouped verification and one to "
+                   "the budget-limited direct main forward.";
+            EXPECT_EQ(child->forwardWithDeviceTokenIdsCount(), 2);
+            EXPECT_EQ(direct.tokens.front(),
+                      child->lastResidentLogicalStateShiftedCommitToken());
+        }
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPGenerateCountsAcceptedDraftsTowardMaxNewTokens)

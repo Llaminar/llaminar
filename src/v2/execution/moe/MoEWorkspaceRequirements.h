@@ -81,14 +81,49 @@ namespace llaminar2
         constexpr const char *ROCM_RUNTIME_PREFILL_UP_DESC_TABLE = "rocm_moe_runtime_prefill_up_desc_table";
         constexpr const char *ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE = "rocm_moe_runtime_prefill_down_desc_table";
 
-        constexpr int kRuntimePointerTableSlots = 1024;
+        /**
+         * @brief Maximum number of MoE transformer layers resident on one device.
+         *
+         * Router-weight caches and histogram tables are owned once per model
+         * layer. Keeping this architectural bound named separately prevents
+         * graph-role metadata from accidentally inheriting the smaller
+         * one-owner-per-layer capacity again.
+         */
+        constexpr int kMaximumMoELayersPerDevice = 128;
+        /**
+         * @brief Maximum retained grouped-descriptor identities per MoE layer.
+         *
+         * One model layer can simultaneously retain descriptor identities for
+         * ordinary prefill, serial decode, grouped verifier, MTP sidecars, and
+         * graph-bucket/topology variants. These owners coexist because captured
+         * graphs record descriptor addresses for their complete lifetime.
+         *
+         * This is an ownership bound, not an execution-depth or request-count
+         * bound. Slot acquisition occurs while graph metadata is prepared; graph
+         * launch and replay only dereference the already leased device address.
+         */
+        constexpr int kMaximumGroupedDescriptorOwnersPerMoELayer = 8;
+        constexpr int kGroupedDescriptorTableSlots =
+            kMaximumMoELayersPerDevice *
+            kMaximumGroupedDescriptorOwnersPerMoELayer;
+        constexpr int kRuntimePointerTableSlots = kGroupedDescriptorTableSlots;
         constexpr int kRuntimePointerWorkspaceScopes = 3;
         constexpr int kRuntimePointerWorkspaceEntries =
             kRuntimePointerTableSlots * kRuntimePointerWorkspaceScopes;
         constexpr int kRuntimePointerArrayMaxTopK = 16;
-        constexpr int kGroupedDescriptorTableSlots = 128;
-        constexpr int kRouterGateCacheSlots = 128;
-        constexpr int kHistogramLayerSlots = 128;
+        /**
+         * @brief Per-device capacity for graph-lifetime MoE metadata owners.
+         *
+         * Descriptor tables and fixed-topology masks are immutable inputs to a
+         * captured graph. They therefore use one leased slot per live MoE
+         * pipeline owner instead of the request scratch region shared by
+         * sequential stages.
+         */
+        constexpr int kRouterGateCacheSlots = kMaximumMoELayersPerDevice;
+        constexpr int kHistogramLayerSlots = kMaximumMoELayersPerDevice;
+        static_assert(
+            kGroupedDescriptorTableSlots <= kRuntimePointerTableSlots,
+            "Every persistent descriptor identity needs a matching runtime pointer-table identity");
         /**
          * @brief Reusable row tile used by verifier split-K partial buffers.
          *
@@ -159,7 +194,9 @@ namespace llaminar2
             add(reqs, GROUP_ORIGINAL_EXPERT_IDS, total_slots * sizeof(int));
             add(reqs, GROUP_WEIGHTS, total_slots * sizeof(float));
             add(reqs, GROUP_ACTIVE_EXPERT_IDS, active_expert_id_slots * sizeof(int));
-            add(reqs, GROUP_EXPERT_MASK, static_cast<std::size_t>(num_experts) * sizeof(uint8_t));
+            add(reqs, GROUP_EXPERT_MASK,
+                static_cast<std::size_t>(kGroupedDescriptorTableSlots) *
+                    static_cast<std::size_t>(num_experts) * sizeof(uint8_t));
             add(reqs, GROUP_OFFSETS, static_cast<std::size_t>(num_experts) * sizeof(int));
             add(reqs, GROUP_COUNTS, static_cast<std::size_t>(num_experts) * sizeof(int));
             add(reqs, GROUP_WRITE_HEADS, static_cast<std::size_t>(num_experts) * sizeof(int));
@@ -235,8 +272,16 @@ namespace llaminar2
             add(reqs, CUDA_GROUPED_GATE_DESC_TABLES, table_descs);
             add(reqs, CUDA_GROUPED_UP_DESC_TABLES, table_descs);
             add(reqs, CUDA_GROUPED_DOWN_DESC_TABLES, table_descs);
-            const std::size_t runtime_prefill_descs =
-                static_cast<std::size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            /*
+             * Runtime-placement grouped graphs materialize the current
+             * device-resident expert pointers before launching their GEMMs.
+             * Those mutable descriptor values are graph-owner state: a main
+             * verifier graph, an MTP sidecar, and a rebalance topology graph
+             * may all remain live at once.  Give every retained immutable
+             * descriptor identity a matching fixed-stride runtime slot so one
+             * graph can never overwrite another graph's captured addresses.
+             */
+            const std::size_t runtime_prefill_descs = table_descs;
             add(reqs, CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE, runtime_prefill_descs);
             add(reqs, CUDA_RUNTIME_PREFILL_UP_DESC_TABLE, runtime_prefill_descs);
             add(reqs, CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE, runtime_prefill_descs);
@@ -337,8 +382,15 @@ namespace llaminar2
             add(reqs, ROCM_GROUPED_GATE_DESC_TABLES, table_descs);
             add(reqs, ROCM_GROUPED_UP_DESC_TABLES, table_descs);
             add(reqs, ROCM_GROUPED_DOWN_DESC_TABLES, table_descs);
-            const std::size_t runtime_prefill_descs =
-                static_cast<std::size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            /*
+             * Runtime-placement grouped graphs materialize mutable descriptor
+             * values on device.  The destination is owned by the persistent
+             * descriptor lease retained by that graph, not by the device-wide
+             * MoE kernel singleton.  Match the immutable table arena's slot
+             * count and stride so concurrently retained verifier/rebalance
+             * graphs cannot alias one another.
+             */
+            const std::size_t runtime_prefill_descs = table_descs;
             add(reqs, ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE, runtime_prefill_descs);
             add(reqs, ROCM_RUNTIME_PREFILL_UP_DESC_TABLE, runtime_prefill_descs);
             add(reqs, ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE, runtime_prefill_descs);

@@ -18,6 +18,8 @@
 #include <hip/hip_fp16.h>
 #include <cstdio>
 #include <cstdint>
+#include <stdexcept>
+#include "../../../backends/BackendManager.h"
 #include "../../../utils/DebugEnv.h"
 
 namespace {
@@ -1531,15 +1533,25 @@ __global__ void rocm_gdn_slice_modular_conv_state_kernel(
 
 extern "C" {
 
-bool rocmGDN_gpu_malloc(float **ptr, size_t count)
+bool rocmGDN_gpu_malloc(float **ptr, size_t count, int device_ordinal)
 {
-    hipError_t err = hipMalloc(ptr, count * sizeof(float));
-    return err == hipSuccess;
+    auto *backend = llaminar2::getROCmBackend();
+    if (!backend)
+        return false;
+    *ptr = static_cast<float *>(
+        backend->allocate(count * sizeof(float), device_ordinal));
+    return *ptr != nullptr;
 }
 
-void rocmGDN_gpu_free(float *ptr)
+void rocmGDN_gpu_free(float *ptr, int device_ordinal)
 {
-    if (ptr) (void)hipFree(ptr);
+    if (!ptr)
+        return;
+    auto *backend = llaminar2::getROCmBackend();
+    if (!backend)
+        throw std::runtime_error(
+            "[ROCm GDN] ROCm backend unavailable during state teardown");
+    backend->free(ptr, device_ordinal);
 }
 
 void rocmGDN_gpu_memset_zero(float *ptr, size_t count)

@@ -84,6 +84,57 @@ namespace
     }
 
     /**
+     * @brief Print generated CUDA grouped-GEMV decisions for a failed depth.
+     *
+     * A full model run records thousands of kernel counters. Dumping all of
+     * them obscures the first divergent projection, so this diagnostic keeps
+     * only NativeVNNI dispatches for serial M=1 and the failing runtime M.
+     * Printing both is important because eager and graph-captured policy
+     * surfaces may select different reduction parenthesizations. Geometry,
+     * codebook, execution mode, route, K partitioning, and grouped row reuse
+     * remain visible together, which is enough to distinguish a grouped-kernel
+     * arithmetic defect from a mismatched execution-mode contract.
+     */
+    void printCudaGroupedGemvFailureDiagnostics(int verifier_rows)
+    {
+        const std::string expected_m = std::to_string(verifier_rows);
+        const auto records = PerfStatsCollector::snapshot({"kernel"});
+        std::cerr << "CUDA grouped verifier dispatches for M="
+                  << verifier_rows << ":\n";
+        for (const auto &record : records)
+        {
+            if (record.name != "cuda_native_vnni_gemv_dispatch")
+                continue;
+
+            const auto m = record.tags.find("m");
+            if (m == record.tags.end() ||
+                (m->second != expected_m && m->second != "1"))
+            {
+                continue;
+            }
+
+            auto tag = [&](const char *name) -> std::string
+            {
+                const auto it = record.tags.find(name);
+                return it == record.tags.end() ? "<missing>" : it->second;
+            };
+            std::cerr << "  codebook=" << tag("codebook")
+                      << " m=" << tag("m")
+                      << " n=" << tag("n")
+                      << " k=" << tag("k")
+                      << " mode=" << tag("execution_mode")
+                      << " policy_mode=" << tag("policy_execution_mode")
+                      << " contract=" << tag("semantic_contract")
+                      << " candidate=" << tag("effective_candidate_id")
+                      << " route=" << tag("route")
+                      << " tile_n=" << tag("tile_n")
+                      << " cpt=" << tag("cpt")
+                      << " effective_kb=" << tag("effective_kb")
+                      << '\n';
+        }
+    }
+
+    /**
      * @brief Build a dense SingleDevice parity case for the requested backend.
      *
      * The shared dense helper owns model loading, prefix setup, row-plan
@@ -356,6 +407,13 @@ namespace
         runDenseMainVerifierGroupedRowsMatchSerialDecode(
             test_case,
             verifier_rows);
+        if (::testing::Test::HasFailure())
+        {
+            if (backend == VerifierBackend::CUDA)
+                printCudaGroupedGemvFailureDiagnostics(verifier_rows);
+            PerfStatsCollector::reset();
+            return;
+        }
         expectLMHeadGroupedDecodeEquivalentVerifierPrefillPath(verifier_rows);
         PerfStatsCollector::reset();
     }
@@ -381,6 +439,13 @@ namespace
         runMoEMainVerifierGroupedRowsMatchSerialDecode(
             test_case,
             verifier_rows);
+        if (::testing::Test::HasFailure())
+        {
+            if (backend == VerifierBackend::CUDA)
+                printCudaGroupedGemvFailureDiagnostics(verifier_rows);
+            PerfStatsCollector::reset();
+            return;
+        }
         expectLMHeadGroupedDecodeEquivalentVerifierPrefillPath(verifier_rows);
 
         if (backend == VerifierBackend::CUDA)

@@ -1285,7 +1285,7 @@ def generate_include(
         "    TwoRowNbc2 = 2,",
         "    TwoRowNbc4 = 3,",
         "    TwoRowNbc8 = 4,",
-        "    TwoRowNbc16 = 5,",
+        "    RetiredTwoRowNbc16 = 5,",
         "    KPartPairwise = 6,",
         "    KPartWideRows = 7,",
         "    TwoRowPairGridNbc1 = 8,",

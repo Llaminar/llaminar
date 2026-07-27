@@ -45,8 +45,6 @@
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
-#include "kernels/rocm/gemm/ROCmNativeVNNIPrefillDispatchGenerated.inc"
-
 // ============================================================================
 // Format tags — full set matching ROCmGemvKernel_native_VNNI.hip
 //
@@ -2376,18 +2374,6 @@ static bool launch_native_vnni_gemm(
         if (eff_n128 && eff_mt > 32)
             eff_mt = 32;
         return launch_config(eff_n128 ? 128 : 64, eff_mt, eff_min_blocks, eff_unroll);
-    }
-
-    llaminar2::rocm::generated::ROCmNativeVNNIPrefillDispatchConfig generated_cfg{};
-    if (!env.nvnni_disable_generated &&
-        llaminar2::rocm::generated::selectROCmNativeVNNIPrefillGenerated<static_cast<uint8_t>(FMT)>(
-            M, N, K, generated_cfg))
-    {
-        return launch_config(
-            static_cast<int>(generated_cfg.n_tile),
-            static_cast<int>(generated_cfg.m_tile),
-            static_cast<int>(generated_cfg.min_blocks),
-            static_cast<int>(generated_cfg.unroll));
     }
 
     // =========================================================================

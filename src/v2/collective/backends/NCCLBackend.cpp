@@ -113,7 +113,6 @@ namespace llaminar2
         bool cudaMemcpyPeerAsyncDevice(void *dst, int dst_device, const void *src, int src_device, size_t bytes, void *stream);
         bool cudaCanAccessPeerDevice(int dst_device, int src_device);
         bool cudaEnablePeerAccessDevice(int peer_device);
-        bool cudaDeviceSynchronizeWrapper();
     } // namespace nccl_backend_detail
 } // namespace llaminar2
 

@@ -22,6 +22,7 @@
 #include "../tensors/TensorKernels.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace llaminar2
@@ -53,6 +54,67 @@ namespace llaminar2
     };
 
     /**
+     * @brief Select which persistent decode histograms grouped routing updates.
+     *
+     * Grouped verifier routing has two publication moments. The initial
+     * grouping observes every selected expert, while final grouping observes
+     * only route slots assigned to this participant. Static-owner grouping
+     * performs both updates together. Least-loaded/LLEP grouping records the
+     * selected routes before planning and local assignments after planning, so
+     * its preliminary grouping pass cannot double-count work.
+     *
+     * Ordinary prefill must use `None`: these counters drive decode
+     * maintenance windows and represent grouped verifier work only.
+     */
+    enum class MoEGroupedHistogramUpdate : uint8_t
+    {
+        None = 0,
+        SelectedRoutes = 1u << 0,
+        LocallyAssignedRoutes = 1u << 1,
+        SelectedAndLocallyAssignedRoutes = 3u,
+    };
+
+    /**
+     * @brief Test whether a grouped histogram policy contains one update bit.
+     */
+    constexpr bool hasMoEGroupedHistogramUpdate(
+        MoEGroupedHistogramUpdate policy,
+        MoEGroupedHistogramUpdate update) noexcept
+    {
+        return (static_cast<uint8_t>(policy) & static_cast<uint8_t>(update)) != 0u;
+    }
+
+    /**
+     * @brief Immutable host launch metadata for one device-resident MoE call.
+     *
+     * GPU MoE execution may be captured concurrently by the main graph, an MTP
+     * sidecar graph, and a graph-native rebalance maintenance graph. A
+     * device-wide kernel object must therefore never carry a mutable "current
+     * stream" or "current workspace" that another graph can retarget between
+     * related launches. Callers construct this value from stage-owned bindings
+     * and pass it directly to each backend primitive.
+     *
+     * The context contains stable addresses only; it does not mirror live
+     * device values and it does not introduce host synchronization. The
+     * workspace pointer is included now even where a primitive receives all
+     * scratch buffers explicitly, so subsequent grouped routing/expert APIs can
+     * migrate to the same contract without changing its ownership model.
+     */
+    struct MoEKernelLaunchContext
+    {
+        void *stream = nullptr;                         ///< Explicit CUDA/HIP stream for this launch.
+        DeviceWorkspaceManager *workspace = nullptr;   ///< Stage-owned persistent workspace view.
+
+        /**
+         * @brief Return whether this context can issue GPU work.
+         */
+        [[nodiscard]] constexpr bool hasExplicitStream() const noexcept
+        {
+            return stream != nullptr;
+        }
+    };
+
+    /**
      * @brief Device-agnostic MoE kernel interface
      *
      * Encapsulates all non-GEMM MoE operations. GEMM (gate/up/down projections)
@@ -72,33 +134,6 @@ namespace llaminar2
         // =================================================================
         // Router: gate logits → softmax → top-k per token
         // =================================================================
-
-        /**
-         * @brief Compute MoE routing: gate logits, softmax, top-k selection
-         *
-         * For each token t in [0, seq_len):
-         *   1. logits[e] = dot(hidden[t], gate_weights[e]) for all experts
-         *   2. probs = softmax(logits)
-         *   3. Select top-k experts by probability
-         *   4. Optionally normalize top-k weights to sum to 1
-         *
-         * @param hidden           Input hidden states [seq_len, d_model]
-         * @param gate_weights     Router gate matrix [num_experts, d_model]
-         * @param seq_len          Number of tokens
-         * @param d_model          Hidden dimension
-         * @param num_experts      Total number of experts
-         * @param top_k            Experts selected per token
-         * @param normalize_weights Renormalize top-k weights to sum to 1
-         * @param[out] result      Routing assignments and weights
-         * @return true on success
-         */
-        virtual bool route(
-            const float *hidden,
-            const float *gate_weights,
-            int seq_len, int d_model,
-            int num_experts, int top_k,
-            bool normalize_weights,
-            MoERoutingResult &result) = 0;
 
         // =================================================================
         // Token gather/scatter for expert batching
@@ -210,23 +245,31 @@ namespace llaminar2
         //
         // These methods accept ITensor* and handle coherence internally.
         // CPU defaults (in IMoEKernel.cpp) use data()/mutable_data().
-        // GPU implementations override to use gpu_data_ptr() +
-        // transitionTo(), keeping data on-device without H2D round-trips.
+        // GPU implementations override to use gpu_data_ptr() and publish
+        // writes through TransferEngine, keeping data on-device without H2D.
         //
         // Compute stages should use ONLY these methods — never raw pointers
         // or CUDA/HIP APIs directly.
         // =================================================================
 
-        /// Tensor-aware route: computes routing, writes results to output
-        /// tensors on the active device, and returns a host copy in
-        /// host_result for CPU-side expert dispatch.  GPU implementations
-        /// use D2D for tensors (no intermediate H2D).
+        /**
+         * @brief Compute softmax/top-k routing into backend-owned tensors.
+         *
+         * This is the sole production routing contract. CPU implementations
+         * populate @p host_result because CPU expert dispatch consumes host
+         * routing rows. GPU implementations must leave @p host_result empty
+         * and publish @p output_indices and @p output_weights with a completion
+         * event on their explicit stream; snapshots perform any D2H transfer
+         * later at an explicit observation boundary.
+         *
+         * @return true when all output rows were published successfully.
+         */
         virtual bool routeWithTensors(
             ITensor *hidden, ITensor *gate_weights,
             int seq_len, int d_model, int num_experts, int top_k,
             bool normalize_weights,
             ITensor *output_indices, ITensor *output_weights,
-            MoERoutingResult &host_result);
+            MoERoutingResult &host_result) = 0;
 
         /**
          * @brief Graph-capturable padded-prefill routing contract.
@@ -253,8 +296,9 @@ namespace llaminar2
         /**
          * @brief Route MTP verifier rows with grouped serial-row-equivalent math.
          *
-         * MTP verifier batches contain M=1..4 logical decode rows, but any accepted
-         * prefix may later be published into live state.  That makes ordinary
+         * MTP verifier batches contain a runtime number of logical decode rows,
+         * and any accepted prefix may later be published into live state. That
+         * makes ordinary
          * small-prefill router math unsafe: a batched GEMM can accumulate gate
          * logits in a different order than serial decode, changing top-k weights
          * enough to drift downstream MoE outputs.  Backends that support this
@@ -822,6 +866,7 @@ namespace llaminar2
          * the captured graph observes them.
          */
         virtual bool runDeviceRebalanceController(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layers,
             const uint64_t *gathered_histograms,
             DeviceMoERebalanceStatus *status,
@@ -835,6 +880,7 @@ namespace llaminar2
             DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
             uint32_t command_buffer_count = 1)
         {
+            (void)launch;
             (void)runtime_layers;
             (void)gathered_histograms;
             (void)status;
@@ -862,6 +908,7 @@ namespace llaminar2
          * device packer follow the same rolling wave cursor as the controller.
          */
         virtual bool packDeviceRebalanceHistograms(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layers,
             uint64_t *local_histograms,
             const DeviceMoERebalanceConfig &config,
@@ -869,6 +916,7 @@ namespace llaminar2
             const DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
             uint32_t command_buffer_count = 1)
         {
+            (void)launch;
             (void)runtime_layers;
             (void)local_histograms;
             (void)config;
@@ -888,10 +936,12 @@ namespace llaminar2
          * invalid.  No host synchronization or default stream work is allowed.
          */
         virtual bool packDeviceRebalanceDirectory(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layers,
             DeviceMoEExpertDirectoryEntry *local_directory,
             const DeviceMoERebalanceConfig &config)
         {
+            (void)launch;
             (void)runtime_layers;
             (void)local_directory;
             (void)config;
@@ -910,6 +960,7 @@ namespace llaminar2
          * [source_participant][destination_participant][command_buffer][plan_index].
          */
         virtual bool packDeviceRebalanceSourceDescriptors(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layers,
             const DeviceMoERebalancePlanEntry *plan_entries,
             const DeviceMoERebalanceCommandBufferHeader *command_headers,
@@ -919,6 +970,7 @@ namespace llaminar2
             DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
             uint32_t command_buffer_count = 1)
         {
+            (void)launch;
             (void)runtime_layers;
             (void)plan_entries;
             (void)command_headers;
@@ -942,6 +994,7 @@ namespace llaminar2
          * header participant id to the local participant.
          */
         virtual bool projectDeviceRebalanceDomainCommands(
+            const MoEKernelLaunchContext &launch,
             const DeviceMoERebalancePlanEntry *gathered_plan_entries,
             const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
             uint32_t plan_capacity,
@@ -952,8 +1005,12 @@ namespace llaminar2
             uint32_t payload_slot_capacity = 0,
             uint32_t command_buffer_count = 1,
             const DeviceMoERebalanceWaveState *gathered_wave_states = nullptr,
-            DeviceMoERebalanceWaveState *local_wave_states = nullptr)
+            DeviceMoERebalanceWaveState *local_wave_states = nullptr,
+            DeviceMoELayerRuntime *runtime_layers = nullptr,
+            const DeviceMoEExpertDirectoryEntry *local_transfer_slots = nullptr,
+            uint32_t local_transfer_slot_count = 0)
         {
+            (void)launch;
             (void)gathered_plan_entries;
             (void)gathered_command_headers;
             (void)plan_capacity;
@@ -965,6 +1022,9 @@ namespace llaminar2
             (void)command_buffer_count;
             (void)gathered_wave_states;
             (void)local_wave_states;
+            (void)runtime_layers;
+            (void)local_transfer_slots;
+            (void)local_transfer_slot_count;
             return false;
         }
 
@@ -980,6 +1040,7 @@ namespace llaminar2
          * destinations.  The router top-k choices are not changed here.
          */
         virtual bool projectPrefillLeastLoadedDomainCommands(
+            const MoEKernelLaunchContext &launch,
             const DeviceMoERebalancePlanEntry *gathered_plan_entries,
             const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
             uint32_t plan_capacity,
@@ -989,8 +1050,12 @@ namespace llaminar2
             const DeviceMoERebalanceConfig &config,
             DeviceMoERebalanceStatus *status,
             uint32_t payload_slot_capacity,
+            DeviceMoELayerRuntime *runtime_layers,
+            const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+            uint32_t local_transfer_slot_count,
             uint32_t command_buffer_count = 1)
         {
+            (void)launch;
             (void)gathered_plan_entries;
             (void)gathered_command_headers;
             (void)plan_capacity;
@@ -1000,6 +1065,9 @@ namespace llaminar2
             (void)config;
             (void)status;
             (void)payload_slot_capacity;
+            (void)runtime_layers;
+            (void)local_transfer_slots;
+            (void)local_transfer_slot_count;
             (void)command_buffer_count;
             return false;
         }
@@ -1012,10 +1080,14 @@ namespace llaminar2
          * expert-weight transfers into DeviceMoELayerRuntime::reserved_ptrs[2].
          * This graph-capturable bridge converts those records into
          * ExpertPayloadArrival commands so the existing compact payload
-         * movement path can stage/import them. It must not rewrite router top-k
-         * choices or perform host readback.
+         * movement path can stage/import them. Commands produced here are
+         * logical: `destination_slot` remains invalid until
+         * projectPrefillLeastLoadedDomainCommands() leases physical storage on
+         * the destination participant from its complete transfer directory.
+         * It must not rewrite router top-k choices or perform host readback.
          */
         virtual bool materializePrefillLeastLoadedTransferCommands(
+            const MoEKernelLaunchContext &launch,
             const DeviceMoELayerRuntime *runtime_layer,
             DeviceMoERebalancePlanEntry *plan_entries,
             uint32_t *plan_count,
@@ -1041,6 +1113,7 @@ namespace llaminar2
          * destination-side counters to the same record.
          */
         virtual bool packDeviceRebalanceCompactPayloads(
+            const MoEKernelLaunchContext &launch,
             const DeviceMoERebalancePlanEntry *plan_entries,
             const DeviceMoERebalanceCommandBufferHeader *command_headers,
             uint32_t plan_capacity,
@@ -1053,6 +1126,7 @@ namespace llaminar2
             DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
             uint32_t command_buffer_count = 1)
         {
+            (void)launch;
             (void)plan_entries;
             (void)command_headers;
             (void)plan_capacity;
@@ -1068,6 +1142,7 @@ namespace llaminar2
         }
 
         virtual bool packDeviceRebalanceCollectivePayloads(
+            const MoEKernelLaunchContext &launch,
             const DeviceMoERebalancePlanEntry *gathered_plan_entries,
             const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
             uint32_t plan_capacity,
@@ -1080,6 +1155,7 @@ namespace llaminar2
             DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
             uint32_t command_buffer_count = 1)
         {
+            (void)launch;
             (void)gathered_plan_entries;
             (void)gathered_command_headers;
             (void)plan_capacity;
@@ -1103,6 +1179,7 @@ namespace llaminar2
          * controller can fail the wave before apply observes incomplete payloads.
          */
         virtual bool unpackDeviceRebalanceCollectivePayloads(
+            const MoEKernelLaunchContext &launch,
             const DeviceMoERebalancePlanEntry *plan_entries,
             const uint32_t *plan_count,
             uint32_t plan_capacity,
@@ -1117,6 +1194,7 @@ namespace llaminar2
             DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
             uint32_t command_buffer_count = 1)
         {
+            (void)launch;
             (void)plan_entries;
             (void)plan_count;
             (void)plan_capacity;
@@ -1143,9 +1221,11 @@ namespace llaminar2
          * valid matching state rather than resetting wave progress.
          */
         virtual bool initializeDeviceRebalanceGraphController(
+            const MoEKernelLaunchContext &launch,
             DeviceMoERebalanceGraphControllerState *controller_state,
             const DeviceMoERebalanceConfig &config)
         {
+            (void)launch;
             (void)controller_state;
             (void)config;
             return false;
@@ -1160,6 +1240,7 @@ namespace llaminar2
          * host callback or host-visible publication path.
          */
         virtual bool publishDeviceRebalanceTransferComplete(
+            const MoEKernelLaunchContext &launch,
             DeviceMoERebalanceGraphControllerState *controller_state,
             const DeviceMoERebalanceCommandBufferHeader *command_header,
             const DeviceMoERebalanceWaveState *wave_state,
@@ -1170,6 +1251,7 @@ namespace llaminar2
             const DeviceMoERebalanceConfig &config,
             uint32_t command_buffer_count = 1)
         {
+            (void)launch;
             (void)controller_state;
             (void)command_header;
             (void)wave_state;
@@ -1191,6 +1273,7 @@ namespace llaminar2
          * layers have passed the apply boundary.
          */
         virtual bool applyReadyDeviceRebalanceWave(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layers,
             const DeviceMoERebalancePlanEntry *plan_entries,
             const uint32_t *plan_count,
@@ -1204,6 +1287,7 @@ namespace llaminar2
             int target_layer = -1,
             uint32_t command_buffer_count = 1)
         {
+            (void)launch;
             (void)runtime_layers;
             (void)plan_entries;
             (void)plan_count;
@@ -1220,6 +1304,7 @@ namespace llaminar2
         }
 
         virtual bool applyDeviceRebalanceArrivals(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layers,
             const DeviceMoERebalancePlanEntry *plan_entries,
             const uint32_t *plan_count,
@@ -1231,6 +1316,7 @@ namespace llaminar2
             const DeviceMoERebalanceCommandBufferHeader *command_header = nullptr,
             int target_layer = -1)
         {
+            (void)launch;
             (void)runtime_layers;
             (void)plan_entries;
             (void)plan_count;
@@ -1359,14 +1445,22 @@ namespace llaminar2
          * reduction combines the partial MoE outputs. Dynamic/LLEP planning
          * leaves this flag false because it first needs all routed slots before
          * the assignment kernels choose participants. The default returns false
-         * so callers can use the established host/grouping path.
+         * so a missing grouped implementation fails loudly.
+         *
+         * @param histogram_update Persistent grouped-verifier histogram updates
+         *        fused into the existing cast/count launches. Ordinary prefill
+         *        passes `None`. Static-owner verifier grouping records selected
+         *        and local routes together. Least-loaded grouping records only
+         *        selected routes here and records local routes during regroup.
          */
         virtual bool groupPrefillRoutes(
             DeviceMoELayerRuntime *runtime_layer,
             ITensor *routing_indices, ITensor *routing_weights,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
-            bool filter_to_local_runtime_experts = false)
+            bool filter_to_local_runtime_experts = false,
+            MoEGroupedHistogramUpdate histogram_update =
+                MoEGroupedHistogramUpdate::None)
         {
             (void)runtime_layer;
             (void)routing_indices;
@@ -1376,6 +1470,7 @@ namespace llaminar2
             (void)num_experts;
             (void)top_k;
             (void)filter_to_local_runtime_experts;
+            (void)histogram_update;
             return false;
         }
 
@@ -1388,17 +1483,24 @@ namespace llaminar2
          * method clears only counts/offsets/grouped scratch, then groups rows
          * assigned to runtime_layer->participant_id. It must not read route
          * metadata back to host and must be graph-capturable.
+         *
+         * @param histogram_update Usually `LocallyAssignedRoutes` for grouped
+         *        verifier execution after LLEP assignment, and `None` for
+         *        ordinary prefill or diagnostic regrouping.
          */
         virtual bool regroupPrefillRoutesFromRuntimeAssignments(
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
-            int num_experts, int top_k)
+            int num_experts, int top_k,
+            MoEGroupedHistogramUpdate histogram_update =
+                MoEGroupedHistogramUpdate::None)
         {
             (void)runtime_layer;
             (void)current_tokens;
             (void)max_tokens;
             (void)num_experts;
             (void)top_k;
+            (void)histogram_update;
             return false;
         }
 
@@ -1415,10 +1517,12 @@ namespace llaminar2
          * never performs an implicit weight transfer.
          */
         virtual bool assignPrefillRoutesLeastLoadedResident(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k)
         {
+            (void)launch;
             (void)runtime_layer;
             (void)current_tokens;
             (void)max_tokens;
@@ -1438,6 +1542,7 @@ namespace llaminar2
          * collective path.
          */
         virtual bool planPrefillRoutesLeastLoadedCurrentBatch(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
@@ -1455,6 +1560,7 @@ namespace llaminar2
          * must import those expert payloads before applying foreign spans.
          */
         virtual bool assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k);
@@ -1470,6 +1576,7 @@ namespace llaminar2
          * top-k expert ids and weights; only route_participant_ids are balanced.
          */
         virtual bool assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
@@ -1517,54 +1624,6 @@ namespace llaminar2
         }
 
         // =================================================================
-        // Phase 4: GPU-side expert dispatch for prefill
-        //
-        // prepareExpertGroups() does GPU-side token grouping from tensor
-        // routing results (float→int conversion + grouping kernel).
-        // After this, gatherExpertBatch/scatterExpertResults use device-
-        // resident grouped indices — no per-call H2D staging needed.
-        //
-        // CPU default: falls back to host-side grouping.
-        // =================================================================
-
-        /**
-         * @brief Prepare device-side token groups from routing tensor results.
-         *
-         * Converts float routing indices to int, runs GPU token grouping,
-         * and D2H's the per-expert counts (small: num_experts ints).
-         * After this call, gatherExpertBatch/scatterExpertResults use
-         * pre-computed device-side offsets.
-         *
-         * @return true if GPU grouping succeeded; false → caller should
-         *         fall back to host-side grouping.
-         */
-        virtual bool prepareExpertGroups(
-            ITensor *routing_indices, ITensor *routing_weights,
-            int seq_len, int num_experts, int top_k);
-
-        /**
-         * @brief Get number of tokens routed to a specific expert.
-         * Only valid after prepareExpertGroups().
-         */
-        virtual int getExpertTokenCount(int expert_id) const;
-
-        /**
-         * @brief Gather tokens for expert_id using pre-grouped device indices.
-         * Only valid after prepareExpertGroups().
-         */
-        virtual void gatherExpertBatch(
-            ITensor *hidden, ITensor *batch_buffer,
-            int expert_id, int d_model);
-
-        /**
-         * @brief Scatter weighted expert results using pre-grouped device data.
-         * Only valid after prepareExpertGroups().
-         */
-        virtual void scatterExpertResults(
-            ITensor *output, ITensor *expert_results,
-            int expert_id, int d_model);
-
-        // =================================================================
         // Phase 5: Fully-grouped MoE prefill pipeline (graph-capturable)
         //
         // Runs ALL experts in a single pipeline with NO host-device sync:
@@ -1580,9 +1639,10 @@ namespace llaminar2
         /**
          * @brief Prepare device-side expert groups WITHOUT D2H synchronization.
          *
-         * Same as prepareExpertGroups() but omits the hipStreamSynchronize
-         * and D2H copy of counts/offsets. The grouped data stays entirely
-         * on device for consumption by executeGroupedPrefillPipeline().
+         * Builds counts, offsets, and grouped route rows entirely on device for
+         * direct consumption by executeGroupedPrefillPipeline(). There is no
+         * synchronous host-metadata counterpart: production GPU grouping is
+         * device-owned by construction.
          *
          * @return true if GPU grouping succeeded.
          */
@@ -1599,36 +1659,41 @@ namespace llaminar2
         }
 
         /**
-         * @brief Prepare device-side groups while excluding masked-off experts.
+         * @brief Prepare device-side groups using a previously published device mask.
          *
-         * Backends copy the host mask to device and build grouping metadata from
-         * a masked route view. The original routing tensors must not be modified:
-         * rebalance histograms still need to observe the model's true top-k
-         * choices even when this participant only computes a subset locally.
+         * This is the graph-execution half of the fixed-topology masked grouping
+         * contract. The backend must consume only its persistent device-resident
+         * mask; this method deliberately accepts no host pointer and may never
+         * perform mask publication. The original routing tensors are preserved so
+         * rebalance histograms can still observe the model's true top-k choices
+         * while this participant computes only its locally enabled experts.
+         *
+         * Call updateGroupedPrefillExpertMask() on the same explicit stream
+         * before graph capture begins. Calling this method without a matching
+         * publication is a contract violation and must fail rather than silently
+         * scheduling every expert or uploading transient host state.
          */
-        virtual bool prepareExpertGroupsAsyncMasked(
+        virtual bool prepareExpertGroupsAsyncUsingPublishedMask(
             ITensor *routing_indices, ITensor *routing_weights,
-            int seq_len, int num_experts, int top_k,
-            const uint8_t *expert_mask)
+            int seq_len, int num_experts, int top_k)
         {
             (void)routing_indices;
             (void)routing_weights;
             (void)seq_len;
             (void)num_experts;
             (void)top_k;
-            (void)expert_mask;
             return false;
         }
 
         /**
-         * @brief Update the persistent device expert mask used by masked
-         *        grouped prefill without rebuilding graph topology.
+         * @brief Publish the persistent device expert mask before graph capture.
          *
          * Captured prefill graphs read the backend-owned mask buffer by device
-         * address. Dynamic MoE placement changes must therefore update that
-         * buffer on an explicit backend stream before replay, instead of
-         * recapturing the graph or relying on a host-side branch inside
-         * prepareExpertGroupsAsyncMasked().
+         * address. The control plane must therefore upload the complete mask on
+         * the same explicit stream used by the stage before capture or replay is
+         * admitted. Implementations must reject this call while graph capture is
+         * active: host publication is a lifecycle transition, never a graph node
+         * or token-hot-path operation.
          */
         virtual bool updateGroupedPrefillExpertMask(
             const uint8_t *expert_mask,
@@ -1728,15 +1793,26 @@ namespace llaminar2
             return false;
         }
 
-    protected:
-        // State for CPU-default prepareExpertGroups / getExpertTokenCount /
-        // gatherExpertBatch / scatterExpertResults.
-        // GPU overrides manage their own device-resident equivalents.
-        std::vector<int> host_expert_counts_;
-        std::vector<int> host_expert_offsets_;
-        std::vector<int> host_grouped_indices_;
-        std::vector<float> host_grouped_weights_;
-        int prepared_num_experts_ = 0;
+    };
+
+    /**
+     * @brief Graph-local owner for one routed MoE producer/consumer pipeline.
+     *
+     * Routing and routed-expert execution are two sequential stages of one
+     * transaction. The router publishes reusable Q8 hidden rows and device
+     * route metadata that the immediately following expert stage consumes.
+     * Keeping one kernel inside this explicit graph-local owner preserves that
+     * zero-copy publication while preventing unrelated main-graph, MTP-sidecar,
+     * shared-expert, and maintenance graphs from aliasing mutable launch state.
+     *
+     * Graph builders create one owner per layer graph. The first stage to warm
+     * the graph constructs @ref kernel lazily through KernelFactory; no backend
+     * allocation or device interaction is required during declarative graph
+     * construction.
+     */
+    struct MoERoutedPipelineKernelOwner
+    {
+        std::unique_ptr<IMoEKernel> kernel; ///< Backend object shared only by the paired routed stages.
     };
 
 } // namespace llaminar2

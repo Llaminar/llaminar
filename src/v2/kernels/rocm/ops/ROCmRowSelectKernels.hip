@@ -9,6 +9,7 @@
  */
 
 #include "ROCmRowSelectKernels.h"
+#include "../../../utils/Logger.h"
 
 #ifdef HAVE_ROCM
 
@@ -192,39 +193,6 @@ namespace llaminar2::rocm
             (void)hipHostFree(host_selected_row);
     }
 
-    bool allocateRowSelectParam(
-        int device_ordinal,
-        int **host_selected_row,
-        int **device_selected_row)
-    {
-        if (!host_selected_row || !device_selected_row)
-            return false;
-
-        *host_selected_row = nullptr;
-        *device_selected_row = nullptr;
-
-        if (!allocateRowSelectHostParam(device_ordinal, host_selected_row))
-            return false;
-        if (!ok(hipMalloc(reinterpret_cast<void **>(device_selected_row), sizeof(int))))
-        {
-            freeRowSelectHostParam(device_ordinal, *host_selected_row);
-            *host_selected_row = nullptr;
-            return false;
-        }
-        return true;
-    }
-
-    void freeRowSelectParam(
-        int device_ordinal,
-        int *host_selected_row,
-        int *device_selected_row)
-    {
-        (void)hipSetDevice(device_ordinal);
-        if (device_selected_row)
-            (void)hipFree(device_selected_row);
-        freeRowSelectHostParam(device_ordinal, host_selected_row);
-    }
-
     bool uploadRowSelectParam(
         int *device_selected_row,
         const int *host_selected_row,
@@ -286,6 +254,39 @@ namespace llaminar2::rocm
         return ok(hipGetLastError());
     }
 
+    bool launchFixedRowSelectFP32(
+        const float *input,
+        float *output,
+        int selected_row,
+        int seq_len,
+        int d_model,
+        void *stream)
+    {
+        if (!input || !output || selected_row < 0 ||
+            selected_row >= seq_len || seq_len <= 0 || d_model <= 0 ||
+            !stream)
+        {
+            return false;
+        }
+
+        /*
+         * The graph geometry fixes both row and width. A contiguous D2D copy
+         * therefore gives the runtime's copy engine the complete transfer,
+         * avoids per-thread bounds work, and captures no host-owned replay
+         * scalar. Rebuilding for another geometry naturally records another
+         * immutable source address.
+         */
+        const size_t source_offset =
+            static_cast<size_t>(selected_row) *
+            static_cast<size_t>(d_model);
+        return ok(hipMemcpyAsync(
+            output,
+            input + source_offset,
+            static_cast<size_t>(d_model) * sizeof(float),
+            hipMemcpyDeviceToDevice,
+            reinterpret_cast<hipStream_t>(stream)));
+    }
+
     bool launchRowsSelectFP32(
         const float *input,
         float *output,
@@ -333,6 +334,18 @@ namespace llaminar2::rocm
             request_count <= 0 ||
             request_count * request_row_stride != seq_len)
         {
+            LOG_ERROR(
+                "[ROCmRowSelectKernels] Request-terminal row selection "
+                "rejected an incomplete launch contract"
+                << " input=" << static_cast<const void *>(input)
+                << " output=" << static_cast<void *>(output)
+                << " lengths="
+                << static_cast<const void *>(request_sequence_lengths)
+                << " stream=" << stream
+                << " seq_len=" << seq_len
+                << " request_row_stride=" << request_row_stride
+                << " d_model=" << d_model
+                << " request_count=" << request_count);
             return false;
         }
 
@@ -357,7 +370,37 @@ namespace llaminar2::rocm
             request_row_stride,
             d_model,
             request_count);
-        return ok(hipGetLastError());
+        const hipError_t launch_status = hipGetLastError();
+        if (launch_status != hipSuccess)
+        {
+            int current_device = -1;
+            int stream_device = -1;
+            const hipError_t current_device_status =
+                hipGetDevice(&current_device);
+            const hipError_t stream_device_status =
+                hipStreamGetDevice(hip_stream, &stream_device);
+            LOG_ERROR(
+                "[ROCmRowSelectKernels] Request-terminal row-selection launch "
+                "failed: "
+                << hipGetErrorString(launch_status)
+                << " current_device=" << current_device
+                << " current_device_status="
+                << hipGetErrorString(current_device_status)
+                << " stream_device=" << stream_device
+                << " stream_device_status="
+                << hipGetErrorString(stream_device_status)
+                << " stream=" << stream
+                << " input=" << static_cast<const void *>(input)
+                << " output=" << static_cast<void *>(output)
+                << " lengths="
+                << static_cast<const void *>(request_sequence_lengths)
+                << " seq_len=" << seq_len
+                << " request_row_stride=" << request_row_stride
+                << " d_model=" << d_model
+                << " request_count=" << request_count);
+            return false;
+        }
+        return true;
     }
 
     bool launchMTPConcatFP32(

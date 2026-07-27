@@ -602,12 +602,12 @@ TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_DefaultCapturedCollectives_
 }
 
 /**
- * @test LocalTP NCCL accepts explicit segmented collective mode
+ * @test LocalTP NCCL rejects a segmented override for homogeneous devices
  *
- * Segmented replay is retained as a special compatibility lane for cases where
- * captured collectives are deliberately disabled.
+ * A raw environment switch must not authorize an architecture that the
+ * topology policy forbids. Homogeneous NCCL requires direct collective capture.
  */
-TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_ExplicitSegmentedCollectives_AllowsExecution)
+TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_SegmentedOverrideRejectsExecution)
 {
     if (cuda_count_ < 2)
     {
@@ -631,8 +631,8 @@ TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_ExplicitSegmentedCollective
     ASSERT_TRUE(tensor0->ensureOnDevice(DeviceId::cuda(0)));
     ASSERT_TRUE(tensor1->ensureOnDevice(DeviceId::cuda(1)));
 
-    std::atomic<bool> result0{false};
-    std::atomic<bool> result1{false};
+    std::atomic<bool> result0{true};
+    std::atomic<bool> result1{true};
 
     std::thread t0([&]()
                    { result0.store(ctx->allreduce(tensor0.get(), "graph_policy_allow", tensor0->numel())); });
@@ -642,9 +642,8 @@ TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_ExplicitSegmentedCollective
     t0.join();
     t1.join();
 
-    // NCCL allreduce should succeed under supported graph policy.
-    EXPECT_TRUE(result0.load());
-    EXPECT_TRUE(result1.load());
+    EXPECT_FALSE(result0.load());
+    EXPECT_FALSE(result1.load());
 }
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)

@@ -6,8 +6,8 @@
  *   1. Build ComputeGraph with real stages (RMSNorm, ResidualAdd)
  *   2. Execute via executeWithGraphCapture() with a real IGPUGraphCapture
  *   3. Verify output correctness
- *   4. Test re-capture + update path (second call → tryUpdate)
- *   5. Test fallback paths (nullptr capture, collective nodes present)
+ *   4. Test backend-specific executable publication after re-capture
+ *   5. Prove invalid capture ownership fails closed
  *
  * IMPORTANT: No <hip/hip_runtime.h> or <cuda_runtime.h> includes.
  * All GPU interaction goes through the backend interfaces.
@@ -16,8 +16,8 @@
  */
 
 #include <gtest/gtest.h>
+#include <array>
 #include <memory>
-#include <optional>
 #include <vector>
 #include <unordered_set>
 #include <string>
@@ -134,6 +134,70 @@ protected:
     }
 
     /**
+     * @brief Make all synthetic tensor parameters resident before capture.
+     *
+     * These integration stages bind raw tensor pointers rather than arena
+     * BufferIds. The fixture must therefore allocate and upload every tensor
+     * before beginCapture(), then wait once on the upload stream. No allocation
+     * or H2D transfer is allowed inside the captured graph.
+     *
+     * @return true when every tensor has a stable device address and the
+     *         context-owned stream has completed all uploads.
+     */
+    bool prepareFixtureTensorsForGPUExecution()
+    {
+        if (!gpu_ctx_ || !device_ctx_)
+            return false;
+
+        void *stream = gpu_ctx_->defaultStream();
+        if (!stream)
+            return false;
+
+        const DeviceId device = device_ctx_->deviceId();
+        for (const auto &tensor : tensor_storage_)
+        {
+            if (!tensor || !tensor->ensureOnDevice(device, stream))
+                return false;
+        }
+        return gpu_ctx_->synchronizeStreamChecked(stream);
+    }
+
+    /**
+     * @brief Execute one mandatory capture on the context-owned stream.
+     *
+     * @param graph GPU-only graph whose tensor parameters are already resident.
+     * @param executor Executor under test.
+     * @param externally_visible_output Output whose post-launch completion
+     *        becomes observable to the test.
+     * @return true only when capture, instantiation/update, and launch succeed.
+     */
+    bool executeCapturedGraph(
+        ComputeGraph &graph,
+        DeviceGraphExecutor &executor,
+        ITensor *externally_visible_output)
+    {
+        const std::array<ITensor *, 1> outputs = {
+            externally_visible_output};
+        return executor.executeWithGraphCapture(
+            graph,
+            device_ctx_.get(),
+            capture_.get(),
+            outputs);
+    }
+
+    /**
+     * @brief Require evidence that the selected path owns a real GPU graph.
+     */
+    void expectExecutableGraph() const
+    {
+        ASSERT_NE(capture_, nullptr);
+        EXPECT_GT(capture_->nodeCount(), 0u)
+            << "Positive graph-capture integration cases must capture device nodes";
+        EXPECT_TRUE(capture_->hasExecutable())
+            << "Positive graph-capture integration cases must instantiate an executable";
+    }
+
+    /**
      * @brief Build a simple 2-stage graph: RMSNorm → ResidualAdd
      *
      * Graph:
@@ -147,25 +211,14 @@ protected:
      * @param[out] norm_input  Raw pointer to the RMSNorm input tensor
      * @param[out] residual    Raw pointer to the residual tensor
      * @param[out] result_output Raw pointer to the final output tensor
-     * @param stage_device  Device ID for stage params (kernel dispatch).
-     *                      Default: CPU — the stages create CPU kernels.
-     * @param node_device   Device ID for graph nodes (coherence target).
-     *                      Default: device_ctx_->deviceId() (GPU).
-     *                      IMPORTANT: When executeNode() is used (e.g. collective-
-     *                      graph fallback), node_device MUST match stage_device.
-     *                      Otherwise coherence marks outputs as GPU-dirty while the
-     *                      CPU kernel writes to host, causing verification to read
-     *                      uninitialized GPU zeros.
      * @return Populated ComputeGraph
      */
     ComputeGraph buildNormResidualGraph(size_t seq_len, size_t d_model,
                                         FP32Tensor *&norm_input,
                                         FP32Tensor *&residual,
-                                        FP32Tensor *&result_output,
-                                        DeviceId stage_device = DeviceId::cpu(),
-                                        std::optional<DeviceId> node_device = std::nullopt)
+                                        FP32Tensor *&result_output)
     {
-        const DeviceId graph_device = node_device.value_or(device_ctx_->deviceId());
+        const DeviceId device = device_ctx_->deviceId();
 
         norm_input = createFP32Tensor({seq_len, d_model});
         auto *norm_output = createFP32Tensor({seq_len, d_model});
@@ -194,19 +247,19 @@ protected:
         norm_params.gamma = gamma;
         norm_params.eps = 1e-5f;
         norm_params.seq_len = static_cast<int>(seq_len);
-        norm_params.device_id = stage_device;
+        norm_params.device_id = device;
 
         ResidualAddStage::Params res_params;
         res_params.input = norm_output;
         res_params.residual = residual;
         res_params.output = result_output;
         res_params.num_elements = num_elements;
-        res_params.device_id = stage_device;
+        res_params.device_id = device;
 
         // Assemble graph with dependency
         ComputeGraph graph;
-        graph.addNode("rmsnorm", ComputeStageFactory::createRMSNorm(norm_params), graph_device);
-        graph.addNode("residual_add", ComputeStageFactory::createResidualAdd(res_params), graph_device);
+        graph.addNode("rmsnorm", ComputeStageFactory::createRMSNorm(norm_params), device);
+        graph.addNode("residual_add", ComputeStageFactory::createResidualAdd(res_params), device);
         graph.addDependency("residual_add", "rmsnorm");
 
         return graph;
@@ -229,21 +282,15 @@ TEST_F(GPUGraphCaptureExecutionTest, FirstExecution_ProducesCorrectOutput)
     FP32Tensor *residual = nullptr;
     FP32Tensor *result = nullptr;
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
 
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
 
     // Execute via graph capture path
-    bool success = executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get());
+    bool success = executeCapturedGraph(graph, executor, result);
     ASSERT_TRUE(success) << "executeWithGraphCapture failed on first invocation";
-
-    // For CPU-only stages, 0-node capture is valid.
-    // With GPU stages, nodeCount() > 0 and hasExecutable() is true.
-    // With CPU stages, nodeCount() == 0 and we skip instantiation.
-    if (capture_->nodeCount() > 0)
-    {
-        EXPECT_TRUE(capture_->hasExecutable());
-    }
+    expectExecutableGraph();
 
     // Verify output is not all zeros (stages actually ran)
     const float *out = result->data();
@@ -267,13 +314,21 @@ TEST_F(GPUGraphCaptureExecutionTest, FirstExecution_ProducesCorrectOutput)
 }
 
 // ===========================================================================
-// 2. Re-capture + update path (second call should use tryUpdate)
+// 2. Re-capture + backend-specific executable publication
 // ===========================================================================
 
-TEST_F(GPUGraphCaptureExecutionTest, SecondExecution_UsesUpdatePath)
+TEST_F(GPUGraphCaptureExecutionTest, SecondExecution_UsesBackendPublicationPath)
 {
     SKIP_IF_NO_GPU();
     ASSERT_NE(capture_, nullptr);
+
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+    EXPECT_TRUE(capture_->supportsExecutableUpdate())
+        << "CUDA must exercise the in-place executable-update lifecycle";
+#elif defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+    EXPECT_FALSE(capture_->supportsExecutableUpdate())
+        << "ROCm must replace the executable directly after recapture";
+#endif
 
     const size_t seq_len = 4;
     const size_t d_model = 64;
@@ -282,12 +337,14 @@ TEST_F(GPUGraphCaptureExecutionTest, SecondExecution_UsesUpdatePath)
     FP32Tensor *residual = nullptr;
     FP32Tensor *result = nullptr;
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
 
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
 
-    // First execution — instantiate path (or 0-node skip for CPU-only stages)
-    ASSERT_TRUE(executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get()));
+    // First execution owns a real graph and instantiates it.
+    ASSERT_TRUE(executeCapturedGraph(graph, executor, result));
+    expectExecutableGraph();
 
     // Save first-run output
     std::vector<float> first_output(seq_len * d_model);
@@ -296,9 +353,9 @@ TEST_F(GPUGraphCaptureExecutionTest, SecondExecution_UsesUpdatePath)
     // Reset graph completion flags for re-execution
     graph.reset();
 
-    // Second execution — with GPU stages this takes the tryUpdate path.
-    // With CPU-only stages (0-node graph), it re-executes stages directly.
-    ASSERT_TRUE(executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get()));
+    // Second execution captures the same topology and takes the update path.
+    ASSERT_TRUE(executeCapturedGraph(graph, executor, result));
+    expectExecutableGraph();
 
     // Output should still be valid (same graph, same inputs → same output)
     const float *out = result->data();
@@ -319,7 +376,7 @@ TEST_F(GPUGraphCaptureExecutionTest, SecondExecution_UsesUpdatePath)
         }
     }
     EXPECT_TRUE(outputs_match)
-        << "Second execution output diverged from first — update path may have failed";
+        << "Second execution output diverged from first after executable publication";
 }
 
 // ===========================================================================
@@ -339,12 +396,14 @@ TEST_F(GPUGraphCaptureExecutionTest, MultipleReExecutions_StableOutput)
     FP32Tensor *residual = nullptr;
     FP32Tensor *result = nullptr;
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
 
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
 
     // First execution
-    ASSERT_TRUE(executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get()));
+    ASSERT_TRUE(executeCapturedGraph(graph, executor, result));
+    expectExecutableGraph();
 
     std::vector<float> reference_output(seq_len * d_model);
     std::memcpy(reference_output.data(), result->data(), reference_output.size() * sizeof(float));
@@ -353,8 +412,9 @@ TEST_F(GPUGraphCaptureExecutionTest, MultipleReExecutions_StableOutput)
     for (int iter = 1; iter < num_iterations; ++iter)
     {
         graph.reset();
-        ASSERT_TRUE(executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get()))
+        ASSERT_TRUE(executeCapturedGraph(graph, executor, result))
             << "Iteration " << iter << " failed";
+        expectExecutableGraph();
 
         const float *out = result->data();
         for (size_t i = 0; i < seq_len * d_model; ++i)
@@ -366,10 +426,10 @@ TEST_F(GPUGraphCaptureExecutionTest, MultipleReExecutions_StableOutput)
 }
 
 // ===========================================================================
-// 4. Fallback: nullptr capture → executeFastDecode
+// 4. Hard failure: a capture policy requires a capture owner
 // ===========================================================================
 
-TEST_F(GPUGraphCaptureExecutionTest, NullCapture_FallsBackToFastDecode)
+TEST_F(GPUGraphCaptureExecutionTest, NullCaptureFailsClosed)
 {
     SKIP_IF_NO_GPU();
 
@@ -384,27 +444,48 @@ TEST_F(GPUGraphCaptureExecutionTest, NullCapture_FallsBackToFastDecode)
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
 
-    // Pass nullptr for capture — should fall back to executeFastDecode
-    bool success = executor.executeWithGraphCapture(graph, device_ctx_.get(), nullptr);
-    ASSERT_TRUE(success) << "Fallback to executeFastDecode should succeed";
-
-    // Verify output is valid
-    const float *out = result->data();
-    bool has_nonzero = false;
-    for (size_t i = 0; i < seq_len * d_model; ++i)
-    {
-        ASSERT_FALSE(std::isnan(out[i])) << "NaN at index " << i;
-        if (out[i] != 0.0f)
-            has_nonzero = true;
-    }
-    EXPECT_TRUE(has_nonzero) << "Fallback output is all zeros";
+    EXPECT_FALSE(
+        executor.executeWithGraphCapture(graph, device_ctx_.get(), nullptr, {}))
+        << "A selected graph-capture path must not silently change execution modes";
 }
 
 // ===========================================================================
-// 5. Fallback: collective nodes present → executeFastDecode
+// 5. Hard failure: graph outputs require an explicit publication contract
 // ===========================================================================
 
-TEST_F(GPUGraphCaptureExecutionTest, CollectiveNodesPresent_FallsBackToFastDecode)
+TEST_F(GPUGraphCaptureExecutionTest, MissingOutputPublicationFailsBeforeCapture)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(capture_, nullptr);
+
+    FP32Tensor *norm_input = nullptr;
+    FP32Tensor *residual = nullptr;
+    FP32Tensor *result = nullptr;
+    auto graph = buildNormResidualGraph(
+        2,
+        32,
+        norm_input,
+        residual,
+        result);
+
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+
+    EXPECT_FALSE(executor.executeWithGraphCapture(
+        graph,
+        device_ctx_.get(),
+        capture_.get(),
+        {}));
+    EXPECT_FALSE(capture_->hasExecutable())
+        << "An incomplete graph output contract must fail before capture begins";
+    EXPECT_EQ(capture_->nodeCount(), 0u);
+}
+
+// ===========================================================================
+// 6. Hard failure: this legacy single-device API cannot own collectives
+// ===========================================================================
+
+TEST_F(GPUGraphCaptureExecutionTest, CollectiveNodesPresentFailClosed)
 {
     SKIP_IF_NO_GPU();
     ASSERT_NE(capture_, nullptr);
@@ -416,55 +497,29 @@ TEST_F(GPUGraphCaptureExecutionTest, CollectiveNodesPresent_FallsBackToFastDecod
     FP32Tensor *residual = nullptr;
     FP32Tensor *result = nullptr;
 
-    // Build graph with CPU device for BOTH stage params and graph nodes.
-    //
-    // This test exercises the collective-fallback path in executeFastDecode,
-    // which routes ALL nodes (not just collectives) through executeNode().
-    // executeNode() does full coherence management based on node.device:
-    //   - Uploads inputs to target device
-    //   - Allocates output buffers on target device
-    //   - After stage->execute(), marks outputs as device-dirty
-    //
-    // If node.device is GPU but stage device_id is CPU, the CPU kernel
-    // writes to host memory while coherence marks outputs as GPU-dirty.
-    // When verification later calls data(), it syncs from GPU (which has
-    // uninitialized zeros) back to host, overwriting the correct CPU output.
-    //
-    // Fix: Use CPU device for graph nodes so that executeNode()'s coherence
-    // targets CPU (effectively a no-op), matching the CPU kernel dispatch.
-    auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result,
-                                        DeviceId::cpu(), DeviceId::cpu());
+    auto graph = buildNormResidualGraph(
+        seq_len,
+        d_model,
+        norm_input,
+        residual,
+        result);
 
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
 
-    // Provide a non-empty collective_nodes set — this forces the fallback path
-    // even though none of the actual nodes in our graph are collective.
-    // The implementation checks `!collective_nodes->empty()` and falls back.
+    // This API is deliberately single-device. Fully captured collective graphs
+    // use the cached graph controller and may not be rewritten as eager work.
     std::unordered_set<std::string> collective_nodes = {"fake_allreduce"};
 
-    bool success = executor.executeWithGraphCapture(
-        graph, device_ctx_.get(), capture_.get(), &collective_nodes);
-    ASSERT_TRUE(success) << "Fallback with collective nodes should succeed";
+    EXPECT_FALSE(executor.executeWithGraphCapture(
+        graph, device_ctx_.get(), capture_.get(), {}, &collective_nodes));
 
-    // capture should NOT have been used (no executable created)
     EXPECT_FALSE(capture_->hasExecutable())
-        << "Graph capture should not be used when collective nodes are present";
-
-    // Verify output is valid
-    const float *out = result->data();
-    bool has_nonzero = false;
-    for (size_t i = 0; i < seq_len * d_model; ++i)
-    {
-        ASSERT_FALSE(std::isnan(out[i])) << "NaN at index " << i;
-        if (out[i] != 0.0f)
-            has_nonzero = true;
-    }
-    EXPECT_TRUE(has_nonzero) << "Fallback output is all zeros";
+        << "The unsupported single-device collective graph must not begin capture";
 }
 
 // ===========================================================================
-// 6. Empty collective set does NOT trigger fallback
+// 7. Empty collective set does NOT trigger fallback
 // ===========================================================================
 
 TEST_F(GPUGraphCaptureExecutionTest, EmptyCollectiveSet_DoesNotFallBack)
@@ -479,21 +534,26 @@ TEST_F(GPUGraphCaptureExecutionTest, EmptyCollectiveSet_DoesNotFallBack)
     FP32Tensor *residual = nullptr;
     FP32Tensor *result = nullptr;
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
 
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
 
-    // Empty set — should NOT cause fallback
+    // Empty set still requires one complete captured graph.
     std::unordered_set<std::string> empty_collectives;
 
+    const std::array<ITensor *, 1> outputs = {result};
     bool success = executor.executeWithGraphCapture(
-        graph, device_ctx_.get(), capture_.get(), &empty_collectives);
+        graph,
+        device_ctx_.get(),
+        capture_.get(),
+        outputs,
+        &empty_collectives);
     ASSERT_TRUE(success);
+    expectExecutableGraph();
 
-    // Graph capture was attempted (not bypassed by collective check).
-    // With GPU stages, hasExecutable() is true. With CPU-only stages,
-    // 0-node capture skips instantiation.
-    // Verify the test ran (output has non-zero values) as proxy.
+    // Verify the captured launch produced output as a second, independent
+    // correctness assertion.
     const float *out_check = result->data();
     bool has_nonzero_check = false;
     for (size_t i = 0; i < seq_len * d_model; ++i)
@@ -508,7 +568,7 @@ TEST_F(GPUGraphCaptureExecutionTest, EmptyCollectiveSet_DoesNotFallBack)
 }
 
 // ===========================================================================
-// 7. Graph capture reset and re-capture
+// 8. Graph capture reset and re-capture
 // ===========================================================================
 
 TEST_F(GPUGraphCaptureExecutionTest, ResetAndRecapture_Works)
@@ -523,12 +583,14 @@ TEST_F(GPUGraphCaptureExecutionTest, ResetAndRecapture_Works)
     FP32Tensor *residual = nullptr;
     FP32Tensor *result = nullptr;
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
 
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
 
     // First execution
-    ASSERT_TRUE(executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get()));
+    ASSERT_TRUE(executeCapturedGraph(graph, executor, result));
+    expectExecutableGraph();
 
     // Reset capture object
     gpu_ctx_->submitAndWait([&]
@@ -537,7 +599,8 @@ TEST_F(GPUGraphCaptureExecutionTest, ResetAndRecapture_Works)
 
     // Re-capture from scratch
     graph.reset();
-    ASSERT_TRUE(executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get()));
+    ASSERT_TRUE(executeCapturedGraph(graph, executor, result));
+    expectExecutableGraph();
 
     // Verify output is still valid
     const float *out = result->data();
@@ -548,7 +611,7 @@ TEST_F(GPUGraphCaptureExecutionTest, ResetAndRecapture_Works)
 }
 
 // ===========================================================================
-// 8. Single-stage graph (minimal capture)
+// 9. Single-stage graph (minimal capture)
 // ===========================================================================
 
 TEST_F(GPUGraphCaptureExecutionTest, SingleStageGraph_Works)
@@ -574,6 +637,7 @@ TEST_F(GPUGraphCaptureExecutionTest, SingleStageGraph_Works)
     params.gamma = gamma;
     params.eps = 1e-5f;
     params.seq_len = static_cast<int>(seq_len);
+    params.device_id = device_ctx_->deviceId();
 
     ComputeGraph graph;
     graph.addNode("solo_rmsnorm", ComputeStageFactory::createRMSNorm(params), device_ctx_->deviceId());
@@ -581,9 +645,9 @@ TEST_F(GPUGraphCaptureExecutionTest, SingleStageGraph_Works)
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
 
-    ASSERT_TRUE(executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get()));
-    // With GPU stages, hasExecutable() is true.
-    // With CPU-only stages (0 GPU nodes), instantiation is skipped.
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+    ASSERT_TRUE(executeCapturedGraph(graph, executor, output));
+    expectExecutableGraph();
 
     // Verify output
     const float *out = output->data();
@@ -595,7 +659,7 @@ TEST_F(GPUGraphCaptureExecutionTest, SingleStageGraph_Works)
 }
 
 // ===========================================================================
-// 9. Correctness: graph capture output matches fast decode output
+// 10. Correctness: graph capture output matches fast decode output
 // ===========================================================================
 
 TEST_F(GPUGraphCaptureExecutionTest, OutputMatchesFastDecode)
@@ -607,7 +671,7 @@ TEST_F(GPUGraphCaptureExecutionTest, OutputMatchesFastDecode)
     const size_t d_model = 64;
     const size_t num_elements = seq_len * d_model;
 
-    // --- Run 1: via executeFastDecode (nullptr capture) ---
+    // --- Run 1: via explicitly selected eager execution ---
     FP32Tensor *norm_input1 = nullptr;
     FP32Tensor *residual1 = nullptr;
     FP32Tensor *result1 = nullptr;
@@ -616,7 +680,8 @@ TEST_F(GPUGraphCaptureExecutionTest, OutputMatchesFastDecode)
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);
 
-    ASSERT_TRUE(executor.executeWithGraphCapture(graph1, device_ctx_.get(), nullptr));
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+    ASSERT_TRUE(executor.executeFastDecode(graph1, device_ctx_.get()));
     std::vector<float> fast_decode_output(num_elements);
     std::memcpy(fast_decode_output.data(), result1->data(), num_elements * sizeof(float));
 
@@ -626,8 +691,10 @@ TEST_F(GPUGraphCaptureExecutionTest, OutputMatchesFastDecode)
     FP32Tensor *residual2 = nullptr;
     FP32Tensor *result2 = nullptr;
     auto graph2 = buildNormResidualGraph(seq_len, d_model, norm_input2, residual2, result2);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
 
-    ASSERT_TRUE(executor.executeWithGraphCapture(graph2, device_ctx_.get(), capture_.get()));
+    ASSERT_TRUE(executeCapturedGraph(graph2, executor, result2));
+    expectExecutableGraph();
 
     // Compare outputs
     const float *graph_output = result2->data();

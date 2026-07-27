@@ -105,6 +105,50 @@ namespace llaminar2
     };
 
     /**
+     * @brief Completion contract for one successful single-buffer collective.
+     *
+     * A tensor owner must know whether it can publish a completed device write
+     * immediately or must record an event on an asynchronous producer stream.
+     * Encoding that distinction as a tagged receipt prevents a null stream from
+     * ambiguously meaning either "synchronous" or "backend forgot to report
+     * ordering."
+     */
+    struct CollectiveSubmissionReceipt
+    {
+        enum class Kind
+        {
+            Unknown,
+            AlreadyComplete,
+            DeviceStream
+        };
+
+        Kind kind = Kind::Unknown;
+        void *producer_stream = nullptr;
+
+        /**
+         * @brief Describe a backend call that returned after all writes completed.
+         */
+        [[nodiscard]] static constexpr CollectiveSubmissionReceipt alreadyComplete() noexcept
+        {
+            return {Kind::AlreadyComplete, nullptr};
+        }
+
+        /**
+         * @brief Describe an asynchronous write ordered on an exact GPU stream.
+         *
+         * Null remains representable in the receipt so this factory can remain
+         * noexcept across CUDA/HIP compilation units. The consuming
+         * CollectiveContext validates it and treats null as a fatal backend
+         * contract violation.
+         */
+        [[nodiscard]] static constexpr CollectiveSubmissionReceipt onDeviceStream(
+            void *stream) noexcept
+        {
+            return {Kind::DeviceStream, stream};
+        }
+    };
+
+    /**
      * @brief Convert string to CollectiveBackendType
      *
      * Note: This is a convenience wrapper. Prefer parseCollectiveBackendType()
@@ -290,6 +334,29 @@ namespace llaminar2
         virtual void setComputeStreams(const std::vector<void *> &compute_streams)
         {
             (void)compute_streams;
+        }
+
+        /**
+         * @brief Describe completion of the most recent single-buffer operation.
+         *
+         * Asynchronous GPU backends return DeviceStream with the exact stream
+         * used for submission. Explicitly synchronous host-staged backends
+         * return AlreadyComplete. The default Unknown receipt fails closed when
+         * a GPU tensor owner attempts publication, forcing every viable backend
+         * to declare its ordering semantics.
+         *
+         * Multi-device APIs whose completion is represented by per-device event
+         * vectors publish those events through their own typed result contracts
+         * and do not use this accessor.
+         *
+         * @param device Device whose tensor buffer was submitted.
+         * @return Tagged completion receipt for the successful operation.
+         */
+        [[nodiscard]] virtual CollectiveSubmissionReceipt singleBufferSubmissionReceipt(
+            DeviceId device) const
+        {
+            (void)device;
+            return {};
         }
 
         // =====================================================================

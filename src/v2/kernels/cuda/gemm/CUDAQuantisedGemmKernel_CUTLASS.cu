@@ -1,11 +1,11 @@
 /**
  * @file CUDAQuantisedGemmKernel_CUTLASS.cu
- * @brief CUDA utility kernels and memory management for CUDAQuantisedGemmKernel
+ * @brief CUDA utility kernels and setup-time transfers for CUDAQuantisedGemmKernel
  *
  * After the NativeVNNI-only transition, this file retains:
  * - Blockwise activation quantization (FP32→INT8 per-block-of-32)
- * - Work buffer management
- * - Device memory utilities (upload, alloc, copy, free)
+ * - Setup-time packed-weight upload through the canonical CUDA backend
+ * - Device copy utilities
  * - Stream/event management
  *
  * The CUTLASS INT8 GEMM, row-wise quantization, output scaling, and
@@ -17,6 +17,8 @@
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+
+#include "backends/BackendManager.h"
 
 // =========================================================================
 // CUDA Error Checking Macros
@@ -176,46 +178,6 @@ extern "C"
     /**
      * @brief Ensure work buffers are allocated for given M
      */
-    bool cudaQuantGemm_ensureWorkBuffers(
-        int8_t **d_A_int8,
-        float **d_scales_A,
-        int32_t **d_C_int32,
-        int *work_buffer_M,
-        int M, int K, int N,
-        int cuda_device_id)
-    {
-        if (M <= *work_buffer_M)
-        {
-            return true; // Already have enough capacity
-        }
-
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
-
-        // Free existing
-        if (*d_A_int8)
-        {
-            cudaFree(*d_A_int8);
-        }
-        if (*d_scales_A)
-        {
-            cudaFree(*d_scales_A);
-        }
-        if (*d_C_int32)
-        {
-            cudaFree(*d_C_int32);
-        }
-
-        // Allocate new buffers with 2x headroom for growth
-        int alloc_M = M * 2;
-
-        CUDA_CHECK(cudaMalloc(d_A_int8, static_cast<size_t>(alloc_M) * K * sizeof(int8_t)));
-        CUDA_CHECK(cudaMalloc(d_scales_A, static_cast<size_t>(alloc_M) * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(d_C_int32, static_cast<size_t>(alloc_M) * N * sizeof(int32_t)));
-
-        *work_buffer_M = alloc_M;
-        return true;
-    }
-
     // NOTE: cudaQuantGemm_execute, cudaQuantGemm_applyScaling,
     // cudaQuantGemm_quantizeActivations (row-wise), and cudaQuantGemm_blockwiseGemm
     // have been removed — NativeVNNI is now the sole CUDA GEMM execution path.
@@ -340,30 +302,25 @@ extern "C"
     // NOTE: cudaQuantGemm_blockwiseGemm removed — NativeVNNI-only mode.
 
     /**
-     * @brief Free device memory
-     * @note Handles CUDA runtime shutdown gracefully during static destruction
+     * @brief Release setup-owned packed-weight storage through the CUDA backend.
+     *
+     * The explicit device ordinal is part of the ownership contract.  Teardown
+     * must not infer ownership from whichever CUDA context happens to be active.
      */
-    void cudaQuantGemm_freeDevice(void *d_ptr)
+    void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id)
     {
-        if (d_ptr)
-        {
-            cudaPointerAttributes attr;
-            cudaError_t pe = cudaPointerGetAttributes(&attr, d_ptr);
-            cudaError_t err = cudaFree(d_ptr);
-            // During static destruction at program exit, CUDA runtime may already
-            // be torn down. These error codes indicate this harmless condition.
-            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
-            {
-                // Only log actual errors, not shutdown-related ones
-                fprintf(stderr, "WARNING: cudaFree failed: %s ptr=%p attr_err=%d type=%d device=%d\n",
-                        cudaGetErrorString(err), d_ptr, (int)pe, (int)attr.type, attr.device);
-            }
-        }
+        if (!d_ptr)
+            return;
+
+        auto *backend = llaminar2::getCUDABackend();
+        if (!backend)
+            throw std::runtime_error(
+                "[CUDAQuantGemm] CUDA backend unavailable while releasing packed weights");
+        backend->free(d_ptr, cuda_device_id);
     }
 
     /**
-     * @brief Allocate raw bytes on device and copy from host
-     * @note Must be compiled by nvcc to ensure CUDA runtime context consistency
+     * @brief Allocate and upload setup-owned packed weights through the backend.
      */
     bool cudaQuantGemm_uploadRawBytes(
         const void *h_src,
@@ -376,19 +333,19 @@ extern "C"
         {
             return true;
         }
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
-        CUDA_CHECK(cudaMalloc(d_dst, bytes));
-        CUDA_CHECK(cudaMemcpy(*d_dst, h_src, bytes, cudaMemcpyHostToDevice));
-        return true;
-    }
+        auto *backend = llaminar2::getCUDABackend();
+        if (!backend)
+            return false;
 
-    /**
-     * @brief Allocate float array on device
-     */
-    bool cudaQuantGemm_allocFloat(float **d_ptr, size_t count, int cuda_device_id)
-    {
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
-        CUDA_CHECK(cudaMalloc(d_ptr, count * sizeof(float)));
+        *d_dst = backend->allocate(bytes, cuda_device_id);
+        if (!*d_dst)
+            return false;
+        if (!backend->hostToDevice(*d_dst, h_src, bytes, cuda_device_id))
+        {
+            backend->free(*d_dst, cuda_device_id);
+            *d_dst = nullptr;
+            return false;
+        }
         return true;
     }
 

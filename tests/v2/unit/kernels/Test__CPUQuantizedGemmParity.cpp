@@ -34,6 +34,7 @@
 #include "tensors/Tensors.h"
 #include "../../utils/TestTensorFactory.h"
 #include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
+#include "v2/kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -165,6 +166,63 @@ namespace
         return nullptr;
     }
 
+    /**
+     * @brief Execute one quantized parity cell without granting unit-test
+     * thread counts production dispatch authority.
+     *
+     * The installed CPU decode policy is certified for the production thread
+     * domain.  This unit test deliberately sweeps every thread count from one
+     * through 56 to expose ownership and tail bugs, so an `M=1` cell cannot
+     * truthfully use production `Auto` dispatch at every point in that sweep.
+     * Decode cells therefore request the explicit frozen diagnostic schedule.
+     * The diagnostic uses the same packed weights, activation quantizer, and
+     * vectorized NativeVNNI microkernel as production; only learned task
+     * ownership is bypassed.  Ordinary `M>1` cells still enter the public GEMM
+     * method and consequently exercise the total production prefill heuristic.
+     *
+     * @param kernel Tensor GEMM created from the quantized test weights.
+     * @param input FP32 activation tensor with `M * K` values.
+     * @param output FP32 destination tensor with `M * N` values.
+     * @param M Number of activation rows.
+     * @param N Number of output columns.
+     * @param K Number of input columns.
+     * @return True when the requested test operation completed.
+     */
+    bool multiplyQuantizedParityCell(
+        ITensorGemm *kernel,
+        const TensorBase *input,
+        TensorBase *output,
+        int M,
+        int N,
+        int K)
+    {
+        if (M != 1)
+            return kernel->multiply_tensor(input, output, M, N, K);
+
+        using namespace llaminar2::cpu::native_vnni;
+        auto *native_vnni =
+            dynamic_cast<CPUNativeVNNIGemmKernel *>(kernel);
+        if (native_vnni == nullptr)
+            return false;
+
+        const int k_blocks = (K + 31) / 32;
+        std::vector<Q8_1Block> quantized_input(
+            static_cast<size_t>(k_blocks));
+        quantize_activations_to_q8_1(
+            input->data(),
+            quantized_input.data(),
+            /*M=*/1,
+            K,
+            k_blocks);
+        gemv_native_vnni_preq(
+            native_vnni->packedWeights(),
+            quantized_input.data(),
+            output->mutable_data(),
+            ISAPath::AUTO,
+            DecodeSchedulePolicy::FrozenSerialOracle);
+        return true;
+    }
+
     // =========================================================================
     // Metrics
     // =========================================================================
@@ -294,8 +352,13 @@ namespace
                     // Zero output buffer for this run
                     std::memset(quant_output->mutable_data(), 0, (size_t)M * N * sizeof(float));
 
-                    bool ok = quantized_gemm->multiply_tensor(
-                        input.get(), quant_output.get(), M, N, K);
+                    bool ok = multiplyQuantizedParityCell(
+                        quantized_gemm.get(),
+                        input.get(),
+                        quant_output.get(),
+                        M,
+                        N,
+                        K);
                     EXPECT_TRUE(ok) << fmt << " " << shape.label << " t=" << t
                                     << " multiply_tensor returned false";
                     if (!ok)
@@ -475,8 +538,13 @@ namespace
 
                         std::memset(quant_output->mutable_data(), 0, (size_t)M * N * sizeof(float));
 
-                        bool ok = quantized_gemm->multiply_tensor(
-                            input.get(), quant_output.get(), M, N, K);
+                        bool ok = multiplyQuantizedParityCell(
+                            quantized_gemm.get(),
+                            input.get(),
+                            quant_output.get(),
+                            M,
+                            N,
+                            K);
                         EXPECT_TRUE(ok) << fmt << " " << pattern.name
                                         << " " << shape.label << " t=" << t;
                         if (!ok)

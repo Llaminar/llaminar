@@ -43,6 +43,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <functional>
+#include <span>
 
 namespace llaminar2
 {
@@ -323,7 +324,7 @@ namespace llaminar2
          * - No stage dumping, validation, or profiling is needed
          * - Stage objects are reused (not rebuilt)
          *
-         * Skips: getDumpInfo, extractBuffers, cohereInputs/Outputs,
+         * Skips: getDumpInfo and ordinary arena preparation,
          *        shouldDump, printStageOutputs, profiling, assertions
          *
          * The collective_nodes set enables O(1) lookup for TP stages instead
@@ -441,40 +442,71 @@ namespace llaminar2
             const char *context = nullptr);
 
         /**
+         * @brief Join every arena input to the exact stream before graph capture.
+         *
+         * Arena residency and producer ordering are separate contracts. Warmup
+         * can leave valid activation storage whose completion event belongs to a
+         * different eager stream. CUDA/HIP graph capture cannot import that
+         * external event after `beginCapture()`, so this method walks all graph
+         * reads, deduplicates their backing tensors, and enqueues nonblocking
+         * event waits on @p capture_stream before the capture transaction starts.
+         *
+         * `TransferEngine::requireDeviceInput()` records each exact
+         * `{completion event, capture stream}` pair. Stage-level prepared-input
+         * guards can then prove the dependency was established and must hard-fail
+         * instead of attempting a late capture-time event wait.
+         *
+         * @param graph Graph whose complete native body will be captured.
+         * @param ctx GPU context owning the graph and stream.
+         * @param capture_stream Exact non-null stream passed to beginCapture().
+         * @param context Optional diagnostic label.
+         * @return true after every unique arena read dependency is joined.
+         */
+        bool prepareInputsForGraphCapture(
+            ComputeGraph &graph,
+            IDeviceContext *ctx,
+            void *capture_stream,
+            const char *context = nullptr);
+
+        /**
          * @brief Execute a cached decode graph with GPU graph capture/replay
          *
          * On first call: captures all kernel launches into a GPU graph, instantiates
          * and launches it. On subsequent calls: re-captures, updates the executable
          * in-place (hipGraphExecUpdate/cudaGraphExecUpdate), and launches.
          *
-         * Falls back to executeFastDecode() if:
-         * - Graph capture/instantiation fails
-         * - Update fails more than max_failures times consecutively
-         * - Collective nodes are present (TP>1 with cross-device communication)
+         * Capture, instantiation, update, and launch failures are hard failures.
+         * This API never changes execution modes after work begins. Callers
+         * selecting eager execution must do so explicitly before invoking it.
          *
          * @param graph The cached compute graph
          * @param ctx Device context for execution
          * @param capture GPU graph capture object (created once, reused across calls)
+         * @param externally_visible_outputs Tensor outputs whose device writes
+         *        become observable outside this graph call. The executor records
+         *        their completion events on capture.executionStream() after the
+         *        graph launch. An empty list is an invalid publication contract.
          * @param collective_nodes Pre-computed collective node names (for TP>1)
-         * @param gpu_stream Opaque GPU stream pointer to assign to stages for dispatch
          * @return true on success
          */
         bool executeWithGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
                                      IGPUGraphCapture *capture,
-                                     const std::unordered_set<std::string> *collective_nodes = nullptr,
-                                     void *gpu_stream = nullptr);
+                                     std::span<ITensor *const> externally_visible_outputs,
+                                     const std::unordered_set<std::string> *collective_nodes = nullptr);
 
         // =========================================================================
         // Cached GPU Graph Replay
         // =========================================================================
 
         /**
-         * @brief A segment of the execution graph — either graph-capturable or manual
+         * @brief One contiguous replay unit in a GPU execution graph.
          *
-         * The execution order is partitioned into contiguous segments based on
-         * isGraphCapturable(). Capturable segments get their own GPU graph;
-         * non-capturable segments (attention, KV cache) are executed manually
-         * between graph launches.
+         * A production homogeneous CUDA/ROCm graph should normally contain one
+         * capturable unit spanning compute, state mutation, and NCCL/RCCL
+         * collectives. Multiple units exist for explicit diagnostics and for a
+         * topology containing a genuinely uncapturable stage. They are not the
+         * target architecture and must never be created merely because a
+         * specialized collective was omitted from orchestration classification.
          */
         struct GraphSegment
         {
@@ -498,14 +530,16 @@ namespace llaminar2
             bool arena_writes_cached = false;
         };
 
-        using GraphCaptureBoundaryHook = std::function<bool(const std::string &)>;
+        using GraphCaptureBoundaryHook =
+            std::function<bool(const std::string &, void *capture_stream)>;
 
         /**
-         * @brief Persistent cache of graph segments for cached graph replay
+         * @brief Persistent cache of GPU graph replay units.
          *
-         * Built once on the first decode step, reused across subsequent steps.
-         * Capturable segments are replayed via GPU graph launch; non-capturable
-         * segments are executed manually each step.
+         * Built on the first decode step and reused across subsequent steps.
+         * The ordinary production plan has one fully captured replay unit.
+         * Manual units are retained only for explicitly supported non-capturable
+         * topologies and are structurally visible through replay-mode telemetry.
          */
         struct GraphSegmentCache
         {
@@ -525,7 +559,6 @@ namespace llaminar2
             std::vector<GraphSegment> segments;       ///< Ordered segments
             bool initialized = false;                 ///< Whether segments have been built
             bool needs_capture = false;               ///< True after warmup, before capture
-            int consecutive_failures = 0;             ///< Segment-level failure counter
             uint64_t decode_step = 0;                 ///< Monotonic segmented-execution step counter
             uint64_t capture_variant_signature = 0;   ///< Stage-reported launch-topology variant for this cache
             uint64_t variant_recapture_count = 0;     ///< Resets caused by launch-topology variant changes
@@ -535,7 +568,6 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx_ref = nullptr; ///< GPU context for stream lifecycle (not owned)
             DeviceId capture_device = DeviceId::invalid(); ///< Device used to resolve the stream owner at teardown
             bool capture_context_from_pool = false; ///< True when the stream was created by the pool context
-            static constexpr int kMaxFailures = 4;    ///< Disable after N failures
 
             GraphSegmentCache() = default;
             ~GraphSegmentCache()
@@ -548,7 +580,6 @@ namespace llaminar2
                 : segments(std::move(other.segments)),
                   initialized(other.initialized),
                   needs_capture(other.needs_capture),
-                  consecutive_failures(other.consecutive_failures),
                   decode_step(other.decode_step),
                   capture_variant_signature(other.capture_variant_signature),
                   variant_recapture_count(other.variant_recapture_count),
@@ -575,7 +606,6 @@ namespace llaminar2
                     segments = std::move(other.segments);
                     initialized = other.initialized;
                     needs_capture = other.needs_capture;
-                    consecutive_failures = other.consecutive_failures;
                     decode_step = other.decode_step;
                     capture_variant_signature = other.capture_variant_signature;
                     variant_recapture_count = other.variant_recapture_count;
@@ -600,11 +630,10 @@ namespace llaminar2
 
             void reset(StreamResetPolicy stream_policy = StreamResetPolicy::Destroy)
             {
-                synchronizeCaptureStream();
+                waitForCaptureStreamFence();
                 segments.clear();
                 initialized = false;
                 needs_capture = false;
-                consecutive_failures = 0;
                 decode_step = 0;
                 capture_variant_signature = 0;
                 destroySyncEvent();
@@ -619,8 +648,17 @@ namespace llaminar2
                 DeviceId device = DeviceId::invalid(),
                 bool context_from_process_pool = false);
 
-            /// Wait for queued replay/capture work before graph resources are torn down.
-            void synchronizeCaptureStream();
+            /**
+             * @brief Wait on one event representing all prior capture-stream work.
+             *
+             * This is a host ownership fence, not an ordering primitive between
+             * GPU streams. Normal producer/consumer ordering must use
+             * orderCaptureStreamAfter() or another device-side event wait. The
+             * fence is reserved for native graph-capture entry and resource
+             * teardown, where the host must know that prior stream work has
+             * completed before changing stream or graph lifetime.
+             */
+            void waitForCaptureStreamFence();
 
             /// Destroy the capture stream if it exists
             void destroyCaptureStream();
@@ -628,28 +666,70 @@ namespace llaminar2
             /// Create or get the cached sync event for inter-stream dependencies
             bool ensureSyncEvent(IWorkerGPUContext *ctx);
 
+            /**
+             * @brief Order the capture stream after work queued on another stream.
+             *
+             * The method records the cache-owned event on `producer_stream` and
+             * queues a wait on `capture_stream`. Both operations stay on the
+             * device; no host wait or device-wide synchronization is permitted.
+             *
+             * @param ctx GPU context owning both streams and the event.
+             * @param producer_stream Explicit stream whose prior work must finish.
+             * @return true when the complete GPU-side dependency was queued.
+             */
+            bool orderCaptureStreamAfter(
+                IWorkerGPUContext *ctx,
+                void *producer_stream);
+
             /// Destroy the cached sync event if it exists
             void destroySyncEvent();
 
-            /// Resolve the current lifecycle context for stream/event cleanup.
-            IWorkerGPUContext *resolveLifecycleContext(const char *operation);
+            /**
+             * @brief Resolve the mandatory owner of a live stream or event.
+             *
+             * Calling this method means a backend resource already exists.
+             * Failure is therefore process-fatal: silently dropping the
+             * resource would make queued-work and graph lifetime unknowable.
+             *
+             * @param operation Human-readable lifecycle operation for diagnostics.
+             * @return Non-null context that owns the live backend resource.
+             */
+            IWorkerGPUContext *requireLifecycleContext(const char *operation);
         };
 
         /**
-         * @brief Execute with segmented GPU graph capture/replay
+         * @brief Topology contract governing whether a replay plan may contain
+         *        more than one graph unit or any host/manual execution unit.
          *
-         * Partitions the execution order into segments based on stage
-         * isGraphCapturable(). Capturable segments (GEMMs, norms, SwiGLU, etc.)
-         * are captured into separate GPU graphs and replayed. Non-capturable
-         * segments (attention, KV cache append) are executed manually between
-         * graph launches.
+         * Homogeneous CUDA-only and ROCm-only execution domains use
+         * @ref RequireFullGraph. Every stage, including NCCL/RCCL collectives,
+         * must then belong to one captured graph.
          *
-         * For a 28-layer Qwen2.5 model this produces ~57 graph segments + 56
-         * manual segments per decode step, with each hipGraphLaunch costing
-         * ~5-10μs (total ~300-600μs host overhead vs ~43ms without graphs).
+         * @ref AllowHeterogeneousCollectiveSegmentation exists only for a
+         * genuinely mixed device-type domain whose graph contains collectives
+         * crossing those device types. Callers must prove both properties
+         * before selecting it. The planner independently requires collective
+         * nodes, preventing this policy from becoming a generic escape hatch
+         * for an uncapturable stage.
+         */
+        enum class GraphReplayPlanPolicy
+        {
+            RequireFullGraph,
+            AllowHeterogeneousCollectiveSegmentation
+        };
+
+        /**
+         * @brief Execute a cached GPU graph replay plan.
          *
-         * On first call: builds replay units and captures capturable units.
-         * On subsequent calls: replays captured graphs and re-executes manual units.
+         * The planner consumes each stage's graph-capture and collective
+         * contracts. Fully capturable homogeneous CUDA/ROCm graphs, including
+         * NCCL/RCCL LocalTP collectives, become one captured replay unit.
+         * Segmentation is reserved for explicitly admitted heterogeneous
+         * collective boundaries; it is not an automatic stage fallback.
+         *
+         * On first call the method builds and captures the replay plan. On
+         * subsequent calls it launches captured units and executes any
+         * explicitly admitted manual units.
          *
          * @param graph The cached compute graph
          * @param ctx Device context for execution
@@ -666,7 +746,9 @@ namespace llaminar2
                                               bool collectives_graph_capturable = false,
                                               bool force_recapture = false,
                                               bool defer_final_sync = false,
-                                              GraphCaptureBoundaryHook before_begin_capture = {});
+                                              GraphCaptureBoundaryHook capture_boundary = {},
+                                              GraphReplayPlanPolicy plan_policy =
+                                                  GraphReplayPlanPolicy::RequireFullGraph);
 
         /**
          * @brief Policy object for decode capture/replay execution mode selection
@@ -677,18 +759,29 @@ namespace llaminar2
             bool allow_cached_graph_replay = false;
             bool collective_segmented_enabled = false;
             bool collectives_graph_capturable = false; ///< True when LocalTP NCCL/RCCL collectives are captured in the replay graph
+            GraphReplayPlanPolicy graph_replay_plan_policy =
+                GraphReplayPlanPolicy::RequireFullGraph; ///< Full graph unless a proven heterogeneous collective domain explicitly admits segmentation.
             bool force_recapture = false;              ///< Re-record graph segments on replay for callers with dynamic params not yet replay-safe
             bool defer_final_sync = false;             ///< Caller will synchronize the replay stream through a following operation.
-            int max_segment_failures = 4;
-            GraphCaptureBoundaryHook before_begin_capture; ///< Optional domain-level fence before stream capture begins.
+            /**
+             * Optional domain-level capture lifecycle rendezvous.
+             *
+             * Capture invokes this hook before beginCapture() and immediately
+             * after endCapture(). LocalTP participants install one shared cyclic
+             * barrier so every device enters and exits native capture as a
+             * domain. The exit rendezvous remains required for a single full
+             * graph because sibling graph instances are recorded independently.
+             */
+            GraphCaptureBoundaryHook capture_boundary;
         };
 
         /**
          * @brief Execute decode graph according to a single policy object
          *
-         * Centralizes mode selection between cached GPU graph replay, fast decode,
-         * and full executor fallback. When graph replay fails, this method falls
-         * back to fast decode automatically.
+         * Centralizes the configuration-time selection between cached GPU graph
+         * replay, fast decode, and the general executor. Once cached replay is
+         * selected, any capture or launch failure is returned as a hard
+         * execution failure; this method never changes paths after an attempt.
          */
         bool executeDecodeWithCapturePolicy(
             ComputeGraph &graph,
@@ -734,6 +827,19 @@ namespace llaminar2
 
         bool cancellationRequested(const std::string &node_name) const;
         void notifyStageFailure(const std::string &node_name, const std::string &reason) const;
+
+        /**
+         * @brief Validate every device-owned prepared weight declared by a stage.
+         *
+         * Prepared weight identity is the tuple
+         * `{model, binding, kind, device}` held by PreparedWeightRef. Validation
+         * happens before raw tensor coherence so a host-only source tensor can
+         * never be mistaken for the allocation consumed by a GPU kernel.
+         */
+        bool validatePreparedWeightBindings(
+            const ComputeNode &node,
+            const StageBufferContract &contract,
+            DeviceId target_device) const;
 
         /**
          * @brief Execute a single stage according to the given policy.
@@ -812,9 +918,10 @@ namespace llaminar2
          * host callbacks while device work is being recorded/launched. Draining
          * live stage outputs after the full graph finishes is incorrect when the
          * arena reuses an activation slot later in the graph. This helper records
-         * a device-to-device copy immediately after the producing stage, so graph
-         * replay preserves the stage-boundary value without re-entering eager
-         * execution.
+         * a device-to-device copy immediately after the producing stage into
+         * a unique device-visible mapped-host slot. Graph replay therefore
+         * preserves the stage-boundary value without re-entering eager
+         * execution or reserving a second activation graph in device memory.
          */
         bool captureGraphSnapshotCopies(ComputeNode &node,
                                         DeviceId target_device,
@@ -823,10 +930,11 @@ namespace llaminar2
         /**
          * @brief Publish one GPU stage from its immutable graph snapshot slots.
          *
-         * Graph replay updates slot device memory without executing stage C++.
-         * This method records a real post-launch completion event, builds a
-         * callback descriptor solely from the frozen slot manifest, transfers
-         * those bytes to host, and invokes the configured snapshot callback.
+         * Graph replay updates a mapped slot through its device-visible pointer
+         * without executing stage C++. This method records a real post-launch
+         * completion event, waits only for that publication point, builds a
+         * callback descriptor solely from the frozen slot manifest, and invokes
+         * the configured snapshot callback over the host-visible mapping.
          * It deliberately never calls getDumpInfo() on the live stage.
          */
         bool publishGraphSnapshotCopies(const std::string &stage_name,

@@ -1,6 +1,6 @@
 ---
 name: nativevnni-gemm-tuning
-description: Tune, benchmark, profile, train, certify, and install Llaminar NativeVNNI GEMV/GEMM dispatch policies across CPU, CUDA, and ROCm. Use for NativeVNNI kernel candidate work, all-format dispatch sweeps, M=1 decode, grouped MTP verifier rows, ordinary prefill, dense or MoE projection geometry, profiler-informed fitting, Git LFS corpus publication or reuse, exact overlays, generic rules, p95 regret failures, scorer acceleration, and generated dispatch .inc files.
+description: Tune, benchmark, profile, train, certify, and install Llaminar NativeVNNI M=1 and grouped-verifier dispatch policies across CPU, CUDA, and ROCm. Use for NativeVNNI kernel candidate work, all-format dispatch sweeps, M=1 decode, grouped MTP verifier rows, dense or MoE projection geometry, profiler-informed fitting, Git LFS corpus publication or reuse, exact overlays, generic rules, p95 regret failures, scorer acceleration, generated dispatch .inc files, and validation of heuristic-only ordinary prefill.
 ---
 
 # NativeVNNI GEMM Tuning
@@ -60,23 +60,23 @@ scripts/train_native_vnni_dispatch.sh --backend cuda --install
 scripts/train_native_vnni_dispatch.sh --backend rocm --install
 scripts/train_native_vnni_dispatch.sh --backend cpu --install -- \
   --cpu-format-shards
-scripts/train_native_vnni_dispatch.sh --backend cpu-prefill --install -- \
-  --cpu-format-shards
 scripts/train_native_vnni_dispatch.sh --backend all --install \
   --minimum-passing-domain-percent 0
 ```
+
+The production transaction installs learned dispatch only for serial M=1 and
+grouped verifier rows. Ordinary prefill is heuristic-only on CPU, CUDA, and
+ROCm and must compile and execute without a generated prefill include. The
+explicit `--backend cpu-prefill` transaction remains available for offline
+kernel research and corpus analysis, but `--install` is intentionally rejected.
 
 Pass hardware/tool/lane controls after `--`. Do not pass `--shapes` or
 `--shape-partition`; add production overlays to the shared inventory. The
 driver owns backend, profile, output path, fit-only flags, and installation.
 The production exact-overlay matrix is symmetric: every known geometry is
 measured for all 21 registry formats at Fast M=1 and grouped-verifier M=2..16
-plus M=31. Ordinary-prefill depth is backend specific. CPU measures
-M={64,128,256,512} for below-14B geometries and M={64,128} for geometries
-owned by a 14B-or-larger model. CUDA and ROCm measure
-M={64,256,1024,2048,4096,8192,16384}. LM heads are absent only from ordinary
-prefill because that operation does not run there. Unmeasured positive M
-values, including CPU M above 512, remain total through generic rules.
+plus M=31. LM heads participate because both learned surfaces execute them.
+Unmeasured positive grouped M values remain total through generic rules.
 CPU collection automatically uses every detected physical socket. Each MPMD
 rank owns a distinct resumable timing cell and retains the production
 per-socket thread count; set `--cpu-measurement-lanes N` only for deliberate
@@ -84,8 +84,8 @@ isolation.
 
 CPU production refresh is dependency ordered. Certify and install the complete
 `Fast M=1` decode policy first, rebuild both AVX2 and AVX512 trainers against
-that include, and only then collect ordinary-prefill or grouped-verifier
-evidence through the production `Auto` route. Use
+that include, and only then collect grouped-verifier evidence through the
+production `Auto` route. Use
 `--stop-after-cpu-decode --install` for this explicit checkpoint. Do not make a
 prefill profiler process bypass an uncertified M=1 selector with a diagnostic
 serial-oracle override; that would profile a non-production path.
@@ -209,7 +209,50 @@ transaction omitted that file, recover it with `profiler_evidence
 compact-witnesses --feature-table ...`; the command reconstructs only strict
 common-observation columns, verifies their embedded digests, and authenticates
 them against request/evidence manifests. It must not run trainer timing tests or
-profiler collectors.
+profiler collectors. Legacy indented evidence is decoded and authenticated on
+physical-core-capped workers during this recovery, then rewritten in compact
+canonical form with the same semantic manifest digest. Later feature export and
+certification can consequently use direct mmap byte authentication instead of
+repeating the legacy parse.
+
+All three backend analyzers use a content-addressed policy fit cache beneath
+the transaction output directory. Development freeze and the mandatory
+pre-seal reconstruction must share that cache so unchanged candidate costs,
+cross-validation folds, and final publication trees are reused; cache keys,
+not directory presence, decide whether retained work is valid.
+
+When a ROCm M=1 development transaction has complete timing and profiler
+evidence but has not yet opened its seal, continue with
+`--reuse-rocm-development --rocm-development-build-change-audit NOTE`. This
+mode retains the original timing provenance, authenticates and re-exports the
+isolated profiler evidence, and collects only the fresh sealed and grouped
+phases. The audit is mandatory because the profiler executable may contain a
+harness-only lifetime fix while the immutable timing rows still belong to the
+older build. Do not use `--skip-sweep` for this state: the sealed and grouped
+corpora legitimately do not exist yet.
+
+```bash
+scripts/train_native_vnni_dispatch.sh --backend rocm --install -- \
+  --reuse-rocm-development \
+  --rocm-development-build-change-audit "reviewed harness-only rebuild"
+```
+
+After Fast sealed and grouped-verifier timing are also complete, resume the
+same workspace through the refresh driver with both `--skip-sweep` and
+`--reuse-rocm-development`. The driver authenticates development provenance
+from the immutable development common corpus, sealed provenance from the
+complementary Fast common rows, and verifier provenance from the grouped common
+corpus. It must schedule no timing lane and may resume an exact profiler journal
+after staging the already certified policy. Never use bare `--skip-sweep` for a
+cross-build ROCm workspace because that would substitute current harness
+metadata for retained measurements.
+
+```bash
+scripts/refresh_native_vnni_dispatch_tables.sh \
+  --backend rocm --profile all --output-dir <workspace> --install \
+  --skip-sweep --reuse-rocm-development \
+  --rocm-development-build-change-audit "reviewed harness-only rebuild"
+```
 
 When changing only profiler-model features, assess the cross-fitted teacher
 before paying for the complete tree frontier. Add
@@ -235,7 +278,8 @@ PYTHONPATH=tests/v2/performance/kernels \
     --observation <compact-observation-witness.csv> \
     --requests <exact-v4-requests.json> \
     --evidence <exact-v4-evidence.json> \
-    --output <profiler-diagnostics.json>
+    --output <profiler-diagnostics.json> \
+    --require-meaningful-signal
 ```
 
 Require complete per-candidate contests for the stable instruction/work and L1
@@ -269,6 +313,24 @@ launchable point. Deduplicate only true aliases with that complete identity.
 Never broadcast counters from a representative anchor to another work size or
 candidate, and never average unrelated launches into one descriptor.
 
+Final CUDA/ROCm combined profiler transactions are additive. Seed them from
+the authenticated development request/evidence/witness triplet, derive exact
+missing requests from the enlarged sealed/grouped observation surface, profile
+only that delta, and compose atomically. Never re-profile unchanged M=1
+development launches merely because the final corpus has a different filename.
+
+CUDA and ROCm collectors amortize profiler injection, device-context creation,
+and fixture preparation across bounded exact-request batches. The collector
+writes an authenticated TSV plan; the trainer claims every row once and opens
+one distinct controlled range around that row's extra production launch. Nsight
+partitions CUDA evidence by the request's explicit stream, while rocprofiler
+partitions the ordered physical trace by its per-request renamed ranges on every
+counter pass. A successful process must report every planned request exactly
+once, retain per-member binary and batch provenance, and reject missing,
+duplicate, reordered, non-contiguous, or cross-attributed ranges. Process
+batching changes setup cost only: it never merges candidate metrics or turns a
+multi-candidate interval into one profiler record.
+
 For CPU grouped-verifier evidence, retain the authenticated effective N-block
 chunk width in every observation. Pairwise and WideRows inherit that geometry
 from serial M=1 planning, while the full-K row-chunk, N-major, and pair-grid
@@ -278,16 +340,22 @@ separately. Inferring one family's geometry from another erases the schedule
 signal the learner needs and can make physically different candidates appear
 identical.
 
-Request schema `native-vnni-profiler-request-v4-exact-point` is the current fit
-contract. Historical v3 anchor catalogs remain immutable and readable for
+Request schema `native-vnni-profiler-request-v5-stratified-exact-point` is the
+current fit contract. Canonical timing remains exhaustive. For every exact
+backend/ISA/format/shape/mode/M contest, rank its physical candidates by the
+canonical timing result and profile the fastest 5%, centered median 5%, and
+slowest 5%, with a minimum of one candidate per stratum. Each selected physical
+launch is still profiled separately; true launch aliases may share evidence
+only when every launch-changing field is identical. Historical v3 anchor and
+v4 exhaustive exact-point catalogs remain immutable and readable for
 provenance, but are not admissible current fit evidence. A replacement
-transaction is derived from existing canonical timing witnesses, profiles each
-exact point separately, and does not repeat canonical timing. Evidence
-composition rejects incompatible request or collector generations, missing
-records, conflicting counters, or a profiled launch whose complete identity
-differs from its request. Compatible immutable raw-profiler feature generations
-are normalized to the current exporter schema during composition; a feature
-engineering change is never authority to relaunch hardware counters.
+transaction is derived from existing canonical timing witnesses and does not
+repeat canonical timing. Evidence composition rejects incompatible request or
+collector generations, missing records, conflicting counters, or a profiled
+launch whose complete identity differs from its request. Compatible immutable
+raw-profiler feature generations are normalized to the current exporter schema
+during composition; a feature-engineering change is never authority to
+relaunch hardware counters.
 
 When a final timing corpus extends a previously complete profiler transaction,
 do not reprofile the covered launch surface. Run `profiler_evidence
@@ -299,17 +367,24 @@ The turnkey driver discovers completed content-addressed deltas that were not
 yet atomically published, authenticates them, and includes them in coverage
 before emitting another request. It also resumes when only the durable
 `.inprogress.jsonl` collector journal exists, or when request publication
-completed before any final evidence or journal record was written. A retained
-legacy request generation may remain beside a current exact-v4 transaction for
-provenance; authenticate and resume the current manifest instead of copying the
-legacy generation over it. Audited common-observation reuse snapshots its
-retained input through an atomic reflink copy and never renames away the
-canonical analyzer input. CPU decode retains one stable development run ID per
-output directory so a restart reopens the same partial transaction instead of
-creating a timestamp sibling. Physical resume identity ignores timing-run
-provenance but includes arithmetic fingerprint, candidate policy hash,
-schedule, workspace, prepared resources, threading/stream mode, execution
-mode, and exact `M/N/K` geometry.
+completed before any final evidence or journal record was written. If corpus
+regeneration changes only representative provenance and therefore derives new
+observation/request IDs, the driver authenticates the old manifest and journal,
+publishes successful terminal members as an immutable subset transaction, and
+subtracts exact physical-launch coverage before opening a new delta. It never
+rewrites old request IDs, observation digests, command digests, raw-artifact
+digests, or counters; failed/missing journal members remain fresh obligations,
+and overlapping journals contribute only their uncovered physical tail. A
+retained legacy request generation may remain beside a current exact-v4
+transaction for provenance; authenticate and resume the current manifest
+instead of copying the legacy generation over it. Audited common-observation
+reuse snapshots its retained input through an atomic reflink copy and never
+renames away the canonical analyzer input. CPU decode retains one stable
+development run ID per output directory so a restart reopens the same partial
+transaction instead of creating a timestamp sibling. Physical resume identity
+ignores timing-run provenance but includes arithmetic fingerprint, candidate
+policy hash, schedule, workspace, prepared resources, threading/stream mode,
+execution mode, and exact `M/N/K` geometry.
 
 Migrate the recipe through its authenticated command, not by editing JSON:
 
@@ -473,11 +548,12 @@ normalized profiler catalog under their fit-cache directory; freeze and
 certification must reuse it when the bound request/evidence/witness identities
 are unchanged.
 
-For large CPU M=1 or grouped transactions, parse exact timing sidecars in
-byte-safe physical-core ranges and adapt aggregate rows into private canonical
-CSV shards before ordered atomic assembly. Keep small corpora serial below the
-reviewed thresholds. Any change to this preprocessing must prove equal timing
-maps, observation order, corpus digest, and output bytes against serial replay.
+For large CPU, CUDA, or ROCm timing transactions, parse exact sidecars in
+byte-safe physical-core ranges that begin and end only at complete measurement
+groups or candidate trials. Adapt aggregate rows into private canonical CSV
+shards before ordered atomic assembly. Keep small corpora serial below reviewed
+thresholds. Any change to this preprocessing must prove equal timing maps,
+observation order, corpus digest, and output bytes against serial replay.
 
 Both CPU decode surfaces require iterative paired development before freeze:
 use `paired_requests --surface decode-m1` for serial decode and
@@ -507,8 +583,13 @@ physical edge merely because the aggregate corpus digest changed.
 
 Canonical observation hashing and fit-cache identity preparation are also
 host-parallel. `ObservationCorpus.digest()` serializes/sorts row shards in fork
-workers, merges them in canonical order, streams the historical byte sequence
-into SHA-256, and memoizes the result on the immutable corpus. Domain-local
+workers, derives deterministic lexical range splitters, merges disjoint global
+ranges on the worker pool, streams already ordered fragments into SHA-256, and
+memoizes the result on the immutable corpus. The coordinator must never perform
+a corpus-wide Python row merge. Serialization, shard partitioning, and range
+merge reuse one persistent physical-core-capped process pool so a large loaded
+corpus is forked only once per digest. Regressions must prove both one-pool
+lifetime and exact historical digest bytes. Domain-local
 semantic, paired-edge, legacy-migration, and serial-oracle cache identities are
 computed independently across policy workers. Use
 `LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS` and
@@ -670,11 +751,18 @@ retain measured cells and evaluate formulas during fitting.
   serial row. M=31 is evidence that runtime support is not artificially capped;
   production M is not limited to the measured buckets.
 - **Ordinary prefill/GEMM:** sweep every applicable production geometry and all
-  21 source formats. CPU uses M={64,128,256,512} below 14B and M={64,128} at
-  14B and above; it measures every build/runtime ISA regime.
-  CUDA and ROCm use M={64,256,1024,2048,4096,8192,16384}. Exact overlays come
-  only from these exact cells; generic rules provide total dispatch for every
-  unseen positive M and N/K geometry.
+  21 source formats. CPU uses M={32,128} below 7B, M={32,64} from 7B through
+  below 14B, and M={32} at 14B and above; it measures every build/runtime ISA
+  regime.
+CUDA and ROCm use M={64,256,1024,2048,4096,8192,16384}. Exact overlays come
+only from these exact cells; generic rules provide total dispatch for every
+unseen positive M and N/K geometry.
+
+For canonical multi-GPU timing, CUDA assigns disjoint format shards. ROCm
+assigns disjoint shape shards and runs the complete format matrix on each
+shard; do not statically divide 21 ROCm formats over four cards because the
+6/5/5/5 assignment leaves three devices idle during the final format. A phase
+with fewer shapes than visible devices uses only the useful lane count.
 - **Dense and MoE:** include attention, GDN, short-conv consumers, dense FFN,
   expert gate/up/down, MTP hidden/embedding projection, and LM head geometries
   that actually route through NativeVNNI.
@@ -759,6 +847,29 @@ register/shared/local-memory resources, occupancy, DRAM throughput, and the
 ALU/FMA/tensor utilization pipes; define compute utilization as the maximum of
 the simultaneously measured compute pipes. Add a replay pass only when a
 focused feature-value study proves it justifies the collection cost.
+
+ROCm collection uses the same exact-plan batching and request-local ROCTx
+ranges, but ROCm 7.1 profiler interception has a validated process-lifetime
+bound. Keep each process at no more than 256 total requests and no more than
+256 graph-captured requests. The collector and trainer both reject larger
+plans; do not raise either ceiling without repeated real-profiler stress runs
+of mixed eager/graph and graph-only plans on the target ROCm runtime. Canonical
+timing still precedes the one isolated profiler replay, and the profiled graph
+launch is terminal for its graph executable.
+
+ROCm profiler-only trainer invocations must not repeat canonical correctness or
+timing work. The immutable timing corpus already owns D2H byte checks, warmups,
+and event-timed samples. For each request and each rocprof pass, verify the
+forced route, execute two fixed unprofiled preconditioning launches while
+collection is paused, execute exactly one request-local selected launch, and
+return. Profiler-only source weights use one valid factory-generated quantized
+row tiled across N: this preserves the concrete source format, raw byte
+footprint, production upload/repack path, and launch geometry without paying
+for value-independent full-matrix Gaussian generation on every profiler pass.
+Canonical collection mode remains unchanged and retains independently random
+full matrices. Keep focused source, all-format, and real-profiler regressions
+so timing loops or expensive value generation cannot drift back into profiler
+mode.
 
 Large request construction and CUDA timing-sidecar adaptation use fork-based,
 physical-core-capped workers. Partition timing CSVs only at complete

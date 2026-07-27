@@ -8,14 +8,428 @@
 #include "utils/WeightLoadingProfiler.h"
 #include "utils/DebugEnv.h"
 
+#include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <cerrno>
+#include <fcntl.h>
 #include <iomanip>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <unistd.h>
 
 namespace llaminar2
 {
+    size_t orderWeightJobsForSequentialHostAccess(std::vector<WeightJob> &jobs)
+    {
+        size_t backward_jumps = 0;
+        uintptr_t previous_address = 0;
+        bool have_previous_address = false;
+
+        for (const auto &job : jobs)
+        {
+            if (!job.host_raw_data)
+                continue;
+
+            const auto address = reinterpret_cast<uintptr_t>(job.host_raw_data);
+            if (have_previous_address && address < previous_address)
+                ++backward_jumps;
+            previous_address = address;
+            have_previous_address = true;
+        }
+
+        std::stable_sort(
+            jobs.begin(), jobs.end(),
+            [](const WeightJob &lhs, const WeightJob &rhs)
+            {
+                // Invalid jobs remain at the end so processJobs() emits its
+                // existing precise null-source diagnostic before touching them.
+                const auto lhs_address = lhs.host_raw_data
+                                             ? reinterpret_cast<uintptr_t>(lhs.host_raw_data)
+                                             : std::numeric_limits<uintptr_t>::max();
+                const auto rhs_address = rhs.host_raw_data
+                                             ? reinterpret_cast<uintptr_t>(rhs.host_raw_data)
+                                             : std::numeric_limits<uintptr_t>::max();
+                return lhs_address < rhs_address;
+            });
+
+        return backward_jumps;
+    }
+
     namespace
     {
+        struct FileReadPlan
+        {
+            int fd = -1;
+            uint64_t file_offset = 0;
+            size_t read_bytes = 0;
+        };
+
+        /**
+         * @brief Resolve mmap jobs into reusable buffered file descriptors.
+         *
+         * Exact buffered pread() calls retain the loader's fixed pinned-ring
+         * memory bound while allowing Linux readahead and the page cache to
+         * service the sequential GGUF stream. This is materially faster than
+         * uncached direct I/O on consumer NVMe devices, where the model's many
+         * sub-megabyte tensor ranges otherwise become synchronous storage
+         * operations.
+         *
+         * One descriptor per split GGUF file is shared by independent pread()
+         * calls. pread() does not mutate descriptor position, so producer lanes
+         * can fill persistent pinned slots concurrently without a file-offset
+         * lock or an intermediate host allocation.
+         */
+        class MmapFileReader
+        {
+        public:
+            MmapFileReader() = default;
+
+            ~MmapFileReader()
+            {
+                for (const int fd : owned_fds_)
+                {
+                    if (fd >= 0)
+                        ::close(fd);
+                }
+            }
+
+            MmapFileReader(const MmapFileReader &) = delete;
+            MmapFileReader &operator=(const MmapFileReader &) = delete;
+
+            bool prepare(const std::vector<WeightJob> &jobs,
+                         std::vector<FileReadPlan> &plans,
+                         std::string &error)
+            {
+                plans.assign(jobs.size(), {});
+                for (size_t job_index = 0; job_index < jobs.size(); ++job_index)
+                {
+                    const auto &job = jobs[job_index];
+                    // MmapRegion owns the process-wide registry of live model
+                    // mappings. Resolve the concrete pointer range instead of
+                    // trusting a tensor-class hint: expert views and other
+                    // borrowed slices can point into a GGUF mapping without
+                    // carrying the root tensor's mmap metadata.
+                    const auto source =
+                        MmapRegion::resolveFileSource(job.host_raw_data, job.raw_bytes);
+                    if (!source)
+                        continue;
+
+                    int fd = -1;
+                    const auto existing = fds_by_path_.find(source->path);
+                    if (existing != fds_by_path_.end())
+                    {
+                        fd = existing->second;
+                    }
+                    else
+                    {
+#ifdef __linux__
+                        fd = ::open(
+                            source->path.c_str(),
+                            O_RDONLY | O_CLOEXEC);
+#endif
+                        if (fd < 0)
+                        {
+                            error = "open for buffered pread failed for '" +
+                                    source->path +
+                                    "' errno=" + std::to_string(errno);
+                            return false;
+                        }
+#ifdef POSIX_FADV_SEQUENTIAL
+                        /*
+                         * This is a scheduling hint, not an eager read request.
+                         * It neither grows the process staging ring nor requires
+                         * the complete model to be resident before loading.
+                         */
+                        (void)::posix_fadvise(
+                            fd,
+                            0,
+                            0,
+                            POSIX_FADV_SEQUENTIAL);
+#endif
+                        fds_by_path_.emplace(source->path, fd);
+                        owned_fds_.push_back(fd);
+                    }
+
+                    plans[job_index] = {
+                        .fd = fd,
+                        .file_offset = source->offset,
+                        .read_bytes = job.raw_bytes,
+                    };
+                }
+                return true;
+            }
+
+            bool read(const FileReadPlan &plan,
+                      void *slot,
+                      size_t slot_bytes,
+                      const void *&payload,
+                      size_t &file_bytes,
+                      std::string &error) const
+            {
+                if (plan.fd < 0)
+                {
+                    error = "file-read plan has no file descriptor";
+                    return false;
+                }
+                if (!slot || plan.read_bytes > slot_bytes)
+                {
+                    error = "buffered file read exceeds pinned staging slot";
+                    return false;
+                }
+
+                size_t completed = 0;
+                while (completed < plan.read_bytes)
+                {
+                    ssize_t result = -1;
+                    do
+                    {
+                        result = ::pread(
+                            plan.fd,
+                            static_cast<uint8_t *>(slot) + completed,
+                            plan.read_bytes - completed,
+                            static_cast<off_t>(
+                                plan.file_offset + completed));
+                    } while (result < 0 && errno == EINTR);
+
+                    if (result < 0)
+                    {
+                        error = "buffered pread failed with errno=" +
+                                std::to_string(errno);
+                        return false;
+                    }
+                    if (result == 0)
+                    {
+                        error = "short buffered pread: required=" +
+                                std::to_string(plan.read_bytes) +
+                                " received=" + std::to_string(completed);
+                        return false;
+                    }
+                    completed += static_cast<size_t>(result);
+                }
+
+                file_bytes = completed;
+                payload = slot;
+                return true;
+            }
+
+        private:
+            std::unordered_map<std::string, int> fds_by_path_;
+            std::vector<int> owned_fds_;
+        };
+
+        struct StagedSource
+        {
+            const void *payload = nullptr;
+            size_t file_bytes = 0;
+            double read_ms = 0.0;
+            double h2d_wait_ms = 0.0;
+            std::string error;
+        };
+
+        /**
+         * @brief Persistent producer threads for pinned upload slots.
+         *
+         * A pinned slot becomes reusable when its H2D event completes, which is
+         * earlier than completion of the repack kernel consuming the paired
+         * device slot. Each worker waits only for that H2D event, refills its host
+         * slot, and lets the main thread protect device-slot reuse with a
+         * stream-side wait on the repack event. This overlaps storage, H2D, and
+         * repack without a full-device synchronization or another allocation.
+         */
+        class StagingLanePool
+        {
+        public:
+            StagingLanePool(
+                IBackend &backend,
+                int device_id,
+                PinnedRingBuffer &pinned,
+                const MmapFileReader &file_reader,
+                const std::vector<FileReadPlan> &file_read_plans,
+                const std::vector<WeightJob> &jobs,
+                const std::vector<void *> &h2d_done_events,
+                int lane_count)
+                : backend_(backend),
+                  device_id_(device_id),
+                  pinned_(pinned),
+                  file_reader_(file_reader),
+                  file_read_plans_(file_read_plans),
+                  jobs_(jobs),
+                  h2d_done_events_(h2d_done_events)
+            {
+                lanes_.reserve(static_cast<size_t>(lane_count));
+                for (int lane = 0; lane < lane_count; ++lane)
+                {
+                    lanes_.push_back(std::make_unique<Lane>());
+                    lanes_.back()->worker = std::thread(
+                        [this, lane]
+                        { workerLoop(lane); });
+                }
+            }
+
+            ~StagingLanePool()
+            {
+                for (auto &lane : lanes_)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(lane->mutex);
+                        lane->stop = true;
+                    }
+                    lane->condition.notify_all();
+                }
+                for (auto &lane : lanes_)
+                {
+                    if (lane->worker.joinable())
+                        lane->worker.join();
+                }
+            }
+
+            StagingLanePool(const StagingLanePool &) = delete;
+            StagingLanePool &operator=(const StagingLanePool &) = delete;
+
+            bool submit(int lane_index, size_t job_index, bool wait_for_prior_h2d)
+            {
+                auto &lane = *lanes_.at(static_cast<size_t>(lane_index));
+                {
+                    std::lock_guard<std::mutex> lock(lane.mutex);
+                    if (lane.pending || lane.busy || lane.ready || lane.stop)
+                        return false;
+                    lane.job_index = job_index;
+                    lane.wait_for_prior_h2d = wait_for_prior_h2d;
+                    lane.pending = true;
+                }
+                lane.condition.notify_all();
+                return true;
+            }
+
+            bool wait(int lane_index, size_t expected_job_index, StagedSource &result)
+            {
+                auto &lane = *lanes_.at(static_cast<size_t>(lane_index));
+                std::unique_lock<std::mutex> lock(lane.mutex);
+                lane.condition.wait(
+                    lock,
+                    [&lane]
+                    { return lane.ready || lane.stop; });
+                if (!lane.ready || lane.job_index != expected_job_index)
+                    return false;
+                result = std::move(lane.result);
+                lane.result = {};
+                lane.ready = false;
+                lane.condition.notify_all();
+                return true;
+            }
+
+        private:
+            struct Lane
+            {
+                std::mutex mutex;
+                std::condition_variable condition;
+                std::thread worker;
+                size_t job_index = 0;
+                bool wait_for_prior_h2d = false;
+                bool pending = false;
+                bool busy = false;
+                bool ready = false;
+                bool stop = false;
+                StagedSource result;
+            };
+
+            void workerLoop(int lane_index)
+            {
+                auto &lane = *lanes_[static_cast<size_t>(lane_index)];
+                while (true)
+                {
+                    size_t job_index = 0;
+                    bool wait_for_prior_h2d = false;
+                    {
+                        std::unique_lock<std::mutex> lock(lane.mutex);
+                        lane.condition.wait(
+                            lock,
+                            [&lane]
+                            { return lane.pending || lane.stop; });
+                        if (lane.stop && !lane.pending)
+                            return;
+                        job_index = lane.job_index;
+                        wait_for_prior_h2d = lane.wait_for_prior_h2d;
+                        lane.pending = false;
+                        lane.busy = true;
+                    }
+
+                    StagedSource result;
+                    if (wait_for_prior_h2d)
+                    {
+                        const auto wait_start = std::chrono::high_resolution_clock::now();
+                        if (!backend_.waitForEvent(
+                                h2d_done_events_[static_cast<size_t>(lane_index)],
+                                device_id_))
+                        {
+                            result.error = "failed waiting for prior H2D completion";
+                        }
+                        result.h2d_wait_ms =
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::high_resolution_clock::now() - wait_start)
+                                .count();
+                    }
+
+                    if (result.error.empty())
+                    {
+                        const auto read_start = std::chrono::high_resolution_clock::now();
+                        void *destination = pinned_.getSlot(lane_index);
+                        if (!destination)
+                        {
+                            result.error = "pinned slot is null";
+                        }
+                        else
+                        {
+                            const auto &job = jobs_[job_index];
+                            const auto &plan =
+                                file_read_plans_[job_index];
+                            if (plan.fd >= 0)
+                            {
+                                file_reader_.read(
+                                    plan,
+                                    destination,
+                                    pinned_.slotSize(),
+                                    result.payload,
+                                    result.file_bytes,
+                                    result.error);
+                            }
+                            else
+                            {
+                                std::memcpy(destination, job.host_raw_data, job.raw_bytes);
+                                result.payload = destination;
+                            }
+                        }
+                        result.read_ms =
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::high_resolution_clock::now() - read_start)
+                                .count();
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(lane.mutex);
+                        lane.result = std::move(result);
+                        lane.busy = false;
+                        lane.ready = true;
+                    }
+                    lane.condition.notify_all();
+                }
+            }
+
+            IBackend &backend_;
+            int device_id_;
+            PinnedRingBuffer &pinned_;
+            const MmapFileReader &file_reader_;
+            const std::vector<FileReadPlan> &file_read_plans_;
+            const std::vector<WeightJob> &jobs_;
+            const std::vector<void *> &h2d_done_events_;
+            std::vector<std::unique_ptr<Lane>> lanes_;
+        };
+
         const char *repackFormatName(RepackFormat format)
         {
             switch (format)
@@ -180,6 +594,18 @@ namespace llaminar2
         const auto &env = debugEnv();
         const bool trace_weights = env.weight_lifecycle_trace;
         const bool sync_after_repack_job = env.rocm.sync_after_kernel;
+        size_t buffered_file_read_bytes = 0;
+
+        MmapFileReader file_reader;
+        std::vector<FileReadPlan> file_read_plans;
+        std::string file_read_error;
+        if (!file_reader.prepare(jobs, file_read_plans, file_read_error))
+        {
+            LOG_ERROR(
+                "DeviceLoadPipeline: failed to prepare bounded buffered file reads: "
+                << file_read_error);
+            return false;
+        }
 
         // Precompute total planned bytes for progress reporting
         size_t total_planned_bytes = 0;
@@ -195,38 +621,18 @@ namespace llaminar2
         double event_wait_ms = 0.0;
         size_t total_bytes = 0;
 
-        for (size_t job_idx = 0; job_idx < jobs.size(); ++job_idx)
+        // Catch malformed jobs before starting producer threads so any failure
+        // exits without partially populated lane state.
+        for (const auto &job : jobs)
         {
-            const auto &job = jobs[job_idx];
-            const int stream_idx = static_cast<int>(job_idx % static_cast<size_t>(num_streams_));
-            if (trace_weights)
-            {
-                LOG_INFO("[DeviceLoadPipeline] device=" << device_id_
-                                                        << " job=" << (job_idx + 1) << "/" << jobs.size()
-                                                        << " name=" << job.name
-                                                        << " format=" << repackFormatName(job.format)
-                                                        << " raw_bytes=" << job.raw_bytes
-                                                        << " N=" << job.N
-                                                        << " K=" << job.K
-                                                        << " stream_slot=" << stream_idx);
-            }
-
-            if (job.raw_bytes == 0)
-            {
-                LOG_ERROR("DeviceLoadPipeline: job '" << job.name << "' has raw_bytes=0");
-                return false;
-            }
-
-            if (!job.host_raw_data)
-            {
-                LOG_ERROR("DeviceLoadPipeline: job '" << job.name
-                                                      << "' has null host_raw_data for " << job.raw_bytes
-                                                      << " raw bytes (host weight data was likely released before GPU repack)");
-                return false;
-            }
-
             const int full_n = job.full_N > 0 ? job.full_N : job.N;
             const int full_k = job.full_K > 0 ? job.full_K : job.K;
+            if (job.raw_bytes == 0 || !job.host_raw_data)
+            {
+                LOG_ERROR("DeviceLoadPipeline: invalid host source for '" << job.name
+                                                                          << "' raw_bytes=" << job.raw_bytes);
+                return false;
+            }
             if (job.N <= 0 || full_n <= 0 || job.row_offset < 0 ||
                 job.row_offset + job.N > full_n)
             {
@@ -236,133 +642,141 @@ namespace llaminar2
                                                                          << " full_N=" << full_n);
                 return false;
             }
-            if (job.K <= 0 || full_k <= 0 || job.output_block_offset < 0)
+            if (job.K <= 0 || full_k <= 0 || job.raw_bytes > max_staging)
             {
-                LOG_ERROR("DeviceLoadPipeline: invalid K chunk for '" << job.name
-                                                                        << "' K=" << job.K
-                                                                        << " full_K=" << full_k
-                                                                        << " output_block_offset=" << job.output_block_offset);
+                LOG_ERROR("DeviceLoadPipeline: invalid bounded row-chunk geometry for '"
+                          << job.name << "'");
+                return false;
+            }
+        }
+
+        StagingLanePool staging_lanes(
+            backend_,
+            device_id_,
+            pinned_,
+            file_reader,
+            file_read_plans,
+            jobs,
+            h2d_done_events_,
+            num_streams_);
+        std::vector<bool> lane_has_prior_repack(
+            static_cast<size_t>(num_streams_), false);
+        std::vector<double> lane_read_ms(
+            static_cast<size_t>(num_streams_), 0.0);
+
+        const size_t initial_jobs = std::min(
+            jobs.size(), static_cast<size_t>(num_streams_));
+        for (size_t job_index = 0; job_index < initial_jobs; ++job_index)
+        {
+            if (!staging_lanes.submit(
+                    static_cast<int>(job_index), job_index, false))
+            {
+                LOG_ERROR("DeviceLoadPipeline: failed to seed staging lane "
+                          << job_index);
+                return false;
+            }
+        }
+
+        for (size_t job_index = 0; job_index < jobs.size(); ++job_index)
+        {
+            const auto &job = jobs[job_index];
+            const int stream_index =
+                static_cast<int>(job_index % static_cast<size_t>(num_streams_));
+            const int full_n = job.full_N > 0 ? job.full_N : job.N;
+            const int full_k = job.full_K > 0 ? job.full_K : job.K;
+
+            StagedSource staged;
+            if (!staging_lanes.wait(stream_index, job_index, staged))
+            {
+                LOG_ERROR("DeviceLoadPipeline: staging lane " << stream_index
+                                                               << " returned an unexpected job");
+                return false;
+            }
+            if (!staged.error.empty() || !staged.payload)
+            {
+                LOG_ERROR("DeviceLoadPipeline: staging failed for '" << job.name
+                                                                      << "': " << staged.error);
                 return false;
             }
 
-            // Validate raw bytes fit in staging slot
-            if (job.raw_bytes > max_staging)
+            lane_read_ms[static_cast<size_t>(stream_index)] += staged.read_ms;
+            event_wait_ms += staged.h2d_wait_ms;
+            buffered_file_read_bytes += staged.file_bytes;
+
+            if (trace_weights)
             {
-                LOG_ERROR("DeviceLoadPipeline: job '" << job.name << "' raw_bytes="
-                                                      << job.raw_bytes << " exceeds max staging slot="
-                                                      << max_staging);
-                return false;
+                LOG_INFO("[DeviceLoadPipeline] device=" << device_id_
+                                                        << " job=" << (job_index + 1) << "/" << jobs.size()
+                                                        << " name=" << job.name
+                                                        << " format=" << repackFormatName(job.format)
+                                                        << " raw_bytes=" << job.raw_bytes
+                                                        << " N=" << job.N
+                                                        << " K=" << job.K
+                                                        << " source=" << job.host_raw_data
+                                                        << " source_mode="
+                                                        << (file_read_plans[job_index].fd >= 0
+                                                                ? "buffered_file"
+                                                                : "memory")
+                                                        << " stream_slot=" << stream_index);
             }
 
-            // 1. Wait for previous repack on this staging slot to complete
-            if (job_idx >= static_cast<size_t>(num_streams_))
-            {
-                const auto wait_start = Clock::now();
-                if (!backend_.waitForEvent(repack_done_events_[stream_idx], device_id_))
-                {
-                    LOG_ERROR("DeviceLoadPipeline: waitForEvent repack_done["
-                              << stream_idx << "] failed");
-                    return false;
-                }
-                if (profiling)
-                {
-                    event_wait_ms += std::chrono::duration<double, std::milli>(
-                                         Clock::now() - wait_start)
-                                         .count();
-                }
-            }
-
-            // 2. CPU memcpy: mmap → pinned slot
-            void *pinned_ptr = pinned_.getSlot(stream_idx);
-            if (!pinned_ptr)
-            {
-                LOG_ERROR("DeviceLoadPipeline: pinned slot " << stream_idx << " is null");
-                return false;
-            }
-            {
-                const auto memcpy_start = Clock::now();
-                if (job.host_row_stride_bytes > 0)
-                {
-                    if (job.host_row_copy_bytes == 0 ||
-                        job.raw_bytes != static_cast<size_t>(job.N) * job.host_row_copy_bytes)
-                    {
-                        LOG_ERROR("DeviceLoadPipeline: invalid gathered host chunk for '"
-                                  << job.name << "'");
-                        return false;
-                    }
-                    auto *dst = static_cast<uint8_t *>(pinned_ptr);
-                    const auto *src = static_cast<const uint8_t *>(job.host_raw_data);
-                    for (int row = 0; row < job.N; ++row)
-                    {
-                        std::memcpy(dst + static_cast<size_t>(row) * job.host_row_copy_bytes,
-                                    src + static_cast<size_t>(row) * job.host_row_stride_bytes,
-                                    job.host_row_copy_bytes);
-                    }
-                }
-                else
-                {
-                    std::memcpy(pinned_ptr, job.host_raw_data, job.raw_bytes);
-                }
-                if (profiling)
-                {
-                    cpu_staging_ms += std::chrono::duration<double, std::milli>(
-                                          Clock::now() - memcpy_start)
-                                          .count();
-                }
-            }
             total_bytes += job.raw_bytes;
 
-            // The source bytes are no longer needed once they have reached the
-            // pinned slot. For demand-paged GGUF mappings, discard the process
-            // PTEs incrementally so RSS follows the bounded ring instead of the
-            // total model size. The underlying file remains available for a
-            // harmless re-fault if another alias still needs the same pages.
-            if (job.advise_mmap_dontneed_after_staging)
-            {
-                MmapRegion::adviseDontneedRange(job.host_raw_data, job.raw_bytes);
-            }
-            else if (job.mmap_discard_data && job.mmap_discard_bytes > 0)
-            {
-                MmapRegion::adviseDontneedRange(job.mmap_discard_data,
-                                                job.mmap_discard_bytes);
-            }
-
-            // Fire progress callback after host memcpy completes
             if (progress_cb)
                 progress_cb(total_bytes, total_planned_bytes);
 
-            // 3. H2D async: pinned → device staging slot
-            uint8_t *staging_ptr = pool_.getStagingSlot(stream_idx);
+            uint8_t *staging_ptr = pool_.getStagingSlot(stream_index);
             if (!staging_ptr)
             {
-                LOG_ERROR("DeviceLoadPipeline: staging slot " << stream_idx << " is null");
+                LOG_ERROR("DeviceLoadPipeline: staging slot " << stream_index << " is null");
                 return false;
             }
 
-            if (!backend_.hostToDeviceOnStream(staging_ptr, pinned_ptr, job.raw_bytes,
-                                               device_id_, h2d_streams_[stream_idx]))
+            // Pinned reuse is guarded by the worker's H2D completion wait.
+            // Device staging lives longer, through repack, so its dependency is
+            // inserted directly into this H2D stream without blocking the host.
+            if (lane_has_prior_repack[static_cast<size_t>(stream_index)] &&
+                !backend_.streamWaitEvent(
+                    h2d_streams_[stream_index],
+                    repack_done_events_[stream_index],
+                    device_id_))
+            {
+                LOG_ERROR("DeviceLoadPipeline: H2D stream failed to wait for prior repack on lane "
+                          << stream_index);
+                return false;
+            }
+
+            if (!backend_.hostToDeviceOnStream(
+                    staging_ptr,
+                    staged.payload,
+                    job.raw_bytes,
+                    device_id_,
+                    h2d_streams_[stream_index]))
             {
                 LOG_ERROR("DeviceLoadPipeline: hostToDeviceOnStream for '"
                           << job.name << "' failed");
                 return false;
             }
 
-            // 4. Record H2D completion
-            if (!backend_.recordEvent(h2d_done_events_[stream_idx], device_id_, h2d_streams_[stream_idx]))
+            if (!backend_.recordEvent(
+                    h2d_done_events_[stream_index],
+                    device_id_,
+                    h2d_streams_[stream_index]))
             {
                 LOG_ERROR("DeviceLoadPipeline: recordEvent h2d_done["
-                          << stream_idx << "] failed");
+                          << stream_index << "] failed");
                 return false;
             }
 
-            // 5. Repack stream waits for this H2D
-            if (!backend_.streamWaitEvent(repack_stream_, h2d_done_events_[stream_idx], device_id_))
+            if (!backend_.streamWaitEvent(
+                    repack_stream_,
+                    h2d_done_events_[stream_index],
+                    device_id_))
             {
                 LOG_ERROR("DeviceLoadPipeline: streamWaitEvent failed");
                 return false;
             }
 
-            // 6. Launch GPU repack kernel on repack stream (or direct D2D copy for raw FP)
             auto slot = pool_.getSlot(job.name);
             if (!slot)
             {
@@ -382,9 +796,7 @@ namespace llaminar2
                     slot->payload_bytes / static_cast<size_t>(full_n);
                 auto *chunk_payload = slot->d_native_vnni_payload +
                                       static_cast<size_t>(job.row_offset) * payload_bytes_per_row;
-                // Floating-point passthrough: copy staging → payload (no repack needed).
-                // Use the repack stream for ordering consistency with other slots.
-                if (!backend_.deviceToDevice(
+                if (!backend_.deviceCopyAsync(
                         chunk_payload, staging_ptr, job.raw_bytes,
                         device_id_, repack_stream_))
                 {
@@ -395,22 +807,14 @@ namespace llaminar2
             }
             else
             {
-                if (job.N != full_n || job.row_offset != 0 || job.K % 32 != 0 ||
+                if (job.K != full_k || job.K % 32 != 0 ||
                     full_k % 32 != 0)
                 {
-                    LOG_ERROR("DeviceLoadPipeline: quantized chunks must span full N and 32-wide K blocks for '"
+                    LOG_ERROR("DeviceLoadPipeline: quantized row chunks must span full K in 32-wide blocks for '"
                               << job.name << "'");
                     return false;
                 }
                 const size_t total_blocks_per_row = static_cast<size_t>(full_k) / 32;
-                const size_t chunk_blocks_per_row = static_cast<size_t>(job.K) / 32;
-                const size_t output_block_offset = static_cast<size_t>(job.output_block_offset);
-                if (output_block_offset + chunk_blocks_per_row > total_blocks_per_row)
-                {
-                    LOG_ERROR("DeviceLoadPipeline: quantized K chunk exceeds planned output for '"
-                              << job.name << "'");
-                    return false;
-                }
                 const size_t total_output_blocks =
                     total_blocks_per_row * static_cast<size_t>(full_n);
                 if (total_output_blocks == 0 ||
@@ -420,29 +824,16 @@ namespace llaminar2
                               << job.name << "'");
                     return false;
                 }
-                const size_t payload_bytes_per_block =
-                    slot->payload_bytes / total_output_blocks;
-                const size_t block_offset =
-                    output_block_offset * static_cast<size_t>(full_n);
-                auto *chunk_payload = slot->d_native_vnni_payload +
-                                      block_offset * payload_bytes_per_block;
-                auto *chunk_scales = slot->d_native_vnni_scales
-                                         ? static_cast<uint16_t *>(slot->d_native_vnni_scales) + block_offset
-                                         : nullptr;
-                auto *chunk_mins = slot->d_native_vnni_mins
-                                       ? static_cast<uint16_t *>(slot->d_native_vnni_mins) + block_offset
-                                       : nullptr;
-                auto *chunk_emins = slot->d_native_vnni_emins
-                                        ? static_cast<uint32_t *>(slot->d_native_vnni_emins) + block_offset
-                                        : nullptr;
-                bool repack_ok = kernels_.vnniRepack(
+                const bool repack_ok = kernels_.vnniRepack(
                     job.format,
                     staging_ptr,
-                    chunk_payload,
-                    chunk_scales,
-                    chunk_mins,
-                    chunk_emins,
-                    job.N, job.K, repack_stream_);
+                    slot->d_native_vnni_payload,
+                    static_cast<uint16_t *>(slot->d_native_vnni_scales),
+                    static_cast<uint16_t *>(slot->d_native_vnni_mins),
+                    static_cast<uint32_t *>(slot->d_native_vnni_emins),
+                    job.N, job.K,
+                    full_n, job.row_offset,
+                    repack_stream_);
 
                 if (!repack_ok)
                 {
@@ -452,13 +843,16 @@ namespace llaminar2
                 }
             }
 
-            // 7. Record repack completion for this staging slot
-            if (!backend_.recordEvent(repack_done_events_[stream_idx], device_id_, repack_stream_))
+            if (!backend_.recordEvent(
+                    repack_done_events_[stream_index],
+                    device_id_,
+                    repack_stream_))
             {
                 LOG_ERROR("DeviceLoadPipeline: recordEvent repack_done["
-                          << stream_idx << "] failed");
+                          << stream_index << "] failed");
                 return false;
             }
+            lane_has_prior_repack[static_cast<size_t>(stream_index)] = true;
 
             if (sync_after_repack_job)
             {
@@ -470,7 +864,23 @@ namespace llaminar2
                 }
             }
 
+            const size_t next_job =
+                job_index + static_cast<size_t>(num_streams_);
+            if (next_job < jobs.size() &&
+                !staging_lanes.submit(stream_index, next_job, true))
+            {
+                LOG_ERROR("DeviceLoadPipeline: failed to refill staging lane "
+                          << stream_index << " with job " << next_job);
+                return false;
+            }
+
             ++num_processed_;
+        }
+
+        if (profiling)
+        {
+            cpu_staging_ms = *std::max_element(
+                lane_read_ms.begin(), lane_read_ms.end());
         }
 
         // Wait for all repack work to complete
@@ -530,6 +940,14 @@ namespace llaminar2
                                            event_wait_ms, "load", device);
             PerfStatsCollector::addCounter("weight_loading", "gpu_pipeline_drain_ms",
                                            drain_ms, "load", device);
+            PerfStatsCollector::addCounter("weight_loading", "gpu_pipeline_job_count",
+                                           static_cast<double>(jobs.size()), "load", device);
+            PerfStatsCollector::addCounter(
+                "weight_loading",
+                "gpu_pipeline_buffered_file_read_bytes",
+                static_cast<double>(buffered_file_read_bytes),
+                "load",
+                device);
         }
         LOG_DEBUG("DeviceLoadPipeline: device " << device_id_ << " loaded "
                                                 << num_processed_ << " weights, " << std::fixed << std::setprecision(1)

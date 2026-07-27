@@ -162,6 +162,22 @@ namespace llaminar2
         const ModelLoader &concreteLoader() const { return loader_; }
 
         /**
+         * @brief Report whether model tensors use file-backed mapped storage.
+         *
+         * This exposes the effective loader policy to memory planning without
+         * allowing callers to mutate it after model metadata has been loaded.
+         * GPU upload preflight uses this distinction because mmap payloads are
+         * consumed through a bounded pinned staging ring rather than copied
+         * wholesale into anonymous host memory.
+         *
+         * @return true when the underlying loader was configured for mmap.
+         */
+        [[nodiscard]] bool usesMmap() const noexcept
+        {
+            return loader_.usesMmap();
+        }
+
+        /**
          * @brief Get weight tensor for a specific device (device-isolated instance)
          *
          * Loads from GGUF with appropriate distribution strategy.

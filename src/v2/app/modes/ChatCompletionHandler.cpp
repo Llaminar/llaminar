@@ -345,12 +345,8 @@ namespace llaminar2
             }
         }
 
-        bool runChatMoERebalanceMaintenance(IOrchestrationRunner &runner,
-                                            bool device_side_moe_rebalance)
+        bool runChatMoERebalanceMaintenance(IOrchestrationRunner &runner)
         {
-            if (device_side_moe_rebalance)
-                return true;
-
             return runner.maybeApplyMoERebalance();
         }
     }
@@ -954,8 +950,6 @@ namespace llaminar2
 
         bool stop_generation = false;
         bool last_decode_window_had_moe_maintenance = true;
-        const bool device_side_moe_rebalance =
-            runner_.usesDeviceSideMoERebalanceController();
         while (completion_tokens < effective_max_tokens && !stop_generation)
         {
             std::vector<int32_t> step_tokens;
@@ -1088,7 +1082,7 @@ namespace llaminar2
 
             if (!stop_generation)
             {
-                if (!runChatMoERebalanceMaintenance(runner_, device_side_moe_rebalance))
+                if (!runChatMoERebalanceMaintenance(runner_))
                     return rebalance_error();
                 last_decode_window_had_moe_maintenance = true;
             }
@@ -1096,7 +1090,7 @@ namespace llaminar2
 
         if (!last_decode_window_had_moe_maintenance)
         {
-            if (!runChatMoERebalanceMaintenance(runner_, device_side_moe_rebalance))
+            if (!runChatMoERebalanceMaintenance(runner_))
                 return rebalance_error();
             last_decode_window_had_moe_maintenance = true;
         }
@@ -1315,8 +1309,6 @@ namespace llaminar2
 
         bool stop_generation = false;
         bool last_decode_window_had_moe_maintenance = true;
-        const bool device_side_moe_rebalance =
-            runner_.usesDeviceSideMoERebalanceController();
         while (completion_tokens < effective_max_tokens && !stop_generation)
         {
             std::vector<int32_t> step_tokens;
@@ -1416,7 +1408,7 @@ namespace llaminar2
 
                 if (!rebalance_applied)
                 {
-                    if (!runChatMoERebalanceMaintenance(runner_, device_side_moe_rebalance))
+                    if (!runChatMoERebalanceMaintenance(runner_))
                         return emit_rebalance_error();
                     rebalance_applied = true;
                     last_decode_window_had_moe_maintenance = true;
@@ -1513,7 +1505,7 @@ namespace llaminar2
 
         if (!last_decode_window_had_moe_maintenance)
         {
-            if (!runChatMoERebalanceMaintenance(runner_, device_side_moe_rebalance))
+            if (!runChatMoERebalanceMaintenance(runner_))
                 return emit_rebalance_error();
             last_decode_window_had_moe_maintenance = true;
         }

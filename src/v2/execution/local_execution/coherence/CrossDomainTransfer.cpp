@@ -9,6 +9,7 @@
 #include "../../../tensors/TensorClasses.h"
 #include "../../../backends/ComputeBackend.h"
 #include "../../../backends/BackendManager.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include <cstring>
 #include <chrono>
@@ -187,8 +188,9 @@ namespace llaminar2
             return false;
         }
 
-        // Mark destination as having valid GPU data (with event for fine-grained sync)
-        dst_cpu->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        // transferCpuToGpuImpl() is blocking. Publish that completed boundary
+        // explicitly instead of inventing an unrelated default-stream event.
+        TransferEngine::publishCompletedDeviceWrite(dst_cpu, device_id);
 
         auto end = std::chrono::high_resolution_clock::now();
         double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();

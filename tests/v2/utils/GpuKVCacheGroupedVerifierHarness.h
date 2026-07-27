@@ -573,6 +573,253 @@ namespace llaminar2::test::gpu_kv_verifier
     }
 
     /**
+     * @brief Prove logical prefix blocks remain device-owned across harvest and restore.
+     *
+     * The matrix covers every native GPU cache family, both supported head
+     * dimensions, and replicated plus LocalTP-sharded storage. Each source ring
+     * is deliberately wrapped before harvest. The production route then gathers
+     * its logical rows into device buffers, scatters those buffers into a fresh
+     * cache, and gathers the restored rows again without an intervening host
+     * observation.
+     *
+     * A host-domain export is retained solely as the canonical assertion oracle.
+     * Device bytes cross to the host only after the complete D2D pipeline has
+     * been enqueued. This separation catches accidental D2H/H2D substitution,
+     * stale host ring metadata, TQ K/V stride confusion, and floating-point
+     * signed-zero differences without making host publication part of the
+     * production route under test.
+     *
+     * @tparam DeviceAllocator Callable `(size_t) -> void *` for test buffers.
+     * @tparam DeviceReleaser Callable `(void *)` for test-buffer destruction.
+     * @tparam AsyncDeviceByteCopier Callable performing test-boundary D2H copy.
+     * @tparam StreamSynchronizer Callable fencing the explicit backend stream.
+     * @param device Backend device used by the production cache factory.
+     * @param backend_label Human-readable backend name for assertion traces.
+     * @param standard_counter Device logical-block counter for ordinary caches.
+     * @param tq_counter Device logical-block counter for asymmetric TQ caches.
+     * @param stream Mandatory non-default CUDA/HIP stream.
+     * @param allocate_device Allocate one backend-native device byte range.
+     * @param release_device Release a range allocated by @p allocate_device.
+     * @param copy_device_bytes_async Enqueue one D2H assertion-boundary copy.
+     * @param synchronize_stream Fence @p stream after all observation copies.
+     */
+    template <typename DeviceAllocator, typename DeviceReleaser,
+              typename AsyncDeviceByteCopier, typename StreamSynchronizer>
+    void runAllFormatDeviceLogicalBlockSweep(
+        DeviceId device,
+        const char *backend_label,
+        const char *standard_export_counter,
+        const char *standard_import_counter,
+        const char *tq_export_counter,
+        const char *tq_import_counter,
+        void *stream,
+        DeviceAllocator &&allocate_device,
+        DeviceReleaser &&release_device,
+        AsyncDeviceByteCopier &&copy_device_bytes_async,
+        StreamSynchronizer &&synchronize_stream)
+    {
+        constexpr int max_seq_len = 6;
+        constexpr std::array<int, 2> head_dims = {64, 128};
+        ScopedPerfStats perfstats;
+        ASSERT_TRUE(PerfStatsCollector::isEnabled());
+        ASSERT_NE(stream, nullptr);
+        uint32_t seed = 0xD3A1CEu;
+        uint64_t expected_standard_cells = 0;
+        uint64_t expected_tq_cells = 0;
+
+        for (const auto &format : kCacheReadFormats)
+        {
+            for (const int head_dim : head_dims)
+            {
+                TurboQuantContext tq_context(head_dim, 0xC0FFEEu);
+                for (const auto &topology : kTopologies)
+                {
+                    SCOPED_TRACE(std::string(backend_label) +
+                                 " device logical block cache=" + format.label +
+                                 " topology=" + topology.label +
+                                 " D=" + std::to_string(head_dim));
+                    const int local_heads = topology.effectiveLocalHeads();
+                    const int kv_dim = local_heads * head_dim;
+                    auto source = makeBoundCache(
+                        device, format.cache_precision, topology,
+                        max_seq_len, head_dim, &tq_context);
+                    std::vector<std::unique_ptr<ITensor>> append_lifetime;
+
+                    const auto append_chunk = [&](int rows)
+                    {
+                        auto k = makeTensor(
+                            format.append_type,
+                            {static_cast<size_t>(rows),
+                             static_cast<size_t>(kv_dim)},
+                            seed++, head_dim);
+                        auto v = makeTensor(
+                            format.append_type,
+                            {static_cast<size_t>(rows),
+                             static_cast<size_t>(kv_dim)},
+                            seed++, head_dim);
+
+                        // The logical codec canonicalizes floating -0 to +0.
+                        // Seed one negative zero in ordinary floating caches so
+                        // the device gather must implement the same byte rule as
+                        // the host diagnostic oracle. TQ stores quantized bytes,
+                        // so its FP32 append source is intentionally left alone.
+                        if (format.cache_precision != ActivationPrecision::TQ8)
+                        {
+                            if (format.append_type == TensorType::FP32)
+                            {
+                                static_cast<uint32_t *>(k->raw_mutable_data())[0] =
+                                    0x80000000u;
+                                static_cast<uint32_t *>(v->raw_mutable_data())[0] =
+                                    0x80000000u;
+                            }
+                            else if (format.append_type == TensorType::FP16 ||
+                                     format.append_type == TensorType::BF16)
+                            {
+                                static_cast<uint16_t *>(k->raw_mutable_data())[0] =
+                                    0x8000u;
+                                static_cast<uint16_t *>(v->raw_mutable_data())[0] =
+                                    0x8000u;
+                            }
+                        }
+
+                        ensureOnDevice(k.get(), device, stream);
+                        ensureOnDevice(v.get(), device, stream);
+                        ASSERT_TRUE(source.cache->appendWithStream(
+                            0, 0, k.get(), v.get(), rows, stream));
+                        append_lifetime.push_back(std::move(k));
+                        append_lifetime.push_back(std::move(v));
+                    };
+
+                    // Five rows followed by four rows leaves the six newest
+                    // logical rows split across both physical ends of the ring.
+                    append_chunk(5);
+                    append_chunk(4);
+                    ASSERT_TRUE(synchronize_stream(stream));
+
+                    const auto layout =
+                        source.cache->logicalBlockLayout(0, max_seq_len);
+                    ASSERT_GT(layout.k_bytes, 0u);
+                    ASSERT_GT(layout.v_bytes, 0u);
+                    ASSERT_TRUE(layout.device_resident);
+                    EXPECT_EQ(layout.local_kv_heads, local_heads);
+                    EXPECT_EQ(layout.kv_head_start, topology.head_start);
+
+                    std::vector<uint8_t> canonical_k(layout.k_bytes, 0);
+                    std::vector<uint8_t> canonical_v(layout.v_bytes, 0);
+                    const IKVCache::KVCacheLogicalBlockDescriptor host_descriptor{
+                        .layer = 0,
+                        .seq_idx = 0,
+                        .logical_token_start = 0,
+                        .token_count = max_seq_len,
+                        .stream = stream,
+                        .payload_domain =
+                            IKVCache::KVCacheLogicalBlockPayloadDomain::Host,
+                    };
+                    ASSERT_TRUE(source.cache->exportLogicalBlock(
+                        host_descriptor, canonical_k.data(), canonical_v.data()));
+
+                    void *source_k = allocate_device(layout.k_bytes);
+                    void *source_v = allocate_device(layout.v_bytes);
+                    void *restored_k = allocate_device(layout.k_bytes);
+                    void *restored_v = allocate_device(layout.v_bytes);
+                    ASSERT_NE(source_k, nullptr);
+                    ASSERT_NE(source_v, nullptr);
+                    ASSERT_NE(restored_k, nullptr);
+                    ASSERT_NE(restored_v, nullptr);
+
+                    const IKVCache::KVCacheLogicalBlockDescriptor device_descriptor{
+                        .layer = 0,
+                        .seq_idx = 0,
+                        .logical_token_start = 0,
+                        .token_count = max_seq_len,
+                        .stream = stream,
+                        .payload_domain =
+                            IKVCache::KVCacheLogicalBlockPayloadDomain::Device,
+                    };
+                    IKVCache::KVCacheLogicalBlockDescriptor null_stream_descriptor =
+                        device_descriptor;
+                    null_stream_descriptor.stream = nullptr;
+                    EXPECT_FALSE(source.cache->exportLogicalBlock(
+                        null_stream_descriptor, source_k, source_v))
+                        << "GPU device export must never enter a default stream";
+
+                    ASSERT_TRUE(source.cache->exportLogicalBlock(
+                        device_descriptor, source_k, source_v));
+                    auto restored = makeBoundCache(
+                        device, format.cache_precision, topology,
+                        max_seq_len, head_dim, &tq_context);
+                    EXPECT_FALSE(restored.cache->importLogicalBlock(
+                        null_stream_descriptor, source_k, source_v))
+                        << "GPU device import must never enter a default stream";
+                    ASSERT_TRUE(restored.cache->importLogicalBlock(
+                        device_descriptor, source_k, source_v));
+                    ASSERT_TRUE(restored.cache->exportLogicalBlock(
+                        device_descriptor, restored_k, restored_v));
+
+                    std::vector<uint8_t> observed_source_k(layout.k_bytes, 0);
+                    std::vector<uint8_t> observed_source_v(layout.v_bytes, 0);
+                    std::vector<uint8_t> observed_restored_k(layout.k_bytes, 0);
+                    std::vector<uint8_t> observed_restored_v(layout.v_bytes, 0);
+                    ASSERT_TRUE(copy_device_bytes_async(
+                        observed_source_k.data(), source_k,
+                        layout.k_bytes, stream));
+                    ASSERT_TRUE(copy_device_bytes_async(
+                        observed_source_v.data(), source_v,
+                        layout.v_bytes, stream));
+                    ASSERT_TRUE(copy_device_bytes_async(
+                        observed_restored_k.data(), restored_k,
+                        layout.k_bytes, stream));
+                    ASSERT_TRUE(copy_device_bytes_async(
+                        observed_restored_v.data(), restored_v,
+                        layout.v_bytes, stream));
+                    ASSERT_TRUE(synchronize_stream(stream));
+
+                    EXPECT_EQ(observed_source_k, canonical_k)
+                        << "Device harvest changed canonical K bytes";
+                    EXPECT_EQ(observed_source_v, canonical_v)
+                        << "Device harvest changed canonical V bytes";
+                    EXPECT_EQ(observed_restored_k, canonical_k)
+                        << "D2D restore changed canonical K bytes";
+                    EXPECT_EQ(observed_restored_v, canonical_v)
+                        << "D2D restore changed canonical V bytes";
+
+                    release_device(source_k);
+                    release_device(source_v);
+                    release_device(restored_k);
+                    release_device(restored_v);
+
+                    if (format.cache_precision == ActivationPrecision::TQ8)
+                        ++expected_tq_cells;
+                    else
+                        ++expected_standard_cells;
+                }
+            }
+        }
+
+        const auto sum_counter = [](const char *counter_name)
+        {
+            uint64_t calls = 0;
+            for (const auto &record : PerfStatsCollector::snapshot(
+                     {std::string("prefix_cache.") + counter_name}))
+            {
+                if (record.kind == PerfStatRecord::Kind::Counter)
+                    calls += record.count;
+            }
+            return calls;
+        };
+
+        // Each cell exports the source and restored cache once, but imports
+        // only into the restored cache. Rejected null-stream probes must not
+        // increment any production-route counter.
+        EXPECT_EQ(sum_counter(standard_export_counter),
+                  expected_standard_cells * 2);
+        EXPECT_EQ(sum_counter(standard_import_counter),
+                  expected_standard_cells);
+        EXPECT_EQ(sum_counter(tq_export_counter), expected_tq_cells * 2);
+        EXPECT_EQ(sum_counter(tq_import_counter), expected_tq_cells);
+    }
+
+    /**
      * @brief Prove the production converted cache read is batch invariant.
      *
      * Each matrix cell creates two request-local rings. Request zero wraps and

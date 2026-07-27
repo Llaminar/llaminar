@@ -704,9 +704,21 @@ namespace llaminar2
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Null input or empty projections");
                 return false;
             }
-            if (precision_ != Precision::FP32 || input->native_type() != TensorType::FP32)
+            /*
+             * FP16/BF16 weights use the fixed-order grouped projection kernel
+             * for ordinary prefill as well as verifier rows. That kernel keeps
+             * the K traversal and 16-bit conversion points independent of M,
+             * which makes request padding and grouped publication byte-stable
+             * without giving up one-launch grouped execution.
+             */
+            if (precision_ != Precision::FP32)
             {
-                LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Only FP32 activations/weights are supported");
+                return multiply_fused_verifier_rows_decode_equivalent(
+                    input, projections, m, k, mpi_ctx, workspace);
+            }
+            if (input->native_type() != TensorType::FP32)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] FP32 activations are required");
                 return false;
             }
 

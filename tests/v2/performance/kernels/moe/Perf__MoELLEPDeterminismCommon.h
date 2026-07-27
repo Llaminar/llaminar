@@ -149,12 +149,6 @@ namespace llaminar2::test::moe_llep_perf
         desc.blocks_per_row = syntheticBlocksPerRow(spec.k);
         desc.codebook_id = spec.codebook_id;
         DeviceMoEExpertDirectoryEntry entry{};
-        entry.descriptor.gate = desc;
-        entry.payload_bytes_per_block = 0;
-        entry.is_asymmetric = 0;
-        entry.has_emins = 0;
-        if (!deviceMoEPopulateDirectoryFormat(entry))
-            return 0;
         return deviceMoEMatrixPayloadBytes(desc, entry) +
                deviceMoEMatrixScalesBytes(desc) +
                deviceMoEMatrixMinsBytes(desc, entry) +
@@ -184,20 +178,13 @@ namespace llaminar2::test::moe_llep_perf
         desc.codebook_id = spec.codebook_id;
 
         DeviceMoEExpertDirectoryEntry entry{};
-        entry.descriptor.gate = desc;
-        const bool format_ok = deviceMoEPopulateDirectoryFormat(entry);
-        (void)format_ok;
-
         const uint64_t blocks =
             static_cast<uint64_t>(desc.blocks_per_row) *
             static_cast<uint64_t>(desc.n);
-        const uint64_t payload_bytes =
-            blocks * static_cast<uint64_t>(entry.payload_bytes_per_block);
+        const uint64_t payload_bytes = deviceMoEMatrixPayloadBytes(desc, entry);
         const uint64_t scales_bytes = blocks * sizeof(uint16_t);
-        const uint64_t mins_bytes = entry.is_asymmetric != 0u ? scales_bytes : 0u;
-        const uint64_t emins_bytes = entry.has_emins != 0u
-                                         ? blocks * sizeof(uint32_t)
-                                         : 0u;
+        const uint64_t mins_bytes = deviceMoEMatrixMinsBytes(desc, entry);
+        const uint64_t emins_bytes = deviceMoEMatrixEminsBytes(desc, entry);
 
         desc.payload = base + offset;
         offset += payload_bytes;
@@ -244,7 +231,25 @@ namespace llaminar2::test::moe_llep_perf
         entry.slot_index = slot;
         entry.flags = static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
                       static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::TransferSlot);
-        (void)deviceMoEPopulateDirectoryFormat(entry);
+        auto mark_transfer_capacity = [](DeviceNativeVNNIMatrixDesc &matrix)
+        {
+            uint8_t payload_bytes_per_block = 0;
+            uint8_t is_asymmetric = 0;
+            uint8_t has_emins = 0;
+            if (deviceMoEProjectionFormat(
+                    matrix,
+                    payload_bytes_per_block,
+                    is_asymmetric,
+                    has_emins))
+            {
+                matrix.allocation_payload_bytes_per_block = payload_bytes_per_block;
+                matrix.allocation_has_mins = is_asymmetric;
+                matrix.allocation_has_emins = has_emins;
+            }
+        };
+        mark_transfer_capacity(entry.descriptor.gate);
+        mark_transfer_capacity(entry.descriptor.up);
+        mark_transfer_capacity(entry.descriptor.down);
         return entry;
     }
 
@@ -276,6 +281,53 @@ namespace llaminar2::test::moe_llep_perf
                 static_cast<uint8_t>(DeviceMoEReplicaRole::Primary);
             bank.resident_participant_mask[expert] =
                 1u << static_cast<uint32_t>(participant_id);
+        }
+    }
+
+    /**
+     * @brief Install device-backed descriptors for every expert visible locally.
+     *
+     * The resident-only determinism scenarios intentionally advertise every
+     * expert as resident on every participant. That promise includes local
+     * executable descriptors: publishing only residency masks while leaving
+     * gate/up/down pointers null describes an impossible production state and
+     * must trip the grouped assignment kernel's fail-fast guard.
+     *
+     * @param runtime Host image of the device runtime table being prepared.
+     * @param shape Synthetic MoE geometry and participant count.
+     * @param spec Quantized matrix layout used for deterministic payload bytes.
+     * @param participant_id Participant represented by this test process.
+     * @param source_slab Device allocation containing one expert payload per slot.
+     * @param bytes_per_expert Byte stride between consecutive expert payloads.
+     */
+    inline void installSyntheticAllLocalExpertDescriptors(
+        DeviceMoELayerRuntime &runtime,
+        const Shape &shape,
+        const SyntheticPayloadSpec &spec,
+        int participant_id,
+        uint8_t *source_slab,
+        uint64_t bytes_per_expert)
+    {
+        auto &bank = runtime.banks[runtime.active_bank];
+        const uint32_t all_mask = participantMask(shape.participant_count);
+        for (int expert = 0; expert < shape.num_experts; ++expert)
+        {
+            const int owner = expert % shape.participant_count;
+            auto *base =
+                source_slab + static_cast<uint64_t>(expert) * bytes_per_expert;
+            bank.experts[expert] = makeSyntheticExpertDescriptor(
+                base,
+                spec,
+                expert,
+                owner,
+                expert);
+            bank.local_compute_mask[expert] = 1u;
+            bank.replica_role[expert] =
+                static_cast<uint8_t>(
+                    owner == participant_id
+                        ? DeviceMoEReplicaRole::Primary
+                        : DeviceMoEReplicaRole::Replica);
+            bank.resident_participant_mask[expert] = all_mask;
         }
     }
 

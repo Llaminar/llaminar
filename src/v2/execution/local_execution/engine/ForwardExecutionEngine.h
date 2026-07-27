@@ -142,35 +142,34 @@ namespace llaminar2
             return true;
         }
 
-        // ----- Logits Synchronization -----
-
-        /** Sync GPU stream and mark logits as host-readable. */
-        virtual void syncLogitsAtBoundary(IDeviceContext *ctx) = 0;
-
-        /** Access the ordinary terminal logits tensor. */
-        virtual TensorBase *logitsTensor() = 0;
+        // ----- Logits Publication -----
 
         /**
-         * @brief Access the tensor published as the logits result for this forward.
+         * @brief Publish the graph-declared logits tensor on its producer stream.
          *
-         * Most forwards publish the ordinary terminal logits tensor.  Verifier
-         * forwards that request all-position logits publish a separate compact or
-         * full row tensor instead.  Boundary synchronization must use this active
-         * publication tensor so mapped-memory and host-read coherence are applied
-         * to the buffer the graph actually wrote.
+         * The graph builder is the sole authority for which tensor is the
+         * forward result. GPU implementations record a completion event on
+         * `producer_stream` for that exact tensor. They must not reselect a
+         * tensor from mutable runtime mode flags, synchronize the stream/device,
+         * or materialize the result on the host. An explicit host result accessor
+         * performs the eventual D2H transfer when one is actually requested.
+         *
+         * @param logits Graph-declared tensor written by the terminal projection.
+         * @param ctx Context for the device that owns the published logits.
+         * @param producer_stream Exact stream that produced the logits.
+         * @return true when device ownership and completion are published.
          */
-        virtual TensorBase *logitsPublicationTensor()
-        {
-            return logitsTensor();
-        }
+        virtual bool publishLogitsAtBoundary(
+            TensorBase *logits,
+            IDeviceContext *ctx,
+            void *producer_stream) = 0;
 
         // ----- Decode Capture Policy -----
 
         /** Build the GPU graph capture/replay policy for decode steps. */
         virtual DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
             bool has_collective_nodes,
-            IDeviceContext *ctx,
-            int segment_consecutive_failures) const = 0;
+            IDeviceContext *ctx) const = 0;
 
         // ----- PP Copy Info -----
 
@@ -225,16 +224,21 @@ namespace llaminar2
          * @param input Forward input for the prefill chunk being captured.
          * @param execution_device Device entering the boundary.
          * @param boundary_name Stable boundary identifier for diagnostics.
+         * @param capture_stream Exact stream entering the lifecycle transition.
          * @return true when the boundary is safe to cross.
          */
         virtual bool waitAtPrefillGraphCaptureBoundary(
             const ForwardInput &input,
             DeviceId execution_device,
-            const std::string &boundary_name)
+            const std::string &boundary_name,
+            void *capture_stream)
         {
             (void)input;
             (void)execution_device;
             (void)boundary_name;
+            if (!capture_stream)
+                throw std::invalid_argument(
+                    "IForwardExecutionHost::waitAtPrefillGraphCaptureBoundary requires a non-null GPU stream");
             return true;
         }
 
@@ -250,11 +254,15 @@ namespace llaminar2
         virtual bool waitAtDecodeGraphCaptureBoundary(
             const ForwardInput &input,
             DeviceId execution_device,
-            const std::string &boundary_name)
+            const std::string &boundary_name,
+            void *capture_stream)
         {
             (void)input;
             (void)execution_device;
             (void)boundary_name;
+            if (!capture_stream)
+                throw std::invalid_argument(
+                    "IForwardExecutionHost::waitAtDecodeGraphCaptureBoundary requires a non-null GPU stream");
             return true;
         }
 
@@ -468,6 +476,8 @@ namespace llaminar2
         {
             bool ok = false;                  ///< True when this chunk may execute under current gates.
             bool padding_required = false;    ///< True when real_count < bucket_seq_len.
+            ForwardPositionPolicy position_policy =
+                ForwardPositionPolicy::ExplicitRows; ///< Host rows on CPU; scalar device offset on GPU.
             int chunk_index = 0;              ///< Stable chunk ordinal within a prepared schedule.
             bool rebalance_allowed_after = false; ///< True when a maintenance hook may run after this chunk.
             bool rebalance_required_after = false; ///< True when a maintenance hook must run after this chunk.
@@ -532,9 +542,9 @@ namespace llaminar2
          * @param host   Host interface for model-specific callbacks
          * @return true on success
          *
-         * @pre input.position_ids != nullptr, or input.position_ids_device is
-         *      set for a GPU graph whose position consumer supports resident
-         *      device rows.
+         * @pre ExplicitRows inputs provide `position_ids` or a GPU-resident
+         *      `position_ids_device`; ContiguousOffset inputs have batch_size=1
+         *      and leave both pointers null.
          * @pre external_hidden_state already set in input (if applicable)
          */
         bool execute(const ForwardInput &input,

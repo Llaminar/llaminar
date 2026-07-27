@@ -175,6 +175,12 @@ namespace llaminar2
             return true;
         }
 
+        bool setGroupedMTPVerifier(bool enabled) override
+        {
+            config_.grouped_mtp_verifier = enabled;
+            return true;
+        }
+
         bool setLiveMTPRequestBatchCondition(bool enabled) override
         {
             config_.live_mtp_request_batch_condition = enabled;
@@ -320,7 +326,8 @@ namespace llaminar2
             int layer_idx,
             int seq_len,
             int batch_size,
-            DeviceId device) override;
+            DeviceId device,
+            const int32_t *sequence_lengths_device = nullptr) override;
 
     protected:
         // =====================================================================
@@ -342,6 +349,7 @@ namespace llaminar2
         bool decode_mirrored_embedding_graph_active_ = false;
         bool mtp_mirrored_lm_head_graph_active_ = false;
         bool mtp_kv_cache_only_graph_active_ = false;
+        bool prefix_runtime_rehydration_graph_active_ = false;
 
         // =====================================================================
         // Helpers
@@ -474,7 +482,45 @@ namespace llaminar2
          * @return true when LMHeadStage must bind the primary sharded LM head.
          */
         bool useColumnParallelLMHeadForGraph(TensorBase *logits_local) const;
+
+        /**
+         * @brief Decide whether a column-parallel LM head needs an MPI gather.
+         *
+         * A single MPI rank is not a distributed vocabulary domain. LocalTP
+         * runners publish their shard-local tensor to RankOrchestrator, which
+         * coordinates sampling across local devices. Emitting a one-rank MPI
+         * allgather would instead route GPU logits through the legacy host path
+         * and falsely advertise the dormant full-vocabulary tensor as produced.
+         *
+         * @param column_parallel Whether LMHeadStage writes the local-vocab tensor.
+         * @return true only for a real multi-rank MPI vocabulary gather.
+         */
+        bool needsDistributedLMHeadAllGather(bool column_parallel) const;
+
+        /**
+         * @brief Resolve the tensor actually produced at the graph boundary.
+         *
+         * This function keeps terminal-stage wiring and ForwardOutput metadata
+         * identical. A non-gathered column-parallel graph publishes LOGITS_LOCAL;
+         * a replicated head or completed distributed allgather publishes LOGITS.
+         *
+         * @param column_parallel Whether LMHeadStage writes LOGITS_LOCAL.
+         * @return Exact tensor downstream publication and consumers must use.
+         */
+        TensorBase *graphLMHeadOutput(bool column_parallel) const;
+
         bool denseDecodeReplicatedActiveForTokens(int total_tokens) const;
+        /**
+         * @brief Whether the graph under construction owns prefix rehydration.
+         *
+         * Derived MoE builders use this immutable build scope to attach a
+         * one-shot transfer transaction to every relevant layer. It must never
+         * be inferred from mutable host runtime-table contents.
+         */
+        bool prefixRuntimeRehydrationGraphActive() const noexcept
+        {
+            return prefix_runtime_rehydration_graph_active_;
+        }
         bool denseDecodeMirroredEmbeddingActiveForTokens(int total_tokens) const;
         bool replicatedAttentionStateActiveForTokens(int total_tokens) const;
         bool attentionTPAllreduceEnabledForCurrentGraph() const;
@@ -786,17 +832,67 @@ namespace llaminar2
             const std::string &wo_node_suffix = "wo_proj",
             const std::string &allreduce_node_suffix = "wo_allreduce");
 
+        /**
+         * @brief Optionally insert a graph-owned checkpoint around final norm.
+         *
+         * The base implementation is a no-op. Architectures with an opt-in
+         * device diagnostic may override it to retain one terminal row before
+         * and after final norm. Returning the new terminal dependency keeps the
+         * checkpoint in the forward DAG's required ordering chain.
+         *
+         * @param graph Forward graph under construction.
+         * @param boundary Stable semantic boundary name.
+         * @param source Tensor whose terminal row should be retained.
+         * @param dependency Producer that must complete before the checkpoint.
+         * @param total_tokens Number of logical rows in @p source.
+         * @param device Device that owns @p source.
+         * @param sequence_lengths_device Optional device-owned real row counts.
+         *        Padded GPU diagnostics consume this pointer inside their
+         *        captured row-copy kernel instead of adopting a host row.
+         * @return @p dependency for the no-op base implementation, or the
+         *         derived checkpoint node name.
+         */
+        virtual std::string maybeAddFinalNormDiagnosticCheckpoint(
+            ComputeGraph &graph,
+            const std::string &boundary,
+            TensorBase *source,
+            const std::string &dependency,
+            int total_tokens,
+            DeviceId device,
+            const int32_t *sequence_lengths_device)
+        {
+            (void)graph;
+            (void)boundary;
+            (void)source;
+            (void)total_tokens;
+            (void)device;
+            (void)sequence_lengths_device;
+            return dependency;
+        }
+
     public:
         static std::vector<int> buildPositionIds(int seq_len, int batch_size, int offset);
 
-        void addFinalNormToGraph(
+        /**
+         * @brief Add final RMSNorm and return its ordered terminal node.
+         *
+         * The returned node may be a derived diagnostic checkpoint chained
+         * after `final_norm`; callers must use it as the LM-head dependency so
+         * graph completion also owns checkpoint completion.
+         *
+         * @param sequence_lengths_device Optional stable device owner for real
+         *        request row counts. It is forwarded only to diagnostic
+         *        checkpoints; RMSNorm itself remains shape-static.
+         */
+        std::string addFinalNormToGraph(
             ComputeGraph &graph,
             TensorBase *hidden,
             TensorBase *normalized_out,
             const std::string &prev_node,
             int seq_len,
             DeviceId device,
-            BufferId input_buffer_id = BufferId::HIDDEN_STATE);
+            BufferId input_buffer_id = BufferId::HIDDEN_STATE,
+            const int32_t *sequence_lengths_device = nullptr);
 
         const TPDomain *getDomainForLayer(int layer_idx, bool is_attention) const;
     };

@@ -25,6 +25,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include <atomic>
 #include <cmath>
 #include <random>
@@ -227,7 +228,7 @@ TEST_F(StageDumpInfoTest, EnsureOutputsOnHostRejectsGpuOutputWithoutExplicitStre
 
     auto output = TestTensorFactory::createFP32({2, 2});
     ASSERT_TRUE(output->ensureOnDevice(device));
-    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    TransferEngine::publishGraphOwnedDeviceWrite(output, device);
 
     StageDumpInfo info;
     info.addOutput("gpu_output", output.get(), 2, 2);

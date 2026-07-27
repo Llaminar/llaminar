@@ -85,7 +85,7 @@ namespace llaminar2
             workspace_ = workspace;
             if (workspace_)
             {
-                LOG_DEBUG("[ROCmKernelBase] Workspace bound with " << workspace_->bufferCount() << " buffers");
+                LOG_TRACE("[ROCmKernelBase] Workspace bound with " << workspace_->bufferCount() << " buffers");
             }
         }
 
@@ -135,18 +135,47 @@ namespace llaminar2
         void setGPUStream(void *stream) { gpu_stream_ = stream; }
 
         /**
-         * @brief Get the GPU stream for kernel dispatch
+         * @brief Report whether a caller explicitly selected the launch stream.
          *
-         * Returns the explicitly-set GPU stream, falling back to the device
-         * context's default stream if available.
+         * `getStream()` may return the worker context's default stream when no
+         * explicit binding exists. That fallback is sufficient for ordinary
+         * kernel dispatch, but it is not proof that a fixture, graph, or
+         * transaction owns the same stream used by its transfers. Ordering
+         * code must use this predicate when it needs to distinguish explicit
+         * ownership from context-level availability.
          *
-         * @return hipStream_t cast to void*, or nullptr if no stream is set
+         * @return true only when `setGPUStream()` received a non-null stream.
+         */
+        [[nodiscard]] bool hasExplicitGPUStream() const noexcept
+        {
+            return gpu_stream_ != nullptr;
+        }
+
+        /**
+         * @brief Get the non-null GPU stream for kernel dispatch.
+         *
+         * Returns the explicitly bound stream, or the worker context's real
+         * non-default stream when the kernel belongs to that context. A kernel
+         * with neither source of stream ownership is not launchable: throwing
+         * here makes the violation happen while C++ evaluates launch arguments,
+         * before HIP can enqueue work on stream zero.
+         *
+         * @return hipStream_t cast to a non-null opaque pointer.
+         * @throws std::runtime_error when no owned stream exists.
          */
         void *getStream() const
         {
             if (gpu_stream_)
                 return gpu_stream_;
-            return device_ctx_ ? device_ctx_->defaultStream() : nullptr;
+            if (device_ctx_)
+            {
+                void *stream = device_ctx_->defaultStream();
+                if (stream)
+                    return stream;
+            }
+            throw std::runtime_error(
+                "[ROCmKernelBase] GPU execution requires an explicit or "
+                "worker-context-owned non-null stream");
         }
 
         /**
@@ -162,16 +191,18 @@ namespace llaminar2
          */
         void *requireStream(const char *kernel_name = "ROCmKernel") const
         {
-            void *s = getStream();
-            if (!s)
+            try
+            {
+                return getStream();
+            }
+            catch (const std::runtime_error &)
             {
                 throw std::runtime_error(
                     std::string("[") + kernel_name +
-                    "] No GPU stream set. All ROCm kernels must have an explicit stream "
-                    "bound via setGPUStream() before execution. Running on the default "
-                    "stream causes race conditions with event-based coherence tracking.");
+                    "] No owned GPU stream is available. Bind an explicit "
+                    "stream or a worker context before execution; stream zero "
+                    "cannot participate in event-backed coherence.");
             }
-            return s;
         }
 
         /**

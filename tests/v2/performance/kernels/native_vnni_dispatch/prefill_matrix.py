@@ -24,28 +24,39 @@ from .shape_manifest import (
 )
 
 
-# The generic CPU policy owns the union of both model-tier inventories. Small
-# models are economical enough to characterize the true prefill regime, while
-# 14B-and-larger projections are intentionally sampled only at short prompts.
-# Keeping the union explicit is important: runtime bucketing, generic-tree
-# totality, and sealed certification must still cover every positive M even
-# though large-model exact overlays intentionally stop after the second anchor.
-CPU_SMALL_MODEL_PREFILL_M_BUCKETS = (64, 128, 256, 512)
-CPU_LARGE_MODEL_PREFILL_M_BUCKETS = (64, 128)
+# The generic CPU policy owns the union of all three model-tier inventories.
+# Exact overlays deliberately spend less measurement time as model size grows:
+# large CPU projections reach steady state quickly, so deeper rows add little
+# evidence while consuming most of the collection budget. Keeping the union
+# explicit is important: runtime bucketing, generic-tree totality, and sealed
+# certification must still cover every positive M even when one exact overlay
+# is measured at only one canonical anchor.
+CPU_BELOW_7B_PREFILL_M_BUCKETS = (32, 128)
+CPU_7B_TO_BELOW_14B_PREFILL_M_BUCKETS = (32, 64)
+CPU_14B_PLUS_PREFILL_M_BUCKETS = (32,)
 CPU_PREFILL_M_BUCKETS = tuple(sorted(set(
-    CPU_SMALL_MODEL_PREFILL_M_BUCKETS
-    + CPU_LARGE_MODEL_PREFILL_M_BUCKETS
+    CPU_BELOW_7B_PREFILL_M_BUCKETS
+    + CPU_7B_TO_BELOW_14B_PREFILL_M_BUCKETS
+    + CPU_14B_PLUS_PREFILL_M_BUCKETS
 )))
 GPU_PREFILL_M_BUCKETS = (64, 256, 1024, 2048, 4096, 8192, 16384)
 
 # Historical CPU certificates legitimately contain these older buckets.  They
 # remain readable as immutable evidence, but new CPU collection and generated
 # runtime bucketing use ``CPU_PREFILL_M_BUCKETS`` exclusively.
-HISTORICAL_CPU_PREFILL_M_BUCKETS = GPU_PREFILL_M_BUCKETS
+HISTORICAL_CPU_PREFILL_M_BUCKETS = tuple(sorted(set(
+    GPU_PREFILL_M_BUCKETS + (128, 512)
+)))
 SUPPORTED_CPU_PREFILL_M_BUCKETS = tuple(sorted(set(
     CPU_PREFILL_M_BUCKETS + HISTORICAL_CPU_PREFILL_M_BUCKETS
 )))
+CPU_MIDDLE_MODEL_THRESHOLD_BILLIONS = 7.0
 CPU_LARGE_MODEL_THRESHOLD_BILLIONS = 14.0
+
+_FIXED_MODEL_FAMILY_SIZE_BILLIONS = {
+    "qwen36-dense": 27.0,
+    "qwen36-moe": 35.0,
+}
 
 # Ordinary prefill never projects through the vocabulary-sized LM head.  This
 # separate ceiling therefore ends at Qwen2.5 32B's largest FFN projection while
@@ -67,38 +78,63 @@ QWEN36_35B_MOE_SHAPES = (
 
 
 @lru_cache(maxsize=1)
-def _large_release_dimensions() -> frozenset[tuple[int, int]]:
-    """Return geometries used by at least one 14B-or-larger Qwen release."""
+def _largest_release_owner_by_dimensions() -> dict[tuple[int, int], float]:
+    """Map each release geometry to its largest owning model.
 
-    large_release_ids = {
-        model.release_id
+    Several releases may share one ``(N, K)`` pair. The largest owner controls
+    the evidence budget so a geometry used by both a small and a very large
+    checkpoint cannot accidentally inherit the small-model schedule.
+    """
+
+    model_sizes = {
+        model.release_id: model.parameter_count_billions
         for model in QWEN_RELEASE_MODELS
-        if model.parameter_count_billions
-        >= CPU_LARGE_MODEL_THRESHOLD_BILLIONS
     }
-    return frozenset(
-        (geometry.n, geometry.k)
+    return {
+        (geometry.n, geometry.k): max(
+            model_sizes[use.release_id] for use in geometry.uses
+        )
         for geometry in qwen_release_geometries()
-        if any(use.release_id in large_release_ids for use in geometry.uses)
-    )
+    }
 
 
-def _is_large_model_shape(shape: NativeVNNIShape) -> bool:
-    """Classify evidence geometry without introducing model-aware dispatch."""
+def _shape_owner_size_billions(shape: NativeVNNIShape) -> float:
+    """Return the largest model size that owns one exact-overlay geometry."""
 
-    if shape.model_family in {"qwen36-dense", "qwen36-moe"}:
-        return True
+    fixed_size = _FIXED_MODEL_FAMILY_SIZE_BILLIONS.get(shape.model_family)
+    if fixed_size is not None:
+        return fixed_size
     if shape.model_family.startswith("qwen25-"):
         size_text = shape.model_family.removeprefix("qwen25-").removesuffix("b")
         try:
-            return float(size_text) >= CPU_LARGE_MODEL_THRESHOLD_BILLIONS
+            return float(size_text)
         except ValueError as error:
             raise ValueError(
                 f"{shape.name}: malformed Qwen2.5 model-family size"
             ) from error
     if shape.model_family == "qwen35-qwen36-release-geometries":
-        return (shape.n, shape.k) in _large_release_dimensions()
-    return False
+        try:
+            return _largest_release_owner_by_dimensions()[(shape.n, shape.k)]
+        except KeyError as error:
+            raise ValueError(
+                f"{shape.name}: release geometry has no owning model"
+            ) from error
+    raise ValueError(
+        f"{shape.name}: production prefill model family has no CPU size tier"
+    )
+
+
+def _cpu_prefill_m_values_for_shape(
+    shape: NativeVNNIShape,
+) -> tuple[int, ...]:
+    """Select the reviewed exact-overlay M inventory for one model owner."""
+
+    owner_size = _shape_owner_size_billions(shape)
+    if owner_size >= CPU_LARGE_MODEL_THRESHOLD_BILLIONS:
+        return CPU_14B_PLUS_PREFILL_M_BUCKETS
+    if owner_size >= CPU_MIDDLE_MODEL_THRESHOLD_BILLIONS:
+        return CPU_7B_TO_BELOW_14B_PREFILL_M_BUCKETS
+    return CPU_BELOW_7B_PREFILL_M_BUCKETS
 
 
 @dataclass(frozen=True)
@@ -166,11 +202,7 @@ def cpu_prefill_measurements() -> tuple[CPUPrefillMeasurement, ...]:
             raise ValueError(f"{name}: LM heads are not ordinary prefill GEMMs")
         if shape.work_items > CPU_PREFILL_MAXIMUM_WEIGHT_ELEMENTS:
             raise ValueError(f"{name}: exceeds the CPU measurement envelope")
-        m_values = (
-            CPU_LARGE_MODEL_PREFILL_M_BUCKETS
-            if _is_large_model_shape(shape)
-            else CPU_SMALL_MODEL_PREFILL_M_BUCKETS
-        )
+        m_values = _cpu_prefill_m_values_for_shape(shape)
         measurements.append(CPUPrefillMeasurement(shape, m_values))
     return tuple(measurements)
 
@@ -180,8 +212,9 @@ def cpu_prefill_maximum_weight_elements_for_m(m: int) -> int:
     """Return the largest CPU projection that may be freshly timed at ``m``.
 
     Adaptive refinement obeys the same model-tiered exact-overlay envelope as
-    the reviewed production matrix. M=64/128 may use the largest model
-    geometries, while M=256/512 is bounded by the largest sub-14B projection.
+    the reviewed production matrix. M=32 may use every production geometry,
+    M=64 is bounded by 7B-to-below-14B owners, and M=128 is bounded by owners
+    below 7B.
 
     Args:
         m: One exact canonical prefill row-count bucket.

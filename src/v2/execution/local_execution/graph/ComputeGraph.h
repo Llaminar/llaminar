@@ -136,6 +136,21 @@ namespace llaminar2
         size_t totalEstimatedFlops() const;
 
         /**
+         * @brief Discover every graph node whose concrete stage participates in a collective.
+         *
+         * Collective behavior is an instance-level stage contract. Composite
+         * stages such as phase-split MoE maintenance may contain NCCL/RCCL
+         * operations even though their broad `ComputeStageType` is not one of
+         * the dedicated collective enum values. Keeping discovery on the graph
+         * prevents forward, verifier, and auxiliary maintenance launchers from
+         * inventing separate and eventually inconsistent collective-node lists.
+         *
+         * @return Node names for which `IComputeStage::isCollectiveStage()`
+         *         reports true.
+         */
+        std::unordered_set<std::string> collectiveNodeNames() const;
+
+        /**
          * @brief Clear the graph
          */
         void clear();

@@ -424,7 +424,9 @@ namespace llaminar2::test
             // Mock: No-op
         }
 
-        bool reserveTempBufferBytes(size_t bytes) override
+        bool reserveCollectiveResources(
+            size_t bytes,
+            size_t /*fp16_scratch_elements*/) override
         {
             (void)bytes;
             return true; // Mock: Always succeed

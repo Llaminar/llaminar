@@ -7,8 +7,8 @@
  *
  *   LocalTPAllreduceStage::execute()
  *     → LocalTPContext::allreduce()
- *       → LocalTPContext::allreduceWithBarrierMultiGpu()
- *         → RCCLBackend::allreduceMulti()
+ *       → LocalTPContext::allreducePerDeviceRequired()
+ *         → RCCLBackend::allreduceSingleDeviceAsync()
  *
  * The key difference from raw backend tests is that these tests exercise:
  * - Multi-threaded barrier synchronization (one thread per device)
@@ -191,7 +191,7 @@ namespace llaminar2
          * - One thread per device
          * - Each thread owns a tensor on its device
          * - All threads call tp_ctx_->allreduce() concurrently
-         * - LocalTPContext::allreduceWithBarrierMultiGpu() coordinates
+         * - LocalTPContext::allreducePerDeviceRequired() enqueues each participant
          *
          * @param per_gpu_values Each GPU's contribution (per_gpu_values[gpu][element])
          * @param expected_sum The expected sum after allreduce

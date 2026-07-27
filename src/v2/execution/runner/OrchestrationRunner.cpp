@@ -733,7 +733,8 @@ namespace llaminar2
                                {
                                    return block.mtp_payload != nullptr ||
                                           (block.mtp_storage && !block.mtp_storage->empty()) ||
-                                          block.device_mtp_storage != nullptr;
+                                          block.device_mtp_storage != nullptr ||
+                                          block.device_mtp_allocation != nullptr;
                                });
         }
 
@@ -5076,6 +5077,19 @@ namespace llaminar2
             active_sampling_params_.seed != 0;
         const bool use_sampling_penalties =
             active_sampling_params_.has_penalties() && !stochastic_verify;
+        if (runner_->primaryDeviceId().is_gpu() &&
+            !runner_->supportsMTPSidecarLogitsStreamHandoff())
+        {
+            /*
+             * This is a foundational GPU MTP ownership contract, so validate it
+             * before selecting a verifier policy or inspecting any secondary
+             * grouped-publication capability. No GPU MTP transaction may begin
+             * if its first sidecar producer cannot hand ownership to the next
+             * device consumer through an explicit stream event.
+             */
+            return fail_without_checkpoint(
+                "GPU MTP requires device-resident sidecar stream handoff");
+        }
         const bool supports_all_position_state_publication =
             runner_->supportsMTPSpecStatePublication() &&
             (!stochastic_verify || stochastic_device_verify || stochastic_host_verify);
@@ -5216,6 +5230,17 @@ namespace llaminar2
             ready_sampled_token.has_value() &&
             ready_sampled_resident_state.has_value() &&
             ready_sampled_resident_state->valid();
+        std::optional<DeviceResidentLogicalSequenceStateHandle>
+            first_token_resident_state;
+        if (use_pending_condition_row &&
+            pending_condition_has_resident_state)
+        {
+            first_token_resident_state = pending_condition_resident_state;
+        }
+        else if (ready_sampled_has_resident_state)
+        {
+            first_token_resident_state = ready_sampled_resident_state;
+        }
         if (use_pending_condition_row)
         {
             if (!pending_condition_params.has_value())
@@ -6182,6 +6207,7 @@ namespace llaminar2
                     {
                         return fail_after_checkpoint("MTP stochastic first-token GPU sampling failed");
                     }
+                    first_token_device_target_slot_available = true;
                     PerfStatsCollector::addCounter(
                         "mtp",
                         "first_token_stochastic_device_samples",
@@ -6274,16 +6300,17 @@ namespace llaminar2
                 }
                 else if (verifier_accepts_device_first_token &&
                          runner_->primaryDeviceId().is_gpu() &&
-                         runner_->supportsMTPDeviceDraftTokenInput() &&
-                         pre_sample_effective_draft_count > 0)
+                         runner_->supportsMTPDeviceDraftTokenInput())
                 {
                     /*
-                     * Penalty-bearing greedy decode still needs a host shadow so
-                     * sampler history can be updated today, but the verifier
-                     * token row itself must be assembled from runner-owned device
-                     * sample slots.  Sampling through the target-slot API records
-                     * that device source while returning the same token shadow the
-                     * history code already consumed.
+                     * Keep a persistent device owner even when the request's
+                     * remaining output budget clamps speculative depth to zero.
+                     * The host shadow is still returned because it is the user
+                     * visible result and feeds sampler history, but shifted-MTP
+                     * publication and the main-model state advance below both
+                     * consume this target slot directly.  Restricting target-slot
+                     * sampling to positive draft depth made the final one-token
+                     * transaction fall back into the obsolete scalar GPU path.
                      */
                     PerfStatsCollector::ScopedTimer timer(
                         "mtp",
@@ -6401,12 +6428,69 @@ namespace llaminar2
                         "mtp",
                         "budget_limited_direct_emit_shifted_commit",
                         "decode");
-                    shifted_commit_ok =
-                        runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
-                            first_token,
-                            /*already_appended_tokens=*/0,
-                            /*allow_speculative_discard=*/true,
-                            base_sidecar_position);
+                    if (runner_->primaryDeviceId().is_gpu())
+                    {
+                        /*
+                         * Ready and rejection-correction tokens are owned by the
+                         * resident publication mailbox, not by their host response
+                         * shadows. Preserve the token in the persistent target
+                         * arena before shifted-cache publication retargets that
+                         * mailbox's transaction epoch. This is an event-ordered
+                         * D2D handoff; the host scalar is never uploaded.
+                         */
+                        if (first_token_resident_state.has_value())
+                        {
+                            if (!runner_
+                                     ->publishDeviceResidentConditionTokenToTargetSampleSlot(
+                                         *first_token_resident_state,
+                                         /*request_index=*/0,
+                                         /*target_sample_slot=*/0))
+                            {
+                                return fail_after_checkpoint(
+                                    "MTP GPU budget-limited direct emit could not publish its resident condition token to the device target slot");
+                            }
+                            first_token_device_target_slot_available = true;
+                            PerfStatsCollector::addCounter(
+                                "mtp",
+                                "budget_limited_direct_emit_resident_target_publications",
+                                1.0,
+                                "decode",
+                                {},
+                                {{"source",
+                                  use_pending_condition_row
+                                      ? "pending_condition"
+                                      : "ready_token"},
+                                 {"transfer", "d2d"}});
+                        }
+                        if (!first_token_device_target_slot_available)
+                        {
+                            return fail_after_checkpoint(
+                                "MTP GPU budget-limited direct emit has no device-owned target token");
+                        }
+                        shifted_commit_ok =
+                            first_token_resident_state.has_value()
+                                ? runner_
+                                      ->commitMTPShiftedRowFromDeviceResidentLogicalState(
+                                          *first_token_resident_state,
+                                          /*request_index=*/0,
+                                          /*already_appended_tokens=*/0,
+                                          /*allow_speculative_discard=*/true)
+                                : runner_
+                                      ->commitMTPShiftedRowFromDeviceTargetSample(
+                                          /*target_sample_slot=*/0,
+                                          /*already_appended_tokens=*/0,
+                                          /*allow_speculative_discard=*/true,
+                                          base_sidecar_position);
+                    }
+                    else
+                    {
+                        shifted_commit_ok =
+                            runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
+                                first_token,
+                                /*already_appended_tokens=*/0,
+                                /*allow_speculative_discard=*/true,
+                                base_sidecar_position);
+                    }
                 }
                 if (!shifted_commit_ok)
                 {
@@ -6429,7 +6513,36 @@ namespace llaminar2
                      */
                     runner_->setMTPMainDecodeSyncDeferralEnabled(
                         can_defer_main_decode_sync);
-                    advance_ok = runner_->forward(&first_token, 1);
+                    if (runner_->primaryDeviceId().is_gpu())
+                    {
+                        /*
+                         * Materialize a stable one-row token input from the same
+                         * target slot consumed by shifted-MTP publication.  For
+                         * LocalTP the rank runner returns its typed bundle of
+                         * participant-local rows, so every child enters the
+                         * captured main graph with its own device pointer.
+                         */
+                        const void *direct_emit_token_device =
+                            runner_->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+                                /*first_target_sample_slot=*/0,
+                                /*first_draft_slot=*/0,
+                                /*draft_token_count=*/0,
+                                /*total_verifier_input_tokens=*/1);
+                        if (!direct_emit_token_device)
+                        {
+                            runner_->setMTPMainDecodeSyncDeferralEnabled(false);
+                            return fail_after_checkpoint(
+                                "MTP GPU budget-limited direct emit could not materialize its device token row");
+                        }
+                        advance_ok = runner_->forwardWithDeviceTokenIds(
+                            &first_token,
+                            direct_emit_token_device,
+                            /*seq_len=*/1);
+                    }
+                    else
+                    {
+                        advance_ok = runner_->forward(&first_token, 1);
+                    }
                     if (!advance_ok)
                     {
                         runner_->setMTPMainDecodeSyncDeferralEnabled(false);
@@ -6774,15 +6887,13 @@ namespace llaminar2
         const bool use_sidecar_sample_fusion =
             runner_->supportsMTPSidecarSampleFusion() && !use_sampling_penalties && !stochastic_verify;
         /*
-         * Penalty-free stochastic MTP can hand sidecar logits directly to the
-         * compact device distribution builder. This avoids the sync that used
-         * to sit between sidecar replay and draft-token sampling. Penalty
-         * paths remain synchronized because accepted-token history mutates the
-         * logits before each sample.
+         * Every GPU MTP lane hands sidecar ownership to its next consumer with
+         * a stream event. Penalty kernels are ordinary device consumers and
+         * republish the same handoff after mutation; they are not a reason to
+         * drain the producer stream on the host.
          */
         const bool use_device_resident_sidecar_stream_handoff =
             runner_->primaryDeviceId().is_gpu() &&
-            !active_sampling_params_.has_penalties() &&
             runner_->supportsMTPSidecarLogitsStreamHandoff();
         const bool use_sidecar_stream_handoff_for_stochastic =
             stochastic_verify &&
@@ -6793,9 +6904,9 @@ namespace llaminar2
             use_grouped_outcome_device_resident_publication_verifier &&
             use_device_resident_sidecar_stream_handoff;
         const bool use_device_draft_token_sidecar =
-            (use_sidecar_stream_handoff_for_stochastic ||
-             use_sidecar_stream_handoff_for_grouped_greedy) &&
-            runner_->supportsMTPDeviceDraftTokenInput();
+            runner_->primaryDeviceId().is_gpu() &&
+            runner_->supportsMTPDeviceDraftTokenInput() &&
+            (stochastic_device_verify || use_greedy_device_draft_slots);
         const bool use_resident_pending_condition_sidecar =
             use_pending_condition_row &&
             pending_condition_has_resident_state &&
@@ -6886,13 +6997,31 @@ namespace llaminar2
                             can_defer_greedy_draft_host_reads;
                         int32_t *sample_host_shadow =
                             defer_fused_sample ? nullptr : &mtp_token;
-                        if (first_token == kDeferredMTPFirstTokenShadow &&
-                            use_greedy_device_draft_slots)
+                        if (use_resident_ready_condition_sidecar)
+                        {
+                            sidecar_ok = runner_
+                                ->forwardMTPFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlot(
+                                    *ready_sampled_resident_state,
+                                    /*request_index=*/0,
+                                    draft_idx,
+                                    sample_host_shadow);
+                        }
+                        else if (use_resident_pending_condition_sidecar)
+                        {
+                            sidecar_ok = runner_
+                                ->forwardMTPFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlot(
+                                    *pending_condition_resident_state,
+                                    /*request_index=*/0,
+                                    draft_idx,
+                                    sample_host_shadow);
+                        }
+                        else if (first_token_device_target_slot_available &&
+                                 use_greedy_device_draft_slots)
                         {
                             sidecar_ok =
-                                runner_->forwardMTPFromDeviceTargetAndSampleGreedyToDeviceDraftSlot(
+                                runner_
+                                    ->forwardMTPFromDeviceTargetAtLivePositionAndSampleGreedyToDeviceDraftSlot(
                                     /*target_sample_slot=*/0,
-                                    base_sidecar_position,
                                     draft_idx,
                                     sample_host_shadow);
                         }
@@ -6969,13 +7098,13 @@ namespace llaminar2
                                     "decode");
                             }
                         }
-                        else if (first_token == kDeferredMTPFirstTokenShadow)
+                        else if (first_token_device_target_slot_available)
                         {
                             sidecar_ok =
                                 use_device_draft_token_sidecar &&
-                                runner_->forwardMTPFromDeviceTargetForDeviceSampling(
-                                    /*target_sample_slot=*/0,
-                                    base_sidecar_position);
+                                runner_
+                                    ->forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(
+                                        /*target_sample_slot=*/0);
                             if (sidecar_ok)
                             {
                                 PerfStatsCollector::addCounter(
@@ -6987,21 +7116,45 @@ namespace llaminar2
                         }
                         else
                         {
-                            sidecar_ok = runner_->forwardMTPForDeviceSampling(
-                                draft_tokens.back());
+                            /*
+                             * A GPU sidecar may never reconstruct a device
+                             * token/position pair from host shadows. CPU keeps
+                             * its ordinary host-owned sidecar contract.
+                             */
+                            sidecar_ok =
+                                runner_->primaryDeviceId().is_gpu()
+                                    ? false
+                                    : runner_->forwardMTPForDeviceSampling(
+                                          draft_tokens.back());
                         }
                     }
-                    else if (first_token == kDeferredMTPFirstTokenShadow &&
-                             use_greedy_device_draft_slots)
+                    else if (use_resident_ready_condition_sidecar)
                     {
                         sidecar_ok =
-                            runner_->forwardMTPFromDeviceTargetForDeviceSampling(
-                                /*target_sample_slot=*/0,
-                                base_sidecar_position);
+                            runner_->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+                                *ready_sampled_resident_state,
+                                /*request_index=*/0);
+                    }
+                    else if (use_resident_pending_condition_sidecar)
+                    {
+                        sidecar_ok =
+                            runner_->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+                                *pending_condition_resident_state,
+                                /*request_index=*/0);
+                    }
+                    else if (first_token_device_target_slot_available &&
+                             use_device_draft_token_sidecar)
+                    {
+                        sidecar_ok = runner_
+                            ->forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(
+                                /*target_sample_slot=*/0);
                     }
                     else
                     {
-                        sidecar_ok = runner_->forwardMTP(draft_tokens.back());
+                        sidecar_ok =
+                            runner_->primaryDeviceId().is_gpu()
+                                ? false
+                                : runner_->forwardMTP(draft_tokens.back());
                     }
                 }
                 else
@@ -7012,7 +7165,7 @@ namespace llaminar2
                             can_defer_greedy_draft_host_reads;
                         int32_t *sample_host_shadow =
                             defer_fused_sample ? nullptr : &mtp_token;
-                        if (use_greedy_device_draft_slots && defer_fused_sample)
+                        if (use_greedy_device_draft_slots)
                         {
                             /*
                              * The previous draft row was sampled into the
@@ -7023,9 +7176,10 @@ namespace llaminar2
                              * so no intermediate D2H token copy is required.
                              */
                             sidecar_ok =
-                                runner_->forwardMTPFromDeviceDraftAndSampleGreedyToDeviceDraftSlot(
+                                runner_
+                                    ->forwardMTPFromDeviceDraftAtLivePositionAndSampleGreedyToDeviceDraftSlot(
                                     draft_idx - 1,
-                                    base_sidecar_position + draft_idx,
+                                    /*position_offset=*/draft_idx,
                                     draft_idx,
                                     sample_host_shadow);
                         }
@@ -7065,9 +7219,10 @@ namespace llaminar2
                          * sidecar embedding instead of uploading draft_tokens.back().
                          */
                         sidecar_ok =
-                            runner_->forwardMTPFromDeviceDraftForDeviceSampling(
+                            runner_
+                                ->forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling(
                                 draft_idx - 1,
-                                base_sidecar_position + draft_idx);
+                                /*position_offset=*/draft_idx);
                     }
                     else if (use_sidecar_stream_handoff_for_stochastic)
                     {
@@ -7091,37 +7246,15 @@ namespace llaminar2
                         ? "MTP sidecar forward failed"
                         : "Chained MTP sidecar forward failed");
             }
-            if (use_sidecar_stream_handoff_for_stochastic ||
-                used_prelaunched_first_sidecar)
+            if (runner_->primaryDeviceId().is_gpu())
             {
                 PerfStatsCollector::addCounter(
                     "mtp",
-                    "stochastic_sidecar_stream_handoff_attempts",
+                    "sidecar_iteration_host_flushes_avoided",
                     1.0,
                     "decode",
                     {},
                     {{"draft_idx", std::to_string(draft_idx)}});
-                if (draft_idx > 0 && use_device_draft_token_sidecar)
-                {
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "stochastic_sidecar_device_token_inputs",
-                        1.0,
-                        "decode",
-                        {},
-                        {{"draft_idx", std::to_string(draft_idx)}});
-                }
-                if (needs_mpi_mtp_boundary_fence)
-                {
-                    PerfStatsCollector::ScopedTimer timer(
-                        "mtp",
-                        "sidecar_iteration_flush",
-                        "decode");
-                    if (!runner_->flushPendingMTPWork())
-                    {
-                        return fail_after_checkpoint("MTP sidecar stream flush failed");
-                    }
-                }
             }
             else
             {
@@ -7201,14 +7334,13 @@ namespace llaminar2
                 const bool next_sidecar_needs_host_token =
                     draft_idx + 1 < speculative_draft_count &&
                     !use_device_draft_token_sidecar;
-                const bool greedy_next_sidecar_can_consume_device_token =
+                const bool greedy_verifier_can_consume_device_token =
                     can_defer_greedy_draft_host_reads &&
-                    use_device_draft_token_sidecar &&
-                    draft_idx + 1 < speculative_draft_count;
+                    use_device_draft_token_sidecar;
                 const bool defer_draft_host_read =
                     (can_defer_stochastic_draft_host_reads &&
                      !next_sidecar_needs_host_token) ||
-                    greedy_next_sidecar_can_consume_device_token;
+                    greedy_verifier_can_consume_device_token;
                 mtp_token = sample_mtp_token(draft_idx, defer_draft_host_read);
             }
             if (mtp_token < 0)
@@ -7254,22 +7386,8 @@ namespace llaminar2
          * the flush because they inspect sidecar-produced state immediately.
          */
         const bool can_skip_sidecar_flush_before_verifier =
-            stochastic_verify &&
-            stochastic_device_verify &&
-            !active_sampling_params_.has_penalties() &&
             runner_->primaryDeviceId().is_gpu() &&
-            use_all_position_state_publication_verifier &&
-            draft_tokens.size() > 1 &&
-            !first_token_is_stop &&
-            !needs_mpi_mtp_boundary_fence &&
-            stop_tokens_.size() <=
-                static_cast<size_t>(
-                    sampling_math::kSpeculativeBatchMaxStopTokens) &&
-            runner_->supportsMTPDeviceDraftTokenInput() &&
-            !DebugEnv::isTruthyEnv(
-                "LLAMINAR_MTP_FORCE_SIDECAR_FLUSH_BEFORE_VERIFIER") &&
-            !DebugEnv::isTruthyEnv(
-                "LLAMINAR_MTP_VERIFY_SIDECAR_PRESERVES_MAIN_STATE");
+            use_device_resident_sidecar_stream_handoff;
         if (can_skip_sidecar_flush_before_verifier)
         {
             PerfStatsCollector::addCounter(
@@ -7503,6 +7621,9 @@ namespace llaminar2
             {
                 return std::string("MTP commit replay check could not capture committed state");
             }
+            const DeviceResidentLogicalSequenceStateHandle
+                committed_resident_state_before_diagnostic =
+                    runner_->deviceResidentLogicalSequenceState();
             auto summarize_probe = [](const PrefixRuntimeStateSnapshot &probe)
             {
                 auto summarize_cache = [](const std::vector<PrefixKVCacheProbe> &caches)
@@ -7601,7 +7722,11 @@ namespace llaminar2
                             << "/term_h=" << block.layout.terminal_hidden_bytes
                             << "/has_hybrid=" << (block.has_hybrid_state ? "1" : "0")
                             << "/has_term_h=" << (block.has_terminal_hidden ? "1" : "0")
-                            << "/dev_hybrid=" << (block.device_hybrid_storage ? "1" : "0");
+                            << "/dev_hybrid="
+                            << ((block.device_hybrid_storage ||
+                                 block.device_hybrid_allocation)
+                                    ? "1"
+                                    : "0");
                     }
                     if (blocks.size() > limit)
                         out << "|...";
@@ -8041,6 +8166,7 @@ namespace llaminar2
                 return std::string("MTP commit replay check could not restore verifier base state");
             }
             bool sequential_replay_ok = true;
+            int32_t replay_next_token = -1;
             for (size_t i = 0; i < tokens_to_replay.size(); ++i)
             {
                 const int32_t replay_token = tokens_to_replay[i];
@@ -8051,6 +8177,62 @@ namespace llaminar2
                 {
                     sequential_replay_ok = false;
                     break;
+                }
+
+                /*
+                 * Validate every output transition, not merely the state after
+                 * the complete transaction. A grouped verifier can emit a wrong
+                 * intermediate correction token whose later continuation happens
+                 * to reconverge. Feeding that wrong token into the replay oracle
+                 * and checking only the final sample would bless the corruption.
+                 * Sampling after each serial row proves byte-for-byte token-stream
+                 * equivalence at the earliest observable boundary.
+                 */
+                replay_next_token = runner_->sampleGreedyOnDevice();
+                if (replay_next_token < 0)
+                {
+                    return std::string(
+                        "MTP commit replay check row sampling failed at replay index=") +
+                           std::to_string(i);
+                }
+                const int32_t expected_row_next =
+                    i + 1 < tokens_to_replay.size()
+                        ? tokens_to_replay[i + 1]
+                        : expected_next_token;
+                if (replay_next_token != expected_row_next)
+                {
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "commit_replay_check_serial_output_token_mismatches",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"path", path},
+                         {"replay_index", std::to_string(i)},
+                         {"replay_token", std::to_string(replay_token)},
+                         {"serial_next", std::to_string(replay_next_token)},
+                         {"grouped_next",
+                          std::to_string(expected_row_next)}});
+                    return std::string(
+                               "MTP grouped output token mismatch against serial row replay: path=") +
+                           path +
+                           " replay_index=" + std::to_string(i) +
+                           " replay_token=" + std::to_string(replay_token) +
+                           " serial_next=" +
+                           std::to_string(replay_next_token) +
+                           " grouped_next=" +
+                           std::to_string(expected_row_next) +
+                           " condition_token=" +
+                           std::to_string(condition_token) +
+                           " committed_tokens=" +
+                           join_tokens(tokens_to_replay) +
+                           " committed_probe_before={" +
+                           summarize_probe(committed_probe_before) + "}" +
+                           " replay_probe={" +
+                           summarize_probe(runner_->prefixStateProbe()) + "}" +
+                           (debug_context.empty()
+                                ? std::string{}
+                                : " " + debug_context);
                 }
                 if (!have_serial_probe_after_state_prefix &&
                     static_cast<int>(i + 1) == replay_prefix_count)
@@ -8076,7 +8258,6 @@ namespace llaminar2
             }
             const PrefixRuntimeStateSnapshot serial_probe_after_full_replay =
                 runner_->prefixStateProbe();
-            const int32_t replay_next_token = runner_->sampleGreedyOnDevice();
             if (replay_next_token < 0)
             {
                 return std::string("MTP commit replay check full replay sampling failed");
@@ -8343,6 +8524,51 @@ namespace llaminar2
                 return std::string("MTP commit replay check continuation replay forward failed");
             }
 
+            /*
+             * Replay diagnostics intentionally replaced the live timeline several
+             * times. Restore the exact committed checkpoint once more, then bind
+             * the durable compact outcome rows to the restored epoch. Without this
+             * final transaction repair, restoreLivePrefixState() correctly leaves
+             * the transient mailbox empty and the following real MTP step cannot
+             * obtain a scheduler-owned resident position.
+             *
+             * This branch is reachable only under
+             * LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_CHECK. Production publication does
+             * not route through checkpoint restore or this diagnostic rebind.
+             */
+            if (!runner_->restoreLivePrefixState(committed_checkpoint))
+            {
+                return std::string(
+                    "MTP commit replay check could not perform final committed-state restore");
+            }
+            if (runner_->primaryDeviceId().is_gpu())
+            {
+                if (!committed_resident_state_before_diagnostic.valid())
+                {
+                    return std::string(
+                        "MTP commit replay check started without a resident logical-state publication");
+                }
+                if (!runner_
+                         ->rebindDeviceResidentLogicalStateAfterDiagnosticRestore(
+                             committed_resident_state_before_diagnostic
+                                 .request_count))
+                {
+                    return std::string(
+                        "MTP commit replay check could not rebind resident logical state after final restore");
+                }
+                decode_transaction_planning_position_ =
+                    committed_checkpoint.cached_tokens;
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "commit_replay_check_scheduler_position_restores",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"position",
+                      std::to_string(committed_checkpoint.cached_tokens)},
+                     {"position_owner", "diagnostic_checkpoint"}});
+            }
+
             PerfStatsCollector::addCounter(
                 "mtp",
                 "commit_replay_check_matches",
@@ -8358,6 +8584,53 @@ namespace llaminar2
                  {"derived_next_token",
                   derived_next_token_from_deferred_condition ? "true" : "false"},
                  {"used_ready_logits", use_ready_logits ? "true" : "false"}});
+            return std::nullopt;
+        };
+
+        auto refresh_resident_condition_handles_after_replay_diagnostic =
+            [&](std::optional<DeviceResidentLogicalSequenceStateHandle>
+                    &pending_condition_state,
+                std::optional<DeviceResidentLogicalSequenceStateHandle>
+                    &ready_condition_state) -> std::optional<std::string>
+        {
+            if (!verify_commit_replay_check ||
+                !runner_->primaryDeviceId().is_gpu() ||
+                (!pending_condition_state.has_value() &&
+                 !ready_condition_state.has_value()))
+            {
+                return std::nullopt;
+            }
+
+            /*
+             * The diagnostic's final checkpoint restore creates a fresh mailbox
+             * event and live-state epoch. Handles captured from the original
+             * publication therefore remain structurally valid but intentionally
+             * fail current-mailbox identity checks. Carry the refreshed handle
+             * into the real transaction commit instead of retaining an identity
+             * token from the timeline that the diagnostic discarded.
+             */
+            const DeviceResidentLogicalSequenceStateHandle refreshed =
+                runner_->deviceResidentLogicalSequenceState();
+            if (!refreshed.valid())
+            {
+                return std::string(
+                    "MTP commit replay check produced no refreshed resident condition handle");
+            }
+            if (pending_condition_state.has_value())
+                pending_condition_state = refreshed;
+            if (ready_condition_state.has_value())
+                ready_condition_state = refreshed;
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "commit_replay_check_condition_handle_refreshes",
+                1.0,
+                "decode",
+                {},
+                {{"pending",
+                  pending_condition_state.has_value() ? "true" : "false"},
+                 {"ready",
+                  ready_condition_state.has_value() ? "true" : "false"}});
             return std::nullopt;
         };
 
@@ -10340,6 +10613,13 @@ namespace llaminar2
                     return fail_after_checkpoint(*mismatch);
                 }
             }
+            if (auto refresh_error =
+                    refresh_resident_condition_handles_after_replay_diagnostic(
+                        next_pending_condition_resident_state,
+                        ready_condition_resident_state))
+            {
+                return fail_after_checkpoint(*refresh_error);
+            }
 
             if (auto commit_error = commit_mtp_transaction_outputs(
                     "all_position_state_publication_verifier",
@@ -11688,6 +11968,13 @@ namespace llaminar2
                         return fail_after_checkpoint(*mismatch);
                     }
                 }
+                if (auto refresh_error =
+                        refresh_resident_condition_handles_after_replay_diagnostic(
+                            next_pending_condition_resident_state,
+                            ready_condition_resident_state))
+                {
+                    return fail_after_checkpoint(*refresh_error);
+                }
 
                 if (auto commit_error = commit_mtp_transaction_outputs(
                         "grouped_decode_equivalent_stochastic_verifier",
@@ -12588,6 +12875,13 @@ namespace llaminar2
                         return fail_after_checkpoint(*mismatch);
                     }
                 }
+                if (auto refresh_error =
+                        refresh_resident_condition_handles_after_replay_diagnostic(
+                            next_pending_condition_resident_state,
+                            ready_condition_resident_state))
+                {
+                    return fail_after_checkpoint(*refresh_error);
+                }
 
                 if (auto commit_error = commit_mtp_transaction_outputs(
                         "grouped_decode_equivalent_greedy_verifier",
@@ -13294,8 +13588,6 @@ namespace llaminar2
 
         // Enable GPU-side logits skip for decode (GPU sampling avoids full D2H)
         runner_->setSkipLogitsGatherDecode(true);
-        const bool device_side_moe_rebalance = usesDeviceSideMoERebalanceController();
-
         while (static_cast<int>(result.tokens.size()) < max_new_tokens)
         {
             // Use decodeStep() which uses last_token_ internally
@@ -13321,7 +13613,7 @@ namespace llaminar2
                 break;
             }
 
-            if (!device_side_moe_rebalance && !maybeApplyMoERebalance())
+            if (!maybeApplyMoERebalance())
             {
                 result.error = last_error_.empty() ? "MoE rebalance failed" : last_error_;
                 break;
@@ -13330,7 +13622,7 @@ namespace llaminar2
 
         if (result.error.empty())
         {
-            if (device_side_moe_rebalance)
+            if (usesDeviceSideMoERebalanceController())
             {
                 if (pending_moe_rebalance_prepare_.has_value())
                 {
@@ -13392,16 +13684,21 @@ namespace llaminar2
 
         if (usesDeviceSideMoERebalanceController())
         {
-            PerfStatsCollector::addCounter(
-                "moe_rebalance",
-                "decode_boundary_maintenance_device_side_skips",
-                1.0,
-                "rebalance",
-                device);
             if (pending_moe_rebalance_prepare_.has_value())
             {
                 return setError(
                     "MoE rebalance has a pending host-prepared publish while the device-side controller is active");
+            }
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "decode_boundary_device_maintenance_calls",
+                1.0,
+                "rebalance",
+                device);
+            if (!runner_->maybeApplyDecodeBoundaryMaintenance())
+            {
+                return setError(
+                    "Device-side MoE rebalance maintenance failed at the committed decode boundary");
             }
             return true;
         }
@@ -14571,9 +14868,25 @@ namespace llaminar2
                 size_t weight_bytes = 0;
                 for (const auto &t : model.tensors)
                     weight_bytes += t.size_bytes;
-                double weight_gb = static_cast<double>(weight_bytes) / (1024.0 * 1024.0 * 1024.0);
                 char buf[64];
-                snprintf(buf, sizeof(buf), "%.1f GB required", weight_gb);
+                const DeviceId primary_device =
+                    DeviceAddressAdapter::toDeviceId(plan_.primary_device);
+                const auto &load_config = debugEnv().rocm;
+                if (primary_device.is_gpu() && config_.use_mmap &&
+                    load_config.repack_budget_mb > 0)
+                {
+                    snprintf(
+                        buf, sizeof(buf),
+                        "%d MiB bounded staging cap",
+                        load_config.repack_budget_mb);
+                }
+                else
+                {
+                    const double weight_gb =
+                        static_cast<double>(weight_bytes) /
+                        (1024.0 * 1024.0 * 1024.0);
+                    snprintf(buf, sizeof(buf), "%.1f GB required", weight_gb);
+                }
                 ram_check.detail = buf;
             }
             data.preflight_checks.push_back(ram_check);

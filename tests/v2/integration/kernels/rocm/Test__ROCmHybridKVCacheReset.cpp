@@ -37,6 +37,7 @@
 #include "tensors/SIMDHelpers.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
+#include "transfer/TransferEngine.h"
 #endif
 
 namespace
@@ -334,7 +335,7 @@ namespace
             state = state * 1664525u + 1013904223u;
             data[i] = static_cast<uint16_t>(0x3000u | ((state >> 16) & 0x0fffu));
         }
-        tensor->mark_host_dirty();
+        llaminar2::TransferEngine::publishHostWrite(tensor);
         if (!tensor->ensureOnDevice(llaminar2::DeviceId::rocm(0), stream.opaque()))
             throw std::runtime_error("failed to upload FP16 test tensor");
         return tensor;

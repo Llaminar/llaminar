@@ -15,9 +15,11 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../backends/DeviceId.h"
 #include "../graph/ComputeGraph.h"
+#include "../graph/GraphCaptureGuard.h"
 #include "../../compute_stages/IComputeStage.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -124,6 +126,7 @@ namespace llaminar2
     /// Summary of request-boundary prefill graph-cache cleanup.
     struct PrefillGraphRequestResetSummary
     {
+        size_t ready_preserved = 0; ///< Ready executable entries retained for replay.
         size_t ready_demoted = 0; ///< Ready executable entries demoted to lazy-initialized state.
         size_t initialized = 0;   ///< Warmup/Initialized entries kept without request capture arming.
         size_t dropped = 0;       ///< Capturing/invalid entries dropped to Cold.
@@ -160,23 +163,35 @@ namespace llaminar2
         void markWarmedUp(const PrefillGraphCacheKey &key);
 
         /**
-         * @brief Begin graph capture on the given explicit stream.
+         * @brief Record and instantiate one prefill graph as an indivisible transaction.
          *
          * Warmup entries are armed by a fresh request-local warmup. Initialized
          * entries are accepted only after the caller has run strict capture-ready
-         * preflight and prepared current request metadata. The cache keeps this
-         * method narrow: it validates lifecycle and stream ownership, while the
-         * executor decides whether capture is semantically safe for this request.
+         * preflight and prepared current request metadata. The supplied callback
+         * records the graph body between one backend `beginCapture()` and its
+         * matching `endCapture()`.
+         *
+         * The begin/body/end sequence is deliberately owned by this method.
+         * Callers cannot leave a native CUDA/HIP stream in capture mode by
+         * returning early, forgetting an abort call, or throwing from the graph
+         * body. `ScopedBackendGraphCapture` closes every successfully opened
+         * interval. A backend failure to leave native capture mode terminates the
+         * process because stream ownership is unknowable after that point.
+         *
+         * @param key Capture-cache identity prepared by warmup or request reset.
+         * @param gpu_ctx Worker context that owns the explicit native stream.
+         * @param stream Exact stream on which every graph-body launch is recorded.
+         * @param record_graph_body Callback that records all graph work and
+         *        returns true only when every required launch was accepted.
+         * @return true only when recording, capture closure, and graph
+         *         instantiation all succeed. A false body result leaves the entry
+         *         Cold and is never retried through eager execution.
          */
-        bool beginCapture(const PrefillGraphCacheKey &key, IWorkerGPUContext *gpu_ctx, void *stream);
-
-        /// End graph capture, instantiate the executable graph.
-        /// Transitions Capturing → Ready. Returns false on failure.
-        bool endCaptureAndInstantiate(const PrefillGraphCacheKey &key);
-
-        /// Abort an in-progress capture for a key, exiting stream capture if needed.
-        /// Returns true when the cache is no longer in Capturing phase.
-        bool abortCapture(const PrefillGraphCacheKey &key);
+        bool captureAndInstantiate(
+            const PrefillGraphCacheKey &key,
+            IWorkerGPUContext *gpu_ctx,
+            void *stream,
+            const std::function<bool()> &record_graph_body);
 
         /// Launch (replay) the cached graph.
         /// Returns false if not Ready or launch fails.
@@ -186,26 +201,29 @@ namespace llaminar2
         void invalidateAll(PrefillGraphRejectReason reason = PrefillGraphRejectReason::InvalidatedByPlacement);
 
         /**
-         * @brief Split durable lazy initialization from request-local graph replay.
+         * @brief Apply a typed request-boundary policy to prefill executables.
          *
-         * `clear_cache()` resets live KV/GDN/short-conv contents. Prefill graph
-         * executables capture request-local state and are not allowed to survive
-         * that boundary. Ready entries are demoted to Initialized: reusable lazy
-         * setup survives, but the executable graph, request arming, and replay
-         * counters are discarded so the next prompt must pass fresh strict
-         * preflight and capture against current metadata.
+         * `clear_cache()` resets live KV/GDN/short-conv contents without changing
+         * their persistent device addresses. A complete Ready graph whose stages
+         * consume those stable addresses can therefore survive the reset: fresh
+         * request inputs and mutable replay metadata are published before its next
+         * launch, while the executable continues to describe the same ownership
+         * graph.
          *
-         * Warmup entries are intentionally not preserved as Warmup. A warmed
-         * entry has observed request-local runtime metadata, but it has also
-         * performed useful lazy stage/kernel initialization. Request reset converts
-         * Warmup to Initialized: the next same-key request may capture only after a
-         * strict capture-ready preflight and fresh metadata preparation, or else it
-         * executes a fresh warmup. This preserves lazy resources without carrying
-         * a request-armed state across `clear_cache()`.
+         * Set @p preserve_ready_executables only for the replay-preserving reset
+         * path. Hard resets leave it false and demote Ready entries to
+         * Initialized. Warmup entries are always request-armed rather than
+         * reusable captures, so they become Initialized and must pass strict
+         * capture-readiness preflight before a later capture. Cold or invalid
+         * entries are dropped.
          *
-         * @return Summary of preserved, initialized, and dropped entries.
+         * @param preserve_ready_executables Keep complete Ready executables bound
+         *        to stable device storage. No partially captured entry is ever
+         *        preserved.
+         * @return Summary of preserved, demoted, initialized, and dropped entries.
          */
-        PrefillGraphRequestResetSummary prepareEntriesForRequestReset();
+        PrefillGraphRequestResetSummary prepareEntriesForRequestReset(
+            bool preserve_ready_executables = false);
 
         /// Invalidate a specific entry.
         void invalidate(const PrefillGraphCacheKey &key);

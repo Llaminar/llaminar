@@ -225,6 +225,15 @@ namespace llaminar2
                 bool transA = false, bool transB = false,
                 float alpha = 1.0f, float beta = 0.0f);
 
+            /**
+             * @brief Declare stable hipBLASLt algorithm workspace.
+             *
+             * Fused-bias GEMM is graph capturable only when its library
+             * workspace has setup-owned storage and a stable address.
+             */
+            WorkspaceRequirements getWorkspaceRequirements(
+                int m, int n = 0, int k = 0) const override;
+
             // Getters
             int device_ordinal() const { return device_id_.ordinal; }
             Precision precision() const { return precision_; }
@@ -250,10 +259,6 @@ namespace llaminar2
             Precision precision_ = Precision::FP32;
             bool owns_handle_ = true;    ///< false when using context's hipBLAS handle
             bool owns_lt_handle_ = true; ///< false when using context's hipBLASLt handle
-
-            // Cached hipBLASLt workspace (avoids per-call hipMalloc/hipFree)
-            void *lt_workspace_ = nullptr;
-            size_t lt_workspace_size_ = 0;
         };
 
         /**

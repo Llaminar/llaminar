@@ -25,6 +25,7 @@
 #include "v2/collective/BackendRouter.h"
 #include "v2/transfer/TransferEngine.h"
 #include "v2/transfer/TransferMethod.h"
+#include "../../utils/ScopedGPUStream.h"
 
 using namespace llaminar2;
 
@@ -46,6 +47,8 @@ protected:
         {
             cuda_available_ = true;
             cuda_device_ = DeviceId::cuda(0);
+            cuda_stream_ =
+                std::make_unique<llaminar2::test::ScopedGPUStream>(cuda_device_);
             // Query the backend directly (hipGetDeviceCount/cudaGetDeviceCount) rather
             // than DeviceManager, which would require an explicit initialize() call.
             if (cuda->deviceCount() >= 2)
@@ -60,6 +63,8 @@ protected:
         {
             rocm_available_ = true;
             rocm_device_ = DeviceId::rocm(0);
+            rocm_stream_ =
+                std::make_unique<llaminar2::test::ScopedGPUStream>(rocm_device_);
             if (rocm->deviceCount() >= 2)
             {
                 rocm_device_1_ = DeviceId::rocm(1);
@@ -75,6 +80,16 @@ protected:
         {
             GlobalBackendRouter::initForTests();
         }
+    }
+
+    void *streamFor(DeviceId device) const
+    {
+        if (device.type == DeviceType::CUDA && cuda_stream_)
+            return cuda_stream_->get();
+        if (device.type == DeviceType::ROCm && rocm_stream_)
+            return rocm_stream_->get();
+        throw std::runtime_error(
+            "No explicit copyActivation test stream for requested GPU");
     }
 
     /// @brief Create an FP32 tensor filled with a deterministic ramp pattern.
@@ -116,11 +131,12 @@ protected:
      */
     bool makeGpuResident(FP32Tensor *t, DeviceId device)
     {
-        if (!t->ensureOnDevice(device))
+        void *stream = streamFor(device);
+        if (!t->ensureOnDevice(device, stream))
         {
             return false;
         }
-        t->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(t, stream);
         return t->isDeviceAuthoritative(device);
     }
 
@@ -151,6 +167,8 @@ protected:
     DeviceId cuda_device_1_ = DeviceId::cpu();
     DeviceId rocm_device_ = DeviceId::cpu();
     DeviceId rocm_device_1_ = DeviceId::cpu();
+    std::unique_ptr<llaminar2::test::ScopedGPUStream> cuda_stream_;
+    std::unique_ptr<llaminar2::test::ScopedGPUStream> rocm_stream_;
 };
 
 // =============================================================================

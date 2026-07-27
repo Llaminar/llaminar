@@ -14,10 +14,11 @@ if str(KERNEL_PERF_ROOT) not in sys.path:
     sys.path.insert(0, str(KERNEL_PERF_ROOT))
 
 from native_vnni_dispatch.prefill_matrix import (  # noqa: E402
-    CPU_LARGE_MODEL_PREFILL_M_BUCKETS,
+    CPU_14B_PLUS_PREFILL_M_BUCKETS,
+    CPU_7B_TO_BELOW_14B_PREFILL_M_BUCKETS,
+    CPU_BELOW_7B_PREFILL_M_BUCKETS,
     CPU_PREFILL_MAXIMUM_WEIGHT_ELEMENTS,
     CPU_PREFILL_M_BUCKETS,
-    CPU_SMALL_MODEL_PREFILL_M_BUCKETS,
     GPU_PREFILL_M_BUCKETS,
     QWEN36_35B_MOE_SHAPES,
     cpu_prefill_maximum_weight_elements_for_m,
@@ -40,25 +41,28 @@ class NativeVNNIPrefillMatrixTest(unittest.TestCase):
         matrix = {row.shape.name: row.m_values for row in cpu_prefill_measurements()}
 
         self.assertEqual(
-            matrix["7B_FFN_Up"], CPU_SMALL_MODEL_PREFILL_M_BUCKETS
+            matrix["3B_FFN_Up"], CPU_BELOW_7B_PREFILL_M_BUCKETS
         )
         self.assertEqual(
-            matrix["14B_FFN_Up"], CPU_LARGE_MODEL_PREFILL_M_BUCKETS
+            matrix["7B_FFN_Up"], CPU_7B_TO_BELOW_14B_PREFILL_M_BUCKETS
         )
         self.assertEqual(
-            matrix["32B_FFN_Up"], CPU_LARGE_MODEL_PREFILL_M_BUCKETS
+            matrix["14B_FFN_Up"], CPU_14B_PLUS_PREFILL_M_BUCKETS
+        )
+        self.assertEqual(
+            matrix["32B_FFN_Up"], CPU_14B_PLUS_PREFILL_M_BUCKETS
         )
 
-    def test_large_attention_geometry_stops_at_m128(self) -> None:
+    def test_large_attention_geometry_stops_at_m32(self) -> None:
         matrix = {row.shape.name: row for row in cpu_prefill_measurements()}
 
         self.assertEqual(
             matrix["32B_AttnOut"].m_values,
-            CPU_LARGE_MODEL_PREFILL_M_BUCKETS,
+            CPU_14B_PLUS_PREFILL_M_BUCKETS,
         )
         self.assertEqual(
             matrix["32B_QKV"].m_values,
-            CPU_LARGE_MODEL_PREFILL_M_BUCKETS,
+            CPU_14B_PLUS_PREFILL_M_BUCKETS,
         )
         self.assertEqual(matrix["32B_AttnOut"].shape.n, 5120)
 
@@ -69,11 +73,11 @@ class NativeVNNIPrefillMatrixTest(unittest.TestCase):
 
         self.assertEqual(
             matrix["Qwen35Release_32x2048"],
-            CPU_LARGE_MODEL_PREFILL_M_BUCKETS,
+            CPU_14B_PLUS_PREFILL_M_BUCKETS,
         )
         self.assertEqual(
             matrix["Qwen35Release_16x2048"],
-            CPU_SMALL_MODEL_PREFILL_M_BUCKETS,
+            CPU_BELOW_7B_PREFILL_M_BUCKETS,
         )
 
     def test_matrix_covers_dense_and_moe_production_without_lm_heads(self) -> None:
@@ -143,11 +147,25 @@ class NativeVNNIPrefillMatrixTest(unittest.TestCase):
 
         self.assertEqual(
             sum(len(row.m_values) for row in matrix),
-            224,
+            112,
         )
         self.assertEqual(
             sum(
-                row.m_values == CPU_LARGE_MODEL_PREFILL_M_BUCKETS
+                row.m_values == CPU_BELOW_7B_PREFILL_M_BUCKETS
+                for row in matrix
+            ),
+            30,
+        )
+        self.assertEqual(
+            sum(
+                row.m_values == CPU_7B_TO_BELOW_14B_PREFILL_M_BUCKETS
+                for row in matrix
+            ),
+            7,
+        )
+        self.assertEqual(
+            sum(
+                row.m_values == CPU_14B_PLUS_PREFILL_M_BUCKETS
                 for row in matrix
             ),
             38,
@@ -160,21 +178,25 @@ class NativeVNNIPrefillMatrixTest(unittest.TestCase):
 
         for name in QWEN36_35B_MOE_SHAPES:
             self.assertEqual(
-                matrix[name], CPU_LARGE_MODEL_PREFILL_M_BUCKETS, name
+                matrix[name], CPU_14B_PLUS_PREFILL_M_BUCKETS, name
             )
 
     def test_cpu_adaptive_work_envelope_matches_every_m(self) -> None:
-        """Large projections stop at 128; smaller shapes stop at 512."""
+        """Adaptive evidence cannot exceed each model-size tier's envelope."""
 
         self.assertEqual(
-            cpu_prefill_maximum_weight_elements_for_m(128),
+            cpu_prefill_maximum_weight_elements_for_m(32),
             CPU_PREFILL_MAXIMUM_WEIGHT_ELEMENTS,
         )
         self.assertEqual(
-            cpu_prefill_maximum_weight_elements_for_m(512),
+            cpu_prefill_maximum_weight_elements_for_m(64),
             18_944 * 3_584,
         )
-        for unsupported_m in (1024, 2048, 4096):
+        self.assertEqual(
+            cpu_prefill_maximum_weight_elements_for_m(128),
+            12_288 * 1_920,
+        )
+        for unsupported_m in (256, 512, 1024, 2048, 4096):
             with self.subTest(m=unsupported_m):
                 with self.assertRaisesRegex(ValueError, "not a canonical"):
                     cpu_prefill_maximum_weight_elements_for_m(unsupported_m)
@@ -185,8 +207,8 @@ class NativeVNNIPrefillMatrixTest(unittest.TestCase):
         self.assertIs(cpu_prefill_measurements(), cpu_prefill_measurements())
         self.assertIs(gpu_prefill_measurements(), gpu_prefill_measurements())
         before = cpu_prefill_maximum_weight_elements_for_m.cache_info()
-        cpu_prefill_maximum_weight_elements_for_m(512)
-        cpu_prefill_maximum_weight_elements_for_m(512)
+        cpu_prefill_maximum_weight_elements_for_m(128)
+        cpu_prefill_maximum_weight_elements_for_m(128)
         after = cpu_prefill_maximum_weight_elements_for_m.cache_info()
         self.assertGreaterEqual(after.hits - before.hits, 2)
 

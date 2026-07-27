@@ -19,6 +19,12 @@ namespace llaminar2
         uint64_t inserts = 0;
         uint64_t evictions = 0;
         uint64_t promotions = 0;
+        uint64_t ram_to_disk_demotions = 0;
+        uint64_t device_hot_promotions = 0;
+        uint64_t device_hot_repromotions = 0;
+        uint64_t device_hot_evictions = 0;
+        uint64_t disk_evictions = 0;
+        uint64_t device_hot_direct_hits = 0;
         uint64_t disk_hydrations = 0;
         uint64_t terminal_state_hits = 0;
         uint64_t disk_write_failures = 0;

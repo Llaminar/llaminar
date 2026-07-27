@@ -427,7 +427,7 @@ TEST_F(Test__TPAllreduceStage, GpuAllreduceFailsFastWithoutExplicitStream)
     TPAllreduceStage stage(params);
     MockDeviceContext cuda_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
 
-    EXPECT_FALSE(stage.execute(&cuda_ctx));
+    EXPECT_THROW((void)stage.execute(&cuda_ctx), std::logic_error);
 }
 
 TEST_F(Test__TPAllreduceStage, EmptyPrecisionResolvesBeforeOnStreamCollective)

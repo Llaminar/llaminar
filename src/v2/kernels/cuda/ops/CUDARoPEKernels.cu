@@ -20,10 +20,7 @@
 #include "kernels/rope/RoPEDeviceParams.h"
 #include <cmath>
 #include <cstdio>
-#include <unordered_map>
 #include <vector>
-#include <mutex>
-#include <cstring>
 
 // =========================================================================
 // Inverse Frequency Cache (CPU-side, mirrors RoPEPrimitives.cpp)
@@ -43,137 +40,6 @@ namespace
         return true;
     }
 
-    // Device memory cache for inverse frequencies
-    struct InvFreqCache
-    {
-        float *d_inv_freq = nullptr;
-        int head_dim = 0;
-        float freq_base = 0.0f;
-        int device_idx = -1;
-
-        InvFreqCache() = default;
-
-        // Disable copy (would cause double-free)
-        InvFreqCache(const InvFreqCache &) = delete;
-        InvFreqCache &operator=(const InvFreqCache &) = delete;
-
-        // Enable move
-        InvFreqCache(InvFreqCache &&other) noexcept
-            : d_inv_freq(other.d_inv_freq), head_dim(other.head_dim), freq_base(other.freq_base), device_idx(other.device_idx)
-        {
-            other.d_inv_freq = nullptr; // Prevent double-free
-            other.device_idx = -1;
-        }
-
-        InvFreqCache &operator=(InvFreqCache &&other) noexcept
-        {
-            if (this != &other)
-            {
-                // Free our current resource
-                if (d_inv_freq && device_idx >= 0)
-                {
-                    cudaSetDevice(device_idx);
-                    cudaFree(d_inv_freq);
-                }
-                // Take ownership of other's resource
-                d_inv_freq = other.d_inv_freq;
-                head_dim = other.head_dim;
-                freq_base = other.freq_base;
-                device_idx = other.device_idx;
-                // Clear other to prevent double-free
-                other.d_inv_freq = nullptr;
-                other.device_idx = -1;
-            }
-            return *this;
-        }
-
-        ~InvFreqCache()
-        {
-            if (d_inv_freq && device_idx >= 0)
-            {
-                // Must set correct device before freeing
-                cudaError_t set_err = cudaSetDevice(device_idx);
-                if (set_err == cudaErrorCudartUnloading || set_err == cudaErrorNoDevice)
-                {
-                    // CUDA runtime is shutting down or no device available, skip cleanup
-                    // This is normal during static destruction at program exit
-                    return;
-                }
-                cudaError_t err = cudaFree(d_inv_freq);
-                if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
-                {
-                    fprintf(stderr, "WARNING: cudaFree(inv_freq) failed: %s\n", cudaGetErrorString(err));
-                }
-            }
-        }
-    };
-
-    // Global cache - one per (head_dim, freq_base, device) combination
-    static std::unordered_map<uint64_t, InvFreqCache> g_inv_freq_cache;
-    static std::mutex g_cache_mutex;
-
-    uint64_t make_cache_key(int head_dim, float freq_base, int device_idx)
-    {
-        uint32_t freq_bits;
-        std::memcpy(&freq_bits, &freq_base, sizeof(float));
-        // Pack: device_idx (8 bits) | head_dim (24 bits) | freq_bits (32 bits)
-        return ((uint64_t)(device_idx & 0xFF) << 56) | ((uint64_t)(head_dim & 0xFFFFFF) << 32) | freq_bits;
-    }
-
-    /**
-     * @brief Get or create cached inverse frequency table on device
-     * @return Device pointer to inv_freq array of size head_dim/2
-     */
-    float *get_inv_freq_device(int head_dim, float freq_base, int device_idx)
-    {
-        uint64_t key = make_cache_key(head_dim, freq_base, device_idx);
-
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
-
-        auto it = g_inv_freq_cache.find(key);
-        if (it != g_inv_freq_cache.end())
-        {
-            return it->second.d_inv_freq;
-        }
-
-        // Compute inverse frequencies on host
-        const int half_dim = head_dim / 2;
-        std::vector<float> h_inv_freq(half_dim);
-        const float log_base = std::log(freq_base);
-
-        for (int i = 0; i < half_dim; ++i)
-        {
-            float exponent = (2.0f * i) / head_dim;
-            h_inv_freq[i] = std::exp(-log_base * exponent);
-        }
-
-        // Allocate and copy to device
-        cudaSetDevice(device_idx);
-        float *d_inv_freq = nullptr;
-        cudaError_t alloc_err = cudaMalloc(&d_inv_freq, half_dim * sizeof(float));
-        if (alloc_err != cudaSuccess)
-        {
-            fprintf(stderr, "ERROR: Failed to allocate inv_freq: %s\n", cudaGetErrorString(alloc_err));
-            return nullptr;
-        }
-        cudaError_t copy_err = cudaMemcpy(d_inv_freq, h_inv_freq.data(), half_dim * sizeof(float), cudaMemcpyHostToDevice);
-        if (copy_err != cudaSuccess)
-        {
-            fprintf(stderr, "ERROR: Failed to copy inv_freq: %s\n", cudaGetErrorString(copy_err));
-            cudaFree(d_inv_freq);
-            return nullptr;
-        }
-
-        // Cache it
-        InvFreqCache cache;
-        cache.d_inv_freq = d_inv_freq;
-        cache.head_dim = head_dim;
-        cache.freq_base = freq_base;
-        cache.device_idx = device_idx;
-        g_inv_freq_cache[key] = std::move(cache);
-
-        return d_inv_freq;
-    }
 } // anonymous namespace
 
 // =========================================================================
@@ -959,12 +825,52 @@ __global__ void rope_fp16_contiguous_kernel(
 // Extern "C" Wrapper Functions
 // =========================================================================
 
+/**
+ * @brief Publish one contiguous-position offset into graph-stable device state.
+ *
+ * The offset is passed to this kernel by value. CUDA copies kernel arguments
+ * when the launch is enqueued, so a later host-side request update cannot
+ * mutate an earlier publication that is still waiting in the same stream.
+ */
+__global__ void cuda_rope_publish_device_params_kernel(
+    llaminar2::rope::RoPEDeviceParams *__restrict__ device_params,
+    int pos_offset)
+{
+    device_params->pos_offset = pos_offset;
+}
+
 extern "C"
 {
     // =========================================================================
     // WORKSPACE-AWARE API (v3)
     // These functions take external inv_freq buffer allocated from workspace
     // =========================================================================
+
+    /**
+     * @brief Enqueue a device-owned RoPE position publication.
+     *
+     * This deliberately uses a kernel instead of an asynchronous H2D copy from
+     * mutable pinned host staging. The launch is ordered by @p stream and its
+     * scalar argument has value semantics, which makes back-to-back graph
+     * launches safe without a host wait or a staging-buffer lease.
+     */
+    bool cudaOps_rope_publish_device_params(
+        llaminar2::rope::RoPEDeviceParams *device_params,
+        int pos_offset,
+        int device_idx,
+        cudaStream_t stream)
+    {
+        if (!device_params || !stream)
+            return false;
+
+        if (cudaSetDevice(device_idx) != cudaSuccess)
+            return false;
+
+        cuda_rope_publish_device_params_kernel<<<1, 1, 0, stream>>>(
+            device_params,
+            pos_offset);
+        return ropeLaunchOk("cudaOps_rope_publish_device_params");
+    }
 
     /**
      * @brief Populate inverse frequency table in an external buffer
@@ -1316,40 +1222,6 @@ extern "C"
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, rotary_dim, device_params);
 
         return ropeLaunchOk("cudaOps_rope_fp16_contiguous_v3");
-    }
-
-    // =========================================================================
-    // Cache Utilities (used by tests)
-    // =========================================================================
-
-    /**
-     * @brief Clear the inv_freq cache (for testing)
-     * This is useful to force fresh computation of inverse frequencies
-     */
-    void cudaOps_rope_clear_inv_freq_cache()
-    {
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
-        g_inv_freq_cache.clear();
-    }
-
-    /**
-     * @brief Verify inv_freq cache content (for debugging)
-     */
-    void cudaOps_rope_verify_inv_freq_cache(int head_dim, float freq_base, int device_idx)
-    {
-        uint64_t key = make_cache_key(head_dim, freq_base, device_idx);
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
-        auto it = g_inv_freq_cache.find(key);
-        if (it == g_inv_freq_cache.end())
-        {
-            return;
-        }
-
-        // Verify by reading back first 3 values (debugging only)
-        cudaSetDevice(device_idx);
-        float verify_buf[3];
-        cudaMemcpy(verify_buf, it->second.d_inv_freq, 3 * sizeof(float), cudaMemcpyDeviceToHost);
-        (void)verify_buf; // Suppress unused warning in release
     }
 
 } // extern "C"

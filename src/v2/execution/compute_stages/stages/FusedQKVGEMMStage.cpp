@@ -7,6 +7,7 @@
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/GemmContext.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -19,16 +20,6 @@
 
 namespace llaminar2
 {
-    namespace
-    {
-        void markGpuTensorWritten(TensorBase *output, DeviceId device, void *stream)
-        {
-            if (!output || !device.is_gpu())
-                return;
-            output->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
-        }
-    }
-
     // =============================================================================
     // FusedQKVGEMMStage Implementation
     // =============================================================================
@@ -177,25 +168,21 @@ namespace llaminar2
         auto *gemm_q = cached_gemm_q_;
         auto *gemm_k = cached_gemm_k_;
         auto *gemm_v = cached_gemm_v_;
-        if (gemm_q)
-            gemm_q->setGPUStream(gpuStream());
-        if (gemm_k)
-            gemm_k->setGPUStream(gpuStream());
-        if (gemm_v)
-            gemm_v->setGPUStream(gpuStream());
         const bool gpu_execution = params_.device_id.is_gpu();
+        void *const stage_stream =
+            gpu_execution ? requireGPUStream() : nullptr;
+        if (gemm_q)
+            gemm_q->setGPUStream(stage_stream);
+        if (gemm_k)
+            gemm_k->setGPUStream(stage_stream);
+        if (gemm_v)
+            gemm_v->setGPUStream(stage_stream);
         LOG_DEBUG("[FusedQKVGEMMStage] device_id=" << params_.device_id.to_string()
                                                    << " is_gpu=" << gpu_execution);
         bool success = false;
 
         if (gpu_execution)
         {
-            if (!gpuStream())
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] GPU execution requires an explicit non-null stream");
-                return false;
-            }
-
             // GPU path: Use tensor-aware API - kernel handles device placement
             LOG_DEBUG("[FusedQKVGEMMStage] Using tensor-aware GPU path");
 
@@ -340,9 +327,10 @@ namespace llaminar2
         {
             if (is_gpu)
             {
-                markGpuTensorWritten(output_q_base, params_.device_id, stream);
-                markGpuTensorWritten(output_k_base, params_.device_id, stream);
-                markGpuTensorWritten(output_v_base, params_.device_id, stream);
+                const StageGPUExecution gpu = gpuExecution();
+                gpu.publish(output_q_base);
+                gpu.publish(output_k_base);
+                gpu.publish(output_v_base);
             }
             PerfStatsCollector::addCounter(
                 "mtp",
@@ -602,13 +590,22 @@ namespace llaminar2
                             .addOutput(*params_.output_q_buffer_id)
                             .addOutput(*params_.output_k_buffer_id)
                             .addOutput(*params_.output_v_buffer_id);
-        // Model weights are not arena-managed
+        // Q/K/V kernels consume store-owned prepared representations.
         if (params_.wq)
-            contract.addWeight(const_cast<ITensor *>(params_.wq));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.wq),
+                params_.prepared_store,
+                params_.prepared_ref_q.value_or(PreparedWeightRef{}));
         if (params_.wk)
-            contract.addWeight(const_cast<ITensor *>(params_.wk));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.wk),
+                params_.prepared_store,
+                params_.prepared_ref_k.value_or(PreparedWeightRef{}));
         if (params_.wv)
-            contract.addWeight(const_cast<ITensor *>(params_.wv));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.wv),
+                params_.prepared_store,
+                params_.prepared_ref_v.value_or(PreparedWeightRef{}));
         if (params_.bias_q)
             contract.addWeight(const_cast<ITensor *>(static_cast<const ITensor *>(params_.bias_q)));
         if (params_.bias_k)

@@ -13,6 +13,7 @@
 #include "../backends/BackendManager.h" // For getCUDABackend, getROCmBackend
 #include "../backends/ComputeBackend.h" // For DeviceManager (NUMA lookup)
 #include "../execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../transfer/TransferEngine.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include "../utils/PerfStatsCollector.h"
@@ -23,8 +24,10 @@
 #include <cstring>
 #include <cstdint>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 
 // Conditionally include GPU-specific backends
@@ -52,8 +55,6 @@ extern "C"
                                    size_t count, int ordinal, cudaStream_t stream);
     cudaError_t cudaCastFP16ToFP32(const void *fp16_input, float *fp32_output,
                                    size_t count, int ordinal, cudaStream_t stream);
-    int cudaFP16ScratchAlloc(void **buf, size_t bytes, int ordinal);
-    void cudaFP16ScratchFree(void *buf, int ordinal);
 }
 #endif
 
@@ -86,8 +87,6 @@ extern "C"
                            size_t count, int ordinal, void *stream);
     int rocmCastFP16ToFP32(const void *fp16_input, float *fp32_output,
                            size_t count, int ordinal, void *stream);
-    int rocmFP16ScratchAlloc(void **buf, size_t bytes, int ordinal);
-    void rocmFP16ScratchFree(void *buf, int ordinal);
 }
 #endif
 
@@ -322,10 +321,11 @@ namespace llaminar2
         }
 
         /*
-         * The production LocalTP GPU path captures homogeneous NCCL/RCCL
-         * collectives directly into the decode graph.  Segmented replay is kept
-         * as an explicit compatibility mode for experiments and diagnostics,
-         * not as the ordinary requirement for GPU graph execution.
+         * A backend-only policy query describes homogeneous NCCL or RCCL
+         * LocalTP. Its only graph-enabled architecture is therefore direct
+         * collective capture inside one full graph. Heterogeneous segmentation
+         * is admitted later by DeviceGraphOrchestrator, where the complete
+         * device list and graph collective inventory are both available.
          */
         if (exec.gpu_graph_capture_collectives)
         {
@@ -338,20 +338,9 @@ namespace llaminar2
             return true;
         }
 
-        if (exec.gpu_graph_collective_segmented)
-        {
-            if (reason_out)
-            {
-                *reason_out = (backend == CollectiveBackendType::NCCL)
-                                  ? "nccl_segmented_collectives_enabled"
-                                  : "rccl_segmented_collectives_enabled";
-            }
-            return true;
-        }
-
         if (reason_out)
         {
-            *reason_out = "gpu_graphs_without_collective_capture_or_segmented_replay";
+            *reason_out = "homogeneous_collectives_require_full_graph_capture";
         }
         return false;
     }
@@ -684,6 +673,7 @@ namespace llaminar2
         onstream_sequence_by_slot_.assign(devices_.size(), 0);
         fp16_scratch_buffers_.assign(devices_.size(), nullptr);
         fp16_scratch_counts_.assign(devices_.size(), 0);
+        graph_capture_boundary_device_words_.assign(devices_.size(), nullptr);
 
         LOG_DEBUG("LocalTPContext created: degree=" << degree()
                                                     << ", backend=" << collectiveBackendTypeToString(backend_));
@@ -723,23 +713,8 @@ namespace llaminar2
 
     LocalTPContext::~LocalTPContext()
     {
-        // Free FP16 scratch buffers via helper functions (avoids HIP/CUDA header conflicts)
-        for (size_t i = 0; i < fp16_scratch_buffers_.size(); ++i)
-        {
-            if (fp16_scratch_buffers_[i])
-            {
-                const int ordinal = devices_[i].device_ordinal;
-#ifdef HAVE_CUDA
-                if (device_group_.allCUDA())
-                    cudaFP16ScratchFree(fp16_scratch_buffers_[i], ordinal);
-#endif
-#ifdef HAVE_ROCM
-                if (device_group_.allROCm())
-                    rocmFP16ScratchFree(fp16_scratch_buffers_[i], ordinal);
-#endif
-                fp16_scratch_buffers_[i] = nullptr;
-            }
-        }
+        releaseGraphCaptureBoundaryDeviceWords();
+        releaseFp16ScratchBuffers();
 
         const uint64_t attempts = nccl_allreduce_attempts_.load();
         const uint64_t success = nccl_allreduce_success_.load();
@@ -917,57 +892,31 @@ namespace llaminar2
         // allreduceMulti with all buffers.
 
         // ================================================================
-        // Multi-GPU Backends (NCCL/RCCL): Prefer barrier-free per-device allreduce
+        // Multi-GPU Backends (NCCL/RCCL): Require barrier-free per-device allreduce
         // ================================================================
         // Each device thread independently calls rcclAllReduce with its own
         // communicator. RCCL internally matches calls across devices.
         // Stream dependencies ensure GPU-side ordering — host never blocks.
         //
-        // Falls back to barrier-synchronized path if the backend doesn't
-        // support per-device async (e.g., older NCCL).
         if (backend_impl_->isMultiGpuSingleProcess() && degree() > 1)
         {
-            // Release the main mutex before any blocking path
+            // The backend call is independently enqueued by each device
+            // participant; no host barrier is part of this production path.
             lock.unlock();
-            return allreducePerDeviceOrBarrier(tensor, stage_name, effective_count);
+            return allreducePerDeviceRequired(tensor, stage_name, effective_count);
         }
         else
         {
-            // Fallback: single-buffer API (tensor must be on local device)
-            // Ensure tensor is on the local device
-            DeviceId local_device = devices_[0].toLocalDeviceId();
-            if (!tensor->ensureOnDevice(local_device))
-            {
-                LOG_ERROR("LocalTPContext::allreduce: Failed to ensure tensor on device");
-                return false;
-            }
-
-            void *buffer = tensor->gpu_data_ptr();
-            if (!buffer)
-            {
-                LOG_ERROR("LocalTPContext::allreduce: No device buffer available");
-                return false;
-            }
-
-            size_t reduce_count = effective_count;
-            CollectiveDataType dtype = tensorDTypeToCollective(tensor);
-
-            LOG_DEBUG("LocalTPContext::allreduce: Single-buffer allreduce with "
-                      << reduce_count << " elements (tensor numel=" << tensor->numel() << ")");
-
-            bool result = backend_impl_->allreduce(
-                buffer, reduce_count, dtype, CollectiveOp::ALLREDUCE_SUM);
-
-            if (result)
-            {
-                tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            }
-            else
-            {
-                LOG_ERROR("LocalTPContext::allreduce: Backend allreduce failed: "
-                          << backend_impl_->lastError());
-            }
-            return result;
+            /*
+             * The legacy collective API owns an internal stream that is not
+             * returned to this caller. Publishing its output would therefore
+             * require guessing a completion stream after work was already
+             * enqueued. GPU stages must enter through allreduceOnStream(), where
+             * launch and publication share the same explicit stream.
+             */
+            throw std::runtime_error(
+                "LocalTPContext::allreduce requires allreduceOnStream for GPU "
+                "collectives");
         }
     }
 
@@ -1115,78 +1064,14 @@ namespace llaminar2
 
         if (use_fp16_allreduce)
         {
-            constexpr size_t kFP16ScratchGuardBytes = 4096;
-
-            // The on-stream collective path runs concurrently on one worker
-            // thread per device. Scratch metadata must therefore be fully sized
-            // before workers enter this method; resizing either vector here can
-            // race another participant and corrupt the vector pair.
-            if (fp16_scratch_buffers_.size() != devices_.size() ||
-                fp16_scratch_counts_.size() != devices_.size())
+            // The graph planner owns capacity. Execution only validates and
+            // borrows the persistent device-local scratch reservation.
+            void *fp16_buf = requireReservedFp16Scratch(
+                device_index,
+                effective_count,
+                stage_name,
+                "LocalTPContext::allreduceOnStream");
             {
-                LOG_ERROR("LocalTPContext::allreduceOnStream: FP16 scratch metadata invariant broken "
-                          << "(buffers=" << fp16_scratch_buffers_.size()
-                          << ", counts=" << fp16_scratch_counts_.size()
-                          << ", degree=" << devices_.size() << ")");
-                requestAbort();
-                return false;
-            }
-
-            // Ensure scratch buffer is large enough for this allreduce
-            if (fp16_scratch_counts_[device_index] < effective_count)
-            {
-                const int ordinal = devices_[device_index].device_ordinal;
-                const size_t live_bytes = effective_count * sizeof(uint16_t); // FP16 = 2 bytes
-                const size_t alloc_bytes = live_bytes + kFP16ScratchGuardBytes;
-
-                // Free old buffer if resizing
-                if (fp16_scratch_buffers_[device_index])
-                {
-#ifdef HAVE_CUDA
-                    if (device_group_.allCUDA())
-                        cudaFP16ScratchFree(fp16_scratch_buffers_[device_index], ordinal);
-#endif
-#ifdef HAVE_ROCM
-                    if (device_group_.allROCm())
-                        rocmFP16ScratchFree(fp16_scratch_buffers_[device_index], ordinal);
-#endif
-                    fp16_scratch_buffers_[device_index] = nullptr;
-                }
-
-                // Allocate new FP16 scratch buffer on the correct device
-                bool alloc_ok = false;
-#ifdef HAVE_CUDA
-                if (device_group_.allCUDA())
-                    alloc_ok = (cudaFP16ScratchAlloc(&fp16_scratch_buffers_[device_index], alloc_bytes, ordinal) == 0);
-#endif
-#ifdef HAVE_ROCM
-                if (device_group_.allROCm())
-                    alloc_ok = (rocmFP16ScratchAlloc(&fp16_scratch_buffers_[device_index], alloc_bytes, ordinal) == 0);
-#endif
-                if (!alloc_ok)
-                {
-                    LOG_ERROR("LocalTPContext::allreduceOnStream: FP16 scratch alloc failed ("
-                              << alloc_bytes << " bytes on device " << ordinal
-                              << ") for stage="
-                              << (stage_name.empty() ? "(none)" : stage_name)
-                              << "; failing fast to avoid asymmetric transport");
-                    requestAbort();
-                    return false;
-                }
-                else
-                {
-                    fp16_scratch_counts_[device_index] = effective_count;
-                    LOG_DEBUG("LocalTPContext: Allocated FP16 scratch buffer: "
-                              << (alloc_bytes / 1024) << " KB (live="
-                              << (live_bytes / 1024) << " KB) on device " << ordinal);
-                }
-            }
-
-            // Execute FP16 allreduce if scratch is available
-            if (fp16_scratch_buffers_[device_index] &&
-                fp16_scratch_counts_[device_index] >= effective_count)
-            {
-                void *fp16_buf = fp16_scratch_buffers_[device_index];
                 const int ordinal = devices_[device_index].device_ordinal;
                 bool cast_ok = false;
 
@@ -1279,7 +1164,10 @@ namespace llaminar2
                                 grouped_explicit_streams ? "on_stream_grouped_fp16_scratch"
                                                          : "on_stream_fp16_scratch",
                                 effective_precision);
-                            tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stream);
+                            TransferEngine::publishDeviceWrite(
+                                tensor,
+                                devices_[device_index].toLocalDeviceId(),
+                                stream);
                             return true;
                         }
                         LOG_ERROR("LocalTPContext: FP16->FP32 cast-back failed for stage="
@@ -1315,7 +1203,10 @@ namespace llaminar2
                 device_group_, backend_, devices_[device_index].toLocalDeviceId(),
                 stage_name, static_cast<size_t>(degree()), effective_count,
                 dtype, "on_stream_grouped", effective_precision);
-            tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stream);
+            TransferEngine::publishDeviceWrite(
+                tensor,
+                devices_[device_index].toLocalDeviceId(),
+                stream);
             return true;
         }
 
@@ -1331,50 +1222,18 @@ namespace llaminar2
                 dtype, "on_stream_native", effective_precision);
             // Mark tensor dirty and record completion event on the allreduce stream.
             // This ensures ensureOnHost() waits for the allreduce to finish before D2H.
-            tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stream);
+            TransferEngine::publishDeviceWrite(
+                tensor,
+                devices_[device_index].toLocalDeviceId(),
+                stream);
             return true;
         }
 
-        LOG_WARN("LocalTPContext::allreduceOnStream: on-stream allreduce not supported, "
-                 "falling back to normal path for stage="
-                 << stage_name);
-
-        // CRITICAL: Synchronize the caller's compute stream before falling back
-        // to the barrier-based allreduce. Without this, GPU kernels that produced
-        // the partial results may still be in-flight when the barrier allreduce
-        // reads the buffer (e.g., via host-staged D2D copy).
-        if (stream && tensor_device.has_value())
-        {
-#ifdef HAVE_CUDA
-            if (tensor_device->is_cuda())
-            {
-                cudaError_t err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
-                if (err != cudaSuccess)
-                {
-                    LOG_ERROR("LocalTPContext::allreduceOnStream: cudaStreamSynchronize failed: "
-                              << cudaGetErrorString(err));
-                    return false;
-                }
-            }
-#endif
-#ifdef HAVE_ROCM
-            if (tensor_device->is_rocm())
-            {
-                auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(*tensor_device));
-                if (rocm_backend)
-                {
-                    if (!rocm_backend->synchronize(tensor_device->toKernelDeviceIndex()))
-                    {
-                        LOG_ERROR("LocalTPContext::allreduceOnStream: ROCm synchronize failed for "
-                                  << tensor_device->toString());
-                        return false;
-                    }
-                }
-            }
-#endif
-        }
-
-        return allreduce(tensor, stage_name, effective_count);
+        LOG_ERROR("LocalTPContext::allreduceOnStream: the configured homogeneous collective backend "
+                  "does not implement the required explicit-stream allreduce for stage="
+                  << stage_name
+                  << "; synchronous barrier fallback is forbidden");
+        return false;
     }
 
     bool LocalTPContext::allreduce(const TensorBase *input, TensorBase *output)
@@ -1398,16 +1257,19 @@ namespace llaminar2
             return true;
         }
 
+        if (!device_group_.allCPU())
+        {
+            throw std::runtime_error(
+                "LocalTPContext::allreduce out-of-place GPU execution is forbidden; "
+                "GPU collectives require allreduceOnStream() with a device-resident "
+                "buffer and the exact producer stream");
+        }
+
         // Check if backend is initialized
         if (!backend_initialized_ || !backend_impl_)
         {
-            LOG_WARN("LocalTPContext::allreduce (out-of-place): Backend not initialized, skipping");
-            // Fall back to copy
-            const float *src = input->data();
-            float *dst = output->mutable_data();
-            size_t count = std::min(input->numel(), output->numel());
-            std::memcpy(dst, src, count * sizeof(float));
-            return true;
+            throw std::runtime_error(
+                "LocalTPContext::allreduce requires an initialized CPU collective backend");
         }
 
         // For out-of-place allreduce:
@@ -1453,47 +1315,9 @@ namespace llaminar2
             return backend_impl_->allreduce(buffer, count, dtype, CollectiveOp::ALLREDUCE_SUM);
         }
 
-        if (backend_impl_->isMultiGpuSingleProcess())
-        {
-            auto buffers = getDeviceBuffers(tensor);
-            if (buffers.size() != static_cast<size_t>(degree()))
-            {
-                LOG_ERROR("LocalTPContext::allreduceImpl: Failed to get device buffers");
-                return false;
-            }
-
-            size_t count = tensor->numel();
-            CollectiveDataType dtype = tensorDTypeToCollective(tensor);
-
-            return backend_impl_->allreduceMulti(
-                buffers, count, dtype, CollectiveOp::ALLREDUCE_SUM);
-        }
-        else
-        {
-            DeviceId local_device = devices_[0].toLocalDeviceId();
-            if (!tensor->ensureOnDevice(local_device))
-            {
-                return false;
-            }
-
-            void *buffer = tensor->gpu_data_ptr();
-            if (!buffer)
-            {
-                return false;
-            }
-
-            size_t count = tensor->numel();
-            CollectiveDataType dtype = tensorDTypeToCollective(tensor);
-
-            bool result = backend_impl_->allreduce(
-                buffer, count, dtype, CollectiveOp::ALLREDUCE_SUM);
-
-            if (result)
-            {
-                tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            }
-            return result;
-        }
+        throw std::runtime_error(
+            "LocalTPContext::allreduceImpl cannot execute a GPU collective "
+            "without an explicit producer stream");
     }
 
     // =========================================================================
@@ -1510,8 +1334,8 @@ namespace llaminar2
     // so we cannot use getDeviceBuffers() to gather buffers from a single tensor.
     // =========================================================================
 
-    bool LocalTPContext::allreducePerDeviceOrBarrier(TensorBase *tensor,
-                                                     const std::string &stage_name, size_t count)
+    bool LocalTPContext::allreducePerDeviceRequired(TensorBase *tensor,
+                                                    const std::string &stage_name, size_t count)
     {
         // Fast path: per-device async allreduce — no barrier, no buffer collection.
         // Each device thread independently calls RCCL/NCCL AllReduce with its own
@@ -1535,47 +1359,59 @@ namespace llaminar2
 
         if (device_index < 0 || device_index >= degree())
         {
-            LOG_ERROR("LocalTPContext::allreducePerDeviceOrBarrier: tensor device "
+            LOG_ERROR("LocalTPContext::allreducePerDeviceRequired: tensor device "
                       << (tensor_device.has_value() ? tensor_device->toString() : "none")
                       << " not found in devices list (degree=" << degree() << ")");
             return false;
         }
 
-        // 2. Ensure tensor is on device and get GPU pointer
-        DeviceId expected_device = devices_[device_index].toLocalDeviceId();
-        if (!tensor->ensureOnDevice(expected_device))
+        /*
+         * The backend places its completion wait on this registered compute
+         * stream. Retaining the same handle here lets input preparation join the
+         * preceding producer and output publication record after the collective.
+         */
+        if (compute_streams_.size() != devices_.size() ||
+            !compute_streams_[device_index])
         {
-            LOG_ERROR("LocalTPContext::allreducePerDeviceOrBarrier: ensureOnDevice failed for slot "
-                      << device_index);
+            LOG_ERROR(
+                "LocalTPContext::allreducePerDeviceRequired: missing registered "
+                "compute stream for slot "
+                << device_index);
             return false;
         }
+
+        DeviceId expected_device = devices_[device_index].toLocalDeviceId();
+        void *const compute_stream = compute_streams_[device_index];
+        TransferEngine::prepareDeviceInput(
+            tensor, expected_device, compute_stream);
 
         void *buffer = tensor->gpu_data_ptr();
         if (!buffer)
         {
-            LOG_ERROR("LocalTPContext::allreducePerDeviceOrBarrier: null GPU buffer for slot "
+            LOG_ERROR("LocalTPContext::allreducePerDeviceRequired: null GPU buffer for slot "
                       << device_index);
             return false;
         }
 
-        // 3. Try per-device async allreduce (barrier-free)
+        // 3. Enqueue the required per-device allreduce (barrier-free).
         CollectiveDataType dtype = tensorDTypeToCollective(tensor);
         bool success = backend_impl_->allreduceSingleDeviceAsync(
             buffer, count, dtype, CollectiveOp::ALLREDUCE_SUM, device_index);
 
         if (success)
         {
-            // Mark tensor dirty (flags only — RCCL may not have completed yet,
-            // but compute stream has a WaitEvent dep on RCCL completion)
-            tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, expected_device);
+            TransferEngine::publishDeviceWrite(
+                tensor,
+                expected_device,
+                compute_streams_[device_index]);
             return true;
         }
 
-        // 4. Fallback: barrier-synchronized path (for backends that don't support per-device async)
-        LOG_DEBUG("LocalTPContext::allreducePerDeviceOrBarrier: per-device async not supported, "
-                  "falling back to barrier path for stage="
-                  << stage_name);
-        return allreduceWithBarrierMultiGpu(tensor, stage_name, count);
+        LOG_ERROR(
+            "LocalTPContext::allreducePerDeviceRequired: backend rejected the "
+            "required per-device asynchronous allreduce for stage="
+            << stage_name << "; blocking barrier recovery is forbidden");
+        return false;
     }
 
     // =========================================================================
@@ -1724,7 +1560,14 @@ namespace llaminar2
                     return false;
                 if (!backend->hostToDevice(tb->gpu_data_ptr(), src, bytes, dev->gpu_ordinal()))
                     return false;
-                tb->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, *dev);
+                /*
+                 * This is the deliberately heterogeneous branch of the CPU
+                 * barrier collective. The synchronous H2D copy above is its
+                 * host ownership boundary; publish a fresh device completion
+                 * event afterward so downstream GPU work consumes an explicit
+                 * dependency instead of eventless authority.
+                 */
+                TransferEngine::publishCompletedDeviceWrite(tb, *dev);
                 return true;
             }
 
@@ -1896,730 +1739,6 @@ namespace llaminar2
         return true;
     }
 
-    bool LocalTPContext::allreduceWithBarrierMultiGpu(TensorBase *tensor, const std::string &stage_name, size_t count)
-    {
-        const int num_participants = degree();
-        const bool strict_stage_barrier = debugEnv().validation.strict_local_tp_stage_barrier;
-
-        // Determine which device index this tensor belongs to BEFORE taking the lock
-        // This is critical: buffers must be ordered by device index, NOT arrival order
-        int device_index = -1;
-        auto tensor_device = tensor->current_device();
-        if (tensor_device.has_value())
-        {
-            for (size_t i = 0; i < devices_.size(); ++i)
-            {
-                if (devices_[i].toLocalDeviceId() == *tensor_device)
-                {
-                    device_index = static_cast<int>(i);
-                    break;
-                }
-            }
-        }
-
-        if (device_index < 0 || device_index >= num_participants)
-        {
-            LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: tensor device "
-                      << (tensor_device.has_value() ? tensor_device->toString() : "none")
-                      << " not found in LocalTPContext devices list (degree=" << num_participants << ")");
-            return false;
-        }
-
-        // ===========================================================================
-        // CRITICAL: Synchronize GPU compute stream BEFORE entering the barrier.
-        // GPU kernels (e.g. GEMM) are launched asynchronously on NonBlocking streams.
-        // Without this sync, the allreduce would read from gpu_data_ptr() before the
-        // preceding kernel has finished writing — producing NaN/garbage.
-        // ===========================================================================
-        if (tensor_device.has_value() && !tensor_device->is_cpu())
-        {
-            auto *backend = getBackendForDevice(*tensor_device);
-            if (backend)
-            {
-                backend->synchronize(tensor_device->toKernelDeviceIndex());
-            }
-        }
-
-        std::unique_lock<std::mutex> lock(barrier_mutex_);
-
-        // Capture current generation to detect spurious wakeups
-        uint64_t my_generation = barrier_generation_.load();
-
-        // Increment arrival count
-        int arrival_order = barrier_count_.fetch_add(1);
-
-        if (arrival_order >= num_participants)
-        {
-            LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: barrier overflow detected "
-                      << "arrival_order=" << arrival_order << " participants=" << num_participants
-                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                      << " generation=" << my_generation << " - resetting barrier state");
-
-            barrier_count_.store(0);
-            barrier_generation_.fetch_add(1);
-            barrier_tensors_.clear();
-            barrier_stage_name_.clear();
-            barrier_element_count_ = 0;
-            barrier_result_ = false;
-
-            lock.unlock();
-            barrier_cv_.notify_all();
-            return false;
-        }
-
-        if (arrival_order == 0)
-        {
-            // First arrival: initialize tensor collection vector and store count
-            barrier_tensors_.clear();
-            barrier_tensors_.resize(num_participants, nullptr);
-            barrier_watch_checksums_.assign(num_participants, 0);
-            barrier_watch_sample_bytes_.assign(num_participants, 0);
-            barrier_watch_sample_offsets_.assign(num_participants, 0);
-            barrier_watch_checksum_valid_.assign(num_participants, false);
-            barrier_element_count_ = count;
-            barrier_stage_name_ = stage_name;
-            LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: First arrival (device thread), "
-                      << "stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                      << ", count=" << count << " (0=use numel)"
-                      << ", waiting for " << (num_participants - 1) << " more devices");
-        }
-        else if (strict_stage_barrier && barrier_stage_name_ != stage_name)
-        {
-            LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: mixed stage names in the same barrier generation "
-                      << "expected='" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
-                      << "' got='" << (stage_name.empty() ? "(none)" : stage_name)
-                      << "' arrival_order=" << arrival_order
-                      << " participants=" << num_participants
-                      << " generation=" << my_generation);
-
-            barrier_count_.store(0);
-            barrier_generation_.fetch_add(1);
-            barrier_tensors_.clear();
-            barrier_stage_name_.clear();
-            barrier_watch_checksums_.clear();
-            barrier_watch_sample_bytes_.clear();
-            barrier_watch_sample_offsets_.clear();
-            barrier_watch_checksum_valid_.clear();
-            barrier_element_count_ = 0;
-            barrier_result_ = false;
-
-            lock.unlock();
-            barrier_cv_.notify_all();
-            return false;
-        }
-
-        // Store this device's tensor at its DEVICE INDEX slot (not arrival order!)
-        // This ensures buffers[i] corresponds to device_ordinals_[i] in RCCL
-        barrier_tensors_[device_index] = tensor;
-
-        DeviceId expected_device_for_slot = devices_[device_index].toLocalDeviceId();
-        if (!tensor->ensureOnDevice(expected_device_for_slot))
-        {
-            LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: failed ensureOnDevice at arrival for slot "
-                      << device_index << " expected_device=" << expected_device_for_slot.toString());
-            barrier_count_.store(0);
-            barrier_generation_.fetch_add(1);
-            barrier_tensors_.clear();
-            barrier_stage_name_.clear();
-            barrier_watch_checksums_.clear();
-            barrier_watch_sample_bytes_.clear();
-            barrier_watch_sample_offsets_.clear();
-            barrier_watch_checksum_valid_.clear();
-            barrier_element_count_ = 0;
-            barrier_result_ = false;
-
-            lock.unlock();
-            barrier_cv_.notify_all();
-            return false;
-        }
-
-        void *arrival_ptr = tensor->gpu_data_ptr();
-        if (!arrival_ptr)
-        {
-            LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: missing GPU buffer at arrival for slot "
-                      << device_index << " expected_device=" << expected_device_for_slot.toString());
-            barrier_count_.store(0);
-            barrier_generation_.fetch_add(1);
-            barrier_tensors_.clear();
-            barrier_stage_name_.clear();
-            barrier_element_count_ = 0;
-            barrier_result_ = false;
-
-            lock.unlock();
-            barrier_cv_.notify_all();
-            return false;
-        }
-
-        const auto arrival_current_device = tensor->current_device();
-        LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: arrival tensor diagnostics"
-                  << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                  << " slot=" << device_index
-                  << " expected_device=" << expected_device_for_slot.toString()
-                  << " tensor=" << static_cast<void *>(tensor)
-                  << " tensor_name=" << (tensor->debugName().empty() ? "(unnamed)" : tensor->debugName())
-                  << " home_device=" << tensor->home_device().toString()
-                  << " current_device=" << (arrival_current_device.has_value() ? arrival_current_device->toString() : "none")
-                  << " gpu_ptr=" << arrival_ptr
-                  << " requested_count=" << count
-                  << " tensor_numel=" << tensor->numel());
-
-#ifdef HAVE_ROCM
-        uint64_t arrival_watch_checksum = 0;
-        size_t arrival_watch_sample_bytes = 0;
-        size_t arrival_watch_sample_offset = 0;
-        if (expected_device_for_slot.is_rocm() &&
-            !validateRocmAllreducePointerForSlot(barrier_stage_name_, "arrival", device_index, expected_device_for_slot, tensor, arrival_ptr,
-                                                 &arrival_watch_checksum, &arrival_watch_sample_bytes, &arrival_watch_sample_offset))
-        {
-            barrier_count_.store(0);
-            barrier_generation_.fetch_add(1);
-            barrier_tensors_.clear();
-            barrier_stage_name_.clear();
-            barrier_watch_checksums_.clear();
-            barrier_watch_sample_bytes_.clear();
-            barrier_watch_sample_offsets_.clear();
-            barrier_watch_checksum_valid_.clear();
-            barrier_element_count_ = 0;
-            barrier_result_ = false;
-
-            lock.unlock();
-            barrier_cv_.notify_all();
-            return false;
-        }
-
-        if (arrival_watch_sample_bytes > 0)
-        {
-            barrier_watch_checksums_[device_index] = arrival_watch_checksum;
-            barrier_watch_sample_bytes_[device_index] = arrival_watch_sample_bytes;
-            barrier_watch_sample_offsets_[device_index] = arrival_watch_sample_offset;
-            barrier_watch_checksum_valid_[device_index] = true;
-        }
-
-        if (debugEnv().validation.validate_gpu_ptrs && expected_device_for_slot.is_rocm())
-        {
-            auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(expected_device_for_slot));
-            if (rocm_backend)
-            {
-                rocm_backend->setDevice(expected_device_for_slot.toKernelDeviceIndex());
-                bool is_device_ptr = false;
-                bool is_host_ptr = false;
-                bool is_managed = false;
-                int attr_device = -1;
-                (void)rocm_backend->queryPointerAttributes(arrival_ptr, is_device_ptr, is_host_ptr, is_managed, attr_device);
-
-                ROCmPointerOwnerInfo owner;
-                if (ROCmBackend::queryPointerOwner(arrival_ptr, owner))
-                {
-                    LOG_DEBUG("[LOCALTP_PTR_OWNER] phase=arrival"
-                              << " stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
-                              << " slot=" << device_index
-                              << " expected_device=" << expected_device_for_slot.toString()
-                              << " ptr=" << arrival_ptr
-                              << " attr_device=" << attr_device
-                              << " is_device_ptr=" << (is_device_ptr ? 1 : 0)
-                              << " is_host_ptr=" << (is_host_ptr ? 1 : 0)
-                              << " is_managed=" << (is_managed ? 1 : 0)
-                              << " owner_device=" << owner.device_id
-                              << " owner_base=" << owner.base_ptr
-                              << " owner_bytes=" << owner.size_bytes
-                              << " owner_seq=" << owner.sequence
-                              << " owner_thread=" << owner.thread_hash
-                              << " tensor=" << static_cast<void *>(tensor)
-                              << " tensor_name=" << (tensor->debugName().empty() ? "(unnamed)" : tensor->debugName()));
-                }
-            }
-        }
-#endif
-
-        LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Device arrival #" << (arrival_order + 1)
-                                                                                   << " of " << num_participants
-                                                                                   << " (tensor ptr=" << tensor
-                                                                                   << ", device_index=" << device_index << ")");
-
-        if (arrival_order + 1 < num_participants)
-        {
-            // Not the last arrival: wait for completion with timeout
-            const int barrier_timeout_ms =
-                collective_timeout_policy::effectiveCollectTimeoutMs(
-                    debugEnv().tp_collect_timeout_ms);
-
-            bool completed = barrier_cv_.wait_for(
-                lock,
-                std::chrono::milliseconds(barrier_timeout_ms),
-                [this, my_generation]()
-                                                  { return barrier_generation_.load() > my_generation; });
-
-            if (!completed)
-            {
-                // Timeout - likely a deadlock or missing participant
-                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: TIMEOUT after " << barrier_timeout_ms
-                                                                                         << "ms waiting for barrier! "
-                                                                                         << "arrival_order=" << arrival_order << ", expected=" << num_participants
-                                                                                         << " devices. Possible causes: missing device thread, kernel crash, or deadlock.");
-
-                // Reset barrier state to allow recovery
-                barrier_count_.store(0);
-                barrier_generation_.fetch_add(1);
-                barrier_tensors_.clear();
-                barrier_element_count_ = 0;
-
-                lock.unlock();
-                barrier_cv_.notify_all(); // Wake any other waiters
-                return false;
-            }
-
-            // Woke up - get the shared result
-            bool result = barrier_result_;
-            LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Waiter released with result=" << result);
-
-            return result;
-        }
-
-        // =====================================================================
-        // LAST ARRIVAL: Execute the actual multi-GPU allreduce
-        // =====================================================================
-        // All other threads are waiting, so we have exclusive access to barrier_tensors_
-
-        LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: All " << num_participants
-                                                                       << " devices arrived, executing multi-GPU allreduce"
-                                                                       << " (count=" << barrier_element_count_ << ")");
-
-        // Collect device buffers from all tensors
-        // CRITICAL: Each tensor must be on its own device, and we need to ensure that
-        std::vector<void *> buffers;
-        buffers.reserve(num_participants);
-
-        // Determine effective count (use first tensor's numel if count is 0)
-        size_t effective_count = barrier_element_count_;
-        if (effective_count == 0 && barrier_tensors_[0] != nullptr)
-        {
-            effective_count = barrier_tensors_[0]->numel();
-        }
-
-        // Get buffer pointer from each tensor (they should already be on their respective devices)
-        for (int i = 0; i < num_participants; ++i)
-        {
-            TensorBase *t = barrier_tensors_[i];
-            if (!t)
-            {
-                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: null tensor at slot " << i);
-                barrier_result_ = false;
-                goto cleanup;
-            }
-
-            DeviceId expected_device = devices_[i].toLocalDeviceId();
-            if (!t->ensureOnDevice(expected_device))
-            {
-                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: failed ensureOnDevice for slot "
-                          << i << " expected_device=" << expected_device.toString());
-                barrier_result_ = false;
-                goto cleanup;
-            }
-
-            void *ptr = t->gpu_data_ptr();
-            if (!ptr)
-            {
-                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: tensor at slot " << i
-                                                                                          << " has no GPU buffer");
-                barrier_result_ = false;
-                goto cleanup;
-            }
-
-            const auto prelaunch_current_device = t->current_device();
-            LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: prelaunch slot diagnostics"
-                      << " stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
-                      << " slot=" << i
-                      << " expected_device=" << expected_device.toString()
-                      << " tensor=" << static_cast<void *>(t)
-                      << " tensor_name=" << (t->debugName().empty() ? "(unnamed)" : t->debugName())
-                      << " home_device=" << t->home_device().toString()
-                      << " current_device=" << (prelaunch_current_device.has_value() ? prelaunch_current_device->toString() : "none")
-                      << " gpu_ptr=" << ptr
-                      << " effective_count=" << effective_count
-                      << " tensor_numel=" << t->numel());
-
-#ifdef HAVE_ROCM
-            uint64_t prelaunch_watch_checksum = 0;
-            size_t prelaunch_watch_sample_bytes = 0;
-            size_t prelaunch_watch_sample_offset = 0;
-            if (expected_device.is_rocm() &&
-                !validateRocmAllreducePointerForSlot(barrier_stage_name_, "prelaunch", i, expected_device, t, ptr,
-                                                     &prelaunch_watch_checksum, &prelaunch_watch_sample_bytes, &prelaunch_watch_sample_offset))
-            {
-                barrier_result_ = false;
-                goto cleanup;
-            }
-
-            if (prelaunch_watch_sample_bytes > 0)
-            {
-                const bool had_arrival_checksum = (i < static_cast<int>(barrier_watch_checksum_valid_.size()))
-                                                      ? barrier_watch_checksum_valid_[i]
-                                                      : false;
-                if (had_arrival_checksum &&
-                    barrier_watch_sample_bytes_[i] == prelaunch_watch_sample_bytes &&
-                    barrier_watch_sample_offsets_[i] == prelaunch_watch_sample_offset &&
-                    barrier_watch_checksums_[i] != prelaunch_watch_checksum)
-                {
-                    LOG_ERROR("[LOCALTP_PTR_WATCH_CHECKSUM_MISMATCH]"
-                              << " stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
-                              << " slot=" << i
-                              << " generation=" << my_generation
-                              << " arrival_checksum=" << barrier_watch_checksums_[i]
-                              << " prelaunch_checksum=" << prelaunch_watch_checksum
-                              << " sample_bytes=" << prelaunch_watch_sample_bytes
-                              << " sample_offset=" << prelaunch_watch_sample_offset
-                              << " expected_device=" << expected_device.toString()
-                              << " tensor=" << static_cast<void *>(t)
-                              << " tensor_name=" << (t->debugName().empty() ? "(unnamed)" : t->debugName()));
-                    ROCmBackend::dumpRecentPointerEvents(128);
-                    barrier_result_ = false;
-                    goto cleanup;
-                }
-            }
-
-            if (debugEnv().validation.validate_gpu_ptrs && expected_device.is_rocm())
-            {
-                ROCmPointerOwnerInfo owner;
-                if (ROCmBackend::queryPointerOwner(ptr, owner))
-                {
-                    auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(expected_device));
-                    bool is_device_ptr = false;
-                    bool is_host_ptr = false;
-                    bool is_managed = false;
-                    int attr_device = -1;
-                    if (rocm_backend)
-                    {
-                        rocm_backend->setDevice(expected_device.toKernelDeviceIndex());
-                        (void)rocm_backend->queryPointerAttributes(ptr, is_device_ptr, is_host_ptr, is_managed, attr_device);
-                    }
-
-                    LOG_DEBUG("[LOCALTP_PTR_OWNER] phase=prelaunch"
-                              << " stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
-                              << " slot=" << i
-                              << " expected_device=" << expected_device.toString()
-                              << " ptr=" << ptr
-                              << " attr_device=" << attr_device
-                              << " is_device_ptr=" << (is_device_ptr ? 1 : 0)
-                              << " is_host_ptr=" << (is_host_ptr ? 1 : 0)
-                              << " is_managed=" << (is_managed ? 1 : 0)
-                              << " owner_device=" << owner.device_id
-                              << " owner_base=" << owner.base_ptr
-                              << " owner_bytes=" << owner.size_bytes
-                              << " owner_seq=" << owner.sequence
-                              << " owner_thread=" << owner.thread_hash
-                              << " tensor=" << static_cast<void *>(t)
-                              << " tensor_name=" << (t->debugName().empty() ? "(unnamed)" : t->debugName()));
-
-                    const int expected_ordinal = expected_device.rocm_ordinal();
-                    if (owner.device_id != expected_ordinal)
-                    {
-                        LOG_ERROR("[LOCALTP_GPU_PTR_MISMATCH] slot=" << i
-                                                                     << " ptr=" << ptr
-                                                                     << " owner.dev=" << owner.device_id
-                                                                     << " expected.dev=" << expected_ordinal
-                                                                     << " owner.base=" << owner.base_ptr
-                                                                     << " owner.bytes=" << owner.size_bytes
-                                                                     << " owner.seq=" << owner.sequence
-                                                                     << " owner.thread=" << owner.thread_hash
-                                                                     << " tensor=" << static_cast<void *>(t)
-                                                                     << " tensor_device="
-                                                                     << (t->current_device().has_value() ? t->current_device()->toString() : "none"));
-                        ROCmBackend::dumpRecentPointerEvents(128);
-                        barrier_result_ = false;
-                        goto cleanup;
-                    }
-                }
-            }
-#endif
-
-            // TRACE: Log detailed buffer info including device for debugging memory faults
-            LOG_TRACE("LocalTPContext::allreduceWithBarrierMultiGpu: BUFFER[" << i << "] "
-                                                                              << "ptr=" << ptr << " tensor=" << static_cast<void *>(t)
-                                                                              << " device=" << (t->current_device().has_value() ? t->current_device()->toString() : "none")
-                                                                              << " name=" << (t->debugName().empty() ? "(unnamed)" : t->debugName())
-                                                                              << " numel=" << t->numel());
-
-            LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Buffer " << i
-                                                                              << " ptr=" << ptr
-                                                                              << " from tensor=" << t);
-            buffers.push_back(ptr);
-        }
-
-        {
-            // Execute the multi-GPU allreduce
-            CollectiveDataType dtype = tensorDTypeToCollective(barrier_tensors_[0]);
-            const bool serialize_local_tp_launch = debugEnv().validation.serialize_local_tp_allreduce_launch;
-            static std::mutex local_tp_launch_mutex;
-            std::unique_lock<std::mutex> launch_lock(local_tp_launch_mutex, std::defer_lock);
-            if (serialize_local_tp_launch)
-            {
-                launch_lock.lock();
-                LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: serialized allreduce launch lock acquired "
-                          << "stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
-                          << " participants=" << num_participants
-                          << " count=" << effective_count);
-            }
-
-            // Runtime policy: make graph-capture support explicit.  Homogeneous
-            // LocalTP NCCL/RCCL normally uses graph-captured collectives; if
-            // that path is explicitly disabled, segmented replay must be
-            // explicitly enabled before we launch GPU-native collectives under
-            // global GPU graph mode.
-            if (backend_ == CollectiveBackendType::NCCL ||
-                backend_ == CollectiveBackendType::RCCL)
-            {
-                std::string graph_policy_reason;
-                const bool graph_supported = isLocalTPGpuGraphPolicySupported(&graph_policy_reason);
-                if (!graph_supported)
-                {
-                    if (!logged_graph_policy_reject_marker_.exchange(true))
-                    {
-                        LOG_ERROR("LOCALTP_GPU_GRAPH_POLICY=UNSUPPORTED backend="
-                                  << collectiveBackendTypeToString(backend_)
-                                  << " reason=" << graph_policy_reason);
-                    }
-
-                    LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: Unsupported LocalTP GPU-native graph mode. "
-                              << "backend=" << collectiveBackendTypeToString(backend_)
-                              << " reason=" << graph_policy_reason);
-                    barrier_result_ = false;
-                    goto cleanup;
-                }
-
-                if (!logged_graph_policy_allow_marker_.exchange(true))
-                {
-                    LOG_DEBUG("LOCALTP_GPU_GRAPH_POLICY=SUPPORTED backend="
-                              << collectiveBackendTypeToString(backend_)
-                              << " reason=" << graph_policy_reason);
-                }
-            }
-
-            // Phase 2 guardrail: fail fast on shape/device/dtype mismatches before
-            // entering backend collective code. This makes bugs deterministic and
-            // easier to diagnose than backend-side "unhandled" failures.
-            if (!validateBarrierTensorSetForMultiGpuAllreduce(effective_count, dtype))
-            {
-                barrier_result_ = false;
-                goto cleanup;
-            }
-
-            // TRACE: Log all buffer pointers before allreduce
-            LOG_TRACE("LocalTPContext::allreduceWithBarrierMultiGpu: ALLREDUCE START "
-                      << "num_buffers=" << buffers.size() << " count=" << effective_count);
-            for (size_t i = 0; i < buffers.size(); ++i)
-            {
-                LOG_TRACE("  allreduce buffer[" << i << "] = " << buffers[i]);
-            }
-
-            LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Calling allreduceMulti with "
-                      << buffers.size() << " buffers, " << effective_count << " elements");
-
-            if (debugEnv().validation.sync_local_tp_allreduce)
-            {
-#ifdef HAVE_ROCM
-                for (int i = 0; i < num_participants; ++i)
-                {
-                    DeviceId sync_device = devices_[i].toLocalDeviceId();
-                    if (!sync_device.is_rocm())
-                    {
-                        continue;
-                    }
-
-                    auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(sync_device));
-                    if (!rocm_backend)
-                    {
-                        LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: missing ROCm backend for pre-allreduce sync "
-                                  << sync_device.toString());
-                        barrier_result_ = false;
-                        goto cleanup;
-                    }
-
-                    rocm_backend->setDevice(sync_device.toKernelDeviceIndex());
-                    if (!rocm_backend->synchronize(sync_device.toKernelDeviceIndex()))
-                    {
-                        LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: pre-allreduce synchronize failed for "
-                                  << sync_device.toString());
-                        barrier_result_ = false;
-                        goto cleanup;
-                    }
-                }
-#endif
-            }
-
-            bool success = backend_impl_->allreduceMultiWithComputeDeps(
-                buffers, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM);
-
-            if (backend_ == CollectiveBackendType::NCCL)
-            {
-                nccl_allreduce_attempts_.fetch_add(1);
-            }
-
-            if (!success)
-            {
-                const std::string backend_error = backend_impl_->lastError();
-
-                if (backend_ == CollectiveBackendType::NCCL)
-                {
-                    nccl_allreduce_failures_.fetch_add(1);
-                }
-
-                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: allreduceMulti FAILED: "
-                          << backend_error);
-
-                barrier_result_ = false;
-                goto cleanup;
-            }
-
-            // TRACE: Log after allreduce+sync completes
-            LOG_TRACE("LocalTPContext::allreduceWithBarrierMultiGpu: ALLREDUCE+SYNC COMPLETE");
-
-            if (debugEnv().validation.sync_local_tp_allreduce)
-            {
-#ifdef HAVE_ROCM
-                for (int i = 0; i < num_participants; ++i)
-                {
-                    DeviceId sync_device = devices_[i].toLocalDeviceId();
-                    if (!sync_device.is_rocm())
-                    {
-                        continue;
-                    }
-
-                    auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(sync_device));
-                    if (!rocm_backend)
-                    {
-                        LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: missing ROCm backend for post-allreduce sync "
-                                  << sync_device.toString());
-                        barrier_result_ = false;
-                        goto cleanup;
-                    }
-
-                    rocm_backend->setDevice(sync_device.toKernelDeviceIndex());
-                    if (!rocm_backend->synchronize(sync_device.toKernelDeviceIndex()))
-                    {
-                        LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: post-allreduce synchronize failed for "
-                                  << sync_device.toString());
-                        barrier_result_ = false;
-                        goto cleanup;
-                    }
-                }
-#endif
-            }
-
-#ifdef HAVE_ROCM
-            if (debugEnv().validation.validate_gpu_ptrs)
-            {
-                for (int i = 0; i < num_participants; ++i)
-                {
-                    TensorBase *t = barrier_tensors_[i];
-                    if (!t)
-                    {
-                        continue;
-                    }
-
-                    DeviceId expected_device = devices_[i].toLocalDeviceId();
-                    if (!expected_device.is_rocm())
-                    {
-                        continue;
-                    }
-
-                    void *ptr = t->gpu_data_ptr();
-                    if (!ptr)
-                    {
-                        LOG_ERROR("[LOCALTP_PTR_OWNER] phase=postallreduce slot=" << i
-                                                                                  << " stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
-                                                                                  << " expected_device=" << expected_device.toString()
-                                                                                  << " ptr=null");
-                        continue;
-                    }
-
-                    auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(expected_device));
-                    bool is_device_ptr = false;
-                    bool is_host_ptr = false;
-                    bool is_managed = false;
-                    int attr_device = -1;
-                    if (rocm_backend)
-                    {
-                        rocm_backend->setDevice(expected_device.toKernelDeviceIndex());
-                        (void)rocm_backend->queryPointerAttributes(ptr, is_device_ptr, is_host_ptr, is_managed, attr_device);
-                    }
-
-                    ROCmPointerOwnerInfo owner;
-                    if (ROCmBackend::queryPointerOwner(ptr, owner))
-                    {
-                        LOG_DEBUG("[LOCALTP_PTR_OWNER] phase=postallreduce"
-                                  << " stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
-                                  << " slot=" << i
-                                  << " expected_device=" << expected_device.toString()
-                                  << " ptr=" << ptr
-                                  << " attr_device=" << attr_device
-                                  << " is_device_ptr=" << (is_device_ptr ? 1 : 0)
-                                  << " is_host_ptr=" << (is_host_ptr ? 1 : 0)
-                                  << " is_managed=" << (is_managed ? 1 : 0)
-                                  << " owner_device=" << owner.device_id
-                                  << " owner_base=" << owner.base_ptr
-                                  << " owner_bytes=" << owner.size_bytes
-                                  << " owner_seq=" << owner.sequence
-                                  << " owner_thread=" << owner.thread_hash
-                                  << " tensor=" << static_cast<void *>(t)
-                                  << " tensor_name=" << (t->debugName().empty() ? "(unnamed)" : t->debugName()));
-                    }
-                }
-            }
-#endif
-
-            // Mark all tensors as device-dirty (data was modified on GPU).
-            // Use flags-only variant because with non-blocking allreduce
-            // (allreduceMultiWithComputeDeps), the RCCL work may not have
-            // completed on the GPU yet. Recording an event here would be
-            // on the wrong stream. The compute stream has a WaitEvent dep
-            // on the RCCL completion event, so subsequent GPU kernels are
-            // safe. If data() is later called (e.g., for sampling), it
-            // falls back to a full device sync which IS correct.
-            for (int i = 0; i < num_participants; ++i)
-            {
-                if (barrier_tensors_[i])
-                {
-                    barrier_tensors_[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                                                      devices_[i].toLocalDeviceId());
-                }
-            }
-
-            if (backend_ == CollectiveBackendType::NCCL)
-            {
-                nccl_allreduce_success_.fetch_add(1);
-                if (!logged_real_path_marker_.exchange(true))
-                {
-                    LOG_DEBUG("LOCALTP_NCCL_PATH=REAL backend=NCCL collective=allreduce_multi count="
-                              << effective_count << " participants=" << num_participants);
-                }
-            }
-
-            barrier_result_ = true;
-        }
-
-    cleanup:
-        // Clear barrier state and signal completion
-        barrier_tensors_.clear();
-        barrier_stage_name_.clear();
-        barrier_watch_checksums_.clear();
-        barrier_watch_sample_bytes_.clear();
-        barrier_watch_sample_offsets_.clear();
-        barrier_watch_checksum_valid_.clear();
-        barrier_element_count_ = 0;
-        barrier_count_.store(0);
-        barrier_generation_.fetch_add(1);
-
-        bool final_result = barrier_result_;
-
-        LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Multi-GPU allreduce completed with result="
-                  << final_result << ", releasing waiters (generation=" << barrier_generation_.load() << ")");
-
-        lock.unlock();
-        barrier_cv_.notify_all();
-
-        return final_result;
-    }
-
     bool LocalTPContext::allgather(const TensorBase *local_shard, TensorBase *global_tensor)
     {
         if (!local_shard || !global_tensor)
@@ -2661,107 +1780,15 @@ namespace llaminar2
             return allgatherCpuBarrier(local_shard, global_tensor);
         }
 
-        // For LOCAL TP with Multi-GPU:
-        // Each device sends its shard, receives all shards concatenated
-        if (backend_impl_->isMultiGpuSingleProcess())
-        {
-            // For multi-GPU allgather, we need send buffers (one per device)
-            // and recv buffers (one per device, each gets the full gathered result)
-
-            // Note: In LOCAL TP, the local_shard and global_tensor parameters
-            // represent the buffers for the "local" device. For true multi-GPU,
-            // we would need separate buffers per device. For now, we use the
-            // single-buffer API.
-            DeviceId local_device = devices_[0].toLocalDeviceId();
-
-            // Ensure local shard is on device (const-cast needed for ensureOnDevice)
-            auto *mutable_shard = const_cast<TensorBase *>(local_shard);
-            if (!mutable_shard->ensureOnDevice(local_device))
-            {
-                LOG_ERROR("LocalTPContext::allgather: Failed to ensure local_shard on device");
-                return false;
-            }
-
-            // Ensure global tensor is allocated on device
-            if (!global_tensor->allocateOnDevice(local_device))
-            {
-                LOG_ERROR("LocalTPContext::allgather: Failed to allocate global_tensor on device");
-                return false;
-            }
-
-            const void *send_buf = mutable_shard->gpu_data_ptr();
-            void *recv_buf = global_tensor->gpu_data_ptr();
-
-            if (!send_buf || !recv_buf)
-            {
-                LOG_ERROR("LocalTPContext::allgather: No device buffers available");
-                return false;
-            }
-
-            size_t send_count = local_shard->numel();
-            CollectiveDataType dtype = tensorDTypeToCollective(local_shard);
-
-            LOG_DEBUG("LocalTPContext::allgather: allgather with "
-                      << degree() << " devices, " << send_count << " elements per device");
-
-            bool result = backend_impl_->allgather(
-                send_buf, recv_buf, send_count, dtype);
-
-            if (result)
-            {
-                global_tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            }
-            else
-            {
-                LOG_ERROR("LocalTPContext::allgather: Backend allgather failed: "
-                          << backend_impl_->lastError());
-            }
-            return result;
-        }
-        else
-        {
-            // Fallback to single-buffer allgather
-            DeviceId local_device = devices_[0].toLocalDeviceId();
-
-            auto *mutable_shard = const_cast<TensorBase *>(local_shard);
-            if (!mutable_shard->ensureOnDevice(local_device))
-            {
-                LOG_ERROR("LocalTPContext::allgather: Failed to ensure local_shard on device");
-                return false;
-            }
-
-            if (!global_tensor->allocateOnDevice(local_device))
-            {
-                LOG_ERROR("LocalTPContext::allgather: Failed to allocate global_tensor on device");
-                return false;
-            }
-
-            const void *send_buf = mutable_shard->gpu_data_ptr();
-            void *recv_buf = global_tensor->gpu_data_ptr();
-
-            if (!send_buf || !recv_buf)
-            {
-                LOG_ERROR("LocalTPContext::allgather: No device buffers available");
-                return false;
-            }
-
-            size_t send_count = local_shard->numel();
-            CollectiveDataType dtype = tensorDTypeToCollective(local_shard);
-
-            bool result = backend_impl_->allgather(
-                send_buf, recv_buf, send_count, dtype);
-
-            if (result)
-            {
-                global_tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            }
-            else
-            {
-                LOG_ERROR("LocalTPContext::allgather: Backend allgather failed: "
-                          << backend_impl_->lastError());
-            }
-            return result;
-        }
+        /*
+         * The streamless allgather backend API cannot expose the producer
+         * ordering needed by a device-resident consumer. Production GPU graphs
+         * use allgatherRawOnStream() or collectiveSidebandOnStream(), both of
+         * which make the launch stream part of the operation contract.
+         */
+        throw std::runtime_error(
+            "LocalTPContext::allgather requires an explicit-stream GPU "
+            "collective API");
     }
 
     bool LocalTPContext::supportsRawAllgatherOnStreamGraphCapture() const
@@ -2982,6 +2009,142 @@ namespace llaminar2
         return depart_generation();
     }
 
+    bool LocalTPContext::graphCaptureBoundaryOnStream(
+        const std::string &boundary_name,
+        int device_index,
+        void *stream,
+        int timeout_ms)
+    {
+        if (!stream)
+        {
+            throw std::invalid_argument(
+                "LocalTPContext::graphCaptureBoundaryOnStream requires a non-null GPU stream");
+        }
+        if (degree() <= 1)
+            return true;
+        if (device_index < 0 || device_index >= degree())
+        {
+            LOG_ERROR("LocalTPContext::graphCaptureBoundaryOnStream: invalid slot "
+                      << device_index << " degree=" << degree()
+                      << " boundary=" << boundary_name);
+            requestAbort();
+            return false;
+        }
+        if (!backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL &&
+             backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess() ||
+            !backend_impl_->supportsAllreduceSingleDeviceOnStream())
+        {
+            LOG_ERROR("LocalTPContext::graphCaptureBoundaryOnStream requires a homogeneous "
+                      << "NCCL/RCCL multi-GPU backend with explicit-stream allreduce support"
+                      << " boundary=" << boundary_name
+                      << " backend=" << collectiveBackendTypeToString(backend_));
+            requestAbort();
+            return false;
+        }
+        if (graph_capture_boundary_device_words_.size() != devices_.size() ||
+            !graph_capture_boundary_device_words_[static_cast<size_t>(device_index)])
+        {
+            LOG_ERROR("LocalTPContext::graphCaptureBoundaryOnStream: persistent device fence "
+                      << "storage is unavailable for slot=" << device_index
+                      << " boundary=" << boundary_name);
+            requestAbort();
+            return false;
+        }
+
+        /*
+         * The first rendezvous prevents one participant from enqueueing this
+         * lifecycle collective while another still believes it belongs to a
+         * different boundary generation. The second proves every peer has
+         * enqueued the matching collective before any thread begins capture or
+         * launches the newly instantiated graph.
+         */
+        if (!graphCaptureBoundaryRendezvous(
+                boundary_name + ":device_fence_ready",
+                device_index,
+                timeout_ms))
+        {
+            return false;
+        }
+
+        void *const device_word =
+            graph_capture_boundary_device_words_[static_cast<size_t>(device_index)];
+
+        /*
+         * Publish the ordering token on the same explicit stream that enters
+         * the collective. This initialization is graph-capturable and makes the
+         * token independent of allocator contents without a setup-time default
+         * stream or host write.
+         */
+        bool token_ready = false;
+#ifdef HAVE_CUDA
+        if (device_group_.allCUDA())
+        {
+            token_ready = nccl_backend_detail::cudaMemsetAsyncDevice(
+                device_word,
+                0,
+                sizeof(int32_t),
+                devices_[static_cast<size_t>(device_index)].device_ordinal,
+                stream);
+        }
+#endif
+#ifdef HAVE_ROCM
+        if (device_group_.allROCm())
+        {
+            token_ready = rccl_backend_detail::hipMemsetAsyncDevice(
+                device_word,
+                0,
+                sizeof(int32_t),
+                devices_[static_cast<size_t>(device_index)].device_ordinal,
+                stream);
+        }
+#endif
+        if (!token_ready)
+        {
+            LOG_ERROR("LocalTPContext::graphCaptureBoundaryOnStream: device fence "
+                      "token publication failed"
+                      << " slot=" << device_index
+                      << " boundary=" << boundary_name);
+            requestAbort();
+            return false;
+        }
+
+        if (!backend_impl_->allreduceSingleDeviceOnStream(
+                device_word,
+                /*count=*/1,
+                CollectiveDataType::INT32,
+                CollectiveOp::ALLREDUCE_SUM,
+                device_index,
+                stream))
+        {
+            LOG_ERROR("LocalTPContext::graphCaptureBoundaryOnStream: device fence enqueue failed"
+                      << " slot=" << device_index
+                      << " boundary=" << boundary_name
+                      << " backend_error=" << backend_impl_->lastError());
+            requestAbort();
+            return false;
+        }
+
+        if (!graphCaptureBoundaryRendezvous(
+                boundary_name + ":device_fence_enqueued",
+                device_index,
+                timeout_ms))
+        {
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "graph_capture",
+            "localtp_device_boundary_fences",
+            1.0,
+            "prefill",
+            devices_[static_cast<size_t>(device_index)].toLocalDeviceId().toString(),
+            {{"boundary", boundary_name},
+             {"backend", collectiveBackendTypeToString(backend_)}});
+        return true;
+    }
+
     bool LocalTPContext::allreduceWithSidebandsOnStream(
         TensorBase *tensor,
         const std::string &stage_name,
@@ -3116,61 +2279,11 @@ namespace llaminar2
 
         if (use_fp16_allreduce)
         {
-            constexpr size_t kFP16ScratchGuardBytes = 4096;
-            if (fp16_scratch_buffers_.size() != devices_.size() ||
-                fp16_scratch_counts_.size() != devices_.size())
-            {
-                LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: FP16 scratch metadata invariant broken"
-                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
-                requestAbort();
-                return false;
-            }
-
-            if (fp16_scratch_counts_[static_cast<size_t>(device_index)] < effective_count)
-            {
-                const size_t live_bytes = effective_count * sizeof(uint16_t);
-                const size_t alloc_bytes = live_bytes + kFP16ScratchGuardBytes;
-                if (fp16_scratch_buffers_[static_cast<size_t>(device_index)])
-                {
-#ifdef HAVE_CUDA
-                    if (device_group_.allCUDA())
-                        cudaFP16ScratchFree(fp16_scratch_buffers_[static_cast<size_t>(device_index)], ordinal);
-#endif
-#ifdef HAVE_ROCM
-                    if (device_group_.allROCm())
-                        rocmFP16ScratchFree(fp16_scratch_buffers_[static_cast<size_t>(device_index)], ordinal);
-#endif
-                    fp16_scratch_buffers_[static_cast<size_t>(device_index)] = nullptr;
-                }
-
-                bool alloc_ok = false;
-#ifdef HAVE_CUDA
-                if (device_group_.allCUDA())
-                    alloc_ok = (cudaFP16ScratchAlloc(
-                                    &fp16_scratch_buffers_[static_cast<size_t>(device_index)],
-                                    alloc_bytes,
-                                    ordinal) == 0);
-#endif
-#ifdef HAVE_ROCM
-                if (device_group_.allROCm())
-                    alloc_ok = (rocmFP16ScratchAlloc(
-                                    &fp16_scratch_buffers_[static_cast<size_t>(device_index)],
-                                    alloc_bytes,
-                                    ordinal) == 0);
-#endif
-                if (!alloc_ok)
-                {
-                    LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: FP16 scratch alloc failed"
-                              << " bytes=" << alloc_bytes
-                              << " ordinal=" << ordinal
-                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
-                    requestAbort();
-                    return false;
-                }
-                fp16_scratch_counts_[static_cast<size_t>(device_index)] = effective_count;
-            }
-
-            collective_buffer = fp16_scratch_buffers_[static_cast<size_t>(device_index)];
+            collective_buffer = requireReservedFp16Scratch(
+                device_index,
+                effective_count,
+                stage_name,
+                "LocalTPContext::allreduceWithSidebandsOnStream");
             collective_dtype = CollectiveDataType::FLOAT16;
             bool cast_ok = false;
 #ifdef HAVE_CUDA
@@ -3265,9 +2378,9 @@ namespace llaminar2
             device_group_, backend_, devices_[static_cast<size_t>(device_index)].toLocalDeviceId(),
             stage_name, static_cast<size_t>(degree()), device_index, sidebands);
 
-        tensor->transitionToWithEvent(
-            TensorCoherenceState::DEVICE_AUTHORITATIVE,
-            std::nullopt,
+        TransferEngine::publishDeviceWrite(
+            tensor,
+            devices_[static_cast<size_t>(device_index)].toLocalDeviceId(),
             producer_stream);
         return true;
     }
@@ -4097,52 +3210,9 @@ namespace llaminar2
             return true;
         }
 
-        // ReduceScatter: reduce across devices, each device gets a slice
-        DeviceId local_device = devices_[0].toLocalDeviceId();
-
-        // Ensure input is on device
-        auto *mutable_input = const_cast<TensorBase *>(input);
-        if (!mutable_input->ensureOnDevice(local_device))
-        {
-            LOG_ERROR("LocalTPContext::reduceScatter: Failed to ensure input on device");
-            return false;
-        }
-
-        // Ensure output is allocated on device
-        if (!output_shard->allocateOnDevice(local_device))
-        {
-            LOG_ERROR("LocalTPContext::reduceScatter: Failed to allocate output_shard on device");
-            return false;
-        }
-
-        const void *send_buf = mutable_input->gpu_data_ptr();
-        void *recv_buf = output_shard->gpu_data_ptr();
-
-        if (!send_buf || !recv_buf)
-        {
-            LOG_ERROR("LocalTPContext::reduceScatter: No device buffers available");
-            return false;
-        }
-
-        size_t recv_count = output_shard->numel();
-        CollectiveDataType dtype = tensorDTypeToCollective(input);
-
-        LOG_DEBUG("LocalTPContext::reduceScatter: reduceScatter with "
-                  << degree() << " devices, " << recv_count << " elements per device");
-
-        bool result = backend_impl_->reduceScatter(
-            send_buf, recv_buf, recv_count, dtype, CollectiveOp::ALLREDUCE_SUM);
-
-        if (result)
-        {
-            output_shard->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        }
-        else
-        {
-            LOG_ERROR("LocalTPContext::reduceScatter: Backend reduceScatter failed: "
-                      << backend_impl_->lastError());
-        }
-        return result;
+        throw std::runtime_error(
+            "LocalTPContext::reduceScatter has no streamless GPU contract; "
+            "use an explicit-stream collective implementation");
     }
 
     bool LocalTPContext::broadcast(TensorBase *tensor, int source_device_index)
@@ -4170,10 +3240,12 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(mutex_);
 
         // Ensure backend is initialized
-        if (!backend_initialized_)
+        if (!backend_initialized_ || !backend_impl_)
         {
-            LOG_WARN("LocalTPContext::broadcast: Backend not initialized, skipping");
-            return true; // Non-fatal: single device fallback
+            LOG_ERROR(
+                "LocalTPContext::broadcast: multi-device broadcast requires "
+                "an initialized collective backend");
+            return false;
         }
 
         const GlobalDeviceAddress &source_device = devices_[source_device_index];
@@ -4183,20 +3255,21 @@ namespace llaminar2
                   << source_device_index << " (" << source_device.toString()
                   << ") to " << degree() << " devices");
 
-        // Ensure tensor data is on the source device
-        if (!tensor->ensureOnDevice(src_device_id))
+        if (compute_streams_.size() != devices_.size() ||
+            !compute_streams_[source_device_index])
         {
-            LOG_ERROR("LocalTPContext::broadcast: Failed to ensure tensor on source device "
-                      << src_device_id.toString());
+            LOG_ERROR(
+                "LocalTPContext::broadcast: missing source compute stream for slot "
+                << source_device_index);
             return false;
         }
-        tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, src_device_id);
-
-        // For homogeneous backends (NCCL/RCCL), use native broadcast if available
-        // For now, we implement broadcast as point-to-point transfers from source to all others
-        // TODO: Use backend_impl_->broadcast() when available in backend interface
-
-        bool all_ok = true;
+        TransferEngine::prepareDeviceInput(
+            tensor,
+            src_device_id,
+            compute_streams_[source_device_index]);
+        // For homogeneous backends (NCCL/RCCL), point-to-point copies use the
+        // backend's native P2P transport. Cross-vendor domains are explicitly
+        // heterogeneous and are host-staged by TransferEngine.
         for (int i = 0; i < degree(); ++i)
         {
             if (i == source_device_index)
@@ -4209,25 +3282,22 @@ namespace llaminar2
             LOG_DEBUG("LocalTPContext::broadcast: " << src_device_id.toString()
                                                     << " → " << dst_device_id.toString());
 
-            // Use tensor's transferTo which uses GlobalBackendRouter
-            // For same-vendor this will use NCCL/RCCL P2P or CUDA/HIP memcpy
-            // For cross-vendor this will use HOST staging
-            if (!tensor->transferTo(dst_device_id))
+            auto result = TransferEngine::instance().transferActivation(
+                tensor,
+                dst_device_id);
+            if (!result.success)
             {
                 LOG_ERROR("LocalTPContext::broadcast: Transfer failed from "
-                          << src_device_id.toString() << " to " << dst_device_id.toString());
-                all_ok = false;
-                // Continue trying other devices
+                          << src_device_id.toString() << " to "
+                          << dst_device_id.toString() << ": "
+                          << result.error);
+                return false;
             }
         }
 
-        if (all_ok)
-        {
-            LOG_DEBUG("LocalTPContext::broadcast: Complete, tensor on all "
-                      << degree() << " devices");
-        }
-
-        return all_ok;
+        LOG_DEBUG("LocalTPContext::broadcast: Complete, tensor on all "
+                  << degree() << " devices");
+        return true;
     }
 
     // =========================================================================
@@ -4263,6 +3333,13 @@ namespace llaminar2
 
     void LocalTPContext::setComputeStreams(const std::vector<void *> &compute_streams)
     {
+        if (!compute_streams.empty() &&
+            compute_streams.size() != devices_.size())
+        {
+            throw std::invalid_argument(
+                "LocalTPContext::setComputeStreams requires one stream per device");
+        }
+
         if (debugEnv().tp_collective_contract_trace)
         {
             LOG_DEBUG("[TP_COLLECTIVE_CONTEXT] event=localtp_set_compute_streams"
@@ -4284,6 +3361,7 @@ namespace llaminar2
         {
             backend_impl_->setComputeStreams(compute_streams);
         }
+        compute_streams_ = compute_streams;
     }
 
     bool LocalTPContext::allreduceGroupedOnExplicitStreams(void *buffer,
@@ -4549,15 +3627,16 @@ namespace llaminar2
 
             if (grouped_onstream_allreduce_graph_capture_active_)
             {
-                if (backend_ == CollectiveBackendType::RCCL)
+                if (backend_ == CollectiveBackendType::RCCL ||
+                    grouped_onstream_allreduce_sideband_count_ > 0)
                 {
                     /*
-                     * For RCCL graph capture the final arrival records the
-                     * entire rcclGroupStart/rcclGroupEnd bundle across every
-                     * captured participant stream. Earlier arrivals must only
-                     * observe that grouped launch outcome; issuing their own
-                     * participant-local rcclAllReduce would duplicate the
-                     * captured collective and can poison HIP capture state.
+                     * The final arrival records one backend group spanning all
+                     * participant streams for RCCL and for any anchor carrying
+                     * sidebands. Earlier arrivals must only observe that grouped
+                     * launch outcome. Enqueuing a participant-local anchor here
+                     * would either duplicate RCCL work or omit the sideband
+                     * operations from CUDA participant graphs.
                      */
                     return depart_generation();
                 }
@@ -4614,12 +3693,6 @@ namespace llaminar2
 
         if (grouped_onstream_allreduce_sideband_count_ > 0)
         {
-            if (grouped_onstream_allreduce_graph_capture_active_)
-            {
-                fail_generation("graph-captured grouped allreduce sidebands require participant-local sideband capture stage=" +
-                                (stage_name.empty() ? std::string("(none)") : stage_name));
-                return false;
-            }
             if (!backend_impl_ || !backend_impl_->supportsAllreduceWithSidebandsMultiOnStreams())
             {
                 fail_generation(std::string("backend does not support grouped allreduce sideband bundles backend=") +
@@ -4639,8 +3712,128 @@ namespace llaminar2
             }
         }
 
+        /*
+         * Lower participant-local semantic descriptors into one backend bundle
+         * only after every LocalTP slot has arrived. The resulting vectors hold
+         * one buffer address per device and are valid for both eager execution
+         * and graph capture. Keeping one lowering path prevents capture from
+         * silently exercising a weaker collective contract than production.
+         */
+        std::vector<CollectiveSidebandMultiOnStreamsOp> backend_sidebands;
+        if (grouped_onstream_allreduce_sideband_count_ > 0)
+        {
+            backend_sidebands.reserve(grouped_onstream_allreduce_sideband_count_);
+            for (size_t sideband_index = 0;
+                 sideband_index < grouped_onstream_allreduce_sideband_count_;
+                 ++sideband_index)
+            {
+                const auto &reference =
+                    grouped_onstream_allreduce_reference_sidebands_[sideband_index];
+                CollectiveSidebandMultiOnStreamsOp backend_sideband;
+                backend_sideband.kind = toBackendSidebandOp(reference.kind);
+                backend_sideband.count = reference.element_count;
+                backend_sideband.dtype = reference.dtype;
+                backend_sideband.root = reference.root_device_index;
+                backend_sideband.recv_buffers.assign(static_cast<size_t>(degree()), nullptr);
+                if (reference.kind == LocalTPCollectiveSidebandKind::Allgather ||
+                    reference.kind == LocalTPCollectiveSidebandKind::Broadcast)
+                {
+                    backend_sideband.send_buffers.assign(static_cast<size_t>(degree()), nullptr);
+                }
+
+                for (int i = 0; i < degree(); ++i)
+                {
+                    const auto &participant =
+                        grouped_onstream_allreduce_sidebands_[static_cast<size_t>(i)][sideband_index];
+                    switch (participant.kind)
+                    {
+                    case LocalTPCollectiveSidebandKind::AllreduceSum:
+                        if (!participant.recv_buffer)
+                        {
+                            fail_generation("AllreduceSum sideband missing recv buffer slot=" +
+                                            std::to_string(i) + " sideband=" +
+                                            std::to_string(sideband_index));
+                            return false;
+                        }
+                        if (participant.send_buffer &&
+                            participant.send_buffer != participant.recv_buffer)
+                        {
+                            fail_generation("AllreduceSum sideband is currently in-place only slot=" +
+                                            std::to_string(i) + " sideband=" +
+                                            std::to_string(sideband_index));
+                            return false;
+                        }
+                        backend_sideband.recv_buffers[static_cast<size_t>(i)] =
+                            participant.recv_buffer;
+                        break;
+                    case LocalTPCollectiveSidebandKind::Allgather:
+                        if (!participant.send_buffer || !participant.recv_buffer)
+                        {
+                            fail_generation("Allgather sideband missing buffer slot=" +
+                                            std::to_string(i) + " sideband=" +
+                                            std::to_string(sideband_index));
+                            return false;
+                        }
+                        backend_sideband.send_buffers[static_cast<size_t>(i)] =
+                            participant.send_buffer;
+                        backend_sideband.recv_buffers[static_cast<size_t>(i)] =
+                            participant.recv_buffer;
+                        break;
+                    case LocalTPCollectiveSidebandKind::Broadcast:
+                        if (!participant.recv_buffer)
+                        {
+                            fail_generation("Broadcast sideband missing recv buffer slot=" +
+                                            std::to_string(i) + " sideband=" +
+                                            std::to_string(sideband_index));
+                            return false;
+                        }
+                        backend_sideband.send_buffers[static_cast<size_t>(i)] =
+                            participant.send_buffer ? participant.send_buffer : participant.recv_buffer;
+                        backend_sideband.recv_buffers[static_cast<size_t>(i)] =
+                            participant.recv_buffer;
+                        break;
+                    }
+                }
+                backend_sidebands.push_back(std::move(backend_sideband));
+            }
+        }
+
         if (grouped_onstream_allreduce_graph_capture_active_)
         {
+            if (grouped_onstream_allreduce_sideband_count_ > 0)
+            {
+                /*
+                 * CUDA and ROCm relaxed capture both permit the rendezvous owner
+                 * to submit one NCCL/RCCL group across streams whose captures
+                 * were begun by their participant workers. The backend group is
+                 * the indivisible production operation: anchor first, followed
+                 * by every sideband, with one group end publishing all nodes.
+                 */
+                const bool enqueue_ok =
+                    backend_impl_->allreduceWithSidebandsMultiOnStreams(
+                        grouped_onstream_allreduce_buffers_,
+                        effective_count,
+                        dtype,
+                        CollectiveOp::ALLREDUCE_SUM,
+                        backend_sidebands,
+                        grouped_onstream_allreduce_streams_);
+                grouped_onstream_allreduce_result_ = enqueue_ok;
+                grouped_onstream_allreduce_ready_ = true;
+                if (!enqueue_ok)
+                {
+                    grouped_onstream_allreduce_error_ =
+                        backend_impl_ ? backend_impl_->lastError() : std::string("missing backend");
+                    abort_requested_.store(true, std::memory_order_release);
+                    LOG_ERROR("LocalTPContext::allreduceGroupedOnExplicitStreams: graph-captured grouped sideband bundle failed"
+                              << " backend=" << collectiveBackendTypeToString(backend_)
+                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                              << " sidebands=" << grouped_onstream_allreduce_sideband_count_
+                              << " error=" << grouped_onstream_allreduce_error_);
+                }
+                grouped_onstream_allreduce_cv_.notify_all();
+                return depart_generation(enqueue_ok);
+            }
+
             if (backend_ == CollectiveBackendType::RCCL)
             {
                 /*
@@ -4722,85 +3915,6 @@ namespace llaminar2
             fail_generation(std::string("backend does not support grouped explicit-stream allreduce backend=") +
                             collectiveBackendTypeToString(backend_));
             return false;
-        }
-
-        std::vector<CollectiveSidebandMultiOnStreamsOp> backend_sidebands;
-        if (grouped_onstream_allreduce_sideband_count_ > 0)
-        {
-            backend_sidebands.reserve(grouped_onstream_allreduce_sideband_count_);
-            for (size_t sideband_index = 0;
-                 sideband_index < grouped_onstream_allreduce_sideband_count_;
-                 ++sideband_index)
-            {
-                const auto &reference =
-                    grouped_onstream_allreduce_reference_sidebands_[sideband_index];
-                CollectiveSidebandMultiOnStreamsOp backend_sideband;
-                backend_sideband.kind = toBackendSidebandOp(reference.kind);
-                backend_sideband.count = reference.element_count;
-                backend_sideband.dtype = reference.dtype;
-                backend_sideband.root = reference.root_device_index;
-                backend_sideband.recv_buffers.assign(static_cast<size_t>(degree()), nullptr);
-                if (reference.kind == LocalTPCollectiveSidebandKind::Allgather ||
-                    reference.kind == LocalTPCollectiveSidebandKind::Broadcast)
-                {
-                    backend_sideband.send_buffers.assign(static_cast<size_t>(degree()), nullptr);
-                }
-
-                for (int i = 0; i < degree(); ++i)
-                {
-                    const auto &participant =
-                        grouped_onstream_allreduce_sidebands_[static_cast<size_t>(i)][sideband_index];
-                    switch (participant.kind)
-                    {
-                    case LocalTPCollectiveSidebandKind::AllreduceSum:
-                        if (!participant.recv_buffer)
-                        {
-                            fail_generation("AllreduceSum sideband missing recv buffer slot=" +
-                                            std::to_string(i) + " sideband=" +
-                                            std::to_string(sideband_index));
-                            return false;
-                        }
-                        if (participant.send_buffer &&
-                            participant.send_buffer != participant.recv_buffer)
-                        {
-                            fail_generation("AllreduceSum sideband is currently in-place only slot=" +
-                                            std::to_string(i) + " sideband=" +
-                                            std::to_string(sideband_index));
-                            return false;
-                        }
-                        backend_sideband.recv_buffers[static_cast<size_t>(i)] =
-                            participant.recv_buffer;
-                        break;
-                    case LocalTPCollectiveSidebandKind::Allgather:
-                        if (!participant.send_buffer || !participant.recv_buffer)
-                        {
-                            fail_generation("Allgather sideband missing buffer slot=" +
-                                            std::to_string(i) + " sideband=" +
-                                            std::to_string(sideband_index));
-                            return false;
-                        }
-                        backend_sideband.send_buffers[static_cast<size_t>(i)] =
-                            participant.send_buffer;
-                        backend_sideband.recv_buffers[static_cast<size_t>(i)] =
-                            participant.recv_buffer;
-                        break;
-                    case LocalTPCollectiveSidebandKind::Broadcast:
-                        if (!participant.recv_buffer)
-                        {
-                            fail_generation("Broadcast sideband missing recv buffer slot=" +
-                                            std::to_string(i) + " sideband=" +
-                                            std::to_string(sideband_index));
-                            return false;
-                        }
-                        backend_sideband.send_buffers[static_cast<size_t>(i)] =
-                            participant.send_buffer ? participant.send_buffer : participant.recv_buffer;
-                        backend_sideband.recv_buffers[static_cast<size_t>(i)] =
-                            participant.recv_buffer;
-                        break;
-                    }
-                }
-                backend_sidebands.push_back(std::move(backend_sideband));
-            }
         }
 
         const bool success =
@@ -5334,6 +4448,15 @@ namespace llaminar2
         }
 
         backend_initialized_ = true;
+        if (!initializeGraphCaptureBoundaryDeviceWords())
+        {
+            LOG_ERROR("LocalTPContext: Failed to initialize persistent graph-capture "
+                      "boundary storage");
+            backend_impl_->abort();
+            backend_impl_.reset();
+            backend_initialized_ = false;
+            return false;
+        }
         LOG_DEBUG("LocalTPContext: Backend " << backend_impl_->name()
                                              << " initialized for " << degree() << " devices");
 
@@ -5348,39 +4471,52 @@ namespace llaminar2
         return true;
     }
 
-    std::vector<void *> LocalTPContext::getDeviceBuffers(TensorBase *tensor)
+    bool LocalTPContext::initializeGraphCaptureBoundaryDeviceWords()
     {
-        std::vector<void *> buffers;
-        buffers.reserve(devices_.size());
+        releaseGraphCaptureBoundaryDeviceWords();
+        graph_capture_boundary_device_words_.assign(devices_.size(), nullptr);
 
-        // For LOCAL TP, we need to get the GPU buffer for each device
-        // Current implementation assumes tensor has data on all devices
-        // or we need to replicate it
-
-        for (size_t i = 0; i < devices_.size(); ++i)
+        if (degree() <= 1 ||
+            (backend_ != CollectiveBackendType::NCCL &&
+             backend_ != CollectiveBackendType::RCCL))
         {
-            DeviceId device_id = devices_[i].toLocalDeviceId();
-
-            // Ensure tensor data is on this device
-            if (!tensor->ensureOnDevice(device_id))
-            {
-                LOG_ERROR("LocalTPContext::getDeviceBuffers: Failed to ensure tensor on device "
-                          << device_id.toString());
-                return {}; // Return empty vector to indicate failure
-            }
-
-            void *ptr = tensor->gpu_data_ptr();
-            if (!ptr)
-            {
-                LOG_ERROR("LocalTPContext::getDeviceBuffers: No GPU buffer for device "
-                          << device_id.toString());
-                return {};
-            }
-
-            buffers.push_back(ptr);
+            return true;
         }
+        if (!device_group_.allCUDA() && !device_group_.allROCm())
+            return false;
 
-        return buffers;
+        constexpr size_t kControlBytes = sizeof(int32_t);
+        for (size_t slot = 0; slot < devices_.size(); ++slot)
+        {
+            const DeviceId device = devices_[slot].toLocalDeviceId();
+            IBackend *const backend = getBackendForDevice(device);
+            void *const buffer =
+                backend ? backend->allocate(kControlBytes, device.ordinal) : nullptr;
+            if (!buffer)
+            {
+                releaseGraphCaptureBoundaryDeviceWords();
+                return false;
+            }
+            graph_capture_boundary_device_words_[slot] = buffer;
+        }
+        return true;
+    }
+
+    void LocalTPContext::releaseGraphCaptureBoundaryDeviceWords() noexcept
+    {
+        for (size_t slot = 0;
+             slot < graph_capture_boundary_device_words_.size() &&
+             slot < devices_.size();
+             ++slot)
+        {
+            void *buffer = graph_capture_boundary_device_words_[slot];
+            if (!buffer)
+                continue;
+            const DeviceId device = devices_[slot].toLocalDeviceId();
+            if (IBackend *const backend = getBackendForDevice(device))
+                backend->free(buffer, device.ordinal);
+            graph_capture_boundary_device_words_[slot] = nullptr;
+        }
     }
 
     CollectiveDataType LocalTPContext::tensorDTypeToCollective(const TensorBase *tensor) const
@@ -5500,16 +4636,178 @@ namespace llaminar2
         LOG_DEBUG("[LocalTPContext] Cleared all output registrations");
     }
 
-    bool LocalTPContext::reserveTempBufferBytes(size_t bytes)
+    bool LocalTPContext::reserveFp16ScratchElements(size_t element_count)
     {
-        if (!backend_impl_)
+        if (backend_ != CollectiveBackendType::NCCL &&
+            backend_ != CollectiveBackendType::RCCL)
         {
-            LOG_WARN("[LocalTPContext] Cannot reserve temp buffer: backend not initialized");
+            return true;
+        }
+        if ((!device_group_.allCUDA() && !device_group_.allROCm()) ||
+            element_count == 0 ||
+            element_count >
+                (std::numeric_limits<size_t>::max() - 4096) / sizeof(uint16_t))
+        {
+            LOG_ERROR("[LocalTPContext] Invalid FP16 collective scratch reservation"
+                      << " elements=" << element_count
+                      << " backend=" << collectiveBackendTypeToString(backend_));
             return false;
         }
 
-        LOG_DEBUG("[LocalTPContext] Reserving temp buffer: " << bytes << " bytes");
-        return backend_impl_->reserveTempBufferBytes(bytes);
+        constexpr size_t kFP16ScratchGuardBytes = 4096;
+        const size_t allocation_bytes =
+            element_count * sizeof(uint16_t) + kFP16ScratchGuardBytes;
+        std::vector<void *> replacements(devices_.size(), nullptr);
+        std::vector<bool> replace(devices_.size(), false);
+
+        /*
+         * Allocate every replacement before publishing any of them. A partial
+         * reservation failure therefore leaves the prior complete generation
+         * intact instead of exposing an asymmetric device set.
+         */
+        try
+        {
+            for (size_t slot = 0; slot < devices_.size(); ++slot)
+            {
+                if (fp16_scratch_buffers_[slot] &&
+                    fp16_scratch_counts_[slot] >= element_count)
+                {
+                    continue;
+                }
+
+                const DeviceId device = devices_[slot].toLocalDeviceId();
+                IBackend *const backend = getBackendForDevice(device);
+                replacements[slot] =
+                    backend ? backend->allocate(allocation_bytes, device.ordinal) : nullptr;
+                if (!replacements[slot])
+                {
+                    throw std::runtime_error(
+                        "backend allocation returned a null FP16 scratch pointer");
+                }
+                replace[slot] = true;
+            }
+        }
+        catch (const std::exception &error)
+        {
+            for (size_t slot = 0; slot < replacements.size(); ++slot)
+            {
+                if (!replacements[slot])
+                    continue;
+                const DeviceId device = devices_[slot].toLocalDeviceId();
+                if (IBackend *const backend = getBackendForDevice(device))
+                    backend->free(replacements[slot], device.ordinal);
+            }
+            LOG_ERROR("[LocalTPContext] FP16 scratch reservation failed"
+                      << " elements=" << element_count
+                      << " bytes_per_device=" << allocation_bytes
+                      << " error=" << error.what());
+            return false;
+        }
+
+        for (size_t slot = 0; slot < devices_.size(); ++slot)
+        {
+            if (!replace[slot])
+                continue;
+            const DeviceId device = devices_[slot].toLocalDeviceId();
+            if (fp16_scratch_buffers_[slot])
+            {
+                IBackend *const backend = getBackendForDevice(device);
+                if (!backend)
+                    throw std::runtime_error(
+                        "LocalTPContext lost the backend owning FP16 scratch");
+                backend->free(fp16_scratch_buffers_[slot], device.ordinal);
+            }
+            fp16_scratch_buffers_[slot] = replacements[slot];
+            fp16_scratch_counts_[slot] = element_count;
+        }
+
+        LOG_DEBUG("[LocalTPContext] Reserved persistent FP16 collective scratch"
+                  << " elements=" << element_count
+                  << " bytes_per_device=" << allocation_bytes
+                  << " participants=" << devices_.size());
+        return true;
+    }
+
+    void LocalTPContext::releaseFp16ScratchBuffers() noexcept
+    {
+        for (size_t slot = 0;
+             slot < fp16_scratch_buffers_.size() && slot < devices_.size();
+             ++slot)
+        {
+            void *const buffer = fp16_scratch_buffers_[slot];
+            if (!buffer)
+                continue;
+            const DeviceId device = devices_[slot].toLocalDeviceId();
+            if (IBackend *const backend = getBackendForDevice(device))
+                backend->free(buffer, device.ordinal);
+            fp16_scratch_buffers_[slot] = nullptr;
+            fp16_scratch_counts_[slot] = 0;
+        }
+    }
+
+    void *LocalTPContext::requireReservedFp16Scratch(
+        int device_index,
+        size_t element_count,
+        const std::string &stage_name,
+        const char *caller)
+    {
+        const bool valid_index =
+            device_index >= 0 &&
+            static_cast<size_t>(device_index) < devices_.size();
+        const bool valid_metadata =
+            fp16_scratch_buffers_.size() == devices_.size() &&
+            fp16_scratch_counts_.size() == devices_.size();
+        const bool sufficient =
+            valid_index &&
+            valid_metadata &&
+            fp16_scratch_buffers_[static_cast<size_t>(device_index)] &&
+            fp16_scratch_counts_[static_cast<size_t>(device_index)] >= element_count;
+        if (sufficient)
+            return fp16_scratch_buffers_[static_cast<size_t>(device_index)];
+
+        requestAbort();
+        std::ostringstream message;
+        message << (caller ? caller : "LocalTPContext")
+                << ": FP16 collective scratch reservation contract violated"
+                << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                << " slot=" << device_index
+                << " requested_elements=" << element_count
+                << " reserved_elements="
+                << ((valid_index && valid_metadata)
+                        ? fp16_scratch_counts_[static_cast<size_t>(device_index)]
+                        : 0)
+                << ". Collective execution is allocation-free; fix graph setup capacity.";
+        throw std::runtime_error(message.str());
+    }
+
+    bool LocalTPContext::reserveCollectiveResources(
+        size_t backend_temp_bytes,
+        size_t fp16_scratch_elements)
+    {
+        if (!backend_impl_ || !backend_initialized_)
+        {
+            LOG_ERROR("[LocalTPContext] Cannot reserve collective resources: "
+                      "backend is not initialized");
+            return false;
+        }
+        if (backend_temp_bytes == 0 || fp16_scratch_elements == 0)
+        {
+            LOG_ERROR("[LocalTPContext] Collective resource reservation requires "
+                      "non-zero byte and element capacities");
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        LOG_DEBUG("[LocalTPContext] Reserving collective resources"
+                  << " backend_temp_bytes=" << backend_temp_bytes
+                  << " fp16_scratch_elements=" << fp16_scratch_elements);
+        if (!backend_impl_->reserveTempBufferBytes(backend_temp_bytes))
+        {
+            LOG_ERROR("[LocalTPContext] Backend temp-buffer reservation failed"
+                      << " bytes=" << backend_temp_bytes);
+            return false;
+        }
+        return reserveFp16ScratchElements(fp16_scratch_elements);
     }
 
     // =========================================================================

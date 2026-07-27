@@ -119,11 +119,13 @@ class NativeVNNIProfilerDiagnosticsTest(unittest.TestCase):
         )
         fast.features.update({
             "metric.gpu.achieved_occupancy_pct.fraction_mean": 0.80,
+            "metric.gpu.achieved_occupancy_pct.fraction_maximum": 0.80,
             "metric.gpu.registers_per_thread.maximum_log1p": 3.50,
             "metric.gpu.decode.effective_gbytes_per_second_log1p": 5.00,
         })
         slow.features.update({
             "metric.gpu.achieved_occupancy_pct.fraction_mean": 0.40,
+            "metric.gpu.achieved_occupancy_pct.fraction_maximum": 0.40,
             "metric.gpu.registers_per_thread.maximum_log1p": 4.00,
             "metric.gpu.decode.effective_gbytes_per_second_log1p": 4.00,
         })
@@ -161,7 +163,23 @@ class NativeVNNIProfilerDiagnosticsTest(unittest.TestCase):
         self.assertEqual(throughput["auxiliary_reliability_weight"], 0.0)
         self.assertEqual(occupancy["learner_role"], "auxiliary_target")
         self.assertGreater(occupancy["auxiliary_reliability_weight"], 0.0)
-        self.assertEqual(registers["learner_role"], "runtime_static_input")
+        occupancy_maximum = metrics[
+            "metric.gpu.achieved_occupancy_pct.fraction_maximum"
+        ]
+        self.assertEqual(occupancy_maximum["learner_role"], "diagnostic_only")
+        self.assertEqual(
+            occupancy_maximum["auxiliary_reliability_weight"], 0.0
+        )
+        self.assertEqual(registers["learner_role"], "auxiliary_target")
+        self.assertGreater(registers["auxiliary_reliability_weight"], 0.0)
+        self.assertTrue(report["signal_gate"]["passed"])
+        self.assertEqual(
+            report["signal_gate"]["qualifying_metrics"],
+            [
+                "metric.cpu.instructions_per_million_macs_log1p",
+                "metric.gpu.achieved_occupancy_pct.fraction_mean",
+            ],
+        )
 
         noisy = diagnose_profiler_catalog(
             catalog,
@@ -171,6 +189,8 @@ class NativeVNNIProfilerDiagnosticsTest(unittest.TestCase):
         self.assertEqual(
             noisy["performance_signal"]["clear_fast_slow_contests"], 0
         )
+        self.assertFalse(noisy["signal_gate"]["passed"])
+        self.assertTrue(noisy["signal_gate"]["reasons"])
 
 
 if __name__ == "__main__":

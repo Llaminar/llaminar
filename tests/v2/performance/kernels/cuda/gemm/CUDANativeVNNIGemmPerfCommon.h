@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include "transfer/TransferEngine.h"
 
 #include "backends/DeviceId.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -619,7 +620,7 @@ namespace llaminar2::test::native_vnni_gemm_perf
 
         RunResult result;
         result.output.resize(static_cast<size_t>(m) * n);
-        C_tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(C_tensor, execution_stream);
         std::memcpy(result.output.data(), C_tensor->data(), static_cast<size_t>(m) * n * sizeof(float));
 
         if (workspace_consumer)

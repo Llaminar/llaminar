@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
@@ -52,6 +53,7 @@
 namespace
 {
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
+    using llaminar2::TransferEngine;
 
     struct CloseMetrics
     {
@@ -970,7 +972,7 @@ namespace
                     gate_outputs.data(), up_outputs.data(), expert_ids.data(), expert_weights.data(),
                     down_table, top_k, decode_output.get(), d_model, intermediate));
                 EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-                decode_output->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+                TransferEngine::publishDeviceWrite(decode_output, device, stream);
                 decoded.insert(
                     decoded.end(),
                     decode_output->data(),
@@ -1027,10 +1029,10 @@ namespace
         cudaStream_t stream = nullptr;
         EXPECT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
 
-        auto *moe = KernelFactory::getOrCreateMoEKernel(device);
+        auto moe = KernelFactory::createMoEKernel(device);
         EXPECT_NE(moe, nullptr);
         moe->setGPUStream(stream);
-        auto *workspace_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe);
+        auto *workspace_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe.get());
         EXPECT_NE(workspace_consumer, nullptr);
         const int workspace_num_experts = std::max(num_experts, routed_num_experts);
         const int workspace_top_k = std::max(top_k, routed_top_k);
@@ -1085,7 +1087,7 @@ namespace
             publishTerminalExpertRoute(routing_indices, rows, top_k, num_experts);
         const auto routing_weights = makeRoutingWeights(rows, top_k);
         auto tables = prepareExpertTables(
-            moe, device, num_experts, d_model, intermediate, "cuda", 270000,
+            moe.get(), device, num_experts, d_model, intermediate, "cuda", 270000,
             uniqueExpertIdsFromRoutes(routing_indices, num_experts),
             selected_gateup_format,
             selected_down_format);
@@ -1179,14 +1181,14 @@ namespace
             });
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-        grouped_output->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        TransferEngine::publishDeviceWrite(grouped_output, device, stream);
         std::vector<float> grouped(
             grouped_output->data(),
             grouped_output->data() + grouped_output->numel());
 
         double rowwise_ms = 0.0;
         std::vector<float> rowwise = runCudaRowwiseDecode(
-            moe, workspace.get(), stream, hidden_values, routing_indices, routing_weights,
+            moe.get(), workspace.get(), stream, hidden_values, routing_indices, routing_weights,
             rows, top_k, d_model, intermediate,
             tables.gateup_table_id, tables.down_table_id, &rowwise_ms);
         CloseMetrics metrics = compareVectors(grouped, rowwise, static_cast<size_t>(d_model));
@@ -1236,10 +1238,10 @@ namespace
             {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 6102);
         auto down_w = format.create(
             {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)}, 6103);
-        auto *moe = KernelFactory::getOrCreateMoEKernel(device);
+        auto moe = KernelFactory::createMoEKernel(device);
         EXPECT_NE(moe, nullptr);
         moe->setGPUStream(stream);
-        auto *moe_workspace = dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe);
+        auto *moe_workspace = dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe.get());
         EXPECT_NE(moe_workspace, nullptr);
         auto prepared = llaminar2::test::makeGpuPreparedFFNFixture(
             gate_w.get(),
@@ -1280,7 +1282,7 @@ namespace
         llaminar2::SharedExpertFFNStage grouped_stage(
             make_params(grouped_output.get(), /*grouped_verifier=*/true));
         grouped_stage.setGPUStream(stream);
-        grouped_stage.setMoEKernelForTesting(moe);
+        grouped_stage.setMoEKernelForTesting(moe.get());
         EXPECT_TRUE(grouped_stage.usesGroupedVerifierPrefillRouteForTesting());
 
         auto reqs = grouped_stage.getWorkspaceRequirements(rows, d_model, intermediate);
@@ -1371,8 +1373,7 @@ namespace
                     return false;
                 }
                 EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-                row_output->transitionTo(
-                    llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+                TransferEngine::publishDeviceWrite(row_output, device, stream);
                 serial.insert(
                     serial.end(),
                     row_output->data(),
@@ -1412,7 +1413,7 @@ namespace
         const double serial_ms = timeCudaEvents(stream, std::max(1, iterations / 4), run_serial);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-        grouped_output->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        TransferEngine::publishDeviceWrite(grouped_output, device, stream);
         std::vector<float> grouped(
             grouped_output->data(),
             grouped_output->data() + grouped_output->numel());

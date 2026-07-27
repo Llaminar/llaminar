@@ -2548,7 +2548,9 @@ extern "C"
     {
         if (!Q || !K_cache_fp16 || !V_cache_fp16 || !O ||
             !O_partial || !m_partial || !l_partial || !device_params ||
-            !stream || verifier_rows < 2 || verifier_rows > 4 ||
+            !stream || verifier_rows < 2 ||
+            verifier_rows >
+                llaminar2::attention::kMaxGroupedVerifierAttentionRows ||
             max_kv_len <= verifier_rows || n_heads <= 0 ||
             n_kv_heads <= 0 || head_dim <= 0 ||
             max_num_splits <= 0 || max_num_splits > 32)
@@ -2643,7 +2645,9 @@ extern "C"
         if (!Q || !K_cache_fp16 || !V_cache_fp16 || !O ||
             !O_partial || !m_partial || !l_partial || !device_params ||
             !stream || request_count < 2 || query_rows <= 0 ||
-            total_rows > 4 || max_kv_len <= 0 || n_heads <= 0 ||
+            total_rows >
+                llaminar2::attention::kMaxGroupedVerifierAttentionRows ||
+            max_kv_len <= 0 || n_heads <= 0 ||
             n_kv_heads <= 0 || head_dim <= 0 ||
             max_num_splits <= 0 || max_num_splits > 32)
         {
@@ -2899,7 +2903,9 @@ extern "C"
     {
         const int total_rows = request_count * query_rows;
         if (!device_params || !post_append_cached_tokens ||
-            request_count < 2 || query_rows <= 0 || total_rows > 4 ||
+            request_count < 2 || query_rows <= 0 ||
+            total_rows >
+                llaminar2::attention::kMaxGroupedVerifierAttentionRows ||
             kv_stride <= 0 || !stream)
         {
             return -1;

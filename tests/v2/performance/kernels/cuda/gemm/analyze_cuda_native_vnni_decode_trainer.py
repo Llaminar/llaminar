@@ -20,7 +20,9 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import sys
+import time
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
@@ -36,7 +38,6 @@ from native_vnni_dispatch.adapters.cuda_decode import (  # noqa: E402
     raw_corpus_id,
 )
 from native_vnni_dispatch.candidate_observation import (  # noqa: E402
-    read_observation_csv,
     write_observation_csv,
 )
 from native_vnni_dispatch.candidate_registry import (  # noqa: E402
@@ -86,6 +87,9 @@ from native_vnni_dispatch.paired_confirmation import (  # noqa: E402
     read_paired_confirmation_csv,
 )
 from native_vnni_dispatch.paired_requests import (  # noqa: E402
+    projected_domain_cache_keys,
+)
+from native_vnni_dispatch.paired_requests import (  # noqa: E402
     paired_comparison_digest,
 )
 from native_vnni_dispatch.policy_ir import PolicyIR  # noqa: E402
@@ -102,7 +106,10 @@ from native_vnni_dispatch.schema import (  # noqa: E402
     SemanticContract,
 )
 from native_vnni_dispatch.segmented_policy import (  # noqa: E402
+    DEFAULT_TREE_LEAVES,
     GenericDispatchRule,
+    MAX_TREE_LEAVES,
+    PolicyFitCache,
     fit_generic_policy,
 )
 from native_vnni_dispatch.shape_manifest import (  # noqa: E402
@@ -118,6 +125,19 @@ from native_vnni_dispatch.validation import (  # noqa: E402
     require_canonical_alias_coverage,
     require_verifier_m_matrix,
 )
+
+
+def _emit_phase_timing(label: str, started: float) -> float:
+    """Report one analyzer phase and return the next phase's start instant."""
+
+    completed = time.perf_counter()
+    if os.environ.get("LLAMINAR_NATIVE_VNNI_POLICY_TIMING", "0") == "1":
+        print(
+            f"CUDA NativeVNNI analyzer timing {label}="
+            f"{completed - started:.3f}s",
+            flush=True,
+        )
+    return completed
 
 
 @dataclass(frozen=True, order=True)
@@ -330,12 +350,15 @@ def select_grouped_entries(
 def select_fast_generic_rules(
     corpus: ObservationCorpus,
     serial_m1_policy_hash: str,
+    *,
+    max_leaves: int = DEFAULT_TREE_LEAVES,
 ) -> list[GenericDispatchRule]:
     """Fit shared public-M1 and grouped-verifier geometry policies."""
 
     generic = fit_generic_policy(
         corpus,
         serial_m1_hashes=_serial_hashes(corpus, serial_m1_policy_hash),
+        max_leaves=max_leaves,
     )
     return [
         rule
@@ -352,6 +375,8 @@ def select_fast_generic_rules(
 def select_grouped_generic_rules(
     corpus: ObservationCorpus,
     serial_m1_policy_hash: str,
+    *,
+    max_leaves: int = DEFAULT_TREE_LEAVES,
 ) -> list[GenericDispatchRule]:
     """Fit only grouped-verifier domains after the M1 policy is frozen."""
 
@@ -370,6 +395,7 @@ def select_grouped_generic_rules(
             verifier,
             serial_m1_policy_hash,
         ),
+        max_leaves=max_leaves,
     )
     return list(generic.rules)
 
@@ -453,7 +479,14 @@ def _fast_m1_corpus(corpus: ObservationCorpus) -> ObservationCorpus:
     )
     if not rows:
         raise ValueError("CUDA policy transaction contains no Fast M=1 evidence")
-    return ObservationCorpus(rows)
+    if len(rows) == len(corpus.observations):
+        return corpus
+    return ObservationCorpus._from_validated(
+        rows,
+        distinguish_execution_mode=corpus.distinguishes_execution_mode,
+        distinguish_aspect_bucket=corpus.distinguishes_aspect_bucket,
+        revalidate_candidate_identities=False,
+    )
 
 
 def _require_manifest_surface_complete(
@@ -602,6 +635,8 @@ def freeze_fast_policy(
     ] | None = None,
     profiler_feature_catalog: ProfilerFeatureCatalog | None = None,
     build_change_audit: str | None = None,
+    fit_cache_directory: Path | None = None,
+    max_leaves: int = DEFAULT_TREE_LEAVES,
 ) -> FrozenPolicy:
     """Fit CUDA Fast M1 from development rows without accepting sealed data."""
 
@@ -611,15 +646,28 @@ def freeze_fast_policy(
         measurement_plan,
         ShapePartition.DEVELOPMENT,
     )
-    development = project_cuda_shape_resolved_candidates(
-        direct_development
-    )
+    projected_cache_keys = projected_domain_cache_keys(direct_development)
     frozen = freeze_policy(
-        development,
+        direct_development,
         sealed_commitment=_fast_sealed_commitment(manifest, measurement_plan),
         split_manifest_digest=measurement_plan.digest(manifest),
         paired_development_comparisons=paired_development_comparisons,
         profiler_feature_catalog=profiler_feature_catalog,
+        max_leaves=max_leaves,
+        fit_cache=(
+            PolicyFitCache(directory=fit_cache_directory)
+            if fit_cache_directory is not None
+            else None
+        ),
+        domain_corpus_provider=lambda domain: (
+            project_cuda_shape_resolved_candidates(
+                direct_development.rows_for_generic_domain(domain),
+                known_generic_domain=domain,
+            )
+        ),
+        domain_corpus_digest_provider=lambda domain: (
+            projected_cache_keys[domain]
+        ),
         metadata={
             "backend": "cuda",
             "semantic_contract": SemanticContract.FAST.value,
@@ -673,6 +721,7 @@ def certify_fast_policy(
 ) -> CompiledPolicy:
     """Open Fast sealed rows and certify an already-frozen CUDA policy."""
 
+    phase_started = time.perf_counter()
     direct_development = _require_fast_partition(
         development_corpus,
         manifest,
@@ -685,14 +734,20 @@ def certify_fast_policy(
         measurement_plan,
         ShapePartition.SEALED,
     )
-    development = project_cuda_shape_resolved_candidates(
-        direct_development
+    phase_started = _emit_phase_timing(
+        "certify_partition_validation", phase_started
     )
     sealed = project_cuda_shape_resolved_candidates(direct_sealed)
+    phase_started = _emit_phase_timing(
+        "certify_shape_projection", phase_started
+    )
     compiled = certify_frozen_policy(
         frozen,
-        development,
+        direct_development,
         sealed,
+    )
+    phase_started = _emit_phase_timing(
+        "certify_common_compiler", phase_started
     )
     exact_overlay_names = {
         shape.name for shape in manifest.shapes if shape.exact_overlay
@@ -719,6 +774,7 @@ def certify_fast_policy(
             "sealed_measurement_context": _measurement_context(sealed_corpus),
         },
     )
+    _emit_phase_timing("certify_exact_filter", phase_started)
     return CompiledPolicy(filtered, compiled.certification)
 
 
@@ -1084,20 +1140,45 @@ def _require_shape_reachable_candidate_coverage(
     """
 
     registry = cuda_native_vnni_gemv_registry()
-    failures = []
-    for key in corpus.runtime_keys():
-        required = set()
+    runtime_keys = corpus.runtime_keys()
+    required_by_contract: dict[
+        SemanticContract,
+        tuple[tuple[str, int, int], ...],
+    ] = {}
+    for contract in {key.semantic_contract for key in runtime_keys}:
+        candidates = []
         for candidate in registry.entries:
-            if not candidate.supports_contract(key.semantic_contract):
+            if not candidate.supports_contract(contract):
                 continue
-            if candidate.config_json.get("family") == "kpar_formula":
-                # Formula costs are projected from this directly measured
-                # exact matrix after completeness validation.
+            # Materialize each immutable tuple once. Constructing a fresh
+            # configuration mapping for every runtime key made this otherwise
+            # linear completeness check dominate large retained-corpus replays.
+            config = dict(candidate.config_items)
+            if config.get("family") == "kpar_formula":
                 continue
-            exact_kb = int(candidate.config_json.get("exact_kb", 0))
-            if exact_kb and exact_kb not in _economical_exact_kblocks(key.k // 32):
-                continue
-            required.add(candidate.effective_candidate_id)
+            candidates.append((
+                candidate.effective_candidate_id,
+                int(config.get("exact_kb", 0)),
+                int(config.get("grouped_rows", 0)),
+            ))
+        required_by_contract[contract] = tuple(candidates)
+
+    failures = []
+    for key in runtime_keys:
+        economical_exact_kblocks = _economical_exact_kblocks(key.k // 32)
+        # Exact KBs with duplicate partition widths do no less work than the
+        # retained representative and cannot win.
+        required = {
+            candidate_id
+            for candidate_id, exact_kb, grouped_rows in required_by_contract[
+                key.semantic_contract
+            ]
+            if not exact_kb or exact_kb in economical_exact_kblocks
+            if not grouped_rows or _grouped_row_tile_is_reachable(
+                grouped_rows,
+                key.m,
+            )
+        }
         actual = {
             row.effective_candidate_id for row in corpus.rows_for_runtime_key(key)
         }
@@ -1112,6 +1193,24 @@ def _require_shape_reachable_candidate_coverage(
             f"{len(failures)} key(s); first={key} missing={missing} "
             f"unexpected={unexpected}"
         )
+
+
+def _grouped_row_tile_is_reachable(grouped_rows: int, m: int) -> bool:
+    """Return whether a grouped row tile can remove work for runtime ``M``.
+
+    The trainer and production dispatcher expose power-of-two row tiles. Once
+    a tile exceeds ``bit_ceil(M)``, it cannot reduce the number of row groups
+    relative to that next-smallest tile and only increases register pressure.
+    Such a candidate is deliberately absent from the measured matrix and must
+    not be invented by the completeness oracle.
+    """
+
+    if grouped_rows <= 0 or m < 2:
+        raise ValueError(
+            "CUDA grouped reachability requires positive rows and M>=2"
+        )
+    maximum_useful_rows = min(64, 1 << (m - 1).bit_length())
+    return grouped_rows <= maximum_useful_rows
 
 
 @lru_cache(maxsize=None)
@@ -2076,6 +2175,20 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--fit-cache-dir",
+        type=Path,
+        help="Persistent content-addressed candidate-cost and CV cache",
+    )
+    parser.add_argument(
+        "--generic-max-leaves",
+        type=int,
+        default=DEFAULT_TREE_LEAVES,
+        help=(
+            "Maximum generic-tree leaves for both Fast M=1 and grouped "
+            f"verifier fitting (default: {DEFAULT_TREE_LEAVES})"
+        ),
+    )
+    parser.add_argument(
         "--development-profiler-observations",
         type=Path,
         help="Original common CSV bound to reusable profiler sidecars",
@@ -2137,6 +2250,10 @@ def main() -> int:
 
     if args.freeze_generic and args.certify_generic:
         parser.error("--freeze-generic and --certify-generic are mutually exclusive")
+    if not 1 <= args.generic_max_leaves <= MAX_TREE_LEAVES:
+        parser.error(
+            f"--generic-max-leaves must be in [1, {MAX_TREE_LEAVES}]"
+        )
     if args.exact_only and (args.certify_generic or args.freeze_generic):
         parser.error(
             "--exact-only cannot be combined with generic freeze/certification"
@@ -2204,7 +2321,7 @@ def main() -> int:
             parser.error(
                 "separate development/sealed inputs require --certify-generic"
             )
-        if inputs or args.timing_sidecar or args.m1_input or args.verifier_input:
+        if inputs or args.timing_sidecar or args.verifier_input:
             parser.error(
                 "separate certification cannot mix normal or two-phase inputs"
             )
@@ -2231,7 +2348,7 @@ def main() -> int:
     if args.freeze_generic:
         if not inputs:
             parser.error("--freeze-generic requires development --input shards")
-        if args.m1_input or args.verifier_input or separate_certification:
+        if args.verifier_input or separate_certification:
             parser.error("--freeze-generic accepts development input only")
         if not args.policy_json:
             parser.error("--freeze-generic requires --policy-json")
@@ -2246,11 +2363,7 @@ def main() -> int:
             corpus,
             args.development_profiler_requests,
             args.development_profiler_evidence,
-            source_corpus=(
-                read_observation_csv((args.development_profiler_observations,))
-                if args.development_profiler_observations
-                else None
-            ),
+            source_corpus_path=args.development_profiler_observations,
         )
         manifest = load_shape_manifest(args.shape_manifest)
         measurement_plan = load_gpu_measurement_plan(
@@ -2268,6 +2381,8 @@ def main() -> int:
             build_change_audit=(
                 args.development_build_change_audit or None
             ),
+            fit_cache_directory=args.fit_cache_dir,
+            max_leaves=args.generic_max_leaves,
         )
         entries, exact = select_fast_entries(
             corpus, context.serial_m1_policy_hash
@@ -2314,6 +2429,7 @@ def main() -> int:
         return 0
 
     if separate_certification:
+        phase_started = time.perf_counter()
         development_inputs = tuple(args.development_input)
         development_timing = tuple(args.development_timing_sidecar)
         development_context = _context_from_args(
@@ -2324,15 +2440,17 @@ def main() -> int:
             development_context,
             timing_sidecars=development_timing,
         )
+        phase_started = _emit_phase_timing(
+            "adapt_development", phase_started
+        )
         profiler_catalog = load_profiler_feature_catalog(
             development_corpus,
             args.development_profiler_requests,
             args.development_profiler_evidence,
-            source_corpus=(
-                read_observation_csv((args.development_profiler_observations,))
-                if args.development_profiler_observations
-                else None
-            ),
+            source_corpus_path=args.development_profiler_observations,
+        )
+        phase_started = _emit_phase_timing(
+            "load_profiler_catalog", phase_started
         )
         manifest = load_shape_manifest(args.shape_manifest)
         measurement_plan = load_gpu_measurement_plan(
@@ -2341,6 +2459,9 @@ def main() -> int:
         )
         if args.require_fast_m1_complete:
             validate_fast_m1_complete(development_corpus)
+        phase_started = _emit_phase_timing(
+            "validate_development", phase_started
+        )
         frozen = freeze_fast_policy(
             development_corpus,
             manifest,
@@ -2350,9 +2471,17 @@ def main() -> int:
             build_change_audit=(
                 args.development_build_change_audit or None
             ),
+            fit_cache_directory=args.fit_cache_dir,
+            max_leaves=args.generic_max_leaves,
+        )
+        phase_started = _emit_phase_timing(
+            "reconstruct_frozen_policy", phase_started
         )
         # This comparison happens before the first sealed file is opened.
         validate_frozen_policy_file(args.frozen_policy_json, frozen)
+        phase_started = _emit_phase_timing(
+            "validate_frozen_artifact", phase_started
+        )
 
         sealed_inputs = tuple(args.sealed_input)
         sealed_timing = tuple(args.sealed_timing_sidecar)
@@ -2376,14 +2505,21 @@ def main() -> int:
             sealed_context,
             timing_sidecars=sealed_timing,
         )
+        phase_started = _emit_phase_timing("adapt_sealed", phase_started)
         if args.require_fast_m1_complete:
             validate_fast_m1_complete(sealed_corpus)
+        phase_started = _emit_phase_timing(
+            "validate_sealed", phase_started
+        )
         compiled = certify_fast_policy(
             frozen,
             development_corpus,
             sealed_corpus,
             manifest,
             measurement_plan,
+        )
+        phase_started = _emit_phase_timing(
+            "certify_frozen_policy", phase_started
         )
         corpus = ObservationCorpus((
             *development_corpus.observations,
@@ -2484,11 +2620,13 @@ def main() -> int:
         generic_rules = select_grouped_generic_rules(
             corpus,
             context.serial_m1_policy_hash,
+            max_leaves=args.generic_max_leaves,
         )
     else:
         generic_rules = select_fast_generic_rules(
             corpus,
             context.serial_m1_policy_hash,
+            max_leaves=args.generic_max_leaves,
         )
     if args.require_fast_m1_complete:
         validate_fast_m1_complete(corpus)

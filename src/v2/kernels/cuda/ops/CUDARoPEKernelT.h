@@ -26,6 +26,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, FP16Tensor
 #include "../../../tensors/BlockStructures.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../rope/RoPEDeviceParams.h"
 #include <cstdint>
@@ -64,7 +65,7 @@ namespace llaminar2
             explicit CUDARoPEKernelT(int device_idx = -1, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
-            ~CUDARoPEKernelT() override;
+            ~CUDARoPEKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
@@ -122,7 +123,7 @@ namespace llaminar2
                 gpu_stream_ = stream;
             }
 
-            /// Pre-upload pos_offset device params for graph replay
+            /// Publish pos_offset into graph-stable device params.
             void setDynamicPosOffset(int pos_offset) override;
             /// Pre-upload explicit position IDs for graph-captured replay.
             void setDynamicPositionIds(const int *position_ids, int seq_len) override;
@@ -139,8 +140,6 @@ namespace llaminar2
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_seq_len_ = 0;
                 dynamic_position_ids_device_ptr_ = nullptr;
-                if (h_device_params_)
-                    h_device_params_->pos_offset = 0;
             }
 
             // ===== ITensorRoPE interface =====
@@ -232,10 +231,16 @@ namespace llaminar2
                 // Mark tensors as modified on GPU
                 if (success)
                 {
-                    q_fp32->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                    TransferEngine::publishDeviceWrite(
+                        q_fp32,
+                        DeviceId::cuda(device_idx),
+                        gpu_stream_);
                     if (k_fp32)
                     {
-                        k_fp32->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                        TransferEngine::publishDeviceWrite(
+                            k_fp32,
+                            DeviceId::cuda(device_idx),
+                            gpu_stream_);
                     }
                 }
 
@@ -257,8 +262,6 @@ namespace llaminar2
             mutable int inv_freq_head_dim_;
             mutable float inv_freq_theta_;
 
-            /// Pinned host staging for pre-capture device-param uploads
-            rope::RoPEDeviceParams *h_device_params_ = nullptr;
             bool dynamic_pos_device_valid_ = false;
             int dynamic_pos_offset_ = 0;
             bool dynamic_position_ids_device_valid_ = false;
@@ -300,7 +303,7 @@ namespace llaminar2
                 device_idx_ = ctx->deviceOrdinal();
             }
 
-            ~CUDARoPEKernelT() override;
+            ~CUDARoPEKernelT() override = default;
 
             // ===== Device Context Support (Phase 4) =====
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
@@ -320,7 +323,7 @@ namespace llaminar2
                 gpu_stream_ = stream;
             }
 
-            /// Pre-upload pos_offset device params for graph replay
+            /// Publish pos_offset into graph-stable device params.
             void setDynamicPosOffset(int pos_offset) override;
             /// Pre-upload explicit position IDs for graph-captured replay.
             void setDynamicPositionIds(const int *position_ids, int seq_len) override;
@@ -337,8 +340,6 @@ namespace llaminar2
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_seq_len_ = 0;
                 dynamic_position_ids_device_ptr_ = nullptr;
-                if (h_device_params_)
-                    h_device_params_->pos_offset = 0;
             }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
@@ -469,10 +470,16 @@ namespace llaminar2
                 // Mark tensors as modified on GPU
                 if (success)
                 {
-                    q_bf16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                    TransferEngine::publishDeviceWrite(
+                        q_bf16,
+                        DeviceId::cuda(device_idx),
+                        gpu_stream_);
                     if (k_bf16)
                     {
-                        k_bf16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                        TransferEngine::publishDeviceWrite(
+                            k_bf16,
+                            DeviceId::cuda(device_idx),
+                            gpu_stream_);
                     }
                 }
 
@@ -494,8 +501,6 @@ namespace llaminar2
             mutable int inv_freq_head_dim_;
             mutable float inv_freq_theta_;
 
-            /// Pinned host staging for pre-capture device-param uploads
-            rope::RoPEDeviceParams *h_device_params_ = nullptr;
             bool dynamic_pos_device_valid_ = false;
             int dynamic_pos_offset_ = 0;
             bool dynamic_position_ids_device_valid_ = false;
@@ -537,7 +542,7 @@ namespace llaminar2
                 device_idx_ = ctx->deviceOrdinal();
             }
 
-            ~CUDARoPEKernelT() override;
+            ~CUDARoPEKernelT() override = default;
 
             // ===== Device Context Support (Phase 4) =====
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
@@ -557,7 +562,7 @@ namespace llaminar2
                 gpu_stream_ = stream;
             }
 
-            /// Pre-upload pos_offset device params for graph replay
+            /// Publish pos_offset into graph-stable device params.
             void setDynamicPosOffset(int pos_offset) override;
             /// Pre-upload explicit position IDs for graph-captured replay.
             void setDynamicPositionIds(const int *position_ids, int seq_len) override;
@@ -574,8 +579,6 @@ namespace llaminar2
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_seq_len_ = 0;
                 dynamic_position_ids_device_ptr_ = nullptr;
-                if (h_device_params_)
-                    h_device_params_->pos_offset = 0;
             }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
@@ -710,10 +713,16 @@ namespace llaminar2
                 // Mark tensors as modified on GPU
                 if (success)
                 {
-                    q_fp16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                    TransferEngine::publishDeviceWrite(
+                        q_fp16,
+                        DeviceId::cuda(device_idx),
+                        gpu_stream_);
                     if (k_fp16)
                     {
-                        k_fp16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                        TransferEngine::publishDeviceWrite(
+                            k_fp16,
+                            DeviceId::cuda(device_idx),
+                            gpu_stream_);
                     }
                 }
 
@@ -735,8 +744,6 @@ namespace llaminar2
             mutable int inv_freq_head_dim_;
             mutable float inv_freq_theta_;
 
-            /// Pinned host staging for pre-capture device-param uploads
-            rope::RoPEDeviceParams *h_device_params_ = nullptr;
             bool dynamic_pos_device_valid_ = false;
             int dynamic_pos_offset_ = 0;
             bool dynamic_position_ids_device_valid_ = false;

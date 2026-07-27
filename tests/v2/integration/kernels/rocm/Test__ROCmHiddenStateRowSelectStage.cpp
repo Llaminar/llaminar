@@ -2,17 +2,22 @@
  * @file Test__ROCmHiddenStateRowSelectStage.cpp
  * @brief ROCm integration tests for graph-capturable hidden-state row selection.
  *
- * Covers stage-owned rows, external verifier metadata, and request-terminal
- * rows derived directly from device-resident unequal request lengths. Captured
- * graph replays prove each mutable device source is observed without recapture.
+ * Covers dynamic stage-owned rows, immutable device-only checkpoint rows,
+ * external verifier metadata, and request-terminal rows derived directly from
+ * device-resident unequal request lengths. Captured graph replays prove each
+ * ownership policy executes without host work inside capture.
  */
 
 #include <gtest/gtest.h>
 
 #include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "execution/compute_stages/stages/HiddenStateRowsSelectStage.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/ComputeGraph.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "memory/BufferArena.h"
 #include "tensors/Tensors.h"
 
 #ifdef HAVE_ROCM
@@ -27,6 +32,52 @@ using namespace llaminar2;
 namespace
 {
 #ifdef HAVE_ROCM
+    /**
+     * @brief Simulate a preceding library stage that temporarily binds another GPU.
+     *
+     * Real LocalTP graphs interleave compute stages with RCCL and backend helper
+     * calls. This deliberately adversarial stage reproduces the relevant
+     * execution boundary without loading a model: it leaves the calling thread
+     * on another HIP device immediately before the production M=39 checkpoint.
+     */
+    class ForeignHIPDeviceStage final : public IComputeStage
+    {
+    public:
+        ForeignHIPDeviceStage(DeviceId graph_device, int foreign_device)
+            : IComputeStage(graph_device),
+              foreign_device_(foreign_device)
+        {
+        }
+
+        bool execute(IDeviceContext *) override
+        {
+            return hipSetDevice(foreign_device_) == hipSuccess;
+        }
+
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::COPY;
+        }
+
+        bool supportsBackend(ComputeBackendType backend) const override
+        {
+            return backend == ComputeBackendType::GPU_ROCM;
+        }
+
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
+
+    private:
+        StageDumpInfo buildDumpInfoImpl() const override
+        {
+            return {};
+        }
+
+        int foreign_device_ = -1;
+    };
+
     /// @brief Fill hidden rows with deterministic values that identify the row.
     std::unique_ptr<FP32Tensor> makeHiddenStates(int seq_len, int d_model, DeviceId device, hipStream_t stream)
     {
@@ -173,6 +224,325 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
     EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
     EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
+/**
+ * @brief Prove fixed diagnostic rows capture without scalar workspace or H2D.
+ */
+TEST(Test__ROCmHiddenStateRowSelectStage, CapturedFixedDeviceRowUsesDeviceOnlyCopy)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const DeviceId device = DeviceId::rocm(0);
+    const int seq_len = 8;
+    const int d_model = 32;
+    const int selected_row = 5;
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+
+    auto hidden = makeHiddenStates(seq_len, d_model, device, stream);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+    ASSERT_TRUE(scratch->allocateOnDevice(device, stream));
+
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = scratch.get();
+    params.seq_len = seq_len;
+    params.d_model = d_model;
+    params.selected_row_idx = selected_row;
+    params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow;
+    HiddenStateRowSelectStage stage(params);
+    stage.setGPUStream(stream);
+
+    ASSERT_TRUE(stage.getWorkspaceRequirements(seq_len, d_model, 0).buffers.empty());
+    ASSERT_TRUE(stage.execute(nullptr));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    expectRow(
+        downloadScratchRow(*scratch, d_model, stream),
+        *hidden,
+        selected_row,
+        d_model);
+
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(
+            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+            hipSuccess);
+        ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(
+        hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+        hipSuccess);
+    ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    expectRow(
+        downloadScratchRow(*scratch, d_model, stream),
+        *hidden,
+        selected_row,
+        d_model);
+
+    EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+    EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
+/**
+ * @brief Reproduce padded M=512 checkpoint selection from resident metadata.
+ *
+ * A single captured executable first observes a 443-row request and then a
+ * 257-row request. Only the persistent device length changes between launches;
+ * no stage replay setter or graph-launch preparation hook participates.
+ */
+TEST(Test__ROCmHiddenStateRowSelectStage, CapturedCheckpointReadsResidentPrefillLength)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const DeviceId device = DeviceId::rocm(0);
+    constexpr int bucket_seq_len = 512;
+    constexpr int d_model = 32;
+    int32_t initial_length = 443;
+    int32_t replay_length = 257;
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+    auto hidden = makeHiddenStates(
+        bucket_seq_len,
+        d_model,
+        device,
+        stream);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+    ASSERT_TRUE(scratch->allocateOnDevice(device, stream));
+
+    int32_t *length_device = nullptr;
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&length_device),
+            sizeof(int32_t)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            length_device,
+            &initial_length,
+            sizeof(int32_t),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = scratch.get();
+    params.seq_len = bucket_seq_len;
+    params.d_model = d_model;
+    params.selected_row_idx = bucket_seq_len - 1;
+    params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::
+            DeviceResidentRequestLength;
+    params.request_sequence_length_device = length_device;
+    HiddenStateRowSelectStage stage(params);
+    stage.setGPUStream(stream);
+
+    ASSERT_TRUE(
+        stage.getWorkspaceRequirements(
+                 bucket_seq_len,
+                 d_model,
+                 0)
+            .buffers.empty());
+    ASSERT_FALSE(stage.needsGraphLaunchPreparation());
+
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(
+            hipStreamBeginCapture(
+                stream,
+                hipStreamCaptureModeGlobal),
+            hipSuccess);
+        ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(
+        hipGraphInstantiate(
+            &graph_exec,
+            graph,
+            nullptr,
+            nullptr,
+            0),
+        hipSuccess);
+
+    ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+    expectRow(
+        downloadScratchRow(*scratch, d_model, stream),
+        *hidden,
+        /*selected_row=*/442,
+        d_model);
+
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            length_device,
+            &replay_length,
+            sizeof(int32_t),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+    expectRow(
+        downloadScratchRow(*scratch, d_model, stream),
+        *hidden,
+        /*selected_row=*/256,
+        d_model);
+
+    EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+    EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+    EXPECT_EQ(hipFree(length_device), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
+/**
+ * @brief Reproduce the first production M=39 mirrored checkpoint through the executor.
+ *
+ * The long-context ROCm2 E2E first builds an exact-shape, 39-row prefill graph
+ * with a 2048-wide hidden state. This test deliberately uses graph-managed
+ * arena tensors and leaves stream assignment to DeviceGraphExecutor. It
+ * therefore proves the production ownership contract in addition to the raw
+ * HIP kernel geometry: the executor must bind a non-null worker stream and the
+ * stage must read the terminal row from the persistent device length.
+ */
+TEST(Test__ROCmHiddenStateRowSelectStage, ExecutorRunsProductionM39ResidentCheckpoint)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const DeviceId device = DeviceId::rocm(0);
+    constexpr int seq_len = 39;
+    constexpr int d_model = 2048;
+    const int32_t request_length = seq_len;
+
+    hipStream_t setup_stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&setup_stream), hipSuccess);
+    auto hidden = makeHiddenStates(seq_len, d_model, device, setup_stream);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+
+    int32_t *length_device = nullptr;
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&length_device),
+            sizeof(int32_t)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            length_device,
+            &request_length,
+            sizeof(int32_t),
+            hipMemcpyHostToDevice,
+            setup_stream),
+        hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(setup_stream), hipSuccess);
+
+    BufferArena arena;
+    ASSERT_TRUE(
+        arena.registerExternalBuffer(
+            BufferId::HIDDEN_STATE,
+            hidden.get()));
+    ASSERT_TRUE(
+        arena.registerExternalBuffer(
+            BufferId::PREFIX_TERMINAL_HIDDEN,
+            scratch.get()));
+
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = scratch.get();
+    params.seq_len = seq_len;
+    params.d_model = d_model;
+    params.selected_row_idx = seq_len - 1;
+    params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::
+            DeviceResidentRequestLength;
+    params.request_sequence_length_device = length_device;
+    params.input_buffer_id = BufferId::HIDDEN_STATE;
+    params.output_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
+
+    auto stage = std::make_unique<HiddenStateRowSelectStage>(params);
+    auto *stage_ptr = stage.get();
+    ComputeGraph graph;
+    if (device_count > 1)
+    {
+        graph.addNode(
+            "foreign_hip_device_binding",
+            std::make_unique<ForeignHIPDeviceStage>(device, 1),
+            device);
+    }
+    graph.addNode("production_m39_resident_checkpoint", std::move(stage), device);
+    if (device_count > 1)
+    {
+        graph.addDependency(
+            "production_m39_resident_checkpoint",
+            "foreign_hip_device_binding");
+    }
+
+    GraphExecutorConfig config;
+    config.enable_profiling = false;
+    config.enable_validation = false;
+    DeviceGraphExecutor executor(config);
+    executor.setArena(&arena);
+    auto ctx = IDeviceContext::create(device, 1);
+    ASSERT_NE(ctx, nullptr);
+
+    ASSERT_TRUE(executor.execute(graph, ctx.get()));
+    ASSERT_NE(stage_ptr->gpuStream(), nullptr);
+    int active_device = -1;
+    ASSERT_EQ(hipGetDevice(&active_device), hipSuccess);
+    EXPECT_EQ(active_device, 0)
+        << "The checkpoint handoff must restore its stream-owning device";
+    auto execution_stream =
+        static_cast<hipStream_t>(stage_ptr->gpuStream());
+    ASSERT_EQ(hipStreamSynchronize(execution_stream), hipSuccess);
+    expectRow(
+        downloadScratchRow(*scratch, d_model, execution_stream),
+        *hidden,
+        /*selected_row=*/seq_len - 1,
+        d_model);
+
+    EXPECT_EQ(hipFree(length_device), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(setup_stream), hipSuccess);
 #endif
 }
 

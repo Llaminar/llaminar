@@ -48,7 +48,6 @@ SOURCE_CANDIDATES = (
     "cpu.nvnni.prefill.two_row_tiles.nbc2.full_k",
     "cpu.nvnni.prefill.two_row_tiles.nbc4.full_k",
     "cpu.nvnni.prefill.two_row_tiles.nbc8.full_k",
-    "cpu.nvnni.prefill.two_row_tiles.nbc16.full_k",
     "cpu.nvnni.prefill.decode_equivalent_kpart.pairwise",
     "cpu.nvnni.prefill.decode_equivalent_kpart.wide_rows",
 )

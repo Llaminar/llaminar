@@ -138,7 +138,7 @@ namespace
         void registerBARBackedOutput(const std::string &, const GlobalDeviceAddress &, TensorBase *) override {}
         bool hasBARBackedOutputs(const std::string &) const override { return false; }
         void clearBARBackedOutputs() override {}
-        bool reserveTempBufferBytes(size_t) override { return true; }
+        bool reserveCollectiveResources(size_t, size_t) override { return true; }
 
         // ILocalTPContext - Abort
         void requestAbort() override {}

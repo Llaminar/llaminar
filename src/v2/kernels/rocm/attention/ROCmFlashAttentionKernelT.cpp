@@ -221,12 +221,6 @@ extern "C"
         int kv_stride,
         void *stream);
 
-    int hipFlashAttn_allocWorkspace(
-        void **partial_output, void **partial_m, void **partial_l,
-        int batch_size, int n_heads, int head_dim, int num_splits);
-
-    void hipFlashAttn_freeWorkspace(void *partial_output, void *partial_m, void *partial_l);
-
     int hipFlashAttn_setDevice(int device_idx);
     // hipFlashAttn_synchronize() removed - caller manages coherence via events
 

@@ -95,7 +95,6 @@ namespace llaminar2
         bool hipMemcpyPeerAsyncDevice(void *dst, int dst_device, const void *src, int src_device, size_t bytes, void *stream);
         bool hipCanAccessPeerDevice(int dst_device, int src_device);
         bool hipEnablePeerAccessDevice(int peer_device);
-        bool hipDeviceSynchronizeWrapper();
 
         // Host staging memory operations (for non-P2P fallback)
         void *hipHostMallocWrapper(size_t bytes);

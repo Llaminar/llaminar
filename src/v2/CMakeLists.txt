@@ -329,7 +329,6 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu  # tuned shape-specific native-vnni GEMV (Wide/KPar/Direct)
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
         kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu  # custom native-vnni prefill GEMM family (Q4_0 first)
-        kernels/cuda/gemm/CUDAcuBLASQuantGemm.cu          # cuBLAS FP16 GEMM path for quantized weights (env: LLAMINAR_CUBLAS_GEMM=1)
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
         kernels/cuda/ops/CUDARMSNormKernels.cu        # RMSNorm kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDAResidualAddKernels.cu    # Residual Add kernels (FP32, BF16, FP16)
@@ -1214,6 +1213,12 @@ endif()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 message(STATUS "V2: Found Python3: ${Python3_EXECUTABLE}")
 
+# Durable prefix-cache artifacts are content-addressed by the exact model file.
+# OpenSSL EVP provides a maintained streaming SHA-256 implementation without
+# materializing multi-gigabyte GGUF files in host memory.
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+message(STATUS "V2: Found OpenSSL Crypto for model content addressing")
+
 # CPU BLAS backend: OneDNN for all GEMM (FP32, BF16, INT8)
 message(STATUS "V2: BLAS backend: OneDNN")
 
@@ -1325,7 +1330,6 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEExpertComputeStage.cpp
     execution/compute_stages/stages/MoEExpertDispatchStage.cpp
-    execution/compute_stages/stages/MoERoutedExpertPartialReduceStage.cpp
     execution/compute_stages/stages/MoELocalExpertStage.cpp
     execution/compute_stages/stages/MoESparseDispatchStage.cpp
     execution/compute_stages/stages/MoESparseReturnReduceStage.cpp
@@ -1352,7 +1356,6 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoERoutedExpertPlacementPlanner.cpp
     execution/moe/MoEExpertOwnerMap.cpp
     execution/moe/MoEExpertTokenRowTransfer.cpp
-    execution/moe/MoEExpertOverlayDenseReduce.cpp
     execution/moe/MoEExpertOverlayExecutionPlan.cpp
     execution/moe/MoEGraphRoleRunner.cpp
     execution/moe/MoEExpertOverlayPreparationPlan.cpp
@@ -1407,6 +1410,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/LMHeadStage.cpp
     execution/local_execution/graph/DeviceGraphCaptureController.cpp
     execution/local_execution/graph/ComputeGraph.cpp
+    execution/local_execution/graph/DeviceExecutionTimeline.cpp
     execution/local_execution/graph/StageVerifier.cpp
     execution/local_execution/graph/DeviceGraphExecutor.cpp
     execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp
@@ -1426,7 +1430,6 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/coherence/CrossDomainTransfer.cpp
     execution/config/HybridPrecisionConfig.cpp
     execution/config/InferenceMode.cpp
-    execution/local_execution/coherence/StageCoherence.cpp
     execution/local_execution/device/DeviceWorkspaceManager.cpp
     execution/local_execution/device/WorkspaceAllocator.cpp
     # Unified transfer engine (explicit coherence state machine + centralized data movement)
@@ -1623,6 +1626,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     utils/MPIStager.cpp
     utils/Tokenizer.cpp
     utils/Sampler.cpp
+    utils/Sha256.cpp
     utils/ChatTemplate.cpp
     utils/ChatUI.cpp
     utils/ToolCallParser.cpp
@@ -1825,6 +1829,7 @@ target_include_directories(llaminar2_core PUBLIC ${NUMA_INCLUDE_DIR})
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX
     OpenMP::OpenMP_CXX
+    OpenSSL::Crypto
     ${NUMA_LIBRARY}
     ftxui::screen
     ftxui::dom

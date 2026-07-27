@@ -8,6 +8,7 @@
  */
 
 #include "ROCmTurboQuantKernels.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantCodebook.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../utils/Logger.h"
@@ -18,6 +19,7 @@
 #include <cstring>
 #include <atomic>
 #include <vector>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -90,13 +92,29 @@ namespace llaminar2
         result.n_layers = n_layers;
         result.n_kv_heads = n_kv_heads;
         result.head_dim = head_dim;
+        result.device_id = device_id;
 
         const size_t mat_size = static_cast<size_t>(head_dim) * head_dim;
         const size_t total_mats = static_cast<size_t>(n_layers) * n_kv_heads;
         const size_t total_floats = total_mats * mat_size;
 
-        (void)hipMalloc(&result.d_rotations, total_floats * sizeof(float));
-        (void)hipMalloc(&result.d_rotations_t, total_floats * sizeof(float));
+        auto *backend = getROCmBackend();
+        if (!backend)
+            throw std::runtime_error("[TurboQuant ROCm] ROCm backend unavailable");
+        const size_t rotation_bytes = total_floats * sizeof(float);
+        result.d_rotations =
+            static_cast<float *>(backend->allocate(rotation_bytes, device_id));
+        result.d_rotations_t =
+            static_cast<float *>(backend->allocate(rotation_bytes, device_id));
+        if (!result.d_rotations || !result.d_rotations_t)
+        {
+            if (result.d_rotations)
+                backend->free(result.d_rotations, device_id);
+            if (result.d_rotations_t)
+                backend->free(result.d_rotations_t, device_id);
+            throw std::runtime_error(
+                "[TurboQuant ROCm] Failed to allocate model-lifetime rotation storage");
+        }
 
         TurboQuantContext base_ctx(head_dim, rotation_seed == 0 ? 31ULL : rotation_seed);
 
@@ -131,16 +149,21 @@ namespace llaminar2
 
     void hip_tq_free_rotations(ROCmTurboQuantRotations &rotations)
     {
+        auto *backend = getROCmBackend();
+        if (!backend && (rotations.d_rotations || rotations.d_rotations_t))
+            throw std::runtime_error(
+                "[TurboQuant ROCm] ROCm backend unavailable during rotation teardown");
         if (rotations.d_rotations)
         {
-            (void)hipFree(rotations.d_rotations);
+            backend->free(rotations.d_rotations, rotations.device_id);
             rotations.d_rotations = nullptr;
         }
         if (rotations.d_rotations_t)
         {
-            (void)hipFree(rotations.d_rotations_t);
+            backend->free(rotations.d_rotations_t, rotations.device_id);
             rotations.d_rotations_t = nullptr;
         }
+        rotations.device_id = -1;
     }
 
     // =========================================================================

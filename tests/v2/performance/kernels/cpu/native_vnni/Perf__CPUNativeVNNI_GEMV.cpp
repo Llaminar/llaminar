@@ -7097,7 +7097,11 @@ namespace
                     row_chunk_target_tasks),
             .schedule = PrefillSchedulePolicy::RowChunkGrid,
         });
-        for (int n_block_chunks : {1, 2, 4, 8, 16})
+        // The N-major NBC16 schedule is retired: it had no winner in 1,827
+        // historical cells and remained at least 36.5% slower in the focused
+        // short-prefill audit. The pair-grid NBC16 schedule remains a distinct
+        // candidate because it has demonstrated real wins.
+        for (int n_block_chunks : {1, 2, 4, 8})
         {
             candidates.push_back({
                 .id = "cpu.nvnni.prefill.two_row_tiles.nbc" +
@@ -7105,6 +7109,9 @@ namespace
                 .n_block_chunks = n_block_chunks,
                 .schedule = PrefillSchedulePolicy::TwoRowNMajor,
             });
+        }
+        for (int n_block_chunks : {1, 2, 4, 8, 16})
+        {
             candidates.push_back({
                 .id = "cpu.nvnni.prefill.two_row_pair_grid.nbc" +
                       std::to_string(n_block_chunks) + ".full_k",

@@ -5,7 +5,6 @@
 
 #include "MTPConcatStage.h"
 #include "../../../tensors/Tensors.h"
-#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
 
@@ -55,15 +54,27 @@ namespace llaminar2
 
         if (params_.device_id.is_gpu())
         {
-            auto hidden_upload = TransferEngine::instance().upload(hidden, params_.device_id);
-            auto embedding_upload = TransferEngine::instance().upload(embedding, params_.device_id);
-            if (!hidden_upload.success || !embedding_upload.success ||
-                !output->allocateOnDevice(params_.device_id))
+            /*
+             * BufferArena and StageBufferContract own all placement and
+             * allocation before execute(). A stage must never repair a malformed
+             * graph by uploading inputs or allocating its output in the hot
+             * path because that makes graph capture and stream provenance
+             * dependent on hidden host work.
+             */
+            const auto hidden_device = hidden->current_device();
+            const auto embedding_device = embedding->current_device();
+            const auto output_device = output->current_device();
+            if (!hidden->gpu_data_ptr() ||
+                !embedding->gpu_data_ptr() ||
+                !output->gpu_data_ptr() ||
+                hidden_device != params_.device_id ||
+                embedding_device != params_.device_id ||
+                output_device != params_.device_id)
             {
-                LOG_ERROR("[MTPConcatStage] Failed to prepare GPU tensors on "
-                          << params_.device_id.toString()
-                          << " hidden_upload=" << hidden_upload.error
-                          << " embedding_upload=" << embedding_upload.error);
+                LOG_ERROR(
+                    "[MTPConcatStage] GPU graph contract did not pre-place "
+                    "hidden/embedding/output on "
+                    << params_.device_id.toString());
                 return false;
             }
 
@@ -116,9 +127,7 @@ namespace llaminar2
                 LOG_ERROR("[MTPConcatStage] GPU concat launch failed on " << params_.device_id.toString());
                 return false;
             }
-            output->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                                          params_.device_id,
-                                          stream);
+            gpuExecution().publish(output);
             return true;
         }
 

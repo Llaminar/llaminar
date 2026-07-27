@@ -294,6 +294,11 @@ namespace llaminar2::cpu::native_vnni
             return packed_.native_interleaved.size() + packed_.payload.size() + packed_.int8_flat.size() + native_blocks_owned_.size();
         }
 
+        bool canReleaseSourceWeightTensor() const override
+        {
+            return valid_ && !packed_.native_interleaved.empty();
+        }
+
         // -------------------------------------------------------------------
         // Accessors
         // -------------------------------------------------------------------

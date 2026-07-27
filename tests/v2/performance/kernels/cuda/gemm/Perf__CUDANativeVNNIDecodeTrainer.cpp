@@ -2170,10 +2170,16 @@ namespace
                 const CandidateEvidence &evidence = batch.evidence[candidate_index];
                 const bool correctness_pass =
                     evidence.route.candidate_id == candidate.id &&
+                    evidence.comparison.mismatch_count == 0 &&
                     evidence.repeat_byte_mismatches == 0 &&
                     evidence.numerical_correctness;
                 ASSERT_TRUE(correctness_pass)
-                    << request.request_id << " candidate=" << candidate.id;
+                    << request.request_id
+                    << " candidate=" << candidate.id
+                    << " serial_byte_mismatches="
+                    << evidence.comparison.mismatch_count
+                    << " repeat_byte_mismatches="
+                    << evidence.repeat_byte_mismatches;
                 ASSERT_EQ(
                     evidence.samples.size(),
                     static_cast<size_t>(config.samples));

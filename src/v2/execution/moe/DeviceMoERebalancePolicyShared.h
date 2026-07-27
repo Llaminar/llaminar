@@ -79,6 +79,63 @@ namespace llaminar2::moe_rebalance_policy
         bool valid = false;
     };
 
+    /**
+     * @brief Storage-lifetime classification for one stable GPU transfer slot.
+     *
+     * Runtime placement keeps storage residency and current compute assignment
+     * as separate concerns. An expert can own or retain resident bytes in a
+     * transfer slot even when `local_compute_mask` is zero because the current
+     * least-loaded assignment sends all of its rows elsewhere. Slot allocation
+     * must therefore derive liveness from ownership, residency, and the next
+     * assignment instead of using compute eligibility as a storage lease.
+     */
+    struct TransferSlotOccupancy
+    {
+        bool occupied = false;
+        bool protected_from_reuse = false;
+    };
+
+    /**
+     * @brief Classify whether a transfer-backed expert occupies a local slot.
+     *
+     * An authoritative local owner is always protected, including while it has
+     * no rows in the current LLEP assignment. A non-owner resident replica
+     * occupies the slot but remains replaceable when the next assignment does
+     * not read it locally. An assignment-local expert is protected even if its
+     * resident bit is awaiting publication in the current transfer wave.
+     *
+     * @param transfer_backed       Whether the descriptor names a transfer slot.
+     * @param assigned_locally      Whether the next assignment reads the expert locally.
+     * @param resident_mask         Participants currently storing the expert.
+     * @param local_participant_bit Bit naming the local participant.
+     * @param owner_participant     Authoritative participant in the descriptor.
+     * @param local_participant     Participant materializing destination slots.
+     * @return Independent occupied and protected-from-reuse decisions.
+     */
+    LLAMINAR_MOE_REBALANCE_HD TransferSlotOccupancy classifyTransferSlotOccupancy(
+        bool transfer_backed,
+        bool assigned_locally,
+        uint32_t resident_mask,
+        uint32_t local_participant_bit,
+        int32_t owner_participant,
+        uint32_t local_participant) noexcept
+    {
+        TransferSlotOccupancy result{};
+        if (!transfer_backed)
+            return result;
+
+        const bool owner_local =
+            owner_participant == static_cast<int32_t>(local_participant);
+        const bool locally_resident =
+            (resident_mask & local_participant_bit) != 0u;
+
+        result.occupied =
+            owner_local || locally_resident || assigned_locally;
+        result.protected_from_reuse =
+            result.occupied && (owner_local || assigned_locally);
+        return result;
+    }
+
     LLAMINAR_MOE_REBALANCE_HD uint32_t participantBit(uint32_t participant) noexcept
     {
         return 1u << participant;

@@ -9,6 +9,7 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -27,6 +28,135 @@ namespace llaminar2
     extern "C" void cuda_kv_sequence_state_advance_dynamic(
         int *d_head, int *d_count, const int *d_append_count,
         int captured_num_tokens, int max_seq_len, cudaStream_t stream);
+
+    /**
+     * @brief Gather asymmetric TurboQuant K/V rows into device prefix storage.
+     *
+     * K and V use different native row sizes, so the kernel traverses one
+     * combined byte range while preserving each format byte-for-byte.
+     */
+    __global__ void tq_ring_logical_block_export_device_kernel(
+        const uint8_t *__restrict__ ring_k,
+        const uint8_t *__restrict__ ring_v,
+        uint8_t *__restrict__ block_k,
+        uint8_t *__restrict__ block_v,
+        const int *__restrict__ ring_head,
+        const int *__restrict__ cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len,
+        size_t k_row_bytes,
+        size_t v_row_bytes)
+    {
+        const int count = *cached_tokens;
+        const int head = *ring_head;
+        if (count < 0 || count > max_seq_len ||
+            head < 0 || head >= max_seq_len ||
+            logical_token_start < 0 ||
+            logical_token_start > count ||
+            token_count < 0 ||
+            token_count > count - logical_token_start)
+        {
+            return;
+        }
+        int tail = (head - count) % max_seq_len;
+        if (tail < 0)
+            tail += max_seq_len;
+
+        const size_t k_bytes = static_cast<size_t>(token_count) * k_row_bytes;
+        const size_t v_bytes = static_cast<size_t>(token_count) * v_row_bytes;
+        const size_t total = k_bytes + v_bytes;
+        for (size_t linear =
+                 static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             linear < total;
+             linear += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const bool is_k = linear < k_bytes;
+            const size_t local = is_k ? linear : linear - k_bytes;
+            const size_t row_bytes = is_k ? k_row_bytes : v_row_bytes;
+            const int token = static_cast<int>(local / row_bytes);
+            const size_t byte_in_row = local % row_bytes;
+            const int physical =
+                (tail + logical_token_start + token) % max_seq_len;
+            const size_t source =
+                static_cast<size_t>(physical) * row_bytes + byte_in_row;
+            if (is_k)
+                block_k[local] = ring_k[source];
+            else
+                block_v[local] = ring_v[source];
+        }
+    }
+
+    /**
+     * @brief Scatter a device TurboQuant block into the canonical live ring.
+     */
+    __global__ void tq_ring_logical_block_import_device_kernel(
+        uint8_t *__restrict__ ring_k,
+        uint8_t *__restrict__ ring_v,
+        const uint8_t *__restrict__ block_k,
+        const uint8_t *__restrict__ block_v,
+        const int *__restrict__ ring_head,
+        const int *__restrict__ cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len,
+        size_t k_row_bytes,
+        size_t v_row_bytes)
+    {
+        const int count = *cached_tokens;
+        const int head = *ring_head;
+        if (count != logical_token_start ||
+            head != (logical_token_start % max_seq_len))
+        {
+            return;
+        }
+
+        const size_t k_bytes = static_cast<size_t>(token_count) * k_row_bytes;
+        const size_t v_bytes = static_cast<size_t>(token_count) * v_row_bytes;
+        const size_t total = k_bytes + v_bytes;
+        for (size_t linear =
+                 static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             linear < total;
+             linear += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const bool is_k = linear < k_bytes;
+            const size_t local = is_k ? linear : linear - k_bytes;
+            const size_t row_bytes = is_k ? k_row_bytes : v_row_bytes;
+            const int token = static_cast<int>(local / row_bytes);
+            const size_t byte_in_row = local % row_bytes;
+            const int physical = (head + token) % max_seq_len;
+            const size_t destination =
+                static_cast<size_t>(physical) * row_bytes + byte_in_row;
+            if (is_k)
+                ring_k[destination] = block_k[local];
+            else
+                ring_v[destination] = block_v[local];
+        }
+    }
+
+    /**
+     * @brief Publish TQ ring metadata after the asynchronous payload scatter.
+     */
+    __global__ void tq_ring_logical_block_import_publish_kernel(
+        int *__restrict__ ring_head,
+        int *__restrict__ cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len)
+    {
+        if (blockIdx.x != 0 || threadIdx.x != 0)
+            return;
+        const int count = *cached_tokens;
+        const int head = *ring_head;
+        if (count != logical_token_start ||
+            head != (logical_token_start % max_seq_len))
+        {
+            return;
+        }
+        const int new_count = logical_token_start + token_count;
+        *cached_tokens = new_count;
+        *ring_head = new_count % max_seq_len;
+    }
 
     // =========================================================================
     // Construction / Destruction
@@ -60,6 +190,18 @@ namespace llaminar2
             throw std::invalid_argument("CUDARingKVCacheTQ: invalid LocalTP KV-head range");
         }
         cudaSetDevice(device_id);
+
+        /*
+         * The cache owns several permanent device allocations. Install one
+         * transaction guard before creating any of them so every constructor
+         * failure follows the same complete teardown path as destruction.
+         */
+        auto construction_cleanup = [this](void *) noexcept
+        {
+            releaseOwnedDeviceStorage();
+        };
+        std::unique_ptr<void, decltype(construction_cleanup)>
+            construction_guard(this, construction_cleanup);
 
         // Determine block sizes
         if (head_dim == 64)
@@ -135,10 +277,6 @@ namespace llaminar2
         }
         if (!publishBatchedEntryTables(init_stream))
         {
-            for (auto &layer : entries_)
-                for (auto &entry : layer)
-                    free_entry(entry);
-            cuda_tq_free_rotations(rotations_);
             throw std::runtime_error(
                 "CUDARingKVCacheTQ: failed to publish resident batched entry topology");
         }
@@ -151,10 +289,24 @@ namespace llaminar2
                 static_cast<size_t>(batch_size) * max_seq_len * kv_dim_ *
                 sizeof(__half);
             layer_scratch_.resize(n_layers);
+            auto *const backend = getCUDABackend();
+            if (!backend)
+            {
+                throw std::runtime_error(
+                    "CUDARingKVCacheTQ: CUDA backend unavailable during persistent scratch allocation");
+            }
             for (int l = 0; l < n_layers; ++l)
             {
-                cudaMalloc(&layer_scratch_[l].d_K, scratch_bytes);
-                cudaMalloc(&layer_scratch_[l].d_V, scratch_bytes);
+                layer_scratch_[l].d_K = static_cast<__half *>(
+                    backend->allocate(scratch_bytes, device_id_));
+                layer_scratch_[l].d_V = static_cast<__half *>(
+                    backend->allocate(scratch_bytes, device_id_));
+                if (!layer_scratch_[l].d_K ||
+                    !layer_scratch_[l].d_V)
+                {
+                    throw std::runtime_error(
+                        "CUDARingKVCacheTQ: failed to allocate persistent FP16 layer scratch");
+                }
                 layer_scratch_[l].invalidate();
             }
 
@@ -176,6 +328,7 @@ namespace llaminar2
             throw std::runtime_error(std::string("CUDARingKVCacheTQ initialization failed: ") +
                                      cudaGetErrorString(init_sync));
 
+        construction_guard.release();
         LOG_DEBUG("CUDARingKVCacheTQ created: " << n_layers << " layers, "
                                                 << max_seq_len << " max_seq_len, " << local_n_kv_heads_
                                                 << "/" << n_kv_heads << " local/total KV heads, "
@@ -185,35 +338,64 @@ namespace llaminar2
     CUDARingKVCacheTQ::~CUDARingKVCacheTQ()
     {
         cudaSetDevice(device_id_);
+        releaseOwnedDeviceStorage();
+    }
 
-        for (auto &layer : entries_)
+    void CUDARingKVCacheTQ::releaseOwnedDeviceStorage() noexcept
+    {
+        auto *const backend = getCUDABackend();
+        bool owns_device_storage =
+            d_batched_k_entry_table_ || d_batched_v_entry_table_ ||
+            rotations_.d_rotations || rotations_.d_rotations_t;
+        for (const auto &layer : entries_)
+            for (const auto &entry : layer)
+                owns_device_storage = owns_device_storage || entry.d_K || entry.d_V;
+        for (const auto &scratch : layer_scratch_)
+            owns_device_storage = owns_device_storage || scratch.d_K || scratch.d_V;
+        if (owns_device_storage && !backend)
         {
-            for (auto &entry : layer)
-                free_entry(entry);
+            LOG_ERROR("[CUDARingKVCacheTQ] CUDA backend unavailable during cache teardown");
+            std::terminate();
         }
 
-        batched_k_view_.reset();
-        batched_v_view_.reset();
-        if (d_batched_k_entry_table_)
-            cudaFree(d_batched_k_entry_table_);
-        if (d_batched_v_entry_table_)
-            cudaFree(d_batched_v_entry_table_);
-        d_batched_k_entry_table_ = nullptr;
-        d_batched_v_entry_table_ = nullptr;
-
-        // Free per-layer scratch buffers
-        for (auto &scratch : layer_scratch_)
+        try
         {
-            scratch.k_view.reset();
-            scratch.v_view.reset();
-            if (scratch.d_K)
-                cudaFree(scratch.d_K);
-            if (scratch.d_V)
-                cudaFree(scratch.d_V);
-        }
-        layer_scratch_.clear();
+            batched_k_view_.reset();
+            batched_v_view_.reset();
 
-        cuda_tq_free_rotations(rotations_);
+            if (d_batched_k_entry_table_)
+                backend->free(d_batched_k_entry_table_, device_id_);
+            if (d_batched_v_entry_table_)
+                backend->free(d_batched_v_entry_table_, device_id_);
+            d_batched_k_entry_table_ = nullptr;
+            d_batched_v_entry_table_ = nullptr;
+
+            for (auto &layer : entries_)
+            {
+                for (auto &entry : layer)
+                    free_entry(entry);
+            }
+
+            for (auto &scratch : layer_scratch_)
+            {
+                scratch.k_view.reset();
+                scratch.v_view.reset();
+                if (scratch.d_K)
+                    backend->free(scratch.d_K, device_id_);
+                if (scratch.d_V)
+                    backend->free(scratch.d_V, device_id_);
+                scratch.d_K = nullptr;
+                scratch.d_V = nullptr;
+            }
+            layer_scratch_.clear();
+
+            cuda_tq_free_rotations(rotations_);
+        }
+        catch (...)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ] CUDA backend threw during cache teardown");
+            std::terminate();
+        }
     }
 
     bool CUDARingKVCacheTQ::publishBatchedEntryTables(cudaStream_t stream)
@@ -237,34 +419,28 @@ namespace llaminar2
             }
         }
 
-        cudaError_t status = cudaMalloc(
-            reinterpret_cast<void **>(&d_batched_k_entry_table_), table_bytes);
-        if (status == cudaSuccess)
-        {
-            status = cudaMalloc(
-                reinterpret_cast<void **>(&d_batched_v_entry_table_),
-                table_bytes);
-        }
-        if (status == cudaSuccess)
-        {
-            status = cudaMemcpyAsync(
+        auto *const backend = getCUDABackend();
+        if (!backend)
+            return false;
+
+        d_batched_k_entry_table_ = static_cast<void **>(
+            backend->allocate(table_bytes, device_id_));
+        d_batched_v_entry_table_ = static_cast<void **>(
+            backend->allocate(table_bytes, device_id_));
+        if (!d_batched_k_entry_table_ ||
+            !d_batched_v_entry_table_ ||
+            !backend->hostToDevice(
                 d_batched_k_entry_table_, host_k.data(), table_bytes,
-                cudaMemcpyHostToDevice, stream);
-        }
-        if (status == cudaSuccess)
-        {
-            status = cudaMemcpyAsync(
+                device_id_, stream) ||
+            !backend->hostToDevice(
                 d_batched_v_entry_table_, host_v.data(), table_bytes,
-                cudaMemcpyHostToDevice, stream);
-        }
-        if (status != cudaSuccess)
+                device_id_, stream))
         {
-            LOG_ERROR("[CUDARingKVCacheTQ] Resident entry-table publication failed: "
-                      << cudaGetErrorString(status));
+            LOG_ERROR("[CUDARingKVCacheTQ] Resident entry-table publication failed");
             if (d_batched_k_entry_table_)
-                cudaFree(d_batched_k_entry_table_);
+                backend->free(d_batched_k_entry_table_, device_id_);
             if (d_batched_v_entry_table_)
-                cudaFree(d_batched_v_entry_table_);
+                backend->free(d_batched_v_entry_table_, device_id_);
             d_batched_k_entry_table_ = nullptr;
             d_batched_v_entry_table_ = nullptr;
             return false;
@@ -278,29 +454,49 @@ namespace llaminar2
 
     void CUDARingKVCacheTQ::allocate_entry(TQEntry &entry)
     {
+        auto *const backend = getCUDABackend();
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "CUDARingKVCacheTQ: CUDA backend unavailable during entry allocation");
+        }
         const size_t k_bytes = static_cast<size_t>(max_seq_len_) * k_pos_bytes_;
         const size_t v_bytes = static_cast<size_t>(max_seq_len_) * v_pos_bytes_;
 
-        cudaMalloc(&entry.d_K, k_bytes);
-        cudaMalloc(&entry.d_V, v_bytes);
+        entry.d_K = backend->allocate(k_bytes, device_id_);
+        entry.d_V = backend->allocate(v_bytes, device_id_);
+        if (!entry.d_K || !entry.d_V)
+        {
+            throw std::runtime_error(
+                "CUDARingKVCacheTQ: failed to allocate permanent compressed entry storage");
+        }
         cudaStream_t alloc_stream = static_cast<cudaStream_t>(
             GPUDeviceContextPool::instance().getNvidiaContext(device_id_).defaultStream());
-        cudaMemsetAsync(entry.d_K, 0, k_bytes, alloc_stream);
-        cudaMemsetAsync(entry.d_V, 0, v_bytes, alloc_stream);
-        cudaStreamSynchronize(alloc_stream);
-
+        if (!alloc_stream ||
+            cudaMemsetAsync(entry.d_K, 0, k_bytes, alloc_stream) != cudaSuccess ||
+            cudaMemsetAsync(entry.d_V, 0, v_bytes, alloc_stream) != cudaSuccess)
+        {
+            throw std::runtime_error(
+                "CUDARingKVCacheTQ: failed to initialize permanent compressed entry storage");
+        }
     }
 
     void CUDARingKVCacheTQ::free_entry(TQEntry &entry)
     {
+        auto *const backend = getCUDABackend();
+        if ((entry.d_K || entry.d_V) && !backend)
+        {
+            throw std::runtime_error(
+                "CUDARingKVCacheTQ: CUDA backend unavailable during entry release");
+        }
         if (entry.d_K)
         {
-            cudaFree(entry.d_K);
+            backend->free(entry.d_K, device_id_);
             entry.d_K = nullptr;
         }
         if (entry.d_V)
         {
-            cudaFree(entry.d_V);
+            backend->free(entry.d_V, device_id_);
             entry.d_V = nullptr;
         }
     }
@@ -596,6 +792,11 @@ namespace llaminar2
         const auto &entry = entries_[layer][desc.seq_idx];
         if (desc.token_count == 0)
         {
+            if (desc.payload_domain ==
+                KVCacheLogicalBlockPayloadDomain::Device)
+            {
+                return true;
+            }
             KVCacheSequenceState state;
             return observeDeviceSequenceState(layer, desc.seq_idx, &state) &&
                    desc.logical_token_start <= state.cached_tokens;
@@ -608,6 +809,52 @@ namespace llaminar2
 
         cudaSetDevice(device_id_);
         const auto stream = static_cast<cudaStream_t>(desc.stream);
+        if (desc.payload_domain ==
+            KVCacheLogicalBlockPayloadDomain::Device)
+        {
+            if (!d_head_params_ || !d_count_params_)
+                return false;
+            const int entry_index =
+                layer * batch_size_ + desc.seq_idx;
+            constexpr int threads = 256;
+            const size_t bytes =
+                static_cast<size_t>(desc.token_count) *
+                (k_pos_bytes_ + v_pos_bytes_);
+            const int blocks = std::max(
+                1,
+                std::min<int>(
+                    65535,
+                    static_cast<int>((bytes + threads - 1) / threads)));
+            tq_ring_logical_block_export_device_kernel
+                <<<blocks, threads, 0, stream>>>(
+                    static_cast<const uint8_t *>(entry.d_K),
+                    static_cast<const uint8_t *>(entry.d_V),
+                    static_cast<uint8_t *>(dst_k),
+                    static_cast<uint8_t *>(dst_v),
+                    &d_head_params_[entry_index],
+                    &d_count_params_[entry_index],
+                    desc.logical_token_start,
+                    desc.token_count,
+                    max_seq_len_,
+                    k_pos_bytes_,
+                    v_pos_bytes_);
+            const cudaError_t launch_error = cudaGetLastError();
+            if (launch_error != cudaSuccess)
+            {
+                LOG_ERROR("[CUDARingKVCacheTQ::exportLogicalBlock] device-domain gather launch failed: "
+                          << cudaGetErrorString(launch_error));
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "prefix_cache",
+                "cuda_device_logical_tq_kv_exports",
+                1.0,
+                "harvest",
+                "cuda:" + std::to_string(device_id_),
+                {{"tokens", std::to_string(desc.token_count)}});
+            return true;
+        }
+
         KVCacheSequenceState state;
         if (!observeDeviceSequenceState(layer, desc.seq_idx, &state))
             return false;
@@ -660,6 +907,72 @@ namespace llaminar2
         }
         auto &entry = entries_[layer][desc.seq_idx];
         const auto stream = static_cast<cudaStream_t>(desc.stream);
+        if (desc.payload_domain ==
+            KVCacheLogicalBlockPayloadDomain::Device)
+        {
+            if (desc.token_count == 0)
+            {
+                if (desc.logical_token_start != 0)
+                    return true;
+                layer_scratch_[layer].invalidate();
+                return setDeviceSequenceState(
+                    layer, desc.seq_idx, 0, 0, stream);
+            }
+            if (!src_k || !src_v || !entry.d_K || !entry.d_V ||
+                !d_head_params_ || !d_count_params_)
+            {
+                return false;
+            }
+
+            const int entry_index =
+                layer * batch_size_ + desc.seq_idx;
+            constexpr int threads = 256;
+            const size_t bytes =
+                static_cast<size_t>(desc.token_count) *
+                (k_pos_bytes_ + v_pos_bytes_);
+            const int blocks = std::max(
+                1,
+                std::min<int>(
+                    65535,
+                    static_cast<int>((bytes + threads - 1) / threads)));
+            tq_ring_logical_block_import_device_kernel
+                <<<blocks, threads, 0, stream>>>(
+                    static_cast<uint8_t *>(entry.d_K),
+                    static_cast<uint8_t *>(entry.d_V),
+                    static_cast<const uint8_t *>(src_k),
+                    static_cast<const uint8_t *>(src_v),
+                    &d_head_params_[entry_index],
+                    &d_count_params_[entry_index],
+                    desc.logical_token_start,
+                    desc.token_count,
+                    max_seq_len_,
+                    k_pos_bytes_,
+                    v_pos_bytes_);
+            tq_ring_logical_block_import_publish_kernel
+                <<<1, 1, 0, stream>>>(
+                    &d_head_params_[entry_index],
+                    &d_count_params_[entry_index],
+                    desc.logical_token_start,
+                    desc.token_count,
+                    max_seq_len_);
+            const cudaError_t launch_error = cudaGetLastError();
+            if (launch_error != cudaSuccess)
+            {
+                LOG_ERROR("[CUDARingKVCacheTQ::importLogicalBlock] device-domain scatter launch failed: "
+                          << cudaGetErrorString(launch_error));
+                return false;
+            }
+            layer_scratch_[layer].invalidate();
+            PerfStatsCollector::addCounter(
+                "prefix_cache",
+                "cuda_device_logical_tq_kv_imports",
+                1.0,
+                "restore",
+                "cuda:" + std::to_string(device_id_),
+                {{"tokens", std::to_string(desc.token_count)}});
+            return true;
+        }
+
         if (desc.token_count == 0)
         {
             if (desc.logical_token_start != 0)
@@ -668,11 +981,7 @@ namespace llaminar2
             return setDeviceSequenceState(
                 layer, desc.seq_idx, 0, 0, stream);
         }
-        KVCacheSequenceState state;
-        if (!src_k || !src_v || !entry.d_K || !entry.d_V ||
-            !observeDeviceSequenceState(layer, desc.seq_idx, &state) ||
-            desc.logical_token_start != state.cached_tokens ||
-            state.implementation_head != state.cached_tokens % max_seq_len_)
+        if (!src_k || !src_v || !entry.d_K || !entry.d_V)
         {
             return false;
         }
@@ -695,7 +1004,7 @@ namespace llaminar2
         if (!setDeviceSequenceState(
                 layer, desc.seq_idx, new_head, new_count, stream))
             return false;
-        return cudaStreamSynchronize(stream) == cudaSuccess;
+        return true;
     }
 
     // =========================================================================
@@ -1295,20 +1604,19 @@ namespace llaminar2
 
     void CUDARingKVCacheTQ::evict_oldest(int layer, int seq_idx, int num_tokens)
     {
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        if (layer < 0 || layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            num_tokens < 0)
             return;
 
-        KVCacheSequenceState state;
-        if (!observeDeviceSequenceState(layer, seq_idx, &state))
-            return;
-        const int evict = std::min(num_tokens, state.cached_tokens);
         const auto stream = clearStream();
-        if (!setDeviceSequenceState(
-                layer, seq_idx, state.implementation_head,
-                state.cached_tokens - evict, stream) ||
-            cudaStreamSynchronize(stream) != cudaSuccess)
+        if (!evictOldestDeviceSequenceState(
+                layer,
+                seq_idx,
+                num_tokens,
+                stream))
         {
-            LOG_ERROR("[CUDARingKVCacheTQ::evict_oldest] Device metadata update failed");
+            LOG_ERROR("[CUDARingKVCacheTQ::evict_oldest] Device metadata eviction launch failed");
             return;
         }
 

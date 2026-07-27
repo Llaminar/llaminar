@@ -41,14 +41,12 @@ namespace llaminar2
 
     CUDAGraphCapture::CUDAGraphCapture(CUDAGraphCapture &&other) noexcept
         : stream_(other.stream_), graph_(other.graph_), exec_(other.exec_),
-          node_count_(other.node_count_),
-          consecutive_update_failures_(other.consecutive_update_failures_)
+          node_count_(other.node_count_)
     {
         other.stream_ = nullptr;
         other.graph_ = nullptr;
         other.exec_ = nullptr;
         other.node_count_ = 0;
-        other.consecutive_update_failures_ = 0;
     }
 
     CUDAGraphCapture &CUDAGraphCapture::operator=(CUDAGraphCapture &&other) noexcept
@@ -60,12 +58,10 @@ namespace llaminar2
             graph_ = other.graph_;
             exec_ = other.exec_;
             node_count_ = other.node_count_;
-            consecutive_update_failures_ = other.consecutive_update_failures_;
             other.stream_ = nullptr;
             other.graph_ = nullptr;
             other.exec_ = nullptr;
             other.node_count_ = 0;
-            other.consecutive_update_failures_ = 0;
         }
         return *this;
     }
@@ -75,7 +71,14 @@ namespace llaminar2
         // Destroy any previous graph (but keep exec_ for tryUpdate)
         if (graph_)
         {
-            CUDA_WARN_IF_FAIL(cudaGraphDestroy(graph_));
+            const cudaError_t destroy_error = cudaGraphDestroy(graph_);
+            if (destroy_error != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAGraphCapture] Cannot begin a new capture because "
+                          "destroying the prior captured graph failed: "
+                          << cudaGetErrorString(destroy_error));
+                return false;
+            }
             graph_ = nullptr;
             node_count_ = 0;
         }
@@ -125,7 +128,14 @@ namespace llaminar2
         // Destroy old executable
         if (exec_)
         {
-            CUDA_WARN_IF_FAIL(cudaGraphExecDestroy(exec_));
+            const cudaError_t destroy_error = cudaGraphExecDestroy(exec_);
+            if (destroy_error != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAGraphCapture] Cannot replace graph executable because "
+                          "destroying the prior executable failed: "
+                          << cudaGetErrorString(destroy_error));
+                return false;
+            }
             exec_ = nullptr;
         }
 
@@ -137,7 +147,6 @@ namespace llaminar2
             exec_ = nullptr;
             return false;
         }
-        consecutive_update_failures_ = 0;
         LOG_DEBUG("[CUDAGraphCapture] Instantiated graph executable (" << node_count_ << " nodes)");
         return true;
     }
@@ -171,26 +180,21 @@ namespace llaminar2
 
         if (err == cudaSuccess && update_result == cudaGraphExecUpdateSuccess)
         {
-            consecutive_update_failures_ = 0;
             LOG_TRACE("[CUDAGraphCapture] Graph executable updated in-place");
             return GraphUpdateResult::Success;
         }
-
-        consecutive_update_failures_++;
 
         if (update_result == cudaGraphExecUpdateErrorTopologyChanged ||
             update_result == cudaGraphExecUpdateErrorNodeTypeChanged ||
             update_result == cudaGraphExecUpdateErrorNotSupported)
         {
             LOG_WARN("[CUDAGraphCapture] Graph update needs reinstantiation: result="
-                     << static_cast<int>(update_result)
-                     << " (failure " << consecutive_update_failures_ << ")");
+                     << static_cast<int>(update_result));
             return GraphUpdateResult::NeedsReinstantiate;
         }
 
         LOG_WARN("[CUDAGraphCapture] Graph update failed: " << cudaGetErrorString(err)
-                                                            << " result=" << static_cast<int>(update_result)
-                                                            << " (failure " << consecutive_update_failures_ << ")");
+                                                            << " result=" << static_cast<int>(update_result));
         return GraphUpdateResult::Failed;
     }
 
@@ -217,7 +221,6 @@ namespace llaminar2
             graph_ = nullptr;
         }
         node_count_ = 0;
-        consecutive_update_failures_ = 0;
     }
 
 } // namespace llaminar2

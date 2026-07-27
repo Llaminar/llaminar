@@ -20,6 +20,35 @@
 
 using namespace llaminar2;
 
+namespace
+{
+    /**
+     * @brief Minimal context that deliberately does not implement GPU collectives.
+     *
+     * The base on-stream API must reject this context instead of silently
+     * routing an explicitly ordered GPU operation through the blocking API.
+     */
+    class BlockingOnlyTPContext final : public ITPContext
+    {
+    public:
+        TPScope scope() const override { return TPScope::GLOBAL; }
+        int degree() const override { return 2; }
+        int myIndex() const override { return 0; }
+        CollectiveBackendType backend() const override { return CollectiveBackendType::MPI; }
+
+        bool allreduce(TensorBase *) override
+        {
+            blocking_allreduce_called = true;
+            return true;
+        }
+
+        bool broadcast(TensorBase *, int) override { return true; }
+        bool allgather(const TensorBase *, TensorBase *) override { return true; }
+
+        bool blocking_allreduce_called = false;
+    };
+}
+
 // =============================================================================
 // Test Fixture
 // =============================================================================
@@ -81,6 +110,25 @@ TEST_F(Test__ITPContext, LocalTPContext_ImplementsITPContext)
     // Should also work with dynamic_cast
     ITPContext *dynamic_ptr = dynamic_cast<ITPContext *>(ctx.get());
     ASSERT_NE(dynamic_ptr, nullptr);
+}
+
+/**
+ * @test An explicit-stream collective never degrades to the blocking API.
+ */
+TEST_F(Test__ITPContext, BaseOnStreamAllreduceRejectsBlockingOnlyContext)
+{
+    BlockingOnlyTPContext context;
+    void *producer_stream = reinterpret_cast<void *>(0xA11D0CE);
+
+    EXPECT_THROW(
+        context.allreduceOnStream(
+            nullptr,
+            "gpu_collective",
+            1,
+            producer_stream,
+            "fp32"),
+        std::logic_error);
+    EXPECT_FALSE(context.blocking_allreduce_called);
 }
 
 /**
@@ -333,4 +381,3 @@ TEST_F(Test__ITPContext, IsLocal_IsGlobal_AreInverses)
     EXPECT_TRUE(base_ptr->isLocal());
     EXPECT_FALSE(base_ptr->isGlobal());
 }
-

@@ -11,6 +11,7 @@
 #include "../../execution/compute_stages/stages/MoEExpertDispatchStage.h"
 #include "../../execution/compute_stages/stages/MoERoutingStage.h"
 #include "../../execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "../../execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "../../execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "../../execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "../../execution/compute_stages/stages/MoESparseReturnReduceStage.h"
@@ -32,6 +33,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -50,7 +52,21 @@ namespace llaminar2
     namespace
     {
         constexpr char kMoEPrefixRuntimeMagic[8] = {'L', 'M', 'O', 'E', 'R', 'U', 'N', '1'};
-        constexpr uint32_t kMoEPrefixRuntimeVersion = 1;
+        constexpr uint32_t kMoEPrefixRuntimeVersion = 3;
+
+        /**
+         * @brief Return whether graph-captured mirrored-layer diagnostics are armed.
+         *
+         * The switch is intentionally opt-in because every selected boundary
+         * adds one small row-copy kernel to the graph. It is read during graph
+         * construction, before any capture, so replay topology never changes
+         * after an executable has been instantiated.
+         */
+        bool mirroredLayerDiagnosticsEnabled()
+        {
+            return DebugEnv::isTruthyEnv(
+                "LLAMINAR_MTP_MIRROR_LAYER_DIAGNOSTICS");
+        }
 
         void appendU32(std::vector<uint8_t> &out, uint32_t value)
         {
@@ -1435,112 +1451,34 @@ namespace llaminar2
             return -1;
         }
 
-        const NativeVnniFormatInfo *nativeVnniFormatInfoForCodebook(uint8_t codebook_id)
-        {
-            switch (codebook_id)
-            {
-            case 0:
-            {
-                static constexpr NativeVnniFormatInfo info{0, 16, false, false, false, 8.0f};
-                return &info;
-            }
-            case 4:
-            {
-                static constexpr NativeVnniFormatInfo info{4, 16, false, false, false, 127.0f};
-                return &info;
-            }
-            case 5:
-            {
-                static constexpr NativeVnniFormatInfo info{5, 16, true, false, false, 15.0f};
-                return &info;
-            }
-            case 6:
-            {
-                static constexpr NativeVnniFormatInfo info{6, 20, false, false, false, 16.0f};
-                return &info;
-            }
-            case 7:
-            {
-                static constexpr NativeVnniFormatInfo info{7, 20, true, false, false, 31.0f};
-                return &info;
-            }
-            case 8:
-            {
-                static constexpr NativeVnniFormatInfo info{8, 24, true, true, false, 32.0f};
-                return &info;
-            }
-            case 9:
-            {
-                static constexpr NativeVnniFormatInfo info{9, 12, true, true, false, 4.0f};
-                return &info;
-            }
-            case 10:
-            {
-                static constexpr NativeVnniFormatInfo info{10, 8, true, true, true, 3.0f};
-                return &info;
-            }
-            case 11:
-            {
-                static constexpr NativeVnniFormatInfo info{11, 13, false, true, false, 15.0f};
-                return &info;
-            }
-            case 12:
-            {
-                static constexpr NativeVnniFormatInfo info{12, 12, false, true, false, 62.0f};
-                return &info;
-            }
-            case 13:
-            {
-                static constexpr NativeVnniFormatInfo info{13, 9, true, true, false, 43.0f};
-                return &info;
-            }
-            case 14:
-            {
-                static constexpr NativeVnniFormatInfo info{14, 9, true, true, false, 43.0f};
-                return &info;
-            }
-            case 15:
-            {
-                static constexpr NativeVnniFormatInfo info{15, 8, false, true, false, 43.0f};
-                return &info;
-            }
-            case 16:
-            {
-                static constexpr NativeVnniFormatInfo info{16, 6, true, true, false, 1.125f};
-                return &info;
-            }
-            case 17:
-            {
-                static constexpr NativeVnniFormatInfo info{17, 6, true, true, false, 1.125f};
-                return &info;
-            }
-            case 19:
-            {
-                static constexpr NativeVnniFormatInfo info{19, 32, false, false, false, 127.0f};
-                return &info;
-            }
-            case 20:
-            {
-                static constexpr NativeVnniFormatInfo info{20, 32, false, false, false, 127.0f};
-                return &info;
-            }
-            default:
-                return nullptr;
-            }
-        }
-
+        /**
+         * @brief Read one layer's exact expert formats without constructing compute views.
+         *
+         * Decode maintenance needs a model-wide allocation profile before its
+         * first graph is finalized. Packed 3-D tensors expose storage-view
+         * dimensions rather than logical per-expert GEMM dimensions, so shape
+         * comes from the declarative model config while codebook characteristics
+         * come from each layer's actual tensor. This preflight does not allocate,
+         * upload, or prepare a kernel.
+         */
         std::optional<std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>>
-        transferSlotSpecsFromExpertParams(
-            const MoEExpertComputeStage::Params &expert_params,
-            int num_experts)
+        transferSlotSpecsFromPackedExpertTensors(
+            TensorBase *gate_exps,
+            TensorBase *up_exps,
+            TensorBase *down_exps,
+            int d_model,
+            int expert_intermediate)
         {
+            if (d_model <= 0 || expert_intermediate <= 0)
+                return std::nullopt;
+
             auto make_spec =
-                [](const char *label, const std::shared_ptr<TensorBase> &view)
+                [](const char *label, TensorBase *tensor, int n, int k)
                 -> std::optional<DeviceMoETransferSlotDirectory::ProjectionSpec>
             {
-                if (!view)
+                if (!tensor || n <= 0 || k <= 0)
                     return std::nullopt;
-                auto *unpackable = dynamic_cast<IINT8Unpackable *>(view.get());
+                auto *unpackable = dynamic_cast<IINT8Unpackable *>(tensor);
                 const NativeVnniFormatInfo *vnni =
                     unpackable ? unpackable->vnniFormatInfo() : nullptr;
                 if (!vnni)
@@ -1548,32 +1486,8 @@ namespace llaminar2
 
                 DeviceMoETransferSlotDirectory::ProjectionSpec spec;
                 spec.label = label;
-                spec.N = static_cast<int>(view->rows());
-                spec.K = static_cast<int>(view->cols());
-                spec.payload_bytes_per_block = vnni->payload_bytes;
-                spec.is_asymmetric = vnni->is_asymmetric;
-                spec.has_emins = vnni->has_emins;
-                spec.codebook_id = vnni->codebook_id;
-                return spec;
-            };
-            auto make_spec_from_gemm =
-                [](const char *label, ITensorGemm *gemm)
-                -> std::optional<DeviceMoETransferSlotDirectory::ProjectionSpec>
-            {
-                if (!gemm)
-                    return std::nullopt;
-                DeviceNativeVNNIMatrixDesc desc;
-                if (!gemm->exportNativeVNNIMatrixDesc(desc) || !desc.valid())
-                    return std::nullopt;
-                const NativeVnniFormatInfo *vnni =
-                    nativeVnniFormatInfoForCodebook(desc.codebook_id);
-                if (!vnni)
-                    return std::nullopt;
-
-                DeviceMoETransferSlotDirectory::ProjectionSpec spec;
-                spec.label = label;
-                spec.N = desc.n;
-                spec.K = desc.k;
+                spec.N = n;
+                spec.K = k;
                 spec.payload_bytes_per_block = vnni->payload_bytes;
                 spec.is_asymmetric = vnni->is_asymmetric;
                 spec.has_emins = vnni->has_emins;
@@ -1581,51 +1495,30 @@ namespace llaminar2
                 return spec;
             };
 
-            for (int expert = 0; expert < num_experts; ++expert)
-            {
-                if (expert >= static_cast<int>(expert_params.expert_gate_views.size()) ||
-                    expert >= static_cast<int>(expert_params.expert_up_views.size()) ||
-                    expert >= static_cast<int>(expert_params.expert_down_views.size()))
-                {
-                    break;
-                }
+            auto gate = make_spec(
+                "gate",
+                gate_exps,
+                expert_intermediate,
+                d_model);
+            auto up = make_spec(
+                "up",
+                up_exps,
+                expert_intermediate,
+                d_model);
+            auto down = make_spec(
+                "down",
+                down_exps,
+                d_model,
+                expert_intermediate);
+            if (!gate || !up || !down)
+                return std::nullopt;
 
-                auto gate = make_spec("gate", expert_params.expert_gate_views[expert]);
-                auto up = make_spec("up", expert_params.expert_up_views[expert]);
-                auto down = make_spec("down", expert_params.expert_down_views[expert]);
-                if (gate && up && down)
-                {
-                    std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec> specs;
-                    specs.reserve(3);
-                    specs.push_back(std::move(*gate));
-                    specs.push_back(std::move(*up));
-                    specs.push_back(std::move(*down));
-                    return specs;
-                }
-            }
-            for (int expert = 0; expert < num_experts; ++expert)
-            {
-                if (expert >= static_cast<int>(expert_params.prepared_gate_gemm.size()) ||
-                    expert >= static_cast<int>(expert_params.prepared_up_gemm.size()) ||
-                    expert >= static_cast<int>(expert_params.prepared_down_gemm.size()))
-                {
-                    break;
-                }
-
-                auto gate = make_spec_from_gemm("gate", expert_params.prepared_gate_gemm[expert]);
-                auto up = make_spec_from_gemm("up", expert_params.prepared_up_gemm[expert]);
-                auto down = make_spec_from_gemm("down", expert_params.prepared_down_gemm[expert]);
-                if (gate && up && down)
-                {
-                    std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec> specs;
-                    specs.reserve(3);
-                    specs.push_back(std::move(*gate));
-                    specs.push_back(std::move(*up));
-                    specs.push_back(std::move(*down));
-                    return specs;
-                }
-            }
-            return std::nullopt;
+            std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec> specs;
+            specs.reserve(3);
+            specs.push_back(std::move(*gate));
+            specs.push_back(std::move(*up));
+            specs.push_back(std::move(*down));
+            return specs;
         }
 
         int participantIdForTierDevice(
@@ -1705,6 +1598,7 @@ namespace llaminar2
     void Qwen35MoEGraph::resetState()
     {
         Qwen35Graph::resetState();
+        prefix_runtime_device_rehydration_pending_ = false;
 
         if (config_.moe.decode_histogram)
             config_.moe.decode_histogram->resetWindow();
@@ -1732,23 +1626,25 @@ namespace llaminar2
          * on stale dynamic placement.
          */
         Qwen35Graph::resetState();
+        prefix_runtime_device_rehydration_pending_ = false;
 
         if (config_.moe.decode_histogram)
             config_.moe.decode_histogram->resetWindow();
 
         /*
-         * Transfer directories, aux transfer streams, and graph-side rebalance
-         * bindings are also request-runtime owners.  They contain device
-         * descriptors and staging slots for dynamic/LLEP movement, so carrying
-         * them across a prefix restore with no portable runtime payload can
-         * make suffix prefill observe expert arrivals from the previous
-         * request.  Prefix restore has already discarded captured graph replay
-         * before calling this hook, so these bindings can be rebuilt lazily for
-         * the suffix graph that follows.
+         * Graph-side bindings, auxiliary streams, and transfer-slot
+         * directories own model-lifetime pointer identities captured by stage
+         * nodes.  Prefix reset must preserve those owners.  Only runtime-table
+         * placement claims are request state; resetDecodeRuntimeState() removes
+         * every transient arrival claim while retaining the stable directory
+         * addresses that the next graph capture/replay will use.
+         *
+         * Clearing these maps used to free directories underneath existing
+         * graph stages and then assume a later graph build would recreate
+         * them.  ComputeGraph nodes outlive replay executables, so that
+         * assumption left dangling transfer pointers and made prefix/MTP
+         * failures dependent on whichever layer reused the freed slot first.
          */
-        moe_graph_rebalance_bindings_.clear();
-        moe_rebalance_transfer_states_.clear();
-        moe_transfer_slot_directories_.clear();
 
         for (auto &[key, table] : moe_runtime_tables_)
         {
@@ -1867,9 +1763,7 @@ namespace llaminar2
     }
 
     ComputeGraph Qwen35MoEGraph::buildDeviceMoERebalanceMaintenanceGraph(
-        DeviceId device,
-        DeviceMoERebalanceMaintenanceGraphKind kind,
-        uint64_t payload_edge_mask)
+        DeviceId device)
     {
         const GraphSideRebalanceBinding *selected_binding =
             findDeviceMoERebalanceMaintenanceBinding(device);
@@ -1894,67 +1788,39 @@ namespace llaminar2
                 device.to_string());
         }
 
-        auto makeMaintenanceParams =
-            [&](const std::string &stage_name,
-                DeviceMoERebalanceStagePhase phase)
-            {
-                MoEDeviceRebalanceStage::Params params;
-                params.device_id = binding.device_id;
-                params.tp_ctx = binding.maintenance_tp_ctx;
-                params.moe_runtime_table = binding.moe_runtime_table;
-                params.tp_device_idx = binding.tp_device_idx;
-                params.config = binding.config;
-                params.local_transfer_slots = binding.local_transfer_slots;
-                params.local_transfer_slot_count = binding.local_transfer_slot_count;
-                params.collective_payload_slot_bytes = binding.collective_payload_slot_bytes;
-                params.collective_payload_slot_capacity = binding.collective_payload_slot_capacity;
-                params.payload_edge_mask =
-                    kind == DeviceMoERebalanceMaintenanceGraphKind::MetadataAndPayload
-                        ? payload_edge_mask
-                        : 0ULL;
-                params.stage_name = stage_name;
-                params.workspace_name = binding.workspace_name;
-                params.phase = phase;
-                params.transfer_mode = binding.transfer_mode;
-                params.transfer_state = binding.transfer_state;
-                return params;
-            };
+        /*
+         * Maintenance is one graph-owned transaction. PlanCopyApply snapshots
+         * source bytes before transport, uses the fixed-capacity collective
+         * payload lane, and applies arrivals before the terminal event is
+         * recorded. The device controller can publish a no-work command, so
+         * the host never needs to inspect an edge mask or select a follow-up
+         * graph.
+         */
+        MoEDeviceRebalanceStage::Params params;
+        params.device_id = binding.device_id;
+        params.tp_ctx = binding.maintenance_tp_ctx;
+        params.moe_runtime_table = binding.moe_runtime_table;
+        params.tp_device_idx = binding.tp_device_idx;
+        params.config = binding.config;
+        params.local_transfer_slots = binding.local_transfer_slots;
+        params.local_transfer_slot_count = binding.local_transfer_slot_count;
+        params.collective_payload_slot_bytes =
+            binding.collective_payload_slot_bytes;
+        params.collective_payload_slot_capacity =
+            binding.collective_payload_slot_capacity;
+        params.stage_name = "moe_device_rebalance_maintenance";
+        params.workspace_name = binding.workspace_name;
+        params.phase = DeviceMoERebalanceStagePhase::PlanCopyApply;
+        params.transfer_mode = binding.transfer_mode;
+        params.transfer_state = binding.transfer_state;
+        params.join_transfer_stream_after_copy = true;
 
         ComputeGraph graph;
-        if (kind == DeviceMoERebalanceMaintenanceGraphKind::MetadataAndPayload)
-        {
-            MoEDeviceRebalanceStage::Params payload_params =
-                makeMaintenanceParams(
-                    "moe_device_rebalance_maintenance_metadata_payload",
-                    DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload);
-            payload_params.join_transfer_stream_after_copy = true;
-
-            graph.addNode(payload_params.stage_name,
-                          ComputeStageFactory::createMoEDeviceRebalance(payload_params),
-                          binding.device_id);
-            graph.setTerminalNode(payload_params.stage_name);
-            return graph;
-        }
-
-        MoEDeviceRebalanceStage::Params collect_params =
-            makeMaintenanceParams(
-                "moe_device_rebalance_maintenance_collect",
-                DeviceMoERebalanceStagePhase::CollectAndGatherState);
-
-        MoEDeviceRebalanceStage::Params plan_params =
-            makeMaintenanceParams(
-                "moe_device_rebalance_maintenance_probe_after_snapshot",
-                DeviceMoERebalanceStagePhase::PlanProbeAfterSideband);
-        plan_params.join_transfer_stream_after_copy = true;
-
-        graph.addNode(collect_params.stage_name,
-                      ComputeStageFactory::createMoEDeviceRebalance(collect_params),
-                      binding.device_id);
-        graph.addNode(plan_params.stage_name,
-                      ComputeStageFactory::createMoEDeviceRebalance(plan_params),
-                      binding.device_id);
-        graph.addDependency(plan_params.stage_name, collect_params.stage_name);
-        graph.setTerminalNode(plan_params.stage_name);
+        graph.addNode(
+            params.stage_name,
+            ComputeStageFactory::createMoEDeviceRebalance(params),
+            binding.device_id);
+        graph.setTerminalNode(params.stage_name);
         return graph;
     }
 
@@ -2061,6 +1927,9 @@ namespace llaminar2
                 appendU32(state, layer.top_k);
                 appendU32(state, layer.participant_id);
                 appendU32(state, layer.participant_count);
+                appendU32(
+                    state,
+                    layer.requires_device_payload_rehydration);
                 for (const auto &expert : layer.experts)
                 {
                     appendI32(state, expert.logical_expert_id);
@@ -2089,75 +1958,9 @@ namespace llaminar2
         return true;
     }
 
-    MoERuntimeTable::LocalPayloadDescriptorResolver
-    Qwen35MoEGraph::localPayloadDescriptorResolverForRuntimeTable(
-        const MoERuntimeTable *table) const
-    {
-        return [this, table](int layer_idx,
-                             int expert,
-                             int local_slot,
-                             DeviceMoEExpertDescriptor &out) -> bool
-        {
-            if (!table || layer_idx < 0 || expert < 0 || local_slot < 0)
-                return false;
-            const uint32_t slot_index = static_cast<uint32_t>(local_slot);
-            const uint32_t logical_expert = static_cast<uint32_t>(expert);
-
-            auto try_binding = [&](const GraphSideRebalanceBinding &binding) -> bool
-            {
-                if (binding.moe_runtime_table != table ||
-                    !deviceMoERebalanceModeUsesTransferSlots(binding.transfer_mode) ||
-                    slot_index >= binding.local_transfer_slot_count)
-                {
-                    return false;
-                }
-
-                const auto directory_it =
-                    moe_transfer_slot_directories_.find(binding.transfer_key);
-                if (directory_it == moe_transfer_slot_directories_.end() ||
-                    !directory_it->second)
-                {
-                    return false;
-                }
-
-                return directory_it->second->descriptorForSlot(
-                    slot_index,
-                    logical_expert,
-                    out);
-            };
-
-            /*
-             * Transfer-backed prefill LLEP owns layer-specific slot directories,
-             * while decode hot-cache rebalance owns a domain-wide directory.  Try
-             * an exact producer-layer match first so a prefix harvested from an
-             * LLEP phase-split prompt rebinds the same layer-local payload slot.
-             */
-            for (const auto &[key, binding] : moe_graph_rebalance_bindings_)
-            {
-                (void)key;
-                if (binding.producer_layer_idx == layer_idx &&
-                    try_binding(binding))
-                {
-                    return true;
-                }
-            }
-
-            for (const auto &[key, binding] : moe_graph_rebalance_bindings_)
-            {
-                (void)key;
-                if (binding.producer_layer_idx != layer_idx &&
-                    try_binding(binding))
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        };
-    }
-
     bool Qwen35MoEGraph::restorePrefixCacheRuntimeState(const std::vector<uint8_t> &state, void *stream)
     {
+        prefix_runtime_device_rehydration_pending_ = false;
         if (state.empty())
             return true;
         if (state.size() < sizeof(kMoEPrefixRuntimeMagic) ||
@@ -2193,6 +1996,7 @@ namespace llaminar2
         }
 
         uint32_t restored_tables = 0;
+        bool requires_device_rehydration = false;
         for (uint32_t table_idx = 0; table_idx < table_count; ++table_idx)
         {
             std::string key;
@@ -2236,7 +2040,11 @@ namespace llaminar2
                     !readU32(state, offset, layer.expert_count) ||
                     !readU32(state, offset, layer.top_k) ||
                     !readU32(state, offset, layer.participant_id) ||
-                    !readU32(state, offset, layer.participant_count))
+                    !readU32(state, offset, layer.participant_count) ||
+                    !readU32(
+                        state,
+                        offset,
+                        layer.requires_device_payload_rehydration))
                 {
                     LOG_ERROR("[Qwen35MoEGraph] Malformed prefix-cache MoE portable runtime layer header");
                     return false;
@@ -2248,6 +2056,9 @@ namespace llaminar2
                               << key << " layer=" << layer_idx);
                     return false;
                 }
+                requires_device_rehydration =
+                    requires_device_rehydration ||
+                    layer.requires_device_payload_rehydration != 0u;
                 layer.experts.resize(static_cast<size_t>(experts));
                 for (uint32_t expert_idx = 0; expert_idx < experts; ++expert_idx)
                 {
@@ -2294,9 +2105,14 @@ namespace llaminar2
                 }
             }
 
-            const auto resolver =
-                localPayloadDescriptorResolverForRuntimeTable(it->second.get());
-            if (!it->second->restorePortableRuntimeState(runtime_layers, stream, resolver))
+            /*
+             * Portable version 3 contains pointer-free logical placement.
+             * Transfer-slot descriptors are reconstructed from immutable owner
+             * payloads by the dedicated captured rehydration transaction; blob
+             * parsing must never consult a rolling slot directory whose bytes
+             * may have been reused since the prefix was harvested.
+             */
+            if (!it->second->restorePortableRuntimeState(runtime_layers, stream))
             {
                 LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE portable runtime restore failed for " << key);
                 return false;
@@ -2309,6 +2125,15 @@ namespace llaminar2
             return false;
         }
 
+        prefix_runtime_device_rehydration_pending_ =
+            requires_device_rehydration;
+        LOG_INFO("[Qwen35MoEGraph] Prefix-runtime restore transaction"
+                 << " device=" << config_.default_device.toString()
+                 << " tables=" << restored_tables
+                 << " device_payload_rehydration="
+                 << (prefix_runtime_device_rehydration_pending_
+                         ? "pending"
+                         : "not_required"));
         PerfStatsCollector::addCounter(
             "prefix_cache",
             "moe_portable_runtime_state_restores",
@@ -2318,6 +2143,22 @@ namespace llaminar2
             {{"tables", std::to_string(restored_tables)},
              {"bytes", std::to_string(state.size())}});
         return true;
+    }
+
+    void Qwen35MoEGraph::completePrefixCacheRuntimeStateDeviceRehydration()
+    {
+        if (!prefix_runtime_device_rehydration_pending_)
+        {
+            throw std::runtime_error(
+                "Qwen35 MoE prefix-runtime device rehydration completion was published without a pending restore transaction");
+        }
+        prefix_runtime_device_rehydration_pending_ = false;
+        PerfStatsCollector::addCounter(
+            "prefix_cache",
+            "moe_portable_runtime_device_rehydrations",
+            1.0,
+            "prefix_cache",
+            config_.default_device.toString());
     }
 
     IMoERuntimeTable *Qwen35MoEGraph::moeRuntimeTableForDevice(DeviceId device,
@@ -2469,6 +2310,10 @@ namespace llaminar2
 
         // Add MoE-specific custom formulas
         int expert_intermediate = config_.moe.intermediate_size;
+        const int shared_intermediate =
+            std::max(0, config_.moe.shared_intermediate_size);
+        const int max_ffn_intermediate =
+            std::max(expert_intermediate, shared_intermediate);
         int top_k = config_.moe.top_k;
         const int mtp_target_query_rows =
             config_.mtp.enabled ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp)) : 1;
@@ -2477,6 +2322,8 @@ namespace llaminar2
 
         config.custom_formulas["moe_top_k"] = static_cast<size_t>(top_k);
         config.custom_formulas["moe_expert_intermediate"] = static_cast<size_t>(expert_intermediate);
+        config.custom_formulas["moe_ffn_intermediate_max"] =
+            static_cast<size_t>(max_ffn_intermediate);
         /*
          * MTP sidecar graphs reuse the MoE BufferIds so that snapshot and
          * publication naming stay aligned with the main graph, but the sidecar
@@ -2498,6 +2345,7 @@ namespace llaminar2
         LOG_DEBUG("[Qwen35MoEGraph::getResolverConfig] MoE formulas: "
                   << "moe_top_k=" << top_k
                   << ", moe_expert_intermediate=" << expert_intermediate
+                  << ", moe_ffn_intermediate_max=" << max_ffn_intermediate
                   << ", moe_activation_rows=" << moe_activation_rows);
 
         return config;
@@ -2513,12 +2361,20 @@ namespace llaminar2
         int layer_idx,
         int seq_len,
         int batch_size,
-        DeviceId device)
+        DeviceId device,
+        const int32_t *sequence_lengths_device)
     {
         // If this layer doesn't have MoE weights, fall back to dense FFN
         if (!layer.moe_gate || !layer.moe_gate_exps)
         {
-            return Qwen35Graph::buildFFNGraph(layer, buffers, layer_idx, seq_len, batch_size, device);
+            return Qwen35Graph::buildFFNGraph(
+                layer,
+                buffers,
+                layer_idx,
+                seq_len,
+                batch_size,
+                device,
+                sequence_lengths_device);
         }
 
         ComputeGraph graph;
@@ -2529,6 +2385,25 @@ namespace llaminar2
                                  : "layer" + std::to_string(layer_idx) + "_";
         std::string ffn_terminal;
         int total_tokens = batch_size * seq_len;
+        if (layer_idx == 0 && mirroredLayerDiagnosticsEnabled())
+        {
+            LOG_INFO(
+                "[MirroredLayerDiagnostics] graph_build device="
+                << device.toString()
+                << " total_tokens=" << total_tokens
+                << " mtp_sidecar=" << (mtp_sidecar_context ? "true" : "false")
+                << " grouped_mtp_verifier="
+                << (config_.grouped_mtp_verifier ? "true" : "false")
+                << " all_position_logits="
+                << (config_.compute_all_position_logits ? "true" : "false")
+                << " live_request_batch_condition="
+                << (config_.live_mtp_request_batch_condition ? "true" : "false")
+                << " checkpoint_graph="
+                << (!mtp_sidecar_context &&
+                            !config_.grouped_mtp_verifier
+                        ? "true"
+                        : "false"));
+        }
         auto overlay_runtime_plan = runtimePlanForGraph(config_);
         const auto &overlay_plan = overlay_runtime_plan
                                        ? overlay_runtime_plan->sourcePlanPtr()
@@ -2657,11 +2532,27 @@ namespace llaminar2
             layer_idx >= config_.pp_layer_offset &&
             layer_idx < config_.pp_layer_offset + config_.n_layers &&
             !config_.compute_all_position_logits;
-        const bool first_local_decode_layer =
-            local_decode_layer &&
+        /*
+         * MTP may execute the main model exclusively through a grouped
+         * all-position verifier.  That graph is not prefill: each row is a
+         * serial-decode-equivalent candidate and its route kernels own the
+         * production decode histograms.  Treat it as a decode maintenance
+         * producer so the device-side controller never waits for an M=1 graph
+         * that this request is not required to build.
+         */
+        const bool grouped_main_verifier_layer =
+            !mtp_sidecar_context &&
+            total_tokens > 1 &&
+            config_.compute_all_position_logits &&
+            layer_idx >= config_.pp_layer_offset &&
+            layer_idx < config_.pp_layer_offset + config_.n_layers;
+        const bool device_rebalance_decode_layer =
+            local_decode_layer || grouped_main_verifier_layer;
+        const bool first_device_rebalance_decode_layer =
+            device_rebalance_decode_layer &&
             layer_idx == config_.pp_layer_offset;
-        const bool last_local_decode_layer =
-            local_decode_layer &&
+        const bool last_device_rebalance_decode_layer =
+            device_rebalance_decode_layer &&
             layer_idx == config_.pp_layer_offset + config_.n_layers - 1;
         auto *local_tp_ctx = dynamic_cast<ILocalTPContext *>(config_.tp_ctx);
         int hot_replica_cap = config_.moe.hot_expert_cache.resolveCap(
@@ -2672,6 +2563,19 @@ namespace llaminar2
             parsedLLEPPrefillTransferMode();
         const bool require_full_llep_prefill_transfer =
             llep_prefill_transfer_mode == 1;
+        const bool prefix_runtime_device_rehydration =
+            prefixRuntimeRehydrationGraphActive() &&
+            !mtp_sidecar_context &&
+            device.is_gpu();
+        if (prefix_runtime_device_rehydration &&
+            layer_idx == config_.pp_layer_offset)
+        {
+            LOG_INFO("[Qwen35MoEGraph] Building dedicated prefix-runtime "
+                     "device rehydration graph"
+                     << " device=" << device.to_string()
+                     << " total_tokens=" << total_tokens
+                     << " first_layer=" << layer_idx);
+        }
         const bool llep_prefill_requested =
             !mtp_sidecar_context &&
             total_tokens > 1 &&
@@ -2698,6 +2602,13 @@ namespace llaminar2
                 *local_tp_ctx,
                 device,
                 config_.tp_device_idx);
+        const bool prefix_runtime_rehydration_transport_supported =
+            prefix_runtime_device_rehydration &&
+            local_tp_ctx &&
+            isHomogeneousGpuLocalTPRebalanceDomain(
+                *local_tp_ctx,
+                device,
+                config_.tp_device_idx);
         if (llep_prefill_enabled &&
             require_full_llep_prefill_transfer &&
             !llep_prefill_transport_supported)
@@ -2707,6 +2618,13 @@ namespace llaminar2
                 "a homogeneous graph-capturable NCCL/RCCL LocalTP domain for " +
                 device.to_string() + "; refusing resident-only or host fallback");
         }
+        if (prefix_runtime_device_rehydration &&
+            !prefix_runtime_rehydration_transport_supported)
+        {
+            throw std::runtime_error(
+                "Qwen35 MoE prefix-runtime payload rehydration requires a homogeneous graph-capturable NCCL/RCCL LocalTP domain for " +
+                device.to_string());
+        }
         const RoutedExpertAssignmentPolicy prefill_routed_expert_assignment_policy =
             (total_tokens > 1 && !llep_prefill_enabled)
                 ? RoutedExpertAssignmentPolicy::StaticOwner
@@ -2714,7 +2632,7 @@ namespace llaminar2
         if (env.presence.has("LLAMINAR_MOE_REBALANCE_REPLICAS"))
             hot_replica_cap = std::max(0, env.moe_rebalance.max_replicas);
         const bool device_side_graph_rebalance_candidate =
-            local_decode_layer &&
+            device_rebalance_decode_layer &&
             env.moe_rebalance.device_rebalance_graph_controller &&
             config_.moe.rebalance_mode == MoERebalanceMode::DYNAMIC &&
             local_tp_ctx &&
@@ -2723,8 +2641,9 @@ namespace llaminar2
                 device,
                 config_.tp_device_idx);
         const bool prefill_llep_transfer_candidate =
-            require_full_llep_prefill_transfer &&
-            llep_prefill_transport_supported;
+            (require_full_llep_prefill_transfer &&
+             llep_prefill_transport_supported) ||
+            prefix_runtime_rehydration_transport_supported;
         const bool graph_rebalance_transport_candidate =
             device_side_graph_rebalance_candidate ||
             prefill_llep_transfer_candidate;
@@ -2821,9 +2740,47 @@ namespace llaminar2
                 /*register_decode_histogram=*/false);
         }
 
-        std::optional<std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>>
-            graph_rebalance_transfer_specs;
+        std::optional<DeviceMoETransferSlotDirectory::FormatProfile>
+            graph_rebalance_transfer_profile;
         std::optional<DeviceMoERebalanceTransferMode> graph_rebalance_transfer_mode;
+        auto collectGraphRebalanceTransferProfile =
+            [&]() -> DeviceMoETransferSlotDirectory::FormatProfile
+        {
+            /*
+             * One transfer directory is shared by the complete device-local MoE
+             * domain. Its slots retain arrivals from different layers, so sizing
+             * it from the current layer would either reject a later, wider
+             * codebook or force one full directory allocation per layer. Scan
+             * every exact packed tensor before any directory is created and
+             * merge those formats into one immutable capacity profile.
+             */
+            std::vector<std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>>
+                layer_formats;
+            layer_formats.reserve(static_cast<size_t>(runtime_table_layers));
+            for (int scan_layer = 0;
+                 scan_layer < runtime_table_layers;
+                 ++scan_layer)
+            {
+                const LayerWeights scan_weights =
+                    layerWeightsForGraph(scan_layer);
+                auto exact_specs =
+                    transferSlotSpecsFromPackedExpertTensors(
+                        scan_weights.moe_gate_exps,
+                        scan_weights.moe_up_exps,
+                        scan_weights.moe_down_exps,
+                        config_.d_model,
+                        config_.moe.intermediate_size);
+                if (!exact_specs.has_value())
+                {
+                    throw std::runtime_error(
+                        "Qwen35 MoE graph could not derive NativeVNNI transfer-slot specs for model layer " +
+                        std::to_string(scan_layer) + " on " + device.to_string());
+                }
+                layer_formats.push_back(std::move(*exact_specs));
+            }
+            return DeviceMoETransferSlotDirectory::profileForLayerFormats(
+                layer_formats);
+        };
         auto graphRebalanceDomainKey = [&]() -> std::string
         {
             std::ostringstream key;
@@ -2873,11 +2830,14 @@ namespace llaminar2
             if (prefill_llep_transfer_candidate)
             {
                 /*
-                 * Transfer-backed prefill LLEP enqueues compute-stream command
-                 * materialization and aux-stream payload movement without a host
-                 * sync.  Use a small rolling lane set so adjacent layers cannot
-                 * overwrite each other's plan/status/payload buffers while
-                 * avoiding a full per-layer payload allocation.
+                 * A transfer-backed prefill stage joins its auxiliary transfer
+                 * stream back into the layer's compute stream before expert
+                 * execution. Two persistent lanes therefore cover adjacent
+                 * layers while allowing layer N+2 to reuse layer N's storage
+                 * only after the graph's event edge has completed. Keeping the
+                 * lane count fixed is essential: a payload workspace per model
+                 * layer consumes several GiB for production expert shapes and
+                 * starves the forward graph's activation/KV scratch budget.
                  */
                 constexpr int kPrefillLLEPTransferWorkspaceLanes = 2;
                 workspace += ":prefill_lane=";
@@ -2980,7 +2940,8 @@ namespace llaminar2
                     static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
             }
 
-            if (first_local_decode_layer && rebalance_config.num_layers > 0)
+            if (first_device_rebalance_decode_layer &&
+                rebalance_config.num_layers > 0)
             {
                 const uint32_t current_layer =
                     static_cast<uint32_t>(std::max(0, layer_idx));
@@ -3141,10 +3102,10 @@ namespace llaminar2
                 rebalance_config.flags |=
                     static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
             }
-            if (!graph_rebalance_transfer_specs.has_value())
+            if (!graph_rebalance_transfer_profile.has_value())
             {
                 throw std::runtime_error(
-                    "Qwen35 MoE graph-side transfer binding requires NativeVNNI transfer slot specs for layer " +
+                    "Qwen35 MoE graph-side transfer binding requires a NativeVNNI transfer profile for layer " +
                     std::to_string(layer_idx) + " on " + device.to_string() +
                     (context ? std::string(" (") + context + ")" : std::string{}));
             }
@@ -3178,21 +3139,19 @@ namespace llaminar2
                     : 1ULL;
             const uint64_t requested_transfer_slots =
                 std::max<uint64_t>(hot_cache_slots, prefill_llep_slots);
-            const uint32_t transfer_slot_count =
-                std::max<uint32_t>(
-                    1u,
-                    std::min<uint32_t>(
-                        static_cast<uint32_t>(
-                            std::min<uint64_t>(
-                                requested_transfer_slots,
-                                static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))),
-                        static_cast<uint32_t>(
-                            std::max(1, env.moe_rebalance.gpu_direct_transfer_wave_experts))));
+            const auto transfer_capacity =
+                DeviceMoETransferSlotDirectory::planBufferedCapacity(
+                    requested_transfer_slots,
+                    static_cast<uint32_t>(
+                        std::max(1, env.moe_rebalance.gpu_direct_transfer_wave_experts)),
+                    static_cast<uint32_t>(
+                        std::max(1, env.moe_rebalance.gpu_direct_transfer_buffers)));
+            const uint32_t transfer_slot_count = transfer_capacity.total_slots;
 
             std::ostringstream transfer_key_builder;
-            transfer_key_builder << binding_key
+            transfer_key_builder << graphRebalanceDomainKey()
                                  << ":slots=" << transfer_slot_count;
-            for (const auto &spec : *graph_rebalance_transfer_specs)
+            for (const auto &spec : graph_rebalance_transfer_profile->allocation_specs)
             {
                 transfer_key_builder << ':' << spec.label
                                      << '=' << spec.N << 'x' << spec.K
@@ -3201,6 +3160,8 @@ namespace llaminar2
                                      << ":asym" << (spec.is_asymmetric ? 1 : 0)
                                      << ":emins" << (spec.has_emins ? 1 : 0);
             }
+            transfer_key_builder
+                << ":wire=" << graph_rebalance_transfer_profile->max_wire_payload_bytes;
             const std::string transfer_key = transfer_key_builder.str();
             auto &transfer_directory = moe_transfer_slot_directories_[transfer_key];
             if (!transfer_directory)
@@ -3211,13 +3172,32 @@ namespace llaminar2
                     gpu_ordinal,
                     rebalance_config.participant_id,
                     transfer_slot_count,
-                    *graph_rebalance_transfer_specs,
+                    *graph_rebalance_transfer_profile,
                     gpuDirectRebalanceVramSafetyMarginBytes());
             }
 
             const std::string rebalance_workspace = graphRebalanceWorkspaceName();
+            /*
+             * Transfer payloads and event edges are layer-owned; only the
+             * auxiliary stream and workspace storage use the bounded rolling
+             * lane.  A CUDA/HIP graph may contain many records and waits on the
+             * same auxiliary stream, but reusing one event object for layer 0,
+             * layer 2, layer 4, ... makes those graph dependencies alias the
+             * event's latest record.  That ambiguity used to invalidate
+             * long-context capture after several MoE layers.
+             *
+             * Key the state object by the layer-specific transfer identity so
+             * every stage owns a persistent compute-ready/transfer-done event
+             * pair. DeviceMoERebalanceTransferState::ensure() still asks the
+             * worker context for the auxiliary stream by rebalance_workspace,
+             * so all even layers share lane 0 and all odd layers share lane 1.
+             * The result is two streams and two workspace lanes, with explicit
+             * non-aliasing graph edges for every layer.
+             */
+            const std::string transfer_state_key =
+                binding_key + ":workspace=" + rebalance_workspace;
             auto &state_ref =
-                moe_rebalance_transfer_states_[transfer_key + ":workspace=" + rebalance_workspace];
+                moe_rebalance_transfer_states_[transfer_state_key];
             if (!state_ref)
                 state_ref = std::make_shared<DeviceMoERebalanceTransferState>();
 
@@ -3228,7 +3208,7 @@ namespace llaminar2
                         std::max(1, env.moe_rebalance.device_rebalance_compact_payload_slots)));
             const uint64_t collective_payload_slot_bytes =
                 static_cast<uint64_t>(
-                    ((transfer_directory->slotPayloadBytes() +
+                    ((transfer_directory->wirePayloadBytes() +
                       sizeof(DeviceMoEExpertDirectoryEntry) + 255u) /
                      256u) *
                     256u);
@@ -3259,17 +3239,8 @@ namespace llaminar2
         {
             if (!prefill_llep_transfer_candidate)
                 return;
-            auto layer_transfer_specs =
-                transferSlotSpecsFromExpertParams(
-                    expert_params,
-                    config_.moe.num_experts);
-            if (!layer_transfer_specs.has_value())
-            {
-                throw std::runtime_error(
-                    "Qwen35 MoE LLEP prefill could not derive NativeVNNI transfer slot specs for layer " +
-                    std::to_string(layer_idx) + " on " + device.to_string());
-            }
-            graph_rebalance_transfer_specs = std::move(layer_transfer_specs);
+            graph_rebalance_transfer_profile =
+                collectGraphRebalanceTransferProfile();
             const auto *binding =
                 ensureGraphRebalanceTransferBindingOnly(context);
             if (!binding)
@@ -3289,6 +3260,13 @@ namespace llaminar2
                 binding->collective_payload_slot_capacity;
             expert_params.prefill_llep_transfer_mode =
                 binding->transfer_mode;
+            expert_params.prefix_runtime_device_rehydration =
+                prefix_runtime_device_rehydration;
+            if (prefix_runtime_device_rehydration)
+            {
+                expert_params.prefix_runtime_rehydration_transfer_state =
+                    std::make_shared<DeviceMoERebalanceTransferState>();
+            }
             expert_params.prefill_llep_rebalance_config =
                 binding->config;
             expert_params.prefill_llep_transfer_state =
@@ -3631,7 +3609,8 @@ namespace llaminar2
             }
 
             const std::string domain_key = graphRebalanceDomainKey();
-            if (first_local_decode_layer && !graph_rebalance_plan_inserted)
+            if (first_device_rebalance_decode_layer &&
+                !graph_rebalance_plan_inserted)
             {
                 moe_graph_rebalance_bindings_.erase(domain_key);
                 if (!ensureGraphRebalanceTransferMode())
@@ -3656,10 +3635,10 @@ namespace llaminar2
                         rebalance_config.flags |=
                             static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
                     }
-                    if (!graph_rebalance_transfer_specs.has_value())
+                    if (!graph_rebalance_transfer_profile.has_value())
                     {
                         throw std::runtime_error(
-                            "Qwen35 MoE graph-side rebalance requires NativeVNNI transfer slot specs for layer " +
+                            "Qwen35 MoE graph-side rebalance requires a NativeVNNI transfer profile for layer " +
                             std::to_string(layer_idx) + " on " + device.to_string() +
                             (context ? std::string(" (") + context + ")" : std::string{}));
                     }
@@ -3686,21 +3665,24 @@ namespace llaminar2
                             1u,
                             rebalance_config.max_hot_replicas_per_participant)) *
                         static_cast<uint64_t>(effective_layer_wave_count);
+                    const auto transfer_capacity =
+                        DeviceMoETransferSlotDirectory::planBufferedCapacity(
+                            requested_transfer_slots,
+                            static_cast<uint32_t>(
+                                std::max(
+                                    1,
+                                    env.moe_rebalance.gpu_direct_transfer_wave_experts)),
+                            static_cast<uint32_t>(
+                                std::max(
+                                    1,
+                                    env.moe_rebalance.gpu_direct_transfer_buffers)));
                     const uint32_t transfer_slot_count =
-                        std::max<uint32_t>(
-                            1u,
-                            std::min<uint32_t>(
-                                static_cast<uint32_t>(
-                                    std::min<uint64_t>(
-                                        requested_transfer_slots,
-                                        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))),
-                                static_cast<uint32_t>(
-                                    std::max(1, env.moe_rebalance.gpu_direct_transfer_wave_experts))));
+                        transfer_capacity.total_slots;
 
                     std::ostringstream transfer_key_builder;
                     transfer_key_builder << domain_key
                                          << ":slots=" << transfer_slot_count;
-                    for (const auto &spec : *graph_rebalance_transfer_specs)
+                    for (const auto &spec : graph_rebalance_transfer_profile->allocation_specs)
                     {
                         transfer_key_builder << ':' << spec.label
                                              << '=' << spec.N << 'x' << spec.K
@@ -3709,6 +3691,8 @@ namespace llaminar2
                                              << ":asym" << (spec.is_asymmetric ? 1 : 0)
                                              << ":emins" << (spec.has_emins ? 1 : 0);
                     }
+                    transfer_key_builder
+                        << ":wire=" << graph_rebalance_transfer_profile->max_wire_payload_bytes;
                     transfer_key = transfer_key_builder.str();
 
                     auto &transfer_directory =
@@ -3721,7 +3705,7 @@ namespace llaminar2
                             gpu_ordinal,
                             rebalance_config.participant_id,
                             transfer_slot_count,
-                            *graph_rebalance_transfer_specs,
+                            *graph_rebalance_transfer_profile,
                             gpuDirectRebalanceVramSafetyMarginBytes());
                     }
 
@@ -3739,7 +3723,7 @@ namespace llaminar2
                     transfer_state = state_ref;
                     collective_payload_slot_bytes =
                         static_cast<uint64_t>(
-                            ((transfer_directory->slotPayloadBytes() +
+                            ((transfer_directory->wirePayloadBytes() +
                               sizeof(DeviceMoEExpertDirectoryEntry) + 255u) /
                              256u) *
                             256u);
@@ -3911,7 +3895,7 @@ namespace llaminar2
             }
             const bool boundary_apply =
                 needs_deferred_resident_apply || needs_transfer_slot_apply;
-            if (boundary_apply && !last_local_decode_layer)
+            if (boundary_apply && !last_device_rebalance_decode_layer)
             {
                 return {};
             }
@@ -4005,6 +3989,14 @@ namespace llaminar2
         // =====================================================================
         // Stage 2: MoE Routing (softmax top-k expert selection)
         // =====================================================================
+        /*
+         * Routing and routed-expert execution form one graph-local producer /
+         * consumer transaction. They share Q8 hidden rows and device route
+         * metadata through this explicit owner, while every separately built
+         * main graph, MTP sidecar, and layer gets a different owner.
+         */
+        auto routed_pipeline_kernel_owner =
+            std::make_shared<MoERoutedPipelineKernelOwner>();
         TensorBase *routing_indices = buffers.get(buffers.idFor(BufferId::MOE_EXPERT_INDICES));
         TensorBase *routing_weights = buffers.get(buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS));
         int expert_intermediate = config_.moe.intermediate_size;
@@ -4030,6 +4022,8 @@ namespace llaminar2
             route_params.moe_runtime_table = moe_runtime_table;
             route_params.force_grouped_verifier_prefill_for_decode =
                 forceGroupedMoEVerifierPrefill(device);
+            route_params.routed_pipeline_kernel_owner =
+                routed_pipeline_kernel_owner;
             route_params.allow_eager_gpu_single_row_route_for_partial_expert_owner =
                 allow_eager_partial_owner_gpu_route;
             route_params.force_decode_equivalent_verifier_prefill =
@@ -4042,43 +4036,19 @@ namespace llaminar2
 
             if (device_side_graph_rebalance_candidate &&
                 env.moe_rebalance.device_rebalance_maintenance_graph &&
-                local_decode_layer &&
-                (first_local_decode_layer || last_local_decode_layer))
+                device_rebalance_decode_layer &&
+                (first_device_rebalance_decode_layer ||
+                 last_device_rebalance_decode_layer))
             {
-                if (first_local_decode_layer &&
+                if (first_device_rebalance_decode_layer &&
                     shouldCollectGraphRebalanceTransferSpecs() &&
-                    !graph_rebalance_transfer_specs.has_value())
+                    !graph_rebalance_transfer_profile.has_value())
                 {
-                    MoEExpertComputeStage::Params spec_params;
-                    spec_params.device_id = device;
-                    spec_params.num_experts = config_.moe.num_experts;
-                    spec_params.gate_exps = layer.moe_gate_exps;
-                    spec_params.up_exps = layer.moe_up_exps;
-                    spec_params.down_exps = layer.moe_down_exps;
-                    spec_params.expert_intermediate = expert_intermediate;
-                    spec_params.layer_idx = layer_idx;
-                    if (config_.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned)
-                    {
-                        spec_params.local_expert_start = config_.moe.local_expert_start;
-                        spec_params.local_expert_count = config_.moe.local_expert_count;
-                    }
-                    if (!MoEExpertComputeStage::extractExpertViews(spec_params))
-                    {
-                        throw std::runtime_error(
-                            "Qwen35 MoE graph failed to extract expert transfer-slot views before routing for layer " +
-                            std::to_string(layer_idx) + " on " + device.to_string());
-                    }
-                    graph_rebalance_transfer_specs =
-                        transferSlotSpecsFromExpertParams(spec_params, config_.moe.num_experts);
-                    if (!graph_rebalance_transfer_specs.has_value())
-                    {
-                        throw std::runtime_error(
-                            "Qwen35 MoE graph could not derive NativeVNNI transfer-slot specs before routing for layer " +
-                            std::to_string(layer_idx) + " on " + device.to_string());
-                    }
+                    graph_rebalance_transfer_profile =
+                        collectGraphRebalanceTransferProfile();
                 }
 
-                if (first_local_decode_layer)
+                if (first_device_rebalance_decode_layer)
                     (void)maybeInsertGraphSideRebalance(
                         "MoE routing ready-wave apply piggyback",
                         std::string{});
@@ -4097,7 +4067,7 @@ namespace llaminar2
                             DeviceMoERebalanceFlags::DeferRuntimeApply);
                     if (needs_transfer_slot_apply || needs_deferred_resident_apply)
                     {
-                        if (last_local_decode_layer)
+                        if (last_device_rebalance_decode_layer)
                         {
                             route_params.device_rebalance_route_apply = true;
                             route_params.device_rebalance_workspace_name =
@@ -4187,6 +4157,8 @@ namespace llaminar2
                 expert_params.d_model = config_.d_model;
                 expert_params.num_experts = config_.moe.num_experts;
                 expert_params.top_k = config_.moe.top_k;
+                expert_params.routed_pipeline_kernel_owner =
+                    routed_pipeline_kernel_owner;
                 expert_params.gate_exps = layer.moe_gate_exps;
                 expert_params.up_exps = layer.moe_up_exps;
                 expert_params.down_exps = layer.moe_down_exps;
@@ -4478,12 +4450,6 @@ namespace llaminar2
                         "Qwen35 MoE graph failed to prepare LocalTP expert-ID-apportioned fast-path parameters for layer " +
                         std::to_string(layer_idx) + " on " + device.to_string());
                 }
-                if (shouldCollectGraphRebalanceTransferSpecs())
-                {
-                    graph_rebalance_transfer_specs =
-                        transferSlotSpecsFromExpertParams(expert_params, config_.moe.num_experts);
-                }
-
                 const bool least_loaded_prefill_runtime_grouping =
                     moe_runtime_table &&
                     total_tokens > 1 &&
@@ -4522,7 +4488,8 @@ namespace llaminar2
                 }
 
                 if (prefill_llep_transfer_candidate &&
-                    expert_params.use_runtime_prefill_grouping)
+                    (expert_params.use_runtime_prefill_grouping ||
+                     prefix_runtime_device_rehydration))
                 {
                     attachPrefillLLEPTransferBinding(
                         expert_params,
@@ -4904,6 +4871,15 @@ namespace llaminar2
                                 }
                             }
                         }
+                        if (!MoELocalExpertStage::prepareExpertGemmEngines(local_params))
+                        {
+                            throw std::runtime_error(
+                                "Qwen35 MoE graph failed to prepare participant-local "
+                                "expert engines for layer " +
+                                std::to_string(layer_idx) + " participant " +
+                                std::to_string(target_participant) + " on " +
+                                target_device.to_string());
+                        }
 
                         const std::string local_name = prefix + "moe_local_expert_" + participant_suffix;
                         graph.addNode(local_name,
@@ -5037,14 +5013,9 @@ namespace llaminar2
                         "Qwen35 MoE graph failed to prepare expert parameters for layer " +
                         std::to_string(layer_idx) + " on " + device.to_string());
                 }
-                if (shouldCollectGraphRebalanceTransferSpecs())
-                {
-                    graph_rebalance_transfer_specs =
-                        transferSlotSpecsFromExpertParams(expert_params, config_.moe.num_experts);
-                }
-
                 if (prefill_llep_transfer_candidate &&
-                    expert_params.use_runtime_prefill_grouping)
+                    (expert_params.use_runtime_prefill_grouping ||
+                     prefix_runtime_device_rehydration))
                 {
                     attachPrefillLLEPTransferBinding(
                         expert_params,
@@ -5199,11 +5170,19 @@ namespace llaminar2
             shared_params.up_w = layer.shared_expert_up;
             shared_params.down_w = layer.shared_expert_down;
             shared_params.output = shared_output;
+            shared_params.gate_scratch =
+                buffers.get(buffers.idFor(BufferId::MOE_GATE_SCRATCH));
+            shared_params.up_scratch =
+                buffers.get(buffers.idFor(BufferId::MOE_UP_SCRATCH));
             shared_params.seq_len = total_tokens;
             shared_params.d_model = config_.d_model;
             shared_params.intermediate = shared_intermediate;
             shared_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
             shared_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+            shared_params.gate_scratch_buffer_id =
+                buffers.idFor(BufferId::MOE_GATE_SCRATCH);
+            shared_params.up_scratch_buffer_id =
+                buffers.idFor(BufferId::MOE_UP_SCRATCH);
             /*
              * Shared-expert verifier rows must match ordinary serial decode,
              * not a separate dense GEMM oracle.  GPU serial decode uses the MoE
@@ -5503,7 +5482,7 @@ namespace llaminar2
             ffn_terminal = prefix + "ffn_residual";
         }
 
-        if (last_local_decode_layer &&
+        if (last_device_rebalance_decode_layer &&
             !env.moe_rebalance.device_rebalance_maintenance_graph &&
             !ffn_terminal.empty())
         {
@@ -5561,8 +5540,255 @@ namespace llaminar2
             }
         }
 
+        if (!mtp_sidecar_context &&
+            device.is_gpu() &&
+            mirroredLayerDiagnosticsEnabled() &&
+            !ffn_terminal.empty())
+        {
+            /*
+             * Preserve the two values needed to reconstruct a transformer
+             * layer boundary in this graph family:
+             *
+             *  - current_hidden is the accumulated residual after attention.
+             *  - attn_proj is the current layer's FFN delta.
+             *
+             * The next layer's fused residual norm combines those tensors.
+             * Capturing both therefore distinguishes an attention/residual
+             * divergence from a routed/shared-FFN divergence without copying a
+             * complete activation matrix. HiddenStateRowSelectStage records
+             * only the final logical row, so storage remains
+             * O(graph variants * layers * d_model) even when a request
+             * contains thousands of prefill or verifier rows.
+             *
+             * Grouped verifier graphs need their own bank. Accepted-state
+             * publication can select the next terminal hidden row directly
+             * from a grouped verifier result; retaining only the older prefill
+             * bank would hide the producer that actually supplied the failed
+             * mailbox payload.
+             */
+            const std::string graph_regime =
+                config_.grouped_mtp_verifier
+                    ? "grouped_verifier"
+                    : config_.live_mtp_request_batch_condition
+                    ? "request_batch_decode"
+                    : total_tokens == 1
+                          ? "serial_decode"
+                          : "prefill";
+            const std::string graph_shape =
+                graph_regime + "_m" + std::to_string(total_tokens);
+
+            auto add_terminal_row_checkpoint =
+                [&](const std::string &boundary,
+                    const ITensor *source,
+                    const std::string &dependency) -> std::string
+            {
+                if (!source)
+                {
+                    throw std::runtime_error(
+                        "Qwen35 MoE mirrored-layer diagnostics lost source tensor for " +
+                        boundary);
+                }
+
+                const std::string checkpoint_name =
+                    graph_shape + "_layer" + std::to_string(layer_idx) +
+                    "_" + boundary;
+                auto &checkpoint = mirrored_layer_checkpoints_[checkpoint_name];
+                if (!checkpoint)
+                {
+                    checkpoint = std::make_unique<FP32Tensor>(
+                        std::vector<size_t>{
+                            1u,
+                            static_cast<size_t>(config_.d_model)},
+                        device);
+                }
+
+                const std::string node_name =
+                    prefix + "mirror_checkpoint_" + graph_shape + "_" + boundary;
+                HiddenStateRowSelectStage::Params checkpoint_params;
+                checkpoint_params.device_id = device;
+                checkpoint_params.input = source;
+                checkpoint_params.output = checkpoint.get();
+                checkpoint_params.seq_len = total_tokens;
+                checkpoint_params.d_model = config_.d_model;
+                checkpoint_params.selected_row_idx = total_tokens - 1;
+                configureMirroredCheckpointRowOwnership(
+                    checkpoint_params,
+                    total_tokens,
+                    device,
+                    sequence_lengths_device);
+
+                graph.addNode(
+                    node_name,
+                    ComputeStageFactory::createHiddenStateRowSelect(
+                        checkpoint_params),
+                    device);
+                graph.addDependency(node_name, dependency);
+                return node_name;
+            };
+
+            const std::string hidden_checkpoint =
+                add_terminal_row_checkpoint(
+                    "attention_residual",
+                    buffers.current_hidden,
+                    ffn_terminal);
+            ffn_terminal =
+                add_terminal_row_checkpoint(
+                    "ffn_delta",
+                    buffers.attn_proj,
+                    hidden_checkpoint);
+        }
+
         graph.setTerminalNode(ffn_terminal);
         return graph;
+    }
+
+    std::vector<Qwen35MoEGraph::MirroredLayerCheckpoint>
+    Qwen35MoEGraph::mirroredLayerCheckpoints() const
+    {
+        std::vector<MirroredLayerCheckpoint> checkpoints;
+        checkpoints.reserve(mirrored_layer_checkpoints_.size());
+        for (const auto &[name, tensor] : mirrored_layer_checkpoints_)
+        {
+            if (!tensor)
+                continue;
+            checkpoints.push_back({
+                .name = name,
+                .tensor = tensor.get(),
+            });
+        }
+        std::sort(
+            checkpoints.begin(),
+            checkpoints.end(),
+            [](const MirroredLayerCheckpoint &lhs,
+               const MirroredLayerCheckpoint &rhs)
+            {
+                return lhs.name < rhs.name;
+            });
+        return checkpoints;
+    }
+
+    std::string Qwen35MoEGraph::maybeAddFinalNormDiagnosticCheckpoint(
+        ComputeGraph &graph,
+        const std::string &boundary,
+        TensorBase *source,
+        const std::string &dependency,
+        int total_tokens,
+        DeviceId device,
+        const int32_t *sequence_lengths_device)
+    {
+        if (mtp_graph_context_active_ ||
+            !device.is_gpu() ||
+            !mirroredLayerDiagnosticsEnabled())
+        {
+            return dependency;
+        }
+        if (!source || total_tokens <= 0)
+        {
+            throw std::runtime_error(
+                "Qwen35 MoE final-norm diagnostics require a source tensor "
+                "and at least one logical row");
+        }
+
+        const std::string graph_regime =
+            config_.grouped_mtp_verifier
+                ? "grouped_verifier"
+                : config_.live_mtp_request_batch_condition
+                ? "request_batch_decode"
+                : total_tokens == 1
+                      ? "serial_decode"
+                      : "prefill";
+        const std::string graph_shape =
+            graph_regime + "_m" + std::to_string(total_tokens);
+        const std::string checkpoint_name =
+            graph_shape + "_" + boundary;
+        auto &checkpoint =
+            mirrored_layer_checkpoints_[checkpoint_name];
+        if (!checkpoint)
+        {
+            checkpoint = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{
+                    1u,
+                    static_cast<size_t>(config_.d_model)},
+                device);
+        }
+
+        const std::string node_name =
+            "mirror_checkpoint_" + checkpoint_name;
+        HiddenStateRowSelectStage::Params params;
+        params.device_id = device;
+        params.input = source;
+        params.output = checkpoint.get();
+        params.seq_len = total_tokens;
+        params.d_model = config_.d_model;
+        params.selected_row_idx = total_tokens - 1;
+        configureMirroredCheckpointRowOwnership(
+            params,
+            total_tokens,
+            device,
+            sequence_lengths_device);
+
+        graph.addNode(
+            node_name,
+            ComputeStageFactory::createHiddenStateRowSelect(params),
+            device);
+        if (!dependency.empty())
+            graph.addDependency(node_name, dependency);
+        return node_name;
+    }
+
+    HiddenStateRowSelectStage::SelectionPolicy
+    Qwen35MoEGraph::mirroredCheckpointSelectionPolicy(
+        int total_tokens,
+        DeviceId device,
+        const int32_t *sequence_lengths_device) const
+    {
+        /*
+         * Exact grouped-verifier, request-condition, and serial-decode graphs
+         * have no padding, so their final physical row is also their final
+         * logical row. Ordinary GPU prefill may reuse a larger captured bucket;
+         * its checkpoint must therefore read the persistent device request
+         * length. Refusing to build a prefill checkpoint without that pointer
+         * makes selection of a padded row structurally impossible instead of
+         * relying on a caller to remember whether this particular shape was
+         * exact.
+         */
+        const bool ordinary_prefill =
+            device.is_gpu() &&
+            total_tokens > 1 &&
+            !config_.grouped_mtp_verifier &&
+            !config_.live_mtp_request_batch_condition;
+        if (!ordinary_prefill)
+        {
+            return HiddenStateRowSelectStage::SelectionPolicy::
+                FixedDeviceRow;
+        }
+        if (!sequence_lengths_device)
+        {
+            throw std::runtime_error(
+                "Qwen35 MoE mirrored prefill checkpoint requires a "
+                "device-resident request length");
+        }
+        return HiddenStateRowSelectStage::SelectionPolicy::
+            DeviceResidentRequestLength;
+    }
+
+    void Qwen35MoEGraph::configureMirroredCheckpointRowOwnership(
+        HiddenStateRowSelectStage::Params &params,
+        int total_tokens,
+        DeviceId device,
+        const int32_t *sequence_lengths_device) const
+    {
+        params.selection_policy =
+            mirroredCheckpointSelectionPolicy(
+                total_tokens,
+                device,
+                sequence_lengths_device);
+        params.request_sequence_length_device =
+            params.selection_policy ==
+                    HiddenStateRowSelectStage::SelectionPolicy::
+                        DeviceResidentRequestLength
+                ? sequence_lengths_device
+                : nullptr;
     }
 
 } // namespace llaminar2

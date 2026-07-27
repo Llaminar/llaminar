@@ -152,6 +152,8 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
         kpart_shapes = {
             "1.5B_FFN_Dn",
             "3B_FFN_Dn",
+            "CPUDecodeKPart_Balanced_Development_3072x4096",
+            "V3VerifierSealed_Tall_1792x7168",
             "V4FastSealed_Tall_1536x5632",
         }
         split = load_cpu_prefill_split_manifest()
@@ -254,14 +256,18 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
         anchors = cpu_prefill_arithmetic_refinement_source_training_records(
             manifest
         )
-        self.assertEqual(len(anchors), 18 * len(ISA_REGIMES))
+        self.assertEqual(len(anchors), 3 * 18 * len(ISA_REGIMES))
         self.assertEqual(
             {record.shape_name for record in anchors},
-            {"V4FastSealed_Tall_1536x5632"},
+            {
+                "CPUDecodeKPart_Balanced_Development_3072x4096",
+                "V3VerifierSealed_Tall_1792x7168",
+                "V4FastSealed_Tall_1536x5632",
+            },
         )
         self.assertEqual(
             {record.m_values for record in anchors},
-            {load_cpu_prefill_split_manifest().sealed_m_values},
+            {(32, 64, 128), (64,)},
         )
 
     def test_source_aliases_are_co_measured(self) -> None:
@@ -361,7 +367,7 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
                 development_p95_regret=0.01,
                 development_mean_regret=0.01,
             )
-            for m in (64, 256)
+            for m in (32, 128)
         )
         plan = build_cpu_prefill_sealed_witness_plan(
             rules,
@@ -378,7 +384,7 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
         self.assertEqual(len(plan.records), len(runtime_aliases("cpu", codebook)))
         self.assertEqual(
             {record.m_values for record in plan.records},
-            {(64, 256)},
+            {(32, 128)},
         )
         self.assertEqual(
             {record.source_format for record in plan.records},
@@ -527,7 +533,11 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
         arithmetic_anchors = [
             record
             for record in records
-            if record.shape_name == "V4FastSealed_Tall_1536x5632"
+            if record.shape_name in {
+                "CPUDecodeKPart_Balanced_Development_3072x4096",
+                "V3VerifierSealed_Tall_1792x7168",
+                "V4FastSealed_Tall_1536x5632",
+            }
         ]
 
         self.assertEqual(len(opened), 8 * len(FORMAT_SPECS) * len(ISA_REGIMES))
@@ -603,13 +613,13 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
                     and record.isa_regime == regime
                 }
                 self.assertEqual(len(codebooks), 18)
-        self.assertEqual(len(arithmetic_anchors), 18 * len(ISA_REGIMES))
+        self.assertEqual(len(arithmetic_anchors), 3 * 18 * len(ISA_REGIMES))
         self.assertEqual(
             {record.m_values for record in arithmetic_anchors},
-            {load_cpu_prefill_split_manifest().sealed_m_values},
+            {(32, 64, 128), (64,)},
         )
-        self.assertEqual(len(records), 849)
-        self.assertEqual(sum(len(record.m_values) for record in records), 1734)
+        self.assertEqual(len(records), 957)
+        self.assertEqual(sum(len(record.m_values) for record in records), 1572)
 
     def test_source_plan_is_exhaustive_across_formats_shapes_m_and_isa(self) -> None:
         runtime = cpu_prefill_runtime_training_cells()
@@ -647,15 +657,19 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
             self.assertEqual(estimated_work, sorted(estimated_work, reverse=True))
             estimated_group_work.append(estimated_work[0])
 
-        self.assertEqual(len(groups), 2)
+        self.assertEqual(len(groups), 3)
         self.assertEqual(
             {group[0].m_values for group in groups},
             {
-                (64, 128),
-                (64, 128, 256, 512),
+                (32,),
+                (32, 64),
+                (32, 128),
             },
         )
-        self.assertEqual(sorted(len(group) for group in groups), [2331, 2394])
+        self.assertEqual(
+            sorted(len(group) for group in groups),
+            [441, 1890, 2394],
+        )
         self.assertEqual(
             sum((len(group) + 1) // 2 for group in groups),
             (len(records) + 1) // 2,

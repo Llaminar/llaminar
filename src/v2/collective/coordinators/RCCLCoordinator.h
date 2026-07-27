@@ -467,6 +467,7 @@ namespace llaminar2
         // Internal collective implementations (called ON coordinator thread)
         bool doAllreduceMulti(const std::vector<void *> &buffers, size_t count,
                               int dtype_int, int op_int);
+        bool doInsertCollectiveInputDeps(const char *operation);
         bool doSynchronizeAll();
         bool doInsertComputeStreamDeps();
         bool doAllgatherMulti(const std::vector<const void *> &send_buffers,

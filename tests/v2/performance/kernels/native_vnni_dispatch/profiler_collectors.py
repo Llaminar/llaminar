@@ -25,6 +25,7 @@ import hashlib
 import io
 import json
 import math
+import multiprocessing
 import os
 import re
 import shutil
@@ -54,6 +55,8 @@ from .profiler_evidence import (
     read_profiler_request_manifest,
     validate_profiler_evidence_coverage,
     write_profiler_evidence_manifest,
+    _offline_worker_count,
+    _physical_core_count,
 )
 from .schema import Backend, ExecutionMode
 
@@ -85,6 +88,17 @@ DEFAULT_TOOL_CANDIDATES = {
         Path("/opt/rocm/bin/rocprof"),
     ),
 }
+
+# ROCm 7.1 selected-region interception retains process-global HIP graph
+# submission state. A 512-member mixed eager/graph counter process repeatedly
+# failed on selected request 304. The captured core placed the fault inside
+# librocprofiler-sdk while it dereferenced the first byte beyond a profiler-
+# owned /dev/zero AQL mapping during hipGraphLaunch. The identical GPUBusy plan
+# truncated to 256 requests completed. A fresh process resets that state.
+# Keep the independent graph limit because a resumed corpus may contain graph
+# requests only, even when the original transaction was mode-balanced.
+ROCM_MAX_GPU_PROCESS_BATCH_SIZE = 256
+ROCM_MAX_GRAPH_REQUESTS_PER_PROCESS = 256
 
 PERF_EVENT_TO_METRIC = {
     "cycles": "cpu.cycles",
@@ -133,6 +147,10 @@ ROCM_COUNTER_GROUPS = (
     ("Wavefronts",),
     ("VALUUtilization",),
     ("LDSBankConflict",),
+    # These instruction-per-work-item counters share one schedulable gfx906
+    # pass. Unlike volatile busy percentages, they directly expose excess ALU
+    # and flat-memory work in an otherwise identical candidate contest.
+    ("VALUInsts", "FlatVMemInsts"),
 )
 
 # Request only the reviewed feature schema. Section-based Nsight collection
@@ -154,6 +172,9 @@ NCU_METRICS = (
 )
 
 CUDA_PRODUCTION_KERNEL_FILTER = "regex:nativeVnni"
+
+
+_PARALLEL_JOURNAL_REQUESTS: Mapping[str, ProfilerRequest] = {}
 
 
 @dataclass(frozen=True)
@@ -357,6 +378,19 @@ def _resolve_tool(backend: Backend, explicit: Path | None) -> Path | None:
     return None if resolved is None else Path(resolved)
 
 
+def _rocm_profile_variant(request: ProfilerRequest) -> str:
+    """Return the ROCm trainer spelling for one registry candidate."""
+
+    config = request.config_json
+    if "kb" in config:
+        return f"KB{int(config['kb'])}"
+    if config.get("split_policy") == "inherit_serial_m1":
+        return "INHERIT_SERIAL_M1"
+    raise ValueError(
+        f"{request.request_id}: unsupported ROCm profiler candidate config"
+    )
+
+
 def _profile_environment(request: ProfilerRequest, raw_dir: Path) -> dict[str, str]:
     """Build exact one-cell trainer filters from one authenticated request."""
 
@@ -380,15 +414,7 @@ def _profile_environment(request: ProfilerRequest, raw_dir: Path) -> dict[str, s
             ),
         })
     elif request.backend == Backend.ROCM:
-        config = request.config_json
-        if "kb" in config:
-            variant = f"KB{int(config['kb'])}"
-        elif config.get("split_policy") == "inherit_serial_m1":
-            variant = "INHERIT_SERIAL_M1"
-        else:
-            raise ValueError(
-                f"{request.request_id}: unsupported ROCm profiler candidate config"
-            )
+        variant = _rocm_profile_variant(request)
         environment.update({
             "LLAMINAR_ROCM_NVNNI_DECODE_FORMATS": request.source_format,
             "LLAMINAR_ROCM_NVNNI_DECODE_SHAPES": request.shape_name,
@@ -455,20 +481,23 @@ class CPUProfilerProcessBatch:
 
 
 @dataclass(frozen=True)
-class CUDAProfilerProcessBatch:
-    """Exact CUDA requests sharing one context and Nsight report process."""
+class GPUProfilerProcessBatch:
+    """Exact same-backend GPU requests sharing one profiler process."""
 
     requests: tuple[ProfilerRequest, ...]
 
     def __post_init__(self) -> None:
         if not self.requests:
-            raise ValueError("CUDA profiler process batch must not be empty")
-        if any(request.backend != Backend.CUDA for request in self.requests):
-            raise ValueError("CUDA profiler batch cannot contain another backend")
+            raise ValueError("GPU profiler process batch must not be empty")
+        backends = {request.backend for request in self.requests}
+        if len(backends) != 1 or not backends.issubset({Backend.CUDA, Backend.ROCM}):
+            raise ValueError(
+                "GPU profiler batch must contain one CUDA or ROCm backend"
+            )
 
 
-def _cuda_process_batch_key(request: ProfilerRequest) -> tuple[object, ...]:
-    """Return immutable context fields that one CUDA process may share.
+def _gpu_process_batch_key(request: ProfilerRequest) -> tuple[object, ...]:
+    """Return immutable context fields that one GPU process may share.
 
     Source format remains part of the key. Adjacent shape/M cells therefore
     reuse one CUDA context and Nsight injection session without forcing the
@@ -477,9 +506,10 @@ def _cuda_process_batch_key(request: ProfilerRequest) -> tuple[object, ...]:
     key and are selected exactly by the authenticated TSV plan.
     """
 
-    if request.backend != Backend.CUDA:
-        raise ValueError("CUDA profiler batch cannot contain another backend")
+    if request.backend not in {Backend.CUDA, Backend.ROCM}:
+        raise ValueError("GPU profiler batch requires CUDA or ROCm requests")
     return (
+        request.backend,
         request.architecture_class,
         request.build_id,
         request.compiler_id,
@@ -497,8 +527,8 @@ def _cuda_process_batch_key(request: ProfilerRequest) -> tuple[object, ...]:
     )
 
 
-def _cuda_cell_key(request: ProfilerRequest) -> tuple[object, ...]:
-    """Return fields that must be kept together when chunking CUDA batches."""
+def _gpu_cell_key(request: ProfilerRequest) -> tuple[object, ...]:
+    """Return fields that must remain together when chunking GPU batches."""
 
     return (
         request.shape_group_id,
@@ -511,11 +541,12 @@ def _cuda_cell_key(request: ProfilerRequest) -> tuple[object, ...]:
     )
 
 
-def _build_cuda_process_batches(
+def _build_gpu_process_batches(
     requests: Sequence[ProfilerRequest],
     maximum_size: int,
-) -> tuple[CUDAProfilerProcessBatch, ...]:
-    """Pack complete CUDA work cells into bounded process batches.
+    maximum_graph_captured: int | None = None,
+) -> tuple[GPUProfilerProcessBatch, ...]:
+    """Pack complete same-backend GPU work cells into bounded batches.
 
     A cell contains every measured candidate for one exact physical geometry.
     Keeping it intact lets the trainer prepare serial/correctness state once
@@ -525,16 +556,18 @@ def _build_cuda_process_batches(
     """
 
     if maximum_size <= 0:
-        raise ValueError("CUDA profiler batch size must be positive")
+        raise ValueError("GPU profiler batch size must be positive")
+    if maximum_graph_captured is not None and maximum_graph_captured <= 0:
+        raise ValueError("GPU graph-captured profiler batch size must be positive")
     grouped: dict[tuple[object, ...], list[ProfilerRequest]] = {}
     for request in requests:
-        grouped.setdefault(_cuda_process_batch_key(request), []).append(request)
+        grouped.setdefault(_gpu_process_batch_key(request), []).append(request)
 
-    batches: list[CUDAProfilerProcessBatch] = []
+    batches: list[GPUProfilerProcessBatch] = []
     for process_key in sorted(grouped, key=repr):
         cells: dict[tuple[object, ...], list[ProfilerRequest]] = {}
         for request in grouped[process_key]:
-            cells.setdefault(_cuda_cell_key(request), []).append(request)
+            cells.setdefault(_gpu_cell_key(request), []).append(request)
         current: list[ProfilerRequest] = []
         for cell_key in sorted(cells, key=repr):
             members = sorted(
@@ -544,17 +577,39 @@ def _build_cuda_process_batches(
                     item.request_id,
                 ),
             )
-            if current and len(current) + len(members) > maximum_size:
-                batches.append(CUDAProfilerProcessBatch(tuple(current)))
+            graph_members = sum(
+                request.execution_mode == ExecutionMode.GRAPH_CAPTURED
+                for request in members
+            )
+            current_graph_members = sum(
+                request.execution_mode == ExecutionMode.GRAPH_CAPTURED
+                for request in current
+            )
+            exceeds_graph_limit = (
+                maximum_graph_captured is not None
+                and current_graph_members + graph_members
+                > maximum_graph_captured
+            )
+            if current and (
+                len(current) + len(members) > maximum_size
+                or exceeds_graph_limit
+            ):
+                batches.append(GPUProfilerProcessBatch(tuple(current)))
                 current = []
-            while len(members) > maximum_size:
-                batches.append(CUDAProfilerProcessBatch(
-                    tuple(members[:maximum_size])
+            cell_limit = maximum_size
+            if (
+                maximum_graph_captured is not None
+                and graph_members == len(members)
+            ):
+                cell_limit = min(cell_limit, maximum_graph_captured)
+            while len(members) > cell_limit:
+                batches.append(GPUProfilerProcessBatch(
+                    tuple(members[:cell_limit])
                 ))
-                members = members[maximum_size:]
+                members = members[cell_limit:]
             current.extend(members)
         if current:
-            batches.append(CUDAProfilerProcessBatch(tuple(current)))
+            batches.append(GPUProfilerProcessBatch(tuple(current)))
     return tuple(batches)
 
 
@@ -713,12 +768,12 @@ def _cpu_batch_environment(
     return environment
 
 
-def _write_cuda_batch_plan(
+def _write_gpu_batch_plan(
     path: Path,
-    batch: CUDAProfilerProcessBatch,
+    batch: GPUProfilerProcessBatch,
     raw_directories: Mapping[str, Path],
 ) -> str:
-    """Write one exact CUDA profiler plan and return its content digest."""
+    """Write one exact GPU profiler plan and return its content digest."""
 
     output = io.StringIO(newline="")
     writer = csv.writer(output, delimiter="\t", lineterminator="\n")
@@ -750,7 +805,7 @@ def _write_cuda_batch_plan(
             str(raw_directories[request.request_id].resolve()),
         )
         if any("\t" in field or "\n" in field or "\r" in field for field in fields):
-            raise ValueError("CUDA profiler batch identity contains a TSV delimiter")
+            raise ValueError("GPU profiler batch identity contains a TSV delimiter")
         writer.writerow(fields)
     payload = output.getvalue()
     path.write_text(payload, encoding="utf-8")
@@ -758,7 +813,7 @@ def _write_cuda_batch_plan(
 
 
 def _cuda_batch_environment(
-    batch: CUDAProfilerProcessBatch,
+    batch: GPUProfilerProcessBatch,
     plan_path: Path,
     plan_digest: str,
     batch_raw_dir: Path,
@@ -795,6 +850,51 @@ def _cuda_batch_environment(
         batch_raw_dir / "trainer.csv"
     )
     environment["LLAMINAR_CUDA_NVNNI_DECODE_TIMING_CSV"] = str(
+        batch_raw_dir / "trainer.timing.csv"
+    )
+    return environment
+
+
+def _rocm_batch_environment(
+    batch: GPUProfilerProcessBatch,
+    plan_path: Path,
+    plan_digest: str,
+    batch_raw_dir: Path,
+) -> dict[str, str]:
+    """Build one exact-plan ROCm environment without Cartesian aliases."""
+
+    first = batch.requests[0]
+    if first.backend != Backend.ROCM:
+        raise ValueError("ROCm batch environment requires ROCm requests")
+    environment = _profile_environment(first, batch_raw_dir)
+    environment.pop("LLAMINAR_NATIVE_VNNI_PROFILE_REQUEST_ID", None)
+    environment["LLAMINAR_NATIVE_VNNI_PROFILE_BATCH_PATH"] = str(
+        plan_path.resolve()
+    )
+    environment["LLAMINAR_NATIVE_VNNI_PROFILE_BATCH_DIGEST"] = plan_digest
+    environment["LLAMINAR_ROCM_NVNNI_DECODE_FORMATS"] = ",".join(sorted({
+        request.source_format for request in batch.requests
+    }))
+    environment["LLAMINAR_ROCM_NVNNI_DECODE_SHAPES"] = ",".join(sorted({
+        request.shape_name for request in batch.requests
+    }))
+    environment["LLAMINAR_ROCM_NVNNI_DECODE_VARIANTS"] = ",".join(sorted({
+        _rocm_profile_variant(request) for request in batch.requests
+    }))
+    environment["LLAMINAR_ROCM_NVNNI_DECODE_M"] = ",".join(str(value) for value in sorted({
+        request.m for request in batch.requests
+    }))
+    environment["LLAMINAR_ROCM_NVNNI_DECODE_EXECUTION_MODES"] = ",".join(sorted({
+        request.execution_mode.value for request in batch.requests
+    }))
+    environment["LLAMINAR_ROCM_NVNNI_DECODE_MAX_CASES"] = str(len({
+        (request.source_format, request.shape_name, request.m)
+        for request in batch.requests
+    }))
+    environment["LLAMINAR_ROCM_NVNNI_DECODE_CSV"] = str(
+        batch_raw_dir / "trainer.csv"
+    )
+    environment["LLAMINAR_ROCM_NVNNI_DECODE_TIMING_CSV"] = str(
         batch_raw_dir / "trainer.timing.csv"
     )
     return environment
@@ -1288,6 +1388,8 @@ ROCM_METRIC_ALIASES = {
     "gpu.write_kib": ("WriteSize", "WRITE_SIZE"),
     "gpu.wavefront_count": ("Wavefronts", "SQ_WAVES_sum"),
     "gpu.lds_bank_conflict_pct": ("LDSBankConflict",),
+    "gpu.valu_instructions_per_workitem": ("VALUInsts",),
+    "gpu.flat_vmem_instructions_per_workitem": ("FlatVMemInsts",),
 }
 
 
@@ -1497,6 +1599,218 @@ def parse_rocprof_csvs(
     if not dispatches:
         raise ValueError("rocprofiler reported no kernels in the selected region")
     return tuple(dispatches)
+
+
+def parse_rocprof_batch_csvs(
+    paths: Iterable[Path],
+    requests: Sequence[ProfilerRequest],
+) -> dict[str, tuple[ProfiledDispatch, ...]]:
+    """Partition one process-amortized rocprof report by exact request range.
+
+    The uninstrumented trace preserves physical kernel names, while every
+    counter pass renames kernels to ``NativeVNNIProfile::<request-id>``. Dispatch
+    IDs restart between profiler processes, so the stable join is the ordered
+    sequence of request ranges and the launch ordinal within each range. All
+    files are parsed once regardless of batch size; no request can inherit a
+    neighboring range's counters.
+    """
+
+    if not requests:
+        raise ValueError("ROCm profiler batch parser requires requests")
+    if any(request.backend != Backend.ROCM for request in requests):
+        raise ValueError("ROCm profiler batch parser received another backend")
+    request_by_kernel = {
+        f"NativeVNNIProfile::{request.request_id}": request
+        for request in requests
+    }
+    if len(request_by_kernel) != len(requests):
+        raise ValueError("ROCm profiler batch repeats a request ID")
+
+    @dataclass
+    class MutableDispatch:
+        kernel: str
+        grid: tuple[int, int, int]
+        block: tuple[int, int, int]
+        values: dict[str, tuple[float, str]]
+
+    all_paths = tuple(sorted(Path(path) for path in paths))
+    trace_paths = tuple(
+        path
+        for path in all_paths
+        if "kernel_trace" in path.name and path.parent.name == "trace"
+    )
+    if not trace_paths:
+        raise ValueError("batched rocprofiler evidence has no physical trace")
+    trace_rows = _read_rocm_csv(trace_paths[0])
+    trace_rows.sort(
+        key=lambda row: int(_first(row, ("Dispatch_Id", "Index")) or 0)
+    )
+    physical: list[MutableDispatch] = []
+    for row in trace_rows:
+        kernel = _first(row, ("KernelName", "Kernel_Name", "Kernel Name"))
+        if not kernel:
+            continue
+        grid = (
+            int(_first(row, ("Grid_Size_X", "Grid Size X")) or 1),
+            int(_first(row, ("Grid_Size_Y", "Grid Size Y")) or 1),
+            int(_first(row, ("Grid_Size_Z", "Grid Size Z")) or 1),
+        )
+        block = (
+            int(_first(row, ("Workgroup_Size_X", "Workgroup Size X", "wgr")) or 1),
+            int(_first(row, ("Workgroup_Size_Y", "Workgroup Size Y")) or 1),
+            int(_first(row, ("Workgroup_Size_Z", "Workgroup Size Z")) or 1),
+        )
+        values: dict[str, tuple[float, str]] = {}
+        start = _first(row, ("Start_Timestamp", "BeginNs"))
+        end = _first(row, ("End_Timestamp", "EndNs"))
+        if start and end:
+            values["gpu.duration_ns"] = (
+                _parse_number(end) - _parse_number(start),
+                "End_Timestamp-Start_Timestamp",
+            )
+        for metric_id, aliases in ROCM_METRIC_ALIASES.items():
+            for alias in aliases:
+                raw = (row.get(alias) or "").strip()
+                if raw:
+                    values[metric_id] = (_parse_number(raw), alias)
+                    break
+        physical.append(MutableDispatch(kernel, grid, block, values))
+    if not physical:
+        raise ValueError("batched rocprofiler trace reported no kernels")
+
+    counter_paths = tuple(
+        path for path in all_paths if "counter_collection" in path.name
+    )
+    if not counter_paths:
+        raise ValueError("batched rocprofiler evidence has no counter pass")
+    spans: dict[str, tuple[int, int]] = {}
+    for pass_index, path in enumerate(counter_paths):
+        rows_by_request: dict[str, dict[int, list[dict[str, str]]]] = {}
+        first_dispatch_by_request: dict[str, int] = {}
+        request_by_dispatch: dict[int, str] = {}
+        for row in _read_rocm_csv(path):
+            kernel = _first(
+                row, ("KernelName", "Kernel_Name", "Kernel Name")
+            )
+            request = request_by_kernel.get(kernel)
+            if request is None:
+                continue
+            dispatch_id = int(_first(row, ("Dispatch_Id", "Index")) or 0)
+            previous_request = request_by_dispatch.setdefault(
+                dispatch_id, request.request_id
+            )
+            if previous_request != request.request_id:
+                raise ValueError(
+                    f"rocprofiler batch counter pass {path} attributed "
+                    f"dispatch {dispatch_id} to multiple requests"
+                )
+            rows_by_request.setdefault(request.request_id, {}).setdefault(
+                dispatch_id, []
+            ).append(row)
+            first_dispatch_by_request.setdefault(request.request_id, dispatch_id)
+            first_dispatch_by_request[request.request_id] = min(
+                first_dispatch_by_request[request.request_id], dispatch_id
+            )
+        expected_ids = {request.request_id for request in requests}
+        if set(rows_by_request) != expected_ids:
+            missing = sorted(expected_ids.difference(rows_by_request))
+            extra = sorted(set(rows_by_request).difference(expected_ids))
+            raise ValueError(
+                f"rocprofiler batch counter pass {path} changed request "
+                f"coverage: missing={missing} extra={extra}"
+            )
+        ordered_ids = sorted(
+            expected_ids, key=lambda request_id: first_dispatch_by_request[request_id]
+        )
+        range_order: list[str] = []
+        for dispatch_id in sorted(request_by_dispatch):
+            request_id = request_by_dispatch[dispatch_id]
+            if not range_order or range_order[-1] != request_id:
+                range_order.append(request_id)
+        if range_order != ordered_ids or len(range_order) != len(expected_ids):
+            raise ValueError(
+                f"rocprofiler batch counter pass {path} contains a "
+                "non-contiguous or repeated request range"
+            )
+        if pass_index == 0:
+            offset = 0
+            for request_id in ordered_ids:
+                count = len(rows_by_request[request_id])
+                spans[request_id] = (offset, offset + count)
+                offset += count
+            if offset != len(physical):
+                raise ValueError(
+                    "rocprofiler batch counter/trace launch totals differ: "
+                    f"counter={offset} trace={len(physical)}"
+                )
+        elif ordered_ids != sorted(
+            spans, key=lambda request_id: spans[request_id][0]
+        ):
+            raise ValueError("rocprofiler batch changed request order between passes")
+
+        for request_id in ordered_ids:
+            begin, end = spans[request_id]
+            ordered_groups = [
+                rows_by_request[request_id][dispatch_id]
+                for dispatch_id in sorted(rows_by_request[request_id])
+            ]
+            if len(ordered_groups) != end - begin:
+                raise ValueError(
+                    f"rocprofiler batch pass {path} changed dispatch count for "
+                    f"{request_id}"
+                )
+            for ordinal, rows_for_dispatch in enumerate(ordered_groups):
+                values = physical[begin + ordinal].values
+                for row in rows_for_dispatch:
+                    counter_name = _first(row, ("Counter_Name", "Counter Name"))
+                    counter_value = _first(row, ("Counter_Value", "Counter Value"))
+                    if counter_name and counter_value:
+                        for metric_id, aliases in ROCM_METRIC_ALIASES.items():
+                            if counter_name in aliases:
+                                values[metric_id] = (
+                                    _parse_number(counter_value), counter_name
+                                )
+                                break
+                    for metric_id, aliases in ROCM_METRIC_ALIASES.items():
+                        for alias in aliases:
+                            raw = (row.get(alias) or "").strip()
+                            if raw:
+                                values.setdefault(
+                                    metric_id, (_parse_number(raw), alias)
+                                )
+                                break
+
+    result: dict[str, tuple[ProfiledDispatch, ...]] = {}
+    for request in requests:
+        begin, end = spans[request.request_id]
+        dispatches = []
+        for dispatch_index, item in enumerate(physical[begin:end]):
+            metrics = _complete_metric_inventory(
+                Backend.ROCM,
+                item.values,
+                unavailable_reason=(
+                    "rocprofiler did not expose this optional metric"
+                ),
+            )
+            dispatch = ProfiledDispatch(
+                dispatch_index=dispatch_index,
+                dispatch_kind=ProfiledDispatchKind.GPU_KERNEL,
+                kernel_name=item.kernel,
+                kernel_fingerprint=_kernel_fingerprint(
+                    item.kernel, item.grid, item.block
+                ),
+                grid=item.grid,
+                block=item.block,
+                metrics=metrics,
+            )
+            dispatch.validate(Backend.ROCM)
+            dispatches.append(dispatch)
+        if not dispatches:
+            raise ValueError(
+                f"rocprofiler batch request {request.request_id} has no kernels"
+            )
+        result[request.request_id] = tuple(dispatches)
+    return result
 
 
 def _failed_evidence(
@@ -1877,7 +2191,7 @@ def _collect_cuda(
 
 def _cuda_request_streams_from_process_log(
     completed: subprocess.CompletedProcess[str],
-    batch: CUDAProfilerProcessBatch,
+    batch: GPUProfilerProcessBatch,
 ) -> tuple[tuple[str, int], ...]:
     """Authenticate the trainer's exact request-to-CUDA-stream ownership."""
 
@@ -1907,7 +2221,7 @@ def _cuda_request_streams_from_process_log(
 
 
 def _collect_cuda_batch(
-    batch: CUDAProfilerProcessBatch,
+    batch: GPUProfilerProcessBatch,
     options: CollectorOptions,
 ) -> dict[str, ProfilerEvidence]:
     """Profile many exact CUDA operations in one setup-amortized process.
@@ -1949,7 +2263,7 @@ def _collect_cuda_batch(
         )
 
     plan_path = batch_raw_dir / "requests.tsv"
-    plan_digest = _write_cuda_batch_plan(
+    plan_digest = _write_gpu_batch_plan(
         plan_path, batch, request_raw_dirs
     )
     environment = _cuda_batch_environment(
@@ -2057,7 +2371,7 @@ def _collect_cuda_batch(
 
 
 def collect_cuda_batch(
-    batch: CUDAProfilerProcessBatch,
+    batch: GPUProfilerProcessBatch,
     options: CollectorOptions,
 ) -> dict[str, ProfilerEvidence]:
     """Collect one CUDA batch and convert shared failures per request."""
@@ -2230,6 +2544,287 @@ def _collect_rocm(
     )
 
 
+def _rocm_request_order_from_process_log(
+    completed: subprocess.CompletedProcess[str],
+    batch: GPUProfilerProcessBatch,
+) -> tuple[str, ...]:
+    """Authenticate one reported production launch for every batch member."""
+
+    pattern = re.compile(
+        r"\[NativeVNNIProfiler\]\[ROCm\] request=([^\s]+) .* launches=1$"
+    )
+    request_order = tuple(
+        match.group(1)
+        for line in (
+            (completed.stdout or "") + "\n" + (completed.stderr or "")
+        ).splitlines()
+        if (match := pattern.search(line))
+    )
+    expected = {request.request_id for request in batch.requests}
+    if len(request_order) != len(batch.requests) or set(request_order) != expected:
+        raise RuntimeError(
+            "ROCm batch trainer did not report exactly one production launch "
+            f"per request: reported={len(request_order)} "
+            f"unique={len(set(request_order))} expected={len(batch.requests)}"
+        )
+    return request_order
+
+
+def _collect_rocm_batch(
+    batch: GPUProfilerProcessBatch,
+    options: CollectorOptions,
+) -> dict[str, ProfilerEvidence]:
+    """Collect one setup-amortized ROCm process batch.
+
+    Every profiler pass executes the same authenticated TSV plan. The trainer
+    opens one named selected region around each exact request's extra production
+    launch, so rocprofiler process startup and weight preparation are amortized
+    while counter ownership remains request-local.
+    """
+
+    if options.tool.name != "rocprofv3":
+        raise ValueError(
+            "batched NativeVNNI profiling requires rocprofv3 selected regions"
+        )
+    if any(request.backend != Backend.ROCM for request in batch.requests):
+        raise ValueError("ROCm profiler batch contains another backend")
+    selected_binaries = {
+        _binary_for_request(request, options) for request in batch.requests
+    }
+    if len(selected_binaries) != 1:
+        raise ValueError("one ROCm profiler batch selected multiple binaries")
+    selected_binary = next(iter(selected_binaries))
+    if not selected_binary.is_file() or not os.access(selected_binary, os.X_OK):
+        raise RuntimeError(f"trainer binary is unavailable: {selected_binary}")
+
+    batch_identity = hashlib.sha256("\n".join(
+        request.request_id for request in batch.requests
+    ).encode("utf-8")).hexdigest()[:24]
+    batch_raw_dir = _next_attempt_directory(
+        options.raw_directory / "_rocm_process_batches" / batch_identity
+    )
+    request_raw_dirs: dict[str, Path] = {}
+    binary_digest = _sha256_file(selected_binary)
+    for request in batch.requests:
+        raw_dir = _next_attempt_directory(
+            options.raw_directory / request.request_id
+        )
+        request_raw_dirs[request.request_id] = raw_dir
+        _write_binary_provenance(
+            raw_dir / "profiler-binary.json",
+            request,
+            selected_binary,
+            binary_digest,
+        )
+
+    plan_path = batch_raw_dir / "requests.tsv"
+    plan_digest = _write_gpu_batch_plan(
+        plan_path, batch, request_raw_dirs
+    )
+    environment = _rocm_batch_environment(
+        batch, plan_path, plan_digest, batch_raw_dir
+    )
+    _apply_device_placement(environment, options)
+    batch_options = replace(options, binary=selected_binary)
+    first = batch.requests[0]
+    commands: list[list[str]] = []
+
+    trace_dir = batch_raw_dir / "trace"
+    trace_dir.mkdir()
+    trace_command = _tool_command(
+        batch_options,
+        "--selected-regions",
+        "--kernel-trace",
+        "--marker-trace",
+        "--minimum-output-data",
+        "0",
+        "--output-file",
+        "profile",
+        "--output-format",
+        "csv",
+        "--output-directory",
+        str(trace_dir),
+        "--",
+        str(selected_binary),
+        *_trainer_arguments(first),
+    )
+    commands.append(trace_command)
+    trace_process = _run_command(
+        trace_command,
+        environment,
+        batch_raw_dir / "rocprof-trace.log",
+        options.timeout_seconds,
+    )
+    if trace_process.returncode != 0:
+        raise RuntimeError(
+            f"rocprofiler trace/ROCm batch trainer exited "
+            f"{trace_process.returncode}"
+        )
+    request_order = _rocm_request_order_from_process_log(trace_process, batch)
+
+    successful_counter_passes = 0
+    successful_counter_directories: list[Path] = []
+
+    def run_counter_pass(counters: Sequence[str], label: str) -> bool:
+        """Run one compatible counter pass over the unchanged exact plan."""
+
+        nonlocal successful_counter_passes
+        pass_dir = batch_raw_dir / label
+        pass_dir.mkdir()
+        command = _tool_command(
+            batch_options,
+            "--selected-regions",
+            "--kernel-trace",
+            "--marker-trace",
+            "--kernel-rename",
+            "--pmc",
+            *counters,
+            "--minimum-output-data",
+            "0",
+            "--output-file",
+            "profile",
+            "--output-format",
+            "csv",
+            "--output-directory",
+            str(pass_dir),
+            "--",
+            str(selected_binary),
+            *_trainer_arguments(first),
+        )
+        commands.append(command)
+        log_path = batch_raw_dir / f"rocprof-{label}.log"
+        try:
+            completed = _run_command(
+                command,
+                environment,
+                log_path,
+                options.timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            timeout_stdout = error.stdout or ""
+            timeout_stderr = error.stderr or ""
+            if isinstance(timeout_stdout, bytes):
+                timeout_stdout = timeout_stdout.decode(errors="replace")
+            if isinstance(timeout_stderr, bytes):
+                timeout_stderr = timeout_stderr.decode(errors="replace")
+            log_path.write_text(
+                json.dumps({
+                    "command": command,
+                    "timeout_seconds": error.timeout,
+                }, sort_keys=True)
+                + "\n\n[stdout]\n"
+                + timeout_stdout
+                + "\n[stderr]\n"
+                + timeout_stderr,
+                encoding="utf-8",
+            )
+            return False
+        if completed.returncode != 0:
+            return False
+        counter_order = _rocm_request_order_from_process_log(completed, batch)
+        if counter_order != request_order:
+            raise RuntimeError(
+                "ROCm batch trainer changed request launch order between "
+                f"profiler passes: trace={request_order} counter={counter_order}"
+            )
+        successful_counter_passes += 1
+        successful_counter_directories.append(pass_dir)
+        return True
+
+    for pass_index, counters in enumerate(ROCM_COUNTER_GROUPS):
+        if run_counter_pass(counters, f"counters-{pass_index}"):
+            continue
+        for counter_index, counter in enumerate(counters):
+            if not run_counter_pass(
+                (counter,), f"counters-{pass_index}-single-{counter_index}"
+            ):
+                raise RuntimeError(
+                    f"rocprofiler rejected required counter {counter}"
+                )
+
+    parse_paths = [*trace_dir.rglob("*.csv")]
+    for counter_directory in successful_counter_directories:
+        parse_paths.extend(counter_directory.rglob("*.csv"))
+    partitioned = parse_rocprof_batch_csvs(parse_paths, batch.requests)
+    batch_raw_digest = _sha256_files(batch_raw_dir)
+    tool_version = _tool_version(options)
+    order_index = {
+        request_id: index for index, request_id in enumerate(request_order)
+    }
+    controlled_environment = {
+        name: value
+        for name, value in environment.items()
+        if name.startswith("LLAMINAR_") or name.startswith("OMP_")
+    }
+
+    results: dict[str, ProfilerEvidence] = {}
+    for request in batch.requests:
+        raw_dir = request_raw_dirs[request.request_id]
+        dispatches = partitioned[request.request_id]
+        (raw_dir / "batch-member.json").write_text(
+            json.dumps({
+                "batch_plan_digest": plan_digest,
+                "batch_raw_artifact_digest": batch_raw_digest,
+                "physical_dispatch_count": len(dispatches),
+                "request_id": request.request_id,
+                "request_launch_order": order_index[request.request_id],
+                "target_launches": 1,
+            }, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        evidence = ProfilerEvidence(
+            request_id=request.request_id,
+            observation_digest=request.observation_digest,
+            backend=request.backend,
+            status=ProfilerEvidenceStatus.COMPLETE,
+            status_reason=None,
+            profiler_tool=EXPECTED_PROFILER_TOOL[request.backend],
+            profiler_tool_version=tool_version,
+            metric_set_version=PROFILER_METRIC_SET_VERSION,
+            collector_version=PROFILER_COLLECTOR_VERSION,
+            command_digest=_sha256_json({
+                "request_id": request.request_id,
+                "commands": commands,
+                "environment": controlled_environment,
+            }),
+            raw_artifact_digest=_sha256_files(raw_dir),
+            profiler_pass_count=1 + successful_counter_passes,
+            target_launches_per_profiler_pass=1,
+            dispatches=dispatches,
+        )
+        evidence.validate(request)
+        results[request.request_id] = evidence
+    return results
+
+
+def collect_rocm_batch(
+    batch: GPUProfilerProcessBatch,
+    options: CollectorOptions,
+) -> dict[str, ProfilerEvidence]:
+    """Collect one ROCm batch and convert a shared failure per request."""
+
+    try:
+        return _collect_rocm_batch(batch, options)
+    except subprocess.TimeoutExpired as error:
+        status = ProfilerEvidenceStatus.LAUNCH_FAILED
+        reason = f"profiler transaction timed out after {error.timeout} seconds"
+    except (OSError, RuntimeError) as error:
+        status = ProfilerEvidenceStatus.LAUNCH_FAILED
+        reason = str(error)
+    except (KeyError, TypeError, ValueError) as error:
+        status = ProfilerEvidenceStatus.PARSE_FAILED
+        reason = str(error)
+    return {
+        request.request_id: _failed_evidence(
+            request,
+            status,
+            reason,
+            EXPECTED_PROFILER_TOOL[request.backend],
+        )
+        for request in batch.requests
+    }
+
+
 def collect_request(
     request: ProfilerRequest,
     options: CollectorOptions,
@@ -2311,12 +2906,116 @@ def collect_request(
         )
 
 
+def _truncate_torn_journal_tail(journal: Path) -> tuple[bytes, int, int]:
+    """Return the complete JSONL extent after discarding one torn tail.
+
+    A killed append can damage only the final line because every completed
+    batch is flushed and fsynced. Scanning backward in bounded blocks avoids
+    materializing a multi-gigabyte journal merely to find its last newline.
+    """
+
+    with journal.open("r+b") as handle:
+        header = handle.readline()
+        if not header.endswith(b"\n"):
+            raise ValueError("profiler checkpoint journal has no complete header")
+        content_begin = handle.tell()
+        handle.seek(0, os.SEEK_END)
+        content_end = handle.tell()
+        if content_end == content_begin:
+            return header, content_begin, content_end
+        handle.seek(content_end - 1)
+        if handle.read(1) == b"\n":
+            return header, content_begin, content_end
+
+        scan_end = content_end
+        complete_end = content_begin
+        while scan_end > content_begin:
+            scan_begin = max(content_begin, scan_end - 1024 * 1024)
+            handle.seek(scan_begin)
+            block = handle.read(scan_end - scan_begin)
+            newline = block.rfind(b"\n")
+            if newline >= 0:
+                complete_end = scan_begin + newline + 1
+                break
+            scan_end = scan_begin
+        handle.truncate(complete_end)
+        handle.flush()
+        os.fsync(handle.fileno())
+        return header, content_begin, complete_end
+
+
+def _journal_byte_ranges(
+    journal: Path,
+    content_begin: int,
+    content_end: int,
+    worker_count: int,
+) -> tuple[tuple[Path, int, int], ...]:
+    """Partition complete JSONL records into deterministic byte ranges."""
+
+    if worker_count < 1:
+        raise ValueError("profiler journal worker count must be positive")
+    if content_end <= content_begin:
+        return ()
+    boundaries = [content_begin]
+    with journal.open("rb") as handle:
+        for worker_index in range(1, worker_count):
+            target = content_begin + (
+                (content_end - content_begin) * worker_index // worker_count
+            )
+            handle.seek(target)
+            handle.readline()
+            boundary = handle.tell()
+            if content_begin < boundary < content_end:
+                boundaries.append(boundary)
+    boundaries.append(content_end)
+    boundaries = sorted(set(boundaries))
+    return tuple(
+        (journal, begin, end)
+        for begin, end in zip(boundaries, boundaries[1:])
+        if begin < end
+    )
+
+
+def _decode_validate_journal_range(
+    task: tuple[Path, int, int],
+) -> tuple[ProfilerEvidence, ...]:
+    """Decode and validate one inherited range of journal evidence."""
+
+    journal, begin, end = task
+    with journal.open("rb") as handle:
+        handle.seek(begin)
+        encoded_records = handle.read(end - begin).splitlines()
+    evidence_records = []
+    for encoded in encoded_records:
+        mapping = json.loads(encoded)
+        if mapping.get("record_type") != "evidence":
+            raise ValueError("profiler checkpoint journal record is invalid")
+        evidence = ProfilerEvidence.from_mapping(mapping["evidence"])
+        request = _PARALLEL_JOURNAL_REQUESTS.get(evidence.request_id)
+        if request is None:
+            raise ValueError(
+                "profiler checkpoint journal contains a foreign request"
+            )
+        evidence.validate(request)
+        evidence_records.append(evidence)
+    return tuple(evidence_records)
+
+
 def _load_incremental_evidence(
     output: Path,
     requests: ProfilerRequestManifest,
     resume: bool,
+    *,
+    workers: int | None = None,
+    parallel_threshold_bytes: int = 16 * 1024 * 1024,
 ) -> dict[str, ProfilerEvidence]:
-    """Load a materialized manifest plus any durable in-progress journal."""
+    """Load a manifest and journal on affinity-visible physical cores.
+
+    The journal can exceed a gigabyte during an all-format GPU profile. Each
+    line is independently canonical and fsynced, so workers decode disjoint
+    newline-aligned ranges and validate records against the inherited immutable
+    request map. The parent alone applies ordered duplicate/rewrite semantics.
+    """
 
     journal = Path(str(output) + ".inprogress.jsonl")
     if not output.exists() and not journal.exists():
@@ -2337,19 +3036,12 @@ def _load_incremental_evidence(
         )
         records.update({item.request_id: item for item in manifest.evidence})
     if journal.exists():
-        payload = journal.read_bytes()
-        lines = payload.splitlines(keepends=True)
-        if lines and not lines[-1].endswith(b"\n"):
-            # A killed append may leave only its final JSON object torn. Every
-            # earlier newline-terminated member is independently recoverable.
-            lines.pop()
-            with journal.open("r+b") as handle:
-                handle.truncate(sum(len(line) for line in lines))
-                handle.flush()
-                os.fsync(handle.fileno())
-        if not lines:
-            raise ValueError("profiler checkpoint journal has no complete header")
-        header = json.loads(lines[0])
+        if parallel_threshold_bytes < 1:
+            raise ValueError("profiler journal parallel threshold must be positive")
+        header_line, content_begin, content_end = _truncate_torn_journal_tail(
+            journal
+        )
+        header = json.loads(header_line)
         expected_header = {
             "collector_version": PROFILER_COLLECTOR_VERSION,
             "record_type": "native-vnni-profiler-journal-v1",
@@ -2360,26 +3052,57 @@ def _load_incremental_evidence(
         request_by_id = {
             request.request_id: request for request in requests.requests
         }
-        for encoded in lines[1:]:
-            mapping = json.loads(encoded)
-            if mapping.get("record_type") != "evidence":
-                raise ValueError("profiler checkpoint journal record is invalid")
-            evidence = ProfilerEvidence.from_mapping(mapping["evidence"])
-            request = request_by_id.get(evidence.request_id)
-            if request is None:
-                raise ValueError(
-                    "profiler checkpoint journal contains a foreign request"
-                )
-            evidence.validate(request)
-            previous = records.get(evidence.request_id)
-            if previous is not None and previous.status in {
-                ProfilerEvidenceStatus.COMPLETE,
-                ProfilerEvidenceStatus.CANDIDATE_UNSUPPORTED,
-            } and previous.canonical_mapping() != evidence.canonical_mapping():
-                raise ValueError(
-                    "profiler checkpoint journal rewrites terminal evidence"
-                )
-            records[evidence.request_id] = evidence
+        payload_bytes = content_end - content_begin
+        if workers is None:
+            worker_count = _offline_worker_count(
+                max(1, payload_bytes // 4096),
+                environment_name="LLAMINAR_NATIVE_VNNI_IO_WORKERS",
+            )
+        else:
+            if workers < 1:
+                raise ValueError("profiler journal worker count must be positive")
+            worker_count = min(workers, _physical_core_count())
+        if payload_bytes < parallel_threshold_bytes:
+            worker_count = 1
+        tasks = _journal_byte_ranges(
+            journal,
+            content_begin,
+            content_end,
+            max(1, worker_count),
+        )
+
+        def merge_partition(partition: Iterable[ProfilerEvidence]) -> None:
+            """Apply historical ordered terminal-rewrite semantics."""
+
+            for evidence in partition:
+                previous = records.get(evidence.request_id)
+                if previous is not None and previous.status in {
+                    ProfilerEvidenceStatus.COMPLETE,
+                    ProfilerEvidenceStatus.CANDIDATE_UNSUPPORTED,
+                } and previous.canonical_mapping() != evidence.canonical_mapping():
+                    raise ValueError(
+                        "profiler checkpoint journal rewrites terminal evidence"
+                    )
+                records[evidence.request_id] = evidence
+
+        global _PARALLEL_JOURNAL_REQUESTS
+        _PARALLEL_JOURNAL_REQUESTS = request_by_id
+        try:
+            if len(tasks) <= 1:
+                for task in tasks:
+                    merge_partition(_decode_validate_journal_range(task))
+            else:
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=len(tasks),
+                    mp_context=multiprocessing.get_context("fork"),
+                ) as executor:
+                    for partition in executor.map(
+                        _decode_validate_journal_range,
+                        tasks,
+                    ):
+                        merge_partition(partition)
+        finally:
+            _PARALLEL_JOURNAL_REQUESTS = {}
         recovered = ProfilerEvidenceManifest(
             request_manifest_digest=requests.digest(),
             corpus_digest=requests.corpus_digest,
@@ -2435,18 +3158,7 @@ def _write_checkpoint(
         evidence=tuple(records[key] for key in sorted(records)),
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=output.parent,
-        prefix=output.name + ".",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        temporary = Path(handle.name)
-        json.dump(manifest.canonical_mapping(), handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    temporary.replace(output)
+    write_profiler_evidence_manifest(output, manifest)
     journal = Path(str(output) + ".inprogress.jsonl")
     if journal.exists():
         journal.unlink()
@@ -2488,10 +3200,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gpu-process-batch-size",
         type=int,
-        default=4096,
+        default=None,
         help=(
             "maximum exact GPU requests sharing one profiler process/report; "
-            "each member retains a distinct controlled range (default: 4096)"
+            "each member retains a distinct controlled range. Defaults to "
+            "512 for CUDA and 256 for ROCm; ROCm is capped at 256 total and "
+            "256 graph-captured requests per process"
         ),
     )
     parser.add_argument(
@@ -2515,6 +3229,35 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-failures", action="store_true")
     parser.add_argument("--finalize", action="store_true")
     return parser
+
+
+def _validate_gpu_process_batch_size(backend: Backend, size: int) -> None:
+    """Reject an unsafe ROCm profiler lifetime before launching a process."""
+
+    if size <= 0:
+        raise ValueError("--gpu-process-batch-size must be positive")
+    if backend == Backend.ROCM and size > ROCM_MAX_GPU_PROCESS_BATCH_SIZE:
+        raise ValueError(
+            "ROCm profiler process batches are capped at "
+            f"{ROCM_MAX_GPU_PROCESS_BATCH_SIZE} requests: ROCm 7.1 "
+            "selected-region graph interception corrupts HSA packet state "
+            "beyond that validated lifetime"
+        )
+
+
+def _resolve_gpu_process_batch_size(
+    backend: Backend,
+    requested: int | None,
+) -> int:
+    """Resolve the backend default and enforce the validated ROCm lifetime."""
+
+    size = (
+        ROCM_MAX_GPU_PROCESS_BATCH_SIZE
+        if requested is None and backend == Backend.ROCM
+        else 512 if requested is None else requested
+    )
+    _validate_gpu_process_batch_size(backend, size)
+    return size
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2560,8 +3303,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--device-lanes must be positive")
     if args.cpu_process_batch_size <= 0:
         raise ValueError("--cpu-process-batch-size must be positive")
-    if args.gpu_process_batch_size <= 0:
-        raise ValueError("--gpu-process-batch-size must be positive")
+    gpu_process_batch_size = _resolve_gpu_process_batch_size(
+        backend,
+        args.gpu_process_batch_size,
+    )
     cpu_lane_lists = (
         _parse_cpu_lane_lists(args.cpu_list, args.device_lanes)
         if backend == Backend.CPU
@@ -2644,7 +3389,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _append_checkpoint_journal(output, requests, (result,))
 
     if (
-        backend == Backend.CUDA
+        backend in {Backend.CUDA, Backend.ROCM}
         and not args.disable_gpu_process_batching
         and pending
     ):
@@ -2660,34 +3405,45 @@ def main(argv: Sequence[str] | None = None) -> int:
                 (records[request.request_id] for request in terminal),
             )
 
-        batches = _build_cuda_process_batches(
-            required, args.gpu_process_batch_size
+        batches = _build_gpu_process_batches(
+            required,
+            gpu_process_batch_size,
+            maximum_graph_captured=(
+                ROCM_MAX_GRAPH_REQUESTS_PER_PROCESS
+                if backend == Backend.ROCM
+                else None
+            ),
+        )
+        batch_collector = (
+            collect_cuda_batch if backend == Backend.CUDA else collect_rocm_batch
         )
 
-        def announce_cuda_batch(
+        def announce_gpu_batch(
             index: int,
-            batch: CUDAProfilerProcessBatch,
+            batch: GPUProfilerProcessBatch,
             lane: int,
         ) -> None:
-            """Report one CUDA process and its independently ranged members."""
+            """Report one GPU process and its independently ranged members."""
 
             first = batch.requests[0]
             print(
-                f"[cuda batch {index}/{len(batches)}] lane={lane} "
+                f"[{backend.value} batch {index}/{len(batches)}] lane={lane} "
                 f"requests={len(batch.requests)} "
                 f"format={first.source_format} operation={first.operation_kind}",
                 flush=True,
             )
 
-        def publish_cuda_batch(
-            batch: CUDAProfilerProcessBatch,
+        def publish_gpu_batch(
+            batch: GPUProfilerProcessBatch,
             results: Mapping[str, ProfilerEvidence],
         ) -> None:
-            """Atomically journal every exact member of one CUDA process."""
+            """Atomically journal every exact member of one GPU process."""
 
             expected = {request.request_id for request in batch.requests}
             if set(results) != expected:
-                raise RuntimeError("CUDA profiler batch returned a partial ID set")
+                raise RuntimeError(
+                    f"{backend.value} profiler batch returned a partial ID set"
+                )
             for request in batch.requests:
                 track(request, results[request.request_id])
             _append_checkpoint_journal(
@@ -2698,10 +3454,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.device_lanes == 1:
             for index, batch in enumerate(batches, start=1):
-                announce_cuda_batch(index, batch, 0)
-                publish_cuda_batch(
+                announce_gpu_batch(index, batch, 0)
+                publish_gpu_batch(
                     batch,
-                    collect_cuda_batch(
+                    batch_collector(
                         batch,
                         replace(options, device_ordinal=0),
                     ),
@@ -2713,17 +3469,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 indexed_batches = iter(enumerate(batches, start=1))
                 active_batches: dict[
                     concurrent.futures.Future[dict[str, ProfilerEvidence]],
-                    tuple[CUDAProfilerProcessBatch, int],
+                    tuple[GPUProfilerProcessBatch, int],
                 ] = {}
 
-                def submit_cuda_batch(lane: int) -> bool:
+                def submit_gpu_batch(lane: int) -> bool:
                     try:
                         index, batch = next(indexed_batches)
                     except StopIteration:
                         return False
-                    announce_cuda_batch(index, batch, lane)
+                    announce_gpu_batch(index, batch, lane)
                     future = executor.submit(
-                        collect_cuda_batch,
+                        batch_collector,
                         batch,
                         replace(options, device_ordinal=lane),
                     )
@@ -2731,7 +3487,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     return True
 
                 for lane in range(args.device_lanes):
-                    if not submit_cuda_batch(lane):
+                    if not submit_gpu_batch(lane):
                         break
                 while active_batches:
                     done, _ = concurrent.futures.wait(
@@ -2740,8 +3496,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     for future in done:
                         batch, lane = active_batches.pop(future)
-                        publish_cuda_batch(batch, future.result())
-                        submit_cuda_batch(lane)
+                        publish_gpu_batch(batch, future.result())
+                        submit_gpu_batch(lane)
 
         manifest = _write_checkpoint(output, requests, records)
         report = validate_profiler_evidence_coverage(

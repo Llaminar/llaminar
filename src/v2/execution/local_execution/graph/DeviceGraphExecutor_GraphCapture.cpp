@@ -12,7 +12,8 @@
 
 #include "DeviceGraphExecutor.h"
 #include "DeviceGraphCaptureController.h"
-#include "../coherence/StageCoherence.h"
+#include "GraphCaptureGuard.h"
+#include "../coherence/CoherencePolicy.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -20,15 +21,103 @@
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
+#include "../../../transfer/TransferEngine.h"
+
+#include <sstream>
+#include <unordered_set>
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Rebind every GPU stage for an explicitly selected eager pass.
+         *
+         * Capture and replay phases deliberately point stages at a graph-owned
+         * stream. A caller that explicitly disables cached graph replay must
+         * therefore establish one worker-owned stream for the complete eager
+         * graph before execution. This helper is not an error-recovery path:
+         * once replay is selected, replay failure is a hard execution failure.
+         *
+         * @param graph Graph whose stages will execute eagerly by policy.
+         * @param gpu_stream Worker-owned stream supplied by the capture policy.
+         * CPU-only graphs legitimately have no GPU stream. The helper first
+         * validates the complete graph and determines whether any stage is
+         * device-backed; only then does it require and publish the explicit
+         * stream. This keeps CPU decode usable without weakening the GPU
+         * ownership contract.
+         *
+         * @return true when every GPU graph stage was rebound, or when the
+         *         graph is entirely CPU-owned.
+         */
+        bool bindGraphStagesForEagerExecution(ComputeGraph &graph, void *gpu_stream)
+        {
+            bool has_gpu_stage = false;
+
+            for (const auto &name : graph.getExecutionOrder())
+            {
+                ComputeNode *node = graph.getNode(name);
+                if (!node || !node->stage)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Capture-policy eager execution cannot bind missing stage '"
+                              << name << "'");
+                    return false;
+                }
+                const DeviceId stage_device =
+                    node->stage->device().is_valid()
+                        ? node->stage->device()
+                        : node->device;
+                has_gpu_stage = has_gpu_stage || stage_device.is_gpu();
+            }
+
+            if (has_gpu_stage && !gpu_stream)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Capture-policy eager GPU execution "
+                    "requires an explicit non-null stream");
+                return false;
+            }
+
+            if (has_gpu_stage)
+            {
+                for (const auto &name : graph.getExecutionOrder())
+                {
+                    ComputeNode *node = graph.getNode(name);
+                    node->stage->setGPUStream(gpu_stream);
+                }
+            }
+            return true;
+        }
+
+        /**
+         * @brief Terminate after a graph-cache resource loses a valid lifecycle.
+         *
+         * A non-null stream or event is an owned backend resource. Once its
+         * owner cannot be resolved, synchronization fails, or destruction
+         * throws, neither dropping the handle nor continuing inference is
+         * correct: queued work may still reference graph state that the host is
+         * about to release. Centralizing the fatal policy here prevents future
+         * lifecycle call sites from quietly reintroducing log-and-continue
+         * behavior.
+         *
+         * @param detail Exact ownership or backend operation that failed.
+         */
+        [[noreturn]] void terminateGraphSegmentCacheLifecycle(
+            const std::string &detail) noexcept
+        {
+            LOG_ERROR(
+                "[GraphSegmentCache] Fatal GPU graph resource lifecycle "
+                "violation: "
+                << detail);
+            std::terminate();
+        }
+    }
 
     // =========================================================================
     // GraphSegmentCache — capture stream management
     // =========================================================================
 
-    IWorkerGPUContext *DeviceGraphExecutor::GraphSegmentCache::resolveLifecycleContext(
+    IWorkerGPUContext *DeviceGraphExecutor::GraphSegmentCache::requireLifecycleContext(
         const char *operation)
     {
         if (capture_device.is_gpu() && capture_context_from_pool)
@@ -42,13 +131,19 @@ namespace llaminar2
             }
             catch (const std::exception &e)
             {
-                LOG_ERROR("[GraphSegmentCache] Failed to resolve GPU context for "
-                          << operation << " on " << capture_device.toString()
-                          << ": " << e.what());
-                return nullptr;
+                terminateGraphSegmentCacheLifecycle(
+                    std::string("failed to resolve the owning GPU context for ") +
+                    operation + " on " + capture_device.toString() + ": " +
+                    e.what());
             }
         }
 
+        if (!gpu_ctx_ref)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                std::string("owned resource has no live GPU context during ") +
+                operation);
+        }
         return gpu_ctx_ref;
     }
 
@@ -76,6 +171,12 @@ namespace llaminar2
                 capture_context_from_pool || context_from_process_pool;
             if (!gpu_ctx_ref)
                 gpu_ctx_ref = ctx;
+            if (!gpu_ctx_ref &&
+                !(capture_device.is_gpu() && capture_context_from_pool))
+            {
+                terminateGraphSegmentCacheLifecycle(
+                    "existing capture stream has no resolvable owner");
+            }
             return true;
         }
         if (!ctx)
@@ -99,28 +200,42 @@ namespace llaminar2
         return true;
     }
 
-    void DeviceGraphExecutor::GraphSegmentCache::synchronizeCaptureStream()
+    void DeviceGraphExecutor::GraphSegmentCache::waitForCaptureStreamFence()
     {
         if (!capture_stream)
             return;
 
-        IWorkerGPUContext *ctx = resolveLifecycleContext("capture stream synchronization");
-        if (!ctx)
-        {
-            LOG_ERROR("[GraphSegmentCache] Cannot synchronize capture stream: no live GPU context");
-            return;
-        }
+        IWorkerGPUContext *ctx =
+            requireLifecycleContext("capture stream event fence");
 
         try
         {
-            if (!ctx->synchronizeStreamChecked(capture_stream))
+            if (!ensureSyncEvent(ctx))
             {
-                LOG_ERROR("[GraphSegmentCache] Capture stream synchronization failed");
+                terminateGraphSegmentCacheLifecycle(
+                    "capture stream event fence allocation was rejected by the backend");
+            }
+            if (!ctx->recordEventChecked(sync_event, capture_stream))
+            {
+                terminateGraphSegmentCacheLifecycle(
+                    "capture stream event fence publication was rejected by the backend");
+            }
+            if (!ctx->synchronizeEventChecked(sync_event))
+            {
+                terminateGraphSegmentCacheLifecycle(
+                    "capture stream event fence wait was rejected by the backend");
             }
         }
         catch (const std::exception &e)
         {
-            LOG_ERROR("[GraphSegmentCache] Capture stream synchronization threw: " << e.what());
+            terminateGraphSegmentCacheLifecycle(
+                std::string("capture stream event fence threw: ") +
+                e.what());
+        }
+        catch (...)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "capture stream event fence threw an unknown exception");
         }
     }
 
@@ -134,22 +249,21 @@ namespace llaminar2
             return;
         }
 
-        IWorkerGPUContext *ctx = resolveLifecycleContext("capture stream destruction");
-        if (ctx)
+        IWorkerGPUContext *ctx =
+            requireLifecycleContext("capture stream destruction");
+        try
         {
-            try
-            {
-                ctx->destroyStream(capture_stream);
-            }
-            catch (const std::exception &e)
-            {
-                LOG_ERROR("[GraphSegmentCache] Capture stream destruction threw: " << e.what());
-            }
+            ctx->destroyStream(capture_stream);
         }
-        else
+        catch (const std::exception &e)
         {
-            LOG_ERROR("[GraphSegmentCache] Dropping capture stream handle without destruction "
-                      "because its GPU context is unavailable");
+            terminateGraphSegmentCacheLifecycle(
+                std::string("capture stream destruction threw: ") + e.what());
+        }
+        catch (...)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "capture stream destruction threw an unknown exception");
         }
         capture_stream = nullptr;
         gpu_ctx_ref = nullptr;
@@ -160,9 +274,23 @@ namespace llaminar2
     bool DeviceGraphExecutor::GraphSegmentCache::ensureSyncEvent(IWorkerGPUContext *ctx)
     {
         if (sync_event)
+        {
+            if (!gpu_ctx_ref &&
+                !(capture_device.is_gpu() && capture_context_from_pool))
+            {
+                terminateGraphSegmentCacheLifecycle(
+                    "existing capture-stream handoff event has no resolvable owner");
+            }
             return true;
+        }
         if (!ctx)
             return false;
+        if (gpu_ctx_ref && gpu_ctx_ref != ctx && !capture_context_from_pool)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "capture-stream handoff event context differs from the capture "
+                "stream owner");
+        }
         sync_event = ctx->createEvent();
         if (!sync_event)
         {
@@ -174,26 +302,59 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphExecutor::GraphSegmentCache::orderCaptureStreamAfter(
+        IWorkerGPUContext *ctx,
+        void *producer_stream)
+    {
+        if (!ctx || !producer_stream || !capture_stream)
+        {
+            LOG_ERROR(
+                "[GraphSegmentCache] Capture-stream handoff requires one "
+                "context and two explicit streams");
+            return false;
+        }
+        if (producer_stream == capture_stream)
+            return true;
+        if (!ensureSyncEvent(ctx))
+            return false;
+        if (!ctx->recordEventChecked(sync_event, producer_stream))
+        {
+            LOG_ERROR(
+                "[GraphSegmentCache] Failed to record capture-stream handoff "
+                "event on the producer stream");
+            return false;
+        }
+        if (!ctx->waitEventChecked(sync_event, capture_stream))
+        {
+            LOG_ERROR(
+                "[GraphSegmentCache] Failed to queue capture-stream wait for "
+                "the producer handoff event");
+            return false;
+        }
+        return true;
+    }
+
     void DeviceGraphExecutor::GraphSegmentCache::destroySyncEvent()
     {
         if (!sync_event)
             return;
-        IWorkerGPUContext *ctx = resolveLifecycleContext("sync event destruction");
-        if (ctx)
+        IWorkerGPUContext *ctx =
+            requireLifecycleContext("sync event destruction");
+        try
         {
-            try
-            {
-                ctx->destroyEvent(sync_event);
-            }
-            catch (const std::exception &e)
-            {
-                LOG_ERROR("[GraphSegmentCache] Sync event destruction threw: " << e.what());
-            }
+            ctx->destroyEvent(sync_event);
         }
-        else
+        catch (const std::exception &e)
         {
-            LOG_ERROR("[GraphSegmentCache] Dropping sync event handle without destruction "
-                      "because its GPU context is unavailable");
+            terminateGraphSegmentCacheLifecycle(
+                std::string("capture-stream handoff event destruction threw: ") +
+                e.what());
+        }
+        catch (...)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "capture-stream handoff event destruction threw an unknown "
+                "exception");
         }
         sync_event = nullptr;
     }
@@ -204,20 +365,85 @@ namespace llaminar2
 
     bool DeviceGraphExecutor::executeWithGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
                                                       IGPUGraphCapture *capture,
-                                                      const std::unordered_set<std::string> *collective_nodes,
-                                                      void *gpu_stream)
+                                                      std::span<ITensor *const> externally_visible_outputs,
+                                                      const std::unordered_set<std::string> *collective_nodes)
     {
         if (!capture)
         {
-            LOG_WARN("[DeviceGraphExecutor] GPU graph capture is null, falling back to fast decode");
-            return executeFastDecode(graph, ctx, collective_nodes);
+            LOG_ERROR("[DeviceGraphExecutor] GPU graph capture requires a non-null capture owner");
+            return false;
         }
 
         // TP>1 with collectives cannot be captured in a single-device graph
         if (collective_nodes && !collective_nodes->empty())
         {
-            LOG_DEBUG("[DeviceGraphExecutor] Collective nodes present, skipping graph capture for TP>1");
-            return executeFastDecode(graph, ctx, collective_nodes);
+            LOG_ERROR("[DeviceGraphExecutor] Single-device graph capture cannot own collective nodes");
+            return false;
+        }
+
+        if (!ctx || !ctx->deviceId().is_gpu())
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Single-graph capture requires an explicit "
+                "GPU execution context");
+            return false;
+        }
+
+        void *const gpu_stream = capture->executionStream();
+        if (!gpu_stream)
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Single-graph capture owner has no explicit "
+                "execution stream");
+            return false;
+        }
+
+        /*
+         * Capture-time tensor writes intentionally cannot publish host-waitable
+         * completion events: those event records would become graph nodes and
+         * describe recording rather than replay completion. The graph boundary
+         * must therefore declare every tensor that may escape this call.
+         * Validate the complete declaration before capture begins so an invalid
+         * output cannot leave a partially published graph launch behind.
+         */
+        if (externally_visible_outputs.empty())
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Single-graph capture requires at least "
+                "one externally visible output publication");
+            return false;
+        }
+
+        std::unordered_set<ITensor *> unique_outputs;
+        unique_outputs.reserve(externally_visible_outputs.size());
+        for (ITensor *output : externally_visible_outputs)
+        {
+            if (!output)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Single-graph capture output "
+                    "publication contains a null tensor");
+                return false;
+            }
+            if (!unique_outputs.insert(output).second)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Single-graph capture output "
+                    "publication contains a duplicate tensor");
+                return false;
+            }
+
+            auto *base = dynamic_cast<TensorBase *>(output);
+            if (!base || !base->gpu_data_ptr() ||
+                !base->current_device().has_value() ||
+                *base->current_device() != ctx->deviceId())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Single-graph capture output is not "
+                    "resident on the execution device "
+                    << ctx->deviceId().toString());
+                return false;
+            }
         }
 
         const auto &order = graph.getExecutionOrder();
@@ -226,14 +452,11 @@ namespace llaminar2
         // own tiny graph metadata buffers and must upload them on this explicit
         // stream before beginCapture(); doing so from execute() would record an
         // illegal H2D operation into the graph.
-        if (gpu_stream)
+        for (const auto &name : order)
         {
-            for (const auto &name : order)
-            {
-                auto *node = graph.getNode(name);
-                if (node && node->stage)
-                    node->stage->setGPUStream(gpu_stream);
-            }
+            auto *node = graph.getNode(name);
+            if (node && node->stage)
+                node->stage->setGPUStream(gpu_stream);
         }
 
         for (const auto &name : order)
@@ -245,15 +468,18 @@ namespace llaminar2
             {
                 LOG_ERROR("[DeviceGraphExecutor] Graph launch metadata preparation failed before capture: "
                           << name);
-                return executeFastDecode(graph, ctx, collective_nodes);
+                return false;
             }
         }
 
-        // Step 1: Begin capture
-        if (!capture->beginCapture())
+        // Step 1: Begin one structurally owned capture transaction.
+        ScopedBackendGraphCapture capture_transaction(
+            *capture,
+            "single-graph capture");
+        if (!capture_transaction.begin())
         {
-            LOG_WARN("[DeviceGraphExecutor] GPU graph beginCapture failed, falling back to fast decode");
-            return executeFastDecode(graph, ctx, collective_nodes);
+            LOG_ERROR("[DeviceGraphExecutor] GPU graph beginCapture failed");
+            return false;
         }
 
         // Step 2: Execute all stages into the captured stream
@@ -274,88 +500,105 @@ namespace llaminar2
             graph.markCompleted(name);
         }
 
-        // Step 3: End capture
-        if (!exec_success || !capture->endCapture())
+        // Step 3: Always leave native stream-capture mode before branching.
+        capture_transaction.finish();
+        if (!exec_success)
         {
-            LOG_WARN("[DeviceGraphExecutor] GPU graph capture failed (exec_success=" << exec_success
-                                                                                     << "), stream may be in bad state");
-            // If capture was started but execute failed, we still need to end capture
-            // to restore the stream to a usable state
-            if (exec_success)
-            {
-                // endCapture failed
-                capture->reset();
-            }
-            // Fall through — the stream should be usable again after endCapture
-            // The kernels were recorded during capture but NOT executed
-            return exec_success;
+            LOG_ERROR(
+                "[DeviceGraphExecutor] A stage failed during mandatory "
+                "single-graph capture; refusing eager recovery");
+            capture->reset();
+            return false;
         }
 
-        // If graph captured 0 nodes, all work was CPU-side (already executed
-        // during capture).  Skip instantiate/update/launch — there is nothing
-        // to replay.
+        /*
+         * Selecting this API is an architectural assertion that every stage
+         * in the graph emitted replayable device work onto the owned capture
+         * stream. A zero-node result therefore means the stage binding,
+         * residency preflight, or stream propagation contract is broken.
+         * Treating the capture-time stage execution as a successful eager run
+         * would let production silently leave graph mode.
+         */
         if (capture->nodeCount() == 0)
         {
-            LOG_WARN("[DeviceGraphExecutor] GPU graph captured 0 nodes — kernels NOT on capture stream! Skipping graph replay");
-            return true;
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Mandatory GPU graph capture produced "
+                "zero nodes; refusing capture-time eager execution");
+            capture->reset();
+            return false;
         }
 
-        // Step 4: Instantiate or update + launch
-        LOG_WARN("[DeviceGraphExecutor] GPU graph captured " << capture->nodeCount()
-                                                             << " nodes, hasExecutable=" << capture->hasExecutable());
-        if (capture->hasExecutable())
+        // Step 4: Select the one executable-publication operation supported by
+        // the capture backend, then launch. This capability branch is static:
+        // a backend that cannot update in place directly replaces its old
+        // executable, without issuing a doomed update call and attempting to
+        // recover from the resulting runtime error.
+        LOG_DEBUG("[DeviceGraphExecutor] GPU graph captured " << capture->nodeCount()
+                                                              << " nodes, hasExecutable=" << capture->hasExecutable());
+        const bool can_update_existing_executable =
+            capture->hasExecutable() && capture->supportsExecutableUpdate();
+        if (can_update_existing_executable)
         {
-            // Try in-place update
-            GraphUpdateResult result = capture->tryUpdate();
-            LOG_WARN("[DeviceGraphExecutor] tryUpdate result=" << static_cast<int>(result));
+            const GraphUpdateResult result = capture->tryUpdate();
+            LOG_DEBUG("[DeviceGraphExecutor] tryUpdate result=" << static_cast<int>(result));
             if (result == GraphUpdateResult::Success)
             {
-                // In-place update succeeded — launch the updated executable
-                if (!capture->launch())
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] GPU graph launch failed after update");
-                    return false;
-                }
-                LOG_TRACE("[DeviceGraphExecutor] GPU graph updated and launched ("
+                LOG_TRACE("[DeviceGraphExecutor] GPU graph executable updated in place ("
                           << capture->nodeCount() << " nodes)");
-                return true;
             }
             else if (result == GraphUpdateResult::NeedsReinstantiate)
             {
-                // Topology changed — reinstantiate
-                LOG_WARN("[DeviceGraphExecutor] NeedsReinstantiate — calling instantiate()");
+                LOG_DEBUG("[DeviceGraphExecutor] NeedsReinstantiate; instantiating the captured topology");
                 if (!capture->instantiate())
                 {
-                    LOG_WARN("[DeviceGraphExecutor] GPU graph reinstantiation failed");
+                    LOG_ERROR("[DeviceGraphExecutor] GPU graph reinstantiation failed");
                     return false;
                 }
             }
             else
             {
                 // Update failed
-                LOG_WARN("[DeviceGraphExecutor] GPU graph update failed (result="
-                         << static_cast<int>(result) << ")");
+                LOG_ERROR("[DeviceGraphExecutor] GPU graph update failed (result="
+                          << static_cast<int>(result) << ")");
                 return false;
             }
         }
         else
         {
-            // First time — instantiate from captured graph
-            LOG_WARN("[DeviceGraphExecutor] First instantiation attempt (" << capture->nodeCount() << " nodes)");
+            LOG_DEBUG("[DeviceGraphExecutor] Instantiating captured graph "
+                      << (capture->hasExecutable() ? "as an executable replacement" : "for the first time")
+                      << " (" << capture->nodeCount() << " nodes)");
             if (!capture->instantiate())
             {
-                LOG_WARN("[DeviceGraphExecutor] GPU graph instantiation failed");
+                LOG_ERROR("[DeviceGraphExecutor] GPU graph instantiation failed");
                 return false;
             }
-            LOG_WARN("[DeviceGraphExecutor] GPU graph instantiated with " << capture->nodeCount()
-                                                                          << " nodes (" << capture->backendName() << ")");
+            LOG_DEBUG("[DeviceGraphExecutor] GPU graph instantiated with " << capture->nodeCount()
+                                                                           << " nodes (" << capture->backendName() << ")");
         }
 
-        // Launch the (newly instantiated) executable
+        // Launch exactly once whether publication updated or replaced the
+        // executable. A failed publication never reaches this point.
         if (!capture->launch())
         {
             LOG_ERROR("[DeviceGraphExecutor] GPU graph launch failed");
             return false;
+        }
+
+        /*
+         * This is the sole externally visible publication boundary for the
+         * direct single-graph API. Every event is recorded after launch on the
+         * capture-owned stream, so a host read or another device stream consumes
+         * the exact replay that produced the declared output. Event
+         * creation/record failures throw from TransferEngine and intentionally
+         * stop inference; there is no stream-synchronization fallback.
+         */
+        for (ITensor *output : externally_visible_outputs)
+        {
+            TransferEngine::publishDeviceWrite(
+                output,
+                ctx->deviceId(),
+                gpu_stream);
         }
 
         return true;
@@ -385,15 +628,15 @@ namespace llaminar2
             return execute(graph, ctx);
         }
 
-        const bool segmented_ready =
-            policy.allow_cached_graph_replay &&
-            segment_cache &&
-            gpu_stream &&
-            gpu_ctx &&
-            segment_cache->consecutive_failures < policy.max_segment_failures;
-
-        if (segmented_ready)
+        if (policy.allow_cached_graph_replay)
         {
+            if (!segment_cache || !gpu_stream || !gpu_ctx)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Cached graph replay policy requires "
+                    "a segment cache, explicit stream, and live GPU context");
+                return false;
+            }
             bool success = executeWithCachedGraphReplay(
                 graph,
                 ctx,
@@ -404,7 +647,8 @@ namespace llaminar2
                 policy.collectives_graph_capturable,
                 policy.force_recapture,
                 policy.defer_final_sync,
-                policy.before_begin_capture);
+                policy.capture_boundary,
+                policy.graph_replay_plan_policy);
 
             if (success)
             {
@@ -422,12 +666,13 @@ namespace llaminar2
                 segment_cache->initialized
                     ? DeviceGraphCaptureController::replayModeName(*segment_cache)
                     : "graph_replay";
-            LOG_WARN("[DeviceGraphExecutor] " << mode_name
-                                              << " failed under policy, falling back to fast decode");
-            graph.reset();
-            return executeFastDecode(graph, ctx, collective_nodes);
+            LOG_ERROR("[DeviceGraphExecutor] " << mode_name
+                                               << " failed under mandatory cached graph replay policy");
+            return false;
         }
 
+        if (!bindGraphStagesForEagerExecution(graph, gpu_stream))
+            return false;
         if (!executeFastDecode(graph, ctx, collective_nodes))
             return false;
         /*
@@ -452,12 +697,13 @@ namespace llaminar2
                                                                bool collectives_graph_capturable,
                                                                bool force_recapture,
                                                                bool defer_final_sync,
-                                                               GraphCaptureBoundaryHook before_begin_capture)
+                                                               GraphCaptureBoundaryHook capture_boundary,
+                                                               GraphReplayPlanPolicy plan_policy)
     {
         if (!gpu_stream || !gpu_ctx)
         {
-            LOG_WARN("[DeviceGraphExecutor] GPU graph capture/replay: missing stream or gpu_ctx, falling back");
-            return executeFastDecode(graph, ctx);
+            LOG_ERROR("[DeviceGraphExecutor] GPU graph capture/replay requires an explicit stream and live GPU context");
+            return false;
         }
 
         const bool has_collective_nodes = (collective_nodes && !collective_nodes->empty());
@@ -494,19 +740,6 @@ namespace llaminar2
             segment_cache.needs_capture,
             segment_cache.decode_step);
         const uint64_t current_step = phase_transition.decode_step;
-        const char *phase_name = "unknown";
-        switch (phase_transition.phase)
-        {
-        case DeviceGraphCaptureController::Phase::Warmup:
-            phase_name = "warmup";
-            break;
-        case DeviceGraphCaptureController::Phase::Capture:
-            phase_name = "capture";
-            break;
-        case DeviceGraphCaptureController::Phase::Replay:
-            phase_name = "replay";
-            break;
-        }
         PerfStatsCollector::addCounter(
             "forward_graph",
             "decode_graph_phase",
@@ -514,7 +747,7 @@ namespace llaminar2
             "decode",
             ctx ? ctx->deviceId().toString() : std::string{},
             {{"context", segment_cache.perf_context},
-             {"phase", phase_name}});
+             {"phase", DeviceGraphCaptureController::phaseName(phase_transition.phase)}});
 
         auto mark_arena_write_dirty = [&](BufferId id, DeviceId device)
         {
@@ -602,21 +835,9 @@ namespace llaminar2
 
             if (!replay_result.success)
             {
-                if (replay_result.launch_failure_fallback)
-                {
-                    segment_cache.consecutive_failures++;
-                    if (segment_cache.consecutive_failures >= GraphSegmentCache::kMaxFailures)
-                    {
-                        LOG_WARN("[DeviceGraphExecutor] Too many GPU graph replay failures, disabling");
-                        segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
-                    }
-                    graph.reset();
-                    return executeFastDecode(graph, ctx, collective_nodes);
-                }
                 return false;
             }
 
-            segment_cache.consecutive_failures = 0;
             return true;
         }
 
@@ -650,25 +871,46 @@ namespace llaminar2
 
             DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
             const StageBufferContract contract = node.stage->bufferContract();
+            void *const coherence_stream = segment_cache.capture_stream;
+            if (!coherence_stream)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Replay coherence for stage '"
+                          << node.name
+                          << "' requires the graph cache's exact non-null capture stream");
+                return false;
+            }
+
+            std::string prepared_error;
+            if (!node.stage->validatePreparedWeights(&prepared_error))
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Prepared weight validation failed for replay stage '"
+                          << node.name << "': " << prepared_error);
+                return false;
+            }
+            if (!validatePreparedWeightBindings(node, contract, target_device))
+                return false;
 
             // Cohere arena-managed reads (inputs + inouts)
             for (const auto &binding : contract.allArenaReads())
             {
-                if (!arena_->prepareForRead(binding.id, target_device))
+                if (!arena_->prepareForRead(
+                        binding.id, target_device, coherence_stream))
                 {
                     LOG_ERROR("[DeviceGraphExecutor] Arena prepareForRead failed for replay stage: " << node.name);
                     return false;
                 }
             }
 
-            // Cohere weights (not arena-managed)
+            // Validate exact weight residency and join producer ordering.
+            // Graph capture is never an allocation or lazy-upload boundary.
             if (!node.weights_cohered)
             {
                 for (auto *weight : contract.weight_tensors)
                 {
                     if (auto *tb = dynamic_cast<TensorBase *>(weight))
                     {
-                        tb->ensureOnDevice(target_device);
+                        TransferEngine::requireDeviceInput(
+                            tb, target_device, coherence_stream);
                     }
                 }
                 node.weights_cohered = true;
@@ -677,7 +919,8 @@ namespace llaminar2
             // Cohere arena-managed writes that require fresh storage.
             for (const auto &binding : contract.writesRequiringPrepare())
             {
-                if (!arena_->prepareForWrite(binding.id, target_device))
+                if (!arena_->prepareForWrite(
+                        binding.id, target_device, coherence_stream))
                 {
                     LOG_ERROR("[DeviceGraphExecutor] Arena prepareForWrite failed for replay stage: " << node.name);
                     return false;
@@ -704,10 +947,7 @@ namespace llaminar2
         {
             if (collective_nodes && collective_nodes->find(node.name) != collective_nodes->end())
                 return true;
-            return node.stage &&
-                   (node.stage->type() == ComputeStageType::ALLREDUCE ||
-                    node.stage->type() == ComputeStageType::ALLGATHER ||
-                    node.stage->type() == ComputeStageType::ALLGATHER_V);
+            return node.stage && node.stage->isCollectiveStage();
         };
 
         DeviceGraphCaptureController::ReplayHooks replay_hooks{
@@ -725,7 +965,7 @@ namespace llaminar2
             {
                 post_captured_segment_launch(segment, stream);
             },
-            before_begin_capture};
+            capture_boundary};
 
         // Capture-phase hooks: same as replay hooks except post_launch skips
         // onGraphReplayed() callbacks. During capture, execute() already ran
@@ -753,7 +993,7 @@ namespace llaminar2
                     },
                     /*skip_replay_callbacks=*/true);
             },
-            before_begin_capture};
+            capture_boundary};
 
         if (phase_transition.phase == DeviceGraphCaptureController::Phase::Replay)
         {
@@ -764,21 +1004,9 @@ namespace llaminar2
 
             if (!replay_result.success)
             {
-                if (replay_result.launch_failure_fallback)
-                {
-                    segment_cache.consecutive_failures++;
-                    if (segment_cache.consecutive_failures >= GraphSegmentCache::kMaxFailures)
-                    {
-                        LOG_WARN("[DeviceGraphExecutor] Too many GPU graph replay failures, disabling");
-                        segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
-                    }
-                    graph.reset();
-                    return executeFastDecode(graph, ctx, collective_nodes);
-                }
                 return false;
             }
 
-            segment_cache.consecutive_failures = 0;
             return true;
         }
 
@@ -799,36 +1027,83 @@ namespace llaminar2
                 segment_cache,
                 collective_nodes,
                 has_collective_nodes,
-                collectives_graph_capturable);
+                collectives_graph_capturable,
+                plan_policy);
 
             // Create the capture stream early so warmup runs on it.
-            if (segment_cache.ensureCaptureStream(
+            if (!segment_cache.ensureCaptureStream(
                     gpu_ctx,
                     ctx ? ctx->deviceId() : DeviceId::invalid(),
                     config_.worker_gpu_context_resolver
                         ? config_.worker_gpu_context_uses_process_pool
                         : true))
             {
-                void *warmup_stream = segment_cache.capture_stream;
+                LOG_ERROR("[DeviceGraphExecutor] GPU graph warmup could not establish its explicit capture stream");
+                return false;
+            }
+            void *warmup_stream = segment_cache.capture_stream;
 
-                // Synchronize prior work on the old stream before switching.
-                // Previous decode steps (e.g., KV cache writes) may still be
-                // in-flight on gpu_stream. Without this dependency, the warmup
-                // on capture_stream could read stale KV data, causing the model
-                // to repeat the previous token (token duplication bug).
-                if (gpu_stream && gpu_stream != warmup_stream)
+            /*
+             * Preserve stream order entirely on device. Previous decode work,
+             * including KV/GDN writes, was queued on the worker stream. Warmup
+             * consumes those tensors on the capture stream, so record one
+             * worker-stream event and make the capture stream wait for it.
+             * A device synchronize here both destroys overlap and lets one
+             * LocalTP rank race ahead into collective warmup while another rank
+             * is still changing streams.
+             */
+            if (gpu_stream && gpu_stream != warmup_stream)
+            {
+                if (!segment_cache.orderCaptureStreamAfter(
+                        gpu_ctx,
+                        gpu_stream))
                 {
-                    gpu_ctx->synchronize();
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] GPU graph warmup could not "
+                        "publish its worker-to-capture stream handoff");
+                    return false;
                 }
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "warmup_stream_event_handoffs",
+                    1.0,
+                    "decode",
+                    ctx ? ctx->deviceId().toString() : std::string{},
+                    {{"context", segment_cache.perf_context}});
+            }
 
-                // Point all stages at the capture stream for warmup execution.
-                for (const auto &name : graph.getExecutionOrder())
+            /*
+             * LocalTP participants must enter warmup as one lifecycle. Actual
+             * capture already invokes this hook before each beginCapture(); the
+             * first warmup execution is equally collective-bearing and must not
+             * be allowed to drift independently across ranks.
+             */
+            if (capture_boundary)
+            {
+                std::ostringstream boundary;
+                boundary << "before_warmup:"
+                         << "phase=warmup"
+                         << ":step=" << current_step
+                         << ":scope=full_graph";
+                if (!segment_cache.perf_context.empty())
+                    boundary << ":context=" << segment_cache.perf_context;
+                if (!capture_boundary(boundary.str(), gpu_stream))
                 {
-                    auto *node = graph.getNode(name);
-                    if (node && node->stage)
-                    {
-                        node->stage->setGPUStream(warmup_stream);
-                    }
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] GPU graph warmup boundary "
+                        "rendezvous failed: "
+                        << boundary.str());
+                    return false;
+                }
+            }
+
+            // Point all stages at the capture stream for warmup execution.
+            for (const auto &name : graph.getExecutionOrder())
+            {
+                auto *node = graph.getNode(name);
+                if (node && node->stage)
+                {
+                    node->stage->setGPUStream(warmup_stream);
                 }
             }
 
@@ -862,13 +1137,6 @@ namespace llaminar2
 
             if (!capture_result.success)
             {
-                if (capture_result.fallback_to_fast_decode)
-                {
-                    // The partial capture marked some nodes completed —
-                    // reset so fast decode re-executes all stages.
-                    graph.reset();
-                    return executeFastDecode(graph, ctx, collective_nodes);
-                }
                 return false;
             }
 

@@ -748,15 +748,27 @@ namespace llaminar2
             contract.addOutput(*params_.output_a_buffer_id);
         if (params_.output_b_buffer_id)
             contract.addOutput(*params_.output_b_buffer_id);
-        // Model weights are not arena-managed
+        // Every GDN projection consumes a store-owned prepared representation.
         if (params_.w_qkv)
-            contract.addWeight(const_cast<ITensor *>(params_.w_qkv));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.w_qkv),
+                params_.prepared_store,
+                params_.prepared_ref_qkv.value_or(PreparedWeightRef{}));
         if (params_.w_z)
-            contract.addWeight(const_cast<ITensor *>(params_.w_z));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.w_z),
+                params_.prepared_store,
+                params_.prepared_ref_z.value_or(PreparedWeightRef{}));
         if (params_.w_a)
-            contract.addWeight(const_cast<ITensor *>(params_.w_a));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.w_a),
+                params_.prepared_store,
+                params_.prepared_ref_a.value_or(PreparedWeightRef{}));
         if (params_.w_b)
-            contract.addWeight(const_cast<ITensor *>(params_.w_b));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.w_b),
+                params_.prepared_store,
+                params_.prepared_ref_b.value_or(PreparedWeightRef{}));
         return contract;
     }
 

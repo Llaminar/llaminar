@@ -32,6 +32,37 @@ namespace llaminar2
             }
         }
 
+        void validatePreparedEmbeddingHandle(
+            const WeightBinding &binding,
+            DeviceId device,
+            const PreparedEmbeddingHandle *handle)
+        {
+            if (!binding.tensor)
+                throw std::runtime_error(
+                    "PreparedWeightStore requires a source tensor for prepared embedding registration");
+            if (!handle)
+                throw std::runtime_error(
+                    "PreparedWeightStore cannot register a null prepared embedding handle");
+            if (handle->tensor != binding.tensor)
+                throw std::runtime_error(
+                    "PreparedWeightStore prepared embedding source tensor mismatch");
+            if (handle->device_id != device)
+                throw std::runtime_error(
+                    "PreparedWeightStore prepared embedding handle device mismatch");
+            if (!handle->weights)
+                throw std::runtime_error(
+                    "PreparedWeightStore cannot register prepared embedding state without owned weights");
+            if (handle->weights->device_id != device)
+                throw std::runtime_error(
+                    "PreparedWeightStore prepared embedding allocation device mismatch");
+
+            const DeviceId binding_device =
+                binding.residency.resident_device.value_or(binding.residency.home_device);
+            if (binding_device != device)
+                throw std::runtime_error(
+                    "PreparedWeightStore prepared embedding binding device mismatch");
+        }
+
         bool samePreparedRef(const PreparedWeightRef &stored, const PreparedWeightRef &requested)
         {
             return stored.model_id == requested.model_id &&
@@ -183,7 +214,7 @@ namespace llaminar2
         stored.prepared = ref;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[ref.binding_id] = Entry{std::move(stored), ref, std::move(owned)};
+        entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(owned)};
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -205,7 +236,7 @@ namespace llaminar2
         stored.prepared = ref;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[ref.binding_id] = Entry{std::move(stored), ref, nullptr};
+        entries_[keyFor(ref)] = Entry{std::move(stored), ref, nullptr};
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -228,10 +259,10 @@ namespace llaminar2
         stored.prepared = ref;
 
         if (stored.tensor)
-            stored.tensor->has_prepared_device_state_ = true;
+            stored.tensor->publishPreparedDeviceState();
 
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[ref.binding_id] = Entry{std::move(stored), ref, std::move(handle)};
+        entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(handle)};
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -250,7 +281,7 @@ namespace llaminar2
             return false;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        if (entries_.find(binding.binding_id) != entries_.end())
+        if (entries_.find(keyFor(binding.binding_id, device)) != entries_.end())
             return true;
 
         for (const auto &[id, entry] : entries_)
@@ -276,8 +307,8 @@ namespace llaminar2
             auto ref = makeRef(binding.binding_id, entry.ref.kind, device);
             stored.prepared = ref;
             if (stored.tensor)
-                stored.tensor->has_prepared_device_state_ = true;
-            entries_[ref.binding_id] = Entry{std::move(stored), ref, std::move(handle)};
+                stored.tensor->publishPreparedDeviceState();
+            entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(handle)};
             return true;
         }
 
@@ -287,7 +318,7 @@ namespace llaminar2
     ITensorGemm *PreparedWeightStore::gemmKernel(const PreparedWeightRef &ref) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = entries_.find(ref.binding_id);
+        auto it = entries_.find(keyFor(ref));
         if (it == entries_.end() || !samePreparedRef(it->second.ref, ref))
             return nullptr;
         const auto *handle = it->second.activeHandle();
@@ -305,12 +336,13 @@ namespace llaminar2
             return std::nullopt;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = entries_.find(binding_id);
-        if (it != entries_.end() && it->second.ref.device == device)
+        const auto key = keyFor(binding_id, device);
+        auto it = entries_.find(key);
+        if (it != entries_.end())
             return it->second.ref;
 
-        auto emb_it = embedding_entries_.find(binding_id);
-        if (emb_it != embedding_entries_.end() && emb_it->second.ref.device == device)
+        auto emb_it = embedding_entries_.find(key);
+        if (emb_it != embedding_entries_.end())
             return emb_it->second.ref;
 
         return std::nullopt;
@@ -321,8 +353,8 @@ namespace llaminar2
         const PreparedWeightRef &up_ref) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto gate_it = entries_.find(gate_ref.binding_id);
-        auto up_it = entries_.find(up_ref.binding_id);
+        auto gate_it = entries_.find(keyFor(gate_ref));
+        auto up_it = entries_.find(keyFor(up_ref));
         if (gate_it == entries_.end() || up_it == entries_.end())
             return nullptr;
         if (!samePreparedRef(gate_it->second.ref, gate_ref) ||
@@ -334,7 +366,12 @@ namespace llaminar2
             return nullptr;
 
         // Phase 8: Check local fused cache first
-        FusedCacheKey fkey{gate_ref.binding_id, up_ref.binding_id};
+        FusedCacheKey fkey{
+            .gate_binding_id = gate_ref.binding_id,
+            .up_binding_id = up_ref.binding_id,
+            .gate_device = gate_ref.device,
+            .up_device = up_ref.device,
+        };
         auto fc_it = fused_cache_.find(fkey);
         if (fc_it != fused_cache_.end())
             return fc_it->second.get();
@@ -368,15 +405,19 @@ namespace llaminar2
         if (!owned)
             throw std::runtime_error("PreparedWeightStore::prepareEmbedding failed for: " + binding.identity.canonical_name);
 
+        validateBindingForStore(binding, model_id_, PreparedWeightKind::PreparedEmbedding);
+        validatePreparedEmbeddingHandle(binding, device, owned.get());
+
         auto ref = makeRef(binding.binding_id, PreparedWeightKind::PreparedEmbedding, device);
         WeightBinding stored = binding;
         stored.prepared = ref;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        embedding_entries_[ref.binding_id] = EmbeddingEntry{std::move(stored), ref, std::move(owned), nullptr};
+        embedding_entries_[keyFor(ref)] =
+            EmbeddingEntry{std::move(stored), ref, std::move(owned), nullptr};
 
         // Mark tensor as having prepared device state
-        binding.tensor->has_prepared_device_state_ = true;
+        binding.tensor->publishPreparedDeviceState();
 
         return ref;
     }
@@ -386,21 +427,24 @@ namespace llaminar2
         DeviceId device,
         const PreparedEmbeddingHandle *handle)
     {
+        validateBindingForStore(binding, model_id_, PreparedWeightKind::PreparedEmbedding);
+        validatePreparedEmbeddingHandle(binding, device, handle);
+
         auto ref = makeRef(binding.binding_id, PreparedWeightKind::PreparedEmbedding, device);
         WeightBinding stored = binding;
         stored.prepared = ref;
 
-        std::shared_ptr<PreparedEmbeddingHandle> owned;
-        if (handle)
-        {
-            owned = std::make_shared<PreparedEmbeddingHandle>();
-            owned->tensor = handle->tensor;
-            owned->device_id = handle->device_id;
-            owned->weights = handle->weights;
-        }
+        auto owned = std::make_shared<PreparedEmbeddingHandle>();
+        owned->tensor = handle->tensor;
+        owned->device_id = handle->device_id;
+        owned->weights = handle->weights;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        embedding_entries_[ref.binding_id] = EmbeddingEntry{std::move(stored), ref, std::move(owned), handle};
+        embedding_entries_[keyFor(ref)] =
+            EmbeddingEntry{std::move(stored), ref, std::move(owned), handle};
+
+        if (binding.tensor)
+            binding.tensor->publishPreparedDeviceState();
 
         return ref;
     }
@@ -408,7 +452,7 @@ namespace llaminar2
     const PreparedEmbeddingHandle *PreparedWeightStore::embeddingHandle(const PreparedWeightRef &ref) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = embedding_entries_.find(ref.binding_id);
+        auto it = embedding_entries_.find(keyFor(ref));
         if (it == embedding_entries_.end() || !samePreparedRef(it->second.ref, ref))
             return nullptr;
         return it->second.activeHandle();
@@ -424,7 +468,7 @@ namespace llaminar2
         size_t row_end) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto entry_it = entries_.find(ref.binding_id);
+        auto entry_it = entries_.find(keyFor(ref));
         if (entry_it == entries_.end() || !samePreparedRef(entry_it->second.ref, ref))
             return nullptr;
 
@@ -432,7 +476,13 @@ namespace llaminar2
         if (!tensor)
             return nullptr;
 
-        SlicedKey key{ref.binding_id, nullptr, row_start, row_end};
+        SlicedKey key{
+            .binding_id = ref.binding_id,
+            .device = ref.device,
+            .tensor = tensor,
+            .row_start = row_start,
+            .row_end = row_end,
+        };
         auto cache_it = sliced_cache_.find(key);
         if (cache_it != sliced_cache_.end())
             return cache_it->second.get();
@@ -451,13 +501,13 @@ namespace llaminar2
     bool PreparedWeightStore::contains(const PreparedWeightRef &ref) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = entries_.find(ref.binding_id);
+        auto it = entries_.find(keyFor(ref));
         if (it != entries_.end())
         {
             return samePreparedRef(it->second.ref, ref);
         }
 
-        auto emb_it = embedding_entries_.find(ref.binding_id);
+        auto emb_it = embedding_entries_.find(keyFor(ref));
         if (emb_it == embedding_entries_.end())
             return false;
         return samePreparedRef(emb_it->second.ref, ref);
@@ -466,11 +516,11 @@ namespace llaminar2
     std::optional<WeightBinding> PreparedWeightStore::binding(const PreparedWeightRef &ref) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = entries_.find(ref.binding_id);
+        auto it = entries_.find(keyFor(ref));
         if (it != entries_.end() && samePreparedRef(it->second.ref, ref))
             return it->second.binding;
 
-        auto emb_it = embedding_entries_.find(ref.binding_id);
+        auto emb_it = embedding_entries_.find(keyFor(ref));
         if (emb_it == embedding_entries_.end() || !samePreparedRef(emb_it->second.ref, ref))
             return std::nullopt;
         return emb_it->second.binding;
@@ -535,9 +585,10 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(mutex_);
         LOG_ERROR(prefix << " PreparedWeightStore dump (" << entries_.size() << " entries):");
-        for (const auto &[id, entry] : entries_)
+        for (const auto &[key, entry] : entries_)
         {
-            LOG_ERROR(prefix << "   id=" << id
+            LOG_ERROR(prefix << "   id=" << key.binding_id
+                             << " device=" << key.device.toString()
                              << " name='" << entry.binding.identity.canonical_name << "'"
                              << " tensor_ptr=" << (void *)entry.binding.tensor
                              << " has_handle=" << (entry.activeHandle() != nullptr));

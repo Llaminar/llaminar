@@ -130,6 +130,11 @@ namespace llaminar2
             const std::string &boundary_name,
             int device_index,
             int timeout_ms) override;
+        bool graphCaptureBoundaryOnStream(
+            const std::string &boundary_name,
+            int device_index,
+            void *stream,
+            int timeout_ms) override;
         bool collectiveSidebandOnStream(
             const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
             int device_index,
@@ -226,14 +231,18 @@ namespace llaminar2
         void clearBARBackedOutputs() override;
 
         /**
-         * @brief Reserve temporary buffer capacity for collective operations
+         * @brief Reserve backend workspace and per-device FP16 transport scratch.
          *
-         * Pre-allocates internal temp buffers to avoid allocation in the hot path.
+         * This method is initialization-only. Collective execution never grows
+         * the reservation and fails hard when graph planning underestimates it.
          *
-         * @param bytes Minimum buffer capacity in bytes
-         * @return true if reservation succeeded
+         * @param backend_temp_bytes Backend transport workspace capacity.
+         * @param fp16_scratch_elements Maximum FP16 transport element count.
+         * @return true only when all backend and participant allocations succeed.
          */
-        bool reserveTempBufferBytes(size_t bytes) override;
+        bool reserveCollectiveResources(
+            size_t backend_temp_bytes,
+            size_t fp16_scratch_elements) override;
 
         /**
          * @brief Get all registered tensors for a stage (concrete implementation)
@@ -425,6 +434,14 @@ namespace llaminar2
         std::string graph_capture_boundary_name_;
         std::string graph_capture_boundary_error_;
         std::vector<bool> graph_capture_boundary_seen_;
+        /**
+         * @brief Persistent device words used only for graph lifecycle fences.
+         *
+         * One INT32 word is allocated per homogeneous GPU participant during
+         * collective-context initialization. Values are immaterial; an in-place
+         * allreduce exists solely to establish cross-device stream ordering.
+         */
+        std::vector<void *> graph_capture_boundary_device_words_;
 
         // =====================================================================
         // FP16 Mixed-Precision Allreduce Scratch Buffers
@@ -432,12 +449,17 @@ namespace llaminar2
         // When allreduce precision is "fp16" (set per-layer via schema,
         // GraphConfig override, or LLAMINAR_ALLREDUCE_PRECISION), FP32 allreduces cast to FP16 first.
         // cast to FP16 first to halve PCIe transfer bandwidth. These device-local
-        // scratch buffers hold the FP16 temporary (lazily allocated on first use).
+        // scratch buffers hold the FP16 temporary. They are reserved once during
+        // graph setup and are immutable throughout eager execution and capture.
 
-        /// FP16 scratch buffer per device (void* to device memory, lazily allocated)
+        /// FP16 scratch buffer per device (void* to backend-owned device memory).
         std::vector<void *> fp16_scratch_buffers_;
-        /// Current allocated element count per device
+        /// Setup-time element capacity per device.
         std::vector<size_t> fp16_scratch_counts_;
+        /// Compute streams registered with the collective backend, retained so
+        /// non-explicit-stream collectives can publish completion on the exact
+        /// stream that receives the backend's completion wait.
+        std::vector<void *> compute_streams_;
 
         // =====================================================================
         // Raw Device AllGather Barrier State
@@ -476,6 +498,15 @@ namespace llaminar2
          * @return true if backend was successfully initialized
          */
         bool initializeBackend();
+        bool initializeGraphCaptureBoundaryDeviceWords();
+        void releaseGraphCaptureBoundaryDeviceWords() noexcept;
+        bool reserveFp16ScratchElements(size_t element_count);
+        void releaseFp16ScratchBuffers() noexcept;
+        void *requireReservedFp16Scratch(
+            int device_index,
+            size_t element_count,
+            const std::string &stage_name,
+            const char *caller);
 
         /**
          * @brief Get device pointers for all devices participating in collective
@@ -487,8 +518,6 @@ namespace llaminar2
          * @param tensor Tensor with data on all devices
          * @return Vector of device pointers (one per device in devices_)
          */
-        std::vector<void *> getDeviceBuffers(TensorBase *tensor);
-
         /**
          * @brief Convert our data type to CollectiveDataType
          * @param tensor Tensor to get dtype from
@@ -523,26 +552,6 @@ namespace llaminar2
                                                const std::string &precision,
                                                const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands = nullptr);
 
-        /**
-         * @brief Barrier-synchronized allreduce for NCCL/RCCL multi-GPU backends
-         *
-         * Similar to allreduceWithBarrier but for NCCL/RCCL backends where each
-         * device thread has its OWN tensor. We cannot use getDeviceBuffers() because
-         * TensorBase can only exist on ONE GPU at a time.
-         *
-         * The barrier works as follows:
-         * 1. Each device thread arrives with its own tensor
-         * 2. Tensors are collected in barrier_tensors_ at their arrival slot
-         * 3. Last arrival extracts GPU pointers and calls allreduceMulti()
-         * 4. All devices are released with the same result
-         *
-         * @param tensor This device's tensor (must already be on its GPU)
-         * @param stage_name Stage identifier for logging (optional)
-         * @param count Number of elements to reduce (0 = use tensor->numel())
-         * @return true on success (same result for all participants)
-         */
-        bool allreduceWithBarrierMultiGpu(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
-
         bool allgatherRawWithBarrierMultiGpu(
             const void *local_send,
             void *full_recv,
@@ -553,17 +562,19 @@ namespace llaminar2
             const std::string &stage_name);
 
         /**
-         * @brief Per-device async allreduce with barrier fallback
+         * @brief Enqueue the required per-device asynchronous GPU allreduce.
          *
-         * Tries barrier-free per-device allreduce first (host never blocks).
-         * Falls back to allreduceWithBarrierMultiGpu if backend doesn't support it.
+         * Every homogeneous LocalTP GPU backend must implement this path. A
+         * rejected launch is a hard operation failure; production never changes
+         * to the host-barrier implementation because doing so would alter both
+         * ordering and graph-capture behavior.
          *
          * @param tensor This device's tensor
          * @param stage_name Stage identifier for logging
          * @param count Number of elements (0 = use numel)
          * @return true on success
          */
-        bool allreducePerDeviceOrBarrier(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
+        bool allreducePerDeviceRequired(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
 
         /**
          * @brief Barrier-synchronized allreduce for CPU-only TP

@@ -551,9 +551,9 @@ namespace llaminar2
             return false;
         }
 
-        // Dirty-marking is handled by LocalTPContext::allreduceOnStream() which
-        // calls transitionToWithEvent(DEVICE_AUTHORITATIVE, ..., stream) to record a completion event.
-        // This ensures ensureOnHost() waits for the allreduce to finish before D2H.
+        // LocalTPContext publishes the allreduce write through TransferEngine
+        // on the exact collective stream. This ensures ensureOnHost() waits for
+        // collective completion before D2H.
 
         return true;
     }

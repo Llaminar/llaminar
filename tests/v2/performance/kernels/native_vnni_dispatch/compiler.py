@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .certification import CertificationReport, certify_generic_policy
 from .corpus import GenericDomain, ObservationCorpus, RuntimeKey
@@ -52,6 +54,74 @@ class FrozenPolicy:
         return self.policy_ir.digest(generic_only=True)
 
 
+@dataclass(frozen=True)
+class _DevelopmentDomainAccounting:
+    """Validated development-domain counts retained in frozen metadata."""
+
+    required_count: int
+    passing_count: int
+
+    @property
+    def passing_fraction(self) -> float:
+        """Return the fraction of required domains without rounding counts."""
+
+        return (
+            float(self.passing_count) / float(self.required_count)
+            if self.required_count
+            else 0.0
+        )
+
+
+def _development_domain_accounting(
+    generic: GenericPolicy,
+) -> _DevelopmentDomainAccounting:
+    """Validate and count the complete development promotion inventory.
+
+    A structurally rejected domain deliberately has a promotion diagnostic but
+    no cross-validation result.  Cross-validation cardinality is consequently
+    not the required-domain cardinality.  The required set is the union of CV
+    decisions and rejection diagnostics; rules and blocking obligations must
+    describe exactly that same set.
+    """
+
+    cross_validation_domains = tuple(
+        result.domain for result in generic.cross_validation
+    )
+    diagnostic_domains = tuple(
+        diagnostic.domain for diagnostic in generic.promotion_diagnostics
+    )
+    if len(set(cross_validation_domains)) != len(cross_validation_domains):
+        raise ValueError("development policy repeats a cross-validation domain")
+    if len(set(diagnostic_domains)) != len(diagnostic_domains):
+        raise ValueError("development policy repeats a promotion diagnostic")
+
+    required_domains = set(cross_validation_domains) | set(diagnostic_domains)
+    if not required_domains:
+        raise ValueError("development policy has no required generic domains")
+    rule_domains = {rule.domain for rule in generic.rules}
+    unpromoted_domains = set(generic.unpromoted_domains)
+    if rule_domains & unpromoted_domains:
+        raise ValueError("development domain is both promoted and unpromoted")
+    decided_domains = rule_domains | unpromoted_domains
+    if decided_domains != required_domains:
+        missing = sorted(required_domains - decided_domains)
+        unexpected = sorted(decided_domains - required_domains)
+        raise ValueError(
+            "development generic-domain decisions are incomplete: "
+            f"missing={missing[:1]} unexpected={unexpected[:1]}"
+        )
+    if not unpromoted_domains.issubset(set(diagnostic_domains)):
+        raise ValueError(
+            "development blocking domains lack promotion diagnostics"
+        )
+
+    rejected_domains = set(diagnostic_domains)
+    return _DevelopmentDomainAccounting(
+        required_count=len(required_domains),
+        passing_count=len(required_domains - rejected_domains),
+    )
+
+
 def _require_certificate_promotion_criteria(
     frozen: FrozenPolicy,
     certification: CertificationReport,
@@ -94,13 +164,22 @@ def freeze_policy(
     minimum_promotion_samples: int = MIN_PROMOTION_SAMPLES,
     profiler_feature_catalog: ProfilerFeatureCatalog | None = None,
     fit_cache: PolicyFitCache | None = None,
+    domain_corpus_provider: (
+        Callable[[GenericDomain], ObservationCorpus] | None
+    ) = None,
+    domain_corpus_digest_provider: (
+        Callable[[GenericDomain], str] | None
+    ) = None,
 ) -> FrozenPolicy:
     """Fit and freeze one policy without receiving sealed observations.
 
     The function signature deliberately has no sealed-corpus parameter. This
     makes the development/sealed lifetime mechanically reviewable: a caller
     must publish ``generic_digest`` before a separate certification call can
-    consume any held-out measurements.
+    consume any held-out measurements. Backends with parameterized candidate
+    families may supply lazy domain projection callbacks. Exact overlays and
+    the frozen corpus identity still come from the direct measured rows, while
+    generic fitting materializes only cache-miss domains.
     """
 
     if not sealed_commitment.strip() or not split_manifest_digest.strip():
@@ -125,17 +204,14 @@ def freeze_policy(
         min_shape_groups_per_leaf=min_shape_groups_per_leaf,
         profiler_feature_catalog=profiler_feature_catalog,
         fit_cache=fit_cache,
+        domain_corpus_provider=domain_corpus_provider,
+        domain_corpus_digest_provider=domain_corpus_digest_provider,
     )
-    development_required_domain_count = len(generic.cross_validation)
-    development_rejected_domain_count = len(generic.promotion_diagnostics)
-    development_passing_domain_count = (
-        development_required_domain_count - development_rejected_domain_count
-    )
+    development_accounting = _development_domain_accounting(generic)
+    development_required_domain_count = development_accounting.required_count
+    development_passing_domain_count = development_accounting.passing_count
     development_passing_domain_fraction = (
-        float(development_passing_domain_count)
-        / float(development_required_domain_count)
-        if development_required_domain_count
-        else 0.0
+        development_accounting.passing_fraction
     )
     common_metadata = {
         "development_corpus_digest": development.digest(),
@@ -200,18 +276,25 @@ def certify_frozen_policy(
 ) -> CompiledPolicy:
     """Certify a frozen generic IR and add exact entries without refitting."""
 
+    timing_enabled = (
+        os.environ.get("LLAMINAR_NATIVE_VNNI_POLICY_TIMING", "0") == "1"
+    )
+    started = time.perf_counter()
     if development.digest() != frozen.policy_ir.metadata.get(
         "development_corpus_digest"
     ):
         raise ValueError("development corpus changed after generic freeze")
+    development_digest_complete = time.perf_counter()
     if require_promotable:
         require_promotion_timing(sealed, label="sealed corpus")
+    promotion_timing_complete = time.perf_counter()
 
     certification = certify_generic_policy(
         frozen.policy_ir,
         sealed,
         serial_m1_hashes=serial_m1_hashes,
     )
+    certification_complete = time.perf_counter()
     if certification.frozen_generic_policy_digest != frozen.generic_digest:
         raise ValueError("sealed certificate does not bind the frozen generic IR")
     _require_certificate_promotion_criteria(frozen, certification)
@@ -227,17 +310,33 @@ def certify_frozen_policy(
         raise ValueError(
             "development and sealed corpora use different runtime projections"
         )
-    combined = ObservationCorpus(
+    combined = ObservationCorpus._from_validated(
         (
             *development.observations,
             *sealed.observations,
         ),
         distinguish_execution_mode=development.distinguishes_execution_mode,
         distinguish_aspect_bucket=development.distinguishes_aspect_bucket,
+        revalidate_candidate_identities=True,
     )
+    combined_complete = time.perf_counter()
     final_exact = build_exact_winners(
         combined, serial_m1_hashes=serial_m1_hashes
     )
+    exact_complete = time.perf_counter()
+    if timing_enabled:
+        print(
+            "NativeVNNI certification timing "
+            f"development_digest={development_digest_complete - started:.3f}s "
+            "promotion_timing="
+            f"{promotion_timing_complete - development_digest_complete:.3f}s "
+            "generic_certificate="
+            f"{certification_complete - promotion_timing_complete:.3f}s "
+            f"combine={combined_complete - certification_complete:.3f}s "
+            f"exact={exact_complete - combined_complete:.3f}s "
+            f"total={exact_complete - started:.3f}s",
+            flush=True,
+        )
     # Reconstructing this immutable wrapper copies the already-frozen rules;
     # no cost matrix or learner is invoked after sealed evidence is visible.
     generic = GenericPolicy(

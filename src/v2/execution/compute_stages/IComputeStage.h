@@ -22,13 +22,14 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <functional>
 #include "../local_execution/device/DeviceContext.h"
 #include "../debug/BufferRole.h"
 #include "../config/RuntimeConfig.h"
-#include "../local_execution/coherence/StageCoherence.h"
+#include "../local_execution/coherence/CoherencePolicy.h"
 #include "ComputeStageUtils.h"
 #include "../../tensors/BlockStructures.h"
 #include "../../tensors/TensorKernels.h"
@@ -294,7 +295,6 @@ namespace llaminar2
         MOE_SHARED_EXPERT_FFN,      ///< Shared expert FFN (distinct from per-expert MOE_EXPERT_FFN)
         MOE_SHARED_EXPERT_GATE,     ///< Shared expert sigmoid gate
         MOE_EXPERT_DISPATCH,        ///< Routed-row dispatch descriptor builder
-        MOE_ROUTED_EXPERT_PARTIAL_REDUCE, ///< Cross-domain routed partial reduction
         MOE_SPARSE_DISPATCH,        ///< Graph-native sparse MoE payload dispatch
         MOE_LOCAL_EXPERT,           ///< Participant-local sparse MoE expert compute
         MOE_SPARSE_RETURN_REDUCE,   ///< Graph-native sparse MoE return reduce
@@ -355,9 +355,154 @@ namespace llaminar2
     };
 
     /**
+     * @brief Identify stage types whose execution includes a domain collective.
+     *
+     * Capture policy, graph partitioning, fast scheduling, and profiling must
+     * agree on this classification. Keeping the mapping beside the enum avoids
+     * duplicated local lists that can silently omit a specialized collective
+     * such as TP KV-state or GDN-state all-gather.
+     *
+     * @param type Stage operation type.
+     * @return true when the stage necessarily participates in a collective.
+     */
+    [[nodiscard]] constexpr bool isCollectiveComputeStageType(
+        ComputeStageType type) noexcept
+    {
+        switch (type)
+        {
+        case ComputeStageType::ALLREDUCE:
+        case ComputeStageType::ALLGATHER:
+        case ComputeStageType::ALLGATHER_V:
+        case ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER:
+        case ComputeStageType::GDN_LIVE_STATE_ALLGATHER:
+        case ComputeStageType::FUSED_ADD_ALLREDUCE:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    /**
      * @brief Convert stage type to string for logging
      */
     const char *computeStageTypeName(ComputeStageType type);
+
+    class IComputeStage;
+
+    /**
+     * @brief Immutable GPU execution authority for one bound compute stage.
+     *
+     * A GPU write is correctly published only when its completion event is
+     * recorded on the exact stream that enqueued the write. Passing a raw
+     * `DeviceId` and `void *` independently to launch and publication APIs made
+     * it possible for those values to drift apart while remaining non-null.
+     *
+     * This token binds the stage's authoritative device and executor-selected
+     * stream into one value. Its constructor is private, so production code
+     * cannot manufacture a token from ambient tensor state or a backend default
+     * stream. Stages use the same value to bind kernels, obtain the native
+     * launch stream, prepare tensor inputs and outputs, and publish resulting
+     * tensor writes.
+     */
+    class StageGPUExecution final
+    {
+    public:
+        /**
+         * @brief Return the GPU selected by the graph executor for this stage.
+         */
+        [[nodiscard]] DeviceId device() const noexcept { return device_; }
+
+        /**
+         * @brief Return the exact non-null native stream for backend launches.
+         *
+         * The returned opaque pointer is a `cudaStream_t` or `hipStream_t`
+         * according to device(). It is never a default-stream sentinel.
+         */
+        [[nodiscard]] void *nativeStream() const noexcept { return stream_; }
+
+        /**
+         * @brief Bind a tensor kernel to this execution's producer stream.
+         *
+         * Returning the kernel preserves the established fluent stage setup
+         * pattern while ensuring binding and later publication are sourced from
+         * the same immutable token.
+         */
+        template <typename KernelT>
+        KernelT *bind(KernelT *kernel) const
+        {
+            if (kernel)
+                kernel->setGPUStream(stream_);
+            return kernel;
+        }
+
+        /**
+         * @brief Join an input tensor to this execution's consumer stream.
+         *
+         * This placement-capable operation is reserved for the explicit
+         * heterogeneous host-packet transport stage. Ordinary GPU graph stages
+         * declare arena inputs and use requirePreparedInput(), which cannot
+         * allocate or upload. No free device or stream arguments are exposed.
+         */
+        void prepareInput(ITensor *tensor) const;
+
+        /**
+         * @brief Prepare output storage for this execution's producer stream.
+         *
+         * This operation carries the same immutable device/stream identity as
+         * bind() and publish(), preventing output preparation from drifting to
+         * a backend default or an unrelated ambient stream.
+         */
+        void prepareOutput(ITensor *tensor) const;
+
+        /**
+         * @brief Require an executor-prepared input without moving or allocating it.
+         *
+         * Graph stages call this after DeviceGraphExecutor has applied their
+         * StageBufferContract. Unlike prepareInput(), this method cannot upload
+         * host bytes, allocate device storage, or change tensor coherence. It
+         * joins an existing producer event to nativeStream() and fails
+         * immediately when the declared input is not valid on the exact device
+         * bound into this execution token.
+         *
+         * @param tensor Declared stage input that the executor prepared.
+         * @throws std::invalid_argument when @p tensor is null.
+         * @throws std::runtime_error when the tensor is not valid on device().
+         */
+        void requirePreparedInput(ITensor *tensor) const;
+
+        /**
+         * @brief Require pre-existing output storage on the executor-bound GPU.
+         *
+         * Output bytes need not be valid before a producer overwrites them, but
+         * the storage must already exist on the exact stage device. This method
+         * never calls an allocator or imports host contents.
+         *
+         * @param tensor Declared stage output whose storage was prepared.
+         * @throws std::invalid_argument when @p tensor is null.
+         * @throws std::runtime_error when exact-device storage is absent.
+         */
+        void requirePreparedOutput(ITensor *tensor) const;
+
+        /**
+         * @brief Publish a tensor written by work enqueued through this token.
+         *
+         * TransferEngine records the completion event on nativeStream(). No
+         * device or stream argument is accepted here, so a stage cannot publish
+         * the write against a different execution context by accident.
+         *
+         * @throws std::invalid_argument for a null tensor.
+         * @throws std::runtime_error if completion-event publication fails.
+         */
+        void publish(ITensor *tensor) const;
+
+    private:
+        friend class IComputeStage;
+
+        StageGPUExecution(DeviceId device, void *stream);
+
+        DeviceId device_;
+        void *stream_;
+    };
 
     /**
      * @brief Base class for all compute stages
@@ -446,6 +591,19 @@ namespace llaminar2
          * @brief Get the operation type
          */
         virtual ComputeStageType type() const = 0;
+
+        /**
+         * @brief Report whether executing this stage participates in a collective.
+         *
+         * Stages with unconditional collective semantics inherit the canonical
+         * enum mapping. A future stage whose collective behavior depends on its
+         * parameters can override this method, keeping capture policy tied to
+         * the actual stage instance rather than another orchestration-side list.
+         */
+        virtual bool isCollectiveStage() const
+        {
+            return isCollectiveComputeStageType(type());
+        }
 
         /**
          * @brief Human-readable name (for profiling/logging)
@@ -555,7 +713,8 @@ namespace llaminar2
          * uses this contract (instead of StageDumpInfo) to drive coherence:
          *
          *   1. For each input binding: arena.prepareForRead(id, device)
-         *   2. For each weight tensor: tensor->ensureOnDevice(device)
+         *   2. For each weight tensor: TransferEngine prepares the exact
+         *      device allocation on the stage's explicit stream
          *   3. For each output binding: arena.prepareForWrite(id, device)
          *   4. stage->execute(ctx)
          *   5. For each output/inout: arena.markWritten(id, device, stream)
@@ -969,18 +1128,95 @@ namespace llaminar2
          *
          * @param stream Opaque GPU stream pointer (hipStream_t / cudaStream_t as void*)
          */
-        void setGPUStream(void *stream) { gpu_stream_ = stream; }
+        void setGPUStream(void *stream)
+        {
+            if (device_id_.is_gpu() && !stream)
+            {
+                throw std::invalid_argument(
+                    "IComputeStage::setGPUStream refuses a null stream for GPU stage on " +
+                    device_id_.toString());
+            }
+            gpu_stream_ = stream;
+        }
 
         /**
-         * @brief Get the GPU stream for kernel dispatch
+         * @brief Report whether the executor has bound an explicit GPU stream.
          *
-         * Returns the explicit stream assigned by the executor, or nullptr if
-         * none was set. GPU code that needs stream ordering must treat nullptr
-         * as an error, not as permission to use the CUDA/HIP legacy stream.
+         * This is the only non-throwing stream-state query. Schedulers, graph
+         * binders, and hardware-free tests may use it before execution to decide
+         * whether a stage still needs a binding. Compute code must use
+         * gpuStream() or requireGPUStream() so a missing GPU stream cannot flow
+         * into a kernel launch, transfer, or completion publication as nullptr.
          *
-         * @return Opaque GPU stream pointer (nullptr = no explicit stream)
+         * @return true when an explicit stream is currently bound.
          */
-        void *gpuStream() const { return gpu_stream_; }
+        bool hasGPUStream() const noexcept { return gpu_stream_ != nullptr; }
+
+        /**
+         * @brief Get the stream used by this stage's current execution.
+         *
+         * CPU stages have no GPU stream and return nullptr. GPU stages must have
+         * been bound by the executor; retrieving an unbound GPU stream is a
+         * fatal programming error. This contract deliberately makes the CUDA or
+         * HIP default stream unavailable as an implicit fallback.
+         *
+         * @return Exact GPU stream, or nullptr only for a CPU stage.
+         * @throws std::logic_error when a GPU stage has not been bound.
+         */
+        void *gpuStream() const
+        {
+            if (device_id_.is_gpu() && !gpu_stream_)
+            {
+                throw std::logic_error(
+                    "IComputeStage::gpuStream found no explicit stream for GPU stage on " +
+                    device_id_.toString());
+            }
+            return gpu_stream_;
+        }
+
+        /**
+         * @brief Return the exact stream bound to this GPU stage.
+         *
+         * GPU execution and publication code may use this accessor when it also
+         * wants to reject accidental use from a CPU stage. Both this method and
+         * gpuStream() reject an unbound GPU stage; requireGPUStream() additionally
+         * rejects CPU callers.
+         *
+         * @return Exact non-null stream assigned by the graph executor.
+         * @throws std::logic_error when called for a CPU stage or before the
+         *         executor has bound the GPU stage to its execution stream.
+         */
+        void *requireGPUStream() const
+        {
+            if (!device_id_.is_gpu())
+            {
+                throw std::logic_error(
+                    "IComputeStage::requireGPUStream called for non-GPU stage on " +
+                    device_id_.toString());
+            }
+            if (!gpu_stream_)
+            {
+                throw std::logic_error(
+                    "IComputeStage::requireGPUStream found no explicit stream for GPU stage on " +
+                    device_id_.toString());
+            }
+            return gpu_stream_;
+        }
+
+        /**
+         * @brief Return the immutable execution authority for this GPU stage.
+         *
+         * New stage code should retain this value for the duration of an
+         * execution method and use it for both kernel binding/launch and output
+         * publication. Unlike separate calls to device() and gpuStream(), the
+         * token cannot be assembled from unrelated values.
+         *
+         * @throws std::logic_error for CPU stages or an unbound GPU stage.
+         */
+        [[nodiscard]] StageGPUExecution gpuExecution() const
+        {
+            return StageGPUExecution(device_id_, requireGPUStream());
+        }
 
         /**
          * @brief Update dynamic parameters for graph reuse
@@ -1258,7 +1494,7 @@ namespace llaminar2
         /**
          * @brief Build partial StageDumpInfo from this stage's bufferContract().
          *
-         * Populates the weight entries from the contract's weight_tensors list.
+         * Populates weight entries from both raw and prepared contract lists.
          * Stages that implement bufferContract() can call this in their
          * buildDumpInfoImpl() and then append inputs/outputs with dynamic dims:
          *
@@ -1280,6 +1516,11 @@ namespace llaminar2
                 const ITensor *w = contract.weight_tensors[i];
                 if (w)
                     info.addWeight("weight", w);
+            }
+            for (const auto &prepared : contract.prepared_weights)
+            {
+                if (prepared.source_tensor)
+                    info.addWeight("prepared_weight", prepared.source_tensor);
             }
             return info;
         }
@@ -1408,7 +1649,10 @@ namespace llaminar2
         {
             if (kernel)
             {
-                kernel->setGPUStream(gpuStream());
+                if (device_id_.is_gpu())
+                    gpuExecution().bind(kernel);
+                else
+                    kernel->setGPUStream(nullptr);
             }
             return kernel;
         }
@@ -1534,7 +1778,7 @@ namespace llaminar2
 
     private:
         DeviceId device_id_;         ///< Authoritative device (set via constructor, no default)
-        void *gpu_stream_ = nullptr; ///< GPU stream for kernel dispatch (nullptr = default stream)
+        void *gpu_stream_ = nullptr; ///< Explicit GPU stream; null means unbound, never a default stream.
 
         // Cached dump info (built once, reused for all subsequent calls)
         mutable StageDumpInfo cached_dump_info_;

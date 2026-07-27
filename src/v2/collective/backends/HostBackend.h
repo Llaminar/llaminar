@@ -86,6 +86,19 @@ namespace llaminar2
          */
         bool isAvailable() const override { return true; }
 
+        /**
+         * @brief Report the HostBackend's explicitly synchronous completion.
+         *
+         * GPU copies in this backend stage through host memory and synchronize
+         * each affected device stream before the collective call returns.
+         */
+        [[nodiscard]] CollectiveSubmissionReceipt singleBufferSubmissionReceipt(
+            DeviceId device) const override
+        {
+            (void)device;
+            return CollectiveSubmissionReceipt::alreadyComplete();
+        }
+
         // =====================================================================
         // Lifecycle
         // =====================================================================

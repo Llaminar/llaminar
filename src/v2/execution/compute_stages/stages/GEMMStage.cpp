@@ -7,6 +7,7 @@
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
@@ -76,14 +77,6 @@ namespace llaminar2
                 LOG_ERROR("[" << caller << "] PreparedWeightRef was provided but no GEMM kernel was found in PreparedWeightStore");
             }
             return gemm;
-        }
-
-        void markDeviceOutputWritten(TensorBase *tensor, DeviceId device, void *stream)
-        {
-            if (tensor && device.is_gpu())
-            {
-                tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
-            }
         }
 
         /**
@@ -401,7 +394,7 @@ namespace llaminar2
                     params_.alpha, params_.beta,
                     getWorkspace()))
             {
-                markDeviceOutputWritten(C_base, params_.device_id, gpuStream());
+                gpuExecution().publish(C_base);
                 LOG_DEBUG("[GEMMStage] Fused SwiGLU+GEMM completed via ITensorGemm");
                 traceOutput("C", params_.C);
                 return true;
@@ -434,7 +427,7 @@ namespace llaminar2
                 LOG_ERROR("[GEMMStage] SwiGLU fallback activation failed");
                 return false;
             }
-            markDeviceOutputWritten(swiglu_output, params_.device_id, gpuStream());
+            gpuExecution().publish(swiglu_output);
 
             bool success = gemm->multiply_tensor(
                 swiglu_output, C_base,
@@ -446,7 +439,7 @@ namespace llaminar2
                 getWorkspace());
             if (success)
             {
-                markDeviceOutputWritten(C_base, params_.device_id, gpuStream());
+                gpuExecution().publish(C_base);
                 traceOutput("C", params_.C);
             }
             return success;
@@ -472,7 +465,7 @@ namespace llaminar2
 
             if (success)
             {
-                markDeviceOutputWritten(C_base, params_.device_id, gpuStream());
+                gpuExecution().publish(C_base);
                 traceOutput("C", params_.C);
             }
             return success;
@@ -547,7 +540,7 @@ namespace llaminar2
         }
 
         if (is_gpu)
-            markDeviceOutputWritten(C_base, params_.device_id, stream);
+            gpuExecution().publish(C_base);
         PerfStatsCollector::addCounter(
             "mtp",
             "gemm_grouped_decode_equivalent_verifier_prefill_rows",
@@ -725,9 +718,15 @@ namespace llaminar2
         if (params_.gate_input && params_.gate_buffer_id)
             contract.addInput(*params_.gate_buffer_id);
         contract.addOutput(*params_.c_buffer_id);
-        // Model weight B is not arena-managed
+        // GEMM consumes the PreparedWeightStore-owned representation, never the
+        // source tensor's raw device pointer.
         if (params_.B)
-            contract.addWeight(const_cast<ITensor *>(params_.B));
+        {
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.B),
+                params_.prepared_store,
+                params_.prepared_ref.value_or(PreparedWeightRef{}));
+        }
         if (params_.bias_tensor)
             contract.addWeight(const_cast<ITensor *>(static_cast<const ITensor *>(params_.bias_tensor)));
         return contract;

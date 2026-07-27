@@ -7,6 +7,7 @@
  */
 
 #include "CUDARingKVCacheBase.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
@@ -58,6 +59,45 @@ namespace llaminar2
         int max_seq_len,
         cudaStream_t stream);
 
+    extern "C" bool cuda_kv_sequence_state_checkpoint_capture(
+        const int *d_heads,
+        const int *d_counts,
+        int *checkpoint,
+        int n_layers,
+        int batch_size,
+        int seq_idx,
+        cudaStream_t stream);
+
+    extern "C" bool cuda_kv_sequence_state_checkpoint_restore(
+        int *d_heads,
+        int *d_counts,
+        const int *checkpoint,
+        int n_layers,
+        int batch_size,
+        int seq_idx,
+        cudaStream_t stream);
+
+    extern "C" bool cuda_kv_sequence_state_truncate(
+        int *d_heads,
+        int *d_counts,
+        int n_layers,
+        int batch_size,
+        int seq_idx,
+        int cached_tokens,
+        int max_seq_len,
+        cudaStream_t stream);
+
+    extern "C" bool cuda_kv_sequence_state_evict_oldest(
+        int *d_heads,
+        int *d_counts,
+        int n_layers,
+        int batch_size,
+        int layer,
+        int seq_idx,
+        int num_tokens,
+        int max_seq_len,
+        cudaStream_t stream);
+
     // =========================================================================
     // Construction / Destruction
     // =========================================================================
@@ -81,6 +121,31 @@ namespace llaminar2
         freeDeviceParams();
     }
 
+    bool CUDARingKVCacheBase::activateOwningDevice(
+        const char *operation,
+        std::string *error) const
+    {
+        /*
+         * CUDA's current device is thread-local ambient state. Re-establish the
+         * cache owner at this public execution boundary so a LocalTP sibling
+         * cannot influence which context receives the following kernel launch.
+         */
+        const cudaError_t status = cudaSetDevice(device_id_);
+        if (status == cudaSuccess)
+            return true;
+
+        const std::string message =
+            std::string("CUDA KV ") +
+            (operation && operation[0] != '\0' ? operation : "device operation") +
+            " could not activate owning device " +
+            std::to_string(device_id_) + ": " +
+            cudaGetErrorString(status);
+        if (error)
+            *error = message;
+        LOG_ERROR("[CUDARingKVCacheBase] " << message);
+        return false;
+    }
+
     // =========================================================================
     // Graph Capture Device Params Management
     // =========================================================================
@@ -93,41 +158,40 @@ namespace llaminar2
             // All-GDN hybrid caches have no FA ring metadata to publish.
             return;
         }
-        cudaError_t err = cudaMalloc(&d_head_params_, num_entries * sizeof(int));
-        if (err != cudaSuccess)
-        {
-            LOG_WARN("[CUDARingKVCacheBase] Failed to allocate device head params: "
-                     << cudaGetErrorString(err) << " - graph capture disabled");
-            d_head_params_ = nullptr;
+        if (!activateOwningDevice("device-parameter allocation"))
             return;
+
+        auto *backend = getCUDABackend();
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "[CUDARingKVCacheBase] CUDA backend unavailable during metadata allocation");
         }
 
-        err = cudaMalloc(&d_count_params_, num_entries * sizeof(int));
-        if (err != cudaSuccess)
+        const size_t metadata_bytes =
+            static_cast<size_t>(num_entries) * sizeof(int);
+        d_head_params_ =
+            static_cast<int *>(backend->allocate(metadata_bytes, device_id_));
+        d_count_params_ =
+            static_cast<int *>(backend->allocate(metadata_bytes, device_id_));
+        if (!d_head_params_ || !d_count_params_)
         {
-            LOG_WARN("[CUDARingKVCacheBase] Failed to allocate device count params: "
-                     << cudaGetErrorString(err) << " - device-resident KV sequence publication disabled");
             freeDeviceParams();
-            return;
+            throw std::runtime_error(
+                "[CUDARingKVCacheBase] Failed to allocate mandatory device sequence metadata");
         }
 
         cudaStream_t init_stream = static_cast<cudaStream_t>(
             GPUDeviceContextPool::instance().getNvidiaContext(device_id_).defaultStream());
-        err = cudaMemsetAsync(
-            d_head_params_, 0, num_entries * sizeof(int), init_stream);
-        if (err == cudaSuccess)
+        if (!init_stream ||
+            !backend->memset(
+                d_head_params_, 0, metadata_bytes, device_id_, init_stream) ||
+            !backend->memset(
+                d_count_params_, 0, metadata_bytes, device_id_, init_stream))
         {
-            err = cudaMemsetAsync(
-                d_count_params_, 0, num_entries * sizeof(int), init_stream);
-        }
-        if (err == cudaSuccess)
-            err = cudaStreamSynchronize(init_stream);
-        if (err != cudaSuccess)
-        {
-            LOG_WARN("[CUDARingKVCacheBase] Failed to initialize canonical device sequence state: "
-                     << cudaGetErrorString(err));
             freeDeviceParams();
-            return;
+            throw std::runtime_error(
+                "[CUDARingKVCacheBase] Failed to initialize mandatory device sequence metadata");
         }
 
         LOG_DEBUG("[CUDARingKVCacheBase] Allocated device params for graph capture: "
@@ -136,22 +200,20 @@ namespace llaminar2
 
     void CUDARingKVCacheBase::freeDeviceParams()
     {
+        auto *backend = getCUDABackend();
+        if ((d_head_params_ || d_count_params_) && !backend)
+        {
+            throw std::runtime_error(
+                "[CUDARingKVCacheBase] CUDA backend unavailable during metadata release");
+        }
         if (d_head_params_)
         {
-            cudaError_t err = cudaFree(d_head_params_);
-            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: cudaFree(d_head_params_) failed: %s\n", cudaGetErrorString(err));
-            }
+            backend->free(d_head_params_, device_id_);
             d_head_params_ = nullptr;
         }
         if (d_count_params_)
         {
-            cudaError_t err = cudaFree(d_count_params_);
-            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: cudaFree(d_count_params_) failed: %s\n", cudaGetErrorString(err));
-            }
+            backend->free(d_count_params_, device_id_);
             d_count_params_ = nullptr;
         }
         std::fill(
@@ -195,6 +257,40 @@ namespace llaminar2
         return state;
     }
 
+    bool CUDARingKVCacheBase::truncateSequence(
+        int seq_idx,
+        int cached_tokens,
+        void *stream)
+    {
+        if (!stream ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            cached_tokens < 0 || cached_tokens > max_seq_len_ ||
+            !d_head_params_ || !d_count_params_)
+        {
+            return false;
+        }
+        if (!activateOwningDevice("sequence-state truncation"))
+            return false;
+
+        if (!cuda_kv_sequence_state_truncate(
+                d_head_params_,
+                d_count_params_,
+                n_layers_,
+                batch_size_,
+                seq_idx,
+                cached_tokens,
+                max_seq_len_,
+                static_cast<cudaStream_t>(stream)))
+        {
+            return false;
+        }
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            onClearSequence(layer, seq_idx);
+        }
+        return true;
+    }
+
     bool CUDARingKVCacheBase::observeDeviceSequenceState(
         int layer,
         int seq_idx,
@@ -211,7 +307,9 @@ namespace llaminar2
             return false;
         }
 
-        (void)cudaSetDevice(device_id_);
+        if (!activateOwningDevice("sequence-state observation"))
+            return false;
+
         const int index = layer * batch_size_ + seq_idx;
         int head = 0;
         int count = 0;
@@ -343,6 +441,106 @@ namespace llaminar2
         return &d_head_params_[idx];
     }
 
+    size_t CUDARingKVCacheBase::deviceSequenceStateCheckpointBytes() const
+    {
+        if (!d_head_params_ || !d_count_params_ || n_layers_ <= 0)
+            return 0;
+        return sizeof(int32_t) * static_cast<size_t>(n_layers_) * 2u;
+    }
+
+    bool CUDARingKVCacheBase::captureDeviceSequenceStateCheckpoint(
+        int seq_idx,
+        void *checkpoint_device,
+        size_t checkpoint_bytes,
+        void *stream,
+        std::string *error) const
+    {
+        const size_t required_bytes = deviceSequenceStateCheckpointBytes();
+        if (!checkpoint_device || !stream ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            required_bytes == 0 || checkpoint_bytes < required_bytes)
+        {
+            if (error)
+            {
+                *error =
+                    "invalid CUDA device sequence-state checkpoint capture request";
+            }
+            return false;
+        }
+        if (!activateOwningDevice(
+                "device sequence-state checkpoint capture",
+                error))
+        {
+            return false;
+        }
+
+        const bool enqueued = cuda_kv_sequence_state_checkpoint_capture(
+            d_head_params_,
+            d_count_params_,
+            static_cast<int *>(checkpoint_device),
+            n_layers_,
+            batch_size_,
+            seq_idx,
+            static_cast<cudaStream_t>(stream));
+        if (!enqueued && error)
+        {
+            *error =
+                "failed to enqueue CUDA device sequence-state checkpoint capture";
+        }
+        return enqueued;
+    }
+
+    bool CUDARingKVCacheBase::restoreDeviceSequenceStateCheckpoint(
+        int seq_idx,
+        const void *checkpoint_device,
+        size_t checkpoint_bytes,
+        void *stream,
+        std::string *error)
+    {
+        const size_t required_bytes = deviceSequenceStateCheckpointBytes();
+        if (!checkpoint_device || !stream ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            required_bytes == 0 || checkpoint_bytes < required_bytes)
+        {
+            if (error)
+            {
+                *error =
+                    "invalid CUDA device sequence-state checkpoint restore request";
+            }
+            return false;
+        }
+        if (!activateOwningDevice(
+                "device sequence-state checkpoint restore",
+                error))
+        {
+            return false;
+        }
+
+        const bool enqueued = cuda_kv_sequence_state_checkpoint_restore(
+            d_head_params_,
+            d_count_params_,
+            static_cast<const int *>(checkpoint_device),
+            n_layers_,
+            batch_size_,
+            seq_idx,
+            static_cast<cudaStream_t>(stream));
+        if (!enqueued)
+        {
+            if (error)
+            {
+                *error =
+                    "failed to enqueue CUDA device sequence-state checkpoint restore";
+            }
+            return false;
+        }
+
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            onClearSequence(layer, seq_idx);
+        }
+        return true;
+    }
+
     const int *CUDARingKVCacheBase::deviceDynamicAppendCountPtr(int layer, int seq_idx) const
     {
         if (!validLayerSeq(layer, seq_idx) || append_count_sources_.empty())
@@ -367,12 +565,44 @@ namespace llaminar2
             count < 0 ||
             count > max_seq_len_)
             return false;
+        if (!activateOwningDevice("sequence-state replacement"))
+            return false;
+
         const int idx = layer * batch_size_ + seq_idx;
         return cuda_kv_sequence_state_set(
             &d_head_params_[idx],
             &d_count_params_[idx],
             head,
             count,
+            max_seq_len_,
+            static_cast<cudaStream_t>(gpu_stream));
+    }
+
+    bool CUDARingKVCacheBase::evictOldestDeviceSequenceState(
+        int layer,
+        int seq_idx,
+        int num_tokens,
+        void *gpu_stream)
+    {
+        if (!validLayerSeq(layer, seq_idx) ||
+            num_tokens < 0 ||
+            !gpu_stream ||
+            !d_head_params_ ||
+            !d_count_params_)
+        {
+            return false;
+        }
+        if (!activateOwningDevice("oldest-sequence-state eviction"))
+            return false;
+
+        return cuda_kv_sequence_state_evict_oldest(
+            d_head_params_,
+            d_count_params_,
+            n_layers_,
+            batch_size_,
+            layer,
+            seq_idx,
+            num_tokens,
             max_seq_len_,
             static_cast<cudaStream_t>(gpu_stream));
     }
@@ -406,6 +636,12 @@ namespace llaminar2
                 *error =
                     "CUDA KV device sequence-state publication request exceeds batch size";
             }
+            return false;
+        }
+        if (!activateOwningDevice(
+                "device sequence-state publication",
+                error))
+        {
             return false;
         }
 

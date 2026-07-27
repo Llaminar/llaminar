@@ -122,8 +122,19 @@ static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRu
         return cached;
     }
 
+    /*
+     * Generic ROCm policy candidates encode a requested split count. The
+     * production launch can never create more K partitions than there are
+     * 32-value groups, so it resolves that request as min(requested, K / 32).
+     * Publish the same physical value through the query/cache surface. Leaving
+     * the nominal request here made serial-M1 policy queries disagree with the
+     * launch telemetry for small-K unseen shapes (for example KB20 at K=416,
+     * whose real launch is KB13), even though the kernel itself was correct.
+     */
+    const int requested_kb = static_cast<int>(generated_cfg.kb);
+    const int k_groups = k / 32;
     cached.has_generated = true;
-    cached.kb = static_cast<int>(generated_cfg.kb);
+    cached.kb = (requested_kb < k_groups) ? requested_kb : k_groups;
     cached.target_waves_per_cu =
         static_cast<int>(generated_cfg.target_waves_per_cu);
     cache.insert(cache_key, true, cached);

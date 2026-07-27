@@ -64,15 +64,7 @@
 // AVX2 GEMV/GEMM kernels (same packed weight format, uses emulated VNNI)
 #include "CPUNativeAVX2Gemv.h"
 #include "kernels/cpu/native_vnni/CPUNativeVNNIDecodePolicyGenerated.inc"
-#include "kernels/cpu/native_vnni/CPUNativeVNNIPrefillPolicyGenerated.inc"
 #include "kernels/cpu/native_vnni/CPUNativeVNNIVerifierRowsPolicyGenerated.inc"
-
-// Development-only artifacts intentionally omit this marker. Absence must
-// fail closed so a stale local include cannot gain production authority merely
-// by having the generated selector's expected filename.
-#ifndef LLAMINAR_CPU_NVNNI_PREFILL_POLICY_CERTIFIED
-#define LLAMINAR_CPU_NVNNI_PREFILL_POLICY_CERTIFIED 0
-#endif
 
 namespace llaminar2::cpu::native_vnni
 {
@@ -560,17 +552,18 @@ namespace llaminar2::cpu::native_vnni
     /**
      * @brief Forceable ordinary-prefill work-sharing schedule.
      *
-     * Production callers use Auto and receive the sealed generated policy.
-     * The explicit values exist for integration tests and the strong perf
-     * trainer, where every physical candidate must be requested independently
-     * and authenticated through launch telemetry. They select only task
-     * ownership: every schedule invokes the same serial-M1-equivalent chunk
-     * microkernels and leaves each output row's increasing-K arithmetic tree
-     * unchanged.
+     * Production callers use Auto and receive the total geometry-aware
+     * heuristic.  Learned installation currently covers serial M=1 and grouped
+     * verifier rows; ordinary prefill deliberately retains this heuristic.
+     * The explicit values exist for integration tests and the perf trainer,
+     * where every physical candidate must be requested independently and
+     * authenticated through launch telemetry. They select only task ownership:
+     * every schedule invokes the same serial-M1-equivalent chunk microkernels
+     * and leaves each output row's increasing-K arithmetic tree unchanged.
      */
     enum class PrefillSchedulePolicy
     {
-        /** Resolve the sealed generated production policy. */
+        /** Resolve the total cache- and geometry-aware production heuristic. */
         Auto,
 
         /** Schedule one independent `(row, 64-column chunk)` task. */
@@ -807,95 +800,6 @@ namespace llaminar2::cpu::native_vnni
             activeISALevel(),
             threads,
             serial_geometry.k_tiles);
-    }
-
-    /**
-     * @brief Resolve the certified ordinary-prefill physical schedule.
-     *
-     * Ordinary M>1 projection and grouped verifier rows have different launch
-     * economics even though both must preserve the serial-M1 accumulation
-     * tree. The generated prefill selector therefore owns row-chunk versus
-     * two-row N sharing as well as Pairwise versus WideRows publication for a
-     * serial K-part geometry. The caller supplies the *effective* ISA selected
-     * for this invocation so an AVX512 build forced to AVX2 uses its separately
-     * trained policy surface.
-     *
-     * @param packed Prepared production weights and execution codebook.
-     * @param M Runtime row count before model-tier bucketing.
-     * @param N Output width.
-     * @param K Input width.
-     * @param use_avx512 True when this invocation executes AVX512 kernels.
-     * @param use_avx2 True when this invocation executes AVX2 kernels.
-     * @param serial_kpart True when production serial M1 owns multiple ordered
-     * K partitions for this geometry.
-     * @return A measured, byte-exact ordinary-prefill schedule.
-     * @throws std::runtime_error when the active build/ISA/thread/codebook/shape
-     * surface has no generated policy. Production never substitutes the old
-     * tile heuristic for an untrained policy cell.
-     */
-    inline generated::CPUNativeVNNIPrefillPolicy selectPrefillPolicy(
-        const CPUNativeVNNIPackedWeights &packed,
-        int M,
-        int N,
-        int K,
-        bool use_avx512,
-        bool use_avx2,
-        bool serial_kpart)
-    {
-        if constexpr (!LLAMINAR_CPU_NVNNI_PREFILL_POLICY_CERTIFIED)
-        {
-            throw std::runtime_error(
-                "CPU NativeVNNI prefill Auto dispatch requires a sealed-certified "
-                "generated policy; the compiled table is development-only");
-        }
-
-#if LLAMINAR_COMPILED_WITH_AVX512
-        constexpr auto build_isa =
-            generated::CPUNativeVNNIPrefillBuildISA::AVX512;
-#else
-        constexpr auto build_isa =
-            generated::CPUNativeVNNIPrefillBuildISA::AVX2;
-#endif
-        generated::CPUNativeVNNIPrefillRuntimeISA runtime_isa{};
-        if (use_avx512)
-        {
-            runtime_isa = generated::CPUNativeVNNIPrefillRuntimeISA::AVX512;
-        }
-        else if (use_avx2)
-        {
-            runtime_isa = generated::CPUNativeVNNIPrefillRuntimeISA::AVX2;
-        }
-        else
-        {
-            throw std::runtime_error(
-                "CPU NativeVNNI prefill requires AVX2 or AVX512");
-        }
-
-        generated::CPUNativeVNNIPrefillPolicy policy{};
-        if (generated::selectCPUNativeVNNIPrefillGeneratedPolicy(
-                build_isa,
-                runtime_isa,
-                omp_get_max_threads(),
-                packed.codebook_id,
-                M,
-                N,
-                K,
-                serial_kpart,
-                policy))
-        {
-            return policy;
-        }
-
-        throw std::runtime_error(
-            std::string("No certified CPU NativeVNNI prefill policy for build=") +
-            compiledNativeVNNIBuildISAName() +
-            " runtime=" + (use_avx512 ? "AVX512" : "AVX2") +
-            " threads=" + std::to_string(omp_get_max_threads()) +
-            " codebook=" + std::to_string(packed.codebook_id) +
-            " M=" + std::to_string(M) +
-            " N=" + std::to_string(N) +
-            " K=" + std::to_string(K) +
-            " serial_kpart=" + (serial_kpart ? "true" : "false"));
     }
 
     // =========================================================================
@@ -2996,28 +2900,6 @@ namespace llaminar2::cpu::native_vnni
             N, packed.K, 1, packed.payload_bytes, num_threads);
         const bool use_decode_equivalent_kpart = serial_cfg.k_tiles > 1;
 
-        generated::CPUNativeVNNIPrefillPolicy generated_policy{};
-        const bool use_generated_policy =
-            verifier_policy_override == VerifierRowsPolicy::Auto &&
-            schedule_override == PrefillSchedulePolicy::Auto;
-        if (use_generated_policy)
-        {
-            if (ldc < 64)
-            {
-                throw std::runtime_error(
-                    "Generated CPU NativeVNNI prefill policy does not admit "
-                    "an output stride narrower than one 64-value chunk");
-            }
-            generated_policy = selectPrefillPolicy(
-                packed,
-                M,
-                N,
-                packed.K,
-                use_avx512,
-                use_avx2,
-                use_decode_equivalent_kpart);
-        }
-
         int n_block_chunks = cfg.n_block_chunks;
         if (n_block_chunks_override < 0)
         {
@@ -3026,12 +2908,6 @@ namespace llaminar2::cpu::native_vnni
         }
         if (n_block_chunks_override > 0)
         {
-            if (use_generated_policy)
-            {
-                throw std::invalid_argument(
-                    "CPU NativeVNNI generated prefill policy cannot be combined "
-                    "with an explicit N-block override");
-            }
             n_block_chunks = n_block_chunks_override;
         }
         bool use_row_chunk_grid =
@@ -3039,106 +2915,35 @@ namespace llaminar2::cpu::native_vnni
                     num_threads / 4 &&
                 M >= 2;
         bool use_two_row_pair_grid = false;
-        if (!use_generated_policy)
+        /*
+         * Ordinary prefill intentionally remains on the total geometry
+         * heuristic. Learned dispatch is installed only for serial M=1 and the
+         * grouped-verifier surface; absence of a prefill corpus must never make
+         * an otherwise valid M>1 projection fail closed. Explicit overrides are
+         * retained solely for the offline candidate sweeper and regressions.
+         */
+        switch (schedule_override)
         {
-            switch (schedule_override)
-            {
-            case PrefillSchedulePolicy::Auto:
-                use_row_chunk_grid = use_row_chunk_grid || ldc < 64;
-                break;
-            case PrefillSchedulePolicy::RowChunkGrid:
-                use_row_chunk_grid = true;
-                break;
-            case PrefillSchedulePolicy::TwoRowNMajor:
-                use_row_chunk_grid = false;
-                break;
-            case PrefillSchedulePolicy::TwoRowPairGrid:
-                use_row_chunk_grid = false;
-                use_two_row_pair_grid = true;
-                break;
-            }
-        }
-        else
-        {
-            /*
-             * Decode stable ordinals rather than naming every generated enum
-             * member. A newly admitted candidate family must compile while the
-             * previous development-only table is still installed; only the
-             * regenerated certified include can return its new ordinals.
-             */
-            switch (static_cast<uint8_t>(generated_policy))
-            {
-            case 0: // RowChunkGrid
-                use_row_chunk_grid = true;
-                break;
-            case 1: // TwoRowNbc1
-                n_block_chunks = 1;
-                use_row_chunk_grid = false;
-                break;
-            case 2: // TwoRowNbc2
-                n_block_chunks = 2;
-                use_row_chunk_grid = false;
-                break;
-            case 3: // TwoRowNbc4
-                n_block_chunks = 4;
-                use_row_chunk_grid = false;
-                break;
-            case 4: // TwoRowNbc8
-                n_block_chunks = 8;
-                use_row_chunk_grid = false;
-                break;
-            case 5: // TwoRowNbc16
-                n_block_chunks = 16;
-                use_row_chunk_grid = false;
-                break;
-            case 8: // TwoRowPairGridNbc1
-                n_block_chunks = 1;
-                use_row_chunk_grid = false;
-                use_two_row_pair_grid = true;
-                break;
-            case 9: // TwoRowPairGridNbc2
-                n_block_chunks = 2;
-                use_row_chunk_grid = false;
-                use_two_row_pair_grid = true;
-                break;
-            case 10: // TwoRowPairGridNbc4
-                n_block_chunks = 4;
-                use_row_chunk_grid = false;
-                use_two_row_pair_grid = true;
-                break;
-            case 11: // TwoRowPairGridNbc8
-                n_block_chunks = 8;
-                use_row_chunk_grid = false;
-                use_two_row_pair_grid = true;
-                break;
-            case 12: // TwoRowPairGridNbc16
-                n_block_chunks = 16;
-                use_row_chunk_grid = false;
-                use_two_row_pair_grid = true;
-                break;
-            case 6: // KPartPairwise
-            case 7: // KPartWideRows
-                if (!use_decode_equivalent_kpart)
-                {
-                    throw std::runtime_error(
-                        "Generated CPU prefill K-part policy disagrees with "
-                        "the production serial-M1 route");
-                }
-                use_row_chunk_grid = false;
-                break;
-            default:
-                throw std::runtime_error(
-                    "Generated CPU NativeVNNI prefill policy is outside the runtime ABI");
-            }
+        case PrefillSchedulePolicy::Auto:
+            use_row_chunk_grid = use_row_chunk_grid || ldc < 64;
+            break;
+        case PrefillSchedulePolicy::RowChunkGrid:
+            use_row_chunk_grid = true;
+            break;
+        case PrefillSchedulePolicy::TwoRowNMajor:
+            use_row_chunk_grid = false;
+            break;
+        case PrefillSchedulePolicy::TwoRowPairGrid:
+            use_row_chunk_grid = false;
+            use_two_row_pair_grid = true;
+            break;
         }
         const int total_n_blocks =
             (N_chunks + n_block_chunks - 1) / n_block_chunks;
         const VerifierRowsPolicy requested_kpart_policy =
             use_decode_equivalent_kpart
-                ? (use_generated_policy
-                       ? (static_cast<uint8_t>(generated_policy) == 7
-                              ? VerifierRowsPolicy::WideRows
-                              : VerifierRowsPolicy::Pairwise)
+                ? (verifier_policy_override == VerifierRowsPolicy::Auto
+                       ? VerifierRowsPolicy::Pairwise
                        : verifier_policy_override)
                 : VerifierRowsPolicy::Pairwise;
         const bool effective_wide_kpart =
@@ -3191,6 +2996,10 @@ namespace llaminar2::cpu::native_vnni
                                      : use_two_row_pair_grid
                                          ? "two_row_pair_grid"
                                          : "two_row_n_major")},
+                    {"row_tile",
+                     use_row_chunk_grid || use_decode_equivalent_kpart
+                         ? "1"
+                         : "2"},
                     {"requested_policy",
                      requested_kpart_policy == VerifierRowsPolicy::WideRows
                          ? "WideRows"

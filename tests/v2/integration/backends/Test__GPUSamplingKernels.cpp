@@ -83,6 +83,16 @@ namespace
             }
 
             device_id_ = 0;
+            ASSERT_TRUE(
+                backend_->prepareLogitPenaltyWorkspace(
+                    /*vocab_size=*/151936,
+                    device_id_))
+                << "Failed to prepare persistent logit-penalty workspace on "
+                << backend_name;
+            penalty_stream_ = backend_->createStream(device_id_);
+            ASSERT_NE(penalty_stream_, nullptr)
+                << "Failed to create the explicit sparse logit-penalty stream on "
+                << backend_name;
 
             // Standard logits (5 tokens) — token 2 has highest logit (3.0)
             standard_logits_ = {1.0f, 2.0f, 3.0f, 0.5f, 1.5f};
@@ -103,10 +113,13 @@ namespace
                     backend_->free(argmax_partial_vals_, device_id_);
                 if (argmax_partial_idxs_)
                     backend_->free(argmax_partial_idxs_, device_id_);
+                if (penalty_stream_)
+                    backend_->destroyStream(penalty_stream_, device_id_);
             }
             argmax_partial_vals_ = nullptr;
             argmax_partial_idxs_ = nullptr;
             argmax_partial_capacity_ = 0;
+            penalty_stream_ = nullptr;
             backend_ = nullptr;
         }
 
@@ -149,7 +162,8 @@ namespace
         // use and reused across calls, then freed in TearDown.
         // ------------------------------------------------------------------
         bool argmaxF32(void *d_ptr, int n, int device_id,
-                       float *out_value, int *out_index)
+                       float *out_value, int *out_index,
+                       void *stream = nullptr)
         {
             if (!argmax_partial_vals_)
             {
@@ -160,7 +174,7 @@ namespace
                     backend_->allocate(argmax_partial_capacity_ * sizeof(int), device_id_);
             }
             return backend_->argmaxF32(d_ptr, n, device_id, out_value, out_index,
-                                       nullptr, argmax_partial_vals_,
+                                       stream, argmax_partial_vals_,
                                        argmax_partial_idxs_, argmax_partial_capacity_);
         }
 
@@ -189,6 +203,7 @@ namespace
 
         IBackend *backend_ = nullptr;
         int device_id_ = 0;
+        void *penalty_stream_ = nullptr;
 
         // Persistent argmax partial-reduction scratch (allocated on first use).
         void *argmax_partial_vals_ = nullptr;
@@ -295,6 +310,265 @@ namespace
         backend_->free(d_conditions, device_id_);
         backend_->free(d_base_positions, device_id_);
         backend_->free(d_proposals, device_id_);
+    }
+
+    /**
+     * @brief Prove grouped verifier positions follow mutable device KV counts.
+     *
+     * Accepted-state publication intentionally does not update a host position
+     * mirror on GPU. The next grouped verifier must expand each request's
+     * canonical device KV count into a contiguous absolute-position row before
+     * captured replay. This test captures that production primitive once, then
+     * changes only the device-owned base positions. Byte-exact output on every
+     * replay catches stale host scalars, a captured initial value, incorrect
+     * request-major indexing, and a missing long-context offset.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        MTPGroupedVerifierPositionsTrackDeviceKVCountsAcrossGraphReplays)
+    {
+        constexpr int request_count = 4;
+        constexpr int padded_seq_len = 5;
+        constexpr int total_rows = request_count * padded_seq_len;
+        const std::array<std::array<int32_t, request_count>, 3> live_positions = {{
+            {{7, 11, 19, 23}},
+            {{4095, 8191, 12287, 16383}},
+            {{2383, 2387, 2391, 2395}},
+        }};
+
+        void *d_live_positions = backend_->allocate(
+            request_count * sizeof(int32_t), device_id_);
+        void *d_verifier_positions = backend_->allocate(
+            total_rows * sizeof(int32_t), device_id_);
+        ASSERT_NE(d_live_positions, nullptr);
+        ASSERT_NE(d_verifier_positions, nullptr);
+
+        std::array<std::array<int32_t, total_rows>, live_positions.size()>
+            observed{};
+
+        auto run = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueuePrepareMTPVerifierPositionIds(
+                    d_live_positions,
+                    request_count,
+                    padded_seq_len,
+                    device_id_,
+                    stream,
+                    d_verifier_positions));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+
+                for (size_t replay = 0; replay < live_positions.size(); ++replay)
+                {
+                    ASSERT_TRUE(backend_->hostToDevice(
+                        d_live_positions,
+                        live_positions[replay].data(),
+                        request_count * sizeof(int32_t),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(capture->launch());
+                    ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+                    ASSERT_TRUE(backend_->deviceToHost(
+                        observed[replay].data(),
+                        d_verifier_positions,
+                        total_rows * sizeof(int32_t),
+                        device_id_));
+                }
+            });
+        };
+        if (GetParam() == "CUDA")
+            run(GPUDeviceContextPool::instance().getNvidiaContext(device_id_));
+        else
+            run(GPUDeviceContextPool::instance().getAMDContext(device_id_));
+
+        for (size_t replay = 0; replay < live_positions.size(); ++replay)
+        {
+            for (int request = 0; request < request_count; ++request)
+            {
+                for (int token = 0; token < padded_seq_len; ++token)
+                {
+                    const int flat_row =
+                        request * padded_seq_len + token;
+                    EXPECT_EQ(
+                        observed[replay][static_cast<size_t>(flat_row)],
+                        live_positions[replay][static_cast<size_t>(request)] +
+                            token)
+                        << "replay=" << replay
+                        << " request=" << request
+                        << " token=" << token;
+                }
+            }
+        }
+
+        backend_->free(d_verifier_positions, device_id_);
+        backend_->free(d_live_positions, device_id_);
+    }
+
+    /**
+     * @brief Prove captured scalar MTP sidecars follow mutable device KV state.
+     *
+     * A scalar GPU MTP transaction has two production input shapes:
+     *
+     * - the first sidecar consumes the main-model target sample at the current
+     *   live KV position, and
+     * - each chained sidecar consumes a draft sample at that same live position
+     *   plus its compile-time depth offset.
+     *
+     * Prefix-cache restore and graph replay can change the live KV count without
+     * changing any captured pointer. This regression captures both compositions
+     * once, mutates only the device-resident base-position word between replays,
+     * and proves that both CUDA and ROCm read the new value on every launch. A
+     * host-captured scalar or stale host mirror would leave the second replay at
+     * the first position and fail byte equality.
+     *
+     * All allocations and immutable token uploads happen before capture. The hot
+     * path consists only of one H2D test-state mutation, graph launch, stream
+     * synchronization for test observation, and the final D2H result read.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        MTPDeviceOwnedSidecarsTrackMutableLivePositionAcrossGraphReplays)
+    {
+        constexpr int request_count = 1;
+        constexpr int32_t target_token = 101;
+        constexpr int32_t draft_token = 202;
+        const std::array<int32_t, 3> live_positions = {7, 4095, 8193};
+
+        void *d_target_token =
+            backend_->allocate(sizeof(target_token), device_id_);
+        void *d_draft_token =
+            backend_->allocate(sizeof(draft_token), device_id_);
+        void *d_live_position =
+            backend_->allocate(sizeof(int32_t), device_id_);
+        void *d_target_condition =
+            backend_->allocate(sizeof(int32_t), device_id_);
+        void *d_target_position =
+            backend_->allocate(sizeof(int32_t), device_id_);
+        void *d_draft_condition =
+            backend_->allocate(sizeof(int32_t), device_id_);
+        void *d_draft_position =
+            backend_->allocate(sizeof(int32_t), device_id_);
+        ASSERT_NE(d_target_token, nullptr);
+        ASSERT_NE(d_draft_token, nullptr);
+        ASSERT_NE(d_live_position, nullptr);
+        ASSERT_NE(d_target_condition, nullptr);
+        ASSERT_NE(d_target_position, nullptr);
+        ASSERT_NE(d_draft_condition, nullptr);
+        ASSERT_NE(d_draft_position, nullptr);
+
+        std::array<int32_t, live_positions.size()> observed_target_tokens{};
+        std::array<int32_t, live_positions.size()> observed_target_positions{};
+        std::array<int32_t, live_positions.size()> observed_draft_tokens{};
+        std::array<int32_t, live_positions.size()> observed_draft_positions{};
+
+        auto run = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_target_token,
+                    &target_token,
+                    sizeof(target_token),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_draft_token,
+                    &draft_token,
+                    sizeof(draft_token),
+                    device_id_,
+                    stream));
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueuePrepareMTPBatchedSidecarInputs(
+                    d_target_token,
+                    /*condition_token_stride=*/1,
+                    d_live_position,
+                    /*position_offset=*/0,
+                    request_count,
+                    device_id_,
+                    stream,
+                    d_target_condition,
+                    d_target_position));
+                ASSERT_TRUE(backend_->enqueuePrepareMTPBatchedSidecarInputs(
+                    d_draft_token,
+                    /*condition_token_stride=*/1,
+                    d_live_position,
+                    /*position_offset=*/1,
+                    request_count,
+                    device_id_,
+                    stream,
+                    d_draft_condition,
+                    d_draft_position));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+
+                for (size_t replay = 0; replay < live_positions.size(); ++replay)
+                {
+                    ASSERT_TRUE(backend_->hostToDevice(
+                        d_live_position,
+                        &live_positions[replay],
+                        sizeof(live_positions[replay]),
+                        device_id_,
+                        stream));
+                    ASSERT_TRUE(capture->launch());
+                    ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                    ASSERT_TRUE(backend_->deviceToHost(
+                        &observed_target_tokens[replay],
+                        d_target_condition,
+                        sizeof(int32_t),
+                        device_id_));
+                    ASSERT_TRUE(backend_->deviceToHost(
+                        &observed_target_positions[replay],
+                        d_target_position,
+                        sizeof(int32_t),
+                        device_id_));
+                    ASSERT_TRUE(backend_->deviceToHost(
+                        &observed_draft_tokens[replay],
+                        d_draft_condition,
+                        sizeof(int32_t),
+                        device_id_));
+                    ASSERT_TRUE(backend_->deviceToHost(
+                        &observed_draft_positions[replay],
+                        d_draft_position,
+                        sizeof(int32_t),
+                        device_id_));
+                }
+            });
+        };
+        if (GetParam() == "CUDA")
+            run(GPUDeviceContextPool::instance().getNvidiaContext(device_id_));
+        else
+            run(GPUDeviceContextPool::instance().getAMDContext(device_id_));
+
+        for (size_t replay = 0; replay < live_positions.size(); ++replay)
+        {
+            EXPECT_EQ(observed_target_tokens[replay], target_token);
+            EXPECT_EQ(observed_target_positions[replay], live_positions[replay]);
+            EXPECT_EQ(observed_draft_tokens[replay], draft_token);
+            EXPECT_EQ(observed_draft_positions[replay],
+                      live_positions[replay] + 1);
+        }
+
+        backend_->free(d_draft_position, device_id_);
+        backend_->free(d_draft_condition, device_id_);
+        backend_->free(d_target_position, device_id_);
+        backend_->free(d_target_condition, device_id_);
+        backend_->free(d_live_position, device_id_);
+        backend_->free(d_draft_token, device_id_);
+        backend_->free(d_target_token, device_id_);
     }
 
     /**
@@ -2771,11 +3045,12 @@ namespace
     // Helper: download GPU logits back to host for verification
     // ------------------------------------------------------------------
     static std::vector<float> downloadLogits(IBackend *backend, void *d_ptr,
-                                             int count, int device_id)
+                                             int count, int device_id,
+                                             void *stream = nullptr)
     {
         std::vector<float> result(count);
         bool ok = backend->deviceToHost(result.data(), d_ptr,
-                                        count * sizeof(float), device_id);
+                                        count * sizeof(float), device_id, stream);
         EXPECT_TRUE(ok) << "D2H transfer failed";
         return result;
     }
@@ -3180,11 +3455,12 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            1, static_cast<int>(logits.size()), device_id_);
+            1, static_cast<int>(logits.size()), device_id_, penalty_stream_);
         ASSERT_TRUE(ok) << "applyLogitPenaltiesF32 not supported on " << GetParam();
 
         auto result = downloadLogits(backend_, d_ptr,
-                                     static_cast<int>(logits.size()), device_id_);
+                                     static_cast<int>(logits.size()), device_id_,
+                                     penalty_stream_);
 
         // Token 2: 5.0 - 3.0 = 2.0
         EXPECT_FLOAT_EQ(result[0], 1.0f) << "Unpenalized tokens should be unchanged";
@@ -3207,11 +3483,12 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            3, static_cast<int>(logits.size()), device_id_);
+            3, static_cast<int>(logits.size()), device_id_, penalty_stream_);
         ASSERT_TRUE(ok);
 
         auto result = downloadLogits(backend_, d_ptr,
-                                     static_cast<int>(logits.size()), device_id_);
+                                     static_cast<int>(logits.size()), device_id_,
+                                     penalty_stream_);
 
         EXPECT_FLOAT_EQ(result[0], 9.0f);  // 10 - 1
         EXPECT_FLOAT_EQ(result[1], 20.0f); // unchanged
@@ -3233,7 +3510,7 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, nullptr, nullptr, 0,
-            static_cast<int>(logits.size()), device_id_);
+            static_cast<int>(logits.size()), device_id_, penalty_stream_);
         // Backends early-return false for num_penalties <= 0
         EXPECT_FALSE(ok) << "Zero penalties → backend returns false (no-op)";
 
@@ -3259,11 +3536,12 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            3, static_cast<int>(logits.size()), device_id_);
+            3, static_cast<int>(logits.size()), device_id_, penalty_stream_);
         ASSERT_TRUE(ok);
 
         auto result = downloadLogits(backend_, d_ptr,
-                                     static_cast<int>(logits.size()), device_id_);
+                                     static_cast<int>(logits.size()), device_id_,
+                                     penalty_stream_);
 
         EXPECT_FLOAT_EQ(result[0], 5.0f) << "OOB tokens should not corrupt logits";
         EXPECT_FLOAT_EQ(result[1], 3.0f) << "Valid token should be penalized: 5.0 - 2.0";
@@ -3284,11 +3562,12 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            1, static_cast<int>(logits.size()), device_id_);
+            1, static_cast<int>(logits.size()), device_id_, penalty_stream_);
         ASSERT_TRUE(ok);
 
         auto result = downloadLogits(backend_, d_ptr,
-                                     static_cast<int>(logits.size()), device_id_);
+                                     static_cast<int>(logits.size()), device_id_,
+                                     penalty_stream_);
 
         EXPECT_FLOAT_EQ(result[0], 0.0f);
         EXPECT_FLOAT_EQ(result[1], 5.0f) << "Negative penalty should boost: 0.0 - (-5.0) = 5.0";
@@ -3317,12 +3596,12 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            1, static_cast<int>(logits.size()), device_id_);
+            1, static_cast<int>(logits.size()), device_id_, penalty_stream_);
         ASSERT_TRUE(ok);
 
         // After penalty, argmax should shift to token 1
         argmaxF32(d_ptr, static_cast<int>(logits.size()),
-                            device_id_, &val, &idx);
+                            device_id_, &val, &idx, penalty_stream_);
         EXPECT_EQ(idx, 1) << "After penalty, argmax should shift to token 1 (9.5 > 8.0)";
         EXPECT_FLOAT_EQ(val, 9.5f);
 
@@ -3347,14 +3626,14 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            3, vocab_size, device_id_);
+            3, vocab_size, device_id_, penalty_stream_);
         ASSERT_TRUE(ok);
 
         // Verify via argmax — token 42 should now win (9.0 - 1.0 = 8.0 > 10.0 - 5.0 = 5.0)
         // token 1000: 8.0 - 0.5 = 7.5
         float val = 0;
         int idx = -1;
-        argmaxF32(d_ptr, vocab_size, device_id_, &val, &idx);
+        argmaxF32(d_ptr, vocab_size, device_id_, &val, &idx, penalty_stream_);
         EXPECT_EQ(idx, 42) << "After penalties, token 42 (8.0) should beat token 0 (5.0)";
 
         freeDevice(d_ptr);
@@ -3379,10 +3658,11 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            num_penalties, vocab_size, device_id_);
+            num_penalties, vocab_size, device_id_, penalty_stream_);
         ASSERT_TRUE(ok);
 
-        auto result = downloadLogits(backend_, d_ptr, vocab_size, device_id_);
+        auto result = downloadLogits(
+            backend_, d_ptr, vocab_size, device_id_, penalty_stream_);
 
         // First 256 tokens should be 0.5, rest should be 1.0
         for (int i = 0; i < num_penalties; ++i)
@@ -3420,10 +3700,11 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            2, vocab_size, device_id_);
+            2, vocab_size, device_id_, penalty_stream_);
         ASSERT_TRUE(ok);
 
-        auto result = downloadLogits(backend_, d_ptr, vocab_size, device_id_);
+        auto result = downloadLogits(
+            backend_, d_ptr, vocab_size, device_id_, penalty_stream_);
 
         EXPECT_NEAR(result[2], 10.0f - dry_3, 0.001f)
             << "Token 2 should have DRY penalty for repeat_len=3";
@@ -3450,14 +3731,15 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            2, static_cast<int>(logits.size()), device_id_);
+            2, static_cast<int>(logits.size()), device_id_, penalty_stream_);
         ASSERT_TRUE(ok);
 
         // topK=3: should now be [2(8.0), 3(7.0), 4(6.0)] instead of [0,1,2]
         std::vector<float> values(3);
         std::vector<int> indices(3);
         ok = backend_->topKF32(d_ptr, static_cast<int>(logits.size()),
-                               3, device_id_, values.data(), indices.data());
+                               3, device_id_, values.data(), indices.data(),
+                               penalty_stream_);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(indices[0], 2) << "After penalty, token 2 (8.0) should be top-1";
@@ -3489,7 +3771,8 @@ namespace
     static std::vector<float> applyGpuPenalties(
         IBackend *backend, int device_id,
         const std::vector<float> &logits,
-        const std::vector<LogitPenalty> &penalties)
+        const std::vector<LogitPenalty> &penalties,
+        void *stream)
     {
         size_t bytes = logits.size() * sizeof(float);
         void *d_ptr = backend->allocate(bytes, device_id);
@@ -3511,12 +3794,13 @@ namespace
             ok = backend->applyLogitPenaltiesF32(
                 d_ptr, token_ids.data(), penalty_vals.data(),
                 static_cast<int>(penalties.size()),
-                static_cast<int>(logits.size()), device_id);
+                static_cast<int>(logits.size()), device_id, stream);
             EXPECT_TRUE(ok);
         }
 
         auto result = downloadLogits(backend, d_ptr,
-                                     static_cast<int>(logits.size()), device_id);
+                                     static_cast<int>(logits.size()), device_id,
+                                     stream);
         backend->free(d_ptr, device_id);
         return result;
     }
@@ -9139,7 +9423,8 @@ namespace
         auto cpu_result = logits;
         applyCpuPenalties(cpu_result, penalties);
 
-        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+        auto gpu_result = applyGpuPenalties(
+            backend_, device_id_, logits, penalties, penalty_stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -9173,7 +9458,8 @@ namespace
         auto cpu_result = logits;
         applyCpuPenalties(cpu_result, penalties);
 
-        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+        auto gpu_result = applyGpuPenalties(
+            backend_, device_id_, logits, penalties, penalty_stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -9212,7 +9498,8 @@ namespace
         auto cpu_result = logits;
         applyCpuPenalties(cpu_result, penalties);
 
-        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+        auto gpu_result = applyGpuPenalties(
+            backend_, device_id_, logits, penalties, penalty_stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -9252,7 +9539,8 @@ namespace
         auto cpu_result = logits;
         applyCpuPenalties(cpu_result, penalties);
 
-        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+        auto gpu_result = applyGpuPenalties(
+            backend_, device_id_, logits, penalties, penalty_stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -9291,7 +9579,8 @@ namespace
         auto cpu_result = logits;
         applyCpuPenalties(cpu_result, penalties);
 
-        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+        auto gpu_result = applyGpuPenalties(
+            backend_, device_id_, logits, penalties, penalty_stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -9335,7 +9624,8 @@ namespace
         auto cpu_result = logits;
         applyCpuPenalties(cpu_result, penalties);
 
-        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+        auto gpu_result = applyGpuPenalties(
+            backend_, device_id_, logits, penalties, penalty_stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -9365,7 +9655,8 @@ namespace
         auto cpu_result = logits;
         applyCpuPenalties(cpu_result, penalties);
 
-        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+        auto gpu_result = applyGpuPenalties(
+            backend_, device_id_, logits, penalties, penalty_stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -9425,12 +9716,15 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalty_vals.data(),
-            static_cast<int>(penalties.size()), vocab_size, device_id_);
+            static_cast<int>(penalties.size()), vocab_size, device_id_,
+            penalty_stream_);
         ASSERT_TRUE(ok);
 
         float gpu_val = 0;
         int gpu_argmax = -1;
-        ok = argmaxF32(d_ptr, vocab_size, device_id_, &gpu_val, &gpu_argmax);
+        ok = argmaxF32(
+            d_ptr, vocab_size, device_id_, &gpu_val, &gpu_argmax,
+            penalty_stream_);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(gpu_argmax, cpu_argmax)
@@ -9479,7 +9773,8 @@ namespace
         auto cpu_result = logits;
         applyCpuPenalties(cpu_result, penalties);
 
-        auto gpu_result = applyGpuPenalties(backend_, device_id_, logits, penalties);
+        auto gpu_result = applyGpuPenalties(
+            backend_, device_id_, logits, penalties, penalty_stream_);
 
         // Spot-check penalized tokens
         for (const auto &p : penalties)

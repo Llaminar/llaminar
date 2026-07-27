@@ -88,6 +88,7 @@ namespace llaminar2
         int all_position_logit_rows = 0; ///< Compact verifier logits row count when all-position logits are row-indexed.
         bool uses_device_token_ids = false; ///< True when embedding reads token IDs from a stable device buffer.
         bool uses_device_position_ids = false; ///< True when RoPE reads position IDs from a stable device buffer.
+        ForwardPositionPolicy position_policy = ForwardPositionPolicy::ExplicitRows; ///< Position geometry captured by this graph.
         bool uses_device_sequence_lengths = false; ///< True when stages derive request geometry from a stable device row.
         bool standard_path = true;
         bool pp_stage_enabled = false;
@@ -97,6 +98,7 @@ namespace llaminar2
         bool pp_has_lm_head = false;
         bool is_bucketed_prefill = false;
         int bucket_seq_len = 0;
+        bool rehydrate_prefix_runtime_on_device = false;
         uint64_t moe_placement_epoch = 0;
 
         bool operator==(const ForwardGraphSignature &other) const
@@ -112,6 +114,7 @@ namespace llaminar2
                    all_position_logit_rows == other.all_position_logit_rows &&
                    uses_device_token_ids == other.uses_device_token_ids &&
                    uses_device_position_ids == other.uses_device_position_ids &&
+                   position_policy == other.position_policy &&
                    uses_device_sequence_lengths == other.uses_device_sequence_lengths &&
                    standard_path == other.standard_path &&
                    pp_stage_enabled == other.pp_stage_enabled &&
@@ -121,6 +124,8 @@ namespace llaminar2
                    pp_has_lm_head == other.pp_has_lm_head &&
                    is_bucketed_prefill == other.is_bucketed_prefill &&
                    bucket_seq_len == other.bucket_seq_len &&
+                   rehydrate_prefix_runtime_on_device ==
+                       other.rehydrate_prefix_runtime_on_device &&
                    moe_placement_epoch == other.moe_placement_epoch;
         }
     };
@@ -139,6 +144,8 @@ namespace llaminar2
             h ^= (std::hash<int>{}(sig.all_position_logit_rows) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_token_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_position_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint8_t>{}(static_cast<uint8_t>(sig.position_policy)) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_sequence_lengths) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.standard_path) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_stage_enabled) + 0x9e3779b9 + (h << 6) + (h >> 2));
@@ -148,6 +155,7 @@ namespace llaminar2
             h ^= (std::hash<bool>{}(sig.pp_has_lm_head) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.is_bucketed_prefill) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.bucket_seq_len) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.rehydrate_prefix_runtime_on_device) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint64_t>{}(sig.moe_placement_epoch) + 0x9e3779b9 + (h << 6) + (h >> 2));
             return h;
         }
@@ -582,13 +590,13 @@ namespace llaminar2
          * executables hot is the served-inference path we want: warmup captures
          * once, later requests replay after device-state reset.
          *
-         * Prefill graph executables do not survive request boundaries. They may
-         * capture GDN/MoE request-local metadata even when their buffers are
-         * stable, so Ready entries are demoted to Initialized: lazy stage/kernel
-         * resources and the owned explicit prefill stream may survive, but
-         * request-local capture arming and executable replay do not. Capturing
-         * or otherwise invalid entries are still dropped rather than silently
-         * reused.
+         * Prefill executables follow the same stable-address contract. Their
+         * kernels read persistent KV, recurrent, routing, and request-input
+         * storage; request reset clears contents but does not replace those
+         * allocations. Ready executables therefore survive, while mutable
+         * request metadata is republished on their exact stream before replay.
+         * Warmup and Initialized entries retain only lazy initialization because
+         * they do not yet own a complete executable.
          */
         void resetSessionStatePreservingGraphReplay()
         {
@@ -599,7 +607,11 @@ namespace llaminar2
             }
             PrefillGraphRequestResetSummary prefill_reset;
             if (prefill_graph_cache)
-                prefill_reset = prefill_graph_cache->prepareEntriesForRequestReset();
+            {
+                prefill_reset =
+                    prefill_graph_cache->prepareEntriesForRequestReset(
+                        /*preserve_ready_executables=*/true);
+            }
             const bool prefill_request_state_was_reset =
                 prefill_reset.ready_demoted > 0 ||
                 prefill_reset.initialized > 0 ||
@@ -609,7 +621,8 @@ namespace llaminar2
             if (graph)
             {
                 const bool captured_replay_preserved =
-                    segment_cache.initialized && !segment_cache.needs_capture;
+                    (segment_cache.initialized && !segment_cache.needs_capture) ||
+                    prefill_reset.ready_preserved > 0;
                 const bool lazy_prefill_only =
                     !captured_replay_preserved &&
                     (prefill_reset.ready_demoted > 0 || prefill_reset.initialized > 0);

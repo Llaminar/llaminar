@@ -6,6 +6,7 @@
  */
 
 #include "InferenceRunnerFactory.h"
+#include "loaders/GPUHostLoadPreflight.h"
 #include "EagerWeightValidator.h"
 #include "../../backends/DeviceId.h"
 #include "../../backends/BackendManager.h"
@@ -743,9 +744,32 @@ namespace llaminar2
         bool hostRamPreflight(
             const GGUFModel &model,
             const std::vector<std::pair<std::string, bool>> &weights_to_load,
-            DeviceId device)
+            DeviceId device,
+            bool use_mmap)
         {
-            const size_t required_bytes = computeEagerLoadHostBytes(model, weights_to_load);
+            const size_t eager_weight_bytes =
+                computeEagerLoadHostBytes(model, weights_to_load);
+            /**
+             * Native GPU weights remain file-backed and are read directly into
+             * the pinned upload ring. They therefore consume the configured
+             * bounded staging budget, not one anonymous-RAM copy of every model
+             * tensor. CPU and explicit --no-mmap paths retain the historical
+             * full eager-footprint requirement.
+             */
+            const auto &load_config = debugEnv().rocm;
+            const size_t configured_staging_bytes =
+                load_config.repack_budget_mb > 0
+                    ? static_cast<size_t>(load_config.repack_budget_mb) *
+                          1024ULL * 1024ULL
+                    : eager_weight_bytes;
+            const bool bounded_gpu_load =
+                device.is_gpu() && use_mmap &&
+                load_config.repack_budget_mb > 0;
+            const size_t required_bytes = gpuHostLoadWorkingSetBytes(
+                eager_weight_bytes,
+                device.is_gpu(),
+                use_mmap,
+                configured_staging_bytes);
             if (required_bytes == 0)
                 return true;
 
@@ -772,7 +796,11 @@ namespace llaminar2
                 LOG_DEBUG("[HostRAM] Preflight passed: need "
                           << std::fixed << std::setprecision(1) << required_gb
                           << " GB, available " << available_gb << " GB"
-                          << (device.is_gpu() ? " (temporary staging for GPU transfer)" : " (retained for CPU inference)"));
+                          << (bounded_gpu_load
+                                  ? " (bounded mmap-to-GPU staging)"
+                                  : device.is_gpu()
+                                        ? " (temporary staging for GPU transfer)"
+                                        : " (retained for CPU inference)"));
                 return true;
             }
 
@@ -783,7 +811,11 @@ namespace llaminar2
                       << "  Margin:    " << margin_gb << " GB (safety headroom)\n"
                       << "  Available: " << available_gb << " GB (system MemAvailable)\n"
                       << "  Device:    " << device.to_string()
-                      << (device.is_gpu() ? " (host RAM needed temporarily for GPU transfer)" : " (host RAM retained for CPU inference)")
+                      << (bounded_gpu_load
+                              ? " (bounded mmap-to-GPU staging)"
+                              : device.is_gpu()
+                                    ? " (host RAM needed temporarily for GPU transfer)"
+                                    : " (host RAM retained for CPU inference)")
                       << "\n"
                       << "  Mitigations:\n"
                       << "    - Free system memory (close other applications)\n"
@@ -2747,7 +2779,8 @@ namespace llaminar2
         // =====================================================================
         // Host RAM preflight check: ensure enough memory before loading
         // =====================================================================
-        if (!hostRamPreflight(gguf_model, weights_to_load, device))
+        if (!hostRamPreflight(
+                gguf_model, weights_to_load, device, model_ctx->usesMmap()))
         {
             WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
             return false;

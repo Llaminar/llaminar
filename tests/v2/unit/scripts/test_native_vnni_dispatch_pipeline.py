@@ -110,7 +110,42 @@ def test_turnkey_cpu_prefill_authenticates_its_measurement_plan(
     assert result.returncode == 0, result.stderr
     assert "--inventory-source" in result.stdout
     assert "prefill_matrix.py" in result.stdout
-    assert "native_vnni_cpu_prefill_split_v12.json" in result.stdout
+    assert "native_vnni_cpu_prefill_split_v13.json" in result.stdout
+
+
+def test_turnkey_rejects_cpu_prefill_install() -> None:
+    """Offline prefill research cannot replace production heuristics."""
+
+    result = subprocess.run(
+        (
+            str(PIPELINE),
+            "--backend",
+            "cpu-prefill",
+            "--install",
+            "--dry-run",
+        ),
+        cwd=REPOSITORY_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "ordinary prefill is heuristic-only" in result.stderr
+
+
+def test_all_backend_transaction_excludes_prefill_install() -> None:
+    """The production bundle owns M=1/grouped policies only."""
+
+    source = PIPELINE.read_text(encoding="utf-8")
+    loop = next(
+        line.strip()
+        for line in source.splitlines()
+        if line.strip().startswith("for selected_backend in ")
+    )
+    assert loop == "for selected_backend in cpu cuda rocm; do"
+    assert "for selected_backend in cpu cpu-prefill cuda rocm; do" not in source
 
 
 def test_fit_threshold_does_not_select_a_new_measurement_corpus(

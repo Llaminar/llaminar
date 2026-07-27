@@ -18,6 +18,7 @@
 #include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt.h>
 #include <thread>
+#include <array>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
@@ -153,11 +154,12 @@ namespace llaminar2
         bool synchronizeChecked() override;
         void synchronizeStream(void *stream) override;
         bool synchronizeStreamChecked(void *stream) override;
-        void insertStreamDependency(void *dependent_stream, void *dependency_stream) override;
+        bool insertStreamDependency(
+            void *dependent_stream,
+            void *dependency_stream) override;
 
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override;
         std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *stream) override;
-        void clearLastError() override;
         PointerValidationResult validatePointerDevice(const void *gpu_ptr, int expected_ordinal) override;
         PointerInspectionResult inspectPointer(const void *gpu_ptr) const override;
         void dumpRecentPointerEvents(size_t max_events) override;
@@ -215,6 +217,28 @@ namespace llaminar2
         hipStream_t default_stream_ = nullptr;
         std::unordered_map<std::string, hipStream_t> auxiliary_streams_;
         std::mutex auxiliary_streams_mutex_;
+
+        /**
+         * @brief Number of independently leasable inter-stream handoff events.
+         *
+         * The fixed pool removes HIP event allocation from graph replay and
+         * gives concurrent graph owners separate record/wait pairs. Contention
+         * remains local to one slot only after more than thirty-two concurrent
+         * publishers target the same physical device.
+         */
+        static constexpr size_t kStreamDependencyEventCount = 32;
+
+        /// Persistent events used only for non-timing stream-to-stream handoffs.
+        std::array<hipEvent_t, kStreamDependencyEventCount>
+            stream_dependency_events_{};
+
+        /// Per-event lease flags prevent concurrent record/wait pairs from aliasing.
+        std::array<std::atomic_flag, kStreamDependencyEventCount>
+            stream_dependency_event_in_use_{};
+
+        /// Round-robin ticket spreads simultaneous publishers across the event pool.
+        std::atomic<size_t> next_stream_dependency_event_{0};
+
         hipblasHandle_t hipblas_handle_ = nullptr;
         hipblasLtHandle_t hipblas_lt_handle_ = nullptr;
         void *rccl_comm_ = nullptr;

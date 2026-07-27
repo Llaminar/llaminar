@@ -61,4 +61,36 @@ namespace llaminar2
         return tryLoadModel(*loader, path);
     }
 
+    /**
+     * @brief Load a model using mmap policy derived from its execution device.
+     *
+     * Direct `ModelLoader` users do not have the `ModelContextConfig` boundary
+     * that normally publishes whether weights are being staged for a GPU.
+     * Declaring the target here, before `loadModel()`, prevents GPU integration
+     * fixtures from accidentally applying CPU NUMA first-touch to an entire
+     * multi-gigabyte GGUF. GPU targets instead use the demand-paged staging
+     * policy; CPU targets retain the NUMA-aware CPU policy.
+     *
+     * @param loader ModelLoader instance that has not loaded a model yet.
+     * @param path Filesystem path to the GGUF model.
+     * @param target_device Device that will consume the loaded weights.
+     * @return true on success; false when the fixture cannot be loaded.
+     */
+    inline bool tryLoadModelForDevice(
+        ModelLoader &loader,
+        const std::string &path,
+        const DeviceId target_device)
+    {
+        loader.setTargetIsGpu(target_device.is_gpu());
+        return tryLoadModel(loader, path);
+    }
+
+    inline bool tryLoadModelForDevice(
+        ModelLoader *loader,
+        const std::string &path,
+        const DeviceId target_device)
+    {
+        return tryLoadModelForDevice(*loader, path, target_device);
+    }
+
 } // namespace llaminar2

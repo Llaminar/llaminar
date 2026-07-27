@@ -20,12 +20,15 @@ from fractions import Fraction
 from unittest import mock
 from pathlib import Path
 
+import numpy as np
+
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 KERNEL_PERF_ROOT = REPO_ROOT / "tests" / "v2" / "performance" / "kernels"
 if str(KERNEL_PERF_ROOT) not in sys.path:
     sys.path.insert(0, str(KERNEL_PERF_ROOT))
 
+from native_vnni_dispatch import certification as certification_module  # noqa: E402
 from native_vnni_dispatch.certification import certify_generic_policy  # noqa: E402
 from native_vnni_dispatch import corpus as corpus_module  # noqa: E402
 from native_vnni_dispatch.candidate_observation import (  # noqa: E402
@@ -39,6 +42,7 @@ from native_vnni_dispatch.candidate_registry import (  # noqa: E402
     cpu_native_vnni_verifier_registry,
     cuda_native_vnni_gemv_registry,
     rocm_moe_grouped_prefill_registry,
+    rocm_native_vnni_decode_formula_registry,
     rocm_native_vnni_decode_registry,
 )
 from native_vnni_dispatch.compiler import (  # noqa: E402
@@ -82,9 +86,15 @@ from native_vnni_dispatch.policy_ir import (  # noqa: E402
     _normalize_policy_inventory,
     make_policy_ir,
 )
+from native_vnni_dispatch.rocm_shape_resolved import (  # noqa: E402
+    project_rocm_shape_resolved_candidates,
+    resolve_rocm_formula_kb,
+)
 from native_vnni_dispatch.policy_artifact import (  # noqa: E402
+    validate_frozen_policy_file,
     validate_installable_policy_artifact,
     write_certification_diagnostic,
+    write_frozen_policy,
     write_compiled_policy,
 )
 from native_vnni_dispatch.paired_confirmation import (  # noqa: E402
@@ -514,6 +524,28 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 0,
             )
 
+    def test_corpus_full_subset_reuses_validated_immutable_indices(self) -> None:
+        """A phase-only file must not rebuild its complete corpus indices."""
+
+        corpus = ObservationCorpus((observation(),))
+        self.assertIs(corpus.subset(lambda row: True), corpus)
+
+    def test_corpus_proper_subset_preserves_runtime_visibility(self) -> None:
+        """A real subset rebuilds indices without changing key semantics."""
+
+        first = observation(shape_group="first", shape_name="first")
+        second = observation(shape_group="second", shape_name="second")
+        corpus = ObservationCorpus(
+            (first, second),
+            distinguish_execution_mode=False,
+            distinguish_aspect_bucket=False,
+        )
+        selected = corpus.subset(lambda row: row.shape_name == "first")
+
+        self.assertEqual(selected.observations, (first,))
+        self.assertFalse(selected.distinguishes_execution_mode)
+        self.assertFalse(selected.distinguishes_aspect_bucket)
+
     def test_parallel_corpus_digest_preserves_legacy_bytes_and_is_memoized(
         self,
     ) -> None:
@@ -571,6 +603,28 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             corpus.digest()
         executor.assert_not_called()
 
+    def test_parallel_corpus_digest_reuses_one_process_pool(self) -> None:
+        """Serialization, partitioning, and merge share one fork lifetime."""
+
+        corpus = ObservationCorpus((observation(),) * 8192)
+        real_executor = corpus_module.ProcessPoolExecutor
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "2"},
+            ),
+            mock.patch.object(
+                corpus_module,
+                "ProcessPoolExecutor",
+                side_effect=lambda *args, **kwargs: real_executor(
+                    *args, **kwargs
+                ),
+            ) as executor_factory,
+        ):
+            corpus.digest()
+
+        self.assertEqual(executor_factory.call_count, 1)
+
     def test_parallel_corpus_digest_preserves_collapsed_prefix_order(self) -> None:
         """Mode/aspect visibility markers retain their historical hash order."""
 
@@ -591,6 +645,32 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             + "]"
         ).encode()
         expected = "sha256:" + hashlib.sha256(historical_bytes).hexdigest()
+
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "2"},
+        ):
+            self.assertEqual(corpus.digest(), expected)
+
+    def test_parallel_corpus_digest_range_merge_preserves_global_order(self) -> None:
+        """Disjoint merge buckets must reproduce one monolithic lexical sort."""
+
+        exemplars = tuple(
+            observation(
+                shape_group=f"digest-shape-{index}",
+                shape_name=f"digest-shape-{index}",
+            )
+            for index in range(8)
+        )
+        rows = tuple(exemplars[index % len(exemplars)] for index in range(8192))
+        corpus = ObservationCorpus(rows)
+        expected = "sha256:" + hashlib.sha256(
+            (
+                "["
+                + ",".join(sorted(row._cached_canonical_json for row in rows))
+                + "]"
+            ).encode()
+        ).hexdigest()
 
         with mock.patch.dict(
             os.environ,
@@ -700,6 +780,95 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 parallel = segmented_policy._load_cached_costs_parallel(
                     cache, tasks
                 )
+
+        self.assertEqual(parallel, serial)
+
+    def test_parallel_candidate_cost_builds_match_serial_generation(self) -> None:
+        """Independent domain builders preserve canonical regret row order."""
+
+        exemplars = tuple(
+            observation(
+                source_format=source_format,
+                shape_group=f"parallel-cost-{index}",
+            )
+            for index, source_format in enumerate(
+                ("Q4_0", "Q5_0", "Q8_0", "IQ4_NL")
+            )
+        )
+        corpus = ObservationCorpus(tuple(
+            row for exemplar in exemplars for row in (exemplar,) * 1024
+        )).with_collapsed_aspect_domains()
+        domains = corpus.generic_domains()
+        domain_corpora = {domain: corpus for domain in domains}
+
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            serial = segmented_policy._build_domain_candidate_costs_parallel(
+                domain_corpora,
+                domains,
+                serial_m1_hashes=None,
+                paired_comparisons=None,
+                supplemental_costs={},
+            )
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "4"},
+        ):
+            parallel = segmented_policy._build_domain_candidate_costs_parallel(
+                domain_corpora,
+                domains,
+                serial_m1_hashes=None,
+                paired_comparisons=None,
+                supplemental_costs={},
+            )
+
+        self.assertEqual(parallel, serial)
+
+    def test_parallel_profiler_prediction_requests_match_serial_generation(
+        self,
+    ) -> None:
+        """Independent fold inventories preserve every prediction point."""
+
+        corpus = ObservationCorpus(tuple(
+            observation(
+                source_format=source_format,
+                shape_group=f"prediction-request-{format_index}-{shape_index}",
+                n=256 * (shape_index + 1),
+            )
+            for format_index, source_format in enumerate(
+                ("Q4_0", "Q5_0", "Q8_0", "IQ4_NL")
+            )
+            for shape_index in range(5)
+        )).with_collapsed_aspect_domains()
+        costs = build_candidate_point_costs(corpus)
+        domains = corpus.generic_domains()
+
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            serial = (
+                segmented_policy
+                ._build_domain_profiler_prediction_requests_parallel(
+                    domains,
+                    costs,
+                    seed="parallel-profiler-request-test",
+                )
+            )
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "4"},
+        ):
+            parallel = (
+                segmented_policy
+                ._build_domain_profiler_prediction_requests_parallel(
+                    domains,
+                    costs,
+                    seed="parallel-profiler-request-test",
+                )
+            )
 
         self.assertEqual(parallel, serial)
 
@@ -1753,7 +1922,7 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             ),
             4,
         )
-        self.assertEqual(len(cpu_prefill.entries), 13)
+        self.assertEqual(len(cpu_prefill.entries), 12)
         self.assertEqual(
             cpu_prefill.entries[0].candidate_id,
             "cpu.nvnni.prefill.row_chunk_grid.full_k",
@@ -1768,6 +1937,15 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 for entry in cpu_prefill.entries
             ),
             5,
+        )
+        self.assertEqual(
+            {
+                entry.config_json["n_block_chunks"]
+                for entry in cpu_prefill.entries
+                if entry.config_json.get("route")
+                == "two_row_full_output_tiles"
+            },
+            {1, 2, 4, 8},
         )
         self.assertEqual(len(cuda.entries), 4495)
         self.assertEqual(
@@ -1965,6 +2143,133 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertIs(formulas[0].config_json, formulas[1].config_json)
         for row in formulas:
             row.validate()
+
+    def test_shape_clamped_rocm_formula_uses_concrete_measured_evidence(self) -> None:
+        """Generic requested KB must resolve to the launch ROCm actually runs."""
+
+        physical = rocm_native_vnni_decode_registry().resolve(
+            "rocm.nvnni.decode.fast.kb8"
+        )
+        concrete = dataclasses.replace(
+            observation(
+                candidate=physical.candidate_id,
+                family=physical.candidate_family,
+                n=192,
+                k=256,
+                m=1,
+                mode=ExecutionMode.GRAPH_CAPTURED,
+                contract=SemanticContract.FAST,
+            ),
+            config_json=physical.config_json,
+            arithmetic_fingerprint=physical.arithmetic_fingerprint,
+            candidate_policy_hash=physical.candidate_policy_hash(),
+            observed_candidate_id=physical.candidate_id,
+        )
+        projected = project_rocm_shape_resolved_candidates(
+            (concrete,),
+            distinguish_execution_mode=False,
+        )
+        self.assertFalse(projected.distinguishes_execution_mode)
+        formula = rocm_native_vnni_decode_formula_registry().resolve(
+            "rocm.nvnni.decode.fast.clamped_formula.kb64"
+        )
+        formula_rows = tuple(
+            row for row in projected if row.candidate_id == formula.candidate_id
+        )
+
+        self.assertEqual(resolve_rocm_formula_kb(formula, 256), 8)
+        self.assertEqual(len(formula_rows), 1)
+        self.assertEqual(
+            formula_rows[0].effective_candidate_id,
+            physical.candidate_id,
+        )
+        self.assertEqual(
+            formula_rows[0].timing_sample_hash,
+            concrete.timing_sample_hash,
+        )
+        self.assertFalse(projected.observations[0].generic_eligible)
+        for row in projected:
+            row.validate()
+        self.assertEqual(
+            next(iter(build_exact_winners(projected).values())).candidate_id,
+            physical.candidate_id,
+        )
+
+        formula_row = formula_rows[0]
+        rule = GenericDispatchRule(
+            domain=projected.generic_domain_for(formula_row),
+            predicates=(),
+            candidate_id=formula.candidate_id,
+            arithmetic_fingerprint=formula.arithmetic_fingerprint,
+            development_shape_groups=(formula_row.shape_group_id,),
+            development_max_regret=0.0,
+            development_p95_regret=0.0,
+            development_mean_regret=0.0,
+        )
+        policy = make_policy_ir(
+            build_exact_winners(projected),
+            GenericPolicy(rules=(rule,), unpromoted_domains=()),
+            metadata={"test": "ROCm formula sealed certification"},
+        )
+
+        report = certify_generic_policy(policy, projected)
+
+        self.assertEqual(report.covered_cell_count, 1)
+        self.assertEqual(report.unexercised_rule_count, 0)
+        self.assertEqual(
+            report.cells[0].selected_candidate_id,
+            formula.candidate_id,
+        )
+        self.assertEqual(report.cells[0].exact_candidate_id, physical.candidate_id)
+        self.assertEqual(report.cells[0].observed_worst_surface_regret, 0.0)
+
+    def test_rocm_formula_projection_is_candidate_total_across_k_sizes(self) -> None:
+        """Every requested-KB policy must have evidence at small and large K."""
+
+        physical_registry = rocm_native_vnni_decode_registry()
+        rows = []
+        for shape_group, n, k, maximum_kb in (
+            ("small-k", 192, 256, 8),
+            ("large-k", 1536, 2048, 64),
+        ):
+            for kb in range(1, maximum_kb + 1):
+                physical = physical_registry.resolve(
+                    f"rocm.nvnni.decode.fast.kb{kb}"
+                )
+                rows.append(dataclasses.replace(
+                    observation(
+                        candidate=physical.candidate_id,
+                        family=physical.candidate_family,
+                        shape_group=shape_group,
+                        shape_name=shape_group,
+                        n=n,
+                        k=k,
+                        m=1,
+                        contract=SemanticContract.FAST,
+                    ),
+                    config_json=physical.config_json,
+                    arithmetic_fingerprint=physical.arithmetic_fingerprint,
+                    candidate_policy_hash=physical.candidate_policy_hash(),
+                    observed_candidate_id=physical.candidate_id,
+                ))
+        projected = project_rocm_shape_resolved_candidates(rows)
+        costs = build_candidate_point_costs(projected)
+        expected = {
+            candidate.candidate_id
+            for candidate in rocm_native_vnni_decode_formula_registry().entries
+        }
+
+        self.assertEqual(len(costs), 1)
+        point_candidates = {
+            (cost.runtime_key, cost.shape_group_id): set()
+            for cost in next(iter(costs.values()))
+        }
+        for cost in next(iter(costs.values())):
+            point_candidates[(cost.runtime_key, cost.shape_group_id)].add(
+                cost.candidate_id
+            )
+        self.assertEqual(len(point_candidates), 2)
+        self.assertTrue(all(ids == expected for ids in point_candidates.values()))
 
     @staticmethod
     def rocm_moe_raw_row(**overrides) -> dict[str, str]:
@@ -2217,6 +2522,130 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             by_mode[ExecutionMode.GRAPH_CAPTURED].candidate_id,
             "candidate.captured",
         )
+
+    def test_certification_uses_mode_collapsed_runtime_key_for_exact_oracle(
+        self,
+    ) -> None:
+        """A mode-robust ABI must certify both physical launch surfaces."""
+
+        development_rows = []
+        for group_index, n in enumerate((256, 384, 448)):
+            for mode in (ExecutionMode.EAGER, ExecutionMode.GRAPH_CAPTURED):
+                development_rows.extend((
+                    observation(
+                        candidate="candidate.robust",
+                        shape_group=f"dev-{group_index}",
+                        shape_name=f"dev-{group_index}",
+                        n=n,
+                        mode=mode,
+                        latency_us=10.0,
+                    ),
+                    observation(
+                        candidate="candidate.slow",
+                        shape_group=f"dev-{group_index}",
+                        shape_name=f"dev-{group_index}",
+                        n=n,
+                        mode=mode,
+                        latency_us=12.0,
+                    ),
+                ))
+        development = ObservationCorpus(
+            development_rows,
+            distinguish_execution_mode=False,
+        )
+        generic = fit_generic_policy(development, max_leaves=1)
+        policy = make_policy_ir(
+            build_exact_winners(development),
+            generic,
+            metadata={"test": "mode-collapsed certification"},
+        )
+        sealed = ObservationCorpus(
+            tuple(
+                observation(
+                    candidate=candidate,
+                    shape_group="sealed",
+                    shape_name="sealed",
+                    n=512,
+                    mode=mode,
+                    latency_us=latency,
+                )
+                for mode in (
+                    ExecutionMode.EAGER,
+                    ExecutionMode.GRAPH_CAPTURED,
+                )
+                for candidate, latency in (
+                    ("candidate.robust", 10.0),
+                    ("candidate.slow", 12.0),
+                )
+            ),
+            distinguish_execution_mode=False,
+        )
+
+        report = certify_generic_policy(policy, sealed)
+
+        self.assertEqual(report.covered_cell_count, 1)
+        self.assertEqual(report.cells[0].execution_mode_count, 2)
+        self.assertEqual(report.cells[0].exact_candidate_id, "candidate.robust")
+
+    def test_parallel_certification_matches_serial_point_order(self) -> None:
+        """Physical-core cell reduction must preserve certificate bytes."""
+
+        development = ObservationCorpus(tuple(
+            observation(
+                candidate=candidate,
+                family=candidate,
+                shape_group=f"cert-dev-{index}",
+                shape_name=f"cert-dev-{index}",
+                n=256 + index * 32,
+                latency_us=latency,
+            )
+            for index in range(6)
+            for candidate, latency in (
+                ("candidate.fast", 10.0),
+                ("candidate.slow", 12.0),
+            )
+        ))
+        policy = make_policy_ir(
+            build_exact_winners(development),
+            fit_generic_policy(development, max_leaves=1),
+            metadata={"test": "parallel sealed certification"},
+        )
+        sealed = ObservationCorpus(tuple(
+            observation(
+                candidate=candidate,
+                family=candidate,
+                shape_group=f"cert-sealed-{index}",
+                shape_name=f"cert-sealed-{index}",
+                n=512 + index * 32,
+                latency_us=latency,
+            )
+            for index in range(12)
+            for candidate, latency in (
+                ("candidate.fast", 10.0),
+                ("candidate.slow", 12.0),
+            )
+        ))
+
+        with mock.patch.object(
+            certification_module,
+            "_physical_core_count",
+            return_value=2,
+        ), mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_CERTIFICATION_WORKERS": "1"},
+        ):
+            serial = certify_generic_policy(policy, sealed)
+        with mock.patch.object(
+            certification_module,
+            "_physical_core_count",
+            return_value=2,
+        ), mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_CERTIFICATION_WORKERS": "2"},
+        ):
+            parallel = certify_generic_policy(policy, sealed)
+
+        self.assertEqual(parallel, serial)
 
     def test_parallel_exact_winners_match_serial_runtime_key_order(self) -> None:
         """Physical-core reduction must preserve exact policy bytes and order."""
@@ -2553,6 +2982,123 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 1,
                 minimum_passing_fraction=1.01,
             )
+
+    def test_freeze_counts_structural_domain_without_cross_validation(self) -> None:
+        """A missing CV result remains one rejected domain, never a negative count."""
+
+        development = ObservationCorpus([
+            observation(candidate="candidate.a"),
+            observation(candidate="candidate.b", latency_us=11.0),
+        ])
+        structural_policy = fit_generic_policy(development)
+        self.assertFalse(structural_policy.cross_validation)
+        self.assertEqual(len(structural_policy.promotion_diagnostics), 1)
+        self.assertEqual(
+            structural_policy.promotion_diagnostics[0].rejection_stage,
+            "cross_validation_missing",
+        )
+
+        with mock.patch(
+            "native_vnni_dispatch.compiler.fit_generic_policy",
+            return_value=structural_policy,
+        ), mock.patch(
+            "native_vnni_dispatch.compiler.MINIMUM_PASSING_DOMAIN_FRACTION",
+            0.0,
+        ):
+            frozen = freeze_policy(
+                development,
+                sealed_commitment="sha256:sealed-shape-inventory",
+                split_manifest_digest="sha256:split-manifest",
+            )
+
+        self.assertEqual(
+            frozen.policy_ir.metadata["development_required_domain_count"],
+            1,
+        )
+        self.assertEqual(
+            frozen.policy_ir.metadata["development_passing_domain_count"],
+            0,
+        )
+        self.assertEqual(
+            frozen.policy_ir.metadata["development_passing_domain_fraction"],
+            0.0,
+        )
+        self.assertTrue(
+            frozen.policy_ir.metadata[
+                "development_domain_promotion_quota_satisfied"
+            ]
+        )
+        self.assertEqual(len(frozen.policy_ir.unpromoted_domains), 1)
+
+    def test_zero_quota_freezes_complete_over_budget_domain(self) -> None:
+        """A performance exception keeps its real tree and explicit diagnostic."""
+
+        rows = []
+        for index in range(6):
+            a_is_fast = index < 3
+            rows.extend((
+                observation(
+                    candidate="candidate.a",
+                    family="a",
+                    shape_group=f"best-effort-{index}",
+                    n=512 + 64 * index,
+                    latency_us=1.0 if a_is_fast else 2.0,
+                ),
+                observation(
+                    candidate="candidate.b",
+                    family="b",
+                    shape_group=f"best-effort-{index}",
+                    n=512 + 64 * index,
+                    latency_us=2.0 if a_is_fast else 1.0,
+                ),
+            ))
+        development = ObservationCorpus(rows)
+        quota = segmented_policy.domain_promotion_quota_is_satisfied
+        with mock.patch.object(
+            segmented_policy,
+            "domain_promotion_quota_is_satisfied",
+            side_effect=lambda passing, required: quota(
+                passing,
+                required,
+                minimum_passing_fraction=0.0,
+            ),
+        ):
+            performance_policy = fit_generic_policy(
+                development,
+                max_leaves=1,
+            )
+        self.assertFalse(performance_policy.unpromoted_domains)
+        self.assertEqual(len(performance_policy.promotion_diagnostics), 1)
+        self.assertTrue(performance_policy.rules)
+
+        with mock.patch(
+            "native_vnni_dispatch.compiler.fit_generic_policy",
+            return_value=performance_policy,
+        ), mock.patch(
+            "native_vnni_dispatch.compiler.MINIMUM_PASSING_DOMAIN_FRACTION",
+            0.0,
+        ):
+            frozen = freeze_policy(
+                development,
+                sealed_commitment="sha256:sealed-shape-inventory",
+                split_manifest_digest="sha256:split-manifest",
+            )
+
+        self.assertEqual(
+            frozen.policy_ir.metadata["development_required_domain_count"],
+            1,
+        )
+        self.assertEqual(
+            frozen.policy_ir.metadata["development_passing_domain_count"],
+            0,
+        )
+        self.assertTrue(
+            frozen.policy_ir.metadata[
+                "development_domain_promotion_quota_satisfied"
+            ]
+        )
+        self.assertFalse(frozen.policy_ir.unpromoted_domains)
+        self.assertEqual(len(frozen.promotion_diagnostics), 1)
 
     def test_promotion_percent_environment_is_parsed_in_one_common_module(self) -> None:
         """Every analyzer process must observe identical manual criteria."""
@@ -3741,6 +4287,99 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                     )
                 self.assertEqual(cached_fit, paired_fit)
 
+    def test_larger_leaf_budget_refits_only_unpromoted_domains(self) -> None:
+        """A split expansion must retain already-promotable one-leaf domains."""
+
+        rows = []
+        for mode in (ExecutionMode.EAGER, ExecutionMode.GRAPH_CAPTURED):
+            for index, n in enumerate((128, 160, 192, 288, 320, 384)):
+                split_domain = mode == ExecutionMode.GRAPH_CAPTURED
+                lower = n < 240
+                rows.extend([
+                    observation(
+                        backend=Backend.CUDA,
+                        contract=SemanticContract.FAST,
+                        m=1,
+                        mode=mode,
+                        candidate="candidate.low",
+                        family="low",
+                        shape_group=f"leaf-cache-{mode.value}-{index}",
+                        n=n,
+                        latency_us=(
+                            10.0
+                            if not split_domain or lower
+                            else 20.0
+                        ),
+                    ),
+                    observation(
+                        backend=Backend.CUDA,
+                        contract=SemanticContract.FAST,
+                        m=1,
+                        mode=mode,
+                        candidate="candidate.high",
+                        family="high",
+                        shape_group=f"leaf-cache-{mode.value}-{index}",
+                        n=n,
+                        latency_us=(
+                            11.0
+                            if not split_domain
+                            else (20.0 if lower else 10.0)
+                        ),
+                    ),
+                ])
+        corpus = ObservationCorpus(rows)
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            cache = PolicyFitCache(Path(directory))
+            one_leaf = fit_generic_policy(
+                corpus,
+                max_leaves=1,
+                fit_cache=cache,
+            )
+            self.assertEqual(
+                {domain.execution_mode for domain in one_leaf.unpromoted_domains},
+                {ExecutionMode.GRAPH_CAPTURED},
+            )
+
+            evaluated_domains = []
+            original = segmented_policy._evaluate_placement_fold
+
+            def record_domain(task, primary_scorer=None):
+                evaluated_domains.append(task[0])
+                return original(task, primary_scorer)
+
+            with mock.patch.object(
+                segmented_policy,
+                "_evaluate_placement_fold",
+                side_effect=record_domain,
+            ):
+                two_leaf = fit_generic_policy(
+                    corpus,
+                    max_leaves=2,
+                    fit_cache=cache,
+                )
+
+        self.assertTrue(evaluated_domains)
+        self.assertEqual(
+            {domain.execution_mode for domain in evaluated_domains},
+            {ExecutionMode.GRAPH_CAPTURED},
+        )
+        self.assertFalse(two_leaf.unpromoted_domains)
+        self.assertEqual(
+            {
+                validation.domain.execution_mode:
+                validation.selected_max_leaves
+                for validation in two_leaf.cross_validation
+            },
+            {
+                ExecutionMode.EAGER: 1,
+                ExecutionMode.GRAPH_CAPTURED: 2,
+            },
+        )
+
     def test_current_fit_cache_miss_never_hashes_full_profiler_provenance(
         self,
     ) -> None:
@@ -4338,6 +4977,18 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                     requested_workers=1,
                 )
             )
+            for request_index, request_key in enumerate(request_keys):
+                points = prediction_points[request_key]
+                cache.store_profiler_predictions(
+                    serial_keys[request_key],
+                    training_pool_digest=training_digests[pool_key],
+                    profiler_model_digest=model_digests[pool_key],
+                    held_out_geometries=request_key[1],
+                    predictions={
+                        point: float(request_index) for point in points
+                    },
+                    prediction_points=points,
+                )
             with mock.patch.object(
                 segmented_policy,
                 "_physical_core_worker_count",
@@ -4359,9 +5010,86 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertEqual(serial_workers, 1)
         self.assertEqual(parallel_workers, 2)
         self.assertEqual(serial_hits, 0)
-        self.assertEqual(parallel_hits, 0)
+        self.assertEqual(parallel_hits, len(request_keys))
         self.assertEqual(parallel_keys, serial_keys)
-        self.assertEqual(parallel_cache, serial_cache)
+        self.assertEqual(len(parallel_cache), len(request_keys))
+        for request_index, request_key in enumerate(request_keys):
+            point = next(iter(prediction_points[request_key]))
+            self.assertEqual(
+                parallel_cache[request_key][point],
+                float(request_index),
+            )
+
+    def test_memmap_teacher_totality_is_vectorized_and_exact(self) -> None:
+        """Batched memmap checks reject missing and non-finite predictions."""
+
+        runtime = runtime_key(observation())
+        costs = [
+            segmented_policy.CandidatePointCost(
+                runtime_key=runtime,
+                shape_group_id=f"teacher-shape-{index}",
+                candidate_id=f"teacher-candidate-{index}",
+                max_surface_regret=0.0,
+                p95_surface_regret=0.0,
+                mean_surface_regret=0.0,
+            )
+            for index in range(3)
+        ]
+        points = frozenset(
+            (cost.runtime_key, cost.shape_group_id, cost.candidate_id)
+            for cost in costs
+        )
+        inventory = segmented_policy._profiler_prediction_point_inventory(
+            points
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            finite_path = directory_path / "finite.f64"
+            np.asarray(
+                [1.0] * len(inventory.points), dtype="<f8"
+            ).tofile(finite_path)
+            finite = segmented_policy.ProfilerPredictionSurface(
+                inventory, finite_path
+            )
+
+            nonfinite_path = directory_path / "nonfinite.f64"
+            nonfinite_values = np.asarray(
+                [1.0] * len(inventory.points), dtype="<f8"
+            )
+            nonfinite_values[1] = np.nan
+            nonfinite_values.tofile(nonfinite_path)
+            nonfinite = segmented_policy.ProfilerPredictionSurface(
+                inventory, nonfinite_path
+            )
+
+            missing_inventory = (
+                segmented_policy._profiler_prediction_point_inventory(
+                    frozenset(tuple(points)[:-1])
+                )
+            )
+            missing_path = directory_path / "missing.f64"
+            np.asarray(
+                [1.0] * len(missing_inventory.points), dtype="<f8"
+            ).tofile(missing_path)
+            missing = segmented_policy.ProfilerPredictionSurface(
+                missing_inventory, missing_path
+            )
+
+            self.assertTrue(
+                segmented_policy._profiler_teacher_surface_is_complete(
+                    costs, finite
+                )
+            )
+            self.assertFalse(
+                segmented_policy._profiler_teacher_surface_is_complete(
+                    costs, nonfinite
+                )
+            )
+            self.assertFalse(
+                segmented_policy._profiler_teacher_surface_is_complete(
+                    costs, missing
+                )
+            )
 
     def test_fit_cache_shares_cv_identity_between_planning_and_publication(self) -> None:
         """Publication is a derivative of planning CV, not a second search."""
@@ -5236,6 +5964,46 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertEqual(report.rule_coverage[0].sealed_hit_count, 1)
         with self.assertRaisesRegex(ValueError, "not promotable"):
             report.require_promotable()
+
+    def test_frozen_policy_mismatch_reports_first_canonical_difference(self) -> None:
+        """A stale pre-seal artifact must identify why reconstruction changed."""
+
+        development = ObservationCorpus([
+            observation(candidate="candidate.fast", shape_group="dev-a", n=256),
+            observation(candidate="candidate.slow", shape_group="dev-a", n=256,
+                        latency_us=12.0),
+            observation(candidate="candidate.fast", shape_group="dev-b", n=384),
+            observation(candidate="candidate.slow", shape_group="dev-b", n=384,
+                        latency_us=12.0),
+            observation(candidate="candidate.fast", shape_group="dev-c", n=448),
+            observation(candidate="candidate.slow", shape_group="dev-c", n=448,
+                        latency_us=12.0),
+        ])
+        frozen = freeze_policy(
+            development,
+            sealed_commitment="sha256:sealed",
+            split_manifest_digest="sha256:split",
+            metadata={"generation": "original"},
+        )
+        reconstructed = dataclasses.replace(
+            frozen,
+            policy_ir=dataclasses.replace(
+                frozen.policy_ir,
+                metadata={
+                    **frozen.policy_ir.metadata,
+                    "generation": "reconstructed",
+                },
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frozen.json"
+            write_frozen_policy(path, frozen)
+            with self.assertRaisesRegex(
+                ValueError,
+                r"persisted_policy_digest=.*reconstructed_policy_digest=.*"
+                r"first_difference=\$\.policy\.metadata\.generation",
+            ):
+                validate_frozen_policy_file(path, reconstructed)
 
     def test_failed_certificate_writes_noninstallable_rule_diagnostics(self) -> None:
         """A failed generic fit must retain cells without becoming publishable."""

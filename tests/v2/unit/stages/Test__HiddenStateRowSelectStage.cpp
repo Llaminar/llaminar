@@ -2,9 +2,10 @@
  * @file Test__HiddenStateRowSelectStage.cpp
  * @brief Unit tests for bucketed-prefill hidden-state row selection.
  *
- * Verifies that dynamic PrefillReplayParams select the expected hidden-state row
- * on CPU and that LMHeadStage can consume the stable one-row scratch at GEMM
- * activation offset zero while the selected source row changes.
+ * Verifies both row-ownership policies: dynamic PrefillReplayParams select the
+ * expected hidden-state row, while graph-fixed checkpoints reject replay
+ * mutation and declare no GPU metadata workspace. LMHeadStage also consumes
+ * the stable one-row scratch at GEMM activation offset zero.
  */
 
 #include <gtest/gtest.h>
@@ -217,6 +218,112 @@ TEST(Test__HiddenStateRowSelectStage, CPUReplayParamsChangeSelectedRow)
     {
         EXPECT_FLOAT_EQ(scratch->data()[column], hidden->data()[static_cast<size_t>(3) * d_model + column]);
     }
+}
+
+/**
+ * @brief Prove fixed checkpoint rows cannot acquire mutable replay state.
+ *
+ * A diagnostic checkpoint's row is part of its graph geometry. Updating
+ * PrefillReplayParams must therefore leave the row unchanged, and GPU versions
+ * must not declare the device scalar used by dynamic bucket replay.
+ */
+TEST(Test__HiddenStateRowSelectStage, FixedDeviceRowHasNoReplayOrScalarWorkspace)
+{
+    const int seq_len = 6;
+    const int d_model = 8;
+    auto hidden = makeHiddenStates(seq_len, d_model);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+
+    HiddenStateRowSelectStage::Params cpu_params;
+    cpu_params.device_id = DeviceId::cpu();
+    cpu_params.input = hidden.get();
+    cpu_params.output = scratch.get();
+    cpu_params.seq_len = seq_len;
+    cpu_params.d_model = d_model;
+    cpu_params.selected_row_idx = 4;
+    cpu_params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow;
+
+    HiddenStateRowSelectStage cpu_stage(cpu_params);
+    EXPECT_FALSE(cpu_stage.hasPrefillReplayParams());
+    cpu_stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{
+        /*real_seq_len=*/2,
+        /*bucket_seq_len=*/seq_len,
+        /*token_offset=*/0});
+    EXPECT_EQ(cpu_stage.selectedRowForTesting(), 4);
+    ASSERT_TRUE(cpu_stage.execute(nullptr));
+    for (int column = 0; column < d_model; ++column)
+    {
+        EXPECT_FLOAT_EQ(
+            scratch->data()[column],
+            hidden->data()[static_cast<size_t>(4) * d_model + column]);
+    }
+
+    HiddenStateRowSelectStage::Params gpu_params;
+    gpu_params.device_id = DeviceId::rocm(0);
+    gpu_params.seq_len = seq_len;
+    gpu_params.d_model = d_model;
+    gpu_params.selected_row_idx = 4;
+    gpu_params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow;
+
+    HiddenStateRowSelectStage gpu_stage(gpu_params);
+    EXPECT_FALSE(gpu_stage.hasPrefillReplayParams());
+    EXPECT_FALSE(gpu_stage.needsGraphLaunchPreparation());
+    EXPECT_TRUE(
+        gpu_stage.getWorkspaceRequirements(seq_len, d_model, 0)
+            .buffers.empty());
+}
+
+/**
+ * @brief Prove resident request lengths bypass every host replay mechanism.
+ *
+ * The pointer is deliberately an opaque non-null sentinel because unit tests
+ * must not perform GPU work. Construction-time policy is the behavior under
+ * test: no mutable replay parameters, no graph-launch upload hook, and no
+ * selected-row workspace may be declared.
+ */
+TEST(Test__HiddenStateRowSelectStage, DeviceResidentRequestLengthHasNoHostReplayState)
+{
+    constexpr uintptr_t kOpaqueDeviceAddress = 0x1000;
+    const auto *request_length_device =
+        reinterpret_cast<const int32_t *>(kOpaqueDeviceAddress);
+
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = 512;
+    params.d_model = 2048;
+    params.selected_row_idx = 511;
+    params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::
+            DeviceResidentRequestLength;
+    params.request_sequence_length_device = request_length_device;
+
+    HiddenStateRowSelectStage stage(params);
+    EXPECT_EQ(
+        stage.selectionPolicyForTesting(),
+        HiddenStateRowSelectStage::SelectionPolicy::
+            DeviceResidentRequestLength);
+    EXPECT_EQ(
+        stage.requestSequenceLengthDeviceForTesting(),
+        request_length_device);
+    EXPECT_FALSE(stage.hasPrefillReplayParams());
+    EXPECT_FALSE(stage.needsGraphLaunchPreparation());
+    EXPECT_TRUE(
+        stage.getWorkspaceRequirements(
+                 params.seq_len,
+                 params.d_model,
+                 0)
+            .buffers.empty());
+
+    stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{
+        /*real_seq_len=*/443,
+        /*bucket_seq_len=*/512,
+        /*token_offset=*/0});
+    EXPECT_EQ(stage.selectedRowForTesting(), 511)
+        << "Resident metadata, not a host replay setter, owns the row";
 }
 
 TEST(Test__HiddenStateRowSelectStage, GPUWorkspaceRequirementsDeclareSelectedRowScalar)

@@ -108,29 +108,4 @@ extern "C"
         return hipGetLastError();
     }
 
-    /**
-     * Allocate device memory and set active device (for FP16 scratch buffers).
-     * @param buf     Output pointer to allocated memory
-     * @param bytes   Bytes to allocate
-     * @param ordinal GPU device ordinal
-     * @return hipSuccess on success
-     */
-    int rocmFP16ScratchAlloc(void **buf, size_t bytes, int ordinal)
-    {
-        hipError_t err = hipSetDevice(ordinal);
-        if (err != hipSuccess) return static_cast<int>(err);
-        return static_cast<int>(hipMalloc(buf, bytes));
-    }
-
-    /**
-     * Free device memory on specified device.
-     * @param buf     Pointer to free
-     * @param ordinal GPU device ordinal
-     */
-    void rocmFP16ScratchFree(void *buf, int ordinal)
-    {
-        (void)hipSetDevice(ordinal);
-        (void)hipFree(buf);
-    }
-
 }

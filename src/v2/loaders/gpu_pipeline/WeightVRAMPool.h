@@ -95,6 +95,19 @@ namespace llaminar2
         /// Maximum bytes per staging slot.
         size_t maxStagingSlotBytes() const;
 
+        /**
+         * @brief Physical byte stride between adjacent device staging slots.
+         *
+         * The logical slot capacity returned by maxStagingSlotBytes() is kept
+         * within the caller's bounded staging budget. The physical stride may
+         * be slightly larger because every GPU repack source must begin at a
+         * naturally aligned address, even when the configured budget divided
+         * by the lane count produces an odd capacity.
+         *
+         * @return Aligned device byte stride, or zero when staging is absent.
+         */
+        size_t stagingSlotStrideBytes() const;
+
     private:
         static constexpr size_t kAlignment = 256;
 
@@ -122,6 +135,7 @@ namespace llaminar2
         size_t staging_region_bytes_ = 0;
         int staging_slot_count_ = 0;
         size_t max_staging_slot_bytes_ = 0;
+        size_t staging_slot_stride_bytes_ = 0;
         IBackend *backend_ = nullptr;
         int device_id_ = -1;
         bool allocated_ = false;

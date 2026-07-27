@@ -234,6 +234,117 @@ class ROCmNativeVNNIDecodeTrainerTest(unittest.TestCase):
             result.stderr,
         )
 
+    def test_generic_leaf_budget_must_be_positive(self) -> None:
+        """ROCm tree segmentation must remain an explicit bounded choice."""
+
+        result, _, _ = self.run_analyzer(
+            [self.row("KB32", "eager", 20.0)],
+            "--generic-max-leaves",
+            "0",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "--generic-max-leaves must be in [1, 32]",
+            result.stderr,
+        )
+
+    def test_sealed_provenance_overrides_are_atomic(self) -> None:
+        """A fresh seal cannot inherit only part of a retained build identity."""
+
+        result, _, _ = self.run_analyzer(
+            [self.row("KB32", "eager", 20.0)],
+            "--profile",
+            "production",
+            "--certify-generic",
+            "--sealed-run-id",
+            "fresh-seal",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "sealed provenance overrides must be supplied together",
+            result.stderr,
+        )
+
+    def test_reused_development_audit_is_part_of_frozen_metadata(self) -> None:
+        """Harness-only rebuild authorization survives freeze reconstruction."""
+
+        source = ANALYZER.read_text(encoding="utf-8")
+        self.assertIn('metadata["development_build_change_audit"]', source)
+        self.assertGreaterEqual(
+            source.count("args.development_build_change_audit"),
+            4,
+        )
+        self.assertIn("--fit-cache-dir", source)
+        self.assertIn("PolicyFitCache(directory=fit_cache_directory)", source)
+        self.assertIn("sealed=True", source)
+
+    def test_profiler_only_launch_skips_paid_timing_and_d2h_work(self) -> None:
+        """Each rocprof pass pays only fixed preconditioning plus its target."""
+
+        source = TRAINER_SOURCE.read_text(encoding="utf-8")
+        profiler_branch = source.index('if (!profiler_request_id.empty())')
+        correctness_download = source.index(
+            "std::vector<float> first_output;",
+            profiler_branch,
+        )
+        timed_samples = source.index(
+            "result.timing_samples_us.reserve",
+            correctness_download,
+        )
+
+        self.assertLess(profiler_branch, correctness_download)
+        self.assertLess(correctness_download, timed_samples)
+        isolated = source[profiler_branch:correctness_download]
+        self.assertIn("kProfilerPreconditioningLaunches = 2", isolated)
+        self.assertIn("result.isolated_profile_launches = 1", isolated)
+        self.assertIn("result.valid = true;", isolated)
+        self.assertIn("return result;", isolated)
+        self.assertNotIn("copyTrainerOutputToHost", isolated)
+        self.assertNotIn("hipEventCreate", isolated)
+
+    def test_profiler_batch_lifetime_matches_validated_rocm_boundary(self) -> None:
+        """The trainer must reject a plan before rocprofiler corrupts HSA state."""
+
+        source = TRAINER_SOURCE.read_text(encoding="utf-8")
+        self.assertIn(
+            "static constexpr size_t kMaximumRequestsPerProcess = 256;",
+            source,
+        )
+        self.assertIn(
+            "static constexpr size_t kMaximumGraphRequestsPerProcess = 256;",
+            source,
+        )
+        self.assertNotIn(
+            "static constexpr size_t kMaximumRequestsPerProcess = 512;",
+            source,
+        )
+
+    def test_profiler_only_weight_fixture_avoids_full_matrix_rng(self) -> None:
+        """Profiler replay preserves source bytes without regenerating N*K values."""
+
+        source = TRAINER_SOURCE.read_text(encoding="utf-8")
+        helper_start = source.index(
+            "static std::unique_ptr<TensorBase> makeProfilerWeightFixture("
+        )
+        helper_end = source.index("using GEMVShape", helper_start)
+        helper = source[helper_start:helper_end]
+        trainer_start = source.index(
+            "TEST_F(NativeVNNIPerfTest, TrainerCsv_CodebookTagged)"
+        )
+        trainer = source[trainer_start:]
+
+        self.assertIn("auto seed_row = format.create(1, K);", helper)
+        self.assertIn("std::memcpy(", helper)
+        self.assertIn("initialized_rows", helper)
+        self.assertIn(
+            "!profiler_request_id.empty() || profiler_batch.enabled()",
+            trainer,
+        )
+        self.assertIn("? makeProfilerWeightFixture(", trainer)
+        self.assertIn(": fmt.create(", trainer)
+
     def test_legacy_weak_csv_is_rejected(self) -> None:
         row = self.row("KB32", "eager", 20.0)
         del row["repeat_byte_mismatches"]
@@ -275,6 +386,20 @@ class ROCmNativeVNNIDecodeTrainerTest(unittest.TestCase):
             source,
         )
         self.assertIn("generated dispatch miss", source)
+
+    def test_serial_query_publishes_shape_clamped_effective_kb(self) -> None:
+        """A nominal generic formula must report the physical production KB."""
+
+        source = RUNTIME_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("const int k_groups = k / 32;", source)
+        self.assertIn(
+            "cached.kb = (requested_kb < k_groups) ? requested_kb : k_groups;",
+            source,
+        )
+        self.assertNotIn(
+            "cached.kb = static_cast<int>(generated_cfg.kb);",
+            source,
+        )
 
     def test_generic_tree_emitter_compiles_every_launch_geometry_axis(self) -> None:
         """ROCm must consume the common predicate IR rather than legacy ranges."""
@@ -351,8 +476,8 @@ class ROCmNativeVNNIDecodeTrainerTest(unittest.TestCase):
         self.assertNotIn("aspect_ratio", generated)
         self.assertNotIn("min_work_items", generated)
 
-    def test_additive_overlay_totalizes_codebook_missing_from_base(self) -> None:
-        """A new execution codebook gets exact and unseen-geometry coverage."""
+    def test_additive_overlay_reuses_modern_total_generic_base(self) -> None:
+        """Exact additions preserve modern generic coverage without a fallback."""
 
         spec = importlib.util.spec_from_file_location(
             "rocm_native_vnni_overlay_test_module",
@@ -399,7 +524,10 @@ class ROCmNativeVNNIDecodeTrainerTest(unittest.TestCase):
             module.emit_overlay(entries, generated_path, base)
             generated = generated_path.read_text(encoding="utf-8")
             self.assertIn(module.OVERLAY_BEGIN, generated)
-            self.assertIn(module.GENERIC_OVERLAY_BEGIN, generated)
+            self.assertNotIn(module.GENERIC_OVERLAY_BEGIN, generated)
+            self.assertNotIn(
+                "selectROCmNativeVNNIDecodeAspectFallback", generated
+            )
             self.assertIn("codebook_id == 19", generated)
             self.assertIn("kCommonExactOverlay", generated)
             self.assertNotIn("codebook_id == 19 &&", generated)

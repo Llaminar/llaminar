@@ -10,6 +10,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda/std/__cccl/assert.h>
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -43,11 +44,14 @@ namespace
     constexpr uint32_t kDeviceMoEDirectoryFlagLocalCompute = 1u << 2;
     constexpr uint32_t kDeviceMoEDirectoryFlagTransferSlot = 1u << 3;
     constexpr uint32_t kDeviceMoEDirectoryFlagCopyComplete = 1u << 4;
+    // Keep these launch-ABI bits aligned with MoEGroupedHistogramUpdate.
+    constexpr int kGroupedHistogramSelectedRoutes = 1 << 0;
+    constexpr int kGroupedHistogramLocallyAssignedRoutes = 1 << 1;
     constexpr uint32_t kDeviceMoEReplicaRoleNone = 0u;
     constexpr uint32_t kDeviceMoEReplicaRolePrimary = 1u;
     constexpr uint32_t kDeviceMoEReplicaRoleReplica = 2u;
     constexpr uint32_t kDeviceMoERebalanceMagic = 0x4d4f4552u;
-    constexpr uint32_t kDeviceMoERebalanceVersion = 1u;
+    constexpr uint32_t kDeviceMoERebalanceVersion = 3u;
     constexpr uint32_t kDeviceMoERebalanceFlagHotReplicaCache = 1u << 0;
     constexpr uint32_t kDeviceMoERebalanceFlagResetHistograms = 1u << 1;
     constexpr uint32_t kDeviceMoERebalanceFlagPlanMissingArrivals = 1u << 2;
@@ -73,6 +77,14 @@ namespace
     constexpr uint32_t kDeviceMoERebalanceLifecycleApplied = 5u;
     constexpr uint32_t kDeviceMoERebalanceLifecycleError = 6u;
     constexpr uint32_t kDeviceMoEInvalidSlot = 0xffffffffu;
+    /**
+     * Internal claim value used while one device thread publishes first-error
+     * provenance. Any non-zero controller error is terminal, so concurrent
+     * graph consumers already stop while the winning publisher fills the
+     * diagnostic fields and replaces this marker with the public status code.
+     */
+    constexpr uint32_t kDeviceMoERebalanceErrorPublicationInProgress =
+        0xffffffffu;
 
     __device__ __forceinline__ bool rebalance_plan_requires_payload(uint32_t op)
     {
@@ -96,7 +108,9 @@ namespace
         int k = 0;
         uint32_t blocks_per_row = 0;
         uint8_t codebook_id = 0;
-        uint8_t reserved[3] = {0, 0, 0};
+        uint8_t allocation_payload_bytes_per_block = 0;
+        uint8_t allocation_has_mins = 0;
+        uint8_t allocation_has_emins = 0;
     };
 
     struct DeviceMoEExpertDescriptorView
@@ -118,7 +132,8 @@ namespace
         uint32_t resident_participant_mask[kDeviceMoEMaxExperts];
         uint32_t epoch;
         uint32_t expert_count;
-        uint32_t reserved[2];
+        uint32_t multi_resident_expert_count;
+        uint32_t transient_placement_observed;
     };
 
     struct DeviceMoELayerRuntimeView
@@ -269,14 +284,47 @@ namespace
         uint32_t payload_source_participant_mask;
         uint32_t payload_destination_participant_mask;
         uint64_t payload_edge_mask;
+        uint64_t pre_wave_load_total;
+        uint64_t pre_wave_load_spread;
         uint64_t post_wave_load_total;
         uint64_t post_wave_load_spread;
+        uint32_t skipped_participant_load_spread;
+        uint32_t skipped_aggregate_load_spread;
+        uint32_t skipped_configured_load_spread_ceiling;
+        uint32_t capacity_limited_candidates;
+        uint32_t prefill_active_transfer_slot_experts;
     };
 
-    __device__ __forceinline__ void fail_fast_incomplete_llep_transfer()
+    /**
+     * @brief Terminate CUDA execution with the exact violated LLEP invariant.
+     *
+     * A bare PTX `trap` correctly made an invalid post-transfer publication
+     * fatal, but CUDA reported every such failure as an anonymous
+     * `cudaErrorLaunchFailure`. That erased the distinction between an
+     * incomplete collective, a non-resident assignment, and malformed grouped
+     * route metadata precisely when the context became unusable.
+     *
+     * Calling CUDA's device assertion primitive directly preserves the required
+     * fail-fast behavior in optimized builds while publishing the invariant,
+     * caller function, and caller line through the ordinary CUDA error channel.
+     * This function never repairs state, skips work, or selects another
+     * execution path: a violated device-owned publication contract remains
+     * unconditionally fatal.
+     *
+     * @param invariant Stable description of the violated device contract.
+     * @param function  Device function that detected the violation.
+     * @param line      Source line at which the violation was detected.
+     */
+    __device__ __forceinline__ void fail_fast_incomplete_llep_transfer(
+        const char *invariant,
+        const char *function,
+        unsigned int line)
     {
-        asm volatile("trap;");
+        __assert_fail(invariant, __FILE__, line, function);
     }
+
+#define FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(INVARIANT) \
+    fail_fast_incomplete_llep_transfer((INVARIANT), __func__, __LINE__)
 
     __device__ __forceinline__ bool prefill_llep_transfer_status_complete(
         const DeviceMoERebalanceStatusView *__restrict__ status,
@@ -315,6 +363,9 @@ namespace
         uint32_t flags;
         uint32_t destination_slot;
         uint32_t payload_slot;
+        uint32_t destination_previous_layer;
+        uint32_t destination_previous_expert;
+        uint32_t destination_generation;
     };
 
     struct DeviceMoERebalanceCommandBufferHeaderView
@@ -364,7 +415,7 @@ namespace
         uint32_t payload_bucket_slots;
         uint32_t payload_bucket_index;
         uint32_t payload_bucket_overflow;
-        uint32_t reserved[1];
+        uint32_t error_participant;
     };
 
     struct DeviceMoERebalanceGraphControllerStateView
@@ -380,7 +431,11 @@ namespace
         uint32_t decode_apply_polls;
         uint32_t decode_apply_hits;
         uint32_t last_error_code;
-        uint32_t reserved[5];
+        uint32_t last_error_wave_index;
+        uint32_t last_error_epoch;
+        uint32_t last_error_expected_arrivals;
+        uint32_t last_error_copied_arrivals;
+        uint32_t last_error_copy_status_code;
         DeviceMoERebalanceWaveProgressView waves[2];
     };
 
@@ -395,11 +450,6 @@ namespace
         uint32_t flags;
         uint32_t slot_index;
         uint32_t generation;
-        uint8_t payload_bytes_per_block;
-        uint8_t is_asymmetric;
-        uint8_t has_emins;
-        uint8_t reserved_u8;
-        uint32_t reserved;
     };
 
     struct DeviceMoERebalanceApplyStatusView
@@ -437,15 +487,28 @@ namespace
 
         const uint32_t transfer_count =
             static_cast<uint32_t>(expected_transfer_count);
+        /*
+         * `expected_transfer_count` is domain-wide, while apply status is
+         * participant-local after command projection. Requiring every
+         * participant to see every domain transfer rejects a valid split wave
+         * (for example, two domain transfers with one local arrival on each
+         * participant). Completeness is instead defined by the local contract:
+         * every locally required payload is ready and published, with every
+         * local payload count bounded by the domain total. `plan_entries_seen`
+         * may be larger than the transfer count because the projected command
+         * list can also contain resident-only assignments.
+         */
         if (transfer_count > 0u &&
-            (status->plan_entries_seen < transfer_count ||
+            (status->applied_arrivals > transfer_count ||
              status->required_local_arrivals > transfer_count ||
-             status->ready_local_arrivals > transfer_count))
+             status->ready_local_arrivals > transfer_count ||
+             status->plan_entries_seen < status->required_local_arrivals))
         {
             return false;
         }
 
         return status->required_local_arrivals == status->ready_local_arrivals &&
+               status->applied_arrivals == status->required_local_arrivals &&
                status->invalid_plan_entries == 0u &&
                status->missing_source_descriptors == 0u &&
                status->missing_destination_slots == 0u &&
@@ -510,6 +573,10 @@ namespace
         const DeviceMoERebalanceConfigView &config,
         uint32_t command_wave_index)
     {
+        if (state && state->last_error_code != 0u)
+        {
+            return true;
+        }
         if (!rebalance_graph_controller_state_basic_ok(state, config) ||
             command_wave_index >= state->wave_count)
         {
@@ -525,17 +592,77 @@ namespace
         return wave.state == kDeviceMoERebalanceLifecyclePlanning ||
                wave.state == kDeviceMoERebalanceLifecycleTransferInFlight ||
                wave.state == kDeviceMoERebalanceLifecycleReadyToApply ||
-               wave.state == kDeviceMoERebalanceLifecycleApplying;
+               wave.state == kDeviceMoERebalanceLifecycleApplying ||
+               wave.state == kDeviceMoERebalanceLifecycleError;
     }
 
     __device__ __forceinline__ void reset_rebalance_wave_progress_device(
         DeviceMoERebalanceWaveProgressView &wave)
     {
+        /*
+         * Error is terminal for the request-owned controller. A later empty
+         * maintenance replay must never launder a failed wave back to Idle.
+         */
+        if (wave.state == kDeviceMoERebalanceLifecycleError ||
+            wave.error_code != 0u)
+        {
+            return;
+        }
         DeviceMoERebalanceWaveProgressView zero{};
         wave = zero;
         wave.magic = kDeviceMoERebalanceMagic;
         wave.version = kDeviceMoERebalanceVersion;
         wave.state = kDeviceMoERebalanceLifecycleIdle;
+        wave.error_participant = kDeviceMoEInvalidSlot;
+    }
+
+    /**
+     * Publish the first fatal controller error and permanently poison replay.
+     *
+     * A claim marker serializes maintenance/apply streams without involving
+     * the host. The winning publisher records complete provenance, fences it,
+     * and only then exposes the public error code. Later failures preserve the
+     * first cause and cannot reset or retarget the affected wave.
+     */
+    __device__ __forceinline__ void poison_rebalance_graph_controller(
+        DeviceMoERebalanceGraphControllerStateView *state,
+        uint32_t error_code,
+        uint32_t wave_index,
+        uint32_t epoch,
+        uint32_t expected_arrivals,
+        uint32_t copied_arrivals,
+        uint32_t copy_status_code,
+        uint32_t error_participant)
+    {
+        if (!state || error_code == 0u)
+            return;
+
+        auto *error_word =
+            reinterpret_cast<unsigned int *>(&state->last_error_code);
+        if (atomicCAS(
+                error_word,
+                0u,
+                kDeviceMoERebalanceErrorPublicationInProgress) != 0u)
+        {
+            return;
+        }
+
+        state->last_error_wave_index = wave_index;
+        state->last_error_epoch = epoch;
+        state->last_error_expected_arrivals = expected_arrivals;
+        state->last_error_copied_arrivals = copied_arrivals;
+        state->last_error_copy_status_code = copy_status_code;
+        if (wave_index < state->wave_count && wave_index < 2u)
+        {
+            auto &wave = state->waves[wave_index];
+            wave.magic = kDeviceMoERebalanceMagic;
+            wave.version = kDeviceMoERebalanceVersion;
+            wave.error_participant = error_participant;
+            wave.error_code = error_code;
+            wave.state = kDeviceMoERebalanceLifecycleError;
+        }
+        __threadfence();
+        atomicExch(error_word, error_code);
     }
 
     __device__ __forceinline__ void clear_rebalance_command_header_device(
@@ -847,6 +974,57 @@ namespace
         return count;
     }
 
+    /**
+     * @brief Count live prefill-migrated experts across the participant runtime.
+     *
+     * This helper examines the active bank only. Requiring both the local
+     * compute mask and the complete applied descriptor flag set distinguishes a
+     * payload that is executable now from a transfer slot that was merely
+     * allocated or populated. It runs inside the already-captured maintenance
+     * controller and is exported by the existing request-boundary status copy.
+     */
+    __device__ __forceinline__ uint32_t
+    rebalance_active_transfer_slot_expert_count(
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        if (!runtime_layers || !rebalance_config_ok(config))
+            return 0u;
+
+        constexpr uint32_t kAppliedTransferSlotFlags =
+            kDeviceMoEFlagValid |
+            kDeviceMoEFlagResident |
+            kDeviceMoEFlagLocalCompute |
+            kDeviceMoEFlagTransferSlot;
+        uint32_t count = 0u;
+        for (uint32_t layer = 0u; layer < config.num_layers; ++layer)
+        {
+            const DeviceMoELayerRuntimeView &runtime = runtime_layers[layer];
+            if (runtime.active_bank > 1u ||
+                runtime.active_epoch == 0u ||
+                runtime.expert_count != config.num_experts ||
+                runtime.participant_id != config.participant_id ||
+                runtime.participant_count != config.participant_count)
+            {
+                continue;
+            }
+
+            const DeviceMoEPlacementBankView &bank =
+                runtime.banks[runtime.active_bank];
+            for (uint32_t expert = 0u; expert < config.num_experts; ++expert)
+            {
+                const uint32_t flags = bank.experts[expert].flags;
+                if (bank.local_compute_mask[expert] != 0u &&
+                    (flags & kAppliedTransferSlotFlags) ==
+                        kAppliedTransferSlotFlags)
+                {
+                    ++count;
+                }
+            }
+        }
+        return count;
+    }
+
     __device__ __forceinline__ bool runtime_expert_replicated(
         const DeviceMoELayerRuntimeView *runtime,
         const DeviceMoEPlacementBankView &bank,
@@ -862,7 +1040,7 @@ namespace
     __device__ __forceinline__ uint32_t runtime_multi_resident_expert_count(
         const DeviceMoEPlacementBankView &bank)
     {
-        return bank.reserved[0];
+        return bank.multi_resident_expert_count;
     }
 
     __device__ __forceinline__ uint32_t runtime_compute_multi_resident_expert_count(
@@ -1245,6 +1423,10 @@ namespace
                 status->magic = kDeviceMoERebalanceMagic;
                 status->version = kDeviceMoERebalanceVersion;
                 status->status_code = kDeviceMoERebalanceStatusOk;
+                status->prefill_active_transfer_slot_experts =
+                    rebalance_active_transfer_slot_expert_count(
+                        runtime_layers,
+                        config);
             }
             else
             {
@@ -1591,8 +1773,10 @@ namespace
             {
                 next.epoch = runtime.active_epoch + 1u;
                 next.expert_count = config.num_experts;
-                next.reserved[0] = active.reserved[0];
-                next.reserved[1] = active.reserved[1];
+                next.multi_resident_expert_count =
+                    active.multi_resident_expert_count;
+                next.transient_placement_observed =
+                    active.transient_placement_observed;
             }
 
             for (uint32_t expert = lane; expert < config.num_experts; expert += blockDim.x)
@@ -1842,7 +2026,7 @@ namespace
                                 transfer.source_participant] >= payload_slot_capacity)
                         {
                             if (status)
-                                ++status->plan_overflow;
+                                ++status->capacity_limited_candidates;
                             break;
                         }
 
@@ -1909,28 +2093,45 @@ namespace
                         accepted_before_max);
                     (void)accepted_before_total;
 
-                    for (uint32_t participant = 0;
-                         participant < config.participant_count;
-                         ++participant)
+                    const bool exact_llep_assignment_is_materialized =
+                        hot_replica_cache &&
+                        accepted_transfers == llep_status.weight_transfer_count;
+                    if (!exact_llep_assignment_is_materialized)
                     {
-                        shared_candidate_policy_load[participant] = 0ULL;
-                    }
-                    for (uint32_t expert = 0; expert < config.num_experts; ++expert)
-                    {
-                        uint32_t resident_mask =
-                            shared_post_policy_resident_mask[expert] & valid_mask;
                         for (uint32_t participant = 0;
                              participant < config.participant_count;
                              ++participant)
                         {
-                            shared_candidate_policy_load[participant] +=
-                                llaminar2::moe_rebalance_policy::projectedParticipantLoadForExpert(
-                                    shared_expert_counts[expert],
-                                    resident_mask,
-                                    config.participant_count,
-                                    participant);
+                            shared_candidate_policy_load[participant] = 0ULL;
+                        }
+                        for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+                        {
+                            const uint32_t resident_mask =
+                                shared_post_policy_resident_mask[expert] & valid_mask;
+                            for (uint32_t participant = 0;
+                                 participant < config.participant_count;
+                                 ++participant)
+                            {
+                                shared_candidate_policy_load[participant] +=
+                                    llaminar2::moe_rebalance_policy::projectedParticipantLoadForExpert(
+                                        shared_expert_counts[expert],
+                                        resident_mask,
+                                        config.participant_count,
+                                        participant);
+                            }
                         }
                     }
+                    /*
+                     * The LLEP planner already wrote its exact row-span loads
+                     * into shared_candidate_policy_load.  When every required
+                     * replica arrival is present, those loads describe the
+                     * production apportioned-row schedule exactly.  Replacing
+                     * them with an equal resident split can invert the economy
+                     * decision for uneven groups and reject a genuinely useful
+                     * transfer.  Whole-expert ownership moves and partial waves
+                     * cannot execute the ideal row schedule, so they retain the
+                     * physical-residency projection above.
+                     */
 
                     uint64_t accepted_after_total = 0ULL;
                     uint64_t accepted_after_min = 0ULL;
@@ -1992,11 +2193,16 @@ namespace
                 {
                     const uint32_t command_count =
                         plan_count ? ((*plan_count < plan_capacity) ? *plan_count : plan_capacity) : 0u;
-                    if (command_count + 2u > plan_capacity ||
-                        command_count + 2u > max_entries)
+                    if (command_count + 2u > plan_capacity)
                     {
                         if (status)
                             ++status->plan_overflow;
+                        break;
+                    }
+                    if (command_count + 2u > max_entries)
+                    {
+                        if (status)
+                            ++status->capacity_limited_candidates;
                         break;
                     }
 
@@ -2038,7 +2244,7 @@ namespace
                         shared_destination_transfer_slot_counts[light_destination] >= payload_slot_capacity)
                     {
                         if (status)
-                            ++status->plan_overflow;
+                            ++status->capacity_limited_candidates;
                         break;
                     }
                     if ((heavy_physical_source_mask & heavy_source_bit) == 0u ||
@@ -2580,7 +2786,7 @@ namespace
                                 else
                                 {
                                     if (destination_slot == kDeviceMoEInvalidSlot && status)
-                                        ++status->plan_overflow;
+                                        ++status->capacity_limited_candidates;
                                     ++skipped_no_resident;
                                 }
                             }
@@ -2734,7 +2940,7 @@ namespace
                             else
                             {
                                 if (destination_slot == kDeviceMoEInvalidSlot && status)
-                                    ++status->plan_overflow;
+                                    ++status->capacity_limited_candidates;
                                 ++skipped_no_resident;
                             }
                         }
@@ -2807,7 +3013,7 @@ namespace
                 }
                 else
                 {
-                    next.reserved[0] =
+                    next.multi_resident_expert_count =
                         runtime_compute_multi_resident_expert_count(
                             next, config.num_experts, config.participant_count);
                     runtime.active_bank = inactive_bank;
@@ -3049,27 +3255,35 @@ namespace
                     true);
             const bool durable_llep_ownership_wave =
                 least_loaded_assignment && !hot_replica_cache;
-            const bool post_load_spread_ceiling_rejected =
+            const bool participant_load_spread_rejected =
                 requested_payload_slots > 0u &&
-                (!llaminar2::moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
+                !llaminar2::moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
                      pre_max - pre_min,
                      post_max - post_min,
                      pre_total,
                      post_total,
                      requested_payload_slots,
-                     realized_router_payback) ||
-                 !llaminar2::moe_rebalance_policy::transferWaveImprovesAggregateLoadSpread(
+                     realized_router_payback);
+            const bool aggregate_load_spread_rejected =
+                requested_payload_slots > 0u &&
+                !llaminar2::moe_rebalance_policy::transferWaveImprovesAggregateLoadSpread(
                      pre_wave_load_spread,
                      post_wave_load_spread,
                      pre_wave_load_total,
                      post_wave_load_total,
-                     requested_payload_slots) ||
-                 (!durable_llep_ownership_wave &&
-                  !llaminar2::moe_rebalance_policy::transferWaveMeetsPostLoadSpreadCeiling(
+                     requested_payload_slots);
+            const bool configured_load_spread_ceiling_rejected =
+                requested_payload_slots > 0u &&
+                !durable_llep_ownership_wave &&
+                !llaminar2::moe_rebalance_policy::transferWaveMeetsPostLoadSpreadCeiling(
                      post_wave_load_spread,
                      post_wave_load_total,
                      requested_payload_slots,
-                     config.max_post_wave_load_spread_per_mille)));
+                     config.max_post_wave_load_spread_per_mille);
+            const bool post_load_spread_ceiling_rejected =
+                participant_load_spread_rejected ||
+                aggregate_load_spread_rejected ||
+                configured_load_spread_ceiling_rejected;
             const bool wave_rejected =
                 wave_cost_floor_rejected ||
                 router_benefit_floor_rejected ||
@@ -3143,10 +3357,18 @@ namespace
                 router_benefit_floor_rejected ? 1u : 0u;
             status->skipped_post_load_spread_ceiling =
                 post_load_spread_ceiling_rejected ? 1u : 0u;
+            status->skipped_participant_load_spread =
+                participant_load_spread_rejected ? 1u : 0u;
+            status->skipped_aggregate_load_spread =
+                aggregate_load_spread_rejected ? 1u : 0u;
+            status->skipped_configured_load_spread_ceiling =
+                configured_load_spread_ceiling_rejected ? 1u : 0u;
             status->payload_source_participant_mask = payload_source_participant_mask;
             status->payload_destination_participant_mask =
                 payload_destination_participant_mask;
             status->payload_edge_mask = payload_edge_mask;
+            status->pre_wave_load_total = pre_wave_load_total;
+            status->pre_wave_load_spread = pre_wave_load_spread;
             status->post_wave_load_total = post_wave_load_total;
             status->post_wave_load_spread = post_wave_load_spread;
             const uint32_t start_layer =
@@ -3306,6 +3528,10 @@ namespace
                 status->magic = kDeviceMoERebalanceMagic;
                 status->version = kDeviceMoERebalanceVersion;
                 status->status_code = kDeviceMoERebalanceStatusOk;
+                status->prefill_active_transfer_slot_experts =
+                    rebalance_active_transfer_slot_expert_count(
+                        runtime_layers,
+                        config);
             }
             else
             {
@@ -3541,11 +3767,16 @@ namespace
                 {
                     const uint32_t command_count =
                         plan_count ? ((*plan_count < plan_capacity) ? *plan_count : plan_capacity) : 0u;
-                    if (command_count + 2u > plan_capacity ||
-                        command_count + 2u > max_entries)
+                    if (command_count + 2u > plan_capacity)
                     {
                         if (status)
                             ++status->plan_overflow;
+                        break;
+                    }
+                    if (command_count + 2u > max_entries)
+                    {
+                        if (status)
+                            ++status->capacity_limited_candidates;
                         break;
                     }
 
@@ -3588,7 +3819,7 @@ namespace
                         shared_destination_transfer_slot_counts[light_destination] >= payload_slot_capacity)
                     {
                         if (status)
-                            ++status->plan_overflow;
+                            ++status->capacity_limited_candidates;
                         break;
                     }
                     if ((heavy_physical_source_mask & heavy_source_bit) == 0u ||
@@ -3763,26 +3994,34 @@ namespace
                     accepted_load_spread_improvement_total,
                     requested_payload_slots,
                     config.min_wave_spread_improvement_per_payload_slot);
-            const bool post_load_spread_ceiling_rejected =
+            const bool participant_load_spread_rejected =
                 requested_payload_slots > 0u &&
-                (!llaminar2::moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
+                !llaminar2::moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
                      pre_max - pre_min,
                      post_max - post_min,
                      pre_total,
                      post_total,
                      requested_payload_slots,
-                     false) ||
-                 !llaminar2::moe_rebalance_policy::transferWaveImprovesAggregateLoadSpread(
+                     false);
+            const bool aggregate_load_spread_rejected =
+                requested_payload_slots > 0u &&
+                !llaminar2::moe_rebalance_policy::transferWaveImprovesAggregateLoadSpread(
                      pre_wave_load_spread,
                      post_wave_load_spread,
                      pre_wave_load_total,
                      post_wave_load_total,
-                     requested_payload_slots) ||
-                 !llaminar2::moe_rebalance_policy::transferWaveMeetsPostLoadSpreadCeiling(
+                     requested_payload_slots);
+            const bool configured_load_spread_ceiling_rejected =
+                requested_payload_slots > 0u &&
+                !llaminar2::moe_rebalance_policy::transferWaveMeetsPostLoadSpreadCeiling(
                      post_wave_load_spread,
                      post_wave_load_total,
                      requested_payload_slots,
-                     config.max_post_wave_load_spread_per_mille));
+                     config.max_post_wave_load_spread_per_mille);
+            const bool post_load_spread_ceiling_rejected =
+                participant_load_spread_rejected ||
+                aggregate_load_spread_rejected ||
+                configured_load_spread_ceiling_rejected;
             const bool wave_rejected =
                 wave_cost_floor_rejected || post_load_spread_ceiling_rejected;
             if (wave_rejected)
@@ -3836,10 +4075,18 @@ namespace
             status->skipped_wave_cost_floor = wave_cost_floor_rejected ? 1u : 0u;
             status->skipped_post_load_spread_ceiling =
                 post_load_spread_ceiling_rejected ? 1u : 0u;
+            status->skipped_participant_load_spread =
+                participant_load_spread_rejected ? 1u : 0u;
+            status->skipped_aggregate_load_spread =
+                aggregate_load_spread_rejected ? 1u : 0u;
+            status->skipped_configured_load_spread_ceiling =
+                configured_load_spread_ceiling_rejected ? 1u : 0u;
             status->payload_source_participant_mask = payload_source_participant_mask;
             status->payload_destination_participant_mask =
                 payload_destination_participant_mask;
             status->payload_edge_mask = payload_edge_mask;
+            status->pre_wave_load_total = pre_wave_load_total;
+            status->pre_wave_load_spread = pre_wave_load_spread;
             status->post_wave_load_total = post_wave_load_total;
             status->post_wave_load_spread = post_wave_load_spread;
             if (collect_load_stats)
@@ -4100,6 +4347,75 @@ namespace
             has_emins);
     }
 
+    __device__ __forceinline__ bool rebalance_projection_allocation_capacity(
+        const DeviceNativeVNNIMatrixDesc &desc,
+        uint8_t &payload_bytes,
+        uint8_t &has_mins,
+        uint8_t &has_emins)
+    {
+        if (desc.allocation_payload_bytes_per_block != 0u)
+        {
+            payload_bytes = desc.allocation_payload_bytes_per_block;
+            has_mins = desc.allocation_has_mins;
+            has_emins = desc.allocation_has_emins;
+            return true;
+        }
+
+        uint8_t is_asymmetric = 0u;
+        if (!rebalance_projection_format(
+                desc,
+                payload_bytes,
+                is_asymmetric,
+                has_emins))
+        {
+            return false;
+        }
+        has_mins = is_asymmetric;
+        return true;
+    }
+
+    __device__ __forceinline__ bool rebalance_matrix_fits_transfer_capacity(
+        const DeviceNativeVNNIMatrixDesc &src,
+        const DeviceNativeVNNIMatrixDesc &dst)
+    {
+        if (src.n != dst.n ||
+            src.k != dst.k ||
+            src.blocks_per_row != dst.blocks_per_row)
+        {
+            return false;
+        }
+
+        uint8_t src_payload_bytes = 0u;
+        uint8_t src_is_asymmetric = 0u;
+        uint8_t src_has_emins = 0u;
+        uint8_t dst_payload_capacity = 0u;
+        uint8_t dst_has_mins = 0u;
+        uint8_t dst_has_emins = 0u;
+        return rebalance_projection_format(
+                   src,
+                   src_payload_bytes,
+                   src_is_asymmetric,
+                   src_has_emins) &&
+               rebalance_projection_allocation_capacity(
+                   dst,
+                   dst_payload_capacity,
+                   dst_has_mins,
+                   dst_has_emins) &&
+               src_payload_bytes <= dst_payload_capacity &&
+               (src_is_asymmetric == 0u || dst_has_mins != 0u) &&
+               (src_has_emins == 0u || dst_has_emins != 0u);
+    }
+
+    __device__ __forceinline__ void rebalance_retarget_transfer_matrix(
+        DeviceNativeVNNIMatrixDesc &dst,
+        const DeviceNativeVNNIMatrixDesc &src)
+    {
+        dst.n = src.n;
+        dst.k = src.k;
+        dst.blocks_per_row = src.blocks_per_row;
+        dst.codebook_id = src.codebook_id;
+    }
+
     __device__ __forceinline__ bool rebalance_matrix_copy_ready(
         const DeviceNativeVNNIMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntryView &entry)
@@ -4179,22 +4495,58 @@ namespace
                (entry.flags & kDeviceMoEDirectoryFlagCopyComplete) != 0u;
     }
 
-    __device__ __forceinline__ bool rebalance_directory_compatible(
+    /**
+     * @brief Authenticate a completed copy as the publication for one plan wave.
+     *
+     * Logical identity alone is insufficient because a transfer slot can retain
+     * a valid completed copy from an older wave.  Apply may consume the slot only
+     * when unpack performed this plan's exact generation transition and stamped
+     * the current command epoch.
+     */
+    __device__ __forceinline__ bool rebalance_transfer_slot_copy_complete_for_plan(
+        const DeviceMoEExpertDirectoryEntryView &entry,
+        const DeviceMoERebalancePlanEntryView &plan,
+        uint32_t participant,
+        uint32_t command_epoch)
+    {
+        return plan.destination_generation != 0xffffffffu &&
+               entry.generation == plan.destination_generation + 1u &&
+               entry.epoch == command_epoch &&
+               rebalance_transfer_slot_copy_complete(
+                   entry,
+                   participant,
+                   plan.layer,
+                   plan.expert);
+    }
+
+    __device__ __forceinline__ bool rebalance_directory_fits_transfer_capacity(
         const DeviceMoEExpertDirectoryEntryView &src,
         const DeviceMoEExpertDirectoryEntryView &dst)
     {
-        return src.descriptor.gate.n == dst.descriptor.gate.n &&
-               src.descriptor.gate.k == dst.descriptor.gate.k &&
-               src.descriptor.gate.blocks_per_row == dst.descriptor.gate.blocks_per_row &&
-               src.descriptor.gate.codebook_id == dst.descriptor.gate.codebook_id &&
-               src.descriptor.up.n == dst.descriptor.up.n &&
-               src.descriptor.up.k == dst.descriptor.up.k &&
-               src.descriptor.up.blocks_per_row == dst.descriptor.up.blocks_per_row &&
-               src.descriptor.up.codebook_id == dst.descriptor.up.codebook_id &&
-               src.descriptor.down.n == dst.descriptor.down.n &&
-               src.descriptor.down.k == dst.descriptor.down.k &&
-               src.descriptor.down.blocks_per_row == dst.descriptor.down.blocks_per_row &&
-	               src.descriptor.down.codebook_id == dst.descriptor.down.codebook_id;
+        return rebalance_matrix_fits_transfer_capacity(
+                   src.descriptor.gate,
+                   dst.descriptor.gate) &&
+               rebalance_matrix_fits_transfer_capacity(
+                   src.descriptor.up,
+                   dst.descriptor.up) &&
+               rebalance_matrix_fits_transfer_capacity(
+                   src.descriptor.down,
+                   dst.descriptor.down);
+    }
+
+    __device__ __forceinline__ void rebalance_retarget_transfer_directory(
+        DeviceMoEExpertDirectoryEntryView &dst,
+        const DeviceMoEExpertDirectoryEntryView &src)
+    {
+        rebalance_retarget_transfer_matrix(
+            dst.descriptor.gate,
+            src.descriptor.gate);
+        rebalance_retarget_transfer_matrix(
+            dst.descriptor.up,
+            src.descriptor.up);
+        rebalance_retarget_transfer_matrix(
+            dst.descriptor.down,
+            src.descriptor.down);
     }
 
     __device__ __forceinline__ DeviceMoEExpertDirectoryEntryView make_rebalance_source_entry(
@@ -4243,12 +4595,7 @@ namespace
         if (local_resident && local_slot_resident && rebalance_expert_desc_ready(desc))
         {
             entry.descriptor = desc;
-            if (rebalance_format_for_codebook(
-                    desc.gate.codebook_id,
-                    entry.payload_bytes_per_block,
-                    entry.is_asymmetric,
-                    entry.has_emins) &&
-                rebalance_directory_copy_ready(entry))
+            if (rebalance_directory_copy_ready(entry))
             {
                 entry.flags = kDeviceMoEDirectoryFlagValid |
                               kDeviceMoEDirectoryFlagResident;
@@ -4337,12 +4684,14 @@ namespace
         state->next_epoch = 1u;
         state->active_wave = 0u;
         state->wave_count = 2u;
+        state->last_error_wave_index = kDeviceMoEInvalidSlot;
         for (uint32_t i = 0; i < 2u; ++i)
         {
             auto &wave = state->waves[i];
             wave.magic = kDeviceMoERebalanceMagic;
             wave.version = kDeviceMoERebalanceVersion;
             wave.state = kDeviceMoERebalanceLifecycleIdle;
+            wave.error_participant = kDeviceMoEInvalidSlot;
         }
     }
 
@@ -4354,7 +4703,8 @@ namespace
             return;
         if (!rebalance_config_ok(config))
         {
-            state->last_error_code = kDeviceMoERebalanceStatusInvalidConfig;
+            if (state->last_error_code == 0u)
+                state->last_error_code = kDeviceMoERebalanceStatusInvalidConfig;
             return;
         }
         if (!rebalance_graph_controller_state_ok(state, config))
@@ -4389,6 +4739,7 @@ namespace
         DeviceMoEReadyWaveSelection selection{nullptr, 0u};
         const uint32_t count = rebalance_command_buffer_count(command_buffer_count);
         if (!rebalance_graph_controller_state_ok(state, config) ||
+            state->last_error_code != 0u ||
             !command_headers)
         {
             return selection;
@@ -4484,11 +4835,19 @@ namespace
             return;
         if (!rebalance_config_ok(config))
         {
-            state->last_error_code = kDeviceMoERebalanceStatusInvalidConfig;
+            if (state->last_error_code == 0u)
+                state->last_error_code = kDeviceMoERebalanceStatusInvalidConfig;
             return;
         }
         if (!rebalance_graph_controller_state_ok(state, config))
             init_rebalance_graph_controller_state_device(state, config);
+        /*
+         * A poisoned request cannot legally publish another transfer. The
+         * maintenance graph remains launchable, but every replay becomes a
+         * device-side no-op until request teardown replaces the controller.
+         */
+        if (state->last_error_code != 0u)
+            return;
         ++state->maintenance_launches;
         const uint32_t wave_index =
             rebalance_active_command_wave_index(state, config, command_buffer_count);
@@ -4500,7 +4859,15 @@ namespace
             !plan_entries || plan_capacity == 0u || !gathered_copy_status ||
             !rebalance_command_header_ok(command_header, config))
         {
-            state->last_error_code = kDeviceMoERebalanceStatusInvalidRuntime;
+            poison_rebalance_graph_controller(
+                state,
+                kDeviceMoERebalanceStatusInvalidRuntime,
+                wave_index,
+                command_header ? command_header->epoch : 0u,
+                0u,
+                0u,
+                copy_status ? copy_status->status_code : 0u,
+                config.participant_id);
             return;
         }
         const uint32_t command_count =
@@ -4523,9 +4890,15 @@ namespace
         if (wave.state == kDeviceMoERebalanceLifecycleReadyToApply &&
             wave.epoch != command_header->epoch)
         {
-            state->last_error_code = kDeviceMoERebalanceStatusMissingTransferCompletion;
-            wave.error_code = kDeviceMoERebalanceStatusMissingTransferCompletion;
-            wave.state = kDeviceMoERebalanceLifecycleError;
+            poison_rebalance_graph_controller(
+                state,
+                kDeviceMoERebalanceStatusMissingTransferCompletion,
+                wave_index,
+                command_header->epoch,
+                0u,
+                0u,
+                copy_status->status_code,
+                config.participant_id);
             return;
         }
 
@@ -4533,24 +4906,36 @@ namespace
             plan_entries + static_cast<unsigned long long>(wave_index) * plan_capacity;
         bool transfer_complete = true;
         uint32_t copied_arrivals_total = 0u;
+        uint32_t failing_participant = kDeviceMoEInvalidSlot;
+        uint32_t failing_expected_arrivals = 0u;
+        uint32_t failing_copied_arrivals = 0u;
+        uint32_t failing_copy_status_code = 0u;
         for (uint32_t participant = 0; participant < config.participant_count; ++participant)
         {
             const auto &peer_status = gathered_copy_status[participant];
-            if (!rebalance_copy_status_ok(peer_status))
-            {
-                transfer_complete = false;
-                break;
-            }
-            copied_arrivals_total += peer_status.copied_arrivals;
             const uint32_t expected =
                 rebalance_expected_payload_arrivals(
                     wave_plan_entries,
                     command_count,
                     participant,
                     config);
+            if (!rebalance_copy_status_ok(peer_status))
+            {
+                transfer_complete = false;
+                failing_participant = participant;
+                failing_expected_arrivals = expected;
+                failing_copied_arrivals = peer_status.copied_arrivals;
+                failing_copy_status_code = peer_status.status_code;
+                break;
+            }
+            copied_arrivals_total += peer_status.copied_arrivals;
             if (peer_status.copied_arrivals < expected)
             {
                 transfer_complete = false;
+                failing_participant = participant;
+                failing_expected_arrivals = expected;
+                failing_copied_arrivals = peer_status.copied_arrivals;
+                failing_copy_status_code = peer_status.status_code;
                 break;
             }
         }
@@ -4573,9 +4958,15 @@ namespace
         __threadfence();
         if (!transfer_complete)
         {
-            state->last_error_code = kDeviceMoERebalanceStatusMissingTransferCompletion;
-            wave.error_code = kDeviceMoERebalanceStatusMissingTransferCompletion;
-            wave.state = kDeviceMoERebalanceLifecycleError;
+            poison_rebalance_graph_controller(
+                state,
+                kDeviceMoERebalanceStatusMissingTransferCompletion,
+                wave_index,
+                command_header->epoch,
+                failing_expected_arrivals,
+                failing_copied_arrivals,
+                failing_copy_status_code,
+                failing_participant);
             return;
         }
         wave.state = kDeviceMoERebalanceLifecycleReadyToApply;
@@ -4633,6 +5024,402 @@ namespace
                static_cast<unsigned long long>(plan_index);
     }
 
+    /**
+     * @brief Validate the immutable physical identity of one transfer slot.
+     *
+     * The logical expert stored in a transfer slot changes over time, while the
+     * allocation, slot index, participant, and pointer-bearing descriptor stay
+     * fixed for the lifetime of the graph.  Projection must reject a malformed
+     * directory entry before it can mint a lease for that allocation.
+     */
+    __device__ __forceinline__ bool rebalance_transfer_slot_identity_ok(
+        const DeviceMoEExpertDirectoryEntryView &entry,
+        uint32_t slot_index,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        /*
+         * `slot_index` is the subscript in the transfer-directory array.
+         * `entry.slot_index` is the stable local expert-allocation identity.
+         * Production currently numbers both from zero, but that is a layout
+         * choice rather than an ABI invariant.  The descriptor and directory
+         * entry must agree about the stable allocation; they need not equal the
+         * directory subscript used to locate this entry.
+         */
+        (void)slot_index;
+        return entry.participant == config.participant_id &&
+               entry.slot_index != kDeviceMoEInvalidSlot &&
+               entry.descriptor.local_slot == static_cast<int32_t>(entry.slot_index) &&
+               entry.generation != 0xffffffffu &&
+               rebalance_transfer_slot_ready(
+                   entry,
+                   config.participant_id,
+                   /*layer=*/0u,
+                   /*expert=*/0u);
+    }
+
+    /**
+     * @brief Test whether a directory occupant is still published by runtime.
+     *
+     * A decode-maintenance copy must never overwrite storage referenced by an
+     * active placement bank.  This remains true when another command in the
+     * same wave intends to transfer ownership away: unpack happens before the
+     * per-layer apply point, so early overwrite would leave the old descriptor
+     * temporarily pointing at another expert's bytes.
+     */
+    __device__ __forceinline__ bool rebalance_transfer_slot_has_active_runtime_claim(
+        const DeviceMoEExpertDirectoryEntryView &entry,
+        uint32_t slot_index,
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        if (!runtime_layers ||
+            entry.layer >= config.num_layers ||
+            entry.expert >= config.num_experts ||
+            (entry.flags & (kDeviceMoEDirectoryFlagResident |
+                            kDeviceMoEDirectoryFlagCopyComplete)) !=
+                (kDeviceMoEDirectoryFlagResident |
+                 kDeviceMoEDirectoryFlagCopyComplete))
+        {
+            return false;
+        }
+
+        const auto &runtime = runtime_layers[entry.layer];
+        if (runtime.active_bank > 1u ||
+            runtime.expert_count != config.num_experts ||
+            runtime.participant_id != config.participant_id ||
+            runtime.participant_count != config.participant_count)
+        {
+            return false;
+        }
+
+        const auto &active = runtime.banks[runtime.active_bank];
+        const auto &descriptor = active.experts[entry.expert];
+        const uint32_t local_bit =
+            runtime_participant_bit(static_cast<int>(config.participant_id));
+        (void)slot_index;
+        return descriptor.logical_expert_id == static_cast<int32_t>(entry.expert) &&
+               descriptor.local_slot == entry.descriptor.local_slot &&
+               descriptor.owner_participant == entry.descriptor.owner_participant &&
+               (descriptor.flags & kDeviceMoEFlagTransferSlot) != 0u &&
+               (active.resident_participant_mask[entry.expert] & local_bit) != 0u;
+    }
+
+    /**
+     * @brief Detect any active descriptor that references a physical slot.
+     *
+     * This complete scan is the safety net for directory/runtime disagreement:
+     * an entry marked empty or stale is not reusable while any layer still
+     * publishes its stable pointer.  Rebalance projection is infrequent
+     * maintenance work, so correctness is preferable to trusting a partial
+     * logical lookup at this ownership boundary.
+     */
+    __device__ __forceinline__ bool rebalance_any_active_runtime_claims_slot(
+        const DeviceMoEExpertDirectoryEntryView &entry,
+        uint32_t slot_index,
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        if (!runtime_layers)
+            return true;
+        (void)slot_index;
+
+        const uint32_t local_bit =
+            runtime_participant_bit(static_cast<int>(config.participant_id));
+        for (uint32_t layer = 0u; layer < config.num_layers; ++layer)
+        {
+            const auto &runtime = runtime_layers[layer];
+            if (runtime.active_bank > 1u ||
+                runtime.expert_count != config.num_experts ||
+                runtime.participant_id != config.participant_id ||
+                runtime.participant_count != config.participant_count)
+            {
+                return true;
+            }
+            const auto &active = runtime.banks[runtime.active_bank];
+            for (uint32_t expert = 0u; expert < config.num_experts; ++expert)
+            {
+                const auto &descriptor = active.experts[expert];
+                if (descriptor.local_slot == entry.descriptor.local_slot &&
+                    (descriptor.flags & kDeviceMoEFlagTransferSlot) != 0u &&
+                    (active.resident_participant_mask[expert] & local_bit) != 0u)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @brief Decide whether a slot generation is no longer runtime-visible.
+     *
+     * An empty directory entry is immediately reusable.  A populated entry is
+     * reusable only after the layer runtime has advanced to or beyond the
+     * directory epoch and no active descriptor claims the allocation.  An
+     * arrival copied by an earlier maintenance wave but not yet applied has an
+     * epoch newer than the active runtime and is therefore protected.
+     */
+    __device__ __forceinline__ bool rebalance_transfer_slot_generation_retired(
+        const DeviceMoEExpertDirectoryEntryView &entry,
+        uint32_t slot_index,
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        const bool empty =
+            entry.layer == kDeviceMoEInvalidSlot &&
+            entry.expert == kDeviceMoEInvalidSlot &&
+            (entry.flags & (kDeviceMoEDirectoryFlagResident |
+                            kDeviceMoEDirectoryFlagCopyComplete)) == 0u;
+        if (empty)
+        {
+            return !rebalance_any_active_runtime_claims_slot(
+                entry,
+                slot_index,
+                runtime_layers,
+                config);
+        }
+
+        if (entry.layer >= config.num_layers ||
+            entry.expert >= config.num_experts ||
+            rebalance_any_active_runtime_claims_slot(
+                entry,
+                slot_index,
+                runtime_layers,
+                config))
+        {
+            return false;
+        }
+
+        const auto &runtime = runtime_layers[entry.layer];
+        return runtime.active_bank <= 1u &&
+               runtime.expert_count == config.num_experts &&
+               runtime.participant_id == config.participant_id &&
+               runtime.participant_count == config.participant_count &&
+               runtime.active_epoch >= entry.epoch;
+    }
+
+    __device__ __forceinline__ bool rebalance_transfer_slot_selected(
+        const uint32_t *selected_slot_words,
+        uint32_t slot_index)
+    {
+        return (selected_slot_words[slot_index / 32u] &
+                (1u << (slot_index % 32u))) != 0u;
+    }
+
+    __device__ __forceinline__ void rebalance_mark_transfer_slot_selected(
+        uint32_t *selected_slot_words,
+        uint32_t slot_index)
+    {
+        selected_slot_words[slot_index / 32u] |=
+            1u << (slot_index % 32u);
+    }
+
+    /**
+     * @brief Lease a destination-local transfer slot from live device state.
+     *
+     * Root plans describe logical movement only.  The destination participant
+     * owns physical slot assignment because only it can observe its current
+     * directory and runtime banks.  The returned command carries the exact
+     * prior occupant and generation so unpack can perform compare-and-replace
+     * instead of trusting a stale integer slot index.
+     */
+    __device__ __forceinline__ bool rebalance_lease_local_transfer_slot(
+        DeviceMoERebalancePlanEntryView &plan,
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfigView &config,
+        uint32_t *selected_slot_words)
+    {
+        if (!runtime_layers ||
+            !local_transfer_slots ||
+            !selected_slot_words ||
+            local_transfer_slot_count == 0u ||
+            local_transfer_slot_count > static_cast<uint32_t>(kDeviceMoEMaxExperts))
+        {
+            return false;
+        }
+
+        uint32_t selected_slot = kDeviceMoEInvalidSlot;
+
+        /*
+         * Reusing the current slot for the same logical expert preserves the
+         * runtime pointer identity and is preferable to consuming a new slot.
+         */
+        for (uint32_t slot = 0u;
+             slot < local_transfer_slot_count;
+             ++slot)
+        {
+            const auto &entry = local_transfer_slots[slot];
+            if (!rebalance_transfer_slot_selected(selected_slot_words, slot) &&
+                rebalance_transfer_slot_identity_ok(entry, slot, config) &&
+                entry.layer == plan.layer &&
+                entry.expert == plan.expert &&
+                rebalance_transfer_slot_has_active_runtime_claim(
+                    entry,
+                    slot,
+                    runtime_layers,
+                    config))
+            {
+                selected_slot = slot;
+                break;
+            }
+        }
+
+        /*
+         * Otherwise consume only storage whose previous publication is already
+         * retired.  Same-wave eviction is intentionally excluded because the
+         * payload copy precedes per-layer runtime publication.
+         */
+        for (uint32_t slot = 0u;
+             selected_slot == kDeviceMoEInvalidSlot &&
+             slot < local_transfer_slot_count;
+             ++slot)
+        {
+            const auto &entry = local_transfer_slots[slot];
+            if (!rebalance_transfer_slot_selected(selected_slot_words, slot) &&
+                rebalance_transfer_slot_identity_ok(entry, slot, config) &&
+                rebalance_transfer_slot_generation_retired(
+                    entry,
+                    slot,
+                    runtime_layers,
+                    config))
+            {
+                selected_slot = slot;
+            }
+        }
+
+        if (selected_slot == kDeviceMoEInvalidSlot)
+            return false;
+
+        const auto &prior = local_transfer_slots[selected_slot];
+        plan.destination_slot = selected_slot;
+        plan.destination_previous_layer = prior.layer;
+        plan.destination_previous_expert = prior.expert;
+        plan.destination_generation = prior.generation;
+        rebalance_mark_transfer_slot_selected(selected_slot_words, selected_slot);
+        return true;
+    }
+
+    /**
+     * @brief Lease physical storage for one projected prefill LLEP arrival.
+     *
+     * Current-batch materialization owns only logical movement and compact
+     * collective payload numbering. Physical transfer-slot selection belongs
+     * here, on the destination participant, because this projection point sees
+     * the complete local directory and every layer's active runtime bank.
+     *
+     * Ordinary lease selection first preserves an existing copy of the same
+     * expert, then consumes empty or retired storage. If the bounded active
+     * cache is full, prefill may replace one remote-owned replica from the same
+     * layer only when that expert has no rows in the current device-owned
+     * assignment. Authoritative local experts and replicas used by the current
+     * grouped pass are never evictable.
+     */
+    __device__ __forceinline__ bool rebalance_lease_prefill_transfer_slot(
+        DeviceMoERebalancePlanEntryView &plan,
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfigView &config,
+        uint32_t *selected_slot_words)
+    {
+        if (rebalance_lease_local_transfer_slot(
+                plan,
+                runtime_layers,
+                local_transfer_slots,
+                local_transfer_slot_count,
+                config,
+                selected_slot_words))
+        {
+            return true;
+        }
+
+        if (!runtime_layers ||
+            !local_transfer_slots ||
+            !selected_slot_words ||
+            plan.layer >= config.num_layers)
+        {
+            return false;
+        }
+
+        const auto &target_runtime = runtime_layers[plan.layer];
+        if (target_runtime.active_bank > 1u ||
+            target_runtime.expert_count != config.num_experts ||
+            target_runtime.participant_id != config.participant_id ||
+            target_runtime.participant_count != config.participant_count)
+        {
+            return false;
+        }
+
+        const auto *spans =
+            static_cast<const llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentSpan *>(
+                target_runtime.reserved_ptrs[1]);
+        const uint32_t span_count =
+            target_runtime.reserved_u64[2] > 0xffffffffULL
+                ? 0xffffffffu
+                : static_cast<uint32_t>(target_runtime.reserved_u64[2]);
+        uint32_t selected_slot = kDeviceMoEInvalidSlot;
+        for (uint32_t slot_index = 0u;
+             slot_index < local_transfer_slot_count;
+             ++slot_index)
+        {
+            const auto &prior = local_transfer_slots[slot_index];
+            if (rebalance_transfer_slot_selected(
+                    selected_slot_words,
+                    slot_index) ||
+                !rebalance_transfer_slot_identity_ok(
+                    prior,
+                    slot_index,
+                    config) ||
+                prior.layer != plan.layer ||
+                prior.expert >= config.num_experts ||
+                !rebalance_transfer_slot_has_active_runtime_claim(
+                    prior,
+                    slot_index,
+                    runtime_layers,
+                    config) ||
+                prior.descriptor.owner_participant ==
+                    static_cast<int32_t>(config.participant_id))
+            {
+                continue;
+            }
+
+            bool assigned_locally = false;
+            for (uint32_t span_index = 0u;
+                 spans && span_index < span_count;
+                 ++span_index)
+            {
+                const auto &span = spans[span_index];
+                if (span.expert == prior.expert &&
+                    span.destination_participant == config.participant_id &&
+                    span.route_row_end > span.route_row_begin)
+                {
+                    assigned_locally = true;
+                    break;
+                }
+            }
+            if (!assigned_locally)
+            {
+                selected_slot = slot_index;
+                break;
+            }
+        }
+
+        if (selected_slot == kDeviceMoEInvalidSlot)
+            return false;
+
+        const auto &prior = local_transfer_slots[selected_slot];
+        plan.destination_slot = selected_slot;
+        plan.destination_previous_layer = prior.layer;
+        plan.destination_previous_expert = prior.expert;
+        plan.destination_generation = prior.generation;
+        rebalance_mark_transfer_slot_selected(
+            selected_slot_words,
+            selected_slot);
+        return true;
+    }
+
     __global__ void project_rebalance_domain_commands_kernel(
         const DeviceMoERebalancePlanEntryView *gathered_plan_entries,
         const DeviceMoERebalanceCommandBufferHeaderView *gathered_command_headers,
@@ -4644,14 +5431,20 @@ namespace
         DeviceMoERebalanceConfigView config,
         uint32_t command_buffer_count,
         const DeviceMoERebalanceWaveStateView *gathered_wave_states,
-        DeviceMoERebalanceWaveStateView *local_wave_states)
+        DeviceMoERebalanceWaveStateView *local_wave_states,
+        DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
+        uint32_t local_transfer_slot_count)
     {
         if (!gathered_plan_entries ||
             !gathered_command_headers ||
             !local_plan_entries ||
             !local_command_headers ||
+            !runtime_layers ||
+            !local_transfer_slots ||
             !rebalance_config_ok(config) ||
-            plan_capacity == 0u)
+            plan_capacity == 0u ||
+            local_transfer_slot_count == 0u)
         {
             return;
         }
@@ -4741,6 +5534,9 @@ namespace
          */
         if (threadIdx.x == 0)
         {
+            constexpr uint32_t kTransferSlotWordCount =
+                (kDeviceMoEMaxExperts + 31u) / 32u;
+            uint32_t selected_transfer_slot_words[kTransferSlotWordCount] = {};
             uint32_t total_command_count = 0u;
             uint32_t last_projected_epoch = 0u;
             uint32_t requested_by_source[kDeviceMoEMaxParticipants] = {};
@@ -4748,6 +5544,7 @@ namespace
             uint32_t payload_destination_participant_mask = 0u;
             uint64_t payload_edge_mask = 0ULL;
             uint32_t invalid_runtime_layers = 0u;
+            uint32_t destination_allocation_failures = 0u;
             for (uint32_t buffer_index = 0; buffer_index < metadata_buffer_count; ++buffer_index)
             {
                 uint32_t output_count = 0u;
@@ -4775,6 +5572,7 @@ namespace
                                 static_cast<unsigned long long>(plan_capacity) +
                             static_cast<unsigned long long>(plan_index);
                         const auto &plan = gathered_plan_entries[root_plan_index];
+                        DeviceMoERebalancePlanEntryView projected_plan = plan;
                         const bool source_in_range =
                             plan.source_participant < config.participant_count &&
                             plan.source_participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants);
@@ -4786,15 +5584,30 @@ namespace
                                 ? llaminar2::moe_rebalance_policy::participantBit(
                                       plan.source_participant)
                                 : 0u;
-                        const bool valid =
-                            rebalance_plan_requires_payload(plan.op) &&
+                        const uint32_t destination_participant_bit =
+                            destination_in_range
+                                ? llaminar2::moe_rebalance_policy::participantBit(
+                                      plan.destination_participant)
+                                : 0u;
+                        const bool common_fields_valid =
+                            rebalance_plan_applies_runtime(plan.op) &&
                             plan.layer < config.num_layers &&
                             plan.expert < config.num_experts &&
                             source_in_range &&
-                            destination_in_range &&
+                            destination_in_range;
+                        const bool payload_transfer_valid =
+                            rebalance_plan_requires_payload(plan.op) &&
                             plan.source_participant != plan.destination_participant &&
                             plan.payload_slot != kDeviceMoEInvalidSlot &&
                             (plan.source_resident_mask & source_participant_bit) != 0u;
+                        const bool resident_assignment_valid =
+                            plan.op == kDeviceMoERebalancePlanResidentExpertAssignment &&
+                            plan.payload_slot == kDeviceMoEInvalidSlot &&
+                            plan.destination_slot == kDeviceMoEInvalidSlot &&
+                            (plan.source_resident_mask & destination_participant_bit) != 0u;
+                        const bool valid =
+                            common_fields_valid &&
+                            (payload_transfer_valid || resident_assignment_valid);
                         if (!valid)
                         {
                             ++invalid_runtime_layers;
@@ -4806,30 +5619,67 @@ namespace
                             continue;
                         }
 
+                        if (rebalance_plan_requires_payload(plan.op) &&
+                            plan.destination_participant == config.participant_id &&
+                            !rebalance_lease_local_transfer_slot(
+                                projected_plan,
+                                runtime_layers,
+                                local_transfer_slots,
+                                local_transfer_slot_count,
+                                config,
+                                selected_transfer_slot_words))
+                        {
+                            /*
+                             * Preserve the domain command so source payload
+                             * numbering remains identical on every participant,
+                             * but make destination failure explicit. The
+                             * mandatory status/apply gates will terminate the
+                             * wave before any runtime publication.
+                             */
+                            projected_plan.destination_slot =
+                                kDeviceMoEInvalidSlot;
+                            projected_plan.destination_previous_layer =
+                                kDeviceMoEInvalidSlot;
+                            projected_plan.destination_previous_expert =
+                                kDeviceMoEInvalidSlot;
+                            projected_plan.destination_generation = 0u;
+                            ++invalid_runtime_layers;
+                            ++destination_allocation_failures;
+                        }
+
                         const unsigned long long local_plan_index =
                             static_cast<unsigned long long>(buffer_index) *
                                 static_cast<unsigned long long>(plan_capacity) +
                             static_cast<unsigned long long>(output_count);
-                        local_plan_entries[local_plan_index] = plan;
+                        local_plan_entries[local_plan_index] = projected_plan;
                         ++output_count;
                         ++total_command_count;
 
-                        const uint32_t requested = plan.payload_slot + 1u;
-                        if (requested_by_source[plan.source_participant] < requested)
-                            requested_by_source[plan.source_participant] = requested;
-                        if (buffer_requested_by_source[plan.source_participant] < requested)
-                            buffer_requested_by_source[plan.source_participant] = requested;
-                        payload_source_participant_mask |=
-                            llaminar2::moe_rebalance_policy::participantBit(
-                                plan.source_participant);
-                        payload_destination_participant_mask |=
-                            llaminar2::moe_rebalance_policy::participantBit(
-                                plan.destination_participant);
-                        payload_edge_mask |=
-                            llaminar2::moe_rebalance_policy::directedParticipantEdgeBit(
-                                plan.source_participant,
-                                plan.destination_participant,
-                                static_cast<uint32_t>(kDeviceMoEMaxParticipants));
+                        /*
+                         * ResidentExpertAssignment is metadata-only: the
+                         * destination already owns the descriptor and bytes.
+                         * Retain it in the apply buffer, but never let it
+                         * inflate payload bucket sizing or collective edges.
+                         */
+                        if (rebalance_plan_requires_payload(plan.op))
+                        {
+                            const uint32_t requested = plan.payload_slot + 1u;
+                            if (requested_by_source[plan.source_participant] < requested)
+                                requested_by_source[plan.source_participant] = requested;
+                            if (buffer_requested_by_source[plan.source_participant] < requested)
+                                buffer_requested_by_source[plan.source_participant] = requested;
+                            payload_source_participant_mask |=
+                                llaminar2::moe_rebalance_policy::participantBit(
+                                    plan.source_participant);
+                            payload_destination_participant_mask |=
+                                llaminar2::moe_rebalance_policy::participantBit(
+                                    plan.destination_participant);
+                            payload_edge_mask |=
+                                llaminar2::moe_rebalance_policy::directedParticipantEdgeBit(
+                                    plan.source_participant,
+                                    plan.destination_participant,
+                                    static_cast<uint32_t>(kDeviceMoEMaxParticipants));
+                        }
                     }
                 }
 
@@ -4895,6 +5745,13 @@ namespace
                     status->windows_observed = max(status->windows_observed, 1u);
                     status->planned_arrivals = total_command_count;
                     status->invalid_runtime_layers += invalid_runtime_layers;
+                    status->capacity_limited_candidates +=
+                        destination_allocation_failures;
+                    if (destination_allocation_failures != 0u)
+                    {
+                        status->plan_overflow = 1u;
+                        status->payload_bucket_overflow = 1u;
+                    }
                     if (total_command_count != 0u)
                     {
                         status->windows_applied = max(status->windows_applied, 1u);
@@ -4908,7 +5765,11 @@ namespace
                     status->payload_bucket_requested_slots = requested_payload_slots;
                     status->payload_bucket_slots = payload_bucket_slots;
                     status->payload_bucket_index = payload_bucket_index;
-                    status->payload_bucket_overflow = payload_bucket_overflow;
+                    status->payload_bucket_overflow =
+                        payload_bucket_overflow != 0u ||
+                                destination_allocation_failures != 0u
+                            ? 1u
+                            : 0u;
                     status->payload_source_participant_mask = payload_source_participant_mask;
                     status->payload_destination_participant_mask =
                         payload_destination_participant_mask;
@@ -4928,7 +5789,10 @@ namespace
         DeviceMoERebalanceStatusView *status,
         uint32_t payload_slot_capacity,
         DeviceMoERebalanceConfigView config,
-        uint32_t command_buffer_count)
+        uint32_t command_buffer_count,
+        DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
+        uint32_t local_transfer_slot_count)
     {
         if (!gathered_plan_entries ||
             !gathered_command_headers ||
@@ -4936,9 +5800,12 @@ namespace
             !local_plan_count ||
             !local_command_headers ||
             !status ||
+            !runtime_layers ||
+            !local_transfer_slots ||
             !rebalance_config_ok(config) ||
             plan_capacity == 0u ||
-            payload_slot_capacity == 0u)
+            payload_slot_capacity == 0u ||
+            local_transfer_slot_count == 0u)
         {
             return;
         }
@@ -4993,6 +5860,16 @@ namespace
              prior_status.version == kDeviceMoERebalanceVersion)
                 ? prior_status.payload_bucket_overflow
                 : 0u;
+        projected_status.capacity_limited_candidates =
+            (prior_status.magic == kDeviceMoERebalanceMagic &&
+             prior_status.version == kDeviceMoERebalanceVersion)
+                ? prior_status.capacity_limited_candidates
+                : 0u;
+        projected_status.prefill_active_transfer_slot_experts =
+            (prior_status.magic == kDeviceMoERebalanceMagic &&
+             prior_status.version == kDeviceMoERebalanceVersion)
+                ? prior_status.prefill_active_transfer_slot_experts
+                : 0u;
 
         uint32_t total_command_count = 0u;
         uint32_t last_epoch = 0u;
@@ -5000,13 +5877,16 @@ namespace
         uint32_t payload_source_participant_mask = 0u;
         uint32_t payload_destination_participant_mask = 0u;
         uint64_t payload_edge_mask = 0ULL;
+        constexpr uint32_t kLocalTransferSlotWordCount =
+            (kDeviceMoEMaxExperts + 31u) / 32u;
+        uint32_t selected_local_transfer_slot_words
+            [kLocalTransferSlotWordCount] = {};
 
         for (uint32_t buffer_index = 0u;
              buffer_index < metadata_buffer_count;
              ++buffer_index)
         {
             uint32_t source_payload_counts[kDeviceMoEMaxParticipants] = {};
-            uint32_t destination_slot_counts[kDeviceMoEMaxParticipants] = {};
             uint32_t output_count = 0u;
             uint32_t buffer_epoch = 0u;
 
@@ -5063,8 +5943,8 @@ namespace
                     }
 
                     if (output_count >= plan_capacity ||
-                        source_payload_counts[plan.source_participant] >= payload_slot_capacity ||
-                        destination_slot_counts[plan.destination_participant] >= payload_slot_capacity)
+                        source_payload_counts[plan.source_participant] >=
+                            payload_slot_capacity)
                     {
                         projected_status.plan_overflow = 1u;
                         projected_status.payload_bucket_overflow = 1u;
@@ -5072,8 +5952,34 @@ namespace
                     }
 
                     DeviceMoERebalancePlanEntryView projected = plan;
-                    projected.destination_slot =
-                        destination_slot_counts[plan.destination_participant]++;
+                    /*
+                     * The gathered command is logical: its destination slot is
+                     * not a physical allocation. Only the destination
+                     * participant can lease stable VRAM because only that
+                     * participant sees the complete local directory and all
+                     * active runtime-bank claims.
+                     */
+                    projected.destination_slot = kDeviceMoEInvalidSlot;
+                    projected.destination_previous_layer =
+                        kDeviceMoEInvalidSlot;
+                    projected.destination_previous_expert =
+                        kDeviceMoEInvalidSlot;
+                    projected.destination_generation = 0u;
+                    if (projected.destination_participant ==
+                            config.participant_id &&
+                        !rebalance_lease_prefill_transfer_slot(
+                            projected,
+                            runtime_layers,
+                            local_transfer_slots,
+                            local_transfer_slot_count,
+                            config,
+                            selected_local_transfer_slot_words))
+                    {
+                        projected_status.plan_overflow = 1u;
+                        projected_status.payload_bucket_overflow = 1u;
+                        ++projected_status.capacity_limited_candidates;
+                        ++projected_status.invalid_runtime_layers;
+                    }
                     projected.payload_slot =
                         source_payload_counts[plan.source_participant]++;
 
@@ -5154,7 +6060,6 @@ namespace
         uint32_t command_buffer_count)
     {
         __shared__ uint32_t source_payload_counts[kDeviceMoEMaxParticipants];
-        __shared__ uint32_t destination_slot_counts[kDeviceMoEMaxParticipants];
         __shared__ uint32_t compact_command_count;
         __shared__ uint32_t overflow;
         __shared__ uint32_t valid;
@@ -5166,6 +6071,9 @@ namespace
         __shared__ uint32_t shared_transfer_experts[kThreads];
         __shared__ uint32_t shared_transfer_sources[kThreads];
         __shared__ uint32_t shared_transfer_destinations[kThreads];
+        __shared__ uint32_t shared_transfer_valid[kThreads];
+        __shared__ uint32_t shared_transfer_output_indices[kThreads];
+        __shared__ uint32_t shared_transfer_payload_slots[kThreads];
 
         const uint32_t lane = threadIdx.x;
         const uint32_t metadata_buffer_count =
@@ -5176,7 +6084,6 @@ namespace
              participant += blockDim.x)
         {
             source_payload_counts[participant] = 0u;
-            destination_slot_counts[participant] = 0u;
         }
 
         for (uint32_t idx = lane; idx < metadata_buffer_count; idx += blockDim.x)
@@ -5218,6 +6125,8 @@ namespace
                 status &&
                 rebalance_config_ok(config) &&
                 payload_slot_capacity > 0u &&
+                payload_slot_capacity <=
+                    static_cast<uint32_t>(kDeviceMoEMaxExperts) &&
                 plan_capacity > 0u &&
                 layer_idx < config.num_layers &&
                 runtime->active_bank <= 1u &&
@@ -5249,10 +6158,9 @@ namespace
         const auto *transfers =
             static_cast<const llaminar2::least_loaded_ep::LeastLoadedExpertWeightTransfer *>(
                 runtime->reserved_ptrs[2]);
+        const auto &active_bank = runtime->banks[runtime->active_bank];
 
-        if (transfer_count <= plan_capacity &&
-            transfer_count <= payload_slot_capacity &&
-            transfer_count <= static_cast<uint32_t>(blockDim.x))
+        if (transfer_count <= static_cast<uint32_t>(blockDim.x))
         {
             if (lane < transfer_count)
             {
@@ -5263,85 +6171,109 @@ namespace
             }
             __syncthreads();
 
-            for (uint32_t transfer_idx = lane; transfer_idx < transfer_count; transfer_idx += blockDim.x)
+            if (lane == 0u)
             {
-                const uint32_t transfer_expert = shared_transfer_experts[transfer_idx];
-                const uint32_t transfer_source = shared_transfer_sources[transfer_idx];
-                const uint32_t transfer_destination = shared_transfer_destinations[transfer_idx];
-                uint32_t resident_mask = 0u;
-                if (runtime->active_bank <= 1u &&
-                    transfer_expert < static_cast<uint32_t>(kDeviceMoEMaxExperts))
+                for (uint32_t transfer_idx = 0u;
+                     transfer_idx < transfer_count;
+                     ++transfer_idx)
                 {
-                    resident_mask =
-                        runtime->banks[runtime->active_bank]
-                            .resident_participant_mask[transfer_expert];
-                }
-                const uint32_t transfer_source_bit =
-                    llaminar2::moe_rebalance_policy::participantBit(
-                        transfer_source);
-                const bool transfer_valid =
-                    transfer_expert < config.num_experts &&
-                    transfer_source < config.participant_count &&
-                    transfer_destination < config.participant_count &&
-                    transfer_source < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
-                    transfer_destination < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
-                    transfer_source != transfer_destination &&
-                    (resident_mask & transfer_source_bit) != 0u;
-                if (!transfer_valid)
-                {
-                    atomicOr(&overflow, 1u);
-                    continue;
-                }
+                    shared_transfer_valid[transfer_idx] = 0u;
+                    shared_transfer_output_indices[transfer_idx] =
+                        kDeviceMoEInvalidSlot;
+                    shared_transfer_payload_slots[transfer_idx] =
+                        kDeviceMoEInvalidSlot;
 
-                uint32_t output_idx = 0u;
-                uint32_t destination_slot = 0u;
-                uint32_t payload_slot = 0u;
-                for (uint32_t prev_idx = 0u; prev_idx < transfer_idx; ++prev_idx)
-                {
-                    const uint32_t prev_expert = shared_transfer_experts[prev_idx];
-                    const uint32_t prev_source = shared_transfer_sources[prev_idx];
-                    const uint32_t prev_destination = shared_transfer_destinations[prev_idx];
-                    const bool prev_valid =
-                        prev_expert < config.num_experts &&
-                        prev_source < config.participant_count &&
-                        prev_destination < config.participant_count &&
-                        prev_source < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
-                        prev_destination < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
-                        prev_source != prev_destination;
-                    if (!prev_valid)
+                    const uint32_t transfer_expert =
+                        shared_transfer_experts[transfer_idx];
+                    const uint32_t transfer_source =
+                        shared_transfer_sources[transfer_idx];
+                    const uint32_t transfer_destination =
+                        shared_transfer_destinations[transfer_idx];
+                    uint32_t resident_mask = 0u;
+                    if (transfer_expert <
+                        static_cast<uint32_t>(kDeviceMoEMaxExperts))
+                    {
+                        resident_mask =
+                            active_bank
+                                .resident_participant_mask[transfer_expert];
+                    }
+                    const uint32_t transfer_source_bit =
+                        llaminar2::moe_rebalance_policy::participantBit(
+                            transfer_source);
+                    const bool transfer_valid =
+                        transfer_expert < config.num_experts &&
+                        transfer_source < config.participant_count &&
+                        transfer_destination < config.participant_count &&
+                        transfer_source <
+                            static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
+                        transfer_destination <
+                            static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
+                        transfer_source != transfer_destination &&
+                        (resident_mask & transfer_source_bit) != 0u;
+                    if (!transfer_valid ||
+                        compact_command_count >= plan_capacity)
+                    {
+                        overflow = 1u;
                         continue;
-                    ++output_idx;
-                    if (prev_destination == transfer_destination)
-                        ++destination_slot;
-                    if (prev_source == transfer_source)
-                        ++payload_slot;
-                }
+                    }
 
+                    const uint32_t payload_slot =
+                        source_payload_counts[transfer_source];
+                    if (payload_slot >= payload_slot_capacity)
+                    {
+                        overflow = 1u;
+                        continue;
+                    }
+                    ++source_payload_counts[transfer_source];
+
+                    shared_transfer_valid[transfer_idx] = 1u;
+                    shared_transfer_output_indices[transfer_idx] =
+                        compact_command_count++;
+                    shared_transfer_payload_slots[transfer_idx] =
+                        payload_slot;
+                    fast_payload_source_participant_mask |=
+                        llaminar2::moe_rebalance_policy::participantBit(
+                            transfer_source);
+                    fast_payload_destination_participant_mask |=
+                        llaminar2::moe_rebalance_policy::participantBit(
+                            transfer_destination);
+                    fast_payload_edge_mask |=
+                        static_cast<unsigned long long>(
+                            llaminar2::moe_rebalance_policy::directedParticipantEdgeBit(
+                                transfer_source,
+                                transfer_destination,
+                                static_cast<uint32_t>(
+                                    kDeviceMoEMaxParticipants)));
+                }
+            }
+            __syncthreads();
+
+            for (uint32_t transfer_idx = lane;
+                 transfer_idx < transfer_count;
+                 transfer_idx += blockDim.x)
+            {
+                if (shared_transfer_valid[transfer_idx] == 0u)
+                    continue;
+
+                const uint32_t transfer_expert =
+                    shared_transfer_experts[transfer_idx];
+                const uint32_t transfer_source =
+                    shared_transfer_sources[transfer_idx];
+                const uint32_t transfer_destination =
+                    shared_transfer_destinations[transfer_idx];
                 DeviceMoERebalancePlanEntryView entry{};
                 entry.op = kDeviceMoERebalancePlanExpertPayloadArrival;
                 entry.layer = layer_idx;
                 entry.expert = transfer_expert;
                 entry.source_participant = transfer_source;
                 entry.destination_participant = transfer_destination;
-                entry.source_resident_mask = resident_mask;
-                entry.destination_slot = destination_slot;
-                entry.payload_slot = payload_slot;
-                plan_entries[output_idx] = entry;
-                atomicMax(source_payload_counts + transfer_source, payload_slot + 1u);
-                atomicOr(
-                    &fast_payload_source_participant_mask,
-                    llaminar2::moe_rebalance_policy::participantBit(transfer_source));
-                atomicOr(
-                    &fast_payload_destination_participant_mask,
-                    llaminar2::moe_rebalance_policy::participantBit(transfer_destination));
-                atomicOr(
-                    &fast_payload_edge_mask,
-                    static_cast<unsigned long long>(
-                        llaminar2::moe_rebalance_policy::directedParticipantEdgeBit(
-                            transfer_source,
-                            transfer_destination,
-                            static_cast<uint32_t>(kDeviceMoEMaxParticipants))));
-                atomicAdd(&compact_command_count, 1u);
+                entry.source_resident_mask =
+                    active_bank.resident_participant_mask[transfer_expert];
+                entry.destination_slot = kDeviceMoEInvalidSlot;
+                entry.payload_slot =
+                    shared_transfer_payload_slots[transfer_idx];
+                plan_entries[
+                    shared_transfer_output_indices[transfer_idx]] = entry;
             }
             __syncthreads();
 
@@ -5396,132 +6328,24 @@ namespace
 
         if (lane == 0u)
         {
-            for (uint32_t transfer_idx = 0u; transfer_idx < transfer_count; ++transfer_idx)
-            {
-                const auto transfer = transfers[transfer_idx];
-                uint32_t resident_mask = 0u;
-                if (runtime->active_bank <= 1u &&
-                    transfer.expert < static_cast<uint32_t>(kDeviceMoEMaxExperts))
-                {
-                    resident_mask =
-                        runtime->banks[runtime->active_bank]
-                            .resident_participant_mask[transfer.expert];
-                }
-                const uint32_t transfer_source_bit =
-                    llaminar2::moe_rebalance_policy::participantBit(
-                        transfer.source_participant);
-                const bool transfer_valid =
-                    transfer.expert < config.num_experts &&
-                    transfer.source_participant < config.participant_count &&
-                    transfer.destination_participant < config.participant_count &&
-                    transfer.source_participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
-                    transfer.destination_participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
-                    transfer.source_participant != transfer.destination_participant &&
-                    (resident_mask & transfer_source_bit) != 0u;
-                if (!transfer_valid)
-                {
-                    ++overflow;
-                    continue;
-                }
-
-                const uint32_t destination_slot =
-                    destination_slot_counts[transfer.destination_participant]++;
-                const uint32_t payload_slot =
-                    source_payload_counts[transfer.source_participant]++;
-                if (destination_slot >= payload_slot_capacity ||
-                    payload_slot >= payload_slot_capacity)
-                {
-                    ++overflow;
-                    continue;
-                }
-
-                const uint32_t output_idx = compact_command_count++;
-                if (output_idx >= plan_capacity)
-                {
-                    ++overflow;
-                    continue;
-                }
-
-                DeviceMoERebalancePlanEntryView entry{};
-                entry.op = kDeviceMoERebalancePlanExpertPayloadArrival;
-                entry.layer = layer_idx;
-                entry.expert = transfer.expert;
-                entry.source_participant = transfer.source_participant;
-                entry.destination_participant = transfer.destination_participant;
-                entry.source_resident_mask = resident_mask;
-                entry.destination_slot = destination_slot;
-                entry.payload_slot = payload_slot;
-                plan_entries[output_idx] = entry;
-            }
-
-            const uint32_t command_count =
-                compact_command_count < plan_capacity
-                    ? compact_command_count
-                    : plan_capacity;
-            *plan_count = command_count;
-            command_headers[0].command_count = command_count;
+            /*
+             * A single layer cannot request more distinct expert transfers
+             * than the runtime's compile-time expert inventory. Treat any
+             * larger count as corrupt device-owned planning state. There is no
+             * serial or partial-plan fallback because publishing a subset
+             * would make the assignment spans and payload wave disagree.
+             */
+            *plan_count = 0u;
+            command_headers[0].command_count = 0u;
             command_headers[0].epoch = runtime ? runtime->active_epoch : 0u;
-
-            uint32_t requested_by_source[kDeviceMoEMaxParticipants] = {};
-            uint32_t requested_payload_slots = 0u;
-            uint32_t payload_source_participant_mask = 0u;
-            uint32_t payload_destination_participant_mask = 0u;
-            uint64_t payload_edge_mask = 0ULL;
-            for (uint32_t idx = 0u; idx < command_count; ++idx)
-            {
-                const auto &entry = plan_entries[idx];
-                const uint32_t requested = entry.payload_slot + 1u;
-                if (entry.source_participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
-                    requested_by_source[entry.source_participant] < requested)
-                {
-                    requested_by_source[entry.source_participant] = requested;
-                }
-                payload_source_participant_mask |=
-                    llaminar2::moe_rebalance_policy::participantBit(
-                        entry.source_participant);
-                payload_destination_participant_mask |=
-                    llaminar2::moe_rebalance_policy::participantBit(
-                        entry.destination_participant);
-                payload_edge_mask |=
-                    llaminar2::moe_rebalance_policy::directedParticipantEdgeBit(
-                        entry.source_participant,
-                        entry.destination_participant,
-                        static_cast<uint32_t>(kDeviceMoEMaxParticipants));
-            }
-            for (uint32_t participant = 0u;
-                 participant < config.participant_count &&
-                 participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants);
-                 ++participant)
-            {
-                if (requested_payload_slots < requested_by_source[participant])
-                    requested_payload_slots = requested_by_source[participant];
-            }
-            const uint32_t payload_bucket_slots =
-                llaminar2::moe_rebalance_policy::payloadBucketSlots(
-                    requested_payload_slots,
-                    payload_slot_capacity);
-
             status->last_epoch = command_headers[0].epoch;
-            status->planned_arrivals = command_count;
-            status->plan_overflow =
-                overflow != 0u || transfer_count > command_count ? 1u : 0u;
-            status->payload_bucket_requested_slots = requested_payload_slots;
-            status->payload_bucket_slots = payload_bucket_slots;
-            status->payload_bucket_index =
-                llaminar2::moe_rebalance_policy::payloadBucketIndex(
-                    payload_bucket_slots);
-            status->payload_bucket_overflow =
-                requested_payload_slots > payload_bucket_slots ||
-                        status->plan_overflow != 0u
-                    ? 1u
-                    : 0u;
-            status->payload_source_participant_mask =
-                payload_source_participant_mask;
-            status->payload_destination_participant_mask =
-                payload_destination_participant_mask;
-            status->payload_edge_mask = payload_edge_mask;
+            status->planned_arrivals = 0u;
+            status->plan_overflow = 1u;
+            status->payload_bucket_overflow = 1u;
             status->llep_assignment_span_count = span_count;
             status->llep_weight_transfer_count = transfer_count;
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "LLEP transfer inventory exceeds the device expert capacity");
         }
     }
 
@@ -6034,11 +6858,25 @@ namespace
                 const auto &plan = plan_entries[plan_index];
                 if (plan.op == 0u)
                     continue;
-                if (!rebalance_plan_requires_payload(plan.op) ||
+                if (!rebalance_plan_applies_runtime(plan.op) ||
                     plan.layer >= config.num_layers ||
                     plan.expert >= config.num_experts ||
                     plan.source_participant >= config.participant_count ||
-                    (plan.source_resident_mask &
+                    plan.destination_participant >= config.participant_count)
+                {
+                    atomicAdd(&status->invalid_plan_entries, 1u);
+                    continue;
+                }
+
+                /*
+                 * ResidentExpertAssignment is already fully represented by
+                 * command metadata. It must reach the apply kernel, but this
+                 * byte-unpack phase has no payload work to validate or copy.
+                 */
+                if (!rebalance_plan_requires_payload(plan.op))
+                    continue;
+
+                if ((plan.source_resident_mask &
                      runtime_participant_bit(static_cast<int>(plan.source_participant))) == 0u)
                 {
                     atomicAdd(&status->invalid_plan_entries, 1u);
@@ -6107,6 +6945,50 @@ namespace
         const unsigned long long payload_data_bytes =
             payload_slot_bytes - sizeof(DeviceMoEExpertDirectoryEntryView);
         auto &dst = local_transfer_slots[destination_slot];
+
+        __shared__ uint32_t shared_arrival_valid;
+        if (threadIdx.x == 0)
+        {
+            shared_arrival_valid = 1u;
+            const bool lease_matches =
+                plan.destination_generation != 0xffffffffu &&
+                dst.generation == plan.destination_generation &&
+                dst.layer == plan.destination_previous_layer &&
+                dst.expert == plan.destination_previous_expert &&
+                rebalance_transfer_slot_identity_ok(
+                    dst,
+                    destination_slot,
+                    config);
+            if (!lease_matches)
+            {
+                shared_arrival_valid = 0u;
+                atomicAdd(&status->descriptor_mismatches, 1u);
+            }
+            else if (!rebalance_source_entry_ready(
+                         src,
+                         plan.source_participant,
+                         plan.layer,
+                         plan.expert))
+            {
+                shared_arrival_valid = 0u;
+                atomicAdd(&status->missing_source_descriptors, 1u);
+            }
+            else if (!rebalance_directory_fits_transfer_capacity(src, dst) ||
+                     rebalance_expert_payload_bytes(src) > payload_data_bytes)
+            {
+                shared_arrival_valid = 0u;
+                atomicAdd(&status->descriptor_mismatches, 1u);
+            }
+        }
+        __syncthreads();
+        if (shared_arrival_valid == 0u)
+            return;
+
+        /*
+         * Destructive mutation begins only after the complete source, capacity,
+         * and generation lease have been validated. A malformed or stale
+         * arrival therefore leaves the previous directory publication intact.
+         */
         if (threadIdx.x == 0)
         {
             dst.layer = kDeviceMoEInvalidSlot;
@@ -6118,25 +7000,9 @@ namespace
         }
         __syncthreads();
 
-        if (!rebalance_source_entry_ready(src, plan.source_participant, plan.layer, plan.expert))
-        {
-            if (threadIdx.x == 0)
-                atomicAdd(&status->missing_source_descriptors, 1u);
-            return;
-        }
-        if (!rebalance_transfer_slot_ready(dst, config.participant_id, plan.layer, plan.expert))
-        {
-            if (threadIdx.x == 0)
-                atomicAdd(&status->missing_destination_slots, 1u);
-            return;
-        }
-        if (!rebalance_directory_compatible(src, dst) ||
-            rebalance_expert_payload_bytes(src) > payload_data_bytes)
-        {
-            if (threadIdx.x == 0)
-                atomicAdd(&status->descriptor_mismatches, 1u);
-            return;
-        }
+        if (threadIdx.x == 0)
+            rebalance_retarget_transfer_directory(dst, src);
+        __syncthreads();
 
         unsigned long long offset = 0ULL;
         const uint8_t *payload_data = payload_slot + sizeof(DeviceMoEExpertDirectoryEntryView);
@@ -6156,10 +7022,115 @@ namespace
             dst.descriptor.owner_participant = src.descriptor.owner_participant;
             dst.descriptor.flags |= kDeviceMoEFlagTransferSlot;
             dst.resident_mask |= runtime_participant_bit(static_cast<int>(config.participant_id));
+            dst.epoch = command_header ? command_header->epoch : 0u;
+            dst.generation = plan.destination_generation + 1u;
             dst.flags |= kDeviceMoEDirectoryFlagResident |
                          kDeviceMoEDirectoryFlagCopyComplete;
             atomicAdd(&status->copied_arrivals, 1u);
         }
+    }
+
+    /**
+     * @brief Report whether a ready local arrival replaces an expert's slot.
+     *
+     * Transfer-directory allocations are stable, but their logical expert
+     * contents are not. Runtime publication must therefore remove the exact
+     * previous logical occupant stamped into the destination lease whenever a
+     * ready arrival reuses the same stable `local_slot`.  Looking up the prior
+     * identity from the post-copy directory is too late: that directory already
+     * names the new expert.
+     *
+     * @param plans                 Current device-owned rebalance plan.
+     * @param plan_count            Number of entries in @p plans.
+     * @param transfer_slots        Destination transfer directory.
+     * @param transfer_slot_count  Number of stable destination slots.
+     * @param config                Participant and model geometry.
+     * @param layer                 Runtime layer being rebuilt.
+     * @param expert                Existing logical expert under inspection.
+     * @param descriptor            Existing expert descriptor.
+     * @return true when another expert's ready arrival owns the same slot.
+     */
+    __device__ __forceinline__ bool
+    rebalance_ready_arrival_reuses_runtime_slot(
+        const DeviceMoERebalancePlanEntryView *plans,
+        uint32_t plan_count,
+        const DeviceMoEExpertDirectoryEntryView *transfer_slots,
+        uint32_t transfer_slot_count,
+        const DeviceMoERebalanceConfigView &config,
+        uint32_t command_epoch,
+        uint32_t layer,
+        uint32_t expert,
+        const DeviceMoEExpertDescriptorView &descriptor)
+    {
+        if (!plans ||
+            !transfer_slots ||
+            descriptor.local_slot < 0 ||
+            (descriptor.flags & kDeviceMoEFlagTransferSlot) == 0u)
+        {
+            return false;
+        }
+
+        for (uint32_t plan_index = 0u;
+             plan_index < plan_count;
+             ++plan_index)
+        {
+            const auto &plan = plans[plan_index];
+            if (plan.destination_previous_layer != layer ||
+                plan.destination_previous_expert != expert ||
+                (plan.layer == layer && plan.expert == expert) ||
+                plan.expert >= config.num_experts ||
+                plan.destination_participant != config.participant_id ||
+                !rebalance_plan_requires_payload(plan.op) ||
+                plan.destination_slot >= transfer_slot_count)
+            {
+                continue;
+            }
+
+            const auto &slot = transfer_slots[plan.destination_slot];
+            if (slot.descriptor.local_slot == descriptor.local_slot &&
+                rebalance_transfer_slot_copy_complete_for_plan(
+                    slot,
+                    plan,
+                    config.participant_id,
+                    command_epoch))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @brief Retire a cached replica whose stable transfer slot was reused.
+     *
+     * The logical descriptor remains in the runtime inventory so its owner and
+     * resident-domain metadata continue to describe the expert, but it no
+     * longer advertises any local payload pointer or compute eligibility.
+     * Authoritative local copies are never evictable: seeing one here means the
+     * materializer violated its protection contract and is fatal.
+     */
+    __device__ __forceinline__ void
+    rebalance_retire_reused_transfer_slot_replica(
+        DeviceMoEExpertDescriptorView &descriptor,
+        uint32_t &resident_mask,
+        uint32_t local_participant_bit,
+        uint32_t local_participant)
+    {
+        if (descriptor.owner_participant ==
+            static_cast<int32_t>(local_participant))
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "LLEP arrival attempted to overwrite an authoritative local transfer slot");
+        }
+
+        resident_mask &= ~local_participant_bit;
+        descriptor.local_slot = -1;
+        descriptor.flags &=
+            ~(kDeviceMoEFlagValid |
+              kDeviceMoEFlagResident |
+              kDeviceMoEFlagReplicated |
+              kDeviceMoEFlagLocalCompute |
+              kDeviceMoEFlagTransferSlot);
     }
 
     __global__ void apply_rebalance_arrivals_kernel(
@@ -6238,6 +7209,15 @@ namespace
                     shared_ready_wave_index = ready.wave_index;
                     if (!shared_ready_wave)
                     {
+                        /*
+                         * An empty ready-wave poll is a successful no-op.  The
+                         * status was initialized to InProgress above so a real
+                         * asynchronous apply can never look complete early;
+                         * publish Ok before returning when there is no wave to
+                         * consume so terminal diagnostics do not mistake an
+                         * idle poll for unfinished device work.
+                         */
+                        status->status_code = 0u;
                         setup_ok = false;
                     }
                     else
@@ -6259,9 +7239,15 @@ namespace
                 status->status_code = 1u;
                 if (shared_ready_wave)
                 {
-                    shared_ready_wave->error_code = 1u;
-                    shared_ready_wave->state = kDeviceMoERebalanceLifecycleError;
-                    controller_state->last_error_code = 1u;
+                    poison_rebalance_graph_controller(
+                        controller_state,
+                        1u,
+                        shared_ready_wave_index,
+                        shared_ready_wave->epoch,
+                        0u,
+                        0u,
+                        status->status_code,
+                        config.participant_id);
                 }
                 setup_ok = false;
             }
@@ -6270,9 +7256,15 @@ namespace
                 status->status_code = 2u;
                 if (shared_ready_wave)
                 {
-                    shared_ready_wave->error_code = 2u;
-                    shared_ready_wave->state = kDeviceMoERebalanceLifecycleError;
-                    controller_state->last_error_code = 2u;
+                    poison_rebalance_graph_controller(
+                        controller_state,
+                        2u,
+                        shared_ready_wave_index,
+                        shared_ready_wave->epoch,
+                        0u,
+                        0u,
+                        status->status_code,
+                        config.participant_id);
                 }
                 setup_ok = false;
             }
@@ -6283,9 +7275,15 @@ namespace
                 status->status_code = 3u;
                 if (shared_ready_wave)
                 {
-                    shared_ready_wave->error_code = 3u;
-                    shared_ready_wave->state = kDeviceMoERebalanceLifecycleError;
-                    controller_state->last_error_code = 3u;
+                    poison_rebalance_graph_controller(
+                        controller_state,
+                        3u,
+                        shared_ready_wave_index,
+                        shared_ready_wave->epoch,
+                        0u,
+                        0u,
+                        status->status_code,
+                        config.participant_id);
                 }
                 setup_ok = false;
             }
@@ -6356,7 +7354,11 @@ namespace
                     }
 
                     const auto &slot = local_transfer_slots[plan.destination_slot];
-                    if (!rebalance_transfer_slot_copy_complete(slot, config.participant_id, plan.layer, plan.expert))
+                    if (!rebalance_transfer_slot_copy_complete_for_plan(
+                            slot,
+                            plan,
+                            config.participant_id,
+                            shared_command_header ? shared_command_header->epoch : 0u))
                     {
                         ++status->copy_incomplete;
                         continue;
@@ -6376,6 +7378,15 @@ namespace
                 }
 
                 changed_layer[plan.layer] = 1u;
+                if (destination_local &&
+                    rebalance_plan_requires_payload(plan.op) &&
+                    plan.destination_previous_layer < config.num_layers &&
+                    plan.destination_previous_expert < config.num_experts &&
+                    (plan.destination_previous_layer != plan.layer ||
+                     plan.destination_previous_expert != plan.expert))
+                {
+                    changed_layer[plan.destination_previous_layer] = 1u;
+                }
             }
         }
         __syncthreads();
@@ -6395,8 +7406,10 @@ namespace
             {
                 next.epoch = runtime.active_epoch + 1u;
                 next.expert_count = config.num_experts;
-                next.reserved[0] = active.reserved[0];
-                next.reserved[1] = active.reserved[1];
+                next.multi_resident_expert_count =
+                    active.multi_resident_expert_count;
+                next.transient_placement_observed =
+                    active.transient_placement_observed;
             }
             for (uint32_t expert = threadIdx.x; expert < config.num_experts; expert += blockDim.x)
             {
@@ -6404,6 +7417,23 @@ namespace
                 auto &base_desc = next.experts[expert];
                 uint32_t resident_mask =
                     active.resident_participant_mask[expert] & shared_valid_mask;
+                if (rebalance_ready_arrival_reuses_runtime_slot(
+                        shared_plan_entries,
+                        shared_count,
+                        local_transfer_slots,
+                        local_transfer_slot_count,
+                        config,
+                        shared_command_header ? shared_command_header->epoch : 0u,
+                        layer,
+                        expert,
+                        base_desc))
+                {
+                    rebalance_retire_reused_transfer_slot_replica(
+                        base_desc,
+                        resident_mask,
+                        shared_participant_bit,
+                        config.participant_id);
+                }
                 const bool owner_local =
                     base_desc.owner_participant == static_cast<int32_t>(config.participant_id);
                 const bool local_resident = (resident_mask & shared_participant_bit) != 0u;
@@ -6486,7 +7516,11 @@ namespace
                         plan.destination_slot >= local_transfer_slot_count)
                         continue;
                     const auto &slot = local_transfer_slots[plan.destination_slot];
-                    if (!rebalance_transfer_slot_copy_complete(slot, config.participant_id, plan.layer, plan.expert))
+                    if (!rebalance_transfer_slot_copy_complete_for_plan(
+                            slot,
+                            plan,
+                            config.participant_id,
+                            shared_command_header ? shared_command_header->epoch : 0u))
                         continue;
                     desc = slot.descriptor;
                     desc.owner_participant =
@@ -6539,6 +7573,17 @@ namespace
                 next.experts[plan.expert] = desc;
                 next.resident_participant_mask[plan.expert] =
                     resident_mask & shared_valid_mask;
+                if (rebalance_plan_requires_payload(plan.op))
+                {
+                    /*
+                     * The transfer plan is domain-wide even though only its
+                     * destination owns the rolling payload descriptor. Keep a
+                     * sticky global durability marker in every participant's
+                     * bank so portable prefix capture cannot diverge by local
+                     * slot ownership.
+                     */
+                    next.transient_placement_observed = 1u;
+                }
             }
         }
         __syncthreads();
@@ -6575,7 +7620,7 @@ namespace
             }
             if (threadIdx.x == 0)
             {
-                next.reserved[0] = reduce_scratch[0];
+                next.multi_resident_expert_count = reduce_scratch[0];
             }
             __syncthreads();
             __threadfence();
@@ -6705,9 +7750,15 @@ namespace
         {
             if (status)
                 status->status_code = 2u;
-            wave->error_code = 2u;
-            wave->state = kDeviceMoERebalanceLifecycleError;
-            controller_state->last_error_code = 2u;
+            poison_rebalance_graph_controller(
+                controller_state,
+                2u,
+                wave_index,
+                wave->epoch,
+                0u,
+                0u,
+                status ? status->status_code : 2u,
+                config.participant_id);
             return;
         }
 
@@ -6760,8 +7811,11 @@ namespace
                     continue;
                 }
                 const auto &slot = local_transfer_slots[plan.destination_slot];
-                if (!rebalance_transfer_slot_copy_complete(
-                        slot, config.participant_id, plan.layer, plan.expert))
+                if (!rebalance_transfer_slot_copy_complete_for_plan(
+                        slot,
+                        plan,
+                        config.participant_id,
+                        command_header->epoch))
                 {
                     if (status)
                         ++status->copy_incomplete;
@@ -6813,14 +7867,33 @@ namespace
         auto &next = runtime.banks[inactive_bank];
         next.epoch = runtime.active_epoch + 1u;
         next.expert_count = config.num_experts;
-        next.reserved[0] = active.reserved[0];
-        next.reserved[1] = active.reserved[1];
+        next.multi_resident_expert_count =
+            active.multi_resident_expert_count;
+        next.transient_placement_observed =
+            active.transient_placement_observed;
         for (uint32_t expert = 0; expert < config.num_experts; ++expert)
         {
             next.experts[expert] = active.experts[expert];
             auto &base_desc = next.experts[expert];
             uint32_t resident_mask =
                 active.resident_participant_mask[expert] & valid_mask;
+            if (rebalance_ready_arrival_reuses_runtime_slot(
+                    wave_plan_entries,
+                    command_count,
+                    local_transfer_slots,
+                    local_transfer_slot_count,
+                    config,
+                    command_header->epoch,
+                    layer,
+                    expert,
+                    base_desc))
+            {
+                rebalance_retire_reused_transfer_slot_replica(
+                    base_desc,
+                    resident_mask,
+                    participant_bit,
+                    config.participant_id);
+            }
             const bool owner_local =
                 base_desc.owner_participant == static_cast<int32_t>(config.participant_id);
             const bool local_resident = (resident_mask & participant_bit) != 0u;
@@ -6890,8 +7963,11 @@ namespace
                     continue;
                 }
                 const auto &slot = local_transfer_slots[plan.destination_slot];
-                if (!rebalance_transfer_slot_copy_complete(
-                        slot, config.participant_id, plan.layer, plan.expert))
+                if (!rebalance_transfer_slot_copy_complete_for_plan(
+                        slot,
+                        plan,
+                        config.participant_id,
+                        command_header->epoch))
                 {
                     if (status)
                         ++status->copy_incomplete;
@@ -6947,6 +8023,8 @@ namespace
             }
             next.experts[plan.expert] = desc;
             next.resident_participant_mask[plan.expert] = resident_mask & valid_mask;
+            if (rebalance_plan_requires_payload(plan.op))
+                next.transient_placement_observed = 1u;
         }
 
         uint32_t multi_resident = 0u;
@@ -6961,7 +8039,7 @@ namespace
                 runtime.decode_local_histogram[expert] = 0ULL;
             }
         }
-        next.reserved[0] = multi_resident;
+        next.multi_resident_expert_count = multi_resident;
         runtime.active_bank = inactive_bank;
         runtime.active_epoch = next.epoch;
         if (status)
@@ -7099,40 +8177,15 @@ namespace
         return true;
     }
 
-    bool cudaMoEGroupedPrefillDebugSyncEnabled()
-    {
-        return !llaminar2::DebugEnv::isFalseyEnv("LLAMINAR_CUDA_MOE_SYNC_GROUPED_PREFILL");
-    }
-
-    bool cudaMoEStreamCaptureActive(cudaStream_t stream)
-    {
-        if (llaminar2::isGraphCaptureActive())
-            return true;
-        if (!stream)
-            return false;
-        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-        const cudaError_t err = cudaStreamIsCapturing(stream, &status);
-        return err == cudaSuccess && status != cudaStreamCaptureStatusNone;
-    }
-
     bool finishGroupedPrefillLaunch(const char *name, cudaStream_t stream)
     {
-        if (!finishLaunch(name))
-            return false;
-        if (!cudaMoEGroupedPrefillDebugSyncEnabled())
-            return true;
-        // LLAMINAR_CUDA_MOE_SYNC_GROUPED_PREFILL is an eager-only debug aid.
-        // A host stream sync is illegal while prefill is being recorded into a
-        // CUDA graph; launch-order correctness is provided by the capture stream.
-        if (cudaMoEStreamCaptureActive(stream))
-            return true;
-        cudaError_t err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess)
-        {
-            std::fprintf(stderr, "%s stream sync failed: %s\n", name, cudaGetErrorString(err));
-            return false;
-        }
-        return true;
+        /*
+         * Every grouped-prefill launch participates in the caller's explicit
+         * stream order.  Completion is published at the graph or stage
+         * ownership boundary; individual kernels must never block the host.
+         */
+        (void)stream;
+        return finishLaunch(name);
     }
 
     // Router GEMV: one block per (expert, token) computes logit = dot(hidden_token, gate_expert).
@@ -8407,7 +9460,8 @@ namespace
             runtime->active_bank > 1u ||
             !runtime->expert_counts)
         {
-            fail_fast_incomplete_llep_transfer();
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "runtime active-expert list has an invalid device contract");
             return;
         }
 
@@ -8443,7 +9497,8 @@ namespace
                        desc.local_slot,
                        desc.logical_expert_id,
                        desc.owner_participant);
-                fail_fast_incomplete_llep_transfer();
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "runtime active expert is not locally resident and compute-ready");
                 return;
             }
             if (active < max_active_experts)
@@ -8496,7 +9551,8 @@ namespace
                        runtime ? runtime->expert_offsets : nullptr,
                        runtime ? runtime->grouped_token_ids : nullptr);
             }
-            fail_fast_incomplete_llep_transfer();
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "runtime original-to-grouped map has an invalid device contract");
             return;
         }
         if (expert >= num_experts)
@@ -8516,7 +9572,8 @@ namespace
                        offset,
                        max_slots);
             }
-            fail_fast_incomplete_llep_transfer();
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "runtime grouped expert range exceeds the published route capacity");
             return;
         }
 
@@ -8545,7 +9602,8 @@ namespace
                        (route_slot >= 0 && route_slot < max_slots)
                            ? runtime->route_participant_ids[route_slot]
                            : -1);
-                fail_fast_incomplete_llep_transfer();
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "runtime grouped route row does not match its original route slot");
                 return;
             }
             original_to_grouped[route_slot] = grouped_slot;
@@ -8759,7 +9817,8 @@ namespace
         int current_slots,
         int max_slots,
         int num_experts,
-        int filter_to_local_runtime_experts)
+        int filter_to_local_runtime_experts,
+        int histogram_update_flags)
     {
         const int slot = blockIdx.x * blockDim.x + threadIdx.x;
         if (!runtime || slot >= max_slots)
@@ -8776,6 +9835,21 @@ namespace
         {
             expert_id = static_cast<int>(routing_indices[slot]);
             weight = routing_weights[slot];
+            /*
+             * The selected-route histogram is global routing demand, so record
+             * it before a StaticOwner participant filters non-local experts.
+             * Integer atomic addition cannot perturb router weights or grouped
+             * verifier numerical equivalence.
+             */
+            if (expert_id >= 0 &&
+                expert_id < num_experts &&
+                (histogram_update_flags & kGroupedHistogramSelectedRoutes) != 0)
+            {
+                atomicAdd(
+                    reinterpret_cast<unsigned long long *>(
+                        &runtime->decode_histogram[expert_id]),
+                    1ULL);
+            }
             if (expert_id < 0 || expert_id >= num_experts ||
                 (filter_to_local_runtime_experts != 0 &&
                  !prefill_static_local_runtime_ready(runtime, expert_id, num_experts)))
@@ -8798,7 +9872,8 @@ namespace
         DeviceMoELayerRuntimeView *__restrict__ runtime,
         int current_slots,
         int max_slots,
-        int num_experts)
+        int num_experts,
+        int histogram_update_flags)
     {
         const int slot = blockIdx.x * blockDim.x + threadIdx.x;
         if (!runtime || slot >= max_slots || slot >= current_slots)
@@ -8815,6 +9890,20 @@ namespace
             participant_id == static_cast<int>(runtime->participant_id))
         {
             atomicAdd(runtime->expert_counts + expert_id, 1);
+            /*
+             * This is the first point where StaticOwner filtering or LLEP
+             * assignment has made the route's actual compute participant
+             * unambiguous. Fuse the persistent local-demand publication into
+             * the existing count launch instead of adding a side kernel.
+             */
+            if ((histogram_update_flags &
+                 kGroupedHistogramLocallyAssignedRoutes) != 0)
+            {
+                atomicAdd(
+                    reinterpret_cast<unsigned long long *>(
+                        &runtime->decode_local_histogram[expert_id]),
+                    1ULL);
+            }
         }
     }
 
@@ -9126,6 +10215,7 @@ namespace
         uint64_t min_spread_improvement_per_transfer,
         uint64_t min_foreign_rows_per_transfer,
         uint32_t max_weight_transfers,
+        uint32_t max_non_owner_experts_per_participant,
         int enable_balanced_skip)
     {
         __shared__ uint64_t expert_loads[kDeviceMoEMaxExperts];
@@ -9214,6 +10304,8 @@ namespace
         config.min_spread_improvement_per_transfer = min_spread_improvement_per_transfer;
         config.min_foreign_rows_per_transfer = min_foreign_rows_per_transfer;
         config.max_weight_transfers = max_weight_transfers;
+        config.max_non_owner_experts_per_participant =
+            max_non_owner_experts_per_participant;
         config.enable_balanced_skip = enable_balanced_skip != 0;
 
         llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentWorkspace workspace{};
@@ -9411,15 +10503,71 @@ namespace
                     runtime->reserved_u64[3]);
             if (!transfer_complete || !apply_complete)
             {
+                /*
+                 * Every expert block observes the same publication-status
+                 * objects.  Designate exactly one lane as the fatal witness so
+                 * its diagnostic reaches the device printf stream before the
+                 * assertion poisons the CUDA context.  Having every lane
+                 * assert is equally fatal but floods the error channel and can
+                 * hide the status fields needed to identify the broken
+                 * ordering or publication contract.
+                 */
                 if (expert == 0 && threadIdx.x == 0)
                 {
+                    int32_t duplicate_slot = -1;
+                    int32_t duplicate_first_expert = -1;
+                    int32_t duplicate_second_expert = -1;
+                    if (runtime->active_bank <= 1u)
+                    {
+                        const auto &bank = runtime->banks[runtime->active_bank];
+                        const uint32_t local_bit =
+                            runtime_participant_bit(
+                                static_cast<int>(runtime->participant_id));
+                        for (int32_t first = 0;
+                             first < num_experts &&
+                             duplicate_slot < 0;
+                             ++first)
+                        {
+                            const auto &first_desc = bank.experts[first];
+                            const bool first_live =
+                                bank.local_compute_mask[first] != 0u &&
+                                (bank.resident_participant_mask[first] &
+                                 local_bit) != 0u &&
+                                (first_desc.flags & kDeviceMoEFlagTransferSlot) != 0u &&
+                                first_desc.local_slot >= 0;
+                            if (!first_live)
+                                continue;
+                            for (int32_t second = first + 1;
+                                 second < num_experts;
+                                 ++second)
+                            {
+                                const auto &second_desc = bank.experts[second];
+                                const bool second_live =
+                                    bank.local_compute_mask[second] != 0u &&
+                                    (bank.resident_participant_mask[second] &
+                                     local_bit) != 0u &&
+                                    (second_desc.flags &
+                                     kDeviceMoEFlagTransferSlot) != 0u &&
+                                    second_desc.local_slot >= 0;
+                                if (second_live &&
+                                    second_desc.local_slot ==
+                                        first_desc.local_slot)
+                                {
+                                    duplicate_slot = first_desc.local_slot;
+                                    duplicate_first_expert = first;
+                                    duplicate_second_expert = second;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     printf("prefill_llep_after_transfer_incomplete "
                            "participant=%u expected_transfers=%llu expected_spans=%llu "
                            "transfer_ok=%u transfer_magic=%u transfer_version=%u transfer_status=%u "
-                           "plan_overflow=%u payload_overflow=%u planned=%u transfer_count=%u span_count=%u "
-                           "apply_ok=%u apply_magic=%u apply_version=%u apply_status=%u seen=%u applied=%u "
-                           "required_local=%u ready_local=%u invalid=%u missing_src=%u missing_dst=%u "
-                           "mismatch=%u copy_incomplete=%u copied=%u\\n",
+                           "plan_overflow=%u payload_overflow=%u planned=%u projected=%llu "
+                           "transfer_count=%u span_count=%u capacity_limited=%u "
+                           "payload_requested=%u payload_bucket=%u "
+                           "duplicate_slot=%d duplicate_first=%d duplicate_second=%d\n",
                            runtime->participant_id,
                            static_cast<unsigned long long>(runtime->reserved_u64[3]),
                            static_cast<unsigned long long>(runtime->reserved_u64[2]),
@@ -9430,8 +10578,30 @@ namespace
                            transfer_status ? transfer_status->plan_overflow : 0u,
                            transfer_status ? transfer_status->payload_bucket_overflow : 0u,
                            transfer_status ? transfer_status->planned_arrivals : 0u,
+                           static_cast<unsigned long long>(
+                               transfer_status
+                                   ? transfer_status->candidate_arrivals_considered
+                                   : 0ULL),
                            transfer_status ? transfer_status->llep_weight_transfer_count : 0u,
                            transfer_status ? transfer_status->llep_assignment_span_count : 0u,
+                           transfer_status
+                               ? transfer_status->capacity_limited_candidates
+                               : 0u,
+                           transfer_status
+                               ? transfer_status->payload_bucket_requested_slots
+                               : 0u,
+                           transfer_status
+                               ? transfer_status->payload_bucket_slots
+                               : 0u,
+                           duplicate_slot,
+                           duplicate_first_expert,
+                           duplicate_second_expert);
+                    printf("prefill_llep_after_apply_incomplete "
+                           "participant=%u apply_ok=%u apply_magic=%u apply_version=%u "
+                           "apply_status=%u seen=%u applied=%u required_local=%u "
+                           "ready_local=%u invalid=%u missing_src=%u missing_dst=%u "
+                           "mismatch=%u copy_incomplete=%u copied=%u\n",
+                           runtime->participant_id,
                            apply_complete ? 1u : 0u,
                            apply_status ? apply_status->magic : 0u,
                            apply_status ? apply_status->version : 0u,
@@ -9446,8 +10616,9 @@ namespace
                            apply_status ? apply_status->descriptor_mismatches : 0u,
                            apply_status ? apply_status->copy_incomplete : 0u,
                            apply_status ? apply_status->copied_arrivals : 0u);
+                    FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                        "post-transfer LLEP status is incomplete or inconsistent");
                 }
-                fail_fast_incomplete_llep_transfer();
                 return;
             }
         }
@@ -9480,7 +10651,8 @@ namespace
                 if (!prefill_llep_assignment_ready(
                         runtime, active_bank, expert, row, assigned_participant))
                 {
-                    fail_fast_incomplete_llep_transfer();
+                    FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                        "default-owner LLEP assignment is not locally compute-ready");
                     return;
                 }
                 const int slot = runtime->grouped_token_ids[expert_offset + row];
@@ -9516,7 +10688,8 @@ namespace
                     if (!prefill_llep_assignment_ready(
                             runtime, active_bank, expert, row, assigned_participant))
                     {
-                        fail_fast_incomplete_llep_transfer();
+                        FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                            "missing-span LLEP assignment is not locally compute-ready");
                         return;
                     }
                     const int slot = runtime->grouped_token_ids[expert_offset + row];
@@ -9560,7 +10733,8 @@ namespace
             if (!prefill_llep_assignment_ready(
                     runtime, active_bank, expert, row, assigned_participant))
             {
-                fail_fast_incomplete_llep_transfer();
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "planned LLEP span assigns a non-ready local expert");
                 return;
             }
 
@@ -10077,7 +11251,8 @@ namespace
                        slot, source_index, source_token, max_tokens, top_k,
                        grouped_indices_are_route_slots);
             }
-            fail_fast_incomplete_llep_transfer();
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "grouped prefill gather references an invalid source token");
             return;
         }
         if (prequantized_hidden && prequantized_hidden_scales)
@@ -10727,7 +11902,8 @@ namespace
                        slot, source_index, token, max_tokens, top_k,
                        grouped_indices_are_route_slots);
             }
-            fail_fast_incomplete_llep_transfer();
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "grouped prefill scatter references an invalid destination token");
             return;
         }
         const float weight = grouped_weights[slot];
@@ -12009,6 +13185,9 @@ extern "C"
         uint32_t command_buffer_count,
         const void *gathered_wave_states,
         void *local_wave_states,
+        void *runtime_layers,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
         int device_idx,
         void *stream)
     {
@@ -12017,8 +13196,11 @@ extern "C"
             !local_plan_entries ||
             !local_command_headers ||
             !config ||
+            !runtime_layers ||
+            !local_transfer_slots ||
             !stream ||
-            plan_capacity == 0u)
+            plan_capacity == 0u ||
+            local_transfer_slot_count == 0u)
         {
             return false;
         }
@@ -12035,7 +13217,10 @@ extern "C"
             cfg,
             command_buffer_count,
             static_cast<const DeviceMoERebalanceWaveStateView *>(gathered_wave_states),
-            static_cast<DeviceMoERebalanceWaveStateView *>(local_wave_states));
+            static_cast<DeviceMoERebalanceWaveStateView *>(local_wave_states),
+            static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
+            static_cast<const DeviceMoEExpertDirectoryEntryView *>(local_transfer_slots),
+            local_transfer_slot_count);
         return finishLaunch("cudaMoE_project_rebalance_domain_commands");
     }
 
@@ -12050,13 +13235,17 @@ extern "C"
         void *status,
         uint32_t payload_slot_capacity,
         uint32_t command_buffer_count,
+        void *runtime_layers,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
         int device_idx,
         void *stream)
     {
         if (!gathered_plan_entries || !gathered_command_headers ||
             !local_plan_entries || !local_plan_count || !local_command_header ||
-            !config || !status || !stream ||
-            plan_capacity == 0u || payload_slot_capacity == 0u)
+            !config || !status || !runtime_layers || !local_transfer_slots ||
+            !stream || plan_capacity == 0u || payload_slot_capacity == 0u ||
+            local_transfer_slot_count == 0u)
             return false;
         cudaSetDevice(device_idx);
         const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
@@ -12070,7 +13259,11 @@ extern "C"
             static_cast<DeviceMoERebalanceStatusView *>(status),
             payload_slot_capacity,
             cfg,
-            command_buffer_count);
+            command_buffer_count,
+            static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
+            static_cast<const DeviceMoEExpertDirectoryEntryView *>(
+                local_transfer_slots),
+            local_transfer_slot_count);
         return finishLaunch("cudaMoE_project_prefill_llep_domain_commands");
     }
 
@@ -12747,6 +13940,7 @@ extern "C"
         int num_experts,
         int top_k,
         int filter_to_local_runtime_experts,
+        int histogram_update_flags,
         int device_idx,
         void *stream)
     {
@@ -12770,12 +13964,14 @@ extern "C"
         prefill_group_cast_count_runtime_kernel<<<blocksFor(max_slots), kThreads, 0, cuda_stream>>>(
             runtime_view, routing_indices, routing_weights,
             current_slots, max_slots, num_experts,
-            filter_to_local_runtime_experts);
+            filter_to_local_runtime_experts,
+            histogram_update_flags);
         if (!finishGroupedPrefillLaunch("cudaMoE_prefill_group_cast_count_runtime", cuda_stream))
             return false;
 
         prefill_group_count_assigned_runtime_kernel<<<blocksFor(max_slots), kThreads, 0, cuda_stream>>>(
-            runtime_view, current_slots, max_slots, num_experts);
+            runtime_view, current_slots, max_slots, num_experts,
+            histogram_update_flags);
         if (!finishGroupedPrefillLaunch("cudaMoE_prefill_group_count_assigned_runtime", cuda_stream))
             return false;
 
@@ -12795,6 +13991,7 @@ extern "C"
         int max_slots,
         int num_experts,
         int top_k,
+        int histogram_update_flags,
         int device_idx,
         void *stream)
     {
@@ -12816,7 +14013,8 @@ extern "C"
             return false;
 
         prefill_group_count_assigned_runtime_kernel<<<blocksFor(max_slots), kThreads, 0, cuda_stream>>>(
-            runtime_view, current_slots, max_slots, num_experts);
+            runtime_view, current_slots, max_slots, num_experts,
+            histogram_update_flags);
         if (!finishGroupedPrefillLaunch("cudaMoE_prefill_regroup_count_assigned_runtime", cuda_stream))
             return false;
 
@@ -12890,6 +14088,7 @@ extern "C"
         uint64_t min_spread_improvement_per_transfer,
         uint64_t min_foreign_rows_per_transfer,
         uint32_t max_weight_transfers,
+        uint32_t max_non_owner_experts_per_participant,
         int enable_balanced_skip,
         int device_idx,
         void *stream)
@@ -12935,6 +14134,7 @@ extern "C"
             min_spread_improvement_per_transfer,
             min_foreign_rows_per_transfer,
             max_weight_transfers,
+            max_non_owner_experts_per_participant,
             enable_balanced_skip);
         return finishGroupedPrefillLaunch("cudaMoE_prefill_llep_plan_current_batch", cuda_stream);
     }

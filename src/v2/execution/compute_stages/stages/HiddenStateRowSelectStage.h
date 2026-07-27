@@ -11,12 +11,22 @@
  * ComputeGraph and updated by the forward execution engine on that graph's
  * execution thread.
  *
- * Lifecycle: the device scalar is a declared graph workspace buffer. Replay
- * setters update only host-side intent and mark the scalar dirty. The GPU upload
- * is performed from executeGPU(), after DeviceGraphExecutor has rebound the
- * current workspace manager and an explicit non-null stream. Captured execution
- * reads the already-resident device scalar and must not record a host-to-device
- * scalar copy.
+ * Lifecycle: dynamic replay uses a device scalar declared in graph workspace.
+ * Replay setters update only host-side intent and mark the scalar dirty. The
+ * GPU upload is performed from executeGPU(), after DeviceGraphExecutor has
+ * rebound the current workspace manager and an explicit non-null stream.
+ * Captured execution reads the already-resident device scalar and must not
+ * record a host-to-device scalar copy. Device-owned request metadata uses
+ * SelectionPolicy::DeviceResidentRequestLength instead: the captured row-copy
+ * kernel reads the terminal row directly from a stable device length pointer,
+ * with no host scalar, workspace allocation, or replay-time upload.
+ *
+ * Exact-shape graph checkpoints use SelectionPolicy::FixedDeviceRow. Their row
+ * is immutable for the lifetime of the graph, so the selected index is encoded
+ * directly in the captured D2D source address. Padded checkpoints use the
+ * device-resident request-length policy above. Both policies declare no scalar
+ * workspace, allocate no pinned host state, and introduce no H2D lifecycle
+ * into graph capture.
  */
 
 #pragma once
@@ -47,6 +57,42 @@ namespace llaminar2
     public:
         static constexpr const char *WS_SELECTED_ROW_SCALAR = "hidden_row_select_selected_row_scalar";
 
+        /**
+         * @brief Select how the source row is owned across graph replays.
+         */
+        enum class SelectionPolicy : uint8_t
+        {
+            /**
+             * @brief Read the row from persistent device workspace.
+             *
+             * Bucketed prefill uses this policy because the real terminal row
+             * can change while the captured bucket geometry remains fixed.
+             */
+            DynamicDeviceScalar,
+
+            /**
+             * @brief Encode an immutable row directly in the GPU D2D copy.
+             *
+             * Graph diagnostic checkpoints use this policy. Their source row
+             * is fixed by graph geometry, so introducing mutable host replay
+             * state would add ownership machinery without adding capability.
+             */
+            FixedDeviceRow,
+
+            /**
+             * @brief Derive the terminal row from a resident request length.
+             *
+             * Padded single-request GPU graphs retain a fixed physical
+             * `seq_len` while their real row count changes between replays.
+             * The serving boundary already publishes that count into a
+             * persistent device allocation. This policy makes that allocation
+             * the only row owner: the captured copy kernel reads
+             * `request_sequence_length_device[0]`, clamps it to the physical
+             * graph shape for memory safety, and copies row `length - 1`.
+             */
+            DeviceResidentRequestLength,
+        };
+
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
@@ -56,6 +102,9 @@ namespace llaminar2
             int seq_len = 0;                ///< Fixed bucket sequence length.
             int d_model = 0;                ///< Hidden-state width.
             int selected_row_idx = -1;      ///< Initial selected row; -1 means seq_len - 1.
+            SelectionPolicy selection_policy =
+                SelectionPolicy::DynamicDeviceScalar; ///< Row ownership across graph replays.
+            const int32_t *request_sequence_length_device = nullptr; ///< Stable device INT32 real-row count.
 
             std::optional<BufferId> input_buffer_id;  ///< Arena input binding, usually NORMALIZED.
             std::optional<BufferId> output_buffer_id; ///< Arena output binding, usually LM_HEAD_INPUT_ROW.
@@ -79,14 +128,23 @@ namespace llaminar2
                        ? CoherencePolicy::FULL
                        : CoherencePolicy::NONE;
         }
-        bool hasPrefillReplayParams() const override { return true; }
+        bool hasPrefillReplayParams() const override
+        {
+            return params_.selection_policy ==
+                   SelectionPolicy::DynamicDeviceScalar;
+        }
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
         void bindWorkspace(DeviceWorkspaceManager *workspace) override;
         void unbindWorkspace() override;
         bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
         DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
-        bool needsGraphLaunchPreparation() const override { return params_.device_id.is_gpu(); }
+        bool needsGraphLaunchPreparation() const override
+        {
+            return params_.device_id.is_gpu() &&
+                   params_.selection_policy ==
+                       SelectionPolicy::DynamicDeviceScalar;
+        }
 
         /**
          * @brief Update selected source row for fixed-bucket prefill replay.
@@ -97,6 +155,18 @@ namespace llaminar2
 
         /// @brief Return the currently selected source row, mainly for tests.
         int selectedRowForTesting() const { return selected_row_idx_; }
+
+        /// @brief Return the immutable row-ownership policy, mainly for graph-construction tests.
+        SelectionPolicy selectionPolicyForTesting() const
+        {
+            return params_.selection_policy;
+        }
+
+        /// @brief Return the borrowed device length owner, mainly for graph-construction tests.
+        const int32_t *requestSequenceLengthDeviceForTesting() const
+        {
+            return params_.request_sequence_length_device;
+        }
 
         /**
          * @brief Update the selected source row for direct graph replay users.

@@ -179,3 +179,66 @@ TEST(Test__PrefixCacheStateProbe, CapturesNamedKVPayloadSegments)
     EXPECT_EQ(layer.segments[1].v_payload_hash,
               hashByteBufferForPrefixProbe(suffix_v.data(), suffix_v.size()));
 }
+
+/**
+ * @brief Proves invocation-scoped diagnostics do not depend on global env state.
+ *
+ * Failed mirrored-MTP reporting must be able to request a small logical tail
+ * after an error without enabling expensive full-payload hashing for every
+ * normal request in the process.  This test disables the compatibility env
+ * controls, selects a two-token tail explicitly, and verifies both the full
+ * payload and tail hashes come only from the typed policy.
+ */
+TEST(Test__PrefixCacheStateProbe, ExplicitCapturePolicySelectsBoundedKVPayloads)
+{
+    ScopedEnvVar hash_payloads("LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", nullptr);
+    ScopedEnvVar hash_segments("LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS", nullptr);
+
+    CPURingKVCacheFP32 cache(getTestMPIContext(), 1, 1, 8, 1, 2, DeviceId::cpu());
+    auto in_k = std::make_shared<FP32Tensor>(std::vector<size_t>{6, 2});
+    auto in_v = std::make_shared<FP32Tensor>(std::vector<size_t>{6, 2});
+    for (size_t i = 0; i < 12; ++i)
+    {
+        in_k->mutable_data()[i] = static_cast<float>(20 + i);
+        in_v->mutable_data()[i] = static_cast<float>(200 + i);
+    }
+    ASSERT_TRUE(cache.append_kv(0, 0, in_k.get(), in_v.get(), 6));
+
+    PrefixProbeCapturePolicy capture_policy;
+    capture_policy.hash_full_kv_payloads = true;
+    capture_policy.trailing_kv_tokens = 2;
+    const PrefixKVCacheProbe probe = inspectKVCacheForPrefixProbe(
+        cache,
+        "explicit",
+        DeviceId::cpu(),
+        /*sequence_count=*/1,
+        /*stream=*/nullptr,
+        capture_policy);
+
+    ASSERT_EQ(probe.layers.size(), 1u);
+    const PrefixKVLayerProbe &layer = probe.layers.front();
+    EXPECT_TRUE(layer.payload_hash_available);
+    ASSERT_EQ(layer.segments.size(), 1u);
+    EXPECT_EQ(layer.segments.front().name, "diagnostic_tail");
+    EXPECT_EQ(layer.segments.front().token_start, 4);
+    EXPECT_EQ(layer.segments.front().token_count, 2);
+    EXPECT_TRUE(layer.segments.front().hash_available);
+
+    const auto layout = cache.logicalBlockLayout(
+        /*global_layer=*/0,
+        /*token_count=*/2);
+    std::vector<uint8_t> tail_k(layout.k_bytes);
+    std::vector<uint8_t> tail_v(layout.v_bytes);
+    IKVCache::KVCacheLogicalBlockDescriptor desc;
+    desc.layer = 0;
+    desc.seq_idx = 0;
+    desc.logical_token_start = 4;
+    desc.token_count = 2;
+    ASSERT_TRUE(cache.exportLogicalBlock(desc, tail_k.data(), tail_v.data()));
+    EXPECT_EQ(
+        layer.segments.front().k_payload_hash,
+        hashByteBufferForPrefixProbe(tail_k.data(), tail_k.size()));
+    EXPECT_EQ(
+        layer.segments.front().v_payload_hash,
+        hashByteBufferForPrefixProbe(tail_v.data(), tail_v.size()));
+}

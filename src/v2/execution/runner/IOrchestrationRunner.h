@@ -296,9 +296,10 @@ namespace llaminar2
         /**
          * @brief True when MoE rebalance publish/apply is owned by captured device graph stages.
          *
-         * Callers that drive decodeStep() directly should skip per-token host
-         * decode-boundary rebalance maintenance when this returns true. The
-         * graph itself runs histogram collection, policy, transfer, and apply.
+         * Callers still invoke maybeApplyMoERebalance() at every committed
+         * decode boundary.  This flag selects its implementation: device-side
+         * mode schedules the captured maintenance graph, while legacy
+         * non-device modes publish host-prepared work.
          */
         virtual bool usesDeviceSideMoERebalanceController() const { return false; }
 

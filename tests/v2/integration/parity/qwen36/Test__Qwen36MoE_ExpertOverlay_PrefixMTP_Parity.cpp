@@ -16,8 +16,10 @@
 
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
+#include "models/qwen35/Qwen35GraphConfigBuilder.h"
 #include "utils/Logger.h"
 
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -43,17 +45,92 @@ namespace
     constexpr int kPhaseSplitLongDecodeMaxSeqLen = 4096;
 
     /**
-     * @brief Prompt header embedded in the long expert-overlay metadata files.
+     * @brief Tokenize the full-tier server's structured-generation prompt exactly.
      *
-     * metadataLooksUsable() intentionally verifies the prompt string before a
-     * parity case consumes token_ids from a metadata file.  Keeping this header
-     * beside the metadata-path helpers makes the partial-prefix fixtures
-     * explicit: they run the long ledger request already generated for the
-     * expert-overlay long-context matrix, then cap the request locally when a
-     * partial cache hit is the behavior under test.
+     * The long-context server gate does not send a raw string to the model. It
+     * sends a system/user conversation through the Qwen3.5 community template
+     * override with thinking disabled. Reusing only the resulting row count in
+     * an integration test misses the expert-routing pattern that drives Dynamic
+     * ownership decisions. This helper therefore mirrors that production
+     * request construction and returns the exact token IDs consumed by prefill.
+     *
+     * The expected 154-token geometry is asserted here as part of the
+     * regression contract. If the tokenizer or bundled chat template changes,
+     * the test must deliberately update both the server expectation and this
+     * reproducer instead of silently exercising a different graph bucket.
+     *
+     * @param model_path Qwen3.6 GGUF used by the parity fixture.
+     * @return Production chat-template token IDs for the structured request.
+     * @throws std::runtime_error if tokenizer or template construction fails,
+     *         or if the resulting request no longer contains 154 tokens.
      */
-    constexpr const char *kLongLedgerPromptHeader =
-        "Task: read the ledger and return one minified JSON object.";
+    std::vector<int32_t> structuredGenerationPromptTokens(
+        const std::string &model_path)
+    {
+        const ModelContextConfig tokenizer_context_config{
+            .strategy = WeightDistributionStrategy::REPLICATED,
+            .use_mmap = true,
+            .target_is_gpu = true,
+        };
+        auto tokenizer_context =
+            ModelContext::create(model_path, tokenizer_context_config);
+        if (!tokenizer_context)
+        {
+            throw std::runtime_error(
+                "failed to parse Qwen3.6 GGUF metadata for structured prompt tokenization");
+        }
+
+        auto tokenizer = createTokenizer(tokenizer_context);
+        if (!tokenizer)
+        {
+            throw std::runtime_error(
+                "failed to construct Qwen3.6 tokenizer for structured prompt regression");
+        }
+
+        Qwen35GraphConfigBuilder config_builder;
+        const auto template_override = config_builder.chatTemplateOverride();
+        if (!template_override.has_value() || template_override->empty())
+        {
+            throw std::runtime_error(
+                "Qwen3.5/3.6 structured prompt regression requires the production chat-template override");
+        }
+        tokenizer->setChatTemplate(
+            ChatTemplate::create(*template_override, "", ""));
+
+        constexpr int kRequestedNumberedLines = 220;
+        std::ostringstream user_prompt;
+        user_prompt
+            << "Control marker for cache isolation: LCACHE-RESET-SENTINEL-593821.\n"
+            << "Do not copy the control marker into the report.\n"
+            << "Write " << kRequestedNumberedLines << " numbered lines.\n"
+            << "Each line must use this exact format:\n"
+            << "001 | one short distinct sentence about reliable inference\n"
+            << "002 | one short distinct sentence about reliable inference\n"
+            << "Keep each sentence concise and vary the wording.\n"
+            << "Never restart numbering; count upward from 001.\n"
+            << "After the final requested line, write END_OF_REPORT on its own line.\n"
+            << "If the token limit interrupts the report, stop wherever the limit occurs.";
+
+        const std::vector<ChatMessage> messages = {
+            ChatMessage(
+                "system",
+                "<|think_off|>\nYou produce deterministic machine-checkable reports."),
+            ChatMessage("user", user_prompt.str()),
+        };
+        const std::vector<int> encoded = tokenizer->encodeChat(
+            messages,
+            /*add_generation_prompt=*/true,
+            /*tools_json=*/"",
+            /*enable_thinking=*/false);
+        if (encoded.size() != 154u)
+        {
+            throw std::runtime_error(
+                "structured-generation prompt token count changed from 154 to " +
+                std::to_string(encoded.size()));
+        }
+
+        return std::vector<int32_t>(encoded.begin(), encoded.end());
+    }
 
     /**
      * @brief Serializes this process with other large Qwen3.6 expert-overlay parity cases.
@@ -151,38 +228,77 @@ namespace
     }
 
     /**
-     * @brief Converts a hot-only expert-overlay case into a phase-split migration probe.
+     * @brief Promotes a short hot-only fixture to the canonical long MTP probe.
      *
-     * The metadata path points at long-decode PyTorch snapshots.  Prefix restore
-     * partial-hit tests cap the prompt after loading metadata, while MTP restore
-     * tests use the full metadata prompt; therefore the case must declare a
-     * long-context window up front instead of depending on the prefix cap.
+     * The original hot-only canary intentionally uses a 96-token context and two
+     * output rows because its third token is a quantized near-tie. That makes it
+     * useful as a fast smoke test but leaves long absolute positions, repeated
+     * grouped publication, and eight-token continuation untested unless runtime
+     * expert movement is also enabled. This helper supplies the long geometry
+     * independently of rebalance policy so static, Dynamic, and LLEP cells differ
+     * by exactly one dimension.
      *
-     * @param test_case Case object to mutate.
-     * @param mode Rebalance mode under test.
-     * @param metadata_path Long-decode PyTorch metadata file to load.
+     * @param test_case Case object to update in place.
      */
-    void configurePhaseSplitMigrationProbe(
-        MoEPrefixRestoreParityCase &test_case,
-        MoERebalanceRuntimeMode mode,
-        const std::string &metadata_path)
+    void configureLongContextMTPProbe(
+        MoEPrefixRestoreParityCase &test_case)
     {
-        test_case.name += mode == MoERebalanceRuntimeMode::LLEP
-                              ? " LLEP phase-split migration"
-                              : " Dynamic phase-split migration";
-        test_case.prompt = "Task: read the ledger and return one minified JSON object.";
-        test_case.default_metadata_path = metadata_path;
-        test_case.decode_steps = 3;
+        test_case.name += " long-context";
+        test_case.prompt = qwen36MoELongNeedleParityPrompt();
+        test_case.reference_input_source =
+            MoEReferenceInputSource::ModelTokenizer;
+        test_case.metadata_envs.clear();
+        test_case.default_metadata_path.clear();
+        test_case.decode_steps = 8;
         test_case.max_seq_len = kPhaseSplitLongDecodeMaxSeqLen;
         test_case.prefix_restore_prompt_token_limit = 640;
-        test_case.moe_rebalance = movementFriendlyRebalanceConfig(mode);
+        test_case.minimum_prompt_tokens = 640;
         test_case.env_overrides = {
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
-            {"LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS", "0"},
-            {"LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS", "32"},
-            {"LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS", "32"},
         };
+    }
+
+    /**
+     * @brief Converts a hot-only expert-overlay case into a phase-split migration probe.
+     *
+     * Prefix partial-hit tests cap the tokenized prompt locally, while MTP
+     * restore tests use the complete deterministic ledger. Both obtain tokens
+     * from Llaminar's production GGUF tokenizer because their correctness
+     * oracle is a fresh serial Llaminar request, not an unused PyTorch decode.
+     * The case must therefore declare a long-context window up front instead
+     * of depending on the partial-prefix cap.
+     *
+     * @param test_case Case object to mutate.
+     * @param mode Rebalance mode under test.
+     */
+    void configurePhaseSplitMigrationProbe(
+        MoEPrefixRestoreParityCase &test_case,
+        MoERebalanceRuntimeMode mode)
+    {
+        configureLongContextMTPProbe(test_case);
+        test_case.name += mode == MoERebalanceRuntimeMode::LLEP
+                              ? " LLEP phase-split migration"
+                              : " Dynamic phase-split migration";
+        /*
+         * The shared long-context fixture emits eight requested tokens. At
+         * grouped depth two that budget is sufficient to publish the first
+         * token-four planning probe, but request reset may legitimately drain
+         * it before a later transaction can publish and apply its payload.
+         * Dedicated lifecycle tests below therefore use sixteen requested
+         * tokens and explicitly require applied arrivals; these ordinary
+         * parity cells remain the affordable single-request correctness gate.
+         */
+        test_case.moe_rebalance = movementFriendlyRebalanceConfig(mode);
+        test_case.env_overrides.emplace_back(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS",
+            "0");
+        test_case.env_overrides.emplace_back(
+            "LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS",
+            "32");
+        test_case.env_overrides.emplace_back(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS",
+            "32");
         if (mode == MoERebalanceRuntimeMode::LLEP)
         {
             test_case.env_overrides.emplace_back(
@@ -200,23 +316,25 @@ namespace
      * The default hot-only metadata prompt is intentionally tiny so the MTP
      * canary tests stay affordable.  Partial-prefix restore, however, needs at
      * least one complete cached block plus a suffix.  This helper points the
-     * hot-only partial-hit cells at long ledger metadata and then caps the
-     * prompt at 640 tokens, giving the cache a non-terminal 256-token block and
-     * a meaningful suffix without turning the hot-only canary itself into a
-     * long-context test.
+     * hot-only partial-hit cells at the shared deterministic ledger and then
+     * caps its production-tokenizer output at 640 rows, giving the cache a
+     * non-terminal 256-token block and a meaningful suffix without turning the
+     * hot-only canary itself into a full long-context decode test.
      *
      * @param test_case Case object to mutate.
-     * @param metadata_path Long-decode PyTorch metadata file to load.
      */
     void configureHotOnlyPartialPrefixProbe(
-        MoEPrefixRestoreParityCase &test_case,
-        const std::string &metadata_path)
+        MoEPrefixRestoreParityCase &test_case)
     {
         test_case.name += " long partial-prefix restore";
-        test_case.prompt = kLongLedgerPromptHeader;
-        test_case.default_metadata_path = metadata_path;
+        test_case.prompt = qwen36MoELongNeedleParityPrompt();
+        test_case.reference_input_source =
+            MoEReferenceInputSource::ModelTokenizer;
+        test_case.metadata_envs.clear();
+        test_case.default_metadata_path.clear();
         test_case.max_seq_len = kPhaseSplitLongDecodeMaxSeqLen;
         test_case.prefix_restore_prompt_token_limit = 640;
+        test_case.minimum_prompt_tokens = 640;
     }
 
     /**
@@ -323,9 +441,19 @@ namespace
     MoEPrefixRestoreParityCase cudaOnlyPartialPrefixCase()
     {
         auto test_case = cudaOnlyExpertOverlayCase();
-        configureHotOnlyPartialPrefixProbe(
-            test_case,
-            "pytorch_qwen36_moe_expert_overlay_cuda2_dynamic_phase_split_long_decode_snapshots/metadata.txt");
+        configureHotOnlyPartialPrefixProbe(test_case);
+        return test_case;
+    }
+
+    /**
+     * @brief Builds the CUDA static-placement long-context MTP control.
+     *
+     * @return CUDA hot-only case with long positions and no runtime movement.
+     */
+    MoEPrefixRestoreParityCase cudaOnlyLongContextCase()
+    {
+        auto test_case = cudaOnlyExpertOverlayCase();
+        configureLongContextMTPProbe(test_case);
         return test_case;
     }
 
@@ -339,8 +467,7 @@ namespace
         auto test_case = cudaOnlyExpertOverlayCase();
         configurePhaseSplitMigrationProbe(
             test_case,
-            MoERebalanceRuntimeMode::Dynamic,
-            "pytorch_qwen36_moe_expert_overlay_cuda2_dynamic_phase_split_long_decode_snapshots/metadata.txt");
+            MoERebalanceRuntimeMode::Dynamic);
         return test_case;
     }
 
@@ -354,8 +481,7 @@ namespace
         auto test_case = cudaOnlyExpertOverlayCase();
         configurePhaseSplitMigrationProbe(
             test_case,
-            MoERebalanceRuntimeMode::LLEP,
-            "pytorch_qwen36_moe_expert_overlay_cuda2_llep_phase_split_long_decode_snapshots/metadata.txt");
+            MoERebalanceRuntimeMode::LLEP);
         return test_case;
     }
 
@@ -369,8 +495,7 @@ namespace
         auto test_case = rocmOnlyExpertOverlayCase();
         configurePhaseSplitMigrationProbe(
             test_case,
-            MoERebalanceRuntimeMode::Dynamic,
-            "pytorch_qwen36_moe_expert_overlay_rocm2_dynamic_phase_split_long_decode_snapshots/metadata.txt");
+            MoERebalanceRuntimeMode::Dynamic);
         return test_case;
     }
 
@@ -383,9 +508,19 @@ namespace
     MoEPrefixRestoreParityCase rocmOnlyPartialPrefixCase()
     {
         auto test_case = rocmOnlyExpertOverlayCase();
-        configureHotOnlyPartialPrefixProbe(
-            test_case,
-            "pytorch_qwen36_moe_expert_overlay_rocm2_dynamic_phase_split_long_decode_snapshots/metadata.txt");
+        configureHotOnlyPartialPrefixProbe(test_case);
+        return test_case;
+    }
+
+    /**
+     * @brief Builds the ROCm static-placement long-context MTP control.
+     *
+     * @return ROCm hot-only case with long positions and no runtime movement.
+     */
+    MoEPrefixRestoreParityCase rocmOnlyLongContextCase()
+    {
+        auto test_case = rocmOnlyExpertOverlayCase();
+        configureLongContextMTPProbe(test_case);
         return test_case;
     }
 
@@ -399,15 +534,386 @@ namespace
         auto test_case = rocmOnlyExpertOverlayCase();
         configurePhaseSplitMigrationProbe(
             test_case,
-            MoERebalanceRuntimeMode::LLEP,
-            "pytorch_qwen36_moe_expert_overlay_rocm2_llep_phase_split_long_decode_snapshots/metadata.txt");
+            MoERebalanceRuntimeMode::LLEP);
         return test_case;
+    }
+
+    /**
+     * @brief Stress GPU rebalance request-boundary ordering without reloading model weights.
+     *
+     * @param test_case Backend-specific CUDA or ROCm Dynamic/LLEP phase-split fixture.
+     *
+     * The server regression that motivated this test appeared only after several
+     * different prefills had alternated with grouped MTP decode. A single parity
+     * request followed by one exact cache hit was therefore too narrow: it reused
+     * one graph shape and gave the asynchronous token-four maintenance wave only
+     * one subsequent consumer.
+     *
+     * This fixture keeps one production runner alive across the exact prefill
+     * row-count history observed before the failing structured request:
+     * 39, 68, 39, 62, 62, 431, 36, 1815, 1813, 1801, and 1305. Each history
+     * request performs the canonical 64-token decode workload, which gives
+     * asynchronous Dynamic/LLEP maintenance several opportunities to plan,
+     * transfer, publish, and consume a new placement before request reset.
+     *
+     * The next request uses the exact 154-token structured-generation prompt
+     * and 512-token completion budget from the server gate. The former
+     * 96-token regression stopped before the original mirrored-terminal-hidden
+     * divergence and therefore provided false confidence despite exercising
+     * many grouped transactions. One final exact repeat makes prefix restore
+     * mandatory after the long requests have already exceeded the canonical
+     * 1 GiB RAM tier. No deterministic kernel mode, row replay, or host-side
+     * rebalance fallback is enabled.
+     *
+     * Keeping the implementation backend-neutral is important. CUDA originally
+     * exposed the lifecycle race, but ROCm owns the same asynchronous graph,
+     * prefix-cache, and LLEP publication contract. Both backends therefore run
+     * this exact request sequence and validate the same production counters.
+     */
+    void runRebalancedPrefillRequestBoundaryStress(
+        MoEPrefixRestoreParityCase test_case)
+    {
+        ASSERT_TRUE(test_case.moe_rebalance.has_value())
+            << "Rebalanced lifecycle stress requires an explicit runtime mode";
+
+        /*
+         * Keep the movement-friendly four-token histogram window and the early
+         * token-four launch, but do not transport a fixed-capacity expert
+         * payload every four decode tokens for the entire 1,232-token request
+         * matrix. Each 64-token history request still launches one real
+         * maintenance transaction, the 512-token structured request launches
+         * eight times, and the final restore launches once. This preserves repeated
+         * cross-request capture, transfer, apply, eviction, and restore coverage
+         * while avoiding roughly two hundred redundant full-payload collectives.
+         */
+        constexpr int kStressMaintenancePeriodTokens = 64;
+        test_case.moe_rebalance->device_min_maintenance_period_tokens =
+            kStressMaintenancePeriodTokens;
+        test_case.moe_rebalance->device_initial_maintenance_period_tokens = 4;
+
+        /*
+         * Match the canonical server cell before installing the scoped
+         * environment. Prefill graph buckets are deliberately disabled for
+         * this collective topology, while ordinary decode and grouped MTP
+         * graphs remain enabled. The two-expert hot cache is also part of the
+         * failing production configuration and materially affects ownership
+         * pressure, so it belongs in the regression contract.
+         */
+        test_case.env_overrides.emplace_back(
+            "LLAMINAR_PREFILL_GRAPH_BUCKETS",
+            "0");
+        test_case.env_overrides.emplace_back(
+            "LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER",
+            "2");
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
+        ScopedMoEPrefixCaseEnvironment case_env(test_case.env_overrides);
+        ScopedEnvironmentValues perf_stats_enabled({
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+            /*
+             * The canonical server gate records per-stage GPU events for every
+             * request. Keep that instrumentation active here because
+             * its event lifecycle overlaps the same graph-captured LLEP
+             * maintenance streams that this regression is designed to stress.
+             */
+            {"LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", "1"},
+        });
+
+        std::string model_path;
+        std::vector<int32_t> reference_prompt;
+        std::vector<int32_t> unused_reference_tokens;
+        loadMoEReferenceInputs(
+            test_case,
+            &model_path,
+            &reference_prompt,
+            &unused_reference_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+            return;
+
+        /*
+         * Preserve the server request order explicitly. The repeated 39- and
+         * 62-row geometries represent different prompts in the server suite;
+         * the loop below therefore gives every entry a unique first token so
+         * equal geometry cannot accidentally turn into a cache hit.
+         */
+        constexpr std::array<size_t, 11> kProductionHistoryPromptLengths = {
+            39u,
+            68u,
+            39u,
+            62u,
+            62u,
+            431u,
+            36u,
+            1815u,
+            1813u,
+            1801u,
+            1305u,
+        };
+        constexpr int kHistoryDecodeTokenBudget = 64;
+        constexpr int kStructuredDecodeTokenBudget = 512;
+        constexpr int kRestoreDecodeTokenBudget = 16;
+        constexpr int kPrefixBlockSize = 64;
+        const std::vector<int32_t> structured_prompt =
+            structuredGenerationPromptTokens(model_path);
+        ASSERT_GE(
+            reference_prompt.size(),
+            *std::max_element(
+                kProductionHistoryPromptLengths.begin(),
+                kProductionHistoryPromptLengths.end()))
+            << "GPU rebalance lifecycle stress metadata is too short";
+
+        auto factory = createOrchestrationRunnerFactory();
+        OrchestrationConfig runner_config =
+            makeMoEPrefixRestoreConfig(
+                test_case,
+                model_path,
+                /*enable_prefix_cache=*/true,
+                kPrefixBlockSize,
+                /*enable_mtp=*/true,
+                /*mtp_draft_tokens=*/2);
+        /*
+         * Match the canonical CUDA2/ROCm2 E2E cells rather than inheriting the
+         * parity helper's intentionally generous 4 GiB RAM tier. One Qwen3.6
+         * 64-token prefix block is roughly 102 MiB per participant. A 1 GiB
+         * budget therefore forces the 443-token request and the surrounding
+         * prompt identities through real LRU eviction, demotion, and later
+         * terminal-state publication pressure before the exact structured
+         * request begins. The former 4 GiB setting retained the whole matrix
+         * and could not reproduce the long-context mirrored-state failure.
+         */
+        runner_config.prefix_cache.ram_budget_bytes =
+            1024ull * 1024ull * 1024ull;
+        auto runner =
+            factory->createFromOrchestrationConfig(runner_config);
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+        /*
+         * This is a transaction-lifetime regression, not a language-quality
+         * assertion. Stop tokens would let an otherwise valid completion end
+         * before the historical 512-token failure window and silently weaken
+         * the workload whenever model weights or prompt formatting change.
+         */
+        runner->setStopTokens({});
+
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        PerfStatsCollector::reset();
+
+        for (size_t request_index = 0;
+             request_index < kProductionHistoryPromptLengths.size();
+             ++request_index)
+        {
+            const size_t prompt_length =
+                kProductionHistoryPromptLengths[request_index];
+            std::vector<int32_t> history_prompt(
+                reference_prompt.begin(),
+                reference_prompt.begin() +
+                    static_cast<std::ptrdiff_t>(prompt_length));
+
+            /*
+             * A unique, ordinary vocabulary token prevents the equal-length
+             * requests above from sharing their first cache block. All
+             * remaining rows retain the real long-ledger routing pattern.
+             */
+            history_prompt.front() =
+                static_cast<int32_t>(1000u + request_index);
+            const GenerationResult result =
+                runner->generate(
+                    history_prompt,
+                    kHistoryDecodeTokenBudget,
+                    greedy);
+            ASSERT_TRUE(result.error.empty())
+                << test_case.name << " production-history request " << request_index
+                << " failed for prompt_rows=" << history_prompt.size()
+                << ": " << result.error;
+            ASSERT_FALSE(result.tokens.empty())
+                << test_case.name << " production-history request " << request_index
+                << " emitted no tokens";
+            ASSERT_EQ(
+                result.tokens.size(),
+                static_cast<size_t>(kHistoryDecodeTokenBudget))
+                << test_case.name << " production-history request " << request_index
+                << " ended before its transaction budget";
+
+            const PrefixRuntimeStateSnapshot probe =
+                runner->prefixStateProbe();
+            EXPECT_FALSE(probe.mtp_bypassed)
+                << "history_request=" << request_index
+                << " reason=" << probe.mtp_bypass_reason;
+            EXPECT_GE(probe.mtp_verifier_runs, 1u)
+                << "history_request=" << request_index;
+            EXPECT_FALSE(probe.prefix_request.hit)
+                << "history_request=" << request_index
+                << " prompt_rows=" << history_prompt.size();
+        }
+
+        const GenerationResult structured_result =
+            runner->generate(
+                structured_prompt,
+                kStructuredDecodeTokenBudget,
+                greedy);
+        ASSERT_TRUE(structured_result.error.empty())
+            << test_case.name << " structured request failed after production history: "
+            << structured_result.error;
+        ASSERT_FALSE(structured_result.tokens.empty())
+            << test_case.name << " structured request emitted no tokens";
+        ASSERT_EQ(
+            structured_result.tokens.size(),
+            static_cast<size_t>(kStructuredDecodeTokenBudget))
+            << test_case.name
+            << " structured request ended before the original server failure window";
+        const PrefixRuntimeStateSnapshot structured_probe =
+            runner->prefixStateProbe();
+        EXPECT_FALSE(structured_probe.mtp_bypassed)
+            << "structured request reason="
+            << structured_probe.mtp_bypass_reason;
+        EXPECT_GE(structured_probe.mtp_verifier_runs, 1u);
+        EXPECT_FALSE(structured_probe.prefix_request.hit);
+
+        const GenerationResult restore_result =
+            runner->generate(
+                structured_prompt,
+                kRestoreDecodeTokenBudget,
+                greedy);
+        ASSERT_TRUE(restore_result.error.empty())
+            << test_case.name << " structured restore failed: "
+            << restore_result.error;
+        ASSERT_FALSE(restore_result.tokens.empty())
+            << test_case.name << " structured restore emitted no tokens";
+        ASSERT_EQ(
+            restore_result.tokens.size(),
+            static_cast<size_t>(kRestoreDecodeTokenBudget))
+            << test_case.name << " structured restore ended before its budget";
+        const PrefixRuntimeStateSnapshot restore_probe =
+            runner->prefixStateProbe();
+        EXPECT_FALSE(restore_probe.mtp_bypassed)
+            << "structured restore reason="
+            << restore_probe.mtp_bypass_reason;
+        EXPECT_GE(restore_probe.mtp_verifier_runs, 1u);
+        ASSERT_TRUE(restore_probe.prefix_request.hit);
+        ASSERT_EQ(
+            restore_probe.prefix_request.matched_tokens,
+            static_cast<int>(structured_prompt.size()));
+
+        /*
+         * Diagnostic export is deliberately outside the inference hot path. It
+         * waits only after the entire production-shaped request sequence so
+         * the assertions below observe completed graph-owned maintenance
+         * records without inserting a host fence between the producer and
+         * consumer requests under test.
+         */
+        runner->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
+        const auto records = PerfStatsCollector::snapshot(
+            {"mtp", "prefix_cache", "moe_rebalance", "kernel"});
+        runner->shutdown();
+
+        expectMoEPrefixCachePerfPath(
+            records,
+            test_case.name + " lifecycle stress");
+        expectMoEGreedyMTPPublicationPath(
+            test_case,
+            records,
+            test_case.name + " lifecycle stress");
+        expectMoEBackendKernelPerfPath(
+            test_case,
+            records,
+            test_case.name + " lifecycle stress");
+        expectPerfCounterPositive(
+            records,
+            "mtp",
+            "live_prefix_checkpoint_logical_captures",
+            test_case.name + " lifecycle stress");
+        expectPerfCounterPositive(
+            records,
+            "mtp",
+            "live_prefix_checkpoint_device_sequence_state_captures",
+            test_case.name + " lifecycle stress");
+        expectPerfCounterZero(
+            records,
+            "mtp",
+            "live_prefix_checkpoint_payload_required",
+            test_case.name + " lifecycle stress");
+        EXPECT_TRUE(hasMTPPerfRecordTag(
+            records,
+            "live_prefix_checkpoint_terminal_hidden_captures",
+            "implementation",
+            "device_to_device"))
+            << test_case.name
+            << " lifecycle stress must keep terminal-hidden checkpoints in VRAM";
+        EXPECT_TRUE(hasMTPPerfRecordTag(
+            records,
+            "live_prefix_checkpoint_device_sequence_state_captures",
+            "cache",
+            "shifted"))
+            << test_case.name
+            << " lifecycle stress must checkpoint every shifted cache's "
+               "device-owned sequence metadata";
+        EXPECT_TRUE(hasMTPPerfRecordTag(
+            records,
+            "live_prefix_checkpoint_device_sequence_state_captures",
+            "implementation",
+            "device_kernel"))
+            << test_case.name
+            << " lifecycle stress must keep shifted-cache rollback metadata "
+               "entirely on device";
+        /*
+         * A single final diagnostics drain exports the currently completed
+         * maintenance slot; it intentionally does not fence and replay every
+         * prior request's copy/apply status. Prove that the selected rebalance
+         * policy planned real transfer-backed assignments during this stress,
+         * then use the common health gate for zero error counters and
+         * producer/consumer event ordering. The ordinary two-request parity
+         * cells drain each wave and remain the canonical copied/applied-arrival
+         * counter proof.
+         */
+        if (test_case.moe_rebalance->mode == MoERebalanceRuntimeMode::LLEP)
+        {
+            expectPerfCounterPositive(
+                records,
+                "moe_rebalance",
+                "device_rebalance_llep_weight_transfer_count",
+                test_case.name + " lifecycle stress");
+            expectPerfCounterPositive(
+                records,
+                "moe_rebalance",
+                "device_rebalance_llep_assignment_span_count",
+                test_case.name + " lifecycle stress");
+        }
+        else
+        {
+            expectDynamicRebalancePlacementPositive(
+                records,
+                test_case.name + " lifecycle stress");
+        }
+        expectPerfCounterPositive(
+            records,
+            "moe_rebalance",
+            "device_rebalance_planned_arrivals",
+            test_case.name + " lifecycle stress");
+        expectPerfCounterPositive(
+            records,
+            "moe_rebalance",
+            "device_rebalance_apply_applied_arrivals",
+            test_case.name + " lifecycle stress");
+        expectMoERebalancePerfPath(
+            test_case,
+            records,
+            test_case.name + " lifecycle stress",
+            /*require_fresh_movement=*/false);
     }
 }
 
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_CUDA2TPHotOnly)
 {
     runMoEMTPParity(cudaOnlyExpertOverlayCase(), false);
+}
+
+/**
+ * @brief Proves long-context CUDA grouped MTP independently of expert movement.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_CUDA2TPLongContextHotOnly)
+{
+    runMoEMTPParity(cudaOnlyLongContextCase(), false);
 }
 
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPHotOnly)
@@ -537,6 +1043,21 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_CUDA2TPDynam
 }
 
 /**
+ * @brief Isolates long-context CUDA Dynamic MTP from prefix-cache activity.
+ *
+ * This control executes the same production-tokenized 2383-row prompt,
+ * movement-friendly Dynamic maintenance policy, grouped verifier, and
+ * device-resident publication path as the prefix-enabled cell below. The sole
+ * difference is that prefill does not concurrently archive reusable state.
+ * Pairing the two cells tells a core long-context verifier defect apart from a
+ * prefix snapshot/import lifetime defect.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_CUDA2TPDynamicPhaseSplit)
+{
+    runMoEMTPParity(cudaOnlyDynamicPhaseSplitCase(), false);
+}
+
+/**
  * @brief Ensures CUDA Dynamic expert movement preserves MTP prefix restore state.
  *
  * This is the Dynamic companion to the LLEP MTP prefix-cache cell below.  It
@@ -547,6 +1068,19 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_CUDA2TPDynam
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPDynamicPhaseSplit)
 {
     runMoEMTPParity(cudaOnlyDynamicPhaseSplitCase(), true);
+}
+
+/**
+ * @brief Reproduces asynchronous CUDA Dynamic publication races across requests.
+ *
+ * Dynamic and LLEP share the captured maintenance and prefix-cache ownership
+ * protocol, but their device planners and placement mutations are distinct.
+ * Keep a dedicated Dynamic cell so a late mirrored-terminal-hidden divergence
+ * cannot hide behind the otherwise comprehensive LLEP lifecycle stress.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_CUDA2TPDynamicPhaseSplit)
+{
+    runRebalancedPrefillRequestBoundaryStress(cudaOnlyDynamicPhaseSplitCase());
 }
 
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_CUDA2TPLLEPPhaseSplit)
@@ -561,9 +1095,30 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPLLEPPha
     runMoEMTPParity(cudaOnlyLLEPPhaseSplitCase(), true);
 }
 
+/**
+ * @brief Reproduces asynchronous CUDA LLEP publication races across requests.
+ *
+ * This is the focused lifecycle regression for the long-context server trap:
+ * one initialized runner must survive the production prefill/decode history
+ * and a subsequent exact prefix restore while graph-captured grouped MTP and
+ * device maintenance remain live.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_CUDA2TPLLEPPhaseSplit)
+{
+    runRebalancedPrefillRequestBoundaryStress(cudaOnlyLLEPPhaseSplitCase());
+}
+
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2TPHotOnly)
 {
     runMoEMTPParity(rocmOnlyExpertOverlayCase(), false);
+}
+
+/**
+ * @brief Proves long-context ROCm grouped MTP independently of expert movement.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2TPLongContextHotOnly)
+{
+    runMoEMTPParity(rocmOnlyLongContextCase(), false);
 }
 
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPHotOnly)
@@ -693,6 +1248,17 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_ROCm2TPDynam
 }
 
 /**
+ * @brief Mirrors the CUDA long-context Dynamic no-prefix isolation control.
+ *
+ * Symmetric coverage proves whether the failure belongs to shared verifier
+ * state ownership or to one vendor's graph/KV implementation.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2TPDynamicPhaseSplit)
+{
+    runMoEMTPParity(rocmOnlyDynamicPhaseSplitCase(), false);
+}
+
+/**
  * @brief Ensures ROCm Dynamic expert movement preserves MTP prefix restore state.
  *
  * ROCm has separate grouped MoE kernels, RCCL synchronization, and graph-capture
@@ -703,6 +1269,19 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_ROCm2TPDynam
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPDynamicPhaseSplit)
 {
     runMoEMTPParity(rocmOnlyDynamicPhaseSplitCase(), true);
+}
+
+/**
+ * @brief Mirrors the multi-request Dynamic lifecycle regression on ROCm.
+ *
+ * The full-tier server failure first appears after many successful MTP samples
+ * and real Dynamic movement waves. This fixture retains one ROCm runner across
+ * the production prompt-shape history and final prefix-restore transition,
+ * making that ownership lifetime part of the focused integration gate.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_ROCm2TPDynamicPhaseSplit)
+{
+    runRebalancedPrefillRequestBoundaryStress(rocmOnlyDynamicPhaseSplitCase());
 }
 
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_ROCm2TPLLEPPhaseSplit)
@@ -717,6 +1296,18 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPLLEPPha
     runMoEMTPParity(rocmOnlyLLEPPhaseSplitCase(), true);
 }
 
+/**
+ * @brief Mirrors the CUDA multi-request lifecycle regression on ROCm.
+ *
+ * ROCm owns the same graph-local routed-kernel state and asynchronous LLEP
+ * maintenance contract. This companion prevents a future ownership or
+ * request-boundary fix from becoming accidentally CUDA-only.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_ROCm2TPLLEPPhaseSplit)
+{
+    runRebalancedPrefillRequestBoundaryStress(rocmOnlyLLEPPhaseSplitCase());
+}
+
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2TPHot_CPU2LocalTPCold)
 {
     runMoEMTPParity(expertOverlayCase(), false);
@@ -728,25 +1319,44 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPHot_CPU
 }
 
 /**
- * @brief Guards the partial-prefix fixtures against accidentally using tiny metadata.
+ * @brief Guards every phase-split fixture against short or heavyweight inputs.
  *
  * This test is intentionally source-level and model-free.  The expensive
- * partial-hit cells validate runtime behavior; this one catches the fixture
- * regression that made the matrix fail before any GPU work started.
+ * runtime cells validate device behavior; this one catches the fixture
+ * regression where a missing long-context snapshot was regenerated from only
+ * its 13-token header. It also proves CUDA/ROCm and Dynamic/LLEP use direct
+ * production tokenization instead of launching a 35B PyTorch decode whose
+ * outputs this state-lifetime suite does not consume.
  */
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PartialPrefixFixturesUseLongMetadata)
 {
-    const auto cuda_case = cudaOnlyPartialPrefixCase();
-    const auto rocm_case = rocmOnlyPartialPrefixCase();
+    const std::string expected_prompt = qwen36MoELongNeedleParityPrompt();
+    const std::array<MoEPrefixRestoreParityCase, 6> test_cases = {
+        cudaOnlyPartialPrefixCase(),
+        rocmOnlyPartialPrefixCase(),
+        cudaOnlyDynamicPhaseSplitCase(),
+        cudaOnlyLLEPPhaseSplitCase(),
+        rocmOnlyDynamicPhaseSplitCase(),
+        rocmOnlyLLEPPhaseSplitCase(),
+    };
 
-    for (const auto *test_case : {&cuda_case, &rocm_case})
+    ASSERT_GT(expected_prompt.size(), 4096u)
+        << "the shared long-ledger prompt unexpectedly lost its workload depth";
+    EXPECT_NE(expected_prompt.find("LCJSON-ALPHA-314159"), std::string::npos);
+    EXPECT_NE(expected_prompt.find("LCJSON-MIDDLE-271828"), std::string::npos);
+    EXPECT_NE(expected_prompt.find("LCJSON-OMEGA-161803"), std::string::npos);
+
+    for (const auto &test_case : test_cases)
     {
-        EXPECT_EQ(test_case->prompt, kLongLedgerPromptHeader);
-        EXPECT_EQ(test_case->max_seq_len, kPhaseSplitLongDecodeMaxSeqLen);
-        EXPECT_GT(test_case->prefix_restore_prompt_token_limit, 256);
-        EXPECT_NE(
-            test_case->default_metadata_path.find("long_decode_snapshots"),
-            std::string::npos);
+        EXPECT_EQ(test_case.prompt, expected_prompt);
+        EXPECT_EQ(test_case.max_seq_len, kPhaseSplitLongDecodeMaxSeqLen);
+        EXPECT_GT(test_case.prefix_restore_prompt_token_limit, 256);
+        EXPECT_GE(test_case.minimum_prompt_tokens, 640u);
+        EXPECT_EQ(
+            test_case.reference_input_source,
+            MoEReferenceInputSource::ModelTokenizer);
+        EXPECT_TRUE(test_case.default_metadata_path.empty());
+        EXPECT_TRUE(test_case.metadata_envs.empty());
     }
 }
 

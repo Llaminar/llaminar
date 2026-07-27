@@ -214,18 +214,6 @@ namespace llaminar2
         mutable std::mutex workspace_mutex_;
         std::unordered_map<int, DeviceWorkspaceManager *> workspace_by_device_;
 
-        struct DebugCanaryBuffer
-        {
-            void *base = nullptr;
-            float *payload = nullptr;
-            size_t guard_bytes = 0;
-            size_t payload_bytes = 0;
-            size_t total_bytes = 0;
-        };
-
-        mutable std::mutex canary_mutex_;
-        std::unordered_map<int, DebugCanaryBuffer> canary_by_device_;
-
         int *h_token_ids_ = nullptr;
         int max_token_ids_ = 0;
         int dynamic_token_count_ = 0;

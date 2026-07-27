@@ -20,6 +20,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
@@ -31,6 +32,7 @@
 
 // Test utils
 #include "../../../utils/CUDATestUtils.h"
+#include "../../../utils/ScopedGPUStream.h"
 
 #include <vector>
 #include <cstring>
@@ -169,8 +171,11 @@ TEST_F(Test__HostReleaseAfterGpuUpload, GpuPointerSurvives_EnsureOnHostFailsGrac
     fillSequential(tensor.get(), 0.0f, 1.0f);
 
     // Upload to GPU, then mark device authoritative (host stale)
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    llaminar2::test::ScopedGPUStream producer_stream(gpu_device_);
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_, producer_stream.get()));
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        producer_stream.get());
     ASSERT_FALSE(tensor->isOnCPU()) << "Host should be stale after mark_device_dirty";
     ASSERT_TRUE(tensor->isDeviceValid());
 

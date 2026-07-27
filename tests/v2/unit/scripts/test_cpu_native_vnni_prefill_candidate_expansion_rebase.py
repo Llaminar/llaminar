@@ -35,7 +35,6 @@ SOURCE_CANDIDATES = (
     "cpu.nvnni.prefill.two_row_tiles.nbc2.full_k",
     "cpu.nvnni.prefill.two_row_tiles.nbc4.full_k",
     "cpu.nvnni.prefill.two_row_tiles.nbc8.full_k",
-    "cpu.nvnni.prefill.two_row_tiles.nbc16.full_k",
     "cpu.nvnni.prefill.decode_equivalent_kpart.pairwise",
     "cpu.nvnni.prefill.decode_equivalent_kpart.wide_rows",
 )
@@ -44,6 +43,8 @@ UNIT_BUILD_DIGEST = "sha256:" + "b" * 64
 
 class CPUNativeVNNIPrefillCheckpointRebaseTest(unittest.TestCase):
     """Prove migration preserves bytes and refuses changed experiments."""
+
+    _cached_complete_plan = None
 
     @staticmethod
     def _write_source(path: Path) -> None:
@@ -152,15 +153,31 @@ class CPUNativeVNNIPrefillCheckpointRebaseTest(unittest.TestCase):
                     })
 
     def _plans(self, root: Path):
+        """Return immutable plan fixtures without repeatedly hashing source code.
+
+        Every test writes the same byte-identical aggregate and timing source.
+        Building a plan also authenticates the full kernel/trainer
+        implementation surface, which is intentionally substantial production
+        work but is unrelated to the individual transaction assertions below.
+        Cache that immutable result once per test process so a highly parallel
+        unit gate does not perform the same repository-wide authentication
+        seven times.
+        """
+
         source_csv = root / "immutable.csv"
         source_timing = root / "immutable.timing.csv"
         self._write_source(source_csv)
         source_timing.write_text("retained timing source\n", encoding="utf-8")
-        current = build_cpu_prefill_candidate_expansion_plan(
-            source_csv,
-            source_timing,
-            collection_build_digest=UNIT_BUILD_DIGEST,
-        )
+        plan_type = type(self)
+        if plan_type._cached_complete_plan is None:
+            plan_type._cached_complete_plan = (
+                build_cpu_prefill_candidate_expansion_plan(
+                    source_csv,
+                    source_timing,
+                    collection_build_digest=UNIT_BUILD_DIGEST,
+                )
+            )
+        current = plan_type._cached_complete_plan
         historical = replace(
             current,
             implementation_digest="sha256:" + "e" * 64,

@@ -200,12 +200,47 @@ namespace llaminar2
         return total;
     }
 
+    PrefixProbeCapturePolicy PrefixProbeCapturePolicy::fromEnvironment()
+    {
+        PrefixProbeCapturePolicy policy;
+        policy.hash_full_kv_payloads =
+            envEnabled("LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS");
+        policy.hash_default_kv_segments =
+            envEnabled("LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS");
+        policy.default_kv_segment_split_tokens =
+            envIntOrDefault("LLAMINAR_PREFIX_PROBE_KV_SEGMENT_SPLIT", 4);
+        if (policy.hash_default_kv_segments)
+            policy.requested_kv_segments = parseRequestedKVSegments();
+        policy.hash_gdn_device_state =
+            envEnabled("LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE");
+        policy.capture_gdn_values =
+            envEnabled("LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES");
+        return policy;
+    }
+
     PrefixKVCacheProbe inspectKVCacheForPrefixProbe(
         const IKVCache &cache,
         std::string owner,
         DeviceId device,
         int sequence_count,
         void *stream)
+    {
+        return inspectKVCacheForPrefixProbe(
+            cache,
+            std::move(owner),
+            device,
+            sequence_count,
+            stream,
+            PrefixProbeCapturePolicy::fromEnvironment());
+    }
+
+    PrefixKVCacheProbe inspectKVCacheForPrefixProbe(
+        const IKVCache &cache,
+        std::string owner,
+        DeviceId device,
+        int sequence_count,
+        void *stream,
+        const PrefixProbeCapturePolicy &capture_policy)
     {
         PrefixKVCacheProbe probe;
         probe.owner = std::move(owner);
@@ -219,11 +254,6 @@ namespace llaminar2
         probe.graph_capture_ready = cache.isGraphCaptureReady();
         probe.k_precision = cache.k_precision();
         probe.v_precision = cache.v_precision();
-        const bool hash_kv_segments =
-            envEnabled("LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS");
-        const std::vector<PrefixKVSegmentProbe> requested_segments =
-            hash_kv_segments ? parseRequestedKVSegments()
-                             : std::vector<PrefixKVSegmentProbe>{};
 
         const int safe_sequence_count = std::max(1, sequence_count);
         probe.layers.reserve(static_cast<size_t>(std::max(0, probe.n_layers)) *
@@ -239,7 +269,7 @@ namespace llaminar2
                 layer_probe.cached_tokens = cache.get_cached_tokens(layer, seq);
                 layer_probe.ring_head = cache.ring_head(layer, seq);
                 if (layer_probe.cached_tokens > 0 &&
-                    envEnabled("LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS"))
+                    capture_policy.hash_full_kv_payloads)
                 {
                     const auto layout = cache.logicalBlockLayout(
                         layer_probe.global_layer,
@@ -273,13 +303,12 @@ namespace llaminar2
                         }
                     }
                 }
-                if (layer_probe.cached_tokens > 1 && hash_kv_segments)
+                const bool capture_any_segment =
+                    capture_policy.hash_default_kv_segments ||
+                    !capture_policy.requested_kv_segments.empty() ||
+                    capture_policy.trailing_kv_tokens > 0;
+                if (layer_probe.cached_tokens > 0 && capture_any_segment)
                 {
-                    const int split_tokens = std::clamp(
-                        envIntOrDefault("LLAMINAR_PREFIX_PROBE_KV_SEGMENT_SPLIT", 4),
-                        1,
-                        layer_probe.cached_tokens - 1);
-
                     auto hash_segment =
                         [&](int token_start,
                             int token_count,
@@ -343,32 +372,54 @@ namespace llaminar2
                         return segment;
                     };
 
-                    layer_probe.leading_segment_tokens = split_tokens;
-                    hash_segment(
-                        0,
-                        split_tokens,
-                        &layer_probe.leading_segment_hash_available,
-                        &layer_probe.leading_k_payload_bytes,
-                        &layer_probe.leading_v_payload_bytes,
-                        &layer_probe.leading_k_payload_hash,
-                        &layer_probe.leading_v_payload_hash);
+                    if (capture_policy.hash_default_kv_segments &&
+                        layer_probe.cached_tokens > 1)
+                    {
+                        const int split_tokens = std::clamp(
+                            capture_policy.default_kv_segment_split_tokens,
+                            1,
+                            layer_probe.cached_tokens - 1);
+                        layer_probe.leading_segment_tokens = split_tokens;
+                        hash_segment(
+                            0,
+                            split_tokens,
+                            &layer_probe.leading_segment_hash_available,
+                            &layer_probe.leading_k_payload_bytes,
+                            &layer_probe.leading_v_payload_bytes,
+                            &layer_probe.leading_k_payload_hash,
+                            &layer_probe.leading_v_payload_hash);
 
-                    layer_probe.trailing_segment_start = split_tokens;
-                    layer_probe.trailing_segment_tokens =
-                        layer_probe.cached_tokens - split_tokens;
-                    hash_segment(
-                        split_tokens,
-                        layer_probe.trailing_segment_tokens,
-                        &layer_probe.trailing_segment_hash_available,
-                        &layer_probe.trailing_k_payload_bytes,
-                        &layer_probe.trailing_v_payload_bytes,
-                        &layer_probe.trailing_k_payload_hash,
-                        &layer_probe.trailing_v_payload_hash);
+                        layer_probe.trailing_segment_start = split_tokens;
+                        layer_probe.trailing_segment_tokens =
+                            layer_probe.cached_tokens - split_tokens;
+                        hash_segment(
+                            split_tokens,
+                            layer_probe.trailing_segment_tokens,
+                            &layer_probe.trailing_segment_hash_available,
+                            &layer_probe.trailing_k_payload_bytes,
+                            &layer_probe.trailing_v_payload_bytes,
+                            &layer_probe.trailing_k_payload_hash,
+                            &layer_probe.trailing_v_payload_hash);
+                    }
 
-                    for (const auto &requested_segment : requested_segments)
+                    for (const auto &requested_segment :
+                         capture_policy.requested_kv_segments)
                     {
                         layer_probe.segments.push_back(
                             capture_named_segment(requested_segment));
+                    }
+
+                    if (capture_policy.trailing_kv_tokens > 0)
+                    {
+                        PrefixKVSegmentProbe trailing;
+                        trailing.name = "diagnostic_tail";
+                        trailing.token_count = std::min(
+                            capture_policy.trailing_kv_tokens,
+                            layer_probe.cached_tokens);
+                        trailing.token_start =
+                            layer_probe.cached_tokens - trailing.token_count;
+                        layer_probe.segments.push_back(
+                            capture_named_segment(std::move(trailing)));
                     }
                 }
                 probe.layers.push_back(layer_probe);
@@ -382,6 +433,17 @@ namespace llaminar2
         const IKVCache &cache,
         void *stream)
     {
+        return inspectHybridGDNForPrefixProbe(
+            cache,
+            stream,
+            PrefixProbeCapturePolicy::fromEnvironment());
+    }
+
+    std::vector<PrefixGDNLayerProbe> inspectHybridGDNForPrefixProbe(
+        const IKVCache &cache,
+        void *stream,
+        const PrefixProbeCapturePolicy &capture_policy)
+    {
         const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&cache);
         if (!hybrid)
         {
@@ -389,10 +451,7 @@ namespace llaminar2
         }
 
         std::vector<uint8_t> device_state_bytes;
-        std::vector<uint8_t> local_device_state_bytes;
-        const bool capture_device_state =
-            envEnabled("LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE");
-        if (capture_device_state)
+        if (capture_policy.hash_gdn_device_state)
         {
             const HybridPrefixStateMetadata metadata =
                 hybrid->hybridPrefixStateMetadata();
@@ -412,25 +471,8 @@ namespace llaminar2
                     device_state_bytes.clear();
                 }
             }
-            if (metadata.host_bytes > 0)
-            {
-                local_device_state_bytes.resize(metadata.host_bytes);
-                HybridPrefixStateDescriptor desc;
-                desc.stream = stream;
-                desc.synchronize = true;
-                desc.include_host_state = true;
-                desc.include_device_state = false;
-                if (!hybrid->exportHybridPrefixState(
-                        desc,
-                        local_device_state_bytes.data(),
-                        nullptr))
-                {
-                    local_device_state_bytes.clear();
-                }
-            }
         }
         size_t device_offset = 0;
-        size_t local_device_offset = 0;
 
         std::vector<PrefixGDNLayerProbe> probes;
         probes.reserve(static_cast<size_t>(std::max(0, hybrid->gdnLayerCount())));
@@ -457,69 +499,119 @@ namespace llaminar2
                 state->recurrence_state.data(), state->recurrence_state.size());
             probe.conv_all_zero = floatBufferAllZeroForPrefixProbe(
                 state->conv_state.data(), state->conv_state.size());
-            if (!local_device_state_bytes.empty())
-            {
-                probe.recurrence_local_device_bytes =
-                    state->recurrence_state.size() * sizeof(float);
-                if (local_device_offset + probe.recurrence_local_device_bytes <=
-                    local_device_state_bytes.size())
-                {
-                    probe.recurrence_local_device_hash =
-                        hashByteBufferForPrefixProbe(
-                            local_device_state_bytes.data() + local_device_offset,
-                            probe.recurrence_local_device_bytes);
-                    probe.local_device_state_hash_available = true;
-                }
-                local_device_offset += probe.recurrence_local_device_bytes;
-
-                probe.conv_local_device_bytes =
-                    state->conv_state.size() * sizeof(float);
-                if (local_device_offset + probe.conv_local_device_bytes <=
-                    local_device_state_bytes.size())
-                {
-                    probe.conv_local_device_hash =
-                        hashByteBufferForPrefixProbe(
-                            local_device_state_bytes.data() + local_device_offset,
-                            probe.conv_local_device_bytes);
-                    probe.local_device_state_hash_available = true;
-                }
-                local_device_offset += probe.conv_local_device_bytes;
-            }
             if (!device_state_bytes.empty())
             {
-                if (auto *conv_kernel =
-                        const_cast<IHybridKVCache *>(hybrid)->getConvKernel(layer))
+                /*
+                 * exportHybridPrefixState serializes each GDN layer as:
+                 *
+                 *   local conv, optional full conv,
+                 *   local recurrence, optional full recurrence.
+                 *
+                 * Parse those exact bank sizes.  The previous probe advanced by
+                 * largestStateBytes() once per kernel; under LocalTP that
+                 * hashed a range spanning the local bank and the beginning of
+                 * the full bank, then misaligned every following layer.
+                 */
+                auto consume_bank =
+                    [&](size_t byte_count,
+                        size_t *reported_bytes,
+                        uint64_t *reported_hash) -> bool
                 {
-                    probe.conv_device_bytes = conv_kernel->largestStateBytes();
-                    if (device_offset + probe.conv_device_bytes <=
-                        device_state_bytes.size())
+                    *reported_bytes = byte_count;
+                    if (byte_count == 0 ||
+                        device_offset > device_state_bytes.size() ||
+                        byte_count > device_state_bytes.size() - device_offset)
                     {
+                        return false;
+                    }
+                    *reported_hash = hashByteBufferForPrefixProbe(
+                        device_state_bytes.data() + device_offset,
+                        byte_count);
+                    device_offset += byte_count;
+                    return true;
+                };
+
+                const bool has_conv =
+                    const_cast<IHybridKVCache *>(hybrid)->getConvKernel(layer) !=
+                    nullptr;
+                const bool has_recurrence =
+                    const_cast<IHybridKVCache *>(hybrid)
+                        ->getRecurrenceKernel(layer) != nullptr;
+                bool local_complete = true;
+                bool full_complete = true;
+                bool has_local_bank = false;
+                bool has_full_bank = false;
+
+                if (has_conv && state->local_conv_state_size > 0)
+                {
+                    has_local_bank = true;
+                    local_complete &=
+                        consume_bank(
+                            static_cast<size_t>(state->local_conv_state_size) *
+                                sizeof(float),
+                            &probe.conv_local_device_bytes,
+                            &probe.conv_local_device_hash);
+
+                    if (state->full_conv_state_size !=
+                        state->local_conv_state_size)
+                    {
+                        has_full_bank = true;
+                        full_complete &=
+                            consume_bank(
+                                static_cast<size_t>(state->full_conv_state_size) *
+                                    sizeof(float),
+                                &probe.conv_device_bytes,
+                                &probe.conv_device_hash);
+                    }
+                    else
+                    {
+                        has_full_bank = true;
+                        probe.conv_device_bytes =
+                            probe.conv_local_device_bytes;
                         probe.conv_device_hash =
-                            hashByteBufferForPrefixProbe(
-                                device_state_bytes.data() + device_offset,
-                                probe.conv_device_bytes);
-                        probe.device_state_hash_available = true;
+                            probe.conv_local_device_hash;
                     }
-                    device_offset += probe.conv_device_bytes;
                 }
-                if (auto *recurrence_kernel =
-                        const_cast<IHybridKVCache *>(hybrid)->getRecurrenceKernel(layer))
+                if (has_recurrence &&
+                    state->local_recurrence_state_size > 0)
                 {
-                    probe.recurrence_device_bytes =
-                        recurrence_kernel->largestStateBytes();
-                    if (device_offset + probe.recurrence_device_bytes <=
-                        device_state_bytes.size())
+                    has_local_bank = true;
+                    local_complete &=
+                        consume_bank(
+                            static_cast<size_t>(
+                                state->local_recurrence_state_size) *
+                                sizeof(float),
+                            &probe.recurrence_local_device_bytes,
+                            &probe.recurrence_local_device_hash);
+
+                    if (state->full_recurrence_state_size !=
+                        state->local_recurrence_state_size)
                     {
-                        probe.recurrence_device_hash =
-                            hashByteBufferForPrefixProbe(
-                                device_state_bytes.data() + device_offset,
-                                probe.recurrence_device_bytes);
-                        probe.device_state_hash_available = true;
+                        has_full_bank = true;
+                        full_complete &=
+                            consume_bank(
+                                static_cast<size_t>(
+                                    state->full_recurrence_state_size) *
+                                    sizeof(float),
+                                &probe.recurrence_device_bytes,
+                                &probe.recurrence_device_hash);
                     }
-                    device_offset += probe.recurrence_device_bytes;
+                    else
+                    {
+                        has_full_bank = true;
+                        probe.recurrence_device_bytes =
+                            probe.recurrence_local_device_bytes;
+                        probe.recurrence_device_hash =
+                            probe.recurrence_local_device_hash;
+                    }
                 }
+
+                probe.local_device_state_hash_available =
+                    has_local_bank && local_complete;
+                probe.device_state_hash_available =
+                    has_full_bank && full_complete;
             }
-            if (envEnabled("LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES"))
+            if (capture_policy.capture_gdn_values)
             {
                 probe.recurrence_sample_values = state->recurrence_state;
                 probe.conv_sample_values = state->conv_state;

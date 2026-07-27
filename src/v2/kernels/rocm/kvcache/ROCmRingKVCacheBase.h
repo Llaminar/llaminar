@@ -48,6 +48,10 @@ namespace llaminar2
         int max_seq_len() const override { return max_seq_len_; }
         int get_cached_tokens(int layer, int seq_idx = 0) const override;
         KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override;
+        bool truncateSequence(
+            int seq_idx,
+            int cached_tokens,
+            void *stream = nullptr) override;
 
         void clear() override;
         void clear_sequence(int layer, int seq_idx) override;
@@ -73,6 +77,19 @@ namespace llaminar2
             void *gpu_stream) override;
         const int *deviceCachedTokenCountPtr(int layer, int seq_idx = 0) const override;
         const int *deviceRingHeadPtr(int layer, int seq_idx = 0) const override;
+        size_t deviceSequenceStateCheckpointBytes() const override;
+        bool captureDeviceSequenceStateCheckpoint(
+            int seq_idx,
+            void *checkpoint_device,
+            size_t checkpoint_bytes,
+            void *stream,
+            std::string *error = nullptr) const override;
+        bool restoreDeviceSequenceStateCheckpoint(
+            int seq_idx,
+            const void *checkpoint_device,
+            size_t checkpoint_bytes,
+            void *stream,
+            std::string *error = nullptr) override;
         bool publishSequenceStateFromDeviceMetadata(
             const DeviceSequenceStatePublicationRequest &request,
             std::string *error = nullptr) override;
@@ -113,6 +130,24 @@ namespace llaminar2
         int *d_count_params_ = nullptr; ///< Device-side cached-token count buffer
         /** Stable arena-owned device count source per cache entry, or nullptr. */
         std::vector<const int32_t *> append_count_sources_;
+
+        /**
+         * @brief Establish this cache's allocation device on the calling thread.
+         *
+         * LocalTP invokes participant caches serially from one coordinator
+         * thread. HIP's ambient current device can therefore name a sibling
+         * when this object receives an out-of-band checkpoint, restore, or
+         * publication request. Every base-class runtime or kernel operation
+         * must call this method before using an owned pointer or stream.
+         *
+         * @param operation Human-readable operation name used in diagnostics.
+         * @param error Optional detailed failure destination for public APIs.
+         * @return true when the HIP runtime selected @ref device_id_.
+         */
+        bool activateOwningDevice(
+            const char *operation,
+            std::string *error = nullptr) const;
+
         void allocateDeviceParams();
         void freeDeviceParams();
         const int *deviceDynamicAppendCountPtr(int layer, int seq_idx) const;
@@ -121,6 +156,25 @@ namespace llaminar2
             int seq_idx,
             int head,
             int count,
+            void *gpu_stream);
+
+        /**
+         * @brief Remove oldest visible rows using only canonical device state.
+         *
+         * The HIP kernel saturates the device-owned count at zero while
+         * preserving the ring head. No host metadata mirror is consulted and
+         * the method never synchronizes the supplied explicit stream.
+         *
+         * @param layer Local cache layer index.
+         * @param seq_idx Request index within the cache batch.
+         * @param num_tokens Number of oldest visible rows to discard.
+         * @param gpu_stream Explicit HIP stream that owns the mutation.
+         * @return true when the metadata kernel was accepted for launch.
+         */
+        bool evictOldestDeviceSequenceState(
+            int layer,
+            int seq_idx,
+            int num_tokens,
             void *gpu_stream);
 
         /**

@@ -284,7 +284,9 @@ namespace llaminar2
     // Error Handling Tests
     // =========================================================================
 
-    TEST_F(CollectiveContextGPUTest, AllReduceWithZeroCount)
+    TEST_F(
+        CollectiveContextGPUTest,
+        ZeroCountStillRejectsMismatchedGPUStorage)
     {
         auto ctx = CollectiveContextFactory::createIntraNode(inventory_, nullptr);
         ASSERT_NE(ctx, nullptr);
@@ -312,8 +314,9 @@ namespace llaminar2
         }
 #endif
 
-        bool result = ctx->executeAllreduce(tensor.get(), 0, device);
-        EXPECT_TRUE(result) << "AllReduce with count=0 should use tensor numel";
+        EXPECT_THROW(
+            ctx->executeAllreduce(tensor.get(), 0, device),
+            std::invalid_argument);
     }
 
     TEST_F(CollectiveContextGPUTest, AllReduceWithNullBuffer)
@@ -321,9 +324,9 @@ namespace llaminar2
         auto ctx = CollectiveContextFactory::createIntraNode(inventory_, nullptr);
         ASSERT_NE(ctx, nullptr);
 
-        // Note: Calling executeAllreduce with nullptr is undefined behavior
-        // and may crash depending on the backend. This test just verifies
-        // context creation works.
+        EXPECT_THROW(
+            ctx->executeAllreduce(nullptr, 64, DeviceId::cpu()),
+            std::invalid_argument);
     }
 
 } // namespace llaminar2

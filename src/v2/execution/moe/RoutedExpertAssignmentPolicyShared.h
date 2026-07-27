@@ -102,7 +102,9 @@ namespace llaminar2::routed_expert_assignment
                     owner < 32u ? (1u << owner) : 0u,
                     0ULL,
                     load,
-                    false))
+                    false,
+                    config.max_non_owner_experts_per_participant,
+                    config.participant_count))
             {
                 if (status_out)
                     *status_out = status;

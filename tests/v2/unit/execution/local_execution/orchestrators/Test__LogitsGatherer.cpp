@@ -90,6 +90,85 @@ namespace
             g_rocm_pin_backend = nullptr;
         }
     };
+
+    /**
+     * @brief CPU-only backend double for ordered GPU-logits D2H tests.
+     *
+     * Test vectors stand in for device storage, so these tests exercise only
+     * LogitsGatherer's ownership and error propagation. No CUDA or ROCm runtime
+     * is loaded by the unit suite.
+     */
+    class OrderedD2HBackend : public test::MockBackend
+    {
+    public:
+        OrderedD2HBackend()
+            : test::MockBackend(DeviceType::CUDA)
+        {
+        }
+
+        bool deviceToHost(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            int,
+            void *stream) override
+        {
+            streams_.push_back(stream);
+            ++copy_count_;
+            if (fail_copies_)
+                return false;
+            if (bytes > 0 && dst && src)
+                std::memcpy(dst, src, bytes);
+            return true;
+        }
+
+        bool deviceToHostFast(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            int device_id,
+            void *stream) override
+        {
+            ++fast_copy_count_;
+            return deviceToHost(dst, src, bytes, device_id, stream);
+        }
+
+        void setFailCopies(bool fail) { fail_copies_ = fail; }
+        size_t copyCount() const { return copy_count_; }
+        size_t fastCopyCount() const { return fast_copy_count_; }
+        const std::vector<void *> &streams() const { return streams_; }
+
+    private:
+        bool fail_copies_ = false;
+        size_t copy_count_ = 0;
+        size_t fast_copy_count_ = 0;
+        std::vector<void *> streams_;
+    };
+
+    OrderedD2HBackend *g_ordered_d2h_backend = nullptr;
+
+    /// @brief Resolve the test-owned CUDA backend without global registration.
+    IBackend *resolveOrderedD2HBackend(DeviceId device)
+    {
+        return device.is_cuda() ? g_ordered_d2h_backend : nullptr;
+    }
+
+    /**
+     * @brief Install one ordered-D2H backend for a lexical test scope.
+     */
+    class OrderedD2HResolverScope
+    {
+    public:
+        explicit OrderedD2HResolverScope(OrderedD2HBackend &backend)
+        {
+            g_ordered_d2h_backend = &backend;
+        }
+
+        ~OrderedD2HResolverScope()
+        {
+            g_ordered_d2h_backend = nullptr;
+        }
+    };
 } // namespace
 
 // =============================================================================
@@ -491,6 +570,64 @@ private:
     std::shared_ptr<FP32Tensor> tensor_;
 };
 
+/**
+ * @brief GPU-shaped runner double with separate metadata and consuming views.
+ *
+ * getLogitsLocalInfo() deliberately returns no stream. The host-gather API is
+ * the only operation allowed to attach the producer-ordered bridge stream.
+ */
+class OrderedGPUColumnParallelMockRunner : public LogitsGathererMockRunner
+{
+public:
+    OrderedGPUColumnParallelMockRunner(
+        int local_vocab,
+        std::vector<float> device_data,
+        void *host_bridge_stream)
+        : LogitsGathererMockRunner(local_vocab),
+          local_vocab_(local_vocab),
+          device_data_(std::move(device_data)),
+          host_bridge_stream_(host_bridge_stream),
+          tensor_(std::make_shared<FP32Tensor>(
+              std::vector<size_t>{1, static_cast<size_t>(local_vocab)},
+              DeviceId::cpu()))
+    {
+        std::fill(
+            tensor_->mutable_data(),
+            tensor_->mutable_data() + local_vocab_,
+            -999.0f);
+    }
+
+    bool hasLogitsLocal() const override { return true; }
+
+    LogitsLocalInfo getLogitsLocalInfo() const override
+    {
+        return LogitsLocalInfo{
+            device_data_.data(),
+            DeviceId::cuda(0),
+            static_cast<size_t>(local_vocab_),
+            0,
+            tensor_.get(),
+            nullptr};
+    }
+
+    LogitsLocalInfo consumeLogitsLocalInfoForHostGather() override
+    {
+        ++host_gather_consumes_;
+        LogitsLocalInfo info = getLogitsLocalInfo();
+        info.stream = host_bridge_stream_;
+        return info;
+    }
+
+    size_t hostGatherConsumes() const { return host_gather_consumes_; }
+
+private:
+    int local_vocab_;
+    std::vector<float> device_data_;
+    void *host_bridge_stream_ = nullptr;
+    std::shared_ptr<FP32Tensor> tensor_;
+    size_t host_gather_consumes_ = 0;
+};
+
 TEST_F(Test__LogitsGatherer, GatherColumnParallel_TwoDevices_Decode)
 {
     // Device 0 has vocab [0..63], device 1 has vocab [64..127]
@@ -519,6 +656,106 @@ TEST_F(Test__LogitsGatherer, GatherColumnParallel_TwoDevices_Decode)
         EXPECT_FLOAT_EQ(out[i], static_cast<float>(i)) << "Mismatch at index " << i;
 
     EXPECT_EQ(g->lastGatheredSize(), static_cast<size_t>(FULL_V));
+}
+
+TEST_F(Test__LogitsGatherer, GatherGPUShardsConsumesExactHostBridgeStreams)
+{
+    constexpr int LOCAL_V = 4;
+    constexpr int FULL_V = 8;
+    void *stream0 = reinterpret_cast<void *>(0x1010);
+    void *stream1 = reinterpret_cast<void *>(0x2020);
+
+    OrderedD2HBackend backend;
+    OrderedD2HResolverScope resolver_scope(backend);
+
+    auto runner0 = std::make_unique<OrderedGPUColumnParallelMockRunner>(
+        LOCAL_V,
+        std::vector<float>{0.0f, 1.0f, 2.0f, 3.0f},
+        stream0);
+    auto runner1 = std::make_unique<OrderedGPUColumnParallelMockRunner>(
+        LOCAL_V,
+        std::vector<float>{4.0f, 5.0f, 6.0f, 7.0f},
+        stream1);
+    auto *runner0_view = runner0.get();
+    auto *runner1_view = runner1.get();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    LogitsGatherer gatherer(
+        FULL_V,
+        /*max_tokens=*/1,
+        resolveOrderedD2HBackend);
+    ASSERT_TRUE(gatherer.gather(runners, /*seq_len=*/1, FULL_V));
+
+    EXPECT_EQ(runner0_view->hostGatherConsumes(), 1U);
+    EXPECT_EQ(runner1_view->hostGatherConsumes(), 1U);
+    ASSERT_EQ(backend.streams().size(), 2U);
+    EXPECT_EQ(backend.streams()[0], stream0);
+    EXPECT_EQ(backend.streams()[1], stream1);
+    EXPECT_EQ(backend.fastCopyCount(), 2U);
+    for (int token = 0; token < FULL_V; ++token)
+    {
+        EXPECT_FLOAT_EQ(
+            gatherer.data()[token],
+            static_cast<float>(token));
+    }
+}
+
+TEST_F(Test__LogitsGatherer, GatherGPUShardRejectsNullHostBridgeStream)
+{
+    constexpr int LOCAL_V = 4;
+    constexpr int FULL_V = 8;
+
+    OrderedD2HBackend backend;
+    OrderedD2HResolverScope resolver_scope(backend);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::make_unique<OrderedGPUColumnParallelMockRunner>(
+        LOCAL_V,
+        std::vector<float>(LOCAL_V, 1.0f),
+        /*host_bridge_stream=*/nullptr));
+    runners.push_back(std::make_unique<OrderedGPUColumnParallelMockRunner>(
+        LOCAL_V,
+        std::vector<float>(LOCAL_V, 2.0f),
+        reinterpret_cast<void *>(0x3030)));
+
+    LogitsGatherer gatherer(
+        FULL_V,
+        /*max_tokens=*/1,
+        resolveOrderedD2HBackend);
+    EXPECT_FALSE(gatherer.gather(runners, /*seq_len=*/1, FULL_V));
+    EXPECT_EQ(backend.copyCount(), 0U);
+    EXPECT_EQ(gatherer.lastGatheredSize(), 0U);
+}
+
+TEST_F(Test__LogitsGatherer, GatherGPUShardPropagatesOrderedD2HFailure)
+{
+    constexpr int LOCAL_V = 4;
+    constexpr int FULL_V = 8;
+
+    OrderedD2HBackend backend;
+    backend.setFailCopies(true);
+    OrderedD2HResolverScope resolver_scope(backend);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::make_unique<OrderedGPUColumnParallelMockRunner>(
+        LOCAL_V,
+        std::vector<float>(LOCAL_V, 1.0f),
+        reinterpret_cast<void *>(0x4040)));
+    runners.push_back(std::make_unique<OrderedGPUColumnParallelMockRunner>(
+        LOCAL_V,
+        std::vector<float>(LOCAL_V, 2.0f),
+        reinterpret_cast<void *>(0x5050)));
+
+    LogitsGatherer gatherer(
+        FULL_V,
+        /*max_tokens=*/1,
+        resolveOrderedD2HBackend);
+    EXPECT_FALSE(gatherer.gather(runners, /*seq_len=*/1, FULL_V));
+    EXPECT_EQ(backend.copyCount(), 1U);
+    EXPECT_EQ(gatherer.lastGatheredSize(), 0U);
 }
 
 TEST_F(Test__LogitsGatherer, GatherLocalInfos_ReplicatedFullVocabUsesPrimary)

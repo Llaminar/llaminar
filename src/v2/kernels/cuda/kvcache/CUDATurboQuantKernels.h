@@ -54,6 +54,7 @@ namespace llaminar2
         int n_layers = 0;
         int n_kv_heads = 0;
         int head_dim = 0;
+        int device_id = -1; ///< Backend-local CUDA ordinal owning both allocations.
 
         /// Get rotation matrix Π for (layer, head)
         const float *rotation(int layer, int head) const

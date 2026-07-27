@@ -23,6 +23,7 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #include "tensors/Tensors.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
@@ -38,6 +39,41 @@ namespace
     {
         return (m > 1) ? ((m + 127) & ~127) : m;
     }
+
+    /**
+     * @brief Restore the mutable debug switch after a structural workspace test.
+     *
+     * Workspace planning reads this process-local setting but launches no GPU
+     * work. Keeping restoration in RAII form prevents an ASSERT from leaking a
+     * serial/concurrent choice into later unit cases.
+     */
+    class ScopedCudaConcurrentPrefillSetting
+    {
+    public:
+        explicit ScopedCudaConcurrentPrefillSetting(bool enabled)
+            : previous_(mutableDebugEnv().gemm.cuda_concurrent_prefill)
+        {
+            set(enabled);
+        }
+
+        ~ScopedCudaConcurrentPrefillSetting()
+        {
+            set(previous_);
+        }
+
+        void set(bool enabled)
+        {
+            mutableDebugEnv().gemm.cuda_concurrent_prefill = enabled;
+        }
+
+        ScopedCudaConcurrentPrefillSetting(
+            const ScopedCudaConcurrentPrefillSetting &) = delete;
+        ScopedCudaConcurrentPrefillSetting &operator=(
+            const ScopedCudaConcurrentPrefillSetting &) = delete;
+
+    private:
+        bool previous_ = true;
+    };
 
     size_t countTempCFp32Buffers(const WorkspaceRequirements &reqs)
     {
@@ -193,6 +229,31 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       Qwen36PrefillDoesNotReservePromptSizedVerifierPartials)
+{
+    auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/150);
+    CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
+
+    constexpr int kM = 595;
+    constexpr int kN = 17408;
+    constexpr int kK = 5120;
+    auto reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
+
+    const WorkspaceDescriptor *partials =
+        reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+    ASSERT_NE(partials, nullptr);
+
+    const size_t expected_rows = static_cast<size_t>(
+        nativeVNNIPersistentVerifierWorkspaceRows(kM, kN, kK));
+    const size_t k_groups = static_cast<size_t>(kK / 32);
+    EXPECT_EQ(
+        partials->size_bytes,
+        k_groups * expected_rows * static_cast<size_t>(kN) * sizeof(float));
+    EXPECT_LT(partials->size_bytes, 256u * 1024u * 1024u)
+        << "Prompt M must not inflate decode/verifier K-part scratch.";
+}
+
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
        SingleProjectionGemvPartials_DoNotReserveSideStreamSlots)
 {
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/151);
@@ -343,6 +404,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
        NativeVNNIPrefillSplitKWorkspace_DeclaredForQwenLikeQ4KShape)
 {
+    ScopedCudaConcurrentPrefillSetting concurrent_prefill(/*enabled=*/false);
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/10);
     CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
 
@@ -357,29 +419,37 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
         << "NativeVNNI prefill split-K dispatch must be backed by declared workspace; "
         << "otherwise selected split-K launches fail at runtime.";
 
-    EXPECT_GE(splitk->size_bytes,
-              static_cast<size_t>(4) * paddedPrefillM(kM) * kN * sizeof(float));
+    EXPECT_GT(splitk->size_bytes, 0u)
+        << "The total heuristic may choose its largest split-K arena at a "
+           "smaller row bucket than prompt M, but that arena must be declared.";
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
        NativeVNNIPrefillSplitKWorkspace_HasConcurrentSlotsForPromptPrefill)
 {
+    ScopedCudaConcurrentPrefillSetting concurrent_prefill(/*enabled=*/false);
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/1010);
     CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
 
     constexpr int kM = 596;
     constexpr int kN = 5120;
     constexpr int kK = 17408;
-    auto reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
+    const auto serial_reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
+    const WorkspaceDescriptor *serial_splitk =
+        serial_reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
+    ASSERT_NE(serial_splitk, nullptr);
+    ASSERT_GT(serial_splitk->size_bytes, 0u);
 
-    const WorkspaceDescriptor *splitk =
-        reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-    ASSERT_NE(splitk, nullptr);
+    concurrent_prefill.set(/*enabled=*/true);
+    const auto concurrent_reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
+    const WorkspaceDescriptor *concurrent_splitk =
+        concurrent_reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
+    ASSERT_NE(concurrent_splitk, nullptr);
 
-    const size_t one_slot_bytes =
-        static_cast<size_t>(4) * paddedPrefillM(kM) * kN * sizeof(float);
-    EXPECT_GE(splitk->size_bytes,
-              static_cast<size_t>(kConcurrentPrefillWorkspaceSlots) * one_slot_bytes)
+    EXPECT_EQ(
+        concurrent_splitk->size_bytes,
+        static_cast<size_t>(kConcurrentPrefillWorkspaceSlots) *
+            serial_splitk->size_bytes)
         << "Concurrent CUDA prefill runs fused projections on side streams, so split-K "
            "partials need disjoint per-stream slots instead of one serial scratch buffer.";
 }

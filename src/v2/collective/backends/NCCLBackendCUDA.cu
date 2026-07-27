@@ -601,12 +601,6 @@ namespace llaminar2
             }
         }
 
-        bool cudaEventSynchronize(void *event)
-        {
-            cudaError_t err = ::cudaEventSynchronize(static_cast<cudaEvent_t>(event));
-            return (err == cudaSuccess);
-        }
-
         // =========================================================================
         // Event-Based Device-to-Host and Host-to-Device Transfers (for staging)
         // =========================================================================
@@ -717,12 +711,6 @@ namespace llaminar2
             // which is OK - it means P2P was already set up
             cudaError_t err = cudaDeviceEnablePeerAccess(peer_device, 0);
             return (err == cudaSuccess || err == cudaErrorPeerAccessAlreadyEnabled);
-        }
-
-        bool cudaDeviceSynchronizeWrapper()
-        {
-            cudaError_t err = cudaDeviceSynchronize();
-            return (err == cudaSuccess);
         }
 
     } // namespace nccl_backend_detail

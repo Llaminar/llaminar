@@ -6,6 +6,7 @@
 #include "RMSNormStage.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 
@@ -149,11 +150,7 @@ namespace llaminar2
         if (success)
         {
             if (params_.device_id.is_gpu())
-            {
-                output_base->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                                                   params_.device_id,
-                                                   gpuStream());
-            }
+                gpuExecution().publish(output_base);
             traceOutput("output", params_.output);
         }
         return success;

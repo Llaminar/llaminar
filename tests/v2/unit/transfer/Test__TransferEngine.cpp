@@ -6,7 +6,9 @@
 
 // For execute tests
 #include "backends/DeviceId.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/TensorClasses.h"
+#include "tensors/TensorSlice.h"
 #include "../../mocks/MockBackend.h"
 #include "../../utils/TestTensorFactory.h"
 
@@ -483,6 +485,83 @@ TEST_F(Test__TransferEngine_Execute, Upload_HostResident_MultipleCallsStillNoop)
     EXPECT_EQ(stats.d2h_count, 0u);
 }
 
+TEST_F(Test__TransferEngine_Execute, Upload_TensorSliceMutatesBackingStorageOwner)
+{
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+
+    auto inner = TestTensorFactory::createFP32Ones({4, 4});
+    inner->setBackendForTesting(mock_backend_.get());
+    TensorBase *inner_ptr = inner.get();
+
+    SliceMetadata metadata{
+        .mode = SliceMode::ROW_PARALLEL,
+        .original_rows = 4,
+        .original_cols = 4,
+        .slice_start = 0,
+        .slice_end = 4,
+        .rank = 0,
+        .world_size = 1,
+        .inner_is_presliced = true,
+    };
+    std::unique_ptr<TensorBase> storage_owner = std::move(inner);
+    TensorSlice slice(std::move(storage_owner), metadata);
+
+    const auto result = engine.upload(&slice, DeviceId::cuda(0));
+
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_EQ(result.method_used, TransferMethod::HOST_TO_DEVICE);
+    EXPECT_EQ(slice.transferStorageOwner(), inner_ptr);
+    EXPECT_EQ(slice.current_device(), DeviceId::cuda(0));
+    EXPECT_NE(slice.gpu_data_ptr(), nullptr);
+    EXPECT_EQ(slice.gpu_data_ptr(), inner_ptr->gpu_data_ptr());
+
+    const auto stats = mock_backend_->getTransferStats();
+    EXPECT_EQ(stats.h2d_count, 1u);
+    EXPECT_EQ(stats.d2h_count, 0u);
+}
+
+TEST_F(Test__TransferEngine_Execute, Download_TensorSliceReadsBackingStorageOwner)
+{
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+
+    auto inner = TestTensorFactory::createFP32Ones({4, 4});
+    inner->setBackendForTesting(mock_backend_.get());
+    TensorBase *inner_ptr = inner.get();
+
+    SliceMetadata metadata{
+        .mode = SliceMode::ROW_PARALLEL,
+        .original_rows = 4,
+        .original_cols = 4,
+        .slice_start = 0,
+        .slice_end = 4,
+        .rank = 0,
+        .world_size = 1,
+        .inner_is_presliced = true,
+    };
+    std::unique_ptr<TensorBase> storage_owner = std::move(inner);
+    TensorSlice slice(std::move(storage_owner), metadata);
+
+    ASSERT_TRUE(engine.upload(&slice, DeviceId::cuda(0)).success);
+    TransferEngine::publishDeviceWrite(
+        &slice,
+        DeviceId::cuda(0),
+        reinterpret_cast<void *>(0x1234));
+    mock_backend_->resetTransferStats();
+
+    const auto result = engine.download(&slice);
+
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_EQ(result.method_used, TransferMethod::DEVICE_TO_HOST);
+    EXPECT_EQ(slice.transferStorageOwner(), inner_ptr);
+    EXPECT_TRUE(slice.hostValid());
+
+    const auto stats = mock_backend_->getTransferStats();
+    EXPECT_EQ(stats.h2d_count, 0u);
+    EXPECT_EQ(stats.d2h_count, 1u);
+}
+
 // ============================================================================
 // Error handling tests
 // ============================================================================
@@ -755,12 +834,17 @@ TEST(Test__TransferEngine_GpuOnly, ReleaseHostWeightData_Idempotent)
 }
 
 // ============================================================================
-// Event wait failure tests — lock in hard-error behavior for downloadFull
-// and fallback behavior for uploadFull
+// Event publication/wait failures — every required dependency fails closed.
 // ============================================================================
 
 namespace
 {
+    /// Non-null sentinel used as a mock producer stream without GPU work.
+    void *mockProducerStream()
+    {
+        return reinterpret_cast<void *>(0x5055424C);
+    }
+
     /**
      * @brief MockBackend subclass with configurable event wait failure.
      *
@@ -777,7 +861,28 @@ namespace
         {
             // Still record the operation for test inspection
             MockBackend::waitForEvent(event, device_id);
+            host_event_wait_count_++;
             return !fail_event_wait_;
+        }
+
+        bool streamWaitEvent(void *stream, void *event, int device_id) override
+        {
+            MockBackend::streamWaitEvent(stream, event, device_id);
+            stream_event_wait_count_++;
+            return !fail_stream_event_wait_;
+        }
+
+        void *createEvent(int device_id) override
+        {
+            if (fail_event_create_)
+                return nullptr;
+            return MockBackend::createEvent(device_id);
+        }
+
+        bool recordEvent(void *event, int device_id, void *stream = nullptr) override
+        {
+            MockBackend::recordEvent(event, device_id, stream);
+            return !fail_event_record_;
         }
 
         bool synchronize(int device_id) override
@@ -790,16 +895,33 @@ namespace
         /// Make waitForEvent() return false from now on
         void setEventWaitFails(bool fail) { fail_event_wait_ = fail; }
 
+        /// Make streamWaitEvent() return false from now on
+        void setStreamEventWaitFails(bool fail) { fail_stream_event_wait_ = fail; }
+
+        /// Make createEvent() fail from now on
+        void setEventCreateFails(bool fail) { fail_event_create_ = fail; }
+
+        /// Make recordEvent() fail from now on
+        void setEventRecordFails(bool fail) { fail_event_record_ = fail; }
+
         /// Make synchronize() return false from now on
         void setSynchronizeFails(bool fail) { fail_synchronize_ = fail; }
 
         /// Number of times synchronize() was called (for verifying fallback behavior)
         size_t getSyncFallbackCount() const { return sync_fallback_count_; }
 
+        size_t getHostEventWaitCount() const { return host_event_wait_count_; }
+        size_t getStreamEventWaitCount() const { return stream_event_wait_count_; }
+
     private:
         bool fail_event_wait_ = false;
+        bool fail_stream_event_wait_ = false;
+        bool fail_event_create_ = false;
+        bool fail_event_record_ = false;
         bool fail_synchronize_ = false;
         size_t sync_fallback_count_ = 0;
+        size_t host_event_wait_count_ = 0;
+        size_t stream_event_wait_count_ = 0;
     };
 } // namespace
 
@@ -829,10 +951,11 @@ protected:
         bool ok = tensor->ensureOnDevice(DeviceId::cuda(0));
         EXPECT_TRUE(ok);
 
-        // Transition to DEVICE_AUTHORITATIVE with a completion event
-        // This creates an event and records it on the mock backend
-        tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                                      DeviceId::cuda(0));
+        // Publish DEVICE_AUTHORITATIVE with a completion event on the mock backend.
+        TransferEngine::publishDeviceWrite(
+            tensor,
+            DeviceId::cuda(0),
+            mockProducerStream());
 
         return tensor;
     }
@@ -938,7 +1061,7 @@ TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitSuccess_Transfer
     EXPECT_EQ(stats.d2h_count, 1u);
 }
 
-TEST_F(Test__TransferEngine_EventFailure, DownloadFull_NoEvent_FallsBackToFullSync)
+TEST_F(Test__TransferEngine_EventFailure, DownloadFull_NoEvent_FailsClosedWithoutTransfer)
 {
     TransferEngine engine(resolver_);
 
@@ -947,18 +1070,19 @@ TEST_F(Test__TransferEngine_EventFailure, DownloadFull_NoEvent_FallsBackToFullSy
 
     // Upload to device but DON'T set a completion event
     tensor->ensureOnDevice(DeviceId::cuda(0));
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, DeviceId::cuda(0));
+    TransferEngine::publishGraphOwnedDeviceWrite(tensor, DeviceId::cuda(0));
 
     mock_->resetTransferStats();
 
     auto result = engine.downloadFull(tensor.get());
 
-    // Should succeed via full device sync (no event to wait on)
-    EXPECT_TRUE(result.success);
+    EXPECT_FALSE(result.success);
     EXPECT_EQ(result.method_used, TransferMethod::DEVICE_TO_HOST);
+    EXPECT_NE(result.error.find("no completion event"), std::string::npos);
 
-    // synchronize() was called as fallback (no event path)
-    EXPECT_GE(mock_->getSyncFallbackCount(), 1u);
+    const auto stats = mock_->getTransferStats();
+    EXPECT_EQ(stats.d2h_count, 0u);
+    EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
 }
 
 // -----------------------------------------------------------------------------
@@ -999,6 +1123,310 @@ TEST_F(Test__TransferEngine_EventFailure, UploadFull_EventWaitFail_ErrorMessageM
 
     EXPECT_FALSE(result.success);
     EXPECT_NE(result.error.find("invalid"), std::string::npos);
+}
+
+TEST_F(Test__TransferEngine_EventFailure, UploadFull_StreamWaitFail_DoesNotHostWait)
+{
+    TransferEngine engine(resolver_);
+
+    auto tensor = createTensorOnDeviceWithEvent();
+    mock_->setStreamEventWaitFails(true);
+
+    auto result = engine.uploadFull(
+        tensor.get(),
+        DeviceId::cuda(0),
+        reinterpret_cast<void *>(0x1234));
+
+    EXPECT_FALSE(result.success);
+    EXPECT_NE(result.error.find("Stream event wait failed"), std::string::npos);
+    EXPECT_EQ(mock_->getStreamEventWaitCount(), 1u);
+    EXPECT_EQ(mock_->getHostEventWaitCount(), 0u)
+        << "A failed device-side dependency must never degrade into a "
+           "host-blocking event wait.";
+    EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
+}
+
+TEST_F(Test__TransferEngine_EventFailure, PublicationCreateFail_DoesNotPublishDeviceAuthority)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    ASSERT_TRUE(tensor->ensureOnDevice(DeviceId::cuda(0)));
+    const TensorCoherenceState state_before = tensor->coherenceState();
+
+    mock_->setEventCreateFails(true);
+    EXPECT_THROW(
+        TransferEngine::publishDeviceWrite(
+            tensor,
+            DeviceId::cuda(0),
+            mockProducerStream()),
+        std::runtime_error);
+    EXPECT_EQ(tensor->coherenceState(), state_before)
+        << "Authority cannot become externally visible without its event.";
+}
+
+TEST_F(Test__TransferEngine_EventFailure, NullProducerStream_DoesNotPublishDeviceAuthority)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    ASSERT_TRUE(tensor->ensureOnDevice(DeviceId::cuda(0)));
+    const TensorCoherenceState state_before = tensor->coherenceState();
+    mock_->resetEventRecords();
+
+    EXPECT_THROW(
+        TransferEngine::publishDeviceWrite(
+            tensor,
+            DeviceId::cuda(0),
+            nullptr),
+        std::invalid_argument);
+    EXPECT_EQ(tensor->coherenceState(), state_before);
+    EXPECT_EQ(mock_->getEventCreateCount(), 0u);
+    EXPECT_EQ(mock_->getEventRecordCount(), 0u);
+}
+
+TEST_F(Test__TransferEngine_EventFailure, NullInputPreparationStreamFailsBeforePlacement)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+
+    EXPECT_THROW(
+        TransferEngine::prepareDeviceInput(
+            tensor.get(),
+            DeviceId::cuda(0),
+            nullptr),
+        std::invalid_argument);
+    EXPECT_FALSE(tensor->current_device().has_value());
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    RequireDeviceInputRejectsHostOnlyTensorWithoutAllocatingOrUploading)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    const size_t allocations_before = mock_->getAllocationCount();
+    const auto transfers_before = mock_->getTransferStats();
+
+    EXPECT_THROW(
+        TransferEngine::requireDeviceInput(
+            tensor.get(),
+            DeviceId::cuda(0),
+            reinterpret_cast<void *>(0x1234)),
+        std::runtime_error);
+
+    EXPECT_EQ(mock_->getAllocationCount(), allocations_before);
+    const auto transfers_after = mock_->getTransferStats();
+    EXPECT_EQ(transfers_after.h2d_count, transfers_before.h2d_count);
+    EXPECT_EQ(transfers_after.d2h_count, transfers_before.d2h_count);
+    EXPECT_FALSE(tensor->current_device().has_value());
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    RequireDeviceInputJoinsProducerEventWithoutTransfer)
+{
+    auto tensor = createTensorOnDeviceWithEvent();
+    const size_t allocations_before = mock_->getAllocationCount();
+    const auto transfers_before = mock_->getTransferStats();
+
+    TransferEngine::requireDeviceInput(
+        tensor.get(),
+        DeviceId::cuda(0),
+        reinterpret_cast<void *>(0x1234));
+
+    EXPECT_EQ(mock_->getStreamEventWaitCount(), 1u);
+    EXPECT_EQ(mock_->getHostEventWaitCount(), 0u);
+    EXPECT_EQ(mock_->getAllocationCount(), allocations_before);
+    const auto transfers_after = mock_->getTransferStats();
+    EXPECT_EQ(transfers_after.h2d_count, transfers_before.h2d_count);
+    EXPECT_EQ(transfers_after.d2h_count, transfers_before.d2h_count);
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    PreCaptureJoinMakesExactEventAndStreamCaptureSafe)
+{
+    auto tensor = createTensorOnDeviceWithEvent();
+    void *capture_stream = reinterpret_cast<void *>(0xCA970001);
+
+    TransferEngine::requireDeviceInput(
+        tensor.get(),
+        DeviceId::cuda(0),
+        capture_stream);
+    ASSERT_EQ(mock_->getStreamEventWaitCount(), 1u);
+
+    {
+        GraphCaptureGuard capture_guard;
+        EXPECT_NO_THROW(
+            TransferEngine::requireDeviceInput(
+                tensor.get(),
+                DeviceId::cuda(0),
+                capture_stream));
+    }
+
+    EXPECT_EQ(mock_->getStreamEventWaitCount(), 1u)
+        << "Capture must consume the prejoined dependency without importing "
+           "the external producer event into the graph.";
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    CaptureRejectsUnpreparedOrDifferentConsumerStreamWithoutBackendWait)
+{
+    auto tensor = createTensorOnDeviceWithEvent();
+    void *prepared_stream = reinterpret_cast<void *>(0xCA970001);
+    void *different_stream = reinterpret_cast<void *>(0xCA970002);
+
+    TransferEngine::requireDeviceInput(
+        tensor.get(),
+        DeviceId::cuda(0),
+        prepared_stream);
+    ASSERT_EQ(mock_->getStreamEventWaitCount(), 1u);
+
+    {
+        GraphCaptureGuard capture_guard;
+        EXPECT_THROW(
+            TransferEngine::requireDeviceInput(
+                tensor.get(),
+                DeviceId::cuda(0),
+                different_stream),
+            std::runtime_error);
+    }
+
+    EXPECT_EQ(mock_->getStreamEventWaitCount(), 1u)
+        << "A missing pre-capture dependency is fatal; capture must never try "
+           "the backend wait and hope the runtime accepts it.";
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    NewDevicePublicationInvalidatesPriorPreCaptureJoin)
+{
+    auto tensor = createTensorOnDeviceWithEvent();
+    void *capture_stream = reinterpret_cast<void *>(0xCA970001);
+
+    TransferEngine::requireDeviceInput(
+        tensor.get(),
+        DeviceId::cuda(0),
+        capture_stream);
+    ASSERT_EQ(mock_->getStreamEventWaitCount(), 1u);
+
+    TransferEngine::publishDeviceWrite(
+        tensor.get(),
+        DeviceId::cuda(0),
+        mockProducerStream());
+
+    {
+        GraphCaptureGuard capture_guard;
+        EXPECT_THROW(
+            TransferEngine::requireDeviceInput(
+                tensor.get(),
+                DeviceId::cuda(0),
+                capture_stream),
+            std::runtime_error);
+    }
+
+    EXPECT_EQ(mock_->getStreamEventWaitCount(), 1u);
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    RequireDeviceInputFailsClosedWhenProducerEventCannotBeJoined)
+{
+    auto tensor = createTensorOnDeviceWithEvent();
+    mock_->setStreamEventWaitFails(true);
+
+    EXPECT_THROW(
+        TransferEngine::requireDeviceInput(
+            tensor.get(),
+            DeviceId::cuda(0),
+            reinterpret_cast<void *>(0x1234)),
+        std::runtime_error);
+
+    EXPECT_EQ(mock_->getStreamEventWaitCount(), 1u);
+    EXPECT_EQ(mock_->getHostEventWaitCount(), 0u);
+    EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    RequireDeviceInputRejectsNullConsumerStreamBeforeResidencyInspection)
+{
+    auto tensor = createTensorOnDeviceWithEvent();
+
+    EXPECT_THROW(
+        TransferEngine::requireDeviceInput(
+            tensor.get(),
+            DeviceId::cuda(0),
+            nullptr),
+        std::invalid_argument);
+    EXPECT_EQ(mock_->getStreamEventWaitCount(), 0u);
+}
+
+TEST_F(Test__TransferEngine_EventFailure, NullOutputPreparationStreamFailsBeforeAllocation)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+
+    EXPECT_THROW(
+        TransferEngine::prepareDeviceOutput(
+            tensor.get(),
+            DeviceId::cuda(0),
+            nullptr),
+        std::invalid_argument);
+    EXPECT_FALSE(tensor->current_device().has_value());
+}
+
+TEST_F(Test__TransferEngine_EventFailure, AllocationOnlyStorageDoesNotPublishAuthority)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    mock_->resetEventRecords();
+
+    TransferEngine::allocateDeviceStorage(
+        tensor.get(),
+        DeviceId::cuda(0));
+
+    ASSERT_TRUE(tensor->current_device().has_value());
+    EXPECT_EQ(*tensor->current_device(), DeviceId::cuda(0));
+    EXPECT_NE(tensor->gpu_data_ptr(), nullptr);
+    EXPECT_FALSE(tensor->deviceValid())
+        << "Allocation alone must not publish unwritten device bytes";
+    EXPECT_EQ(mock_->getEventCreateCount(), 0u);
+    EXPECT_EQ(mock_->getEventRecordCount(), 0u);
+}
+
+TEST_F(Test__TransferEngine_EventFailure, CurrentDevicePublicationRejectsNullStream)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    ASSERT_TRUE(tensor->ensureOnDevice(DeviceId::cuda(0)));
+    const TensorCoherenceState state_before = tensor->coherenceState();
+    mock_->resetEventRecords();
+
+    EXPECT_THROW(
+        TransferEngine::publishCurrentDeviceWrite(tensor, nullptr),
+        std::invalid_argument);
+    EXPECT_EQ(tensor->coherenceState(), state_before);
+    EXPECT_EQ(mock_->getEventCreateCount(), 0u);
+    EXPECT_EQ(mock_->getEventRecordCount(), 0u);
+}
+
+TEST_F(Test__TransferEngine_EventFailure, PublicationRecordFail_DoesNotPublishDeviceAuthority)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    ASSERT_TRUE(tensor->ensureOnDevice(DeviceId::cuda(0)));
+    const TensorCoherenceState state_before = tensor->coherenceState();
+
+    mock_->setEventRecordFails(true);
+    EXPECT_THROW(
+        TransferEngine::publishDeviceWrite(
+            tensor.get(),
+            DeviceId::cuda(0),
+            reinterpret_cast<void *>(0x1234)),
+        std::runtime_error);
+    EXPECT_EQ(tensor->coherenceState(), state_before)
+        << "A failed record must not expose an eventless GPU write.";
 }
 
 TEST_F(Test__TransferEngine_EventFailure, UploadFull_EventWaitSuccess_Succeeds)

@@ -57,6 +57,14 @@ namespace llaminar2
             DecodeExpertHistogram *decode_histogram = nullptr;
             IMoERuntimeTable *moe_runtime_table = nullptr;
             bool force_grouped_verifier_prefill_for_decode = false;
+            /**
+             * @brief Explicit graph-local owner shared with the routed expert stage.
+             *
+             * The paired stages are sequential and exchange router-produced Q8
+             * hidden rows through this backend object. A distinct owner must be
+             * created for every separately captured main or MTP graph.
+             */
+            std::shared_ptr<MoERoutedPipelineKernelOwner> routed_pipeline_kernel_owner;
 
             // Optional graph-capturable decode rebalance apply piggyback.
             // When enabled, the route kernel applies any ready device-side
@@ -155,9 +163,24 @@ namespace llaminar2
          * @brief Preserve warmed routing workspace for capture-from-Initialized.
          */
         void resetSessionStatePreservingLazyInitialization() override;
+        /**
+         * @brief Reset backend launch metadata owned exclusively by this stage.
+         *
+         * Routing stages retain independent MoE kernel instances so a sibling
+         * expert or maintenance graph cannot retarget their stream, workspace,
+         * or descriptor storage. A hard graph invalidation resets that private
+         * backend state; captured-replay request boundaries deliberately do not
+         * call this method.
+         */
+        void invalidateKernelDynamicState() override;
 
         // Test accessors
-        void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
+        void setMoEKernelForTesting(IMoEKernel *kernel)
+        {
+            params_.routed_pipeline_kernel_owner.reset();
+            owned_moe_kernel_.reset();
+            moe_kernel_ = kernel;
+        }
 
     private:
         struct GpuEffectiveSeqLenState;
@@ -169,7 +192,13 @@ namespace llaminar2
         mutable std::vector<float> routing_weights_;
         mutable std::vector<float> router_logits_;
 
-        /// Cached MoE kernel
+        /**
+         * @brief Stage-owned MoE kernel and optional non-owning test override.
+         *
+         * The backend object contains mutable launch state and therefore must
+         * never be shared across separately captured graph stages.
+         */
+        mutable std::unique_ptr<IMoEKernel> owned_moe_kernel_;
         mutable IMoEKernel *moe_kernel_ = nullptr;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
 

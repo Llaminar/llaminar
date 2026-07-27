@@ -45,6 +45,78 @@ namespace llaminar2
         return getBackendFor(device);
     }
 
+    bool LogitsGatherer::copyLocalSpanToHost(
+        void *dst,
+        const void *src,
+        size_t bytes,
+        const LogitsLocalInfo &info,
+        bool fast) const
+    {
+        if (bytes == 0)
+            return true;
+        if (!dst)
+        {
+            LOG_ERROR("LogitsGatherer::copyLocalSpanToHost: null host destination");
+            return false;
+        }
+
+        const bool declares_gpu_device =
+            info.device.has_value() && info.device->is_gpu();
+        const bool declares_gpu_storage = info.gpu_ptr != nullptr || src != nullptr;
+        if (declares_gpu_device || declares_gpu_storage)
+        {
+            if (!declares_gpu_device || !info.gpu_ptr || !src)
+            {
+                LOG_ERROR("LogitsGatherer::copyLocalSpanToHost: incomplete GPU logits ownership metadata");
+                return false;
+            }
+            if (!info.stream)
+            {
+                LOG_ERROR("LogitsGatherer::copyLocalSpanToHost: GPU logits gather requires "
+                          "the explicit stream returned by a consuming runner API");
+                return false;
+            }
+
+            IBackend *backend = resolveBackend(*info.device);
+            if (!backend)
+            {
+                LOG_ERROR("LogitsGatherer::copyLocalSpanToHost: no backend for "
+                          << info.device->toString());
+                return false;
+            }
+
+            const bool copied =
+                fast
+                    ? backend->deviceToHostFast(
+                          dst,
+                          src,
+                          bytes,
+                          info.device->gpu_ordinal(),
+                          info.stream)
+                    : backend->deviceToHost(
+                          dst,
+                          src,
+                          bytes,
+                          info.device->gpu_ordinal(),
+                          info.stream);
+            if (!copied)
+            {
+                LOG_ERROR("LogitsGatherer::copyLocalSpanToHost: ordered D2H failed for "
+                          << info.device->toString());
+                return false;
+            }
+            return true;
+        }
+
+        if (!info.tensor)
+        {
+            LOG_ERROR("LogitsGatherer::copyLocalSpanToHost: CPU logits tensor is null");
+            return false;
+        }
+        std::memcpy(dst, info.tensor->data(), bytes);
+        return true;
+    }
+
     LogitsGatherer::~LogitsGatherer()
     {
         if (pinned_ && buffer_)
@@ -162,30 +234,14 @@ namespace llaminar2
             }
 
             float *output = buffer_->mutable_data();
-            if (primary.gpu_ptr && primary.device.has_value())
+            if (!copyLocalSpanToHost(
+                    output,
+                    primary.gpu_ptr,
+                    copy_bytes,
+                    primary,
+                    seq_len == 1))
             {
-                IBackend *backend = resolveBackend(*primary.device);
-                if (backend)
-                {
-                    if (seq_len == 1)
-                    {
-                        backend->deviceToHostFast(output, primary.gpu_ptr, copy_bytes,
-                                                  primary.device->gpu_ordinal());
-                    }
-                    else
-                    {
-                        backend->deviceToHost(output, primary.gpu_ptr, copy_bytes,
-                                              primary.device->gpu_ordinal());
-                    }
-                }
-                else
-                {
-                    std::memcpy(output, primary.tensor->data(), copy_bytes);
-                }
-            }
-            else
-            {
-                std::memcpy(output, primary.tensor->data(), copy_bytes);
+                return false;
             }
 
             last_gathered_size_ = copy_elements;
@@ -239,22 +295,14 @@ namespace llaminar2
                 float *dst = output + dst_offset;
                 size_t copy_bytes = info.vocab_local * sizeof(float);
 
-                if (info.gpu_ptr && info.device.has_value())
+                if (!copyLocalSpanToHost(
+                        dst,
+                        info.gpu_ptr,
+                        copy_bytes,
+                        info,
+                        /*fast=*/true))
                 {
-                    IBackend *backend = resolveBackend(*info.device);
-                    if (backend)
-                    {
-                        backend->deviceToHostFast(dst, info.gpu_ptr, copy_bytes,
-                                                  info.device->gpu_ordinal());
-                    }
-                    else
-                    {
-                        std::memcpy(dst, info.tensor->data(), copy_bytes);
-                    }
-                }
-                else
-                {
-                    std::memcpy(dst, info.tensor->data(), copy_bytes);
+                    return false;
                 }
                 col_offset += info.vocab_local;
             }
@@ -277,43 +325,49 @@ namespace llaminar2
             const auto &info = device_infos[dev];
             const size_t row_stride = logitsRowStride(info);
 
-            if (info.gpu_ptr && info.device.has_value())
+            if (info.device.has_value() && info.device->is_gpu())
             {
-                IBackend *backend = resolveBackend(*info.device);
-                if (backend)
+                staging_buffers[dev].resize(seq_len * info.vocab_local);
+                if (row_stride == info.vocab_local)
                 {
-                    staging_buffers[dev].resize(seq_len * info.vocab_local);
-                    if (row_stride == info.vocab_local)
+                    size_t copy_bytes = seq_len * info.vocab_local * sizeof(float);
+                    if (!copyLocalSpanToHost(
+                            staging_buffers[dev].data(),
+                            info.gpu_ptr,
+                            copy_bytes,
+                            info,
+                            /*fast=*/false))
                     {
-                        size_t copy_bytes = seq_len * info.vocab_local * sizeof(float);
-                        backend->deviceToHost(staging_buffers[dev].data(), info.gpu_ptr,
-                                              copy_bytes, info.device->gpu_ordinal());
+                        return false;
                     }
-                    else
-                    {
-                        const auto *src_base = static_cast<const float *>(info.gpu_ptr);
-                        for (size_t row = 0; row < seq_len; ++row)
-                        {
-                            backend->deviceToHost(
-                                staging_buffers[dev].data() + row * info.vocab_local,
-                                src_base + row * row_stride,
-                                info.vocab_local * sizeof(float),
-                                info.device->gpu_ordinal());
-                        }
-                    }
-                    device_data[dev] = staging_buffers[dev].data();
-                    device_strides[dev] = info.vocab_local;
                 }
                 else
                 {
-                    LOG_WARN("LogitsGatherer::gatherLocalInfos: no backend for device "
-                             << info.device->toString() << ", falling back to full D2H");
-                    device_data[dev] = info.tensor->data();
-                    device_strides[dev] = row_stride;
+                    const auto *src_base = static_cast<const float *>(info.gpu_ptr);
+                    for (size_t row = 0; row < seq_len; ++row)
+                    {
+                        if (!copyLocalSpanToHost(
+                                staging_buffers[dev].data() +
+                                    row * info.vocab_local,
+                                src_base + row * row_stride,
+                                info.vocab_local * sizeof(float),
+                                info,
+                                /*fast=*/false))
+                        {
+                            return false;
+                        }
+                    }
                 }
+                device_data[dev] = staging_buffers[dev].data();
+                device_strides[dev] = info.vocab_local;
             }
             else
             {
+                if (info.gpu_ptr)
+                {
+                    LOG_ERROR("LogitsGatherer::gatherLocalInfos: GPU pointer has no GPU device");
+                    return false;
+                }
                 device_data[dev] = info.tensor->data();
                 device_strides[dev] = row_stride;
             }
@@ -355,13 +409,12 @@ namespace llaminar2
         if (runners.size() == 1)
         {
             const float *primary_logits = runners[0]->logits();
-            if (primary_logits)
-            {
-                size_t copy_size = seq_len * static_cast<size_t>(full_vocab_size);
-                std::memcpy(buffer_->mutable_data(), primary_logits,
-                            copy_size * sizeof(float));
-                last_gathered_size_ = copy_size;
-            }
+            if (!primary_logits)
+                return false;
+            size_t copy_size = seq_len * static_cast<size_t>(full_vocab_size);
+            std::memcpy(buffer_->mutable_data(), primary_logits,
+                        copy_size * sizeof(float));
+            last_gathered_size_ = copy_size;
             return true;
         }
 
@@ -380,13 +433,12 @@ namespace llaminar2
         {
             // LM head is replicated — use primary device's full logits
             const float *primary_logits = runners[0]->logits();
-            if (primary_logits)
-            {
-                size_t copy_size = seq_len * static_cast<size_t>(full_vocab_size);
-                std::memcpy(buffer_->mutable_data(), primary_logits,
-                            copy_size * sizeof(float));
-                last_gathered_size_ = copy_size;
-            }
+            if (!primary_logits)
+                return false;
+            size_t copy_size = seq_len * static_cast<size_t>(full_vocab_size);
+            std::memcpy(buffer_->mutable_data(), primary_logits,
+                        copy_size * sizeof(float));
+            last_gathered_size_ = copy_size;
             return true;
         }
 
@@ -405,7 +457,7 @@ namespace llaminar2
                 return false;
             }
 
-            auto info = runner->getLogitsLocalInfo();
+            auto info = runner->consumeLogitsLocalInfoForHostGather();
             if (!info)
             {
                 LOG_ERROR("LogitsGatherer::gather: device missing logits_local");

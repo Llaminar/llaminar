@@ -27,13 +27,6 @@
 
 namespace llaminar2
 {
-    enum class DeviceMoERebalanceMaintenanceGraphKind
-    {
-        Probe,
-        MetadataAndPayload,
-    };
-
-
     // Forward declarations
     class TensorBase;
     class ICPUKVCache;
@@ -52,6 +45,23 @@ namespace llaminar2
     // =========================================================================
     // Generic Input/Output Structures
     // =========================================================================
+
+    /**
+     * @brief Declares how a forward invocation represents logical positions.
+     *
+     * Position geometry is part of graph policy, not something graph builders
+     * may infer from whichever pointers happen to be non-null. ExplicitRows is
+     * required for request-batched or otherwise non-contiguous positions and
+     * must provide host or device rows. ContiguousOffset represents the single
+     * sequence `[position_offset, position_offset + seq_len)` directly; GPU
+     * stages publish that scalar on their execution stream and must not create
+     * or upload a host row array.
+     */
+    enum class ForwardPositionPolicy : uint8_t
+    {
+        ExplicitRows,
+        ContiguousOffset,
+    };
 
     /**
      * @brief Generic forward pass input
@@ -84,6 +94,16 @@ namespace llaminar2
          * pointer as the source of truth when it is present.
          */
         const void *position_ids_device = nullptr;
+        /**
+         * @brief Semantic representation of this invocation's positions.
+         *
+         * The default preserves the long-standing public contract that callers
+         * provide explicit rows. Internal single-request prefill planning opts
+         * into ContiguousOffset deliberately. A contiguous input must have
+         * batch_size == 1 and leave both position pointers null so there is one
+         * unambiguous source of truth.
+         */
+        ForwardPositionPolicy position_policy = ForwardPositionPolicy::ExplicitRows;
         int batch_size = 1;                ///< Number of sequences
         int seq_len = 0;                   ///< Sequence length per batch
         /**
@@ -109,6 +129,15 @@ namespace llaminar2
          */
         int token_offset = 0;
         int prefill_chunk_index = 0;       ///< Stable chunk ordinal for chunked graph-captured prefill.
+        /**
+         * @brief Select the one-shot graph that reconstructs prefix-owned GPU state.
+         *
+         * This is immutable graph policy for one invocation, not mutable host
+         * placement data. When true, model stages prepend their captured
+         * device-resident payload reconstruction transaction before any route,
+         * attention, or decode consumer observes the restored state.
+         */
+        bool rehydrate_prefix_runtime_on_device = false;
         DeviceId device = DeviceId::cpu(); ///< Target device
         IKVCache *kv_cache = nullptr;      ///< KV cache (optional)
 
@@ -170,12 +199,37 @@ namespace llaminar2
     };
 
     /**
-     * @brief Generic forward pass output
+     * @brief Device-ordering provenance for one concrete forward execution.
+     *
+     * A tensor pointer identifies storage, but it does not identify the GPU
+     * stream that most recently wrote that storage. Downstream device-only
+     * consumers therefore need this execution-scoped record in addition to the
+     * output tensor itself. Carrying the record in ForwardOutput makes the
+     * producer-to-consumer handoff explicit and prevents a later graph launch
+     * from overwriting an engine-global "last execution" lookup before the
+     * original consumer has queued its dependency.
+     *
+     * CPU execution is synchronous and publishes a valid record with a null
+     * stream. A successful GPU execution must publish a valid record with a
+     * non-null, Llaminar-owned stream.
+     */
+    struct ForwardExecutionProvenance
+    {
+        bool valid = false;                    ///< True only after successful graph execution.
+        DeviceId device = DeviceId::invalid(); ///< Device that owns the produced output.
+        void *stream = nullptr;                ///< Exact GPU producer stream; null for CPU.
+        bool is_decode = false;                ///< Whether decode semantics selected this graph.
+        bool all_position_logits = false;      ///< Whether this was a grouped verifier graph.
+    };
+
+    /**
+     * @brief Generic forward pass output and its concrete execution provenance.
      */
     struct ForwardOutput
     {
         TensorBase *logits = nullptr; ///< Output logits [batch_size * seq_len, vocab_size]
         TensorBase *hidden = nullptr; ///< Optional: final hidden states
+        ForwardExecutionProvenance execution; ///< Ordering owner for this invocation's outputs.
 
         virtual ~ForwardOutput() = default;
     };
@@ -329,6 +383,31 @@ namespace llaminar2
             return state.empty();
         }
 
+        /**
+         * @brief Whether restored logical state still needs GPU payload reconstruction.
+         *
+         * A true result means restorePrefixCacheRuntimeState() imported a
+         * pointer-free placement record whose rolling payload replicas must be
+         * recreated by the next dedicated captured forward graph. The query is
+         * deliberately separate from restore success: success means the archive
+         * was valid and its device plan was published, not that payload transport
+         * has already executed.
+         */
+        virtual bool prefixCacheRuntimeStateRequiresDeviceRehydration() const
+        {
+            return false;
+        }
+
+        /**
+         * @brief Retire the one-shot device rehydration contract after execution.
+         *
+         * Called only after the dedicated graph has completed successfully. A
+         * model that advertised pending work must treat an unexpected call or
+         * incomplete device plan as fatal rather than silently retaining stale
+         * placement.
+         */
+        virtual void completePrefixCacheRuntimeStateDeviceRehydration() {}
+
         // =====================================================================
         // Weight / Buffer Management
         // =====================================================================
@@ -353,6 +432,20 @@ namespace llaminar2
 
         /// Enable or disable all-position LM-head logits for speculative verification.
         virtual bool setComputeAllPositionLogits(bool enabled)
+        {
+            (void)enabled;
+            return false;
+        }
+
+        /**
+         * @brief Select the grouped speculative-verifier graph policy.
+         *
+         * This is deliberately independent of all-position logits because MTP
+         * prompt prefill also requests logits for multiple rows while still
+         * producing the terminal hidden state consumed by the first draft
+         * sidecar.
+         */
+        virtual bool setGroupedMTPVerifier(bool enabled)
         {
             (void)enabled;
             return false;
@@ -530,7 +623,8 @@ namespace llaminar2
             int layer_idx,
             int seq_len,
             int batch_size,
-            DeviceId device)
+            DeviceId device,
+            const int32_t *sequence_lengths_device = nullptr)
         {
             (void)layer;
             (void)buffers;
@@ -538,26 +632,30 @@ namespace llaminar2
             (void)seq_len;
             (void)batch_size;
             (void)device;
+            (void)sequence_lengths_device;
             return {};
         }
 
         /**
-         * @brief Build a producer-only device-side MoE rebalance maintenance graph.
+         * @brief Build one atomic device-side MoE maintenance transaction.
          *
-         * Ordinary decode graphs should contain only cheap per-layer apply/poll
-         * stages once a backend-neutral runtime table is active. Homogeneous GPU
-         * MoE domains can run planning, allgather, and transfer-slot staging from
-         * a separate captured maintenance graph at rebalance-window boundaries.
-         * Non-MoE builders and unsupported placements return an empty graph.
+         * The returned graph owns histogram collection, controller planning,
+         * command publication, immutable expert-payload packing, NCCL/RCCL
+         * transport, and runtime-table apply. Those phases must remain in one
+         * captured transaction so no host readback or graph selection can sit
+         * between planning and publication. Ordinary decode graphs contain
+         * only their cheap ready-wave consumers. Non-MoE builders and
+         * unsupported placements return an empty graph.
+         *
+         * @param device Participant device whose symmetric maintenance graph
+         *        should be constructed.
+         * @return A complete per-device maintenance graph, or an empty graph
+         *         when the model has no device-side MoE maintenance contract.
          */
         virtual ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
-            DeviceId device,
-            DeviceMoERebalanceMaintenanceGraphKind kind = DeviceMoERebalanceMaintenanceGraphKind::Probe,
-            uint64_t payload_edge_mask = 0)
+            DeviceId device)
         {
             (void)device;
-            (void)kind;
-            (void)payload_edge_mask;
             return {};
         }
 

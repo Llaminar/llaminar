@@ -16,6 +16,7 @@
 
 // Backend interface (no GPU headers exposed)
 #include "../backends/IBackend.h"
+#include "../transfer/TransferEngine.h"
 
 // Conditional backend includes (separate compilation units)
 #ifdef HAVE_CUDA
@@ -139,8 +140,11 @@ namespace llaminar2
             LOG_DEBUG("[MPIStager] toDevice: GPU tensor (" << home_device.toString() << "), staging " << numel << " elements");
             hostToDevice(gpu_ptr, host_buffer.data(), numel, device_id);
             synchronizeDevice(device_id);
-            // Mark device data as authoritative after H2D transfer (with event for fine-grained sync)
-            tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            // The explicit device synchronization above completed this H2D
+            // boundary; no asynchronous producer remains to publish.
+            TransferEngine::publishCompletedDeviceWrite(
+                tensor,
+                home_device);
         }
     }
 

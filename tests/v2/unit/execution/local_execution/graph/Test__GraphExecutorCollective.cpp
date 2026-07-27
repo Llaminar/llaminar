@@ -87,7 +87,7 @@ namespace
 
         void synchronize() override {}
         void synchronizeStream(void * /*stream*/) override {}
-        void insertStreamDependency(void * /*dependent_stream*/, void * /*dependency_stream*/) override {}
+        bool insertStreamDependency(void * /*dependent_stream*/, void * /*dependency_stream*/) override { return true; }
 
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override { return nullptr; }
         std::unique_ptr<IGPUGraphCapture> createGraphCapture(void * /*stream*/) override { return nullptr; }
@@ -146,8 +146,7 @@ namespace
             ++update_count_;
             last_pos_offset_ = pos_offset;
             last_seq_len_ = seq_len;
-            if (!gpuStream())
-                throw std::runtime_error("dynamic-param update requires an explicit stream");
+            (void)requireGPUStream();
         }
 
         int updateCount() const { return update_count_; }
@@ -742,7 +741,7 @@ TEST_F(Test__GraphExecutorStreamBinding, NullStageStream_BindsToNodeDeviceDefaul
         DeviceId::cuda(0));
     auto *stage_raw = stage.get();
 
-    ASSERT_EQ(stage_raw->gpuStream(), nullptr);
+    ASSERT_FALSE(stage_raw->hasGPUStream());
 
     ComputeGraph graph;
     graph.addNode("stream_bind_stage", std::move(stage), DeviceId::cuda(0));
@@ -776,7 +775,7 @@ TEST_F(Test__GraphExecutorStreamBinding, NullWorkerStreamForGPUStage_FailsInstea
     graph.addNode("null_worker_stream_stage", std::move(stage), DeviceId::cuda(0));
 
     EXPECT_FALSE(executor.execute(graph, &ctx));
-    EXPECT_EQ(stage_raw->gpuStream(), nullptr);
+    EXPECT_FALSE(stage_raw->hasGPUStream());
 }
 
 TEST_F(Test__GraphExecutorStreamBinding, PreBoundStageStream_IsNotOverwritten)
@@ -801,6 +800,48 @@ TEST_F(Test__GraphExecutorStreamBinding, PreBoundStageStream_IsNotOverwritten)
     EXPECT_EQ(stage_raw->gpuStream(), prebound);
 }
 
+TEST_F(Test__GraphExecutorStreamBinding, ExplicitEagerCapturePolicyRebindsStaleCaptureStream)
+{
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    auto &worker =
+        GPUDeviceContextPool::instance().getContext(DeviceId::cuda(0));
+    void *stale_capture_stream = reinterpret_cast<void *>(0x1234ABCD);
+
+    auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+        ComputeStageType::EMBEDDING,
+        "mtp0_embedding",
+        DeviceId::cuda(0));
+    auto *stage_raw = stage.get();
+    stage_raw->setGPUStream(stale_capture_stream);
+
+    ComputeGraph graph;
+    graph.addNode("mtp0_embedding", std::move(stage), DeviceId::cuda(0));
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphExecutor::DecodeCapturePolicy policy;
+    policy.allow_fast_decode = true;
+    policy.allow_cached_graph_replay = false;
+    bool used_graph_replay = true;
+
+    ASSERT_TRUE(executor.executeDecodeWithCapturePolicy(
+        graph,
+        &ctx,
+        &cache,
+        cuda_default_stream_,
+        &worker,
+        /*collective_nodes=*/nullptr,
+        policy,
+        &used_graph_replay));
+    EXPECT_FALSE(used_graph_replay);
+    EXPECT_EQ(stage_raw->gpuStream(), cuda_default_stream_)
+        << "An explicitly eager policy must not execute MTP stages on a stale capture stream.";
+}
+
 TEST_F(Test__GraphExecutorStreamBinding, NodeDeviceOverridesStageDeviceWhenResolvingStream)
 {
     GraphExecutorConfig config;
@@ -814,7 +855,7 @@ TEST_F(Test__GraphExecutorStreamBinding, NodeDeviceOverridesStageDeviceWhenResol
         DeviceId::rocm(0));
     auto *stage_raw = stage.get();
 
-    ASSERT_EQ(stage_raw->gpuStream(), nullptr);
+    ASSERT_FALSE(stage_raw->hasGPUStream());
 
     ComputeGraph graph;
     graph.addNode("node_device_precedence", std::move(stage), DeviceId::cuda(0));
@@ -837,7 +878,7 @@ TEST_F(Test__GraphExecutorStreamBinding, CudaContextUsedWhenNodeAndStageDevicesA
         DeviceId::invalid());
     auto *stage_raw = stage.get();
 
-    ASSERT_EQ(stage_raw->gpuStream(), nullptr);
+    ASSERT_FALSE(stage_raw->hasGPUStream());
 
     ComputeGraph graph;
     graph.addNode("ctx_fallback_cuda", std::move(stage), DeviceId::invalid());
@@ -953,8 +994,8 @@ TEST_F(Test__GraphExecutorStreamBinding, MTPSidecarDynamicParamStagesBindBeforeU
     graph.addNode("mtp_kv_append", std::move(kv_append_stage), DeviceId::rocm(0));
     graph.addDependency("mtp_kv_append", "mtp_attention_dynamic_params");
 
-    ASSERT_EQ(attention_stage_raw->gpuStream(), nullptr);
-    EXPECT_THROW(attention_stage_raw->updateDynamicParams(31, 2), std::runtime_error);
+    ASSERT_FALSE(attention_stage_raw->hasGPUStream());
+    EXPECT_THROW(attention_stage_raw->updateDynamicParams(31, 2), std::logic_error);
 
     std::string error;
     ASSERT_TRUE(mtp_sidecar::bindStagesToCaptureStream(graph, capture_stream, &error)) << error;

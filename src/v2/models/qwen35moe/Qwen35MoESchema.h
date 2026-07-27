@@ -116,9 +116,9 @@ namespace llaminar2
 
             // Expert GEMM scratch buffers (for gate/up projections)
             schema.layer_buffers.push_back(
-                {"moe_gate_scratch", {"moe_activation_rows", "moe_expert_intermediate"}, "fp32", BufferSemantic::Scratch, "moe_gemm_scratch", 10, "Expert gate projection scratch"});
+                {"moe_gate_scratch", {"moe_activation_rows", "moe_ffn_intermediate_max"}, "fp32", BufferSemantic::Scratch, "moe_gemm_scratch", 10, "Routed/shared expert gate projection scratch"});
             schema.layer_buffers.push_back(
-                {"moe_up_scratch", {"moe_activation_rows", "moe_expert_intermediate"}, "fp32", BufferSemantic::Scratch, "moe_gemm_scratch", 5, "Expert up projection scratch"});
+                {"moe_up_scratch", {"moe_activation_rows", "moe_ffn_intermediate_max"}, "fp32", BufferSemantic::Scratch, "moe_gemm_scratch", 5, "Routed/shared expert up projection scratch"});
 
             return schema;
         }

@@ -296,6 +296,27 @@ namespace llaminar2
         }
         LOG_TRACE("[AMDDeviceContext] - hipBLASLt handle: " << hipblas_lt_handle_);
 
+        /*
+         * Stream handoffs are issued on every graph replay. Own their events
+         * for the entire device-context lifetime so replay never allocates or
+         * destroys HIP runtime resources in the inference hot path.
+         */
+        for (auto &event : stream_dependency_events_)
+        {
+            hipError_t event_status =
+                hipEventCreateWithFlags(&event, hipEventDisableTiming);
+            if (event_status != hipSuccess)
+            {
+                LOG_ERROR("[AMDDeviceContext] Failed to create persistent stream "
+                          "dependency event: "
+                          << hipGetErrorString(event_status));
+                cleanupOnWorker();
+                return false;
+            }
+        }
+        LOG_TRACE("[AMDDeviceContext] - Stream dependency events: "
+                  << stream_dependency_events_.size());
+
         return true;
     }
 
@@ -319,6 +340,7 @@ namespace llaminar2
             hipblas_lt_handle_ = nullptr;
             hipblas_handle_ = nullptr;
             default_stream_ = nullptr;
+            stream_dependency_events_.fill(nullptr);
             return;
         }
 
@@ -345,6 +367,26 @@ namespace llaminar2
         }
 
         resetAuxiliaryStreams();
+
+        /*
+         * Context shutdown occurs after the worker queue has drained, so no
+         * graph owner can still enqueue a record/wait pair. Destroy each
+         * persistent handoff event exactly once before destroying streams.
+         */
+        for (auto &event : stream_dependency_events_)
+        {
+            if (event == nullptr)
+                continue;
+
+            hipError_t err = hipEventDestroy(event);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[AMDDeviceContext] hipEventDestroy(stream dependency) "
+                          "failed: "
+                          << hipGetErrorString(err));
+            }
+            event = nullptr;
+        }
 
         // Destroy default stream
         if (default_stream_ != nullptr)
@@ -712,22 +754,26 @@ namespace llaminar2
 
     bool AMDDeviceContext::synchronizeChecked()
     {
-        // During graph capture, hipDeviceSynchronize() is illegal — it poisons
-        // the capture state. Skip the sync entirely since no real GPU work is
-        // happening during capture recording (kernels are just being recorded).
         if (capture_active_.load(std::memory_order_acquire))
         {
-            return true;
+            LOG_ERROR(
+                "[AMDDeviceContext] synchronizeChecked is forbidden while graph "
+                "capture owns the device");
+            return false;
         }
 
         bool ok = true;
         submitAndWait([this, &ok]()
                       {
-        // Re-check capture_active_ inside worker — another thread's capture
-        // controller may have started capture between our outer check and
-        // this worker dispatch (race in multi-device TP graph capture).
-        if (capture_active_.load(std::memory_order_acquire))
+        // Re-check inside the worker because capture ownership may change
+        // between submission and execution. A requested synchronization that
+        // cannot be honored is a hard ordering failure, never a successful no-op.
+        if (capture_active_.load(std::memory_order_acquire)) {
+            LOG_ERROR("[AMDDeviceContext] synchronizeChecked raced with graph capture "
+                      "(ordinal=" << device_ordinal_ << ")");
+            ok = false;
             return;
+        }
 
         if (!setAMDDeviceForResource(device_ordinal_, "synchronize"))
         {
@@ -737,15 +783,6 @@ namespace llaminar2
 
         hipError_t err = hipDeviceSynchronize();
         if (err != hipSuccess) {
-            // hipErrorStreamCaptureUnsupported (900): another thread started
-            // graph capture on this device after our check. Benign race in
-            // multi-device TP — the capture will complete without this sync.
-            if (err == hipErrorStreamCaptureUnsupported ||
-                err == hipErrorStreamCaptureImplicit) {
-                LOG_DEBUG("[AMDDeviceContext] Skipping hipDeviceSynchronize during "
-                          "concurrent graph capture (ordinal=" << device_ordinal_ << ")");
-                return;
-            }
             LOG_ERROR("[AMDDeviceContext] hipDeviceSynchronize failed: " 
                       << hipGetErrorString(err));
             ok = false;
@@ -763,7 +800,10 @@ namespace llaminar2
         // During graph capture, stream sync is illegal on the capture stream.
         if (capture_active_.load(std::memory_order_acquire))
         {
-            return true;
+            LOG_ERROR(
+                "[AMDDeviceContext] synchronizeStreamChecked is forbidden while "
+                "graph capture owns the device");
+            return false;
         }
 
         if (!setAMDDeviceForResource(device_ordinal_, "synchronizeStreamChecked"))
@@ -788,11 +828,13 @@ namespace llaminar2
         return true;
     }
 
-    void AMDDeviceContext::insertStreamDependency(void *dependent_stream, void *dependency_stream)
+    bool AMDDeviceContext::insertStreamDependency(
+        void *dependent_stream,
+        void *dependency_stream)
     {
-        // GPU-side inter-stream synchronization via events.
-        // Records an event on dependency_stream, makes dependent_stream wait for it.
-        // Unlike synchronizeStream(), this does NOT block the CPU.
+        if (dependent_stream == dependency_stream)
+            return true;
+
         hipStream_t dep_stream = dependent_stream ? static_cast<hipStream_t>(dependent_stream) : hipStream_t(0);
         hipStream_t src_stream = dependency_stream ? static_cast<hipStream_t>(dependency_stream) : hipStream_t(0);
 
@@ -804,33 +846,61 @@ namespace llaminar2
         {
             LOG_ERROR("[AMDDeviceContext] hipSetDevice(" << device_ordinal_
                                                          << ") failed in insertStreamDependency: " << hipGetErrorString(set_err));
-            return;
+            return false;
         }
 
-        hipEvent_t event;
-        hipError_t err = hipEventCreateWithFlags(&event, hipEventDisableTiming);
+        /*
+         * Lease one preallocated event for the host-side record/wait pair.
+         * HIP binds the queued wait to the latest event record visible at the
+         * hipStreamWaitEvent call, so the lease can be released immediately
+         * after that call without waiting for either device stream.
+         */
+        const size_t event_index =
+            next_stream_dependency_event_.fetch_add(
+                1,
+                std::memory_order_relaxed) %
+            kStreamDependencyEventCount;
+        std::atomic_flag &in_use =
+            stream_dependency_event_in_use_[event_index];
+        while (in_use.test_and_set(std::memory_order_acquire))
+            std::this_thread::yield();
+
+        struct ScopedEventLease final
+        {
+            std::atomic_flag &flag;
+            ~ScopedEventLease()
+            {
+                flag.clear(std::memory_order_release);
+            }
+        } lease{in_use};
+
+        hipEvent_t event = stream_dependency_events_[event_index];
+        if (event == nullptr)
+        {
+            LOG_ERROR("[AMDDeviceContext] Persistent stream dependency event "
+                      << event_index << " is not initialized");
+            return false;
+        }
+
+        hipError_t err = hipEventRecord(event, src_stream);
         if (err != hipSuccess)
         {
-            LOG_ERROR("[AMDDeviceContext] hipEventCreate failed in insertStreamDependency: "
+            LOG_ERROR("[AMDDeviceContext] hipEventRecord failed in "
+                      "insertStreamDependency: "
                       << hipGetErrorString(err));
-            return;
-        }
-
-        err = hipEventRecord(event, src_stream);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[AMDDeviceContext] hipEventRecord failed: " << hipGetErrorString(err));
-            (void)hipEventDestroy(event);
-            return;
+            return false;
         }
 
         err = hipStreamWaitEvent(dep_stream, event, 0);
         if (err != hipSuccess)
         {
-            LOG_ERROR("[AMDDeviceContext] hipStreamWaitEvent failed: " << hipGetErrorString(err));
+            LOG_ERROR("[AMDDeviceContext] hipStreamWaitEvent failed in "
+                      "insertStreamDependency: "
+                      << hipGetErrorString(err));
+            return false;
         }
 
-        (void)hipEventDestroy(event);
+        return true;
     }
 
     std::unique_ptr<IGPUGraphCapture> AMDDeviceContext::createGraphCapture()
@@ -841,16 +911,6 @@ namespace llaminar2
     std::unique_ptr<IGPUGraphCapture> AMDDeviceContext::createGraphCapture(void *stream)
     {
         return std::make_unique<HIPGraphCapture>(static_cast<hipStream_t>(stream));
-    }
-
-    void AMDDeviceContext::clearLastError()
-    {
-        const hipError_t err = hipGetLastError();
-        if (err != hipSuccess)
-        {
-            LOG_DEBUG("[AMDDeviceContext] Cleared sticky HIP error on device "
-                      << device_ordinal_ << ": " << hipGetErrorString(err));
-        }
     }
 
     PointerValidationResult AMDDeviceContext::validatePointerDevice(const void *gpu_ptr, int expected_ordinal)
@@ -963,7 +1023,10 @@ namespace llaminar2
     {
         if (capture_active_.load(std::memory_order_acquire))
         {
-            return true;
+            LOG_ERROR(
+                "[AMDDeviceContext] debugSynchronize is forbidden while graph "
+                "capture owns the device");
+            return false;
         }
 
         const hipError_t sync_err = hipDeviceSynchronize();

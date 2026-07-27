@@ -34,18 +34,6 @@ namespace llaminar2::rocm
         int device_ordinal,
         int *host_selected_row);
 
-    /** @brief Allocate pinned host and device scalar storage for selected row. */
-    bool allocateRowSelectParam(
-        int device_ordinal,
-        int **host_selected_row,
-        int **device_selected_row);
-
-    /** @brief Free scalar storage allocated by allocateRowSelectParam(). */
-    void freeRowSelectParam(
-        int device_ordinal,
-        int *host_selected_row,
-        int *device_selected_row);
-
     /** @brief Upload selected-row scalar to its stable device address. */
     bool uploadRowSelectParam(
         int *device_selected_row,
@@ -64,6 +52,29 @@ namespace llaminar2::rocm
         const float *input,
         float *output,
         const int *device_selected_row,
+        int seq_len,
+        int d_model,
+        void *stream);
+
+    /**
+     * @brief Copy one graph-immutable FP32 source row without replay metadata.
+     *
+     * The selected row is encoded in the captured kernel arguments. This path
+     * is intended for graph-native diagnostic checkpoints whose row cannot
+     * change without rebuilding the graph itself.
+     *
+     * @param input Device pointer to [seq_len, d_model] FP32 hidden states.
+     * @param output Device pointer to [1, d_model] FP32 checkpoint storage.
+     * @param selected_row Immutable row index encoded in the captured D2D source address.
+     * @param seq_len Number of source rows, used for validation.
+     * @param d_model Number of columns copied.
+     * @param stream Explicit HIP stream.
+     * @return true when the contiguous device-to-device copy was accepted.
+     */
+    bool launchFixedRowSelectFP32(
+        const float *input,
+        float *output,
+        int selected_row,
         int seq_len,
         int d_model,
         void *stream);

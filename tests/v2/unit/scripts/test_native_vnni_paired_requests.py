@@ -259,6 +259,19 @@ class NativeVNNIPairedRequestsTest(unittest.TestCase):
         self.assertNotIn("formula", request.selected_candidate_id)
         self.assertEqual(request.reason, "missing_direct_tournament_edge")
 
+    def test_best_effort_regret_budget_accepts_one_hundred_percent(self) -> None:
+        """The turnkey percentage contract includes an explicit 100% budget."""
+
+        corpus, policy, comparisons = self._fixture()
+        plan = build_paired_request_plan(
+            corpus,
+            policy,
+            comparisons,
+            max_regret=1.0,
+        )
+
+        self.assertEqual(plan.max_regret, 1.0)
+
     def test_selected_candidate_star_covers_every_forceable_launch(self) -> None:
         """One refinement batch directly compares every candidate to its anchor."""
 

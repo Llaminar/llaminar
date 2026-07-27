@@ -28,6 +28,7 @@
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "kernels/common/NativeVNNIDispatchCache.h"
+#include "backends/BackendManager.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/PrefillGraphBucketDefaults.h"
@@ -37,6 +38,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
+#include <limits>
 #include <mutex>
 
 static thread_local int g_cuda_native_vnni_decode_equivalent_m1_config = 0;
@@ -78,6 +81,44 @@ static float *getKparPartials(CUDAGemvContext_ *ctx, size_t num_floats)
     if (ctx->kpar_partials && ctx->kpar_capacity >= num_floats)
         return ctx->kpar_partials;
     return nullptr;
+}
+
+/**
+ * @brief Clamp a grouped K-part tile to the persistent bound workspace.
+ *
+ * Workspace planning deliberately reserves a stable verifier tile rather than
+ * scaling scratch with prompt M. Extended verifier depths remain total by
+ * launching multiple grouped tiles against that arena. A multi-row operation
+ * must retain room for at least two rows; returning zero hard-fails an
+ * under-provisioned binding instead of degenerating into production row replay.
+ */
+static int workspaceBoundedKparTileRows(
+    const CUDAGemvContext_ *ctx,
+    int requested_rows,
+    int k_partitions,
+    int n)
+{
+    if (!ctx || !ctx->kpar_partials || requested_rows <= 0 ||
+        k_partitions <= 0 || n <= 0)
+    {
+        return 0;
+    }
+
+    const size_t floats_per_row =
+        static_cast<size_t>(k_partitions) * static_cast<size_t>(n);
+    if (floats_per_row == 0)
+        return 0;
+
+    const size_t capacity_rows = ctx->kpar_capacity / floats_per_row;
+    const size_t required_group_rows = requested_rows > 1 ? size_t{2} : size_t{1};
+    if (capacity_rows < required_group_rows)
+        return 0;
+
+    return std::min(
+        requested_rows,
+        static_cast<int>(std::min(
+            capacity_rows,
+            static_cast<size_t>(std::numeric_limits<int>::max()))));
 }
 
 // =====================================================================
@@ -495,17 +536,23 @@ namespace
     // Transpose a column-major buffer to row-major and return device pointer.
     // Returns nullptr on failure.
     template <typename T, int ELEM_BYTES>
-    static T *transposeBuffer(const T *d_col, int N, int K_blocks, cudaStream_t stream)
+    static T *transposeBuffer(
+        const T *d_col,
+        int N,
+        int K_blocks,
+        int cuda_device_id,
+        cudaStream_t stream)
     {
         const size_t total_elements = static_cast<size_t>(N) * K_blocks;
         const size_t total_bytes = total_elements * ELEM_BYTES;
 
-        T *d_row = nullptr;
-        if (cudaMalloc(&d_row, total_bytes) != cudaSuccess)
-        {
-            cudaGetLastError(); // Clear sticky state before reporting preparation failure.
+        auto *const backend = llaminar2::getCUDABackend();
+        if (!backend)
             return nullptr;
-        }
+        T *d_row = static_cast<T *>(
+            backend->allocate(total_bytes, cuda_device_id));
+        if (!d_row)
+            return nullptr;
 
         const int threads = 256;
         const int blocks = (static_cast<int>(total_elements) + threads - 1) / threads;
@@ -516,7 +563,7 @@ namespace
 
         if (cudaGetLastError() != cudaSuccess)
         {
-            cudaFree(d_row);
+            backend->free(d_row, cuda_device_id);
             return nullptr;
         }
         return d_row;
@@ -569,6 +616,19 @@ namespace
         graph_captured = status != cudaStreamCaptureStatusNone;
         return true;
     }
+
+    /**
+     * @brief Canonical generated-policy surface for production decode.
+     *
+     * The decode graph state machine necessarily executes a new shape once as
+     * an eager warmup before recording and replaying its CUDA graph. Dispatch
+     * mode therefore cannot be allowed to change the reduction tree: otherwise
+     * an MTP verifier warmup can use a different K partition from an already
+     * captured serial M=1 oracle. The graph-captured policy is the steady-state
+     * performance authority, so eager warmup deliberately selects that same
+     * family, tile, and exact K partition.
+     */
+    static constexpr bool kCanonicalDecodePolicyGraphCaptured = true;
 
     /**
      * @brief Build the stable common-trainer identity for an observed launch.
@@ -633,7 +693,8 @@ namespace
         bool graph_captured,
         bool verifier_serial_m1,
         CUDAGemvContext_ *gemv_ctx,
-        int grouped_rows = 0)
+        int grouped_rows = 0,
+        int policy_graph_captured = -1)
     {
         if (!llaminar2::PerfStatsCollector::isEnabled())
             return;
@@ -665,6 +726,12 @@ namespace
                 {"execution_mode", graph_captured
                                        ? "graph_captured"
                                        : "eager"},
+                {"policy_execution_mode",
+                 (policy_graph_captured < 0
+                      ? graph_captured
+                      : policy_graph_captured != 0)
+                     ? "graph_captured"
+                     : "eager"},
                 {"semantic_contract", verifier_serial_m1
                                              ? "verifier_serial_m1_bitwise"
                                              : "fast"},
@@ -2301,8 +2368,13 @@ namespace
          * still owns multiple rows and reuses one packed-weight traversal; no
          * row is replayed through the scalar public API.
          */
-        const int workspace_tile_rows =
+        const int desired_tile_rows =
             llaminar2::nativeVNNIBatchInvariantTileRows(M, N, K);
+        const int workspace_tile_rows = workspaceBoundedKparTileRows(
+            gemv_ctx,
+            desired_tile_rows,
+            kb_capped,
+            N);
         if (workspace_tile_rows <= 0)
             return false;
         float *d_partials = getKparPartials(
@@ -2411,8 +2483,13 @@ namespace
             return false;
         g_last_effective_kb = kb;
 
-        const int workspace_tile_rows =
+        const int desired_tile_rows =
             llaminar2::nativeVNNIBatchInvariantTileRows(M, N, K);
+        const int workspace_tile_rows = workspaceBoundedKparTileRows(
+            gemv_ctx,
+            desired_tile_rows,
+            kb,
+            N);
         if (workspace_tile_rows <= 0)
             return false;
         float *partials = getKparPartials(
@@ -3106,22 +3183,13 @@ namespace
                 g_sweep.exact_kb,
             };
 
-            // For ROWPAR sweep: ensure row-major exists (skip for Q8_0
-            // which uses column-major ROWPAR to avoid doubling VRAM)
+            // ROWPAR preparation is a setup transaction. The timed dispatch
+            // path may consume an existing representation but cannot allocate
+            // or transpose one.
             if (shape == NativeGemvShape::ROWPAR)
             {
-                if constexpr (CB != 19)
-                {
-                    if (rm_slot && !*rm_slot)
-                    {
-                        constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
-                        *rm_slot = cudaRowMajorWeights_create(
-                            d_payload, d_scales, d_mins, d_emins,
-                            N, K, PB, cuda_device_id, stream);
-                    }
-                    if (!rm_slot || !*rm_slot)
-                        return false;
-                }
+                if (!rm_slot || !*rm_slot)
+                    return false;
             }
 
             recordGemvDispatch<CB>(
@@ -3152,7 +3220,12 @@ namespace
         NativeGemvShape shape = NativeGemvShape::KPAR;
         GeneratedDispatchTuning tuning{};
         if (!selectCachedGeneratedDispatch<CB>(
-                graph_captured, 1, N, K, shape, tuning))
+                kCanonicalDecodePolicyGraphCaptured,
+                1,
+                N,
+                K,
+                shape,
+                tuning))
             return false;
 
         recordGemvDispatch<CB>(
@@ -3165,7 +3238,9 @@ namespace
             cuda_device_id,
             graph_captured,
             false,
-            gemv_ctx);
+            gemv_ctx,
+            0,
+            kCanonicalDecodePolicyGraphCaptured ? 1 : 0);
 
         return dispatchGeneratedTuning<CB>(
             shape, tuning,
@@ -3248,8 +3323,17 @@ namespace
             const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
             const int dispatch_m =
                 decode_equivalent_m1 ? 1 : (llaminar2::debugEnv().gemm.deterministic ? 2 : M);
+            const bool dispatch_policy_graph_captured =
+                decode_equivalent_m1
+                    ? kCanonicalDecodePolicyGraphCaptured
+                    : graph_captured;
             if (!selectCachedGeneratedDispatch<CB>(
-                    graph_captured, dispatch_m, N, K, shape, tuning))
+                    dispatch_policy_graph_captured,
+                    dispatch_m,
+                    N,
+                    K,
+                    shape,
+                    tuning))
             {
                 return false;
             }
@@ -3277,7 +3361,11 @@ namespace
 #if defined(LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2)
                     GeneratedGroupedTuning grouped_tuning{};
                     if (!selectCachedGeneratedGroupedTuning<CB>(
-                            graph_captured, M, N, K, grouped_tuning))
+                            dispatch_policy_graph_captured,
+                            M,
+                            N,
+                            K,
+                            grouped_tuning))
                         return false;
                     switch (grouped_tuning.kernel)
                     {
@@ -3346,7 +3434,10 @@ namespace
             graph_captured,
             decode_equivalent_m1,
             gemv_ctx,
-            grouped_rows);
+            grouped_rows,
+            decode_equivalent_m1
+                ? (kCanonicalDecodePolicyGraphCaptured ? 1 : 0)
+                : (graph_captured ? 1 : 0));
         if (shape == NativeGemvShape::WIDE || shape == NativeGemvShape::DIRECT)
         {
             if (!decode_equivalent_m1)
@@ -3360,16 +3451,9 @@ namespace
 
         if constexpr (CB != 19)
         {
-            /* Explicit diagnostic ROWPAR candidates own their preparation. */
+            /* Explicit diagnostic ROWPAR candidates require setup preparation. */
             if (shape == NativeGemvShape::ROWPAR && rm_slot)
             {
-                if (!*rm_slot)
-                {
-                    constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
-                    *rm_slot = cudaRowMajorWeights_create(
-                        d_payload, d_scales, d_mins, d_emins,
-                        N, K, PB, cuda_device_id, stream);
-                }
                 if (*rm_slot && (*rm_slot)->d_payload && (*rm_slot)->d_scales)
                 {
                     return launchRowParSmallM<CB>(
@@ -3915,8 +3999,9 @@ extern "C"
 
     void cudaNativeVNNIGemvTuned_clearStaticState()
     {
-        // Row-major weight data is now owned by CUDAPackedWeights (per-weight)
-        // and KPAR partials are owned by CUDAGemvContext (per-device).
+        // Row-major weight data is now owned by CUDAQuantisedGemmKernel::Impl
+        // (per-weight) and KPAR partials are owned by CUDAGemvContext
+        // (per-device).
         // Only sweep override needs clearing here.
         g_sweep.active = false;
         g_grouped_rows_override = 0;
@@ -3980,47 +4065,47 @@ extern "C"
         {
         case 6:
             rm->d_payload = reinterpret_cast<uint8_t *>(
-                transposeBuffer<uint8_t, 6>(d_payload_col, N, K_blocks, s));
+                transposeBuffer<uint8_t, 6>(d_payload_col, N, K_blocks, device_id, s));
             break;
         case 8:
             rm->d_payload = reinterpret_cast<uint8_t *>(
-                transposeBuffer<uint8_t, 8>(d_payload_col, N, K_blocks, s));
+                transposeBuffer<uint8_t, 8>(d_payload_col, N, K_blocks, device_id, s));
             break;
         case 9:
             rm->d_payload = reinterpret_cast<uint8_t *>(
-                transposeBuffer<uint8_t, 9>(d_payload_col, N, K_blocks, s));
+                transposeBuffer<uint8_t, 9>(d_payload_col, N, K_blocks, device_id, s));
             break;
         case 12:
             rm->d_payload = reinterpret_cast<uint8_t *>(
-                transposeBuffer<uint8_t, 12>(d_payload_col, N, K_blocks, s));
+                transposeBuffer<uint8_t, 12>(d_payload_col, N, K_blocks, device_id, s));
             break;
         case 13:
             rm->d_payload = reinterpret_cast<uint8_t *>(
-                transposeBuffer<uint8_t, 13>(d_payload_col, N, K_blocks, s));
+                transposeBuffer<uint8_t, 13>(d_payload_col, N, K_blocks, device_id, s));
             break;
         case 2:
             rm->d_payload = reinterpret_cast<uint8_t *>(
-                transposeBuffer<uint8_t, 2>(d_payload_col, N, K_blocks, s));
+                transposeBuffer<uint8_t, 2>(d_payload_col, N, K_blocks, device_id, s));
             break;
         case 4:
             rm->d_payload = reinterpret_cast<uint8_t *>(
-                transposeBuffer<uint8_t, 4>(d_payload_col, N, K_blocks, s));
+                transposeBuffer<uint8_t, 4>(d_payload_col, N, K_blocks, device_id, s));
             break;
         case 16:
             rm->d_payload = reinterpret_cast<uint8_t *>(
-                transposeBuffer<uint8_t, 16>(d_payload_col, N, K_blocks, s));
+                transposeBuffer<uint8_t, 16>(d_payload_col, N, K_blocks, device_id, s));
             break;
         case 20:
             rm->d_payload = reinterpret_cast<uint8_t *>(
-                transposeBuffer<uint8_t, 20>(d_payload_col, N, K_blocks, s));
+                transposeBuffer<uint8_t, 20>(d_payload_col, N, K_blocks, device_id, s));
             break;
         case 24:
             rm->d_payload = reinterpret_cast<uint8_t *>(
-                transposeBuffer<uint8_t, 24>(d_payload_col, N, K_blocks, s));
+                transposeBuffer<uint8_t, 24>(d_payload_col, N, K_blocks, device_id, s));
             break;
         case 32:
             rm->d_payload = reinterpret_cast<uint8_t *>(
-                transposeBuffer<uint8_t, 32>(d_payload_col, N, K_blocks, s));
+                transposeBuffer<uint8_t, 32>(d_payload_col, N, K_blocks, device_id, s));
             break;
         default:
             delete rm;
@@ -4033,10 +4118,11 @@ extern "C"
         }
 
         // Transpose scales (2 bytes each)
-        rm->d_scales = transposeBuffer<uint16_t, 2>(d_scales_col, N, K_blocks, s);
+        rm->d_scales = transposeBuffer<uint16_t, 2>(
+            d_scales_col, N, K_blocks, device_id, s);
         if (!rm->d_scales)
         {
-            cudaFree(rm->d_payload);
+            llaminar2::getCUDABackend()->free(rm->d_payload, device_id);
             delete rm;
             return nullptr;
         }
@@ -4044,11 +4130,13 @@ extern "C"
         // Transpose mins if present
         if (d_mins_col)
         {
-            rm->d_mins = transposeBuffer<uint16_t, 2>(d_mins_col, N, K_blocks, s);
+            rm->d_mins = transposeBuffer<uint16_t, 2>(
+                d_mins_col, N, K_blocks, device_id, s);
             if (!rm->d_mins)
             {
-                cudaFree(rm->d_payload);
-                cudaFree(rm->d_scales);
+                auto *const backend = llaminar2::getCUDABackend();
+                backend->free(rm->d_payload, device_id);
+                backend->free(rm->d_scales, device_id);
                 delete rm;
                 return nullptr;
             }
@@ -4057,13 +4145,15 @@ extern "C"
         // Transpose emins if present
         if (d_emins_col)
         {
-            rm->d_emins = transposeBuffer<uint32_t, 4>(d_emins_col, N, K_blocks, s);
+            rm->d_emins = transposeBuffer<uint32_t, 4>(
+                d_emins_col, N, K_blocks, device_id, s);
             if (!rm->d_emins)
             {
-                cudaFree(rm->d_payload);
-                cudaFree(rm->d_scales);
+                auto *const backend = llaminar2::getCUDABackend();
+                backend->free(rm->d_payload, device_id);
+                backend->free(rm->d_scales, device_id);
                 if (rm->d_mins)
-                    cudaFree(rm->d_mins);
+                    backend->free(rm->d_mins, device_id);
                 delete rm;
                 return nullptr;
             }
@@ -4073,19 +4163,98 @@ extern "C"
         return rm;
     }
 
+    CUDARowMajorWeights *cudaRowMajorWeights_createForCodebook(
+        const uint8_t *d_payload_col,
+        const uint16_t *d_scales_col,
+        const uint16_t *d_mins_col,
+        const uint32_t *d_emins_col,
+        int N,
+        int K,
+        uint8_t codebook_id,
+        int device_id,
+        void *stream)
+    {
+#define LLAMINAR_CREATE_CUDA_ROW_MAJOR(CODEBOOK)                         \
+        case CODEBOOK:                                                   \
+            return cudaRowMajorWeights_create(                           \
+                d_payload_col, d_scales_col, d_mins_col, d_emins_col,    \
+                N, K,                                                    \
+                llaminar2::cuda_native_vnni::                            \
+                    CodebookTraits<CODEBOOK>::payload_bytes,              \
+                device_id, stream)
+        switch (codebook_id)
+        {
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(0);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(4);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(5);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(6);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(7);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(8);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(9);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(10);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(11);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(12);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(13);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(14);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(15);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(16);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(17);
+            LLAMINAR_CREATE_CUDA_ROW_MAJOR(19);
+        default:
+            return nullptr;
+        }
+#undef LLAMINAR_CREATE_CUDA_ROW_MAJOR
+    }
+
+    bool cudaNativeVNNIGemvTuned_policyRequiresRowMajor(
+        uint8_t codebook_id,
+        int N,
+        int K)
+    {
+        for (const bool graph_captured : {false, true})
+        {
+            NativeGemvShape shape = NativeGemvShape::KPAR;
+            GeneratedDispatchTuning tuning{};
+            if (queryCachedGeneratedDispatch(
+                    codebook_id,
+                    graph_captured,
+                    1,
+                    N,
+                    K,
+                    shape,
+                    tuning) &&
+                shape == NativeGemvShape::ROWPAR)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void cudaRowMajorWeights_destroy(CUDARowMajorWeights *rm)
     {
         if (!rm)
             return;
         cudaSetDevice(rm->device_id);
+        auto *const backend = llaminar2::getCUDABackend();
+        if (!backend)
+        {
+            /*
+             * Releasing only the host handle would leak four device allocations
+             * and conceal a broken backend lifetime.  This owner is destroyed
+             * before backend teardown by construction; violating that order is
+             * a fatal lifecycle defect, not a recoverable cleanup condition.
+             */
+            std::terminate();
+        }
         if (rm->d_payload)
-            cudaFree(rm->d_payload);
+            backend->free(rm->d_payload, rm->device_id);
         if (rm->d_scales)
-            cudaFree(rm->d_scales);
+            backend->free(rm->d_scales, rm->device_id);
         if (rm->d_mins)
-            cudaFree(rm->d_mins);
+            backend->free(rm->d_mins, rm->device_id);
         if (rm->d_emins)
-            cudaFree(rm->d_emins);
+            backend->free(rm->d_emins, rm->device_id);
         delete rm;
     }
 }

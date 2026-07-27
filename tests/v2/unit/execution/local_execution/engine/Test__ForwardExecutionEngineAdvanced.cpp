@@ -59,7 +59,7 @@ namespace
         int last_workspace_seq_len = -1;
         uint64_t workspace_generation = 0;
         int sync_logits_calls = 0;
-        int logits_tensor_calls = 0;
+        TensorBase *last_published_logits = nullptr;
         int build_decode_policy_calls = 0;
         int resolve_pp_copy_calls = 0;
         int get_pipeline_contexts_calls = 0;
@@ -145,23 +145,22 @@ namespace
             return workspace_generation;
         }
 
-        void syncLogitsAtBoundary(IDeviceContext *ctx) override
+        bool publishLogitsAtBoundary(
+            TensorBase *logits,
+            IDeviceContext *ctx,
+            void *producer_stream) override
         {
+            last_published_logits = logits;
+            (void)ctx;
+            (void)producer_stream;
             sync_logits_calls++;
             call_sequence.push_back("syncLogits");
-        }
-
-        TensorBase *logitsTensor() override
-        {
-            logits_tensor_calls++;
-            call_sequence.push_back("logitsTensor");
-            return nullptr;
+            return true;
         }
 
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
             bool has_collective_nodes,
-            IDeviceContext *ctx,
-            int segment_consecutive_failures) const override
+            IDeviceContext *ctx) const override
         {
             const_cast<TrackingHost *>(this)->build_decode_policy_calls++;
             const_cast<TrackingHost *>(this)->call_sequence.push_back("buildDecodeCapturePolicy");
@@ -717,8 +716,13 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PPCopyInfo_ResolvedOnCacheMiss)
 
     TrackingHost host(&mock_ctx_);
     host.graph_node_count = 3;
+    FP32Tensor external_hidden(std::vector<size_t>{1024}, DeviceId::cpu());
+    FP32Tensor working_buffer(std::vector<size_t>{1024}, DeviceId::cpu());
+    host.mock_pp_copy.external_hidden = &external_hidden;
+    host.mock_pp_copy.working_buffer = &working_buffer;
     host.mock_pp_copy.needs_copy = true;
     host.mock_pp_copy.copy_bytes = 4096;
+    host.mock_pp_copy.device = DeviceId::cpu();
 
     TestInput ti(1);
     ForwardOutput output{};

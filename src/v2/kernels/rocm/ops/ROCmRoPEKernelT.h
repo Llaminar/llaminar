@@ -85,7 +85,7 @@ namespace llaminar2
                 device_idx_ = ctx->deviceOrdinal();
             }
 
-            ~ROCmRoPEKernelT() override;
+            ~ROCmRoPEKernelT() override = default;
 
             // ===== Device Context Support (Phase 4) =====
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
@@ -107,7 +107,7 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            /// Pre-upload pos_offset device params for graph replay
+            /// Publish pos_offset into graph-stable device params.
             void setDynamicPosOffset(int pos_offset) override;
             /// Pre-upload explicit position IDs for graph-captured replay.
             void setDynamicPositionIds(const int *position_ids, int seq_len) override;
@@ -125,10 +125,6 @@ namespace llaminar2
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_seq_len_ = 0;
                 dynamic_position_ids_device_ptr_ = nullptr;
-                if (h_device_params_)
-                {
-                    h_device_params_->pos_offset = 0;
-                }
             }
 
             // ===== ITensorRoPE interface =====
@@ -205,8 +201,6 @@ namespace llaminar2
             mutable int inv_freq_head_dim_ = 0;
             mutable float inv_freq_theta_ = 0.0f;
 
-            /// Pinned host staging for pre-capture device-param uploads
-            rope::RoPEDeviceParams *h_device_params_ = nullptr;
             bool dynamic_pos_device_valid_ = false;
             int dynamic_pos_offset_ = 0;
             bool dynamic_position_ids_device_valid_ = false;
@@ -248,7 +242,7 @@ namespace llaminar2
                 device_idx_ = ctx->deviceOrdinal();
             }
 
-            ~ROCmRoPEKernelT() override;
+            ~ROCmRoPEKernelT() override = default;
 
             // ===== Device Context Support (Phase 4) =====
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
@@ -269,7 +263,7 @@ namespace llaminar2
             }
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            /// Pre-upload pos_offset device params for graph replay
+            /// Publish pos_offset into graph-stable device params.
             void setDynamicPosOffset(int pos_offset) override;
             /// Pre-upload explicit position IDs for graph-captured replay.
             void setDynamicPositionIds(const int *position_ids, int seq_len) override;
@@ -287,10 +281,6 @@ namespace llaminar2
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_seq_len_ = 0;
                 dynamic_position_ids_device_ptr_ = nullptr;
-                if (h_device_params_)
-                {
-                    h_device_params_->pos_offset = 0;
-                }
             }
 
             // ===== ITensorRoPE interface =====
@@ -344,8 +334,6 @@ namespace llaminar2
             mutable int inv_freq_head_dim_ = 0;
             mutable float inv_freq_theta_ = 0.0f;
 
-            /// Pinned host staging for pre-capture device-param uploads
-            rope::RoPEDeviceParams *h_device_params_ = nullptr;
             bool dynamic_pos_device_valid_ = false;
             int dynamic_pos_offset_ = 0;
             bool dynamic_position_ids_device_valid_ = false;
@@ -387,7 +375,7 @@ namespace llaminar2
                 device_idx_ = ctx->deviceOrdinal();
             }
 
-            ~ROCmRoPEKernelT() override;
+            ~ROCmRoPEKernelT() override = default;
 
             // ===== Device Context Support (Phase 4) =====
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
@@ -408,7 +396,7 @@ namespace llaminar2
             }
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            /// Pre-upload pos_offset device params for graph replay
+            /// Publish pos_offset into graph-stable device params.
             void setDynamicPosOffset(int pos_offset) override;
             /// Pre-upload explicit position IDs for graph-captured replay.
             void setDynamicPositionIds(const int *position_ids, int seq_len) override;
@@ -426,10 +414,6 @@ namespace llaminar2
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_seq_len_ = 0;
                 dynamic_position_ids_device_ptr_ = nullptr;
-                if (h_device_params_)
-                {
-                    h_device_params_->pos_offset = 0;
-                }
             }
 
             // ===== ITensorRoPE interface =====
@@ -483,8 +467,6 @@ namespace llaminar2
             mutable int inv_freq_head_dim_ = 0;
             mutable float inv_freq_theta_ = 0.0f;
 
-            /// Pinned host staging for pre-capture device-param uploads
-            rope::RoPEDeviceParams *h_device_params_ = nullptr;
             bool dynamic_pos_device_valid_ = false;
             int dynamic_pos_offset_ = 0;
             bool dynamic_position_ids_device_valid_ = false;

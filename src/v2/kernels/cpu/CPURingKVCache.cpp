@@ -1702,6 +1702,12 @@ namespace llaminar2
     bool CPURingKVCache<KPrecision, VPrecision>::exportLogicalBlock(
         const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const
     {
+        if (desc.payload_domain !=
+            KVCacheLogicalBlockPayloadDomain::Host)
+        {
+            LOG_ERROR("[CPURingKVCache::exportLogicalBlock] CPU cache refuses a device-domain prefix payload");
+            return false;
+        }
         const int local_layer = remapLayerIndex(desc.layer);
         if (local_layer < 0 || local_layer >= n_layers_ ||
             desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
@@ -1800,6 +1806,12 @@ namespace llaminar2
     bool CPURingKVCache<KPrecision, VPrecision>::importLogicalBlock(
         const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v)
     {
+        if (desc.payload_domain !=
+            KVCacheLogicalBlockPayloadDomain::Host)
+        {
+            LOG_ERROR("[CPURingKVCache::importLogicalBlock] CPU cache refuses a device-domain prefix payload");
+            return false;
+        }
         const int local_layer = remapLayerIndex(desc.layer);
         if (local_layer < 0 || local_layer >= n_layers_ ||
             desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||

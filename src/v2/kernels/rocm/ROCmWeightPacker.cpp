@@ -16,6 +16,7 @@
  */
 
 #include "ROCmWeightPacker.h"
+#include "backends/BackendManager.h"
 #include "gemm/ROCmQuantisedGemmKernel.h"
 #include "tensors/TensorClasses.h"   // IINT8Unpackable (for packVnniBlock, requantizeRowToInt8)
 #include "tensors/VnniPackContext.h" // VnniPackContext, vnniLinearIdx, etc.
@@ -377,22 +378,24 @@ namespace llaminar2
             return true;
 
         DeviceUpload upload;
+        IBackend *const backend = getROCmBackend();
+        if (!backend)
+        {
+            LOG_ERROR("[MoEBatchPackedWeightsROCm::uploadToDevice] ROCm backend unavailable");
+            return false;
+        }
 
         auto uploadBuffer = [&](const void *host_data, size_t bytes, void **d_ptr) -> bool
         {
             *d_ptr = nullptr;
             if (!host_data || bytes == 0)
                 return true;
-            hipError_t err = hipSetDevice(rocm_device_id);
-            if (err != hipSuccess)
+            *d_ptr = backend->allocate(bytes, rocm_device_id);
+            if (!*d_ptr)
                 return false;
-            err = hipMalloc(d_ptr, bytes);
-            if (err != hipSuccess || !*d_ptr)
-                return false;
-            err = hipMemcpy(*d_ptr, host_data, bytes, hipMemcpyHostToDevice);
-            if (err != hipSuccess)
+            if (!backend->hostToDevice(*d_ptr, host_data, bytes, rocm_device_id))
             {
-                (void)hipFree(*d_ptr);
+                backend->free(*d_ptr, rocm_device_id);
                 *d_ptr = nullptr;
                 return false;
             }
@@ -410,10 +413,10 @@ namespace llaminar2
             !uploadBuffer(all_native_emins.empty() ? nullptr : all_native_emins.data(),
                           all_native_emins.size() * sizeof(uint32_t), &d_emins))
         {
-            if (d_vnni) (void)hipFree(d_vnni);
-            if (d_scales) (void)hipFree(d_scales);
-            if (d_mins) (void)hipFree(d_mins);
-            if (d_emins) (void)hipFree(d_emins);
+            if (d_vnni) backend->free(d_vnni, rocm_device_id);
+            if (d_scales) backend->free(d_scales, rocm_device_id);
+            if (d_mins) backend->free(d_mins, rocm_device_id);
+            if (d_emins) backend->free(d_emins, rocm_device_id);
             return false;
         }
 

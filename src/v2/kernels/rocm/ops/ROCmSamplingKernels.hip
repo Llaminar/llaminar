@@ -3481,6 +3481,31 @@ __global__ void rocm_prepare_mtp_batched_sidecar_inputs_kernel(
 }
 
 /**
+ * @brief Expand canonical request positions into a grouped verifier matrix.
+ *
+ * The request's live KV count is the sole mutable position owner. One work item
+ * maps a flattened request-major verifier row back to `(request, token)` and
+ * writes `live_kv_count[request] + token`. Populating the complete padded matrix
+ * gives captured RoPE kernels a stable pointer while request-length metadata
+ * suppresses padded state updates.
+ */
+__global__ void rocm_prepare_mtp_verifier_position_ids_kernel(
+    const int32_t *__restrict__ base_positions,
+    int request_count,
+    int padded_seq_len,
+    int32_t *__restrict__ out_position_ids)
+{
+    const int flat_row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_rows = request_count * padded_seq_len;
+    if (flat_row >= total_rows)
+        return;
+
+    const int request = flat_row / padded_seq_len;
+    const int token = flat_row - request * padded_seq_len;
+    out_position_ids[flat_row] = base_positions[request] + token;
+}
+
+/**
  * @brief Publish the first device-owned logical rows from terminal prefill samples.
  *
  * Request admission and sampling have already published prompt positions and
@@ -5448,6 +5473,51 @@ bool rocmOps_prepare_mtp_batched_sidecar_inputs(
     {
         fprintf(stderr,
                 "ROCm batched MTP sidecar input preparation failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Enqueue device-resident grouped-verifier position expansion.
+ */
+bool rocmOps_prepare_mtp_verifier_position_ids(
+    const int32_t *base_positions,
+    int request_count,
+    int padded_seq_len,
+    int32_t *out_position_ids,
+    int device_idx,
+    void *stream)
+{
+    if (!base_positions ||
+        request_count <= 0 ||
+        padded_seq_len <= 0 ||
+        !out_position_ids ||
+        !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads_per_block = 64;
+    const int total_rows = request_count * padded_seq_len;
+    const int blocks =
+        (total_rows + threads_per_block - 1) / threads_per_block;
+    hipLaunchKernelGGL(
+        rocm_prepare_mtp_verifier_position_ids_kernel,
+        dim3(blocks), dim3(threads_per_block), 0,
+        static_cast<hipStream_t>(stream),
+        base_positions,
+        request_count,
+        padded_seq_len,
+        out_position_ids);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "ROCm grouped MTP verifier position preparation failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }

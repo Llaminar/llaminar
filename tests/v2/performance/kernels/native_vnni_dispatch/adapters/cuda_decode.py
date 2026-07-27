@@ -583,7 +583,13 @@ def _raw_candidate_config(raw: Mapping[str, str]) -> dict[str, object]:
             config["grouped_rows"] = int(raw["grouped_rows"])
         return config
     if family == "tensor_core_mma16":
-        return {"family": family}
+        # The v1 aggregate CSV contains the tunable fields carried by the
+        # trainer's Candidate struct. TensorCoreMma16 has no alternate launch
+        # geometry: its candidate ID and schedule permanently identify the
+        # four-warp kernel. Materialize that immutable registry field here so
+        # retained v1 evidence authenticates without changing its schema or
+        # the compiled trainer identity.
+        return {"family": family, "warps_per_block": 4}
     return {
         "family": family,
         "tile_n": int(raw["tile_n"]),
@@ -659,10 +665,12 @@ def adapt_cuda_decode_row(
     observed_cpt = int(raw["observed_cpt"])
     observed_kb = int(raw["observed_effective_kb"])
     serial_config = serial_candidate.config_json
-    inherited_route_ok = (
+    requested_config = candidate.config_json
+    grouped_route_ok = (
         contract != SemanticContract.VERIFIER_SERIAL_M1_BITWISE
         or (
-            observed_path == serial_config["family"]
+            requested_config["family"] == "inherit_serial_m1"
+            and observed_path == serial_config["family"]
             and observed_tile_n == int(serial_config["tile_n"])
             and observed_cpt == int(serial_config["cpt"])
             and (
@@ -670,8 +678,13 @@ def adapt_cuda_decode_row(
                 or observed_kb == int(serial_config["exact_kb"])
             )
         )
+        or (
+            requested_config["family"] == "tensor_core_mma16"
+            and observed_path == "tensor_core"
+            and observed_tile_n == 8
+            and observed_cpt == 0
+        )
     )
-    requested_config = candidate.config_json
     requested_kb_ok = (
         contract != SemanticContract.FAST
         or observed_path != "kpar"
@@ -682,7 +695,7 @@ def adapt_cuda_decode_row(
         and route_counter_ok
         and serial_route_ok
         and observed_id == candidate.effective_candidate_id
-        and inherited_route_ok
+        and grouped_route_ok
         and requested_kb_ok
     )
 

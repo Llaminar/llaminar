@@ -1287,41 +1287,40 @@ namespace llaminar2
         }
 
         /**
-         * @brief Run a chained MTP sidecar from a sampled draft token slot.
+         * @brief Run a chained MTP sidecar from device-owned token and position state.
          *
          * @param draft_sample_slot Slot in the runner-owned device draft-token
          *        buffer written by sampleStochasticDistributionOnDevice(Draft, ...).
-         * @param position_id Logical shifted-cache position for the append.
+         * @param position_offset Sidecar depth added to the live main KV cache's
+         *        canonical device-resident cached-token count.
          * @return true when the graph ran and left logits ready for sampling.
          *
-         * The default hard-fails by returning false; callers should gate this
-         * with supportsMTPDeviceDraftTokenInput() and never silently fall back to
-         * a host token upload in the vLLM-style path.
+         * The default hard-fails by returning false. GPU implementations must
+         * consume both the token slot and live position on device; callers must
+         * never substitute a host token upload or host position scalar.
          */
-        virtual bool forwardMTPFromDeviceDraftForDeviceSampling(
+        virtual bool forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling(
             int draft_sample_slot,
-            int position_id)
+            int position_offset)
         {
             (void)draft_sample_slot;
-            (void)position_id;
+            (void)position_offset;
             return false;
         }
 
         /**
-         * @brief Run the first MTP sidecar from a sampled main-model token slot.
+         * @brief Run the first MTP sidecar from device-owned token and position state.
          *
-         * Penalty-free stochastic GPU decoding can sample the first token into
-         * runner-owned device memory and defer the host read until the batched
-         * verifier summary. This entry point feeds that token directly to the
-         * sidecar embedding. The default hard-fails; GPU implementations must
-         * provide explicit stream ordering before advertising the path.
+         * GPU decoding samples the first token into runner-owned device memory.
+         * This entry point feeds that token directly to the sidecar embedding
+         * and derives its position from the live main KV cache's canonical
+         * device count. The default hard-fails; GPU implementations must order
+         * both device producers before captured replay.
          */
-        virtual bool forwardMTPFromDeviceTargetForDeviceSampling(
-            int target_sample_slot,
-            int position_id)
+        virtual bool forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(
+            int target_sample_slot)
         {
             (void)target_sample_slot;
-            (void)position_id;
             return false;
         }
 
@@ -1329,23 +1328,20 @@ namespace llaminar2
          * @brief Run the first MTP sidecar from a target slot and sample a draft slot.
          *
          * This is the fused greedy companion to
-         * forwardMTPFromDeviceTargetForDeviceSampling().  The first main-model
-         * token is already stored in a runner-owned target-token slot, so the
-         * sidecar embedding must consume that device value directly.  The MTP
-         * draft proposal is then sampled into @p draft_sample_slot for the
-         * verifier input row.  The optional host shadow in @p out_token is for
-         * response planning only; the verifier source of truth remains the
-         * device draft slot.
+         * forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(). The
+         * first main-model token and the live sidecar position are both
+         * device-owned. The MTP draft proposal is sampled into
+         * @p draft_sample_slot for the verifier input row. The optional host
+         * shadow in @p out_token is for response planning only; the verifier
+         * source of truth remains the device draft slot.
          */
-        virtual bool forwardMTPFromDeviceTargetAndSampleGreedyToDeviceDraftSlot(
+        virtual bool forwardMTPFromDeviceTargetAtLivePositionAndSampleGreedyToDeviceDraftSlot(
             int target_sample_slot,
-            int position_id,
             int draft_sample_slot,
             int32_t *out_token)
         {
-            if (!forwardMTPFromDeviceTargetForDeviceSampling(
-                    target_sample_slot,
-                    position_id))
+            if (!forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(
+                    target_sample_slot))
             {
                 return false;
             }
@@ -1372,6 +1368,33 @@ namespace llaminar2
             (void)logical_state;
             (void)request_index;
             return false;
+        }
+
+        /**
+         * @brief Run a resident first sidecar and sample into a device draft slot.
+         *
+         * This greedy convenience entry point preserves the device mailbox as
+         * the sole condition-token and position owner, then samples the sidecar
+         * logits into @p draft_sample_slot. A nullable @p out_token is only a
+         * response/history shadow; subsequent sidecars and the verifier must
+         * consume the device slot.
+         */
+        virtual bool
+        forwardMTPFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlot(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int draft_sample_slot,
+            int32_t *out_token)
+        {
+            if (!forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+                    logical_state,
+                    request_index))
+            {
+                return false;
+            }
+            return sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+                draft_sample_slot,
+                out_token);
         }
 
         /**
@@ -1615,23 +1638,23 @@ namespace llaminar2
          * @brief Chained device-slot sidecar plus greedy sample into a device slot.
          *
          * This is the fixed-depth greedy hot-path companion to
-         * forwardMTPFromDeviceDraftForDeviceSampling().  The previous draft
-         * token is read from @p draft_condition_sample_slot in runner-owned
-         * device memory, the chained sidecar executes at @p position_id, and
-         * the next draft proposal is written to @p draft_sample_slot.  The
-         * optional host shadow in @p out_token is deliberately nullable; when
-         * it is null, callers must consume the compact verifier outcome rather
-         * than inspecting `draft_tokens` on the CPU.
+         * forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling(). The
+         * previous draft token is read from @p draft_condition_sample_slot in
+         * runner-owned device memory. The chained sidecar executes at the live
+         * device KV count plus @p position_offset, and writes the next proposal
+         * to @p draft_sample_slot. The optional host shadow in @p out_token is
+         * deliberately nullable; when it is null, callers must consume the
+         * compact verifier outcome rather than inspecting `draft_tokens`.
          */
-        virtual bool forwardMTPFromDeviceDraftAndSampleGreedyToDeviceDraftSlot(
+        virtual bool forwardMTPFromDeviceDraftAtLivePositionAndSampleGreedyToDeviceDraftSlot(
             int draft_condition_sample_slot,
-            int position_id,
+            int position_offset,
             int draft_sample_slot,
             int32_t *out_token)
         {
-            if (!forwardMTPFromDeviceDraftForDeviceSampling(
+            if (!forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling(
                     draft_condition_sample_slot,
-                    position_id))
+                    position_offset))
             {
                 return false;
             }
@@ -1878,7 +1901,7 @@ namespace llaminar2
          * read.  The initial shifted-cache repair after verifier-base restore
          * must still append that token's row, so supporting runners read the
          * token from the same target sample slot used by
-         * forwardMTPFromDeviceTargetForDeviceSampling().
+         * forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling().
          */
         virtual bool commitMTPShiftedRowFromDeviceTargetSample(
             int target_sample_slot,
@@ -2041,6 +2064,19 @@ namespace llaminar2
          * unrelated stream before replay has completed.
          */
         virtual LogitsLocalInfo consumeAllPositionLogitsLocalInfoForSampling()
+        {
+            return getAllPositionLogitsLocalInfo();
+        }
+
+        /**
+         * @brief Consume local verifier logits for an explicit host gather.
+         *
+         * GPU implementations must join the grouped verifier publication onto
+         * an explicit host-bridge stream before returning. This contract keeps
+         * diagnostics and parity snapshots ordered without synchronizing the
+         * producer stream or retaining graph-cache stream pointers.
+         */
+        virtual LogitsLocalInfo consumeAllPositionLogitsLocalInfoForHostGather()
         {
             return getAllPositionLogitsLocalInfo();
         }
@@ -2343,6 +2379,32 @@ namespace llaminar2
         }
 
         /**
+         * @brief Rebind resident outcome metadata after an opt-in diagnostic restore.
+         *
+         * The commit/replay equivalence diagnostic deliberately restores several
+         * live-prefix checkpoints while comparing grouped publication with serial
+         * replay. A restore invalidates transient mailbox events and advances the
+         * live-state epoch, even though the arena-owned compact outcome rows still
+         * contain the publication being diagnosed. Before returning to the real
+         * decode transaction, the diagnostic calls this method exactly once to
+         * bind those durable rows to the restored epoch and a fresh stream event.
+         *
+         * This is not a production publication API. Normal MTP execution must
+         * publish logical state through the grouped verifier outcome path. The
+         * default hard failure keeps runners without a proved resident diagnostic
+         * lifecycle from silently substituting host state.
+         *
+         * @param request_count Number of durable compact outcome rows to rebind.
+         * @return true only when the runner restored a complete resident mailbox.
+         */
+        virtual bool rebindDeviceResidentLogicalStateAfterDiagnosticRestore(
+            int request_count)
+        {
+            (void)request_count;
+            return false;
+        }
+
+        /**
          * @brief Get vocabulary size
          */
         virtual int vocab_size() const = 0;
@@ -2416,7 +2478,7 @@ namespace llaminar2
          * graph-capturable argmax on an explicit stream and write the selected
          * token into the same runner-owned target sample arena consumed by
          * prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken() and
-         * forwardMTPFromDeviceTargetForDeviceSampling().  Passing nullptr for
+         * forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(). Passing nullptr for
          * @p out_token requests a fully deferred sample with no D2H copy.
          */
         virtual bool sampleGreedyFromMainLogitsToDeviceTargetSlot(
@@ -2567,7 +2629,11 @@ namespace llaminar2
         }
 
         /**
-         * @brief Apply decode-boundary maintenance after a successful step.
+         * @brief Apply decode-boundary maintenance after a successful committed step.
+         *
+         * Implementations that own graph-captured MoE maintenance launch it
+         * here, after MTP verifier publication or rollback has closed.  Raw
+         * forward execution is deliberately not a substitute for this hook.
          */
         virtual bool maybeApplyDecodeBoundaryMaintenance() { return true; }
 
@@ -2929,6 +2995,41 @@ namespace llaminar2
             int target_sample_slot = 0)
         {
             (void)target_token;
+            (void)target_sample_slot;
+            return false;
+        }
+
+        /**
+         * @brief Publish a resident condition token into a device target slot.
+         *
+         * A verifier publication mailbox can outlive the transaction that
+         * produced it long enough to seed the next decode step. Some consumers,
+         * notably budget-limited direct emit, must both mutate the mailbox-owned
+         * shifted-MTP transaction and retain the same token for a later main
+         * graph replay. Implementations copy the request-local
+         * `next_condition_tokens_device` entry into the persistent target-sample
+         * arena before that mutation, using an explicit stream ordered after the
+         * mailbox readiness event, and publish the normal target-slot readiness
+         * event after the copy.
+         *
+         * This operation is strictly device-to-device. It must never read the
+         * host token shadow or call a host-to-device transfer API. A stale,
+         * foreign, out-of-range, or streamless mailbox is a hard contract
+         * failure for GPU callers.
+         *
+         * @param logical_state Runner-owned resident publication mailbox.
+         * @param request_index Request row containing the condition token.
+         * @param target_sample_slot Persistent target slot receiving the token.
+         * @return true only when the D2D copy and target readiness publication
+         *         were enqueued successfully.
+         */
+        virtual bool publishDeviceResidentConditionTokenToTargetSampleSlot(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int target_sample_slot = 0)
+        {
+            (void)logical_state;
+            (void)request_index;
             (void)target_sample_slot;
             return false;
         }
@@ -3774,6 +3875,25 @@ namespace llaminar2
         }
 
         /**
+         * @brief Consume local main logits for an explicit host gather.
+         *
+         * Metadata returned by getLogitsLocalInfo() does not establish an
+         * ordering edge from a GPU graph producer to a host transfer. GPU
+         * runners override this method to consume that producer publication
+         * onto a dedicated, non-null host-bridge stream. LogitsGatherer rejects
+         * GPU metadata without such a stream, making unordered D2H impossible.
+         *
+         * CPU runners may use the metadata-only implementation because their
+         * tensor storage is already host resident.
+         *
+         * @return Ordered local-logits information, or empty when unavailable.
+         */
+        virtual LogitsLocalInfo consumeLogitsLocalInfoForHostGather()
+        {
+            return getLogitsLocalInfo();
+        }
+
+        /**
          * @brief Check if this runner has column-parallel local MTP logits
          *
          * True when the MTP sidecar LM head writes a local vocabulary shard
@@ -3799,6 +3919,18 @@ namespace llaminar2
          * gather/snapshot paths should keep using getMTPLogitsLocalInfo().
          */
         virtual LogitsLocalInfo consumeMTPLogitsLocalInfoForSampling()
+        {
+            return getMTPLogitsLocalInfo();
+        }
+
+        /**
+         * @brief Consume local MTP logits for an explicit host gather.
+         *
+         * GPU implementations must return the exact host-bridge stream ordered
+         * after the sidecar graph. Returning a metadata-only GPU view is not a
+         * valid implementation and is rejected by LogitsGatherer.
+         */
+        virtual LogitsLocalInfo consumeMTPLogitsLocalInfoForHostGather()
         {
             return getMTPLogitsLocalInfo();
         }

@@ -122,6 +122,13 @@ namespace llaminar2
             /// @brief Returns true when any CUDA execution context is live.
             bool hasDynamicStateActive() const override;
 
+            bool canReleaseSourceWeightTensor() const override
+            {
+                return packed_ != nullptr ||
+                       lifetime_owner_ != nullptr ||
+                       (weights_converted_ && d_weights_int8_ && d_scales_B_);
+            }
+
             /**
              * @brief Construct kernel for quantized weight tensor (lazy conversion)
              *
@@ -371,7 +378,22 @@ namespace llaminar2
              * For CUDA: converts weights to INT8 + uploads to device memory.
              * Call this during weight preloading to avoid first-use overhead.
              */
-            void prepareWeights() override { ensureWeightsConverted(); }
+            void prepareWeights() override;
+
+            /**
+             * @brief Materialize the optional ROWPAR weight view during setup.
+             *
+             * This operation allocates persistent weight storage and launches
+             * transpose kernels. It therefore requires an explicit,
+             * non-capturing setup stream and is forbidden from all multiply
+             * entry points. Production `prepareWeights()` calls it only when
+             * the installed generated policy selects ROWPAR for this shape.
+             *
+             * @param stream Explicit CUDA setup stream.
+             * @throws std::runtime_error for a null/capturing stream or failed
+             *         preparation.
+             */
+            void prepareRowMajorWeights(void *stream);
 
             // =========================================================================
             // Fused Activation+GEMM entry points

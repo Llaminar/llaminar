@@ -497,10 +497,15 @@ namespace
         bool workerGPUContextUsesProcessPool(DeviceId) const override { return false; }
         std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override { return {}; }
         bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int) override { return true; }
-        void syncLogitsAtBoundary(IDeviceContext *) override {}
-        TensorBase *logitsTensor() override { return nullptr; }
+        bool publishLogitsAtBoundary(
+            TensorBase *,
+            IDeviceContext *,
+            void *) override
+        {
+            return true;
+        }
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
-            bool, IDeviceContext *, int) const override
+            bool, IDeviceContext *) const override
         {
             return {};
         }

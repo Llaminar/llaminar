@@ -21,6 +21,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 // Include project headers
 #include "backends/DeviceId.h"
@@ -783,7 +784,7 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_ApplyTensor)
         rows, cols, epsilon, nullptr, 0));
 
     ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
-    rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(rocm_output, stream.get());
     const float *result = rocm_output->data();
 
     ASSERT_FALSE(hasNaNOrInf(result, total)) << "ROCm output contains NaN/Inf";
@@ -870,7 +871,7 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_RealQwen2Layer21InputParity)
         rows, cols, epsilon, nullptr, 0));
 
     ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
-    rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(rocm_output, stream.get());
     const float *result = rocm_output->data();
 
     ASSERT_FALSE(hasNaNOrInf(result, total)) << "ROCm output contains NaN/Inf";
@@ -959,7 +960,7 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_RealQwen2Layer3InputParity)
         rows, cols, epsilon, nullptr, 0));
 
     ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
-    rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(rocm_output, stream.get());
     const float *result = rocm_output->data();
 
     ASSERT_FALSE(hasNaNOrInf(result, total)) << "ROCm output contains NaN/Inf";

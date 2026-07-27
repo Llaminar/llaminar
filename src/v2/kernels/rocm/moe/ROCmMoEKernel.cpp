@@ -10,11 +10,13 @@
 #include "../gemm/HipBLASGemmKernel.h"
 #include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../tensors/ITensor.h"
 #include "../../../tensors/TensorClasses.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -33,6 +35,52 @@
 namespace
 {
     constexpr size_t kGroupedDecodeGateLogitsSharedCapBytes = 48 * 1024;
+    constexpr const char *kROCmGroupedDownDescriptorLeaseDomain =
+        "rocm_moe_grouped_down_descriptors";
+    constexpr const char *kROCmGroupedGateUpDescriptorLeaseDomain =
+        "rocm_moe_grouped_gateup_descriptors";
+    constexpr const char *kROCmGroupedExpertMaskLeaseDomain =
+        "rocm_moe_grouped_expert_masks";
+    constexpr const char *kROCmRouterQ8GatePublicationDomain =
+        "rocm_moe_router_q8_gate_cache";
+    constexpr const char *kROCmRouterFP16GatePublicationDomain =
+        "rocm_moe_router_fp16_gate_cache";
+
+    /**
+     * @brief Preserve every router identity component for workspace sharing.
+     */
+    llaminar2::PersistentWorkspacePublicationKey routerPublicationKey(
+        const llaminar2::DeviceResidentRouterGateCacheKey &key) noexcept
+    {
+        return {
+            .word0 = key.workspace_id,
+            .word1 = static_cast<std::uint64_t>(key.source_device_ptr),
+            .word2 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(key.d_model)),
+            .word3 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(key.num_experts)),
+        };
+    }
+
+    /**
+     * @brief Validate the stage-owned stream for a device-resident MoE launch.
+     *
+     * Rebalance and LLEP primitives use this immutable context rather than the
+     * mutable stream inherited from ROCmKernelBase, which may be rebound by a
+     * concurrent main, MTP, or maintenance graph capture.
+     */
+    void *explicitMoELaunchStream(
+        const llaminar2::MoEKernelLaunchContext &launch,
+        const char *operation)
+    {
+        if (!launch.hasExplicitStream())
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << operation
+                                         << " requires an explicit stage-owned HIP stream");
+            return nullptr;
+        }
+        return launch.stream;
+    }
 
     bool setMoEDevice(int device_ordinal, const char *context)
     {
@@ -197,17 +245,24 @@ namespace
         return err == hipSuccess && status == hipStreamCaptureStatusActive;
     }
 
+    /**
+     * @brief Publish an asynchronous HIP tensor write through TransferEngine.
+     *
+     * The kernel wrapper supplies the exact producer device and stream. The
+     * transfer service owns concrete tensor validation and the event-backed
+     * coherence transition consumed by later streams.
+     */
     void markDeviceWritten(llaminar2::ITensor *tensor, llaminar2::DeviceId device, void *stream)
     {
-        if (auto *base = dynamic_cast<llaminar2::TensorBase *>(tensor))
-            base->transitionToWithEvent(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
-        else
-            tensor->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        llaminar2::TransferEngine::publishDeviceWrite(
+            tensor,
+            device,
+            stream);
     }
 
     void markSynced(llaminar2::ITensor *tensor)
     {
-        tensor->transitionTo(llaminar2::TensorCoherenceState::SYNCED);
+        llaminar2::TransferEngine::publishSynchronized(tensor);
     }
 
     llaminar2::PerfStatsCollector::Tags groupedDecodeTags(
@@ -251,31 +306,11 @@ namespace
             return false;
         }
 
-        auto *base = dynamic_cast<llaminar2::TensorBase *>(tensor);
-        if (!base)
-        {
-            if (tensor && tensor->gpu_data_ptr())
-                return true;
-            LOG_ERROR("[ROCmMoEKernel] " << context
-                                         << " has no device pointer for non-TensorBase " << name);
-            return false;
-        }
-
-        if (!base->ensureOnDevice(device, stream))
-        {
-            LOG_ERROR("[ROCmMoEKernel] " << context
-                                         << " failed to place " << name << " on "
-                                         << device.to_string());
-            return false;
-        }
-
-        if (!base->gpu_data_ptr())
-        {
-            LOG_ERROR("[ROCmMoEKernel] " << context
-                                         << " has null device pointer after upload for " << name);
-            return false;
-        }
-
+        (void)context;
+        llaminar2::TransferEngine::prepareDeviceInput(
+            tensor,
+            device,
+            stream);
         return true;
     }
 
@@ -292,37 +327,11 @@ namespace
             return false;
         }
 
-        auto *base = dynamic_cast<llaminar2::TensorBase *>(tensor);
-        if (!base)
-        {
-            if (tensor && tensor->gpu_data_ptr())
-                return true;
-            LOG_ERROR("[ROCmMoEKernel] " << context
-                                         << " has no device pointer for non-TensorBase output " << name);
-            return false;
-        }
-
-        /*
-         * Output-only verifier row buffers are about to be overwritten by a
-         * HIP kernel.  Allocating is correct; uploading the stale host mirror
-         * is not.  This mirrors the CUDA MoE helper and keeps row handoff
-         * semantics explicit.
-         */
-        if (!base->gpu_data_ptr() && !base->allocateOnDevice(device, stream))
-        {
-            LOG_ERROR("[ROCmMoEKernel] " << context
-                                         << " failed to allocate output " << name
-                                         << " on " << device.to_string());
-            return false;
-        }
-
-        if (!base->gpu_data_ptr())
-        {
-            LOG_ERROR("[ROCmMoEKernel] " << context
-                                         << " has null output device pointer for " << name);
-            return false;
-        }
-
+        (void)context;
+        llaminar2::TransferEngine::prepareDeviceOutput(
+            tensor,
+            device,
+            stream);
         return true;
     }
 }
@@ -350,6 +359,12 @@ extern "C"
         const float *hidden, const float *gate_weights, float *logits,
         int d_model, int num_experts, size_t shared_mem_bytes,
         int device_idx, void *stream);
+
+    bool hipMoE_gate_logits_grouped_decode_router_rows(
+        const float *hidden, const float *gate_weights, float *logits,
+        int seq_len, int d_model, int num_experts, size_t shared_mem_bytes,
+        int device_idx, void *stream,
+        const int *device_effective_seq_len);
 
     bool hipMoE_fp32_to_fp16(
         const float *input, void *output_fp16, int count,
@@ -551,6 +566,9 @@ extern "C"
         uint32_t command_buffer_count,
         const void *gathered_wave_states,
         void *local_wave_states,
+        void *runtime_layers,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
         int device_idx,
         void *stream);
 
@@ -565,6 +583,9 @@ extern "C"
         void *status,
         uint32_t payload_slot_capacity,
         uint32_t command_buffer_count,
+        void *runtime_layers,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
         int device_idx,
         void *stream);
 
@@ -849,11 +870,13 @@ extern "C"
         void *runtime,
         int current_slots, int max_slots, int num_experts, int top_k,
         int filter_to_local_runtime_experts,
+        int histogram_update_flags,
         int device_idx, void *stream);
 
     bool hipMoE_regroup_prefill_routes_runtime_assignments(
         void *runtime,
         int current_slots, int max_slots, int num_experts, int top_k,
+        int histogram_update_flags,
         int device_idx, void *stream);
 
     bool hipMoE_assign_prefill_routes_least_loaded_resident(
@@ -874,6 +897,7 @@ extern "C"
         uint64_t min_spread_improvement_per_transfer,
         uint64_t min_foreign_rows_per_transfer,
         uint32_t max_weight_transfers,
+        uint32_t max_non_owner_experts_per_participant,
         int enable_balanced_skip,
         int device_idx, void *stream);
 
@@ -1276,6 +1300,60 @@ namespace
             device_ordinal, stream);
     }
 
+    /**
+     * @brief Launch FP32 grouped rows with the exact router geometry selected by decode.
+     *
+     * Decode can use either the shared-hidden two-experts-per-block kernel or
+     * the one-expert-per-block kernel. This policy function is the single owner
+     * of that choice for every M, preventing routeWithTensors(), verifier
+     * routing, and runtime decode from silently adopting different reduction
+     * trees. A selected launch failure is returned directly; it never retries
+     * with the other arithmetic path.
+     */
+    bool launchDecodeEquivalentFP32Rows(
+        const float *hidden,
+        const float *gate_weights,
+        float *logits,
+        int seq_len,
+        int d_model,
+        int num_experts,
+        int device_ordinal,
+        void *stream,
+        const int *device_effective_seq_len)
+    {
+        const size_t shared_mem_bytes =
+            static_cast<size_t>(d_model) * sizeof(float);
+        const bool decode_uses_shared_hidden_router =
+            llaminar2::debugEnv().rocm.moe_grouped_decode_router &&
+            num_experts > 1 &&
+            shared_mem_bytes <= kGroupedDecodeGateLogitsSharedCapBytes;
+        if (decode_uses_shared_hidden_router)
+        {
+            return hipMoE_gate_logits_grouped_decode_router_rows(
+                hidden,
+                gate_weights,
+                logits,
+                seq_len,
+                d_model,
+                num_experts,
+                shared_mem_bytes,
+                device_ordinal,
+                stream,
+                device_effective_seq_len);
+        }
+
+        return hipMoE_gate_logits_fp32_decode_equivalent_rows(
+            hidden,
+            gate_weights,
+            logits,
+            seq_len,
+            d_model,
+            num_experts,
+            device_ordinal,
+            stream,
+            device_effective_seq_len);
+    }
+
     bool launchDecodeGateLogits(
         const float *hidden,
         const float *gate_weights,
@@ -1355,7 +1433,6 @@ namespace llaminar2
     {
         auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_ordinal);
         ROCmKernelBase::setDeviceContext(&ctx);
-        ROCmKernelBase::setGPUStream(ctx.defaultStream());
 
         // Create hipBLAS GEMM kernel using device context (shares hipBLAS handle)
         blas_gemm_ = std::make_unique<rocm::HipBLASGemmKernel>(&ctx);
@@ -1363,7 +1440,7 @@ namespace llaminar2
         // Ensure hipBLAS runs on the same stream as our HIP kernels
         syncBlasStream();
 
-        LOG_DEBUG("[ROCmMoEKernel] Created for ROCm device " << device_ordinal
+        LOG_TRACE("[ROCmMoEKernel] Created for ROCm device " << device_ordinal
                                                              << " stream=" << ROCmKernelBase::getStream());
     }
 
@@ -1521,6 +1598,7 @@ namespace llaminar2
         d_group_counts_ = nullptr;
         d_group_max_tokens_ = nullptr;
         d_group_expert_mask_ = nullptr;
+        group_expert_mask_workspace_lease_.reset();
         d_group_token_indices_ = nullptr;
         d_group_original_to_grouped_ = nullptr;
         d_group_weights_ = nullptr;
@@ -1531,9 +1609,6 @@ namespace llaminar2
         d_prefill_swiglu_scales_ = nullptr;
         d_prefill_gate_ = nullptr;
         d_prefill_up_ = nullptr;
-        d_runtime_prefill_gate_descs_ = nullptr;
-        d_runtime_prefill_up_descs_ = nullptr;
-        d_runtime_prefill_down_descs_ = nullptr;
 
         max_experts_ = 0;
         max_layers_ = 0;
@@ -1559,27 +1634,27 @@ namespace llaminar2
         group_experts_cap_ = 0;
         group_expert_mask_cap_ = 0;
         group_expert_mask_hash_ = 0;
+        group_expert_mask_num_experts_ = 0;
+        group_expert_mask_active_experts_ = 0;
+        group_expert_mask_published_ = false;
         prefill_slots_cap_ = 0;
         prefill_d_model_cap_ = 0;
         prefill_intermediate_cap_ = 0;
-        runtime_prefill_desc_cap_ = 0;
         router_fp16_gate_cache_.clear();
         router_q8_gate_cache_.clear();
         for (auto &table : grouped_down_desc_tables_)
         {
             table.device_descs = nullptr;
+            table.workspace_lease.reset();
             table.workspace_slot = 0;
         }
         for (auto &table : grouped_gateup_desc_tables_)
         {
             table.device_gate_descs = nullptr;
             table.device_up_descs = nullptr;
+            table.workspace_lease.reset();
             table.workspace_slot = 0;
         }
-        next_grouped_down_desc_workspace_slot_ = 0;
-        next_grouped_gateup_desc_workspace_slot_ = 0;
-        next_router_q8_gate_workspace_slot_ = 0;
-        next_router_fp16_gate_workspace_slot_ = 0;
         grouped_gateup_cached_expert_ids_.clear();
         grouped_down_cached_expert_ids_.clear();
         grouped_down_cached_weights_.clear();
@@ -1592,6 +1667,8 @@ namespace llaminar2
     {
         if (grouped_down_desc_tables_.empty() && grouped_gateup_desc_tables_.empty())
             return true;
+        if (rejectDecodeStagingDuringCapture("rebind grouped descriptor tables"))
+            return false;
         if (!setMoEDevice(device_ordinal_, context ? context : "rebindGroupedDescriptorTablesToWorkspace"))
             return false;
         hipStream_t stream = static_cast<hipStream_t>(getStream());
@@ -1601,18 +1678,21 @@ namespace llaminar2
             return false;
         }
 
-        next_grouped_down_desc_workspace_slot_ = 0;
         for (auto &table : grouped_down_desc_tables_)
         {
             if (!table.valid || table.host_descs.empty() || table.num_experts <= 0)
                 continue;
-            const std::size_t slot = next_grouped_down_desc_workspace_slot_;
-            if (slot >= static_cast<std::size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots))
+            auto lease = workspace_->acquirePersistentSlot(
+                kROCmGroupedDownDescriptorLeaseDomain,
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+            if (!lease)
             {
-                LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] down descriptor slots exhausted");
+                LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] "
+                          "failed to lease a down descriptor slot");
                 table.device_descs = nullptr;
                 return false;
             }
+            const std::size_t slot = lease->slot();
             const size_t desc_bytes =
                 static_cast<size_t>(table.num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
             DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
@@ -1639,11 +1719,10 @@ namespace llaminar2
                 return false;
             }
             table.device_descs = device_descs;
+            table.workspace_lease = std::move(lease);
             table.workspace_slot = slot;
-            next_grouped_down_desc_workspace_slot_ = slot + 1;
         }
 
-        next_grouped_gateup_desc_workspace_slot_ = 0;
         for (auto &table : grouped_gateup_desc_tables_)
         {
             if (!table.valid || table.host_gate_descs.empty() ||
@@ -1651,14 +1730,18 @@ namespace llaminar2
             {
                 continue;
             }
-            const std::size_t slot = next_grouped_gateup_desc_workspace_slot_;
-            if (slot >= static_cast<std::size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots))
+            auto lease = workspace_->acquirePersistentSlot(
+                kROCmGroupedGateUpDescriptorLeaseDomain,
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+            if (!lease)
             {
-                LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] gate/up descriptor slots exhausted");
+                LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] "
+                          "failed to lease a gate/up descriptor slot");
                 table.device_gate_descs = nullptr;
                 table.device_up_descs = nullptr;
                 return false;
             }
+            const std::size_t slot = lease->slot();
             const size_t desc_bytes =
                 static_cast<size_t>(table.num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
             DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
@@ -1701,8 +1784,8 @@ namespace llaminar2
             }
             table.device_gate_descs = device_gate_descs;
             table.device_up_descs = device_up_descs;
+            table.workspace_lease = std::move(lease);
             table.workspace_slot = slot;
-            next_grouped_gateup_desc_workspace_slot_ = slot + 1;
         }
         return true;
     }
@@ -1729,11 +1812,6 @@ namespace llaminar2
         clearWorkspaceScratchBindings();
         grouped_down_desc_tables_.clear();
         grouped_gateup_desc_tables_.clear();
-        host_expert_counts_.clear();
-        host_expert_offsets_.clear();
-        host_grouped_indices_.clear();
-        host_grouped_weights_.clear();
-        prepared_num_experts_ = 0;
     }
 
     void ROCmMoEKernel::syncBlasStream()
@@ -1916,31 +1994,34 @@ namespace llaminar2
     }
 
     const ROCmMoEKernel::RouterQ8GateCacheEntry *ROCmMoEKernel::getOrCreateQ8RouterGateCache(
-        ITensor *gate_weights,
         const float *gate_device_ptr,
         int d_model,
         int num_experts)
     {
         if (!debugEnv().rocm.moe_router_q8)
             return nullptr;
-        if (!gate_weights || !gate_device_ptr || d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+        if (!gate_device_ptr || d_model <= 0 || num_experts <= 0 ||
+            (d_model % 32) != 0)
         {
             LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] invalid Q8 router gate request "
-                      "(gate_weights=" << gate_weights
-                      << " gate_device_ptr=" << static_cast<const void *>(gate_device_ptr)
+                      "(gate_device_ptr=" << static_cast<const void *>(gate_device_ptr)
                       << " d_model=" << d_model
                       << " num_experts=" << num_experts << ")");
             return nullptr;
         }
+        if (!workspace_)
+        {
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] "
+                      "graph-owned workspace is required before cache publication");
+            return nullptr;
+        }
 
-        const auto tensor_key = reinterpret_cast<std::uintptr_t>(gate_weights);
-        const auto device_ptr_key = reinterpret_cast<std::uintptr_t>(gate_device_ptr);
+        const DeviceResidentRouterGateCacheKey cache_key =
+            DeviceResidentRouterGateCacheKey::make(
+                workspace_->id(), gate_device_ptr, d_model, num_experts);
         for (const auto &entry : router_q8_gate_cache_)
         {
-            if (entry.source_tensor == tensor_key &&
-                entry.source_device_ptr == device_ptr_key &&
-                entry.d_model == d_model &&
-                entry.num_experts == num_experts &&
+            if (entry.key == cache_key &&
                 entry.d_gate_weights_q8 && entry.d_gate_scales)
             {
                 return &entry;
@@ -1982,105 +2063,180 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "getOrCreateQ8RouterGateCache"))
             return nullptr;
 
-        for (auto it = router_q8_gate_cache_.begin(); it != router_q8_gate_cache_.end();)
-        {
-            if (it->source_tensor == tensor_key &&
-                it->d_model == d_model &&
-                it->num_experts == num_experts &&
-                it->source_device_ptr != device_ptr_key)
-            {
-                it = router_q8_gate_cache_.erase(it);
-            }
-            else
-            {
-                ++it;
-            }
-        }
-
-        const std::size_t slot = next_router_q8_gate_workspace_slot_;
-        if (slot >= static_cast<std::size_t>(MoEWorkspaceBuffers::kRouterGateCacheSlots))
-        {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] Q8 router gate workspace slots exhausted: "
-                      << slot << " capacity=" << MoEWorkspaceBuffers::kRouterGateCacheSlots);
-            return nullptr;
-        }
-
         void *gate_weights_base = nullptr;
         void *gate_scales_base = nullptr;
-        const size_t weights_bytes =
-            static_cast<size_t>(MoEWorkspaceBuffers::kRouterGateCacheSlots) *
-            element_count * sizeof(int8_t);
-        const size_t scales_bytes =
-            static_cast<size_t>(MoEWorkspaceBuffers::kRouterGateCacheSlots) *
-            scale_count * sizeof(float);
+        const size_t weights_payload_bytes = element_count * sizeof(int8_t);
+        const size_t scales_payload_bytes = scale_count * sizeof(float);
         if (!bindWorkspaceBuffer(&gate_weights_base,
                                  MoEWorkspaceBuffers::ROCM_ROUTER_Q8_GATE_WEIGHTS,
-                                 weights_bytes,
+                                 weights_payload_bytes,
                                  "ROCm Q8 router gate weights") ||
             !bindWorkspaceBuffer(&gate_scales_base,
                                  MoEWorkspaceBuffers::ROCM_ROUTER_Q8_GATE_SCALES,
-                                 scales_bytes,
+                                 scales_payload_bytes,
                                  "ROCm Q8 router gate scales"))
         {
             return nullptr;
         }
-        int8_t *d_gate_weights_q8 =
-            static_cast<int8_t *>(gate_weights_base) + slot * element_count;
-        float *d_gate_scales =
-            static_cast<float *>(gate_scales_base) + slot * scale_count;
 
-        if (!hipMoE_quantize_router_gate_q8(gate_device_ptr, d_gate_weights_q8, d_gate_scales,
-                                            d_model, num_experts,
-                                            device_ordinal_, stream))
+        /*
+         * Model router weights are immutable, while the paired routed pipeline
+         * kernels are graph-local by design. Publish one conversion through the
+         * workspace manager and let every graph adopt it. The setup factory
+         * records an event before exposing the publication, so cross-stream
+         * adoption is an explicit HIP dependency rather than a host sync.
+         */
+        const auto publication_result =
+            workspace_->getOrCreatePersistentPublication(
+                kROCmRouterQ8GatePublicationDomain,
+                routerPublicationKey(cache_key),
+                MoEWorkspaceBuffers::kRouterGateCacheSlots,
+                [&](std::size_t slot) -> std::shared_ptr<void>
+                {
+                    void *weights = workspace_->getPersistentSlotBuffer(
+                        MoEWorkspaceBuffers::ROCM_ROUTER_Q8_GATE_WEIGHTS,
+                        MoEWorkspaceBuffers::kRouterGateCacheSlots,
+                        slot,
+                        weights_payload_bytes);
+                    void *scales = workspace_->getPersistentSlotBuffer(
+                        MoEWorkspaceBuffers::ROCM_ROUTER_Q8_GATE_SCALES,
+                        MoEWorkspaceBuffers::kRouterGateCacheSlots,
+                        slot,
+                        scales_payload_bytes);
+                    if (!weights || !scales)
+                        return {};
+
+                    hipEvent_t ready_event = nullptr;
+                    hipError_t event_err = hipEventCreateWithFlags(
+                        &ready_event, hipEventDisableTiming);
+                    if (event_err != hipSuccess || !ready_event)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] "
+                                  "failed to create immutable publication event: "
+                                  << hipGetErrorString(event_err));
+                        return {};
+                    }
+
+                    auto publication =
+                        std::shared_ptr<RouterGateWorkspacePublication>(
+                            new RouterGateWorkspacePublication{
+                                .ready_event = static_cast<void *>(ready_event),
+                                .primary_weights = weights,
+                                .scales = scales,
+                                .workspace_slot = slot,
+                            },
+                            [](RouterGateWorkspacePublication *value)
+                            {
+                                if (value && value->ready_event)
+                                {
+                                    (void)hipEventDestroy(
+                                        static_cast<hipEvent_t>(
+                                            value->ready_event));
+                                }
+                                delete value;
+                            });
+
+                    if (!hipMoE_quantize_router_gate_q8(
+                            gate_device_ptr,
+                            static_cast<int8_t *>(weights),
+                            static_cast<float *>(scales),
+                            d_model,
+                            num_experts,
+                            device_ordinal_,
+                            stream))
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] "
+                                  "FP32->Q8 router gate conversion launch failed");
+                        return {};
+                    }
+
+                    event_err = hipEventRecord(
+                        ready_event, static_cast<hipStream_t>(stream));
+                    if (event_err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] "
+                                  "failed to record immutable publication event: "
+                                  << hipGetErrorString(event_err));
+                        /*
+                         * Conversion work is already in flight. There is no
+                         * coherent unwind without its readiness event, and a
+                         * stream/device sync would be an implicit recovery
+                         * path. Stop the process before stale bytes can escape.
+                         */
+                        std::terminate();
+                    }
+                    return publication;
+                });
+        if (!publication_result)
         {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] FP32->Q8 router gate conversion launch failed");
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] "
+                      "failed to publish immutable router gate");
+            return nullptr;
+        }
+
+        auto publication =
+            std::static_pointer_cast<RouterGateWorkspacePublication>(
+                publication_result.publication);
+        const hipError_t wait_err = hipStreamWaitEvent(
+            static_cast<hipStream_t>(stream),
+            static_cast<hipEvent_t>(publication->ready_event),
+            0);
+        if (wait_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] "
+                      "failed to adopt immutable router publication: "
+                      << hipGetErrorString(wait_err));
             return nullptr;
         }
 
         RouterQ8GateCacheEntry entry{};
-        entry.source_tensor = tensor_key;
-        entry.source_device_ptr = device_ptr_key;
-        entry.d_model = d_model;
-        entry.num_experts = num_experts;
+        entry.key = cache_key;
         entry.blocks_per_row = blocks_per_row;
         entry.element_count = element_count;
         entry.scale_count = scale_count;
-        entry.d_gate_weights_q8 = d_gate_weights_q8;
-        entry.d_gate_scales = d_gate_scales;
-        entry.workspace_slot = slot;
-        router_q8_gate_cache_.push_back(entry);
-        next_router_q8_gate_workspace_slot_ = slot + 1;
+        entry.d_gate_weights_q8 =
+            static_cast<int8_t *>(publication->primary_weights);
+        entry.d_gate_scales =
+            static_cast<float *>(publication->scales);
+        entry.workspace_publication = std::move(publication);
+        entry.workspace_slot = publication_result.slot;
+        router_q8_gate_cache_.push_back(std::move(entry));
 
-        LOG_DEBUG("[ROCmMoEKernel] Cached Q8 router gate tensor="
-                  << reinterpret_cast<const void *>(tensor_key)
-                  << " source_device=" << reinterpret_cast<const void *>(device_ptr_key)
+        LOG_DEBUG("[ROCmMoEKernel] Adopted Q8 router gate source_device="
+                  << static_cast<const void *>(gate_device_ptr)
+                  << " workspace_id=" << cache_key.workspace_id
+                  << " slot=" << publication_result.slot
+                  << " created=" << publication_result.created
                   << " shape=[" << num_experts << "," << d_model << "] payload_bytes="
                   << element_count << " scale_bytes=" << (scale_count * sizeof(float)));
         return &router_q8_gate_cache_.back();
     }
 
     const void *ROCmMoEKernel::getOrCreateFP16RouterGateCache(
-        ITensor *gate_weights,
         const float *gate_device_ptr,
         int d_model,
         int num_experts)
     {
         if (!debugEnv().rocm.moe_router_fp16)
             return nullptr;
-        if (!gate_weights || !gate_device_ptr || d_model <= 0 || num_experts <= 0)
+        if (!gate_device_ptr || d_model <= 0 || num_experts <= 0)
         {
             LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] invalid FP16 router gate request");
             return nullptr;
         }
+        if (!workspace_)
+        {
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] "
+                      "graph-owned workspace is required before cache publication");
+            return nullptr;
+        }
 
-        const auto tensor_key = reinterpret_cast<std::uintptr_t>(gate_weights);
-        const auto device_ptr_key = reinterpret_cast<std::uintptr_t>(gate_device_ptr);
+        const DeviceResidentRouterGateCacheKey cache_key =
+            DeviceResidentRouterGateCacheKey::make(
+                workspace_->id(), gate_device_ptr, d_model, num_experts);
         for (const auto &entry : router_fp16_gate_cache_)
         {
-            if (entry.source_tensor == tensor_key &&
-                entry.source_device_ptr == device_ptr_key &&
-                entry.d_model == d_model &&
-                entry.num_experts == num_experts &&
+            if (entry.key == cache_key &&
                 entry.d_gate_weights_fp16)
             {
                 return entry.d_gate_weights_fp16;
@@ -2126,67 +2282,123 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "getOrCreateFP16RouterGateCache"))
             return nullptr;
 
-        for (auto it = router_fp16_gate_cache_.begin(); it != router_fp16_gate_cache_.end();)
-        {
-            if (it->source_tensor == tensor_key &&
-                it->d_model == d_model &&
-                it->num_experts == num_experts &&
-                it->source_device_ptr != device_ptr_key)
-            {
-                it = router_fp16_gate_cache_.erase(it);
-            }
-            else
-            {
-                ++it;
-            }
-        }
-
-        const std::size_t slot = next_router_fp16_gate_workspace_slot_;
-        if (slot >= static_cast<std::size_t>(MoEWorkspaceBuffers::kRouterGateCacheSlots))
-        {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] FP16 router gate workspace slots exhausted: "
-                      << slot << " capacity=" << MoEWorkspaceBuffers::kRouterGateCacheSlots);
-            return nullptr;
-        }
         void *gate_weights_base = nullptr;
-        const size_t weights_bytes =
-            static_cast<size_t>(MoEWorkspaceBuffers::kRouterGateCacheSlots) *
+        const size_t weights_payload_bytes =
             element_count * sizeof(uint16_t);
         if (!bindWorkspaceBuffer(&gate_weights_base,
                                  MoEWorkspaceBuffers::ROCM_ROUTER_FP16_GATE_WEIGHTS,
-                                 weights_bytes,
+                                 weights_payload_bytes,
                                  "ROCm FP16 router gate weights"))
         {
             return nullptr;
         }
-        void *d_gate_weights_fp16 =
-            static_cast<uint16_t *>(gate_weights_base) + slot * element_count;
 
-        if (!hipMoE_fp32_to_fp16(gate_device_ptr, d_gate_weights_fp16,
-                                 static_cast<int>(element_count),
-                                 device_ordinal_, stream))
+        const auto publication_result =
+            workspace_->getOrCreatePersistentPublication(
+                kROCmRouterFP16GatePublicationDomain,
+                routerPublicationKey(cache_key),
+                MoEWorkspaceBuffers::kRouterGateCacheSlots,
+                [&](std::size_t slot) -> std::shared_ptr<void>
+                {
+                    void *weights = workspace_->getPersistentSlotBuffer(
+                        MoEWorkspaceBuffers::ROCM_ROUTER_FP16_GATE_WEIGHTS,
+                        MoEWorkspaceBuffers::kRouterGateCacheSlots,
+                        slot,
+                        weights_payload_bytes);
+                    if (!weights)
+                        return {};
+
+                    hipEvent_t ready_event = nullptr;
+                    hipError_t event_err = hipEventCreateWithFlags(
+                        &ready_event, hipEventDisableTiming);
+                    if (event_err != hipSuccess || !ready_event)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] "
+                                  "failed to create immutable publication event: "
+                                  << hipGetErrorString(event_err));
+                        return {};
+                    }
+
+                    auto publication =
+                        std::shared_ptr<RouterGateWorkspacePublication>(
+                            new RouterGateWorkspacePublication{
+                                .ready_event = static_cast<void *>(ready_event),
+                                .primary_weights = weights,
+                                .scales = nullptr,
+                                .workspace_slot = slot,
+                            },
+                            [](RouterGateWorkspacePublication *value)
+                            {
+                                if (value && value->ready_event)
+                                {
+                                    (void)hipEventDestroy(
+                                        static_cast<hipEvent_t>(
+                                            value->ready_event));
+                                }
+                                delete value;
+                            });
+
+                    if (!hipMoE_fp32_to_fp16(
+                            gate_device_ptr,
+                            weights,
+                            static_cast<int>(element_count),
+                            device_ordinal_,
+                            stream))
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] "
+                                  "FP32->FP16 router gate conversion launch failed");
+                        return {};
+                    }
+
+                    event_err = hipEventRecord(
+                        ready_event, static_cast<hipStream_t>(stream));
+                    if (event_err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] "
+                                  "failed to record immutable publication event: "
+                                  << hipGetErrorString(event_err));
+                        std::terminate();
+                    }
+                    return publication;
+                });
+        if (!publication_result)
         {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] FP32->FP16 router gate conversion launch failed");
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] "
+                      "failed to publish immutable router gate");
+            return nullptr;
+        }
+
+        auto publication =
+            std::static_pointer_cast<RouterGateWorkspacePublication>(
+                publication_result.publication);
+        const hipError_t wait_err = hipStreamWaitEvent(
+            static_cast<hipStream_t>(stream),
+            static_cast<hipEvent_t>(publication->ready_event),
+            0);
+        if (wait_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] "
+                      "failed to adopt immutable router publication: "
+                      << hipGetErrorString(wait_err));
             return nullptr;
         }
 
         RouterFP16GateCacheEntry entry{};
-        entry.source_tensor = tensor_key;
-        entry.source_device_ptr = device_ptr_key;
-        entry.d_model = d_model;
-        entry.num_experts = num_experts;
+        entry.key = cache_key;
         entry.element_count = element_count;
-        entry.d_gate_weights_fp16 = d_gate_weights_fp16;
-        entry.workspace_slot = slot;
-        router_fp16_gate_cache_.push_back(entry);
-        next_router_fp16_gate_workspace_slot_ = slot + 1;
+        entry.d_gate_weights_fp16 = publication->primary_weights;
+        entry.workspace_publication = std::move(publication);
+        entry.workspace_slot = publication_result.slot;
+        router_fp16_gate_cache_.push_back(std::move(entry));
 
-        LOG_DEBUG("[ROCmMoEKernel] Cached FP16 router gate tensor="
-                  << reinterpret_cast<const void *>(tensor_key)
-                  << " source_device=" << reinterpret_cast<const void *>(device_ptr_key)
+        LOG_DEBUG("[ROCmMoEKernel] Adopted FP16 router gate source_device="
+                  << static_cast<const void *>(gate_device_ptr)
+                  << " workspace_id=" << cache_key.workspace_id
+                  << " slot=" << publication_result.slot
+                  << " created=" << publication_result.created
                   << " shape=[" << num_experts << "," << d_model << "] bytes="
                   << (element_count * sizeof(uint16_t)));
-        return d_gate_weights_fp16;
+        return router_fp16_gate_cache_.back().d_gate_weights_fp16;
     }
 
     // =========================================================================
@@ -2198,8 +2410,7 @@ namespace llaminar2
         const float *hidden, const void *gate_weights, TensorType gate_type,
         int seq_len, int d_model, int num_experts, int top_k,
         bool normalize_weights, DeviceRouteBuffers &bufs,
-        const int *device_effective_seq_len,
-        ITensor *gate_weights_tensor)
+        const int *device_effective_seq_len)
     {
         bufs.logits_count = static_cast<size_t>(seq_len) * num_experts;
         bufs.topk_count = static_cast<size_t>(seq_len) * top_k;
@@ -2252,16 +2463,15 @@ namespace llaminar2
                 const auto &rocm_env = debugEnv().rocm;
                 if (rocm_env.moe_router_q8)
                 {
-                    if (!gate_weights_tensor || (d_model % 32) != 0 ||
+                    if ((d_model % 32) != 0 ||
                         !ensureRouterQ8HiddenScratchCapacity(seq_len, d_model))
                     {
                         LOG_ERROR("[ROCmMoEKernel::routeCore] batch-invariant Q8 prefill router "
-                                  "requires a tensor identity, 32-column blocks, and declared row scratch");
+                                  "requires 32-column blocks and declared row scratch");
                         bufs = {};
                         return false;
                     }
                     const auto *q8_gate = getOrCreateQ8RouterGateCache(
-                        gate_weights_tensor,
                         static_cast<const float *>(gate_weights),
                         d_model,
                         num_experts);
@@ -2298,7 +2508,6 @@ namespace llaminar2
                 else if (rocm_env.moe_router_fp16)
                 {
                     const void *gate_fp16 = getOrCreateFP16RouterGateCache(
-                        gate_weights_tensor,
                         static_cast<const float *>(gate_weights),
                         d_model,
                         num_experts);
@@ -2322,7 +2531,7 @@ namespace llaminar2
                 }
                 else
                 {
-                    logits_ready = hipMoE_gate_logits_fp32_decode_equivalent_rows(
+                    logits_ready = launchDecodeEquivalentFP32Rows(
                         hidden,
                         static_cast<const float *>(gate_weights),
                         bufs.d_logits,
@@ -2412,64 +2621,6 @@ namespace llaminar2
                  {"device_effective_len", device_effective_seq_len ? "1" : "0"}});
         }
 
-        return true;
-    }
-
-    // =========================================================================
-    // route() — Gate logits + softmax + top-k on GPU, results back to host
-    // =========================================================================
-
-    bool ROCmMoEKernel::route(
-        const float *hidden,
-        const float *gate_weights,
-        int seq_len, int d_model,
-        int num_experts, int top_k,
-        bool normalize_weights,
-        MoERoutingResult &result)
-    {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
-        DeviceRouteBuffers bufs;
-        if (!routeCore(hidden, gate_weights, TensorType::FP32, seq_len, d_model,
-                       num_experts, top_k, normalize_weights, bufs))
-            return false;
-
-        // D2H results
-        result.expert_indices.resize(bufs.topk_count);
-        result.expert_weights.resize(bufs.topk_count);
-        result.router_logits.resize(bufs.logits_count);
-
-        hipStream_t stream = static_cast<hipStream_t>(getStream());
-        hipError_t err;
-
-        err = hipMemcpyAsync(result.router_logits.data(), bufs.d_logits,
-                             bufs.logits_count * sizeof(float),
-                             hipMemcpyDeviceToHost, stream);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::route] D2H logits failed: " << hipGetErrorString(err));
-            return false;
-        }
-
-        err = hipMemcpyAsync(result.expert_indices.data(), bufs.d_indices,
-                             bufs.topk_count * sizeof(int),
-                             hipMemcpyDeviceToHost, stream);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::route] D2H indices failed: " << hipGetErrorString(err));
-            return false;
-        }
-
-        err = hipMemcpyAsync(result.expert_weights.data(), bufs.d_weights,
-                             bufs.topk_count * sizeof(float),
-                             hipMemcpyDeviceToHost, stream);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::route] D2H weights failed: " << hipGetErrorString(err));
-            return false;
-        }
-
-        (void)hipStreamSynchronize(stream);
         return true;
     }
 
@@ -3157,44 +3308,6 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmMoEKernel::ensureRuntimePrefillDescriptorCapacity(int num_experts)
-    {
-        if (num_experts <= 0 || num_experts > kDeviceMoEMaxExperts)
-            return false;
-        if (d_runtime_prefill_gate_descs_ &&
-            d_runtime_prefill_up_descs_ &&
-            d_runtime_prefill_down_descs_ &&
-            runtime_prefill_desc_cap_ >= num_experts)
-        {
-            return true;
-        }
-
-        const size_t bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
-        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_runtime_prefill_gate_descs_),
-                                 MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
-                                 bytes,
-                                 "ensureRuntimePrefillDescriptorCapacity(gate)") ||
-            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_runtime_prefill_up_descs_),
-                                 MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,
-                                 bytes,
-                                 "ensureRuntimePrefillDescriptorCapacity(up)") ||
-            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_runtime_prefill_down_descs_),
-                                 MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE,
-                                 bytes,
-                                 "ensureRuntimePrefillDescriptorCapacity(down)"))
-        {
-            d_runtime_prefill_gate_descs_ = nullptr;
-            d_runtime_prefill_up_descs_ = nullptr;
-            d_runtime_prefill_down_descs_ = nullptr;
-            runtime_prefill_desc_cap_ = 0;
-            return false;
-        }
-
-        runtime_prefill_desc_cap_ = num_experts;
-        return true;
-    }
-
     bool ROCmMoEKernel::isDecodeGraphCaptureActive() const
     {
         const bool capture_active = isGraphCaptureActive() ||
@@ -3318,33 +3431,32 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::runtimePointerWorkspaceSlot(
-        int descriptor_table_id,
+        std::size_t persistent_descriptor_slot,
         RuntimePointerArrayScope scope,
         std::size_t *workspace_slot,
         const char *context) const
     {
-        if (!workspace_slot || descriptor_table_id < 0)
+        if (!workspace_slot)
             return false;
 
-        const std::size_t table_slot = static_cast<std::size_t>(descriptor_table_id);
-        if (table_slot >= kRuntimePointerArrayTableSlots)
+        if (persistent_descriptor_slot >= kRuntimePointerArrayTableSlots)
         {
             LOG_ERROR("[ROCmMoEKernel] " << context
-                                         << " pointer workspace table slot exceeded: table_id="
-                                         << descriptor_table_id << " table_slots="
+                                         << " persistent descriptor slot exceeded: slot="
+                                         << persistent_descriptor_slot << " table_slots="
                                          << kRuntimePointerArrayTableSlots);
             return false;
         }
 
         const std::size_t scope_slot = static_cast<std::size_t>(scope);
         const std::size_t slot =
-            scope_slot * kRuntimePointerArrayTableSlots + table_slot;
+            scope_slot * kRuntimePointerArrayTableSlots + persistent_descriptor_slot;
         if (slot >= kRuntimePointerArrayWorkspaceEntries)
         {
             LOG_ERROR("[ROCmMoEKernel] " << context
                                          << " pointer workspace slot exceeded: scope="
-                                         << scope_slot << " table_id="
-                                         << descriptor_table_id << " capacity="
+                                         << scope_slot << " descriptor_slot="
+                                         << persistent_descriptor_slot << " capacity="
                                          << kRuntimePointerArrayWorkspaceEntries);
             return false;
         }
@@ -3354,7 +3466,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::stageRuntimeGateUpPointerArrays(
-        int descriptor_table_id,
+        std::size_t persistent_descriptor_slot,
         RuntimePointerArrayScope scope,
         int top_k,
         const std::array<float *, ROCmMoEKernel::kRuntimePointerArrayMaxTopK> &gate_ptrs,
@@ -3362,7 +3474,7 @@ namespace llaminar2
         float ***d_gate_ptrs,
         float ***d_up_ptrs)
     {
-        if (!d_gate_ptrs || !d_up_ptrs || descriptor_table_id < 0 || top_k <= 0 ||
+        if (!d_gate_ptrs || !d_up_ptrs || top_k <= 0 ||
             top_k > static_cast<int>(kRuntimePointerArrayMaxTopK))
         {
             return false;
@@ -3370,7 +3482,7 @@ namespace llaminar2
 
         std::size_t workspace_slot = 0;
         if (!runtimePointerWorkspaceSlot(
-                descriptor_table_id, scope, &workspace_slot,
+                persistent_descriptor_slot, scope, &workspace_slot,
                 "grouped gate/up"))
             return false;
         if (!setMoEDevice(device_ordinal_, "stageRuntimeGateUpPointerArrays"))
@@ -3401,7 +3513,8 @@ namespace llaminar2
             if (!gate_ptrs[slot] || !up_ptrs[slot])
             {
                 LOG_ERROR("[ROCmMoEKernel::stageRuntimeGateUpPointerArrays] Null gate/up output pointer for slot "
-                          << slot << " descriptor_table_id=" << descriptor_table_id);
+                          << slot << " persistent_descriptor_slot="
+                          << persistent_descriptor_slot);
                 return false;
             }
         }
@@ -3426,7 +3539,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::stageRuntimeDownPointerArrays(
-        int descriptor_table_id,
+        std::size_t persistent_descriptor_slot,
         RuntimePointerArrayScope scope,
         int top_k,
         const std::array<const float *, ROCmMoEKernel::kRuntimePointerArrayMaxTopK> &gate_ptrs,
@@ -3434,7 +3547,7 @@ namespace llaminar2
         const float ***d_gate_ptrs,
         const float ***d_up_ptrs)
     {
-        if (!d_gate_ptrs || !d_up_ptrs || descriptor_table_id < 0 || top_k <= 0 ||
+        if (!d_gate_ptrs || !d_up_ptrs || top_k <= 0 ||
             top_k > static_cast<int>(kRuntimePointerArrayMaxTopK))
         {
             return false;
@@ -3442,7 +3555,7 @@ namespace llaminar2
 
         std::size_t workspace_slot = 0;
         if (!runtimePointerWorkspaceSlot(
-                descriptor_table_id, scope, &workspace_slot,
+                persistent_descriptor_slot, scope, &workspace_slot,
                 "grouped down"))
             return false;
         if (!setMoEDevice(device_ordinal_, "stageRuntimeDownPointerArrays"))
@@ -3473,7 +3586,8 @@ namespace llaminar2
             if (!gate_ptrs[slot] || !up_ptrs[slot])
             {
                 LOG_ERROR("[ROCmMoEKernel::stageRuntimeDownPointerArrays] Null gate/up pointer for slot "
-                          << slot << " descriptor_table_id=" << descriptor_table_id);
+                          << slot << " persistent_descriptor_slot="
+                          << persistent_descriptor_slot);
                 return false;
             }
         }
@@ -3522,8 +3636,7 @@ namespace llaminar2
         DeviceRouteBuffers bufs;
         if (!routeCore(h, g, gate_type, seq_len, d_model, num_experts, top_k,
                        normalize_weights, bufs,
-                       device_effective_seq_len,
-                       gate_weights))
+                       device_effective_seq_len))
             return false;
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
@@ -3543,19 +3656,6 @@ namespace llaminar2
             LOG_ERROR("[" << context << "] output tensors have no device allocation");
             return false;
         }
-
-        float *h_idx = nullptr;
-        float *h_wt = nullptr;
-        const bool capture_active = isGraphCaptureActive() ||
-                                    (deviceContext() && deviceContext()->isDeviceGraphCaptureActive()) ||
-                                    isHipStreamCapturing(getStream());
-        const bool needs_decode_host_topk = (seq_len == 1);
-#ifdef ENABLE_PIPELINE_SNAPSHOTS
-        const bool needs_snapshot_host_topk = true;
-#else
-        const bool needs_snapshot_host_topk = false;
-#endif
-        const bool needs_host_topk = !capture_active && (needs_decode_host_topk || needs_snapshot_host_topk);
 
         // int→float conversion kernel (indices are int on device, tensor stores float)
         if (!hipMoE_int_to_float(bufs.d_indices, d_idx,
@@ -3579,75 +3679,15 @@ namespace llaminar2
         host_result.expert_weights.clear();
         host_result.router_logits.clear();
 
-        if (needs_host_topk)
-        {
-            h_idx = static_cast<float *>(output_indices->raw_mutable_data());
-            h_wt = static_cast<float *>(output_weights->raw_mutable_data());
-            if (!h_idx || !h_wt)
-            {
-                LOG_ERROR("[" << context << "] output tensors have no host storage");
-                return false;
-            }
-
-            err = hipMemcpyAsync(h_idx, d_idx,
-                                 bufs.topk_count * sizeof(float),
-                                 hipMemcpyDeviceToHost, stream);
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[" << context << "] D2H decode indices failed: " << hipGetErrorString(err));
-                return false;
-            }
-
-            err = hipMemcpyAsync(h_wt, d_wt,
-                                 bufs.topk_count * sizeof(float),
-                                 hipMemcpyDeviceToHost, stream);
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[" << context << "] D2H decode weights failed: " << hipGetErrorString(err));
-                return false;
-            }
-        }
-
-#ifdef ENABLE_PIPELINE_SNAPSHOTS
-        if (!capture_active)
-        {
-            host_result.router_logits.resize(bufs.logits_count);
-            err = hipMemcpyAsync(host_result.router_logits.data(), bufs.d_logits,
-                                 bufs.logits_count * sizeof(float), hipMemcpyDeviceToHost, stream);
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[" << context << "] D2H snapshot logits failed: " << hipGetErrorString(err));
-                return false;
-            }
-        }
-#endif
-
-        if (needs_host_topk || !host_result.router_logits.empty())
-        {
-            err = hipStreamSynchronize(stream);
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[" << context << "] stream sync failed after routing D2H: " << hipGetErrorString(err));
-                return false;
-            }
-        }
-
-        if (needs_host_topk)
-        {
-            host_result.expert_indices.resize(bufs.topk_count);
-            host_result.expert_weights.assign(h_wt, h_wt + bufs.topk_count);
-            for (size_t i = 0; i < bufs.topk_count; ++i)
-                host_result.expert_indices[i] = static_cast<int>(h_idx[i]);
-
-            output_indices->transitionTo(TensorCoherenceState::SYNCED);
-            output_weights->transitionTo(TensorCoherenceState::SYNCED);
-        }
-        else
-        {
-            const auto device = DeviceId::rocm(device_ordinal_);
-            markDeviceWritten(output_indices, device, getStream());
-            markDeviceWritten(output_weights, device, getStream());
-        }
+        /*
+         * Routing tensors remain device-authoritative in eager execution and
+         * graph replay alike.  Snapshot infrastructure performs any requested
+         * D2H materialization after publication, at an explicit observation
+         * boundary, rather than maintaining a live host mirror here.
+         */
+        const auto device = DeviceId::rocm(device_ordinal_);
+        markDeviceWritten(output_indices, device, getStream());
+        markDeviceWritten(output_weights, device, getStream());
 
         return true;
     }
@@ -3727,23 +3767,14 @@ namespace llaminar2
             return false;
         }
 
-        auto *hidden_base = dynamic_cast<TensorBase *>(hidden);
-        auto *gate_base = dynamic_cast<TensorBase *>(gate_weights);
-        auto *indices_base = dynamic_cast<TensorBase *>(output_indices);
-        auto *weights_base = dynamic_cast<TensorBase *>(output_weights);
-        if (!hidden_base || !gate_base || !indices_base || !weights_base)
-        {
-            LOG_ERROR("[" << kContext << "] verifier routing requires TensorBase-backed tensors");
-            return false;
-        }
-        if (hidden_base->native_type() != TensorType::FP32)
+        if (hidden->native_type() != TensorType::FP32)
         {
             LOG_ERROR("[" << kContext << "] hidden tensor must be FP32, got "
-                          << tensorTypeName(hidden_base->native_type()));
+                          << tensorTypeName(hidden->native_type()));
             return false;
         }
-        if (indices_base->native_type() != TensorType::FP32 ||
-            weights_base->native_type() != TensorType::FP32)
+        if (output_indices->native_type() != TensorType::FP32 ||
+            output_weights->native_type() != TensorType::FP32)
         {
             LOG_ERROR("[" << kContext << "] routing outputs must be FP32 tensors");
             return false;
@@ -3783,7 +3814,8 @@ namespace llaminar2
         }
 
         const auto &rocm_env = debugEnv().rocm;
-        const bool gate_is_fp32 = (gate_base->native_type() == TensorType::FP32);
+        const bool gate_is_fp32 =
+            gate_weights->native_type() == TensorType::FP32;
         const bool q8_router_requested = gate_is_fp32 && rocm_env.moe_router_q8;
         if (q8_router_requested && (d_model % 32) != 0)
         {
@@ -3820,7 +3852,7 @@ namespace llaminar2
                 return false;
             }
             const auto *q8_gate = getOrCreateQ8RouterGateCache(
-                gate_weights, static_cast<const float *>(d_gate), d_model, num_experts);
+                static_cast<const float *>(d_gate), d_model, num_experts);
             if (!q8_gate)
             {
                 LOG_ERROR("[" << kContext << "] Q8 router gate cache unavailable");
@@ -3851,7 +3883,7 @@ namespace llaminar2
         else if (gate_is_fp32)
         {
             const void *g_fp16 = getOrCreateFP16RouterGateCache(
-                gate_weights, static_cast<const float *>(d_gate), d_model, num_experts);
+                static_cast<const float *>(d_gate), d_model, num_experts);
             if (rocm_env.moe_router_fp16 && !g_fp16)
             {
                 LOG_ERROR("[" << kContext << "] FP16 router was requested but gate cache is unavailable");
@@ -3874,7 +3906,7 @@ namespace llaminar2
                 }
                 used_fp16_grouped_router = true;
             }
-            else if (!hipMoE_gate_logits_fp32_decode_equivalent_rows(
+            else if (!launchDecodeEquivalentFP32Rows(
                          d_hidden,
                          static_cast<const float *>(d_gate),
                          d_route_logits_,
@@ -3882,13 +3914,14 @@ namespace llaminar2
                          d_model,
                          num_experts,
                          device_ordinal_,
-                         getStream()))
+                         getStream(),
+                         nullptr))
             {
                 LOG_ERROR("[" << kContext << "] grouped FP32 verifier logits failed");
                 return false;
             }
         }
-        else if (gate_base->native_type() == TensorType::FP16)
+        else if (gate_weights->native_type() == TensorType::FP16)
         {
             if (!hipMoE_gate_logits_fp16_decode_equivalent_rows(
                     d_hidden,
@@ -3905,7 +3938,7 @@ namespace llaminar2
             }
             used_fp16_grouped_router = true;
         }
-        else if (gate_base->native_type() == TensorType::BF16)
+        else if (gate_weights->native_type() == TensorType::BF16)
         {
             if (!hipMoE_gate_logits_bf16_decode_equivalent_rows(
                     d_hidden,
@@ -3924,7 +3957,7 @@ namespace llaminar2
         else
         {
             LOG_ERROR("[" << kContext << "] unsupported router gate dtype "
-                          << tensorTypeName(gate_base->native_type()));
+                          << tensorTypeName(gate_weights->native_type()));
             return false;
         }
 
@@ -4072,7 +4105,7 @@ namespace llaminar2
                 return false;
             }
             const auto *q8_gate = getOrCreateQ8RouterGateCache(
-                gate_weights, static_cast<const float *>(g), d_model, num_experts);
+                static_cast<const float *>(g), d_model, num_experts);
             if (!q8_gate)
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] Q8 router gate cache unavailable");
@@ -4149,7 +4182,7 @@ namespace llaminar2
         if (!runtime_ready && !logits_ready && gate_is_fp32)
         {
             const void *g_fp16 = getOrCreateFP16RouterGateCache(
-                gate_weights, static_cast<const float *>(g), d_model, num_experts);
+                static_cast<const float *>(g), d_model, num_experts);
             if (rocm_env.moe_router_fp16 && !g_fp16)
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] FP16 router was requested but gate cache is unavailable");
@@ -4353,7 +4386,7 @@ namespace llaminar2
                 return false;
             }
             const auto *q8_gate = getOrCreateQ8RouterGateCache(
-                gate_weights, static_cast<const float *>(g), d_model, num_experts);
+                static_cast<const float *>(g), d_model, num_experts);
             if (!q8_gate)
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] Q8 router gate cache unavailable");
@@ -4430,7 +4463,7 @@ namespace llaminar2
         if (!runtime_ready && !logits_ready && gate_is_fp32)
         {
             const void *g_fp16 = getOrCreateFP16RouterGateCache(
-                gate_weights, static_cast<const float *>(g), d_model, num_experts);
+                static_cast<const float *>(g), d_model, num_experts);
             if (rocm_env.moe_router_fp16 && !g_fp16)
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] FP16 router was requested but gate cache is unavailable");
@@ -4530,6 +4563,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::runDeviceRebalanceController(
+        const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layers,
         const uint64_t *gathered_histograms,
         DeviceMoERebalanceStatus *status,
@@ -4555,7 +4589,9 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::runDeviceRebalanceController] runtime layers, gathered histograms, and status must be non-null");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::runDeviceRebalanceController");
+        void *stream = explicitMoELaunchStream(launch, "runDeviceRebalanceController");
+        if (!stream)
+            return false;
         if (!setMoEDevice(device_ordinal_, "runDeviceRebalanceController"))
             return false;
 
@@ -4577,6 +4613,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::packDeviceRebalanceHistograms(
+        const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layers,
         uint64_t *local_histograms,
         const DeviceMoERebalanceConfig &config,
@@ -4596,7 +4633,9 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceHistograms] runtime layers and local histograms must be non-null");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::packDeviceRebalanceHistograms");
+        void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceHistograms");
+        if (!stream)
+            return false;
         if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceHistograms"))
             return false;
 
@@ -4612,6 +4651,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::packDeviceRebalanceDirectory(
+        const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layers,
         DeviceMoEExpertDirectoryEntry *local_directory,
         const DeviceMoERebalanceConfig &config)
@@ -4628,7 +4668,9 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceDirectory] runtime layers and local directory must be non-null");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::packDeviceRebalanceDirectory");
+        void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceDirectory");
+        if (!stream)
+            return false;
         if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceDirectory"))
             return false;
 
@@ -4641,6 +4683,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::packDeviceRebalanceSourceDescriptors(
+        const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layers,
         const DeviceMoERebalancePlanEntry *plan_entries,
         const DeviceMoERebalanceCommandBufferHeader *command_headers,
@@ -4663,7 +4706,9 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceSourceDescriptors] runtime, projected plans, headers, and source descriptor output must be non-null");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::packDeviceRebalanceSourceDescriptors");
+        void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceSourceDescriptors");
+        if (!stream)
+            return false;
         if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceSourceDescriptors"))
             return false;
 
@@ -4681,6 +4726,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::projectDeviceRebalanceDomainCommands(
+        const MoEKernelLaunchContext &launch,
         const DeviceMoERebalancePlanEntry *gathered_plan_entries,
         const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
         uint32_t plan_capacity,
@@ -4691,7 +4737,10 @@ namespace llaminar2
         uint32_t payload_slot_capacity,
         uint32_t command_buffer_count,
         const DeviceMoERebalanceWaveState *gathered_wave_states,
-        DeviceMoERebalanceWaveState *local_wave_states)
+        DeviceMoERebalanceWaveState *local_wave_states,
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -4702,12 +4751,15 @@ namespace llaminar2
         }
         if (!gathered_plan_entries || !gathered_command_headers ||
             !local_plan_entries || !local_command_headers ||
-            plan_capacity == 0)
+            !runtime_layers || !local_transfer_slots ||
+            plan_capacity == 0 || local_transfer_slot_count == 0)
         {
-            LOG_ERROR("[ROCmMoEKernel::projectDeviceRebalanceDomainCommands] gathered and local command buffers must be non-null");
+            LOG_ERROR("[ROCmMoEKernel::projectDeviceRebalanceDomainCommands] gathered/local commands, runtime layers, and transfer directory must be non-null");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::projectDeviceRebalanceDomainCommands");
+        void *stream = explicitMoELaunchStream(launch, "projectDeviceRebalanceDomainCommands");
+        if (!stream)
+            return false;
         if (!setMoEDevice(device_ordinal_, "projectDeviceRebalanceDomainCommands"))
             return false;
 
@@ -4723,11 +4775,15 @@ namespace llaminar2
             command_buffer_count,
             gathered_wave_states,
             local_wave_states,
+            runtime_layers,
+            local_transfer_slots,
+            local_transfer_slot_count,
             device_ordinal_,
             stream);
     }
 
     bool ROCmMoEKernel::projectPrefillLeastLoadedDomainCommands(
+        const MoEKernelLaunchContext &launch,
         const DeviceMoERebalancePlanEntry *gathered_plan_entries,
         const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
         uint32_t plan_capacity,
@@ -4737,6 +4793,9 @@ namespace llaminar2
         const DeviceMoERebalanceConfig &config,
         DeviceMoERebalanceStatus *status,
         uint32_t payload_slot_capacity,
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
         uint32_t command_buffer_count)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
@@ -4748,12 +4807,16 @@ namespace llaminar2
         }
         if (!gathered_plan_entries || !gathered_command_headers ||
             !local_plan_entries || !local_plan_count || !local_command_header ||
-            !status || plan_capacity == 0 || payload_slot_capacity == 0)
+            !status || !runtime_layers || !local_transfer_slots ||
+            plan_capacity == 0 || payload_slot_capacity == 0 ||
+            local_transfer_slot_count == 0)
         {
-            LOG_ERROR("[ROCmMoEKernel::projectPrefillLeastLoadedDomainCommands] gathered commands, local command output, status, and payload capacity are required");
+            LOG_ERROR("[ROCmMoEKernel::projectPrefillLeastLoadedDomainCommands] gathered commands, local command output, runtime layers, transfer directory, status, and payload capacity are required");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::projectPrefillLeastLoadedDomainCommands");
+        void *stream = explicitMoELaunchStream(launch, "projectPrefillLeastLoadedDomainCommands");
+        if (!stream)
+            return false;
         if (!setMoEDevice(device_ordinal_, "projectPrefillLeastLoadedDomainCommands"))
             return false;
 
@@ -4768,11 +4831,15 @@ namespace llaminar2
             status,
             payload_slot_capacity,
             command_buffer_count,
+            runtime_layers,
+            local_transfer_slots,
+            local_transfer_slot_count,
             device_ordinal_,
             stream);
     }
 
     bool ROCmMoEKernel::materializePrefillLeastLoadedTransferCommands(
+        const MoEKernelLaunchContext &launch,
         const DeviceMoELayerRuntime *runtime_layer,
         DeviceMoERebalancePlanEntry *plan_entries,
         uint32_t *plan_count,
@@ -4803,7 +4870,9 @@ namespace llaminar2
                       << " layer=" << layer_idx << " num_layers=" << config.num_layers);
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::materializePrefillLeastLoadedTransferCommands");
+        void *stream = explicitMoELaunchStream(launch, "materializePrefillLeastLoadedTransferCommands");
+        if (!stream)
+            return false;
         if (!setMoEDevice(device_ordinal_, "materializePrefillLeastLoadedTransferCommands"))
             return false;
 
@@ -4823,6 +4892,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::packDeviceRebalanceCompactPayloads(
+        const MoEKernelLaunchContext &launch,
         const DeviceMoERebalancePlanEntry *plan_entries,
         const DeviceMoERebalanceCommandBufferHeader *command_headers,
         uint32_t plan_capacity,
@@ -4850,7 +4920,9 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceCompactPayloads] plans, headers, source descriptors, payload, and status must be non-null");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::packDeviceRebalanceCompactPayloads");
+        void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceCompactPayloads");
+        if (!stream)
+            return false;
         if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceCompactPayloads"))
             return false;
 
@@ -4871,6 +4943,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::applyDeviceRebalanceArrivals(
+        const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layers,
         const DeviceMoERebalancePlanEntry *plan_entries,
         const uint32_t *plan_count,
@@ -4895,7 +4968,9 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::applyDeviceRebalanceArrivals] runtime, plan, transfer slots, and status must be non-null");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::applyDeviceRebalanceArrivals");
+        void *stream = explicitMoELaunchStream(launch, "applyDeviceRebalanceArrivals");
+        if (!stream)
+            return false;
         if (!setMoEDevice(device_ordinal_, "applyDeviceRebalanceArrivals"))
             return false;
 
@@ -4915,6 +4990,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::packDeviceRebalanceCollectivePayloads(
+        const MoEKernelLaunchContext &launch,
         const DeviceMoERebalancePlanEntry *gathered_plan_entries,
         const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
         uint32_t plan_capacity,
@@ -4942,7 +5018,9 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceCollectivePayloads] gathered plans, headers, local directory, payload, and status must be non-null");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::packDeviceRebalanceCollectivePayloads");
+        void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceCollectivePayloads");
+        if (!stream)
+            return false;
         if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceCollectivePayloads"))
             return false;
 
@@ -4963,6 +5041,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::unpackDeviceRebalanceCollectivePayloads(
+        const MoEKernelLaunchContext &launch,
         const DeviceMoERebalancePlanEntry *plan_entries,
         const uint32_t *plan_count,
         uint32_t plan_capacity,
@@ -4992,7 +5071,9 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::unpackDeviceRebalanceCollectivePayloads] plan, gathered payload, transfer slots, and status must be non-null");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::unpackDeviceRebalanceCollectivePayloads");
+        void *stream = explicitMoELaunchStream(launch, "unpackDeviceRebalanceCollectivePayloads");
+        if (!stream)
+            return false;
         if (!setMoEDevice(device_ordinal_, "unpackDeviceRebalanceCollectivePayloads"))
             return false;
 
@@ -5015,6 +5096,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::initializeDeviceRebalanceGraphController(
+        const MoEKernelLaunchContext &launch,
         DeviceMoERebalanceGraphControllerState *controller_state,
         const DeviceMoERebalanceConfig &config)
     {
@@ -5030,7 +5112,7 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::initializeDeviceRebalanceGraphController] controller state must be non-null");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::initializeDeviceRebalanceGraphController");
+        void *stream = explicitMoELaunchStream(launch, "initializeDeviceRebalanceGraphController");
         if (!setMoEDevice(device_ordinal_, "initializeDeviceRebalanceGraphController"))
             return false;
 
@@ -5042,6 +5124,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::publishDeviceRebalanceTransferComplete(
+        const MoEKernelLaunchContext &launch,
         DeviceMoERebalanceGraphControllerState *controller_state,
         const DeviceMoERebalanceCommandBufferHeader *command_header,
         const DeviceMoERebalanceWaveState *wave_state,
@@ -5065,7 +5148,7 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::publishDeviceRebalanceTransferComplete] controller state, command header, wave state, copy status, plan entries, and gathered copy status must be non-null");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::publishDeviceRebalanceTransferComplete");
+        void *stream = explicitMoELaunchStream(launch, "publishDeviceRebalanceTransferComplete");
         if (!setMoEDevice(device_ordinal_, "publishDeviceRebalanceTransferComplete"))
             return false;
 
@@ -5084,6 +5167,7 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::applyReadyDeviceRebalanceWave(
+        const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layers,
         const DeviceMoERebalancePlanEntry *plan_entries,
         const uint32_t *plan_count,
@@ -5110,7 +5194,7 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::applyReadyDeviceRebalanceWave] runtime, plan, status, controller state, and command ABI must be non-null");
             return false;
         }
-        void *stream = requireStream("ROCmMoEKernel::applyReadyDeviceRebalanceWave");
+        void *stream = explicitMoELaunchStream(launch, "applyReadyDeviceRebalanceWave");
         if (!setMoEDevice(device_ordinal_, "applyReadyDeviceRebalanceWave"))
             return false;
 
@@ -5148,8 +5232,10 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::zeroBuffer] hipMemsetAsync failed: " << hipGetErrorString(err));
             return;
         }
-        tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                             DeviceId::rocm(device_ordinal_));
+        markDeviceWritten(
+            tensor,
+            DeviceId::rocm(device_ordinal_),
+            getStream());
     }
 
     void ROCmMoEKernel::gatherTokenBatchFromTensors(
@@ -5188,8 +5274,10 @@ namespace llaminar2
         }
 
         gatherTokenBatch(h, b, d_staging_indices_, num_tokens, d_model);
-        batch_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                                   DeviceId::rocm(device_ordinal_));
+        markDeviceWritten(
+            batch_buffer,
+            DeviceId::rocm(device_ordinal_),
+            getStream());
     }
 
     bool ROCmMoEKernel::copyTokenRowFromTensor(
@@ -5269,8 +5357,10 @@ namespace llaminar2
 
         scatterAddWeighted(o, e, d_staging_indices_, d_staging_weights_,
                            num_tokens, d_model);
-        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                             DeviceId::rocm(device_ordinal_));
+        markDeviceWritten(
+            output,
+            DeviceId::rocm(device_ordinal_),
+            getStream());
     }
 
     bool ROCmMoEKernel::writeTokenRowToTensor(
@@ -5485,8 +5575,10 @@ namespace llaminar2
         }
 
         swiGLU(g, u, count);
-        gate->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                           DeviceId::rocm(device_ordinal_));
+        markDeviceWritten(
+            gate,
+            DeviceId::rocm(device_ordinal_),
+            getStream());
     }
 
     void ROCmMoEKernel::weightedAddFromTensors(
@@ -5505,8 +5597,10 @@ namespace llaminar2
         }
 
         weightedAdd(o, in, weight, count);
-        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                             DeviceId::rocm(device_ordinal_));
+        markDeviceWritten(
+            output,
+            DeviceId::rocm(device_ordinal_),
+            getStream());
     }
 
     int ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable(
@@ -5517,6 +5611,11 @@ namespace llaminar2
     {
         if (!down_descs || num_experts <= 0 || d_model <= 0 ||
             intermediate <= 0 || (intermediate % 32) != 0)
+        {
+            return -1;
+        }
+        if (rejectDecodeStagingDuringCapture(
+                "upload grouped down descriptor table"))
         {
             return -1;
         }
@@ -5582,13 +5681,22 @@ namespace llaminar2
         table.codebook_id = codebook_id;
         table.codebook_mask = codebook_mask;
 
-        const std::size_t slot = next_grouped_down_desc_workspace_slot_;
-        if (slot >= static_cast<std::size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots))
+        if (!workspace_)
         {
-            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] descriptor workspace slots exhausted: "
-                      << slot << " capacity=" << MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] "
+                      "graph-owned workspace is required before descriptor publication");
             return -1;
         }
+        auto lease = workspace_->acquirePersistentSlot(
+            kROCmGroupedDownDescriptorLeaseDomain,
+            MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+        if (!lease)
+        {
+            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] "
+                      "failed to lease a persistent descriptor slot");
+            return -1;
+        }
+        const std::size_t slot = lease->slot();
         DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
         hipError_t err = hipSuccess;
         if (!bindGroupedDescriptorTableSlot(
@@ -5614,10 +5722,10 @@ namespace llaminar2
         }
 
         table.device_descs = device_descs;
+        table.workspace_lease = std::move(lease);
         table.workspace_slot = slot;
         table.valid = true;
         grouped_down_desc_tables_.push_back(std::move(table));
-        next_grouped_down_desc_workspace_slot_ = slot + 1;
         return static_cast<int>(grouped_down_desc_tables_.size() - 1);
     }
 
@@ -5630,6 +5738,11 @@ namespace llaminar2
     {
         if (!gate_descs || !up_descs || num_experts <= 0 || d_model <= 0 ||
             intermediate <= 0 || (d_model % 32) != 0)
+        {
+            return -1;
+        }
+        if (rejectDecodeStagingDuringCapture(
+                "upload grouped gate/up descriptor tables"))
         {
             return -1;
         }
@@ -5717,13 +5830,22 @@ namespace llaminar2
         table.codebook_id = codebook_id;
         table.codebook_mask = codebook_mask;
 
-        const std::size_t slot = next_grouped_gateup_desc_workspace_slot_;
-        if (slot >= static_cast<std::size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots))
+        if (!workspace_)
         {
-            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] descriptor workspace slots exhausted: "
-                      << slot << " capacity=" << MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] "
+                      "graph-owned workspace is required before descriptor publication");
             return -1;
         }
+        auto lease = workspace_->acquirePersistentSlot(
+            kROCmGroupedGateUpDescriptorLeaseDomain,
+            MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+        if (!lease)
+        {
+            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] "
+                      "failed to lease a persistent descriptor slot");
+            return -1;
+        }
+        const std::size_t slot = lease->slot();
         DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
         DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
         hipError_t err = hipSuccess;
@@ -5761,10 +5883,10 @@ namespace llaminar2
 
         table.device_gate_descs = device_gate_descs;
         table.device_up_descs = device_up_descs;
+        table.workspace_lease = std::move(lease);
         table.workspace_slot = slot;
         table.valid = true;
         grouped_gateup_desc_tables_.push_back(std::move(table));
-        next_grouped_gateup_desc_workspace_slot_ = slot + 1;
         return static_cast<int>(grouped_gateup_desc_tables_.size() - 1);
     }
 
@@ -5779,6 +5901,11 @@ namespace llaminar2
             descriptor_table_id >= static_cast<int>(grouped_down_desc_tables_.size()) ||
             num_experts <= 0 || d_model <= 0 ||
             intermediate <= 0 || (intermediate % 32) != 0)
+        {
+            return false;
+        }
+        if (rejectDecodeStagingDuringCapture(
+                "update grouped down descriptor table"))
         {
             return false;
         }
@@ -5848,6 +5975,11 @@ namespace llaminar2
             descriptor_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
             num_experts <= 0 || d_model <= 0 ||
             intermediate <= 0 || (d_model % 32) != 0)
+        {
+            return false;
+        }
+        if (rejectDecodeStagingDuringCapture(
+                "update grouped gate/up descriptor tables"))
         {
             return false;
         }
@@ -5969,12 +6101,18 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "groupedExpertGateUpDecodeFromTable"))
             return false;
 
+        const bool capture_active = isDecodeGraphCaptureActive();
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         if (!d_hidden && rejectDecodeStagingDuringCapture("grouped gate/up input tensor"))
             return false;
-        if (!d_hidden)
+        if (!capture_active)
         {
-            if (!const_cast<TensorBase *>(input)->ensureOnDevice(DeviceId::rocm(device_ordinal_), getStream()))
+            if (!ensureTensorOnDevice(
+                    const_cast<TensorBase *>(input),
+                    DeviceId::rocm(device_ordinal_),
+                    getStream(),
+                    "input",
+                    "groupedExpertGateUpDecodeFromTable"))
                 return false;
             d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         }
@@ -6003,7 +6141,7 @@ namespace llaminar2
         float **d_gate_output_ptrs = nullptr;
         float **d_up_output_ptrs = nullptr;
         if (!stageRuntimeGateUpPointerArrays(
-                descriptor_table_id, RuntimePointerArrayScope::TableDecode,
+                table.workspace_slot, RuntimePointerArrayScope::TableDecode,
                 num_active, gate_output_ptrs, up_output_ptrs,
                 &d_gate_output_ptrs, &d_up_output_ptrs))
         {
@@ -6031,8 +6169,14 @@ namespace llaminar2
         {
             for (int i = 0; i < num_active; ++i)
             {
-                gate_outputs[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                up_outputs[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                markDeviceWritten(
+                    gate_outputs[i],
+                    DeviceId::rocm(device_ordinal_),
+                    getStream());
+                markDeviceWritten(
+                    up_outputs[i],
+                    DeviceId::rocm(device_ordinal_),
+                    getStream());
             }
         }
         return ok;
@@ -6074,10 +6218,19 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "groupedExpertGateUpDecodeFromRouting"))
             return false;
 
+        const bool capture_active = isDecodeGraphCaptureActive();
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
-        if (!d_hidden)
+        if (!d_hidden &&
+            rejectDecodeStagingDuringCapture("grouped gate/up input tensor"))
+            return false;
+        if (!capture_active)
         {
-            if (!const_cast<TensorBase *>(input)->ensureOnDevice(DeviceId::rocm(device_ordinal_), getStream()))
+            if (!ensureTensorOnDevice(
+                    const_cast<TensorBase *>(input),
+                    DeviceId::rocm(device_ordinal_),
+                    getStream(),
+                    "input",
+                    "groupedExpertGateUpDecodeFromRouting"))
                 return false;
             d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         }
@@ -6282,10 +6435,19 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "groupedExpertGateUpDecodeFromRuntime"))
             return false;
 
+        const bool capture_active = isDecodeGraphCaptureActive();
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
-        if (!d_hidden)
+        if (!d_hidden &&
+            rejectDecodeStagingDuringCapture("grouped gate/up input tensor"))
+            return false;
+        if (!capture_active)
         {
-            if (!const_cast<TensorBase *>(input)->ensureOnDevice(DeviceId::rocm(device_ordinal_), getStream()))
+            if (!ensureTensorOnDevice(
+                    const_cast<TensorBase *>(input),
+                    DeviceId::rocm(device_ordinal_),
+                    getStream(),
+                    "input",
+                    "groupedExpertGateUpDecodeFromRuntime"))
                 return false;
             d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         }
@@ -6313,7 +6475,7 @@ namespace llaminar2
         float **d_gate_output_ptrs = nullptr;
         float **d_up_output_ptrs = nullptr;
         if (!stageRuntimeGateUpPointerArrays(
-                descriptor_table_id, RuntimePointerArrayScope::RuntimeTwoStep,
+                table.workspace_slot, RuntimePointerArrayScope::RuntimeTwoStep,
                 top_k, gate_output_ptrs, up_output_ptrs,
                 &d_gate_output_ptrs, &d_up_output_ptrs))
         {
@@ -6335,7 +6497,6 @@ namespace llaminar2
                       "K-part gate/up decode was requested but scratch allocation failed");
             return false;
         }
-        const bool capture_active = isDecodeGraphCaptureActive();
         const bool reuse_router_q8_hidden =
             canReuseRouterQ8Hidden(d_hidden, /*rows=*/1, d_model);
         int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
@@ -6395,8 +6556,14 @@ namespace llaminar2
         {
             for (int i = 0; i < top_k; ++i)
             {
-                gate_outputs[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                up_outputs[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                markDeviceWritten(
+                    gate_outputs[i],
+                    DeviceId::rocm(device_ordinal_),
+                    getStream());
+                markDeviceWritten(
+                    up_outputs[i],
+                    DeviceId::rocm(device_ordinal_),
+                    getStream());
             }
         }
         return ok;
@@ -6467,8 +6634,10 @@ namespace llaminar2
             return false;
         if (!d_hidden)
         {
-            if (!const_cast<TensorBase *>(input)->ensureOnDevice(device, stream))
-                return false;
+            TransferEngine::prepareDeviceInput(
+                const_cast<TensorBase *>(input),
+                device,
+                stream);
             d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         }
 
@@ -6477,9 +6646,7 @@ namespace llaminar2
             return false;
         if (!d_output)
         {
-            auto *output_base = dynamic_cast<TensorBase *>(output);
-            if (!output_base || !output_base->ensureOnDevice(device, stream))
-                return false;
+            TransferEngine::prepareDeviceOutput(output, device, stream);
             d_output = static_cast<float *>(output->gpu_data_ptr());
         }
 
@@ -6508,7 +6675,7 @@ namespace llaminar2
         float **d_gate_ptrs = nullptr;
         float **d_up_ptrs = nullptr;
         if (!stageRuntimeGateUpPointerArrays(
-                gateup_descriptor_table_id, RuntimePointerArrayScope::RuntimeFused,
+                gateup_table.workspace_slot, RuntimePointerArrayScope::RuntimeFused,
                 top_k, gate_ptrs, up_ptrs,
                 &d_gate_ptrs, &d_up_ptrs))
         {
@@ -6718,7 +6885,7 @@ namespace llaminar2
         const float **d_down_gate_ptrs = nullptr;
         const float **d_down_up_ptrs = nullptr;
         if (!stageRuntimeDownPointerArrays(
-                down_descriptor_table_id, RuntimePointerArrayScope::RuntimeFused,
+                down_table.workspace_slot, RuntimePointerArrayScope::RuntimeFused,
                 top_k, const_gate_ptrs, const_up_ptrs,
                 &d_down_gate_ptrs, &d_down_up_ptrs))
         {
@@ -6871,10 +7038,10 @@ namespace llaminar2
             return false;
         if (!d_output)
         {
-            auto *output_base = dynamic_cast<TensorBase *>(output);
-            if (!output_base ||
-                !output_base->ensureOnDevice(DeviceId::rocm(device_ordinal_), getStream()))
-                return false;
+            TransferEngine::prepareDeviceOutput(
+                output,
+                DeviceId::rocm(device_ordinal_),
+                getStream());
             d_output = static_cast<float *>(output->gpu_data_ptr());
         }
         if (!d_output)
@@ -6883,7 +7050,7 @@ namespace llaminar2
         const float **d_gate_ptrs = nullptr;
         const float **d_up_ptrs = nullptr;
         if (!stageRuntimeDownPointerArrays(
-                descriptor_table_id, RuntimePointerArrayScope::TableDecode,
+                table.workspace_slot, RuntimePointerArrayScope::TableDecode,
                 num_active, gate_ptrs, up_ptrs,
                 &d_gate_ptrs, &d_up_ptrs))
             return false;
@@ -6905,7 +7072,12 @@ namespace llaminar2
             getStream());
 
         if (ok)
-            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        {
+            markDeviceWritten(
+                output,
+                DeviceId::rocm(device_ordinal_),
+                getStream());
+        }
         return ok;
     }
 
@@ -7151,7 +7323,7 @@ namespace llaminar2
         const float **d_gate_ptrs = nullptr;
         const float **d_up_ptrs = nullptr;
         if (!stageRuntimeDownPointerArrays(
-                descriptor_table_id, RuntimePointerArrayScope::RuntimeTwoStep,
+                table.workspace_slot, RuntimePointerArrayScope::RuntimeTwoStep,
                 top_k, gate_ptrs, up_ptrs,
                 &d_gate_ptrs, &d_up_ptrs))
         {
@@ -7203,7 +7375,12 @@ namespace llaminar2
                                   getStream());
 
         if (ok)
-            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        {
+            markDeviceWritten(
+                output,
+                DeviceId::rocm(device_ordinal_),
+                getStream());
+        }
         return ok;
     }
 
@@ -7314,7 +7491,12 @@ namespace llaminar2
             getStream());
 
         if (ok)
-            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        {
+            markDeviceWritten(
+                output,
+                DeviceId::rocm(device_ordinal_),
+                getStream());
+        }
         return ok;
     }
 
@@ -7327,7 +7509,8 @@ namespace llaminar2
         ITensor *routing_indices, ITensor *routing_weights,
         int current_tokens, int max_tokens,
         int num_experts, int top_k,
-        bool filter_to_local_runtime_experts)
+        bool filter_to_local_runtime_experts,
+        MoEGroupedHistogramUpdate histogram_update)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -7366,6 +7549,7 @@ namespace llaminar2
             num_experts,
             top_k,
             filter_to_local_runtime_experts ? 1 : 0,
+            static_cast<int>(histogram_update),
             device_ordinal_,
             getStream());
     }
@@ -7373,7 +7557,8 @@ namespace llaminar2
     bool ROCmMoEKernel::regroupPrefillRoutesFromRuntimeAssignments(
         DeviceMoELayerRuntime *runtime_layer,
         int current_tokens, int max_tokens,
-        int num_experts, int top_k)
+        int num_experts, int top_k,
+        MoEGroupedHistogramUpdate histogram_update)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -7399,15 +7584,24 @@ namespace llaminar2
             max_tokens * top_k,
             num_experts,
             top_k,
+            static_cast<int>(histogram_update),
             device_ordinal_,
             getStream());
     }
 
     bool ROCmMoEKernel::assignPrefillRoutesLeastLoadedResident(
+        const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layer,
         int current_tokens, int max_tokens, int num_experts, int top_k)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+        void *stream = explicitMoELaunchStream(
+            launch,
+            "assignPrefillRoutesLeastLoadedResident");
+        if (!stream)
+            return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
 
         if (!runtime_layer)
         {
@@ -7422,11 +7616,6 @@ namespace llaminar2
                       << " num_experts=" << num_experts << " top_k=" << top_k);
             return false;
         }
-        if (!getStream())
-        {
-            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesLeastLoadedResident] explicit stream is required");
-            return false;
-        }
         if (!setMoEDevice(device_ordinal_, "assignPrefillRoutesLeastLoadedResident"))
             return false;
 
@@ -7437,15 +7626,23 @@ namespace llaminar2
             num_experts,
             top_k,
             device_ordinal_,
-            getStream());
+            stream);
     }
 
     bool ROCmMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch(
+        const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layer,
         int current_tokens, int max_tokens, int num_experts, int top_k,
         const least_loaded_ep::LeastLoadedExpertAssignmentConfig &config)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+        void *stream = explicitMoELaunchStream(
+            launch,
+            "planPrefillRoutesLeastLoadedCurrentBatch");
+        if (!stream)
+            return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
 
         if (!runtime_layer)
         {
@@ -7470,11 +7667,6 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch] invalid LLEP config");
             return false;
         }
-        if (!getStream())
-        {
-            LOG_ERROR("[ROCmMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch] explicit stream is required");
-            return false;
-        }
         if (!setMoEDevice(device_ordinal_, "planPrefillRoutesLeastLoadedCurrentBatch"))
             return false;
 
@@ -7494,18 +7686,25 @@ namespace llaminar2
             config.min_spread_improvement_per_transfer,
             config.min_foreign_rows_per_transfer,
             config.max_weight_transfers,
+            config.max_non_owner_experts_per_participant,
             config.enable_balanced_skip ? 1 : 0,
             device_ordinal_,
-            getStream());
+            stream);
     }
 
     bool ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+        const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layer,
         int current_tokens,
         int max_tokens,
         int num_experts,
         int top_k)
     {
+        void *stream = explicitMoELaunchStream(
+            launch,
+            "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers");
+        if (!stream)
+            return false;
         if (!runtime_layer)
         {
             LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers] null runtime");
@@ -7519,11 +7718,6 @@ namespace llaminar2
                       << " num_experts=" << num_experts << " top_k=" << top_k);
             return false;
         }
-        if (!getStream())
-        {
-            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers] explicit stream is required");
-            return false;
-        }
         if (!setMoEDevice(device_ordinal_, "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers"))
             return false;
 
@@ -7534,10 +7728,11 @@ namespace llaminar2
             num_experts,
             top_k,
             device_ordinal_,
-            getStream());
+            stream);
     }
 
     bool ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+        const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layer,
         int current_tokens,
         int max_tokens,
@@ -7546,6 +7741,11 @@ namespace llaminar2
         const DeviceMoERebalanceStatus *transfer_status,
         const DeviceMoERebalanceApplyStatus *apply_status)
     {
+        void *stream = explicitMoELaunchStream(
+            launch,
+            "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers");
+        if (!stream)
+            return false;
         if (!runtime_layer)
         {
             LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] null runtime");
@@ -7562,11 +7762,6 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] invalid dimensions current_tokens="
                       << current_tokens << " max_tokens=" << max_tokens
                       << " num_experts=" << num_experts << " top_k=" << top_k);
-            return false;
-        }
-        if (!getStream())
-        {
-            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] explicit stream is required");
             return false;
         }
         if (!setMoEDevice(device_ordinal_, "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers"))
@@ -7599,7 +7794,7 @@ namespace llaminar2
             transfer_status,
             apply_status,
             device_ordinal_,
-            getStream());
+            stream);
     }
 
     bool ROCmMoEKernel::gatherPrefillExpertBatchFromRuntime(
@@ -7643,7 +7838,12 @@ namespace llaminar2
             device_ordinal_,
             getStream());
         if (ok)
-            batch_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        {
+            markDeviceWritten(
+                batch_buffer,
+                DeviceId::rocm(device_ordinal_),
+                getStream());
+        }
         return ok;
     }
 
@@ -7688,181 +7888,13 @@ namespace llaminar2
             device_ordinal_,
             getStream());
         if (ok)
-            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        {
+            markDeviceWritten(
+                output,
+                DeviceId::rocm(device_ordinal_),
+                getStream());
+        }
         return ok;
-    }
-
-    bool ROCmMoEKernel::prepareExpertGroups(
-        ITensor *routing_indices, ITensor *routing_weights,
-        int seq_len, int num_experts, int top_k)
-    {
-        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
-            return false;
-
-        if (!setMoEDevice(device_ordinal_, "prepareExpertGroups"))
-            return false;
-
-        const int total_slots = seq_len * top_k;
-        hipStream_t stream = static_cast<hipStream_t>(getStream());
-
-        // 1. Ensure routing tensors are on device
-        routing_indices->ensureOnDevice(DeviceId::rocm(device_ordinal_));
-        routing_weights->ensureOnDevice(DeviceId::rocm(device_ordinal_));
-
-        const float *d_float_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
-        const float *d_float_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
-        if (!d_float_indices || !d_float_weights)
-        {
-            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroups] null device pointers");
-            return false;
-        }
-
-        // 2. Lazy-allocate grouping buffers
-        if (total_slots > group_slots_cap_ ||
-            !d_group_int_indices_ ||
-            !d_group_token_indices_ ||
-            !d_group_original_to_grouped_ ||
-            !d_group_weights_ ||
-            !d_group_active_expert_ids_)
-        {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_int_indices_),
-                                     MoEWorkspaceBuffers::GROUP_INT_INDICES,
-                                     static_cast<size_t>(total_slots) * sizeof(int),
-                                     "prepareExpertGroups(group_int_indices)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_token_indices_),
-                                     MoEWorkspaceBuffers::GROUP_TOKEN_INDICES,
-                                     static_cast<size_t>(total_slots) * sizeof(int),
-                                     "prepareExpertGroups(group_token_indices)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_original_to_grouped_),
-                                     MoEWorkspaceBuffers::GROUP_ORIGINAL_TO_GROUPED,
-                                     static_cast<size_t>(total_slots) * sizeof(int),
-                                     "prepareExpertGroups(group_original_to_grouped)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_weights_),
-                                     MoEWorkspaceBuffers::GROUP_WEIGHTS,
-                                     static_cast<size_t>(total_slots) * sizeof(float),
-                                     "prepareExpertGroups(group_weights)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_active_expert_ids_),
-                                     MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
-                                     static_cast<size_t>(total_slots) * sizeof(int),
-                                     "prepareExpertGroups(group_active_expert_ids)"))
-            {
-                d_group_int_indices_ = nullptr;
-                d_group_token_indices_ = nullptr;
-                d_group_original_to_grouped_ = nullptr;
-                d_group_weights_ = nullptr;
-                d_group_active_expert_ids_ = nullptr;
-                group_active_expert_slots_ = 0;
-                group_slots_cap_ = 0;
-                return false;
-            }
-            group_slots_cap_ = total_slots;
-        }
-        if (num_experts > group_experts_cap_)
-        {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_offsets_),
-                                     MoEWorkspaceBuffers::GROUP_OFFSETS,
-                                     static_cast<size_t>(num_experts) * sizeof(int),
-                                     "prepareExpertGroups(group_offsets)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_counts_),
-                                     MoEWorkspaceBuffers::GROUP_COUNTS,
-                                     static_cast<size_t>(num_experts) * sizeof(int),
-                                     "prepareExpertGroups(group_counts)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_max_tokens_),
-                                     MoEWorkspaceBuffers::ROCM_GROUP_MAX_TOKENS,
-                                     sizeof(int),
-                                     "prepareExpertGroups(group_max_tokens)"))
-            {
-                d_group_offsets_ = nullptr;
-                d_group_counts_ = nullptr;
-                d_group_max_tokens_ = nullptr;
-                group_experts_cap_ = 0;
-                return false;
-            }
-            group_experts_cap_ = num_experts;
-        }
-
-        // 3. Convert float indices → int on device
-        if (!hipMoE_float_to_int(d_float_indices, d_group_int_indices_,
-                                 total_slots, device_ordinal_, getStream()))
-        {
-            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroups] float_to_int failed");
-            return false;
-        }
-
-        // 4. Group tokens by expert (counts, offsets, scatter)
-        if (!groupTokensByExpertDevice(
-                d_group_int_indices_, d_float_weights,
-                seq_len, num_experts, top_k,
-                d_group_offsets_, d_group_counts_,
-                d_group_token_indices_, d_group_weights_))
-        {
-            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroups] groupTokensByExpertDevice failed");
-            return false;
-        }
-
-        // 5. D2H expert counts and offsets (small — num_experts ints each)
-        host_expert_counts_.resize(num_experts);
-        host_expert_offsets_.resize(num_experts);
-        hipError_t copy_err = hipMemcpyAsync(host_expert_counts_.data(), d_group_counts_,
-                                             num_experts * sizeof(int), hipMemcpyDeviceToHost, stream);
-        if (copy_err == hipSuccess)
-            copy_err = hipMemcpyAsync(host_expert_offsets_.data(), d_group_offsets_,
-                                      num_experts * sizeof(int), hipMemcpyDeviceToHost, stream);
-        if (copy_err == hipSuccess)
-            copy_err = hipStreamSynchronize(stream);
-        if (copy_err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroups] D2H grouping metadata failed: "
-                      << hipGetErrorString(copy_err));
-            return false;
-        }
-
-        prepared_num_experts_ = num_experts;
-        return true;
-    }
-
-    int ROCmMoEKernel::getExpertTokenCount(int expert_id) const
-    {
-        if (expert_id < 0 || expert_id >= prepared_num_experts_)
-            return 0;
-        return host_expert_counts_[expert_id];
-    }
-
-    void ROCmMoEKernel::gatherExpertBatch(
-        ITensor *hidden, ITensor *batch_buffer,
-        int expert_id, int d_model)
-    {
-        int count = getExpertTokenCount(expert_id);
-        if (count <= 0)
-            return;
-
-        if (!setMoEDevice(device_ordinal_, "gatherExpertBatch"))
-            return;
-
-        const float *h = static_cast<const float *>(hidden->gpu_data_ptr());
-        float *b = static_cast<float *>(batch_buffer->gpu_data_ptr());
-        int offset = host_expert_offsets_[expert_id];
-
-        gatherTokenBatch(h, b, d_group_token_indices_ + offset, count, d_model);
-    }
-
-    void ROCmMoEKernel::scatterExpertResults(
-        ITensor *output, ITensor *expert_results,
-        int expert_id, int d_model)
-    {
-        int count = getExpertTokenCount(expert_id);
-        if (count <= 0)
-            return;
-
-        if (!setMoEDevice(device_ordinal_, "scatterExpertResults"))
-            return;
-
-        float *o = static_cast<float *>(output->gpu_data_ptr());
-        const float *r = static_cast<const float *>(expert_results->gpu_data_ptr());
-        int offset = host_expert_offsets_[expert_id];
-
-        scatterAddWeighted(o, r, d_group_token_indices_ + offset,
-                           d_group_weights_ + offset, count, d_model);
     }
 
     // =========================================================================
@@ -7881,9 +7913,29 @@ namespace llaminar2
 
         const int total_slots = seq_len * top_k;
 
-        // 1. Ensure routing tensors are on device
-        routing_indices->ensureOnDevice(DeviceId::rocm(device_ordinal_));
-        routing_weights->ensureOnDevice(DeviceId::rocm(device_ordinal_));
+        // 1. Join both routing producers onto this planner's explicit stream.
+        //
+        // A transfer that omits the consumer stream may return before this
+        // planner reads the route table. The stream-aware helper either uploads
+        // on this stream or joins the tensor's existing producer event, making
+        // that race structurally impossible.
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        void *stream = getStream();
+        if (!ensureTensorOnDevice(
+                routing_indices,
+                device,
+                stream,
+                "routing_indices",
+                "prepareExpertGroupsAsync") ||
+            !ensureTensorOnDevice(
+                routing_weights,
+                device,
+                stream,
+                "routing_weights",
+                "prepareExpertGroupsAsync"))
+        {
+            return false;
+        }
 
         const float *d_float_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
         const float *d_float_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
@@ -8009,7 +8061,6 @@ namespace llaminar2
                         {"top_k", std::to_string(top_k)}});
             }
 
-            prepared_num_experts_ = num_experts;
             return true;
         }
 
@@ -8066,33 +8117,49 @@ namespace llaminar2
         // NO D2H copy, NO hipStreamSynchronize — data stays on device
         // for consumption by executeGroupedPrefillPipeline()
 
-        prepared_num_experts_ = num_experts;
         return true;
     }
 
-    bool ROCmMoEKernel::prepareExpertGroupsAsyncMasked(
+    bool ROCmMoEKernel::prepareExpertGroupsAsyncUsingPublishedMask(
         ITensor *routing_indices,
         ITensor *routing_weights,
         int seq_len,
         int num_experts,
-        int top_k,
-        const uint8_t *expert_mask)
+        int top_k)
     {
-        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0 || !expert_mask)
+        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
             return false;
 
-        if (!setMoEDevice(device_ordinal_, "prepareExpertGroupsAsyncMasked"))
+        if (!setMoEDevice(
+                device_ordinal_,
+                "prepareExpertGroupsAsyncUsingPublishedMask"))
             return false;
 
         const int total_slots = seq_len * top_k;
-        routing_indices->ensureOnDevice(DeviceId::rocm(device_ordinal_));
-        routing_weights->ensureOnDevice(DeviceId::rocm(device_ordinal_));
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        void *stream = getStream();
+        if (!ensureTensorOnDevice(
+                routing_indices,
+                device,
+                stream,
+                "routing_indices",
+                "prepareExpertGroupsAsyncUsingPublishedMask") ||
+            !ensureTensorOnDevice(
+                routing_weights,
+                device,
+                stream,
+                "routing_weights",
+                "prepareExpertGroupsAsyncUsingPublishedMask"))
+        {
+            return false;
+        }
 
         const float *d_float_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
         const float *d_float_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
         if (!d_float_indices || !d_float_weights)
         {
-            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsyncMasked] null device pointers");
+            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsyncUsingPublishedMask] "
+                      "null device pointers");
             return false;
         }
 
@@ -8106,23 +8173,23 @@ namespace llaminar2
             if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_int_indices_),
                                      MoEWorkspaceBuffers::GROUP_INT_INDICES,
                                      static_cast<size_t>(total_slots) * sizeof(int),
-                                     "prepareExpertGroupsAsyncMasked(group_int_indices)") ||
+                                     "prepareExpertGroupsAsyncUsingPublishedMask(group_int_indices)") ||
                 !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_token_indices_),
                                      MoEWorkspaceBuffers::GROUP_TOKEN_INDICES,
                                      static_cast<size_t>(total_slots) * sizeof(int),
-                                     "prepareExpertGroupsAsyncMasked(group_token_indices)") ||
+                                     "prepareExpertGroupsAsyncUsingPublishedMask(group_token_indices)") ||
                 !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_original_to_grouped_),
                                      MoEWorkspaceBuffers::GROUP_ORIGINAL_TO_GROUPED,
                                      static_cast<size_t>(total_slots) * sizeof(int),
-                                     "prepareExpertGroupsAsyncMasked(group_original_to_grouped)") ||
+                                     "prepareExpertGroupsAsyncUsingPublishedMask(group_original_to_grouped)") ||
                 !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_weights_),
                                      MoEWorkspaceBuffers::GROUP_WEIGHTS,
                                      static_cast<size_t>(total_slots) * sizeof(float),
-                                     "prepareExpertGroupsAsyncMasked(group_weights)") ||
+                                     "prepareExpertGroupsAsyncUsingPublishedMask(group_weights)") ||
                 !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_active_expert_ids_),
                                      MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
                                      static_cast<size_t>(total_slots) * sizeof(int),
-                                     "prepareExpertGroupsAsyncMasked(group_active_expert_ids)"))
+                                     "prepareExpertGroupsAsyncUsingPublishedMask(group_active_expert_ids)"))
             {
                 d_group_int_indices_ = nullptr;
                 d_group_token_indices_ = nullptr;
@@ -8140,15 +8207,15 @@ namespace llaminar2
             if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_offsets_),
                                      MoEWorkspaceBuffers::GROUP_OFFSETS,
                                      static_cast<size_t>(num_experts) * sizeof(int),
-                                     "prepareExpertGroupsAsyncMasked(group_offsets)") ||
+                                     "prepareExpertGroupsAsyncUsingPublishedMask(group_offsets)") ||
                 !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_counts_),
                                      MoEWorkspaceBuffers::GROUP_COUNTS,
                                      static_cast<size_t>(num_experts) * sizeof(int),
-                                     "prepareExpertGroupsAsyncMasked(group_counts)") ||
+                                     "prepareExpertGroupsAsyncUsingPublishedMask(group_counts)") ||
                 !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_max_tokens_),
                                      MoEWorkspaceBuffers::ROCM_GROUP_MAX_TOKENS,
                                      sizeof(int),
-                                     "prepareExpertGroupsAsyncMasked(group_max_tokens)"))
+                                     "prepareExpertGroupsAsyncUsingPublishedMask(group_max_tokens)"))
             {
                 d_group_offsets_ = nullptr;
                 d_group_counts_ = nullptr;
@@ -8159,48 +8226,23 @@ namespace llaminar2
             group_experts_cap_ = num_experts;
         }
 
-        uint64_t mask_hash = 1469598103934665603ull;
-        int mask_active_experts = 0;
-        for (int i = 0; i < num_experts; ++i)
+        /*
+         * The graph path consumes only the backend-owned mask. Missing
+         * publication is a lifecycle error, not an invitation to stage a host
+         * pointer while HIP is recording graph nodes.
+         */
+        if (!group_expert_mask_published_ ||
+            !d_group_expert_mask_ ||
+            group_expert_mask_cap_ < num_experts ||
+            group_expert_mask_num_experts_ != num_experts)
         {
-            mask_hash ^= static_cast<uint64_t>(expert_mask[i]);
-            mask_hash *= 1099511628211ull;
-            mask_active_experts += expert_mask[i] != 0u ? 1 : 0;
-        }
-        mask_hash ^= static_cast<uint64_t>(num_experts);
-        mask_hash *= 1099511628211ull;
-
-        if (!d_group_expert_mask_ || group_expert_mask_cap_ < num_experts)
-        {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_expert_mask_),
-                                     MoEWorkspaceBuffers::GROUP_EXPERT_MASK,
-                                     static_cast<size_t>(num_experts) * sizeof(uint8_t),
-                                     "prepareExpertGroupsAsyncMasked(group_expert_mask)"))
-            {
-                d_group_expert_mask_ = nullptr;
-                group_expert_mask_cap_ = 0;
-                group_expert_mask_hash_ = 0;
-                return false;
-            }
-            group_expert_mask_cap_ = num_experts;
-            group_expert_mask_hash_ = 0;
-        }
-
-        if (group_expert_mask_hash_ != mask_hash)
-        {
-            hipError_t err = hipMemcpyAsync(
-                d_group_expert_mask_,
-                expert_mask,
-                static_cast<size_t>(num_experts) * sizeof(uint8_t),
-                hipMemcpyHostToDevice,
-                static_cast<hipStream_t>(getStream()));
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsyncMasked] H2D mask copy failed: "
-                          << hipGetErrorString(err));
-                return false;
-            }
-            group_expert_mask_hash_ = mask_hash;
+            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsyncUsingPublishedMask] "
+                      "fixed-topology expert mask was not published for the current "
+                      "workspace and expert count before graph execution"
+                      << " requested_experts=" << num_experts
+                      << " published_experts=" << group_expert_mask_num_experts_
+                      << " capacity=" << group_expert_mask_cap_);
+            return false;
         }
 
         group_active_expert_slots_ = 0;
@@ -8213,7 +8255,8 @@ namespace llaminar2
                 device_ordinal_,
                 getStream()))
         {
-            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsyncMasked] float_to_masked_int failed");
+            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsyncUsingPublishedMask] "
+                      "float_to_masked_int failed");
             return false;
         }
 
@@ -8223,7 +8266,8 @@ namespace llaminar2
                 d_group_offsets_, d_group_counts_,
                 d_group_token_indices_, d_group_weights_))
         {
-            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsyncMasked] groupTokensByExpertDevice failed");
+            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsyncUsingPublishedMask] "
+                      "groupTokensByExpertDevice failed");
             return false;
         }
         /*
@@ -8232,22 +8276,23 @@ namespace llaminar2
          * this participant can own instead of launching planes for every global
          * expert.  This mirrors CUDA and keeps masked publication economical.
          */
-        group_active_expert_slots_ = std::min(total_slots, mask_active_experts);
+        group_active_expert_slots_ =
+            std::min(total_slots, group_expert_mask_active_experts_);
 
         if (!hipMoE_max_expert_count(d_group_counts_, d_group_max_tokens_,
                                      num_experts, device_ordinal_, getStream()))
         {
-            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsyncMasked] max_expert_count failed");
+            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsyncUsingPublishedMask] "
+                      "max_expert_count failed");
             return false;
         }
 
-        prepared_num_experts_ = num_experts;
         PerfStatsCollector::addCounter(
             "kernel", "rocm_moe_masked_prefill_grouping_calls", 1.0, {}, {},
             {{"seq_len", std::to_string(seq_len)},
              {"top_k", std::to_string(top_k)},
              {"num_experts", std::to_string(num_experts)},
-             {"mask_active_experts", std::to_string(mask_active_experts)},
+             {"mask_active_experts", std::to_string(group_expert_mask_active_experts_)},
              {"expert_grid_slots", std::to_string(group_active_expert_slots_)}});
         return true;
     }
@@ -8261,33 +8306,94 @@ namespace llaminar2
 
         if (!setMoEDevice(device_ordinal_, "updateGroupedPrefillExpertMask"))
             return false;
+        void *stream = getStream();
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel::updateGroupedPrefillExpertMask] "
+                      "an explicit stream is required");
+            return false;
+        }
+        if (isGraphCaptureActive() || isHipStreamCapturing(stream))
+        {
+            LOG_ERROR("[ROCmMoEKernel::updateGroupedPrefillExpertMask] "
+                      "host expert-mask publication is forbidden during graph capture");
+            return false;
+        }
 
         uint64_t mask_hash = 1469598103934665603ull;
+        int active_experts = 0;
         for (int i = 0; i < num_experts; ++i)
         {
             mask_hash ^= static_cast<uint64_t>(expert_mask[i]);
             mask_hash *= 1099511628211ull;
+            active_experts += expert_mask[i] != 0u ? 1 : 0;
         }
         mask_hash ^= static_cast<uint64_t>(num_experts);
         mask_hash *= 1099511628211ull;
 
         if (!d_group_expert_mask_ || group_expert_mask_cap_ < num_experts)
         {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_expert_mask_),
-                                     MoEWorkspaceBuffers::GROUP_EXPERT_MASK,
-                                     static_cast<size_t>(num_experts) * sizeof(uint8_t),
-                                     "updateGroupedPrefillExpertMask(group_expert_mask)"))
+            if (!workspace_)
             {
-                d_group_expert_mask_ = nullptr;
-                group_expert_mask_cap_ = 0;
-                group_expert_mask_hash_ = 0;
+                LOG_ERROR("[ROCmMoEKernel::updateGroupedPrefillExpertMask] "
+                          "graph-owned workspace is required before mask publication");
                 return false;
             }
-            group_expert_mask_cap_ = num_experts;
+
+            auto lease = workspace_->acquirePersistentSlot(
+                kROCmGroupedExpertMaskLeaseDomain,
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+            void *mask_table = nullptr;
+            const size_t required_table_bytes =
+                static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) *
+                static_cast<size_t>(num_experts) * sizeof(uint8_t);
+            if (!lease ||
+                !bindWorkspaceBuffer(
+                    &mask_table,
+                    MoEWorkspaceBuffers::GROUP_EXPERT_MASK,
+                    required_table_bytes,
+                    "updateGroupedPrefillExpertMask(group_expert_mask_table)"))
+            {
+                d_group_expert_mask_ = nullptr;
+                group_expert_mask_workspace_lease_.reset();
+                group_expert_mask_cap_ = 0;
+                group_expert_mask_hash_ = 0;
+                group_expert_mask_num_experts_ = 0;
+                group_expert_mask_active_experts_ = 0;
+                group_expert_mask_published_ = false;
+                return false;
+            }
+
+            const size_t table_bytes =
+                workspace_->getBufferSize(MoEWorkspaceBuffers::GROUP_EXPERT_MASK);
+            const size_t slot_stride =
+                table_bytes /
+                static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+            if (slot_stride < static_cast<size_t>(num_experts))
+            {
+                LOG_ERROR("[ROCmMoEKernel::updateGroupedPrefillExpertMask] "
+                          "leased expert-mask slot is too narrow: stride="
+                          << slot_stride << " requested_experts=" << num_experts);
+                d_group_expert_mask_ = nullptr;
+                group_expert_mask_workspace_lease_.reset();
+                group_expert_mask_cap_ = 0;
+                group_expert_mask_published_ = false;
+                return false;
+            }
+
+            d_group_expert_mask_ =
+                static_cast<uint8_t *>(mask_table) + lease->slot() * slot_stride;
+            group_expert_mask_workspace_lease_ = std::move(lease);
+            group_expert_mask_cap_ = static_cast<int>(slot_stride);
             group_expert_mask_hash_ = 0;
+            group_expert_mask_num_experts_ = 0;
+            group_expert_mask_active_experts_ = 0;
+            group_expert_mask_published_ = false;
         }
 
-        if (group_expert_mask_hash_ == mask_hash)
+        if (group_expert_mask_published_ &&
+            group_expert_mask_hash_ == mask_hash &&
+            group_expert_mask_num_experts_ == num_experts)
             return true;
 
         hipError_t err = hipMemcpyAsync(
@@ -8295,7 +8401,7 @@ namespace llaminar2
             expert_mask,
             static_cast<size_t>(num_experts) * sizeof(uint8_t),
             hipMemcpyHostToDevice,
-            static_cast<hipStream_t>(getStream()));
+            static_cast<hipStream_t>(stream));
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmMoEKernel::updateGroupedPrefillExpertMask] H2D mask copy failed: "
@@ -8304,6 +8410,9 @@ namespace llaminar2
         }
 
         group_expert_mask_hash_ = mask_hash;
+        group_expert_mask_num_experts_ = num_experts;
+        group_expert_mask_active_experts_ = active_experts;
+        group_expert_mask_published_ = true;
         return true;
     }
 
@@ -8390,7 +8499,6 @@ namespace llaminar2
             return false;
         }
 
-        prepared_num_experts_ = 1;
         group_active_expert_slots_ = 1;
         if (PerfStatsCollector::isEnabled())
         {
@@ -8531,9 +8639,27 @@ namespace llaminar2
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
             return false;
 
-        // Ensure hidden and output are on device
-        hidden->ensureOnDevice(DeviceId::rocm(device_ordinal_));
-        output->ensureOnDevice(DeviceId::rocm(device_ordinal_));
+        // Join the hidden-state producer to this pipeline and allocate the
+        // overwrite-only result on the same device. No host mirror is adopted:
+        // ensureOutputOnDevice deliberately allocates without uploading stale
+        // host bytes because ordered publication defines every output element.
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        void *stream = getStream();
+        if (!ensureTensorOnDevice(
+                hidden,
+                device,
+                stream,
+                "hidden",
+                "executeGroupedPrefillPipeline") ||
+            !ensureOutputOnDevice(
+                output,
+                device,
+                stream,
+                "output",
+                "executeGroupedPrefillPipeline"))
+        {
+            return false;
+        }
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
@@ -8618,8 +8744,10 @@ namespace llaminar2
                  {"descriptor_source", "static_table"}});
         }
 
-        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                             DeviceId::rocm(device_ordinal_));
+        markDeviceWritten(
+            output,
+            DeviceId::rocm(device_ordinal_),
+            getStream());
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
         {
             const MoEPrefillPolicyTags gateup_policy =
@@ -8737,15 +8865,48 @@ namespace llaminar2
         }
 
         const int total_slots = seq_len * top_k;
-        if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
-            !ensureRuntimePrefillDescriptorCapacity(num_experts))
+        if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
             return false;
+
+        /*
+         * Runtime placement changes descriptor values without changing the
+         * graph's descriptor identity.  Resolve the mutable destination from
+         * that retained identity so main-verifier, MTP-sidecar, and rebalance
+         * graphs never publish through the same device address.  This performs
+         * only validated pointer arithmetic over persistent workspace.
+         */
+        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        if (!bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_gate_descs,
+                "ROCm runtime prefill gate descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_up_descs,
+                "ROCm runtime prefill up descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                down_table.workspace_slot,
+                num_experts,
+                &runtime_down_descs,
+                "ROCm runtime prefill down descriptors"))
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
+                      "failed to bind graph-owned runtime descriptor slots");
+            return false;
+        }
 
         if (!hipMoE_materialize_runtime_prefill_descriptor_tables(
                 device_runtime_layer,
-                d_runtime_prefill_gate_descs_,
-                d_runtime_prefill_up_descs_,
-                d_runtime_prefill_down_descs_,
+                runtime_gate_descs,
+                runtime_up_descs,
+                runtime_down_descs,
                 num_experts,
                 device_ordinal_,
                 getStream()))
@@ -8754,8 +8915,23 @@ namespace llaminar2
             return false;
         }
 
-        hidden->ensureOnDevice(DeviceId::rocm(device_ordinal_));
-        output->ensureOnDevice(DeviceId::rocm(device_ordinal_));
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        void *stream = getStream();
+        if (!ensureTensorOnDevice(
+                hidden,
+                device,
+                stream,
+                "hidden",
+                "executeGroupedPrefillPipelineFromRuntime") ||
+            !ensureOutputOnDevice(
+                output,
+                device,
+                stream,
+                "output",
+                "executeGroupedPrefillPipelineFromRuntime"))
+        {
+            return false;
+        }
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
@@ -8824,9 +9000,9 @@ namespace llaminar2
             d_hidden,
             reuse_router_q8_hidden ? d_router_q8_hidden_ : nullptr,
             reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : nullptr,
-            d_runtime_prefill_gate_descs_,
-            d_runtime_prefill_up_descs_,
-            d_runtime_prefill_down_descs_,
+            runtime_gate_descs,
+            runtime_up_descs,
+            runtime_down_descs,
             runtime_host_layer.expert_counts,
             runtime_host_layer.expert_offsets,
             runtime_host_layer.grouped_token_ids,
@@ -8870,8 +9046,10 @@ namespace llaminar2
                  {"descriptor_source", "runtime_table"}});
         }
 
-        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                             DeviceId::rocm(device_ordinal_));
+        markDeviceWritten(
+            output,
+            DeviceId::rocm(device_ordinal_),
+            getStream());
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
         {
             const MoEPrefillPolicyTags gateup_policy =

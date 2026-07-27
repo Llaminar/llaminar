@@ -1988,6 +1988,49 @@ namespace llaminar2
         }
 
         /**
+         * @brief Expand device-owned request positions into grouped verifier rows.
+         *
+         * A grouped verifier consumes a request-major matrix with shape
+         * `[request_count, padded_seq_len]`. The canonical next position for
+         * request @c r is stored in @p base_positions_device and can change after
+         * every accepted-state publication without any corresponding host
+         * update. This primitive writes
+         * `out[r * padded_seq_len + token] = base[r] + token`, allowing RoPE and
+         * every position-dependent verifier stage to consume the same
+         * device-owned logical state as the KV cache.
+         *
+         * Implementations must enqueue one bounded launch on the explicit
+         * non-null @p stream. They must not allocate, synchronize, or copy
+         * mutable logical state through the host.
+         *
+         * @param base_positions_device Device INT32 next-position row, one value
+         *        per request.
+         * @param request_count Number of independent request rows.
+         * @param padded_seq_len Physical verifier columns per request.
+         * @param device_id GPU ordinal owning both input and output.
+         * @param stream Explicit CUDA/HIP verifier execution stream.
+         * @param out_position_ids_device Device INT32 request-major output with
+         *        `request_count * padded_seq_len` elements.
+         * @return true when the position expansion was enqueued successfully.
+         */
+        virtual bool enqueuePrepareMTPVerifierPositionIds(
+            const void *base_positions_device,
+            int request_count,
+            int padded_seq_len,
+            int device_id,
+            void *stream,
+            void *out_position_ids_device)
+        {
+            (void)base_positions_device;
+            (void)request_count;
+            (void)padded_seq_len;
+            (void)device_id;
+            (void)stream;
+            (void)out_position_ids_device;
+            return false;
+        }
+
+        /**
          * @brief Seed the request-batched GPU logical-state mailbox after prefill.
          *
          * The terminal prefill sampler already owns one sampled token per request
@@ -2064,6 +2107,15 @@ namespace llaminar2
          * @param stream Optional stream for async execution
          * @return true if executed on device, false if not supported
          */
+        virtual bool prepareLogitPenaltyWorkspace(
+            int vocab_size,
+            int device_id)
+        {
+            (void)vocab_size;
+            (void)device_id;
+            return false;
+        }
+
         virtual bool applyLogitPenaltiesF32(void *logits_device,
                                             const int *token_ids_host,
                                             const float *penalties_host,

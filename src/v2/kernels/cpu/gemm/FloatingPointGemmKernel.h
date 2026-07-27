@@ -1573,6 +1573,158 @@ namespace llaminar2
             }
 
             /**
+             * @brief Execute the ordinary CPU floating-point SwiGLU/down path.
+             *
+             * Shared experts produce FP32 gate and up activations regardless of
+             * the stored down-projection format. The generic ITensorGemm
+             * fallback cannot express that mixed-input contract, so returning
+             * false here used to make every ordinary FP32 shared-expert stage
+             * fail after fallbacks were correctly removed from the stage.
+             *
+             * The implementation materializes one reusable thread-local SwiGLU
+             * tile and then dispatches the down projection by weight format.
+             * M=1 uses the skinny kernel used by serial decode. FP32 M>1 uses
+             * oneDNN's matrix path, while FP16/BF16 retain the mixed-input
+             * skinny kernels because their activation rows remain FP32.
+             */
+            bool multiply_tensor_with_fused_swiglu(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override
+            {
+                (void)workspace;
+                if (!weight_tensor_ || !gate || !up || !output ||
+                    m <= 0 || n <= 0 || k <= 0)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] fused SwiGLU rejected invalid tensors or shape"
+                              << " weight=" << (weight_tensor_ != nullptr)
+                              << " gate=" << (gate != nullptr)
+                              << " up=" << (up != nullptr)
+                              << " output=" << (output != nullptr)
+                              << " m=" << m << " n=" << n << " k=" << k);
+                    return false;
+                }
+                if (gate->native_type() != TensorType::FP32 ||
+                    up->native_type() != TensorType::FP32 ||
+                    output->native_type() != TensorType::FP32)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] fused SwiGLU requires FP32 gate, up, and output tensors");
+                    return false;
+                }
+
+                const size_t input_elements =
+                    static_cast<size_t>(m) * static_cast<size_t>(k);
+                const size_t output_elements =
+                    static_cast<size_t>(m) * static_cast<size_t>(n);
+                if (gate->numel() < input_elements ||
+                    up->numel() < input_elements ||
+                    output->numel() < output_elements)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] fused SwiGLU tensor capacity mismatch");
+                    return false;
+                }
+
+                const float *gate_data = gate->data();
+                const float *up_data = up->data();
+                float *out_data = output->mutable_data();
+                if (!gate_data || !up_data || !out_data)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] fused SwiGLU requires host-visible tensors");
+                    return false;
+                }
+
+                thread_local std::vector<float> swiglu_scratch_tls;
+                if (swiglu_scratch_tls.size() < input_elements)
+                    swiglu_scratch_tls.resize(input_elements);
+                if (m == 1)
+                {
+                    primitives::compute_swiglu_serial(
+                        gate_data,
+                        up_data,
+                        swiglu_scratch_tls.data(),
+                        static_cast<int>(input_elements));
+                }
+                else
+                {
+                    primitives::compute_swiglu(
+                        gate_data,
+                        up_data,
+                        swiglu_scratch_tls.data(),
+                        static_cast<int>(input_elements));
+                }
+
+                switch (weight_type_)
+                {
+                case TensorType::FP32:
+                    if (m == 1)
+                    {
+                        return run_fp32_skinny_matmul(
+                            swiglu_scratch_tls.data(),
+                            weight_tensor_->data(),
+                            out_data,
+                            m,
+                            n,
+                            k,
+                            /*transpose_B=*/true,
+                            alpha,
+                            beta,
+                            nullptr);
+                    }
+                    return run_onednn_fp32_matmul(
+                        swiglu_scratch_tls.data(),
+                        weight_tensor_->data(),
+                        out_data,
+                        m,
+                        n,
+                        k,
+                        /*transpose_B=*/true,
+                        alpha,
+                        beta,
+                        nullptr);
+
+                case TensorType::FP16:
+                {
+                    const auto *weights =
+                        dynamic_cast<const FP16Tensor *>(weight_tensor_);
+                    return weights && run_fp32xfp16_skinny_matmul(
+                                          swiglu_scratch_tls.data(),
+                                          weights->typed_data(),
+                                          out_data,
+                                          m,
+                                          n,
+                                          k,
+                                          /*transpose_B=*/true,
+                                          alpha,
+                                          beta);
+                }
+
+                case TensorType::BF16:
+                {
+                    const auto *weights =
+                        dynamic_cast<const BF16Tensor *>(weight_tensor_);
+                    return weights && run_fp32xbf16_skinny_matmul(
+                                          swiglu_scratch_tls.data(),
+                                          weights->typed_data(),
+                                          out_data,
+                                          m,
+                                          n,
+                                          k,
+                                          /*transpose_B=*/true,
+                                          alpha,
+                                          beta);
+                }
+
+                default:
+                    LOG_ERROR("[FloatingPointGemmKernel] fused SwiGLU unsupported weight type "
+                              << static_cast<int>(weight_type_));
+                    return false;
+                }
+            }
+
+            /**
              * @brief Grouped verifier SwiGLU + FP32 down projection.
              *
              * The verifier graph may carry an arbitrary runtime-M candidate batch, but state

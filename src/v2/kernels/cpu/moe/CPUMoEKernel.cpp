@@ -248,6 +248,56 @@ namespace llaminar2
         return true;
     }
 
+    bool CPUMoEKernel::routeWithTensors(
+        ITensor *hidden,
+        ITensor *gate_weights,
+        int seq_len,
+        int d_model,
+        int num_experts,
+        int top_k,
+        bool normalize_weights,
+        ITensor *output_indices,
+        ITensor *output_weights,
+        MoERoutingResult &host_result)
+    {
+        if (!hidden || !gate_weights || !output_indices || !output_weights)
+        {
+            LOG_ERROR("[CPUMoEKernel::routeWithTensors] missing routing tensor");
+            return false;
+        }
+
+        if (!route(hidden->data(),
+                   gate_weights->data(),
+                   seq_len,
+                   d_model,
+                   num_experts,
+                   top_k,
+                   normalize_weights,
+                   host_result))
+        {
+            return false;
+        }
+
+        const size_t route_count =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
+        if (output_indices->numel() < route_count ||
+            output_weights->numel() < route_count)
+        {
+            LOG_ERROR("[CPUMoEKernel::routeWithTensors] output capacity is too small");
+            return false;
+        }
+
+        float *indices = output_indices->mutable_data();
+        float *weights = output_weights->mutable_data();
+        for (size_t route_index = 0; route_index < route_count; ++route_index)
+        {
+            indices[route_index] =
+                static_cast<float>(host_result.expert_indices[route_index]);
+            weights[route_index] = host_result.expert_weights[route_index];
+        }
+        return true;
+    }
+
     void CPUMoEKernel::gatherTokenBatch(
         const float *hidden,
         float *batch_buffer,

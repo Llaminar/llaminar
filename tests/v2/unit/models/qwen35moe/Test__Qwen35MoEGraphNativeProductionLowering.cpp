@@ -264,11 +264,13 @@ namespace llaminar2::test
             return plan;
         }
 
-        GraphConfig makeConfig(std::shared_ptr<MoERoutedExpertPlacementPlan> plan)
+        GraphConfig makeConfig(
+            std::shared_ptr<MoERoutedExpertPlacementPlan> plan,
+            int layer_count = 2)
         {
             GraphConfig config;
-            config.n_layers = 2;
-            config.total_n_layers = 2;
+            config.n_layers = layer_count;
+            config.total_n_layers = layer_count;
             config.d_model = kDModel;
             config.n_heads = 2;
             config.n_kv_heads = 2;
@@ -795,18 +797,18 @@ namespace llaminar2::test
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
-         LocalTPApportionedLeastLoadedPrefillTransferWorkspacesUseRollingLanes)
+         LocalTPApportionedLeastLoadedPrefillTransferWorkspacesUseBoundedRollingLanes)
     {
         ScopedDebugEnv env({
             {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
             {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
         });
-        constexpr int kLayerCount = 2;
+        constexpr int kLayerCount = 3;
         auto plan = makeLocalTPApportionedHotPlan(kLayerCount);
         ASSERT_FALSE(plan->domains.empty());
         plan->domains[0].routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
-        GraphConfig config = makeConfig(plan);
+        GraphConfig config = makeConfig(plan, kLayerCount);
         config.default_device = DeviceId::rocm(0);
         config.moe.routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
@@ -823,6 +825,8 @@ namespace llaminar2::test
         auto buffers0 = makeActivationBuffers(activation_arena0);
         TensorArena activation_arena1;
         auto buffers1 = makeActivationBuffers(activation_arena1);
+        TensorArena activation_arena2;
+        auto buffers2 = makeActivationBuffers(activation_arena2);
 
         auto model_ctx = makeTestingModelContextWithHotDomainExperts(kLayerCount);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
@@ -830,22 +834,110 @@ namespace llaminar2::test
             layer_weights, buffers0, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
         ComputeGraph graph1 = graph_builder.buildFFNGraph(
             layer_weights, buffers1, 1, kSeqLen, kBatchSize, DeviceId::rocm(0));
+        ComputeGraph graph2 = graph_builder.buildFFNGraph(
+            layer_weights, buffers2, 2, kSeqLen, kBatchSize, DeviceId::rocm(0));
 
         const auto *stage0 = expertComputeStage(graph0, "layer0_moe_expert_ffn_overlay_fast");
         const auto *stage1 = expertComputeStage(graph1, "layer1_moe_expert_ffn_overlay_fast");
+        const auto *stage2 = expertComputeStage(graph2, "layer2_moe_expert_ffn_overlay_fast");
         ASSERT_NE(stage0, nullptr);
         ASSERT_NE(stage1, nullptr);
+        ASSERT_NE(stage2, nullptr);
         ASSERT_TRUE(stage0->hasTransferBackedPrefillLLEPForTesting());
         ASSERT_TRUE(stage1->hasTransferBackedPrefillLLEPForTesting());
+        ASSERT_TRUE(stage2->hasTransferBackedPrefillLLEPForTesting());
 
         const std::string workspace0 = stage0->prefillLLEPWorkspaceNameForTesting();
         const std::string workspace1 = stage1->prefillLLEPWorkspaceNameForTesting();
+        const std::string workspace2 = stage2->prefillLLEPWorkspaceNameForTesting();
         EXPECT_NE(workspace0, workspace1)
             << "Transfer-backed prefill LLEP stages run compute and transfer streams "
-               "concurrently; adjacent layers must not share plan/status/payload "
+               "concurrently; adjacent layers must not share plan/payload "
                "workspace while an earlier layer's transfer can still be in flight.";
+        EXPECT_EQ(workspace0, workspace2)
+            << "The graph must bound persistent transfer storage instead of "
+               "allocating one expert payload arena per model layer.";
         EXPECT_NE(workspace0.find("prefill_lane=0"), std::string::npos);
         EXPECT_NE(workspace1.find("prefill_lane=1"), std::string::npos);
+        EXPECT_NE(workspace2.find("prefill_lane=0"), std::string::npos);
+
+        auto publication_buffer_name =
+            [](const MoEExpertComputeStage *stage,
+               const char *buffer_family) -> std::string
+        {
+            const auto requirements =
+                stage->getWorkspaceRequirements(kSeqLen);
+            const auto buffer = std::find_if(
+                requirements.buffers.begin(),
+                requirements.buffers.end(),
+                [buffer_family](const WorkspaceDescriptor &descriptor)
+                {
+                    return descriptor.name.rfind(buffer_family, 0) == 0;
+                });
+            return buffer == requirements.buffers.end()
+                       ? std::string{}
+                       : buffer->name;
+        };
+        const std::string status0 =
+            publication_buffer_name(
+                stage0,
+                MoEDeviceRebalanceStage::WS_STATUS);
+        const std::string status1 =
+            publication_buffer_name(
+                stage1,
+                MoEDeviceRebalanceStage::WS_STATUS);
+        const std::string status2 =
+            publication_buffer_name(
+                stage2,
+                MoEDeviceRebalanceStage::WS_STATUS);
+        const std::string apply_status0 =
+            publication_buffer_name(
+                stage0,
+                MoEDeviceRebalanceStage::WS_APPLY_STATUS);
+        const std::string apply_status1 =
+            publication_buffer_name(
+                stage1,
+                MoEDeviceRebalanceStage::WS_APPLY_STATUS);
+        const std::string apply_status2 =
+            publication_buffer_name(
+                stage2,
+                MoEDeviceRebalanceStage::WS_APPLY_STATUS);
+        ASSERT_FALSE(status0.empty());
+        ASSERT_FALSE(status1.empty());
+        ASSERT_FALSE(status2.empty());
+        ASSERT_FALSE(apply_status0.empty());
+        ASSERT_FALSE(apply_status1.empty());
+        ASSERT_FALSE(apply_status2.empty());
+        EXPECT_NE(status0, status1);
+        EXPECT_NE(status0, status2)
+            << "Tiny transfer-status publications are layer-owned even when "
+               "their bulk payload lanes roll over.";
+        EXPECT_NE(status1, status2);
+        EXPECT_NE(apply_status0, apply_status1);
+        EXPECT_NE(apply_status0, apply_status2)
+            << "Arrival publication must not alias across model layers.";
+        EXPECT_NE(apply_status1, apply_status2);
+
+        const auto *transfer_state0 =
+            stage0->prefillLLEPTransferStateForTesting();
+        const auto *transfer_state1 =
+            stage1->prefillLLEPTransferStateForTesting();
+        const auto *transfer_state2 =
+            stage2->prefillLLEPTransferStateForTesting();
+        ASSERT_NE(transfer_state0, nullptr);
+        ASSERT_NE(transfer_state1, nullptr);
+        ASSERT_NE(transfer_state2, nullptr);
+        EXPECT_NE(transfer_state0, transfer_state1)
+            << "Adjacent layers need independent rolling-lane stream/event state.";
+        EXPECT_NE(transfer_state0, transfer_state2)
+            << "Layers may reuse a bounded workspace/stream lane only after the "
+               "graph gives each layer a distinct persistent event pair. Event "
+               "identity cannot alias across multiple records in one capture.";
+        EXPECT_TRUE(stage0->needsGraphLaunchPreparation());
+        EXPECT_TRUE(stage1->needsGraphLaunchPreparation());
+        EXPECT_TRUE(stage2->needsGraphLaunchPreparation())
+            << "Every transfer-backed prefill stage must preflight lane resources "
+               "before CUDA/HIP capture begins.";
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,

@@ -63,7 +63,8 @@ namespace
             EXPECT_EQ(hipSetDevice(0), hipSuccess);
             EXPECT_EQ(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), hipSuccess);
 
-            kernel_ = KernelFactory::getOrCreateMoEKernel(device_);
+            owned_kernel_ = KernelFactory::createMoEKernel(device_);
+            kernel_ = owned_kernel_.get();
             EXPECT_NE(kernel_, nullptr);
             kernel_->setGPUStream(stream_);
 
@@ -90,8 +91,26 @@ namespace
                     workspace_consumer->unbindWorkspace();
             }
             workspace_.reset();
+            if (resident_expert_slab_)
+                (void)hipFree(resident_expert_slab_);
             if (stream_)
                 (void)hipStreamDestroy(stream_);
+        }
+
+        /**
+         * @brief Describe the immutable launch resources owned by this harness.
+         *
+         * Rebalance and current-batch LLEP methods consume this context directly
+         * instead of reading the mutable stream/workspace fields inherited by
+         * the process-wide kernel singleton. Keeping construction here makes
+         * every benchmark launch explicit without duplicating resource wiring.
+         */
+        [[nodiscard]] MoEKernelLaunchContext launchContext() const noexcept
+        {
+            return {
+                .stream = stream_,
+                .workspace = workspace_.get(),
+            };
         }
 
         void prepare(bool all_participants_resident,
@@ -109,6 +128,26 @@ namespace
 
             auto runtime = runtime_table_->hostLayerState(0);
             configureRuntimeLayer(runtime, shape_, all_participants_resident);
+            if (all_participants_resident)
+            {
+                const SyntheticPayloadSpec payload_spec{};
+                const uint64_t bytes_per_expert =
+                    syntheticExpertDataBytes(payload_spec);
+                ASSERT_GT(bytes_per_expert, 0u);
+                ASSERT_EQ(
+                    hipMalloc(
+                        &resident_expert_slab_,
+                        static_cast<size_t>(bytes_per_expert) *
+                            static_cast<size_t>(shape_.num_experts)),
+                    hipSuccess);
+                installSyntheticAllLocalExpertDescriptors(
+                    runtime,
+                    shape_,
+                    payload_spec,
+                    /*participant_id=*/0,
+                    resident_expert_slab_,
+                    bytes_per_expert);
+            }
             ASSERT_EQ(hipMemcpyAsync(runtime_table_->deviceLayerState(0),
                                      &runtime,
                                      sizeof(runtime),
@@ -136,6 +175,7 @@ namespace
                 shape_.num_experts,
                 shape_.top_k));
             ASSERT_TRUE(kernel_->planPrefillRoutesLeastLoadedCurrentBatch(
+                launchContext(),
                 runtime_table_->deviceLayerState(0),
                 shape_.seq_len,
                 shape_.seq_len,
@@ -195,8 +235,10 @@ namespace
         Shape shape_;
         DeviceId device_;
         hipStream_t stream_ = nullptr;
+        std::unique_ptr<IMoEKernel> owned_kernel_;
         IMoEKernel *kernel_ = nullptr;
         std::unique_ptr<DeviceWorkspaceManager> workspace_;
+        uint8_t *resident_expert_slab_ = nullptr;
         std::unique_ptr<MoERuntimeTable> runtime_table_;
         std::unique_ptr<FP32Tensor> route_indices_tensor_;
         std::unique_ptr<FP32Tensor> route_weights_tensor_;
@@ -227,6 +269,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CurrentBatchSpanAssignmentDeterministic)
     for (int i = 0; i < warmups; ++i)
     {
         ASSERT_TRUE(harness.kernel_->assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+            harness.launchContext(),
             harness.runtime_table_->deviceLayerState(0),
             shape.seq_len,
             shape.seq_len,
@@ -240,6 +283,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CurrentBatchSpanAssignmentDeterministic)
     for (int i = 0; i < iterations; ++i)
     {
         ASSERT_TRUE(harness.kernel_->assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+            harness.launchContext(),
             harness.runtime_table_->deviceLayerState(0),
             shape.seq_len,
             shape.seq_len,
@@ -257,6 +301,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CurrentBatchSpanAssignmentDeterministic)
     for (int repeat = 0; repeat < 8; ++repeat)
     {
         ASSERT_TRUE(harness.kernel_->assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+            harness.launchContext(),
             harness.runtime_table_->deviceLayerState(0),
             shape.seq_len,
             shape.seq_len,
@@ -400,6 +445,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_TransferCommandMaterializationDeterministic)
     for (int i = 0; i < warmups; ++i)
     {
         ASSERT_TRUE(harness.kernel_->materializePrefillLeastLoadedTransferCommands(
+            harness.launchContext(),
             harness.runtime_table_->deviceLayerState(0),
             d_plan,
             d_plan_count,
@@ -417,6 +463,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_TransferCommandMaterializationDeterministic)
     for (int i = 0; i < iterations; ++i)
     {
         ASSERT_TRUE(harness.kernel_->materializePrefillLeastLoadedTransferCommands(
+            harness.launchContext(),
             harness.runtime_table_->deviceLayerState(0),
             d_plan,
             d_plan_count,
@@ -446,7 +493,6 @@ TEST(Perf__MoELLEPDeterminism, ROCm_TransferCommandMaterializationDeterministic)
 
     const auto first = harness.copyPlan(d_plan, count);
     const uint64_t plan_hash = fnv1a64Plan(first.data(), first.size());
-    std::array<uint32_t, kDeviceMoEMaxParticipants> destination_slots{};
     for (uint32_t i = 0; i < count; ++i)
     {
         const auto &entry = first[static_cast<size_t>(i)];
@@ -456,12 +502,13 @@ TEST(Perf__MoELLEPDeterminism, ROCm_TransferCommandMaterializationDeterministic)
         ASSERT_LT(entry.destination_participant, static_cast<uint32_t>(shape.participant_count));
         EXPECT_EQ(entry.payload_slot, i);
         EXPECT_LT(entry.payload_slot, status.payload_bucket_slots);
-        EXPECT_EQ(entry.destination_slot, destination_slots[entry.destination_participant]++);
+        EXPECT_EQ(entry.destination_slot, kDeviceMoEInvalidSlot);
     }
 
     for (int repeat = 0; repeat < 8; ++repeat)
     {
         ASSERT_TRUE(harness.kernel_->materializePrefillLeastLoadedTransferCommands(
+            harness.launchContext(),
             harness.runtime_table_->deviceLayerState(0),
             d_plan,
             d_plan_count,
@@ -546,6 +593,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_DynamicMaintenancePackAndControllerDetermini
     auto run_maintenance = [&]()
     {
         ASSERT_TRUE(harness.kernel_->packDeviceRebalanceHistograms(
+            harness.launchContext(),
             harness.runtime_table_->deviceLayerState(0),
             d_local_histograms,
             config));
@@ -556,6 +604,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_DynamicMaintenancePackAndControllerDetermini
                                  harness.stream_),
                   hipSuccess);
         ASSERT_TRUE(harness.kernel_->runDeviceRebalanceController(
+            harness.launchContext(),
             harness.runtime_table_->deviceLayerState(0),
             d_gathered_histograms,
             d_status,
@@ -697,6 +746,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
     ASSERT_EQ(hipMalloc(&d_header, sizeof(DeviceMoERebalanceCommandBufferHeader)), hipSuccess);
     ASSERT_EQ(hipMalloc(&d_plan_status, sizeof(DeviceMoERebalanceStatus)), hipSuccess);
     ASSERT_TRUE(harness.kernel_->materializePrefillLeastLoadedTransferCommands(
+        harness.launchContext(),
         harness.runtime_table_->deviceLayerState(0),
         d_plan,
         d_plan_count,
@@ -780,6 +830,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
               hipSuccess);
 
     ASSERT_TRUE(harness.kernel_->packDeviceRebalanceSourceDescriptors(
+        harness.launchContext(),
         harness.runtime_table_->deviceLayerState(0),
         d_plan,
         d_header,
@@ -802,6 +853,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
         auto pack_payloads = [&]()
         {
             ASSERT_TRUE(harness.kernel_->packDeviceRebalanceCompactPayloads(
+                harness.launchContext(),
                 d_plan,
                 d_header,
                 plan_capacity,
@@ -825,6 +877,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
         auto unpack_payloads = [&]()
         {
             ASSERT_TRUE(harness.kernel_->unpackDeviceRebalanceCollectivePayloads(
+                harness.launchContext(),
                 d_plan,
                 d_plan_count,
                 plan_capacity,
@@ -840,6 +893,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
         auto apply_arrivals = [&]()
         {
             ASSERT_TRUE(harness.kernel_->applyDeviceRebalanceArrivals(
+                harness.launchContext(),
                 harness.runtime_table_->deviceLayerState(0),
                 d_plan,
                 d_plan_count,
@@ -860,6 +914,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
     auto pack_payloads_once = [&]()
     {
         ASSERT_TRUE(harness.kernel_->packDeviceRebalanceCompactPayloads(
+            harness.launchContext(),
             d_plan,
             d_header,
             plan_capacity,
@@ -885,6 +940,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
         DeviceMoERebalanceConfig destination_config = rebalanceConfig(shape);
         destination_config.participant_id = 1u;
         ASSERT_TRUE(harness.kernel_->unpackDeviceRebalanceCollectivePayloads(
+            harness.launchContext(),
             d_plan,
             d_plan_count,
             plan_capacity,
@@ -902,6 +958,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
         DeviceMoERebalanceConfig destination_config = rebalanceConfig(shape);
         destination_config.participant_id = 1u;
         ASSERT_TRUE(harness.kernel_->applyDeviceRebalanceArrivals(
+            harness.launchContext(),
             harness.runtime_table_->deviceLayerState(0),
             d_plan,
             d_plan_count,
@@ -945,6 +1002,22 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
     const double bucket_copy_us = time_component_us(copy_payload_bucket_once);
     const double unpack_us = time_component_us(unpack_payloads_once);
     const double apply_us = time_component_us(apply_arrivals_once);
+
+    /*
+     * The unpack-only timing loop intentionally reuses an append-only status
+     * record so the measured interval contains only the kernel under test.
+     * Clear that diagnostic record and execute one untimed production-shaped
+     * wave before validating counters; otherwise the assertion would compare
+     * all microbenchmark repetitions against one wave's expected arrivals.
+     */
+    ASSERT_EQ(hipMemsetAsync(
+                  d_unpack_status,
+                  0,
+                  sizeof(DeviceMoERebalanceApplyStatus),
+                  harness.stream_),
+              hipSuccess);
+    run_payload_wave();
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
 
     DeviceMoERebalanceApplyStatus pack_status{};
     DeviceMoERebalanceApplyStatus unpack_status{};

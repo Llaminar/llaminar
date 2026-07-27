@@ -82,6 +82,57 @@ namespace llaminar2
         }
 
         /**
+         * @brief Validate position ownership and select optional host rows.
+         *
+         * Graph builders must preserve the position representation declared by
+         * ForwardInput. They may not manufacture host rows for a contiguous GPU
+         * range: doing so records an asynchronous H2D copy whose mutable source
+         * can race the next chunk. ExplicitRows accepts either host rows or
+         * device-resident rows; ContiguousOffset accepts only a single request
+         * represented by the scalar position_offset.
+         *
+         * @param input Forward invocation whose position contract is validated.
+         * @param graph_name Graph path used to make fatal diagnostics actionable.
+         * @return Host position rows, or null for device rows/contiguous offsets.
+         * @throws std::runtime_error when the declared contract is inconsistent.
+         */
+        const int *validatedHostPositionRows(
+            const ForwardInput &input,
+            const char *graph_name)
+        {
+            if (input.position_policy == ForwardPositionPolicy::ContiguousOffset)
+            {
+                if (input.batch_size != 1)
+                {
+                    throw std::runtime_error(
+                        std::string(graph_name) +
+                        ": contiguous position offsets require batch_size=1");
+                }
+                if (input.position_ids || input.position_ids_device)
+                {
+                    throw std::runtime_error(
+                        std::string(graph_name) +
+                        ": contiguous position offsets must not also provide position rows");
+                }
+                return nullptr;
+            }
+
+            if (!input.position_ids && !input.position_ids_device)
+            {
+                throw std::runtime_error(
+                    std::string(graph_name) +
+                    ": explicit position policy requires host or device rows");
+            }
+            if (input.position_ids_device && !input.device.is_gpu())
+            {
+                throw std::runtime_error(
+                    std::string(graph_name) +
+                    ": device position rows require a GPU graph");
+            }
+            return input.position_ids;
+        }
+
+        /**
          * @brief Resolve the layer id passed to a KV-cache stage.
          *
          * Plain PP-local ring caches are sized only for the current stage, so
@@ -455,7 +506,8 @@ namespace llaminar2
                 : request.full_vocab_output;
         policy.lm_head_vocab_size =
             policy.column_parallel ? config_.vocab_local : config_.vocab_size;
-        policy.needs_allgather = policy.column_parallel && mpi_ctx_ != nullptr;
+        policy.needs_allgather =
+            needsDistributedLMHeadAllGather(policy.column_parallel);
 
         if (policy.column_parallel)
         {
@@ -567,6 +619,22 @@ namespace llaminar2
          * descriptor, so the hidden states can be identical while logits drift.
          */
         return denseTPAllreduceEnabledForCurrentGraph();
+    }
+
+    bool QwenGraphBase::needsDistributedLMHeadAllGather(
+        bool column_parallel) const
+    {
+        return column_parallel &&
+               mpi_ctx_ &&
+               mpi_ctx_->world_size() > 1;
+    }
+
+    TensorBase *QwenGraphBase::graphLMHeadOutput(
+        bool column_parallel) const
+    {
+        if (needsDistributedLMHeadAllGather(column_parallel))
+            return buffers_.logits;
+        return column_parallel ? buffers_.logits_local : buffers_.logits;
     }
 
     bool QwenGraphBase::needsPhaseSplitPrefillKVCacheHandoff(
@@ -1193,30 +1261,45 @@ namespace llaminar2
         const int total_tokens = input.batch_size * input.seq_len;
         DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
 
-        // Adapt generic ForwardInput to ForwardInput
-        ForwardInput qwen_input;
-        qwen_input.token_ids = input.token_ids;
-        qwen_input.token_ids_device = input.token_ids_device;
-        qwen_input.position_ids = input.position_ids;
-        qwen_input.position_ids_device = input.position_ids_device;
-        qwen_input.batch_size = input.batch_size;
-        qwen_input.seq_len = input.seq_len;
-        qwen_input.real_seq_len = input.real_seq_len;
-        qwen_input.bucket_seq_len = input.bucket_seq_len;
-        qwen_input.token_offset = input.token_offset;
-        qwen_input.position_offset = input.position_offset;
-        qwen_input.device = input.device;
-        qwen_input.kv_cache = input.kv_cache;
-        qwen_input.sequence_lengths = input.sequence_lengths;
-        qwen_input.sequence_lengths_device = input.sequence_lengths_device;
+        /*
+         * Preserve the complete declarative input contract while entering the
+         * Qwen builder.  ForwardInput is already the graph system's shared
+         * value type, so a field-by-field adapter is both unnecessary and
+         * unsafe: adding a field such as position_policy can otherwise leave
+         * Qwen on that field's default while the execution engine requested a
+         * different policy.  Whole-value copying makes future input-policy
+         * additions structurally impossible to omit at this boundary.
+         */
+        ForwardInput qwen_input = input;
 
         // Adapt generic ForwardOutput to ForwardOutput
         ForwardOutput qwen_output;
         qwen_output.logits = output.logits;
         qwen_output.hidden = output.hidden;
 
-        // Build the graph
-        ComputeGraph graph = buildFullForwardGraph(qwen_input, qwen_output);
+        /*
+         * Prefix runtime rehydration changes graph topology: every MoE layer
+         * prepends one captured payload-transfer transaction. Keep that policy
+         * in a scoped graph-build value so derived declarative FFN builders can
+         * attach the transaction without consulting mutable host runtime state.
+         */
+        const bool previous_rehydration_scope =
+            prefix_runtime_rehydration_graph_active_;
+        prefix_runtime_rehydration_graph_active_ =
+            qwen_input.rehydrate_prefix_runtime_on_device;
+        ComputeGraph graph;
+        try
+        {
+            graph = buildFullForwardGraph(qwen_input, qwen_output);
+            prefix_runtime_rehydration_graph_active_ =
+                previous_rehydration_scope;
+        }
+        catch (...)
+        {
+            prefix_runtime_rehydration_graph_active_ =
+                previous_rehydration_scope;
+            throw;
+        }
 
         // Copy back output pointers (in case they were set by the builder)
         output.logits = qwen_output.logits;
@@ -1256,7 +1339,7 @@ namespace llaminar2
         // Build FFN graph
         ComputeGraph ffn_graph = buildFFNGraph(
             layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
-            ctx.batch_size, ctx.device);
+            ctx.batch_size, ctx.device, ctx.sequence_lengths_device);
 
         // Merge: attention -> FFN
         std::string attn_last = attn_graph.terminalNode();
@@ -1355,16 +1438,8 @@ namespace llaminar2
                                     ? "embedding_allreduce"
                                     : "embedding";
 
-        // Position IDs must be provided externally (or use fallback for backward compat)
-        const int *position_ids = input.position_ids;
-        std::vector<int> local_position_ids;
-        if (!position_ids)
-        {
-            // Fallback: build position IDs internally (deprecated path)
-            local_position_ids = buildPositionIds(input.seq_len, input.batch_size, input.position_offset);
-            position_ids = local_position_ids.data();
-            LOG_DEBUG("[QwenGraphBase] Position IDs built internally (deprecated - prefer external input)");
-        }
+        const int *position_ids =
+            validatedHostPositionRows(input, "Qwen standard forward graph");
 
         // Check if we have layer weight accessor
         if (!hasLayerWeightSource())
@@ -1398,7 +1473,7 @@ namespace llaminar2
             // Build FFN graph for this layer
             ComputeGraph ffn_graph = buildFFNGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
-                input.batch_size, device);
+                input.batch_size, device, input.sequence_lengths_device);
 
             // Get the terminal node of FFN sub-graph
             std::string ffn_last = ffn_graph.terminalNode();
@@ -1429,9 +1504,15 @@ namespace llaminar2
                 ? BufferId::RESIDUAL
                 : BufferId::HIDDEN_STATE;
 
-        addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                            prev_node, total_tokens, device, final_norm_input_id);
-        prev_node = "final_norm";
+        prev_node = addFinalNormToGraph(
+            graph,
+            final_norm_input,
+            buffers_.layer_buffers.normalized,
+            prev_node,
+            total_tokens,
+            device,
+            final_norm_input_id,
+            input.sequence_lengths_device);
 
         std::string lm_head_dependency = prev_node;
         TensorBase *lm_head_input = maybeAddLMHeadRowSelect(
@@ -1501,7 +1582,7 @@ namespace llaminar2
         prev_node = "lm_head";
 
         // Phase 5: AllGather stage for column-parallel LM head
-        if (use_column_parallel && mpi_ctx_)
+        if (needsDistributedLMHeadAllGather(use_column_parallel))
         {
             LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather in buildFullForwardGraph: world_size="
                       << mpi_ctx_->world_size() << " total_tokens=" << total_tokens);
@@ -1527,7 +1608,7 @@ namespace llaminar2
         }
 
         // Set output
-        output.logits = buffers_.logits;
+        output.logits = graphLMHeadOutput(use_column_parallel);
 
         LOG_DEBUG("[QwenGraphBase] Built full forward graph with "
                   << graph.size() << " nodes");
@@ -1655,59 +1736,20 @@ namespace llaminar2
         else if (input.external_hidden_state)
         {
             // -----------------------------------------------------------------
-            // PP middle/final stage: Use external hidden state as starting point
-            // The external_hidden_state tensor contains activations from the
-            // previous PP stage. We need to copy it to our working buffer if
-            // they're different.
+            // PP middle/final stage: the execution engine has already handed the
+            // external activation to this graph's working buffer through
+            // TransferEngine. Graph construction only declares the layer DAG;
+            // it must never materialize or move tensor contents itself.
             // -----------------------------------------------------------------
             TensorBase *working_buffer = (buffers_.layer_buffers.residual && config_.isHybridQ16())
                                              ? buffers_.layer_buffers.residual
                                              : buffers_.current_hidden;
 
-            // Check if external buffer differs from working buffer
             if (input.external_hidden_state != working_buffer)
             {
-                LOG_DEBUG("[QwenGraphBase] PP middle stage: copying external hidden state to working buffer");
-
-                // NOTE: TensorCopyStage is not yet implemented. For now, we perform
-                // the copy inline. In Phase 3, we should add TensorCopyStage for
-                // proper graph-based memory transfer with device awareness.
-
-                size_t copy_bytes = static_cast<size_t>(total_tokens * config_.d_model);
-                if (config_.isHybridQ16())
-                {
-                    // Q16_1: copy the raw Q16_1 blocks
-                    // Block size = 32 elements, so num_blocks = copy_elements / 32
-                    size_t num_blocks = (copy_bytes + 31) / 32;
-                    copy_bytes = num_blocks * sizeof(Q16_1Block);
-                }
-                else
-                {
-                    // FP32: copy floats
-                    copy_bytes *= sizeof(float);
-                }
-
-                // Unified PP copy: data() handles all device coherence sync
-                // automatically (including D2H via staging buffer).
-                // This eliminates the previous 3-way D2D/CPU branch.
-                const void *src = input.external_hidden_state->data();
-                void *dst = working_buffer->mutable_data();
-                std::memcpy(dst, src, copy_bytes);
-
-                if (config_.default_device.is_gpu())
-                {
-                    DeviceId target_device = config_.default_device;
-                    if (!working_buffer->ensureOnDevice(target_device))
-                    {
-                        LOG_ERROR("[QwenGraphBase] Failed to upload working buffer to "
-                                  << target_device.toString());
-                        throw std::runtime_error("Failed to upload working buffer");
-                    }
-                    working_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, target_device);
-                }
-
-                LOG_DEBUG("[QwenGraphBase] PP copy: " << copy_bytes << " bytes to "
-                                                      << config_.default_device.toString());
+                LOG_TRACE(
+                    "[QwenGraphBase] PP external activation was prepared in the "
+                    "graph working buffer before declarative graph construction");
             }
             else
             {
@@ -1724,16 +1766,8 @@ namespace llaminar2
         // -------------------------------------------------------------------------
         // Stage 2: Transformer Layers (subset for this PP stage)
         // -------------------------------------------------------------------------
-        // Position IDs must be provided externally (or use fallback for backward compat)
-        const int *position_ids = input.position_ids;
-        std::vector<int> local_position_ids;
-        if (!position_ids)
-        {
-            // Fallback: build position IDs internally (deprecated path)
-            local_position_ids = buildPositionIds(input.seq_len, input.batch_size, input.position_offset);
-            position_ids = local_position_ids.data();
-            LOG_DEBUG("[QwenGraphBase] Position IDs built internally (deprecated - prefer external input)");
-        }
+        const int *position_ids =
+            validatedHostPositionRows(input, "Qwen partial pipeline forward graph");
 
         // Build graphs for assigned layer range [first_layer, last_layer)
         for (int layer = first_layer; layer < last_layer; ++layer)
@@ -1772,7 +1806,7 @@ namespace llaminar2
             // Build FFN graph for this layer
             ComputeGraph ffn_graph = buildFFNGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
-                input.batch_size, device);
+                input.batch_size, device, input.sequence_lengths_device);
 
             // Get the terminal node of FFN sub-graph
             std::string ffn_last = ffn_graph.terminalNode();
@@ -1800,9 +1834,15 @@ namespace llaminar2
                     ? BufferId::RESIDUAL
                     : BufferId::HIDDEN_STATE;
 
-            addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                                prev_node, total_tokens, device, final_norm_input_id);
-            prev_node = "final_norm";
+            prev_node = addFinalNormToGraph(
+                graph,
+                final_norm_input,
+                buffers_.layer_buffers.normalized,
+                prev_node,
+                total_tokens,
+                device,
+                final_norm_input_id,
+                input.sequence_lengths_device);
 
             std::string lm_head_dependency = prev_node;
             TensorBase *lm_head_input = maybeAddLMHeadRowSelect(
@@ -1861,7 +1901,7 @@ namespace llaminar2
             prev_node = "lm_head";
 
             // AllGather stage for column-parallel LM head
-            if (use_column_parallel && mpi_ctx_)
+            if (needsDistributedLMHeadAllGather(use_column_parallel))
             {
                 LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather in buildPartialForwardGraph: world_size="
                           << mpi_ctx_->world_size() << " total_tokens=" << total_tokens);
@@ -1885,7 +1925,7 @@ namespace llaminar2
             }
 
             // Set output logits
-            output.logits = buffers_.logits;
+            output.logits = graphLMHeadOutput(use_column_parallel);
         }
         else
         {
@@ -1946,15 +1986,8 @@ namespace llaminar2
         std::string prev_node;
         int total_tokens = input.batch_size * input.seq_len;
 
-        // Position IDs
-        const int *position_ids = input.position_ids;
-        std::vector<int> local_position_ids;
-        if (!position_ids)
-        {
-            local_position_ids = buildPositionIds(input.seq_len, input.batch_size, input.position_offset);
-            position_ids = local_position_ids.data();
-            LOG_DEBUG("[QwenGraphBase] Position IDs built internally for unified PP graph");
-        }
+        const int *position_ids =
+            validatedHostPositionRows(input, "Qwen unified pipeline forward graph");
 
         // =====================================================================
         // 3. Iterate over PP stages
@@ -2108,7 +2141,9 @@ namespace llaminar2
                 // Build FFN graph
                 ComputeGraph ffn_graph = buildFFNGraph(
                     layer_weights, buffers_.layer_buffers, layer, input.seq_len,
-                    input.batch_size, stage_device);
+                    input.batch_size,
+                    stage_device,
+                    input.sequence_lengths_device);
 
                 // Get the terminal node of FFN sub-graph
                 std::string ffn_last = ffn_graph.terminalNode();
@@ -2197,9 +2232,15 @@ namespace llaminar2
                         ? BufferId::RESIDUAL
                         : BufferId::HIDDEN_STATE;
 
-                addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                                    prev_node, total_tokens, stage_device, final_norm_input_id);
-                prev_node = "final_norm";
+                prev_node = addFinalNormToGraph(
+                    graph,
+                    final_norm_input,
+                    buffers_.layer_buffers.normalized,
+                    prev_node,
+                    total_tokens,
+                    stage_device,
+                    final_norm_input_id,
+                    input.sequence_lengths_device);
 
                 std::string lm_head_dependency = prev_node;
                 TensorBase *lm_head_input = maybeAddLMHeadRowSelect(
@@ -2256,7 +2297,7 @@ namespace llaminar2
                 prev_node = "lm_head";
 
                 // AllGather stage for column-parallel LM head
-                if (use_column_parallel && mpi_ctx_)
+                if (needsDistributedLMHeadAllGather(use_column_parallel))
                 {
                     LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather in unified PP: world_size="
                               << mpi_ctx_->world_size());
@@ -2279,7 +2320,7 @@ namespace llaminar2
                     graph.addDependency("lm_head_allgather", prev_node);
                 }
 
-                output.logits = buffers_.logits;
+                output.logits = graphLMHeadOutput(use_column_parallel);
 
                 LOG_DEBUG("[QwenGraphBase] Added LM head stage on device " << stage_device.to_string());
             }
@@ -2356,7 +2397,8 @@ namespace llaminar2
         ComputeGraph graph = GraphBuilder::build(resolved);
 
         // Set output
-        output.logits = buffers_.logits;
+        output.logits = graphLMHeadOutput(
+            useColumnParallelLMHeadForGraph(buffers_.logits_local));
 
         LOG_DEBUG("[QwenGraphBase] Built schema-based forward graph with "
                   << graph.size() << " nodes");
@@ -2669,8 +2711,10 @@ namespace llaminar2
         int layer_idx,
         int seq_len,
         int batch_size,
-        DeviceId device)
+        DeviceId device,
+        const int32_t *sequence_lengths_device)
     {
+        (void)sequence_lengths_device;
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
         std::string ffn_terminal; // Track the last node for terminalNode()
@@ -3165,14 +3209,15 @@ namespace llaminar2
         return config;
     }
 
-    void QwenGraphBase::addFinalNormToGraph(
+    std::string QwenGraphBase::addFinalNormToGraph(
         ComputeGraph &graph,
         TensorBase *hidden,
         TensorBase *normalized_out,
         const std::string &prev_node,
         int n_tokens,
         DeviceId device,
-        BufferId input_buffer_id)
+        BufferId input_buffer_id,
+        const int32_t *sequence_lengths_device)
     {
         RMSNormStage::Params norm_params;
         norm_params.input = hidden;
@@ -3191,14 +3236,31 @@ namespace llaminar2
         norm_params.input_buffer_id = input_buffer_id;
         norm_params.output_buffer_id = BufferId::NORMALIZED;
 
+        const std::string norm_dependency =
+            maybeAddFinalNormDiagnosticCheckpoint(
+                graph,
+                "final_norm_input",
+                hidden,
+                prev_node,
+                n_tokens,
+                device,
+                sequence_lengths_device);
         graph.addNode("final_norm",
                       ComputeStageFactory::createRMSNorm(norm_params),
                       device);
 
-        if (!prev_node.empty())
+        if (!norm_dependency.empty())
         {
-            graph.addDependency("final_norm", prev_node);
+            graph.addDependency("final_norm", norm_dependency);
         }
+        return maybeAddFinalNormDiagnosticCheckpoint(
+            graph,
+            "final_norm_output",
+            normalized_out,
+            "final_norm",
+            n_tokens,
+            device,
+            sequence_lengths_device);
     }
 
     const TPDomain *QwenGraphBase::getDomainForLayer(int layer_idx, bool is_attention) const

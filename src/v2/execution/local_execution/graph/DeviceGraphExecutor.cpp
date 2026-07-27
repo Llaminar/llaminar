@@ -11,7 +11,7 @@
 #include "GraphCaptureGuard.h"
 #include "../../debug/StageDumper.h"
 #include "../../debug/AsyncStageDumper.h"
-#include "../coherence/StageCoherence.h"
+#include "../coherence/CoherencePolicy.h"
 #include "../collective/CollectiveContext.h"
 #include "../../compute_stages/stages/AllreduceStage.h"
 #include "../../compute_stages/stages/AllGatherStage.h"
@@ -25,6 +25,8 @@
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../backends/BackendManager.h"
+#include "../../../transfer/TransferEngine.h"
+#include "../../../loaders/PreparedWeightStore.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -144,7 +146,7 @@ namespace llaminar2
             IDeviceContext *ctx,
             const GraphExecutorConfig &config)
         {
-            if (!node.stage || node.stage->gpuStream() != nullptr)
+            if (!node.stage || node.stage->hasGPUStream())
             {
                 return true;
             }
@@ -194,36 +196,6 @@ namespace llaminar2
                 return true;
             }
 
-            struct PendingDependency
-            {
-                IWorkerGPUContext *gpu_ctx = nullptr;
-                void *worker_stream = nullptr;
-                void *old_stream = nullptr;
-            };
-
-            std::vector<PendingDependency> pending_dependencies;
-
-            auto rememberDependency = [&](IWorkerGPUContext *gpu_ctx, void *worker_stream, void *old_stream)
-            {
-                if (!gpu_ctx || !worker_stream || !old_stream || old_stream == worker_stream)
-                {
-                    return;
-                }
-                const auto already_present = std::any_of(
-                    pending_dependencies.begin(),
-                    pending_dependencies.end(),
-                    [&](const PendingDependency &dep)
-                    {
-                        return dep.gpu_ctx == gpu_ctx &&
-                               dep.worker_stream == worker_stream &&
-                               dep.old_stream == old_stream;
-                    });
-                if (!already_present)
-                {
-                    pending_dependencies.push_back({gpu_ctx, worker_stream, old_stream});
-                }
-            };
-
             for (const auto &entry : schedule)
             {
                 auto *node = entry.node;
@@ -258,19 +230,12 @@ namespace llaminar2
                     return false;
                 }
 
-                void *stage_stream = node->stage->gpuStream();
-                if (stage_stream)
+                if (node->stage->hasGPUStream())
                 {
                     continue;
                 }
 
-                rememberDependency(gpu_ctx, worker_stream, stage_stream);
                 node->stage->setGPUStream(worker_stream);
-            }
-
-            for (const auto &dep : pending_dependencies)
-            {
-                dep.gpu_ctx->insertStreamDependency(dep.worker_stream, dep.old_stream);
             }
 
             return true;
@@ -700,6 +665,94 @@ namespace llaminar2
         return runStages(graph, ctx, policy, collective_nodes);
     }
 
+    bool DeviceGraphExecutor::prepareInputsForGraphCapture(
+        ComputeGraph &graph,
+        IDeviceContext *ctx,
+        void *capture_stream,
+        const char *context)
+    {
+        if (!arena_)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Cannot prepare graph input dependencies without a BufferArena"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+        if (!ctx || !ctx->isGPU())
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Graph input dependency preparation requires a GPU context"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+        if (!capture_stream)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Graph input dependency preparation requires the exact capture stream"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Graph input dependencies must be prepared before beginCapture()"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+
+        const DeviceId capture_device = ctx->deviceId();
+        std::unordered_set<ITensor *> prepared_inputs;
+
+        try
+        {
+            for (const auto &name : graph.getExecutionOrder())
+            {
+                ComputeNode *node = graph.getNode(name);
+                if (!node || !node->stage)
+                    continue;
+
+                DeviceId target_device =
+                    node->device.is_valid() ? node->device : node->stage->device();
+                if (!target_device.is_valid())
+                    target_device = capture_device;
+                if (target_device != capture_device)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] A native graph capture cannot span "
+                              << capture_device.toString() << " and "
+                              << target_device.toString() << " at stage '" << name << "'"
+                              << (context ? std::string(" (") + context + ")" : std::string()));
+                    return false;
+                }
+
+                const StageBufferContract contract = node->stage->bufferContract();
+                for (const auto &binding : contract.allArenaReads())
+                {
+                    ITensor *tensor = arena_->getTensor(binding.id);
+                    if (!tensor)
+                    {
+                        LOG_ERROR("[DeviceGraphExecutor] Graph input "
+                                  << bufferIdName(binding.id)
+                                  << " is not bound for stage '" << name << "'"
+                                  << (context ? std::string(" (") + context + ")" : std::string()));
+                        return false;
+                    }
+                    if (!prepared_inputs.insert(tensor).second)
+                        continue;
+
+                    TransferEngine::requireDeviceInput(
+                        tensor,
+                        capture_device,
+                        capture_stream);
+                }
+            }
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Failed to prepare graph input dependencies"
+                      << (context ? std::string(" (") + context + ")" : std::string())
+                      << ": " << e.what());
+            return false;
+        }
+
+        return true;
+    }
+
     bool DeviceGraphExecutor::prepareSnapshotsForGraphCapture(
         ComputeGraph &graph,
         IDeviceContext *ctx,
@@ -1041,7 +1094,8 @@ namespace llaminar2
             const bool needs_new_storage =
                 !copy.storage ||
                 copy.device != copy_device ||
-                copy.storage_bytes < storage_bytes;
+                copy.storage_bytes < storage_bytes ||
+                !copy.storage->isMapped();
 
             if (needs_new_storage)
             {
@@ -1054,16 +1108,31 @@ namespace llaminar2
                     return false;
                 }
 
-                copy.storage = std::make_unique<FP32Tensor>(
+                /*
+                 * Snapshot values are intentional debug results surfaced to
+                 * the host. Give each immutable graph slot mapped host storage
+                 * and record the point-in-time D2D copy into its device-visible
+                 * address. This preserves arena-aliased stage values without
+                 * reserving one full HBM tensor per output.
+                 */
+                copy.storage = FP32Tensor::createMapped(
                     std::vector<size_t>{storage_elements},
                     copy_device);
+                if (!copy.storage || !copy.storage->isMapped())
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Failed to allocate required mapped graph "
+                              "snapshot storage for stage '"
+                              << node.name << "' output '" << copy.name << "' bytes="
+                              << copy.byte_size << " on " << copy_device.toString());
+                    return false;
+                }
                 copy.device = copy_device;
                 copy.storage_bytes = storage_bytes;
             }
 
-            if (!copy.storage->allocateOnDevice(copy_device, producer_stream))
+            if (!copy.storage->gpu_data_ptr())
             {
-                LOG_ERROR("[DeviceGraphExecutor] Failed to allocate graph snapshot storage for stage '"
+                LOG_ERROR("[DeviceGraphExecutor] Mapped graph snapshot storage has no device-visible pointer for stage '"
                           << node.name << "' output '" << copy.name << "' on "
                           << copy_device.toString());
                 return false;
@@ -1115,14 +1184,14 @@ namespace llaminar2
                  * publisher re-marks this storage with a real completion event
                  * after the captured graph is launched.
                  */
-                copy.storage->transitionTo(
-                    TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                TransferEngine::publishGraphOwnedDeviceWrite(
+                    copy.storage.get(),
                     copy_device);
             }
             else
             {
-                copy.storage->transitionToWithEvent(
-                    TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                TransferEngine::publishDeviceWrite(
+                    copy.storage.get(),
                     copy_device,
                     producer_stream);
             }
@@ -1136,6 +1205,17 @@ namespace llaminar2
         void *producer_stream)
     {
         if (!config_.snapshot_callback)
+            return true;
+
+        /*
+         * Snapshot selection is one immutable contract shared by warmup,
+         * graph recording, and post-launch publication. Fast collective stages
+         * return through an abbreviated execution branch and invoke this
+         * helper directly; without the guard here, an intentionally filtered
+         * stage was treated as a missing-manifest error even though preparation
+         * and recording had correctly skipped it.
+         */
+        if (!shouldCaptureSnapshotStage(stage_name))
             return true;
 
         if (graph_snapshot_outputless_stages_.contains(stage_name))
@@ -1177,12 +1257,12 @@ namespace llaminar2
                 return false;
             }
 
-            // Replay updates the storage through a captured D2D node, but no CPU
-            // stage code runs then. Mark each slot dirty with a real post-launch
-            // event so host publication downloads the just-replayed bytes rather
-            // than reusing an older host snapshot.
-            copy.storage->transitionToWithEvent(
-                TensorCoherenceState::DEVICE_AUTHORITATIVE,
+            // Replay updates the mapped storage through a captured D2D node, but
+            // no CPU stage code runs then. Mark each slot dirty with a real
+            // post-launch event so host publication waits for the just-replayed
+            // bytes before reading the host-visible mapping.
+            TransferEngine::publishDeviceWrite(
+                copy.storage.get(),
                 copy.device,
                 producer_stream);
 
@@ -1580,6 +1660,50 @@ namespace llaminar2
             config_.stage_failure_callback(node_name, reason);
     }
 
+    bool DeviceGraphExecutor::validatePreparedWeightBindings(
+        const ComputeNode &node,
+        const StageBufferContract &contract,
+        DeviceId target_device) const
+    {
+        for (const auto &prepared : contract.prepared_weights)
+        {
+            const PreparedWeightRef &ref = prepared.ref;
+            auto fail = [&](const std::string &reason)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Invalid prepared-weight contract for stage '"
+                          << node.name << "': " << reason
+                          << " binding_id=" << ref.binding_id
+                          << " kind=" << toString(ref.kind)
+                          << " ref_device=" << ref.device.toString()
+                          << " stage_device=" << target_device.toString());
+                return false;
+            };
+
+            if (!prepared.source_tensor)
+                return fail("missing source tensor");
+            if (!prepared.store)
+                return fail("missing PreparedWeightStore");
+            if (ref.binding_id == 0 ||
+                ref.kind == PreparedWeightKind::None ||
+                !ref.device.is_valid())
+            {
+                return fail("incomplete PreparedWeightRef");
+            }
+            if (ref.device != target_device)
+                return fail("PreparedWeightRef belongs to another device");
+            if (!prepared.store->contains(ref))
+                return fail("PreparedWeightStore does not contain the exact ref");
+
+            const auto binding = prepared.store->binding(ref);
+            if (!binding.has_value())
+                return fail("PreparedWeightStore ref has no binding");
+            if (binding->tensor != prepared.source_tensor)
+                return fail("PreparedWeightStore binding names a different source tensor");
+        }
+
+        return true;
+    }
+
     bool DeviceGraphExecutor::runStages(
         ComputeGraph &graph,
         IDeviceContext *ctx,
@@ -1836,17 +1960,10 @@ namespace llaminar2
                 }
                 else if (stage_type == ComputeStageType::ALLGATHER)
                 {
-                    if (debugEnv().execution.gpu_graph_collective_segmented)
-                    {
-                        LOG_DEBUG("[DeviceGraphExecutor] Skipping strided ALLGATHER intercept in segmented collective mode for '" << node.name << "'");
-                    }
-                    else
-                    {
-                        LOG_DEBUG("[DeviceGraphExecutor] Attempting strided ALLGATHER intercept for '" << node.name << "'");
-                        if (executeCollectiveStridedAllgather(node, ctx))
-                            return true;
-                        LOG_DEBUG("[DeviceGraphExecutor] Strided ALLGATHER not available, using stage execution");
-                    }
+                    LOG_DEBUG("[DeviceGraphExecutor] Attempting strided ALLGATHER intercept for '" << node.name << "'");
+                    if (executeCollectiveStridedAllgather(node, ctx))
+                        return true;
+                    LOG_DEBUG("[DeviceGraphExecutor] Strided ALLGATHER not available, using stage execution");
                 }
             }
 
@@ -1900,21 +2017,46 @@ namespace llaminar2
                 }
 
                 /*
-                 * Fast collective execution is still a stage boundary.  GPU
-                 * graph capture/replay disables host callbacks while the graph
-                 * body is recorded or launched, but the graph-stable D2D
-                 * snapshot copy must be recorded immediately after the
-                 * collective.  Returning before this hook lets post-collective
-                 * diagnostics such as *_ALLREDUCED observe an older copy even
-                 * though the in-graph tensor payload is correct.
+                 * Fast collective execution is still a complete stage
+                 * boundary, even though this branch returns before the normal
+                 * snapshot section at the bottom of runStage().  Therefore it
+                 * must reproduce both halves of that section's GPU contract:
+                 *
+                 * 1. Record a D2D copy immediately after the collective.  When
+                 *    stream capture is active this becomes a graph node and
+                 *    preserves the exact post-allreduce bytes before a later
+                 *    arena alias can overwrite the source buffer.
+                 * 2. Publish the copied slot immediately only for eager
+                 *    execution.  Captured execution cannot perform D2H work or
+                 *    invoke host callbacks inside the graph; its caller
+                 *    publishes the immutable slot manifest after launch.
+                 *
+                 * policy.snapshot_callback controls immediate host
+                 * publication, not whether the graph-stable D2D copy exists.
+                 * Conditioning the copy on !policy.snapshot_callback left
+                 * *_ALLREDUCED diagnostics permanently stuck at warmup bytes
+                 * for monolithic prefill graphs.
                  */
-                if (ok && config_.snapshot_callback && !policy.snapshot_callback)
+                if (ok && config_.snapshot_callback)
                 {
                     DeviceId snapshot_device = target_device;
                     if (!snapshot_device.is_valid() && ctx)
                         snapshot_device = ctx->deviceId();
-                    if (!captureGraphSnapshotCopies(node, snapshot_device, node.stage->gpuStream()))
+                    if (!captureGraphSnapshotCopies(
+                            node,
+                            snapshot_device,
+                            node.stage->gpuStream()))
+                    {
                         ok = false;
+                    }
+                    else if (policy.snapshot_callback &&
+                             !isGraphCaptureActive() &&
+                             !publishGraphSnapshotCopies(
+                                 node.name,
+                                 node.stage->gpuStream()))
+                    {
+                        ok = false;
+                    }
                 }
 
                 if (profiling_fast)
@@ -1929,10 +2071,9 @@ namespace llaminar2
                     stats_.stage_type_execute_ms[stage_type_name] += exec_ms;
                     stats_.stage_type_counts[stage_type_name]++;
 
-                    const auto stype = node.stage->type();
-                    if (stype == ComputeStageType::ALLREDUCE ||
-                        stype == ComputeStageType::ALLGATHER ||
-                        stype == ComputeStageType::ALLGATHER_V)
+                    const bool stage_is_collective =
+                        node.stage->isCollectiveStage();
+                    if (stage_is_collective)
                     {
                         stats_.total_collective_ms += exec_ms;
                         stats_.total_collective_calls++;
@@ -1951,9 +2092,7 @@ namespace llaminar2
                         phase_stats->total_stages_executed++;
                         phase_stats->stage_type_execute_ms[stage_type_name] += exec_ms;
                         phase_stats->stage_type_counts[stage_type_name]++;
-                        if (stype == ComputeStageType::ALLREDUCE ||
-                            stype == ComputeStageType::ALLGATHER ||
-                            stype == ComputeStageType::ALLGATHER_V)
+                        if (stage_is_collective)
                         {
                             phase_stats->total_collective_ms += exec_ms;
                             phase_stats->total_collective_calls++;
@@ -1995,6 +2134,19 @@ namespace llaminar2
         if (!ensureStageGPUStreamBound(node, ctx, config_))
             return false;
         void *stage_stream = node.stage ? node.stage->gpuStream() : nullptr;
+
+        // Prepared representations are a graph-construction invariant, not a
+        // coherence side effect. Validate them before any raw source tensor can
+        // be uploaded or observed by a stage.
+        std::string prepared_error;
+        if (!node.stage->validatePreparedWeights(&prepared_error))
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Prepared weight validation failed for stage '"
+                      << node.name << "': " << prepared_error);
+            return false;
+        }
+        if (!validatePreparedWeightBindings(node, contract, target_device))
+            return false;
 
         // =====================================================================
         // Stage Dump: input snapshot setup
@@ -2059,7 +2211,12 @@ namespace llaminar2
                     input_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
                 }
 
-                // Weight coherence (not arena-managed, use direct ensureOnDevice).
+                // Weight residency is not arena-managed. GPU preparation owns
+                // placement before graph execution; the executor may only
+                // validate exact residency and join an existing producer event
+                // to this stage stream before exposing a raw weight pointer.
+                // A missing allocation is fatal here and can never trigger a
+                // lazy upload in the inference hot path.
                 // Only processes contract.weight_tensors — the canonical weight list.
                 // dump_info.weights duplicates these, and dump_info.inputs are activation
                 // tensors already handled by arena coherence above.
@@ -2078,25 +2235,14 @@ namespace llaminar2
                     {
                         if (auto *tb = dynamic_cast<TensorBase *>(weight))
                         {
-                            // Skip weights whose GEMM representation is managed by the
-                            // PreparedWeightStore-backed GPU pipeline.
-                            // The kernel owns its device copy in pooled VRAM — calling
-                            // ensureOnDevice would fail because the host data may have
-                            // been released after pipeline upload.
-                            if (tb->hasPreparedDeviceState())
+                            if (target_device.is_gpu())
                             {
-                                continue;
+                                TransferEngine::requireDeviceInput(
+                                    tb, target_device, stage_stream);
                             }
-                            if (!tb->ensureOnDevice(target_device, stage_stream))
+                            else
                             {
-                                LOG_ERROR("[DeviceGraphExecutor] Weight upload failed for stage '"
-                                          << node.name << "'"
-                                          << " tensor=" << static_cast<void *>(tb)
-                                          << " name=" << (tb->debugName().empty() ? "(unnamed)" : tb->debugName())
-                                          << " shape=[" << tb->rows() << "," << tb->cols() << "]"
-                                          << " type=" << static_cast<int>(tb->native_type())
-                                          << " device=" << target_device.toString());
-                                return false;
+                                TransferEngine::prepareHostInput(tb);
                             }
                         }
                     }
@@ -2144,14 +2290,6 @@ namespace llaminar2
         // =====================================================================
         // ENTRY Verification (Debug/Integration only)
         // =====================================================================
-        std::string prepared_error;
-        if (!node.stage->validatePreparedWeights(&prepared_error))
-        {
-            LOG_ERROR("[DeviceGraphExecutor] Prepared weight validation failed for stage '"
-                      << node.name << "': " << prepared_error);
-            return false;
-        }
-
 #if LLAMINAR_ASSERTIONS_ACTIVE
         if (policy.validation && debugEnv().validation.validate_inputs)
         {
@@ -2484,10 +2622,9 @@ namespace llaminar2
             stats_.stage_type_execute_ms[stage_type_name] += execute_ms;
             stats_.stage_type_counts[stage_type_name]++;
 
-            const auto stype = node.stage->type();
-            if (stype == ComputeStageType::ALLREDUCE ||
-                stype == ComputeStageType::ALLGATHER ||
-                stype == ComputeStageType::ALLGATHER_V)
+            const bool stage_is_collective =
+                node.stage->isCollectiveStage();
+            if (stage_is_collective)
             {
                 stats_.total_collective_ms += execute_ms;
                 stats_.total_collective_calls++;
@@ -2516,9 +2653,7 @@ namespace llaminar2
                 phase_stats->total_stages_executed++;
                 phase_stats->stage_type_execute_ms[stage_type_name] += execute_ms;
                 phase_stats->stage_type_counts[stage_type_name]++;
-                if (stype == ComputeStageType::ALLREDUCE ||
-                    stype == ComputeStageType::ALLGATHER ||
-                    stype == ComputeStageType::ALLGATHER_V)
+                if (stage_is_collective)
                 {
                     phase_stats->total_collective_ms += execute_ms;
                     phase_stats->total_collective_calls++;
@@ -2707,7 +2842,7 @@ namespace llaminar2
     /**
      * @brief Print first N elements of stage outputs for debugging
      *
-     * Called AFTER markOutputsDirty() so GPU→host sync has occurred.
+     * Called after TransferEngine publishes the stage's exact producer event.
      * Controlled by LLAMINAR_STAGE_OUTPUT_PRINT environment variable.
      */
     static void printStageOutputs(const std::string &stage_name, const StageDumpInfo &dump_info, void *stream)
@@ -2846,10 +2981,8 @@ namespace llaminar2
         // Legacy entry point — delegates to unified runStage with full policy.
         // Retained for backward compatibility (used by executeMultiDevice and
         // graph capture's non-captured segment execution).
-        const bool is_collective = node.stage &&
-                                   (node.stage->type() == ComputeStageType::ALLREDUCE ||
-                                    node.stage->type() == ComputeStageType::ALLGATHER ||
-                                    node.stage->type() == ComputeStageType::ALLGATHER_V);
+        const bool is_collective =
+            node.stage && node.stage->isCollectiveStage();
         return runStage(node, ctx, StageRunPolicy::full(), is_collective);
     }
 

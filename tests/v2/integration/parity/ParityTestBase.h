@@ -89,6 +89,7 @@
 
 // Modern orchestration runner support (for incremental migration)
 #include "utils/TestOrchestrationHelper.h"
+#include "../../utils/ParitySnapshotSelection.h"
 #include "execution/runner/IOrchestrationRunner.h"
 #include "kernels/KernelFactory.h"
 #include "backends/BackendManager.h"
@@ -220,11 +221,21 @@ namespace llaminar2::test::parity
         /// produce partial outputs that can't be directly compared to full PyTorch outputs.
         std::vector<std::string> excluded_stages;
 
-        /// Stages whose snapshots should be allreduced (SUM) across MPI ranks before
-        /// comparing to PyTorch reference. Used for routed/TP partial sums (e.g., MoE expert
-        /// output, shared expert output) where each rank holds a partial contribution.
-        /// Requires mpi_ctx_ to be set. Stages listed here should NOT also be excluded.
+        /// Stages whose pre-collective snapshots are tensor-parallel partials.
+        /// LocalTP comparisons require the explicit `_ALLREDUCED` snapshot;
+        /// cross-rank TP comparisons sum the partial through MPI. Stages listed
+        /// here should not also be excluded.
         std::vector<std::string> allreduce_stages;
+
+        /**
+         * @brief Whether declared reductions execute across devices in this process.
+         *
+         * LocalTP publishes explicit `_ALLREDUCED` graph snapshot slots. Global
+         * and NodeLocal TP publish rank partials that the parity harness sums
+         * through MPI. This bit is copied from the declarative TestConfig so the
+         * model-agnostic comparison loop can select the correct evidence.
+         */
+        bool uses_in_process_local_tp = false;
 
         /**
          * @brief Declarative MoE rebalance/migration exercise policy.
@@ -2482,7 +2493,14 @@ namespace llaminar2::test::parity
             }
             catch (const std::exception &e)
             {
-                LOG_ERROR("[Parity] Failed to load snapshot '" << name << "': " << e.what());
+                /*
+                 * Stage snapshots are sparse by design: callers probe a common
+                 * stage list across dense, MoE, attention, and GDN layers.
+                 * Required snapshots are asserted by the caller after this
+                 * method returns empty, so logging every expected miss as an
+                 * error hides the actual parity failure in thousands of lines.
+                 */
+                LOG_DEBUG("[Parity] Snapshot unavailable '" << name << "': " << e.what());
                 return {};
             }
         }
@@ -4162,6 +4180,57 @@ namespace llaminar2::test::parity
             return 0;
         }
 
+        /**
+         * @brief Publish completed device maintenance status at the parity epilogue.
+         *
+         * Graph-owned MoE maintenance intentionally avoids host readback during
+         * decode. Before parity inspects the host-facing movement epoch, this
+         * method asks the active runner to publish only the newest completed
+         * maintenance status. The runner uses the maintenance stream and does
+         * not reset KV, recurrent, sampler, or graph state.
+         */
+        void activeDrainCompletedDecodeBoundaryMaintenanceDiagnostics()
+        {
+            if (orch_runner_)
+            {
+                orch_runner_->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
+            }
+            else if (auto *runner = activeLegacyRunner())
+            {
+                runner->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
+            }
+        }
+
+        /**
+         * @brief Decide whether a committed decode step must enter maintenance.
+         *
+         * A device-owned controller uses this hook as a scheduler tick, so
+         * every committed decode transaction must call it and let the captured
+         * scheduler enforce its own launch period. Legacy host controllers
+         * retain the explicit test cadence because their hook performs the
+         * planning/apply operation directly.
+         *
+         * @param completed_decode_steps One-based count of committed decode
+         *        transactions in the parity request.
+         * @return true when the production maintenance boundary must run.
+         */
+        bool parityMoERebalanceMaintenanceDue(
+            size_t completed_decode_steps) const
+        {
+            const auto &exercise = config_.moe_rebalance_exercise;
+            if (!exercise.enabled ||
+                exercise.request_every_decode_steps <= 0)
+            {
+                return false;
+            }
+            if (activeUsesDeviceSideMoERebalanceController())
+                return true;
+            return
+                (completed_decode_steps %
+                 static_cast<size_t>(
+                     exercise.request_every_decode_steps)) == 0;
+        }
+
         bool driveParityMoERebalanceMaintenance(
             const std::string &phase,
             int decode_step = -1)
@@ -4179,13 +4248,54 @@ namespace llaminar2::test::parity
                 return false;
             }
 
-            /*
-             * Device-side rebalance is graph-owned. Each decode forward runs
-             * histogram collection plus any scheduled maintenance; there is no
-             * host apply call to make here.
-             */
             if (device_side)
-                return true;
+            {
+                /*
+                 * Histogram collection and publication are graph-owned, but
+                 * scheduling begins at the committed transaction boundary.
+                 * Raw forward cannot invoke this early because grouped MTP may
+                 * still reject or roll back verifier rows. Enter the same
+                 * boundary used by serving and generation after parity has
+                 * committed this decode step.
+                 */
+                if (orch_runner_)
+                {
+                    if (!orch_runner_->maybeApplyMoERebalance())
+                    {
+                        ADD_FAILURE()
+                            << "Parity device-owned MoE maintenance failed during "
+                            << phase
+                            << (decode_step >= 0
+                                    ? (" step " + std::to_string(decode_step))
+                                    : "")
+                            << ": " << orch_runner_->lastError();
+                        return false;
+                    }
+                    return true;
+                }
+                if (auto *runner = activeLegacyRunner())
+                {
+                    if (!runner->maybeApplyDecodeBoundaryMaintenance())
+                    {
+                        ADD_FAILURE()
+                            << "Parity device-owned MoE maintenance failed during "
+                            << phase
+                            << (decode_step >= 0
+                                    ? (" step " + std::to_string(decode_step))
+                                    : "");
+                        return false;
+                    }
+                    return true;
+                }
+
+                ADD_FAILURE()
+                    << "Parity device-owned MoE maintenance has no active runner during "
+                    << phase
+                    << (decode_step >= 0
+                            ? (" step " + std::to_string(decode_step))
+                            : "");
+                return false;
+            }
 
             if (orch_runner_)
             {
@@ -4510,22 +4620,47 @@ namespace llaminar2::test::parity
                             continue;
                     }
 
-                    std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage;
-                    std::string pytorch_key = llaminar_key;
+                    const std::string semantic_key =
+                        "layer" + std::to_string(layer_idx) + "_" + stage;
+                    const std::string pytorch_key = semantic_key;
 
                     auto pytorch_data = loadPyTorchSnapshot(pytorch_key);
                     if (pytorch_data.empty())
                         continue;
 
-                    const bool is_allreduce_stage =
-                        mpi_ctx_ && !config_.allreduce_stages.empty() &&
+                    const bool stage_requires_reduction =
+                        !config_.allreduce_stages.empty() &&
                         std::find(config_.allreduce_stages.begin(), config_.allreduce_stages.end(), stage) !=
                             config_.allreduce_stages.end();
+                    const auto snapshot_selection = selectParitySnapshot(
+                        semantic_key,
+                        stage_requires_reduction,
+                        config_.uses_in_process_local_tp);
+                    const std::string &llaminar_key = snapshot_selection.key;
+                    const bool requires_cross_rank_sum =
+                        snapshot_selection.reduction ==
+                        ParitySnapshotReduction::CrossRankSum;
 
                     const bool has_local_snapshot = available_snapshots.count(llaminar_key) > 0;
-                    float ranks_with_snapshot = has_local_snapshot ? 1.0f : 0.0f;
-                    if (is_allreduce_stage)
+                    if (!has_local_snapshot &&
+                        snapshot_selection.requires_post_collective_key)
                     {
+                        ADD_FAILURE()
+                            << "LocalTP parity requires live post-collective snapshot '"
+                            << llaminar_key << "' for semantic stage '" << semantic_key
+                            << "'. The pre-collective partial is not a valid fallback.";
+                        continue;
+                    }
+                    float ranks_with_snapshot = has_local_snapshot ? 1.0f : 0.0f;
+                    if (requires_cross_rank_sum)
+                    {
+                        if (!mpi_ctx_)
+                        {
+                            ADD_FAILURE()
+                                << "Cross-rank parity snapshot '" << llaminar_key
+                                << "' requires an MPI context";
+                            continue;
+                        }
                         float local_has_snapshot = ranks_with_snapshot;
                         mpi_ctx_->allreduce_sum(&local_has_snapshot, &ranks_with_snapshot, 1);
                     }
@@ -4546,7 +4681,7 @@ namespace llaminar2::test::parity
                     // Routed/TP allreduce: reconstruct full output from rank partials.
                     bool did_allreduce = false;
                     std::vector<float> allreduced_buf;
-                    if (is_allreduce_stage &&
+                    if (requires_cross_rank_sum &&
                         static_cast<int>(ranks_with_snapshot + 0.5f) == mpiWorldSize())
                     {
                         allreduced_buf.resize(llaminar_size);
@@ -4598,7 +4733,11 @@ namespace llaminar2::test::parity
                     else
                     {
                         LOG_INFO("[Parity] Layer " << layer_idx << " " << stage
-                                                   << (did_allreduce ? " (allreduced)" : "")
+                                                   << (snapshot_selection.requires_post_collective_key
+                                                           ? " (LocalTP post-collective)"
+                                                           : (did_allreduce
+                                                                  ? " (cross-rank summed)"
+                                                                  : ""))
                                                    << " cosine=" << std::fixed << std::setprecision(6) << result.cosine_similarity
                                                    << " size=" << llaminar_size);
                     }
@@ -5262,10 +5401,7 @@ namespace llaminar2::test::parity
                 exportActiveSnapshotsForParityDiagnostics(
                     ParityForwardPhase::Decode,
                     static_cast<int>(step));
-                if (config_.moe_rebalance_exercise.enabled &&
-                    config_.moe_rebalance_exercise.request_every_decode_steps > 0 &&
-                    ((step + 1) % static_cast<size_t>(
-                                      config_.moe_rebalance_exercise.request_every_decode_steps)) == 0 &&
+                if (parityMoERebalanceMaintenanceDue(step + 1) &&
                     !driveParityMoERebalanceMaintenance(
                         "decode",
                         static_cast<int>(step)))
@@ -5392,6 +5528,7 @@ namespace llaminar2::test::parity
                                      (summary.avg_cosine >= config_.decode_cosine_threshold) &&
                                      topk_gate;
 
+            activeDrainCompletedDecodeBoundaryMaintenanceDiagnostics();
             assertParityMoERebalanceExercise(
                 initial_moe_movement_epoch,
                 activeMoERuntimeMovementEpoch());
@@ -5696,10 +5833,7 @@ namespace llaminar2::test::parity
                         ParityForwardPhase::Decode,
                         static_cast<int>(step));
                 }
-                if (config_.moe_rebalance_exercise.enabled &&
-                    config_.moe_rebalance_exercise.request_every_decode_steps > 0 &&
-                    ((step + 1) % static_cast<size_t>(
-                                      config_.moe_rebalance_exercise.request_every_decode_steps)) == 0 &&
+                if (parityMoERebalanceMaintenanceDue(step + 1) &&
                     !driveParityMoERebalanceMaintenance(
                         "decode",
                         static_cast<int>(step)))
@@ -5767,8 +5901,9 @@ namespace llaminar2::test::parity
                                     continue;
                             }
 
-                            // Llaminar snapshot key: layer{N}_{STAGE}
-                            std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage;
+                            // Semantic snapshot key: layer{N}_{STAGE}
+                            const std::string semantic_key =
+                                "layer" + std::to_string(layer_idx) + "_" + stage;
 
                             // PyTorch snapshot key: decode_step{N}_layer{L}_{STAGE}
                             std::string pytorch_key = step_prefix + "_layer" + std::to_string(layer_idx) + "_" + stage;
@@ -5776,15 +5911,40 @@ namespace llaminar2::test::parity
                             if (pytorch_data.empty())
                                 continue;
 
-                            const bool is_allreduce_stage =
-                                mpi_ctx_ && !config_.allreduce_stages.empty() &&
+                            const bool stage_requires_reduction =
+                                !config_.allreduce_stages.empty() &&
                                 std::find(config_.allreduce_stages.begin(), config_.allreduce_stages.end(), stage) !=
                                     config_.allreduce_stages.end();
+                            const auto snapshot_selection = selectParitySnapshot(
+                                semantic_key,
+                                stage_requires_reduction,
+                                config_.uses_in_process_local_tp);
+                            const std::string &llaminar_key = snapshot_selection.key;
+                            const bool requires_cross_rank_sum =
+                                snapshot_selection.reduction ==
+                                ParitySnapshotReduction::CrossRankSum;
 
                             const bool has_local_snapshot = available_snapshots.count(llaminar_key) > 0;
-                            float ranks_with_snapshot = has_local_snapshot ? 1.0f : 0.0f;
-                            if (is_allreduce_stage)
+                            if (!has_local_snapshot &&
+                                snapshot_selection.requires_post_collective_key)
                             {
+                                ADD_FAILURE()
+                                    << "LocalTP decode parity requires live post-collective snapshot '"
+                                    << llaminar_key << "' for semantic stage '"
+                                    << semantic_key
+                                    << "'. The pre-collective partial is not a valid fallback.";
+                                continue;
+                            }
+                            float ranks_with_snapshot = has_local_snapshot ? 1.0f : 0.0f;
+                            if (requires_cross_rank_sum)
+                            {
+                                if (!mpi_ctx_)
+                                {
+                                    ADD_FAILURE()
+                                        << "Cross-rank decode parity snapshot '"
+                                        << llaminar_key << "' requires an MPI context";
+                                    continue;
+                                }
                                 float local_has_snapshot = ranks_with_snapshot;
                                 mpi_ctx_->allreduce_sum(&local_has_snapshot, &ranks_with_snapshot, 1);
                             }
@@ -5823,7 +5983,7 @@ namespace llaminar2::test::parity
                             // Routed/TP allreduce: reconstruct full output from rank partials.
                             bool did_allreduce_decode = false;
                             std::vector<float> allreduced_decode_buf;
-                            if (is_allreduce_stage &&
+                            if (requires_cross_rank_sum &&
                                 static_cast<int>(ranks_with_snapshot + 0.5f) == mpiWorldSize())
                             {
                                 allreduced_decode_buf.resize(llaminar_size);
@@ -6006,6 +6166,7 @@ namespace llaminar2::test::parity
                                      (summary.avg_cosine >= config_.decode_cosine_threshold) &&
                                      topk_gate;
 
+            activeDrainCompletedDecodeBoundaryMaintenanceDiagnostics();
             assertParityMoERebalanceExercise(
                 initial_moe_movement_epoch,
                 activeMoERuntimeMovementEpoch());

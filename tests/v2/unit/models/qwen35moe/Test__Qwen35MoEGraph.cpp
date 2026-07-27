@@ -10,6 +10,7 @@
 #include "execution/compute_stages/stages/GDNLiveStateLocalizeStage.h"
 #include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
+#include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "execution/compute_stages/stages/AttentionComputeStage.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "execution/compute_stages/stages/LMHeadStage.h"
@@ -282,6 +283,23 @@ namespace
     {
     public:
         using Qwen35MoEGraph::Qwen35MoEGraph;
+
+        HiddenStateRowSelectStage::Params
+        mirroredCheckpointRowParamsForTesting(
+            int total_tokens,
+            DeviceId device,
+            const int32_t *sequence_lengths_device) const
+        {
+            HiddenStateRowSelectStage::Params params;
+            params.device_id = device;
+            params.seq_len = total_tokens;
+            configureMirroredCheckpointRowOwnership(
+                params,
+                total_tokens,
+                device,
+                sequence_lengths_device);
+            return params;
+        }
 
         ComputeGraph buildFFNGraphForTokenCount(
             const LayerWeights &layer,
@@ -1010,8 +1028,10 @@ TEST(Test__Qwen35MoEGraph, DecodeMirroredEmbeddingSuppressesOnlyDecodeEmbeddingA
     graph_builder.setBuffers(buffers);
 
     int decode_token = 3;
+    int decode_position = 0;
     ForwardInput decode_input;
     decode_input.token_ids = &decode_token;
+    decode_input.position_ids = &decode_position;
     decode_input.seq_len = 1;
     decode_input.batch_size = 1;
     ForwardOutput decode_output;
@@ -1024,8 +1044,10 @@ TEST(Test__Qwen35MoEGraph, DecodeMirroredEmbeddingSuppressesOnlyDecodeEmbeddingA
         << "The policy should not suppress the rest of the dense graph";
 
     int prefill_tokens[] = {3, 4};
+    int prefill_positions[] = {0, 1};
     ForwardInput prefill_input;
     prefill_input.token_ids = prefill_tokens;
+    prefill_input.position_ids = prefill_positions;
     prefill_input.seq_len = 2;
     prefill_input.batch_size = 1;
     ForwardOutput prefill_output;
@@ -1883,8 +1905,10 @@ TEST(Test__Qwen35MoEGraph, FullForwardGraphActivatesDenseDecodeReplicatedScope)
     graph_builder.setBuffers(makeFullForwardModelBuffers(arena, /*tokens=*/2, config));
 
     std::vector<int> token_ids = {0, 1};
+    std::vector<int> position_ids = {0, 1};
     ForwardInput decode_input;
     decode_input.token_ids = token_ids.data();
+    decode_input.position_ids = position_ids.data();
     decode_input.batch_size = 1;
     decode_input.seq_len = 1;
     decode_input.device = DeviceId::cpu();
@@ -1903,6 +1927,108 @@ TEST(Test__Qwen35MoEGraph, FullForwardGraphActivatesDenseDecodeReplicatedScope)
     ASSERT_NE(prefill_graph.getNode("layer0_down_proj"), nullptr);
     EXPECT_NE(prefill_graph.getNode("layer0_down_allreduce"), nullptr)
         << "Prefill full-forward graphs still compute dense TP partials and must keep the dense FFN allreduce";
+}
+
+/**
+ * @brief Preserve contiguous GPU-prefill position ownership through the Qwen adapter.
+ *
+ * ForwardExecutionEngine represents a single-request bucketed GPU prefill with
+ * ForwardPositionPolicy::ContiguousOffset and deliberately leaves both position
+ * row pointers null. QwenGraphBase::buildForwardGraph() is the production
+ * IGraphBuilder entry point. It must copy that policy together with the rest of
+ * ForwardInput; silently reverting to ExplicitRows makes a valid graph fail
+ * before launch and previously surfaced only in prefix-cache LocalTP E2E runs.
+ */
+TEST(Test__Qwen35MoEGraph, ForwardAdapterPreservesContiguousPositionPolicy)
+{
+    GraphConfig config = makeMoEConfig();
+    config.n_layers = 1;
+    config.total_n_layers = 1;
+    config.max_seq_len = 2;
+    config.vocab_local = config.vocab_size;
+
+    TensorArena arena;
+    ModelWeights weights = makeFullForwardModelWeights(arena, config);
+
+    Qwen35MoEGraph graph_builder(config, nullptr);
+    graph_builder.setWeights(weights);
+    graph_builder.setBuffers(
+        makeFullForwardModelBuffers(arena, /*tokens=*/2, config));
+
+    std::vector<int> token_ids = {0, 1};
+    ForwardInput input;
+    input.token_ids = token_ids.data();
+    input.position_ids = nullptr;
+    input.position_ids_device = nullptr;
+    input.position_policy = ForwardPositionPolicy::ContiguousOffset;
+    input.batch_size = 1;
+    input.seq_len = 2;
+    input.position_offset = 32;
+    input.token_offset = 32;
+    input.device = DeviceId::cpu();
+    ForwardOutput output;
+
+    ComputeGraph graph;
+    EXPECT_NO_THROW(graph = graph_builder.buildForwardGraph(input, output));
+    EXPECT_GT(graph.size(), 0u);
+    EXPECT_NE(graph.getNode("embedding"), nullptr);
+}
+
+/**
+ * @brief Prove that a LocalTP graph publishes the tensor its LM head writes.
+ *
+ * LocalTP is coordinated inside one process rather than through a multi-rank
+ * MPI vocabulary allgather. Its participant graph therefore ends at the local
+ * vocabulary shard. Advertising the dormant full-vocabulary arena allocation
+ * as ForwardOutput used to make the post-launch event boundary publish a tensor
+ * with no GPU storage, even though LOGITS_LOCAL had been produced correctly.
+ */
+TEST(Test__Qwen35MoEGraph, LocalTPColumnParallelForwardPublishesLocalLogits)
+{
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices(
+        {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)});
+    tp_ctx->setBackend(CollectiveBackendType::HOST);
+
+    GraphConfig config = makeMoEConfig(tp_ctx.get());
+    config.n_layers = 1;
+    config.total_n_layers = 1;
+    config.max_seq_len = 2;
+    config.dense_tp_enabled = true;
+    config.lm_head_column_parallel = true;
+    config.vocab_local = config.vocab_size / 2;
+
+    TensorArena arena;
+    ModelWeights weights = makeFullForwardModelWeights(arena, config);
+    ModelBuffers buffers =
+        makeFullForwardModelBuffers(arena, /*tokens=*/2, config);
+    TensorBase *const full_logits = buffers.logits;
+    TensorBase *const local_logits = buffers.logits_local;
+
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    graph_builder.setWeights(weights);
+    graph_builder.setBuffers(buffers);
+
+    std::vector<int> token_ids = {0, 1};
+    std::vector<int> position_ids = {0, 1};
+    ForwardInput input;
+    input.token_ids = token_ids.data();
+    input.position_ids = position_ids.data();
+    input.batch_size = 1;
+    input.seq_len = 2;
+    input.device = DeviceId::cpu();
+    ForwardOutput output;
+
+    ComputeGraph graph =
+        graph_builder.buildFullForwardGraph(input, output);
+
+    ASSERT_NE(graph.getNode("lm_head"), nullptr);
+    EXPECT_EQ(graph.getNode("lm_head_allgather"), nullptr)
+        << "A LocalTP participant must not route logits through a one-rank MPI allgather";
+    EXPECT_EQ(output.logits, local_logits)
+        << "ForwardOutput must name the tensor written by the terminal LM head";
+    EXPECT_NE(output.logits, full_logits)
+        << "The dormant full-vocabulary allocation is not a graph result";
 }
 
 TEST(Test__Qwen35MoEGraph, CPUAllPositionMoEVerifierUsesDecodeEquivalentExpertPath)
@@ -1931,6 +2057,82 @@ TEST(Test__Qwen35MoEGraph, CPUAllPositionMoEVerifierUsesDecodeEquivalentExpertPa
     auto *shared_stage = dynamic_cast<SharedExpertFFNStage *>(shared_node->stage.get());
     ASSERT_NE(shared_stage, nullptr);
     EXPECT_TRUE(shared_stage->usesCPUDecodeEquivalentVerifierPrefillForTesting());
+}
+
+/**
+ * @brief Padded prefill checkpoints must read the arena-owned real row count.
+ *
+ * The regression uses the exact geometry that exposed the bug: a 443-token
+ * request replayed through an M=512 graph. Unit tests inspect the centralized
+ * graph policy only and therefore use an opaque pointer rather than allocating
+ * or launching on a GPU.
+ */
+TEST(Test__Qwen35MoEGraph, PaddedPrefillCheckpointsUseResidentRequestLength)
+{
+    constexpr uintptr_t kOpaqueDeviceAddress = 0x2000;
+    const auto *request_length_device =
+        reinterpret_cast<const int32_t *>(kOpaqueDeviceAddress);
+
+    GraphConfig config = makeMoEConfig();
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    const auto params =
+        graph_builder.mirroredCheckpointRowParamsForTesting(
+            /*total_tokens=*/512,
+            DeviceId::rocm(0),
+            request_length_device);
+
+    EXPECT_EQ(
+        params.selection_policy,
+        HiddenStateRowSelectStage::SelectionPolicy::
+            DeviceResidentRequestLength);
+    EXPECT_EQ(
+        params.request_sequence_length_device,
+        request_length_device);
+}
+
+/**
+ * @brief Refuse an ambiguous GPU prefill checkpoint at graph construction.
+ *
+ * A missing resident length cannot be repaired during graph replay without
+ * reintroducing mutable host row state. Failing construction is therefore the
+ * only valid behavior when diagnostics are enabled for an ordinary prefill.
+ */
+TEST(Test__Qwen35MoEGraph, PaddedPrefillCheckpointRejectsMissingResidentLength)
+{
+    GraphConfig config = makeMoEConfig();
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+
+    EXPECT_THROW(
+        (void)graph_builder.mirroredCheckpointRowParamsForTesting(
+            /*total_tokens=*/512,
+            DeviceId::rocm(0),
+            /*sequence_lengths_device=*/nullptr),
+        std::runtime_error);
+}
+
+/**
+ * @brief Exact grouped-verifier checkpoints remain immutable fixed rows.
+ *
+ * Grouped verifier rows are logical work rather than prefill padding. This
+ * complementary assertion prevents the padded-prefill fix from accidentally
+ * binding verifier checkpoints to unrelated request-length metadata.
+ */
+TEST(Test__Qwen35MoEGraph, GroupedVerifierCheckpointsKeepFixedDeviceRows)
+{
+    GraphConfig config = makeMoEConfig();
+    config.grouped_mtp_verifier = true;
+    config.compute_all_position_logits = true;
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    const auto params =
+        graph_builder.mirroredCheckpointRowParamsForTesting(
+            /*total_tokens=*/4,
+            DeviceId::cuda(0),
+            /*sequence_lengths_device=*/nullptr);
+
+    EXPECT_EQ(
+        params.selection_policy,
+        HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow);
+    EXPECT_EQ(params.request_sequence_length_device, nullptr);
 }
 
 TEST(Test__Qwen35MoEGraph, SchemaDefaultsRoutedExpertWeightsToExpertParallel)
@@ -1972,6 +2174,8 @@ TEST(Test__Qwen35MoEGraph, MTPDecodeMoEBuffersReserveVerifierRows)
     GraphConfig config = makeMoEConfig();
     config.mtp.enabled = true;
     config.mtp.draft_tokens = 15;
+    config.moe.intermediate_size = 3;
+    config.moe.shared_intermediate_size = 7;
     const size_t expected_rows =
         static_cast<size_t>(resolveMTPMaxTargetQueryRows(config.mtp));
 
@@ -1982,6 +2186,12 @@ TEST(Test__Qwen35MoEGraph, MTPDecodeMoEBuffersReserveVerifierRows)
         resolver_config.custom_formulas.find("moe_activation_rows");
     ASSERT_NE(rows_it, resolver_config.custom_formulas.end());
     EXPECT_EQ(rows_it->second, expected_rows);
+    const auto width_it =
+        resolver_config.custom_formulas.find("moe_ffn_intermediate_max");
+    ASSERT_NE(width_it, resolver_config.custom_formulas.end());
+    EXPECT_EQ(width_it->second, 7u)
+        << "The reusable scratch pair must cover the wider shared FFN, not "
+           "only routed-expert intermediate width.";
 
     Qwen35MoESchemaFactory factory;
     const GraphSchema schema = factory.createSchema();
@@ -2002,6 +2212,13 @@ TEST(Test__Qwen35MoEGraph, MTPDecodeMoEBuffersReserveVerifierRows)
         ASSERT_FALSE(buffer->shape.empty()) << name;
         EXPECT_EQ(buffer->shape[0], expected_rows)
             << name << " must reserve every depth-0 verifier row";
+        if (std::string(name) == "moe_gate_scratch" ||
+            std::string(name) == "moe_up_scratch")
+        {
+            ASSERT_GE(buffer->shape.size(), 2u);
+            EXPECT_EQ(buffer->shape[1], 7u)
+                << name << " must cover the largest routed/shared FFN width";
+        }
     }
 }
 
@@ -2741,6 +2958,31 @@ TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSkipsDecodeHistogramSid
     EXPECT_NE(gate_body.find("DeviceMoERebalanceTransferMode::CollectiveSidebandPayload"),
               std::string::npos)
         << "Decode-side histogram sidebands may exist only behind the now-refused fixed-payload mode.";
+}
+
+TEST(Test__Qwen35MoEGraph, GroupedMainVerifierCreatesDecodeMaintenanceBinding)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    EXPECT_NE(source.find("const bool grouped_main_verifier_layer"),
+              std::string::npos)
+        << "Grouped MTP main-model rows must be recognized as decode maintenance producers.";
+    EXPECT_NE(
+        source.find(
+            "device_rebalance_decode_layer =\n            local_decode_layer || grouped_main_verifier_layer"),
+        std::string::npos)
+        << "Device maintenance binding must not require an M=1 graph when grouped MTP owns the main forward path.";
+    EXPECT_NE(source.find("first_device_rebalance_decode_layer"),
+              std::string::npos);
+    EXPECT_NE(source.find("last_device_rebalance_decode_layer"),
+              std::string::npos);
+    EXPECT_EQ(source.find("local_decode_layer &&\n                (first_local_decode_layer"),
+              std::string::npos)
+        << "Route-boundary binding/apply must not retain the obsolete M=1-only gate.";
 }
 
 TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSelectsDecodeBindingByRole)

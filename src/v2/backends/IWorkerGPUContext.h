@@ -437,21 +437,30 @@ namespace llaminar2
         }
 
         /**
-         * @brief Insert a GPU-side dependency between two streams (non-blocking from CPU)
-         * @param dependent_stream Stream that should wait (nullptr = legacy stream 0)
-         * @param dependency_stream Stream to wait for (nullptr = legacy stream 0)
+         * @brief Insert a checked GPU-side dependency between two explicit streams.
          *
-         * Makes dependent_stream wait until all prior work on dependency_stream
-         * completes, using an internal event. This is a GPU-side wait — the CPU
-         * is NOT blocked. This is much cheaper than synchronizeStream() because
-         * it avoids CPU stalls entirely.
+         * @param dependent_stream Stream that must wait for the producer.
+         * @param dependency_stream Producer stream whose already-enqueued work must complete.
+         * @return true when both event publication and the stream wait were accepted
+         *         by the backend; false when ordering could not be established.
          *
-         * Used by segmented graph capture to order graph launches (on capture_stream)
-         * with manual stage dispatches (on legacy stream 0) without CPU overhead.
+         * The method records a context-owned, timing-disabled event on
+         * `dependency_stream` and makes `dependent_stream` wait for that record.
+         * It never synchronizes either stream on the host. Implementations keep
+         * the event storage alive for the device-context lifetime, so inserting
+         * a dependency performs no event allocation or destruction in the
+         * inference hot path.
          *
-         * @note The event is managed internally; callers don't need to create/destroy events.
+         * A false result is a correctness failure, not an optional optimization
+         * miss. Callers must stop the graph transaction rather than continuing
+         * with unordered producer and consumer streams.
+         *
+         * @thread_safety Thread-safe; concurrent callers may publish independent
+         *                handoffs for the same device context.
          */
-        virtual void insertStreamDependency(void *dependent_stream, void *dependency_stream) = 0;
+        virtual bool insertStreamDependency(
+            void *dependent_stream,
+            void *dependency_stream) = 0;
 
         // =========================================================================
         // GPU Graph Capture (worker-thread-only)
@@ -480,8 +489,6 @@ namespace llaminar2
         // =========================================================================
         // Diagnostics and Debug Utilities
         // =========================================================================
-
-        virtual void clearLastError() {}
 
         virtual PointerValidationResult validatePointerDevice(const void *gpu_ptr, int expected_ordinal)
         {

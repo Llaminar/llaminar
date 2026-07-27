@@ -90,6 +90,18 @@ namespace llaminar2
         void shutdown() override;
         void abort() override;
         void setComputeStreams(const std::vector<void *> &compute_streams) override;
+        [[nodiscard]] CollectiveSubmissionReceipt singleBufferSubmissionReceipt(
+            DeviceId device) const override
+        {
+#ifdef HAVE_NCCL
+            return device.is_cuda()
+                       ? CollectiveSubmissionReceipt::onDeviceStream(stream_)
+                       : CollectiveSubmissionReceipt{};
+#else
+            (void)device;
+            return {};
+#endif
+        }
 
         // =====================================================================
         // Collective Operations

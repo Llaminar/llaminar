@@ -36,6 +36,16 @@ class MoERoutingToComputeTest : public ::testing::Test
 {
 protected:
     std::unique_ptr<MockDeviceContext> cpu_ctx_;
+    /**
+     * @brief Graph-local owner shared by routing and expert compute.
+     *
+     * Production graphs use one owner for the ordered routed pipeline so the
+     * CPU router can publish its canonical Q8_1 hidden rows directly to the
+     * expert projection stage.  Keeping the same ownership contract in this
+     * fixture prevents the test from accidentally exercising two disconnected
+     * kernels that cannot exchange publication state.
+     */
+    std::shared_ptr<MoERoutedPipelineKernelOwner> routed_pipeline_kernel_owner_;
 
     // Dimensions must be multiples of 256 for Q4_K block size
     static constexpr int D_MODEL = 256;
@@ -46,6 +56,8 @@ protected:
     void SetUp() override
     {
         cpu_ctx_ = std::make_unique<MockDeviceContext>(DeviceId::cpu(), ComputeBackendType::CPU);
+        routed_pipeline_kernel_owner_ =
+            std::make_shared<MoERoutedPipelineKernelOwner>();
     }
 
     /// Create a 3D Q4_K expert tensor in GGUF layout [cols, rows, num_experts]
@@ -95,6 +107,8 @@ protected:
         params.top_k = top_k;
         params.norm_topk_prob = norm_topk_prob;
         params.layer_idx = 0;
+        params.routed_pipeline_kernel_owner =
+            routed_pipeline_kernel_owner_;
 
         MoERoutingStage stage(params);
         return stage.execute(cpu_ctx_.get());
@@ -125,6 +139,8 @@ protected:
         params.expert_intermediate = intermediate;
         params.local_expert_start = local_expert_start;
         params.local_expert_count = local_expert_count;
+        params.routed_pipeline_kernel_owner =
+            routed_pipeline_kernel_owner_;
 
         if (!MoEExpertComputeStage::extractExpertViews(params))
             return false;

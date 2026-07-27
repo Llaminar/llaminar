@@ -1383,15 +1383,13 @@ namespace
 
                 /*
                  * Exercise the actual inference entry once before forcing any
-                 * diagnostic candidate. This call must resolve through the
-                 * installed generated policy; the explicit calls below prove
-                 * the rest of the byte-exact candidate surface without making
-                 * production Auto honor debug-environment overrides.
+                 * diagnostic candidate. Production Auto must remain total with
+                 * no generated prefill policy installed; the explicit calls
+                 * below prove the rest of the byte-exact candidate surface.
                  */
                 std::vector<float> auto_grouped(
                     static_cast<size_t>(M) * N,
                     0.0f);
-#if LLAMINAR_CPU_NVNNI_PREFILL_POLICY_CERTIFIED
                 ASSERT_TRUE(multiplyViaTensor(
                     kernel,
                     input->data(),
@@ -1400,24 +1398,12 @@ namespace
                     N,
                     K));
                 expectBitwiseEqualFloatRows(
-                    format.name + " generated production full-K prefill M=" +
+                    format.name + " heuristic production full-K prefill M=" +
                         std::to_string(M),
                     auto_grouped.data(),
                     serial.data(),
                     auto_grouped.size(),
                     static_cast<size_t>(N));
-#else
-                EXPECT_THROW(
-                    multiplyViaTensor(
-                        kernel,
-                        input->data(),
-                        auto_grouped.data(),
-                        M,
-                        N,
-                        K),
-                    std::runtime_error)
-                    << "A development-only generated table must fail closed";
-#endif
 
                 const auto run_candidate = [&](
                                                int n_block_chunks,
@@ -1519,9 +1505,8 @@ namespace
         EXPECT_EQ(
             launch_count,
             ALL_FORMATS.size() * runtime_rows.size() *
-                (2u * n_block_candidates.size() + 1u +
-                 LLAMINAR_CPU_NVNNI_PREFILL_POLICY_CERTIFIED))
-            << "Every full-K candidate and generated Auto decision must publish "
+                (2u * n_block_candidates.size() + 2u))
+            << "Every full-K candidate and heuristic Auto decision must publish "
                "one production M>1 route";
 
         const auto pair_grid_records = PerfStatsCollector::snapshot(
@@ -1770,8 +1755,8 @@ namespace
      * serial decode. A grouped full-K accumulation is deterministic but cannot
      * be byte-identical because it changes FP32 parenthesization. This focused
      * all-format regression uses the real Qwen 1.5B FFN-down geometry, which is
-     * one of the finite serial-K-part production shapes exhaustively owned by
-     * the generated prefill table. The selected Pairwise or WideRows kernel
+     * one of the finite serial-K-part production shapes exercised by the
+     * ordinary-prefill heuristic. The selected Pairwise or WideRows kernel
      * must compute independent tile partials and reduce them in exactly the
      * same order as M individual decode rows.
      */

@@ -6,11 +6,13 @@
 #include "MoELocalExpertStage.h"
 
 #include "MoEExpertComputeStage.h"
+#include "../../../execution/moe/MoEExpertWeightService.h"
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 
 #include <algorithm>
@@ -101,6 +103,81 @@ namespace llaminar2
             params_.output_rows = params_.output_rows_lifetime.get();
         if (params_.moe_runtime_table && params_.layer_idx >= 0)
             (void)refreshRuntimePlacement();
+    }
+
+    bool MoELocalExpertStage::prepareExpertGemmEngines(Params &params)
+    {
+        const size_t expected =
+            static_cast<size_t>(std::max(params.num_experts, 0));
+        const auto complete_active_table = [&]()
+        {
+            if (expected == 0 ||
+                params.prepared_gate_gemm.size() != expected ||
+                params.prepared_up_gemm.size() != expected ||
+                params.prepared_down_gemm.size() != expected)
+            {
+                return false;
+            }
+
+            bool has_active_expert = false;
+            for (size_t expert = 0; expert < expected; ++expert)
+            {
+                const bool active =
+                    params.expert_mask.empty() ||
+                    (expert < params.expert_mask.size() &&
+                     params.expert_mask[expert]);
+                if (!active)
+                    continue;
+                has_active_expert = true;
+                if (!params.prepared_gate_gemm[expert] ||
+                    !params.prepared_up_gemm[expert] ||
+                    !params.prepared_down_gemm[expert])
+                {
+                    return false;
+                }
+            }
+            return has_active_expert;
+        };
+
+        if (complete_active_table())
+            return true;
+
+        MoEWeightContext context{
+            params.device_id,
+            params.num_experts,
+            params.expert_intermediate,
+            params.d_model,
+            /*local_expert_start=*/0,
+            /*local_expert_count=*/params.num_experts,
+            params.layer_idx,
+            params.expert_mask,
+            params.gate_exps,
+            params.up_exps,
+            params.down_exps,
+            params.expert_gate_views,
+            params.expert_up_views,
+            params.expert_down_views,
+            params.prepared_gate_gemm,
+            params.prepared_up_gemm,
+            params.prepared_down_gemm,
+            params.moe_owned_kernels,
+            params.moe_packed_gate_lifetime,
+            params.moe_packed_up_lifetime,
+            params.moe_packed_down_lifetime,
+            nullptr,
+            params.prepared_store,
+            params.expert_registry,
+            params.gate_slab_ref,
+            params.up_slab_ref,
+            params.down_slab_ref};
+
+        if (!MoEExpertWeightService::extractExpertViews(context))
+            return false;
+        const bool prepared = MoEExpertWeightService::prepareGemmEngines(context);
+        params.gate_slab_ref = context.gate_slab_ref;
+        params.up_slab_ref = context.up_slab_ref;
+        params.down_slab_ref = context.down_slab_ref;
+        return prepared && complete_active_table();
     }
 
     bool MoELocalExpertStage::refreshRuntimePlacement()
@@ -384,10 +461,11 @@ namespace llaminar2
             return true;
 
         const bool has_prepared = hasPreparedExpertState(params_);
-        if (!has_prepared && (!params_.gate_exps || !params_.up_exps || !params_.down_exps))
+        if (!has_prepared)
         {
-            LOG_ERROR("[MoELocalExpertStage] Missing expert weight tensors and no prepared expert state");
-            return false;
+            throw std::runtime_error(
+                "MoELocalExpertStage requires graph-build-time prepared expert "
+                "state; inline expert extraction/preparation is forbidden");
         }
         std::string prepared_error;
         if (!validatePreparedWeights(&prepared_error))
@@ -532,31 +610,17 @@ namespace llaminar2
         compute_params.up_slab_ref = params_.up_slab_ref;
         compute_params.down_slab_ref = params_.down_slab_ref;
 
-        if (!has_prepared)
-        {
-            // Legacy / test fallback: extract expert views and prepare engines inline.
-            if (!MoEExpertComputeStage::extractExpertViews(compute_params) ||
-                !MoEExpertComputeStage::prepareExpertGemmEngines(compute_params))
-            {
-                LOG_ERROR("[MoELocalExpertStage] Failed to prepare compact expert compute stage");
-                return false;
-            }
-        }
-
-        // For GPU participants: upload compact input tensors to device before expert
-        // kernel dispatch.  After execute(), reading compact_output_->data() triggers
-        // an implicit D2H sync via the coherence state machine.
+        // This sparse packet path is used at an explicit host-transport boundary.
+        // TransferEngine owns its one H2D preparation and output-only allocation;
+        // homogeneous GPU expert execution must use the device-native grouped lane.
         const bool is_gpu = params_.device_id.is_gpu();
         if (is_gpu)
         {
-            if (!compact_hidden_->ensureOnDevice(params_.device_id) ||
-                !compact_routing_indices_->ensureOnDevice(params_.device_id) ||
-                !compact_routing_weights_->ensureOnDevice(params_.device_id) ||
-                !compact_output_->ensureOnDevice(params_.device_id))
-            {
-                LOG_ERROR("[MoELocalExpertStage] GPU coherence upload failed for compact tensors");
-                return false;
-            }
+            const StageGPUExecution execution = gpuExecution();
+            execution.prepareInput(compact_hidden_.get());
+            execution.prepareInput(compact_routing_indices_.get());
+            execution.prepareInput(compact_routing_weights_.get());
+            execution.prepareOutput(compact_output_.get());
         }
 
         MoEExpertComputeStage compute_stage(std::move(compute_params));
@@ -568,12 +632,9 @@ namespace llaminar2
             LOG_ERROR("[MoELocalExpertStage] GPU local expert compute requires a bound workspace");
             return false;
         }
-        if (has_prepared)
-        {
-            // Signal to MoEExpertComputeStage that raw weight pointers may be null —
-            // prepared engines are used instead.
-            compute_stage.releaseRawExpertWeights();
-        }
+        // Prepared engines are the only production implementation; raw expert
+        // tensors may already have released their host mappings.
+        compute_stage.releaseRawExpertWeights();
 
         std::chrono::steady_clock::time_point t_compute_start;
         if (MoEExpertOverlayProfiler::isEnabled())

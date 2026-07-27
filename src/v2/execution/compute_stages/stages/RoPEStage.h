@@ -111,9 +111,11 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
 
-        /// Update position offset for cached graph reuse.
-        /// Also pre-uploads the kernel's device params on the explicit stage
-        /// stream so captured RoPE execution records kernels only.
+        /// Record the position offset consumed by the next graph preparation.
+        ///
+        /// Device publication is deliberately centralized in
+        /// prepareGraphLaunch(), where the executor supplies the exact stream
+        /// that will launch or capture the graph.
         bool hasDynamicParams() const override { return true; }
         bool supportsDeviceResidentDynamicPositionReplay() const override
         {
@@ -126,13 +128,6 @@ namespace llaminar2
             params_.position_ids = nullptr;
             params_.position_ids_device = nullptr;
             position_ids_cache_.clear();
-            if (cached_kernel_)
-            {
-                // Propagate current stage stream so setDynamicPosOffset can
-                // pre-upload device params before capture/replay.
-                cached_kernel_->setGPUStream(gpuStream());
-                cached_kernel_->setDynamicPosOffset(pos_offset);
-            }
         }
 
         /**
@@ -142,8 +137,8 @@ namespace llaminar2
          * one tiny graph.  Rows can therefore share the same absolute position
          * (for example `[595, 595]` for two requests), which is not equivalent
          * to the contiguous scalar range `[595, 596]`.  This method keeps the
-         * stable host copy alive for CPU/eager execution and asks GPU kernels
-         * to pre-upload the workspace-owned device copy before graph capture.
+         * stable host copy alive for CPU/eager execution. GPU publication, when
+         * permitted by the caller's policy, occurs only in prepareGraphLaunch().
          */
         void updateDynamicPositionIds(const int *position_ids, int seq_len) override
         {
@@ -162,12 +157,6 @@ namespace llaminar2
                 params_.position_ids_device = nullptr;
                 params_.pos_offset = 0;
             }
-
-            if (cached_kernel_)
-            {
-                cached_kernel_->setGPUStream(gpuStream());
-                cached_kernel_->setDynamicPositionIds(params_.position_ids, seq_len);
-            }
         }
 
         /**
@@ -184,12 +173,6 @@ namespace llaminar2
             params_.position_ids = nullptr;
             params_.position_ids_device = position_ids_device;
             position_ids_cache_.clear();
-
-            if (cached_kernel_)
-            {
-                cached_kernel_->setGPUStream(gpuStream());
-                cached_kernel_->setDynamicDevicePositionIds(position_ids_device, seq_len);
-            }
         }
 
         void resetSessionState() override

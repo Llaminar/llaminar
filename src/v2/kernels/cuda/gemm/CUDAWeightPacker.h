@@ -56,9 +56,6 @@ namespace llaminar2
 
             TensorBase *source_tensor_ = nullptr;
 
-            // Row-major transpose for ROWPAR GEMV (lazily created, freed in destructor)
-            CUDARowMajorWeights *rowmajor_ = nullptr;
-
             CUDAPackedWeights() = default;
             CUDAPackedWeights(const CUDAPackedWeights &) = delete;
             CUDAPackedWeights &operator=(const CUDAPackedWeights &) = delete;
@@ -91,8 +88,6 @@ namespace llaminar2
                     cuda_device_id = other.cuda_device_id;
                     uploaded = other.uploaded;
                     source_tensor_ = other.source_tensor_;
-                    rowmajor_ = other.rowmajor_;
-
                     other.d_native_vnni = nullptr;
                     other.d_native_scales = nullptr;
                     other.d_native_mins = nullptr;
@@ -104,7 +99,6 @@ namespace llaminar2
                     other.native_codebook_id = 0;
                     other.native_blocks_per_row = 0;
                     other.source_tensor_ = nullptr;
-                    other.rowmajor_ = nullptr;
                 }
                 return *this;
             }

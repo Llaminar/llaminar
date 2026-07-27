@@ -1098,6 +1098,27 @@ namespace llaminar2
                       std::string::npos)
                 << "CUDA must consume the shared grouped-attention row policy.";
 
+            const std::string rocm_kernels = readFile(
+                root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernels.hip");
+            const std::string cuda_kernels = readFile(
+                root / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu");
+            ASSERT_FALSE(rocm_kernels.empty());
+            ASSERT_FALSE(cuda_kernels.empty());
+            EXPECT_NE(
+                rocm_kernels.find(
+                    "llaminar2::attention::kMaxGroupedVerifierAttentionRows"),
+                std::string::npos)
+                << "ROCm grouped launchers must accept the complete M=2..16 policy.";
+            EXPECT_NE(
+                cuda_kernels.find(
+                    "llaminar2::attention::kMaxGroupedVerifierAttentionRows"),
+                std::string::npos)
+                << "CUDA grouped launchers must accept the complete M=2..16 policy.";
+            EXPECT_EQ(rocm_kernels.find("row_count > 4"), std::string::npos)
+                << "A stale ROCm M=4 launcher cap would contradict the shared policy.";
+            EXPECT_EQ(cuda_kernels.find("verifier_rows > 4"), std::string::npos)
+                << "A stale CUDA M=4 launcher cap would contradict the shared policy.";
+
             const std::string stage_source =
                 readFile(root / "src/v2/execution/compute_stages/stages/AttentionComputeStage.cpp");
             ASSERT_FALSE(stage_source.empty());
@@ -1110,13 +1131,6 @@ namespace llaminar2
             EXPECT_NE(stage_source.find("params_.seq_len > attention::kMaxGroupedVerifierAttentionRows"),
                       std::string::npos)
                 << "ROCm graph replay signatures must be keyed for every MTP verifier row up to M=16.";
-
-            const std::string rocm_kernels = readFile(
-                root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernels.hip");
-            const std::string cuda_kernels = readFile(
-                root / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu");
-            ASSERT_FALSE(rocm_kernels.empty());
-            ASSERT_FALSE(cuda_kernels.empty());
 
             const std::string rocm_body = sliceFunction(
                 rocm_kernels,

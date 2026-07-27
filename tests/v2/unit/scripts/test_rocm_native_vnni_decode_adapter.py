@@ -22,6 +22,7 @@ from tests.v2.performance.kernels.native_vnni_dispatch.adapters.rocm_decode impo
     adapt_rocm_decode_csv,
     adapt_rocm_decode_row,
     raw_corpus_id,
+    read_rocm_decode_timing_sidecars,
 )
 from tests.v2.performance.kernels.native_vnni_dispatch.exact_oracle import (
     candidate_is_eligible,
@@ -206,6 +207,55 @@ class ROCmNativeVNNIDecodeAdapterTest(unittest.TestCase):
                 adapt_rocm_decode_csv(
                     (aggregate,), context, timing_sidecars=(sidecar,)
                 )
+
+    def test_parallel_timing_reader_preserves_complete_trial_sequences(self) -> None:
+        """A byte split inside one trial must advance to the next trial."""
+
+        rows = []
+        for shape, samples in (
+            ("LargeFirstTrial", tuple(float(index + 1) for index in range(20))),
+            ("SmallSecondTrial", (101.0, 102.0, 103.0)),
+        ):
+            for sample_index, latency in enumerate(samples):
+                rows.append({
+                    "backend": "rocm",
+                    "phase": "decode",
+                    "source_format": "Q8_0",
+                    "source_codebook": "19",
+                    "execution_codebook": "19",
+                    "shape": shape,
+                    "execution_mode": "eager",
+                    "m": "1",
+                    "n": "512",
+                    "k": "2048",
+                    "candidate_id": "KB32/TW4",
+                    "kb": "32",
+                    "target_waves": "4",
+                    "sample_index": str(sample_index),
+                    "timed_replays": "1",
+                    "latency_us": f"{latency:.9f}",
+                    "latency_us_hex": latency.hex(),
+                })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rocm-timing.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=tuple(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+
+            serial = read_rocm_decode_timing_sidecars((path,), workers=1)
+            parallel = read_rocm_decode_timing_sidecars((path,), workers=2)
+
+        self.assertEqual(parallel, serial)
+        self.assertEqual(len(parallel), 2)
+        self.assertEqual(sorted(len(samples) for samples in parallel.values()), [3, 20])
+
+    def test_timing_reader_rejects_nonpositive_worker_count(self) -> None:
+        """Explicit analyzer parallelism must remain a positive contract."""
+
+        with self.assertRaisesRegex(ValueError, "worker count must be positive"):
+            read_rocm_decode_timing_sidecars((Path("unused.csv"),), workers=0)
 
 
 if __name__ == "__main__":

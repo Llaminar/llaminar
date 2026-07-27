@@ -7,6 +7,7 @@ import heapq
 import multiprocessing
 import os
 import tempfile
+from bisect import bisect_right
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
@@ -28,6 +29,20 @@ from .schema import (
 # parent publishes this tuple only for the lifetime of one digest operation;
 # worker tasks receive integer ranges and return sorted canonical JSON shards.
 _PARALLEL_DIGEST_ROWS: tuple[NativeVNNIObservation, ...] = ()
+
+
+@dataclass(frozen=True)
+class _SerializedDigestShard:
+    """One locally sorted corpus shard plus representative split samples.
+
+    Samples are canonical row bytes without the shard's newline delimiter.
+    The coordinator uses their global quantiles only to divide the lexical key
+    space; samples never participate in the digest itself.
+    """
+
+    path: Path
+    row_count: int
+    samples: tuple[bytes, ...]
 
 
 def _physical_core_count() -> int:
@@ -58,8 +73,8 @@ def _physical_core_count() -> int:
 
 
 def _serialize_canonical_digest_range(
-    task: tuple[int, int, Path],
-) -> Path:
+    task: tuple[int, int, Path, int],
+) -> _SerializedDigestShard:
     """Serialize one sorted observation range to a private binary shard.
 
     Returning corpus-sized tuples through a multiprocessing pipe duplicates all
@@ -69,7 +84,7 @@ def _serialize_canonical_digest_range(
     so each physical line remains exactly one sortable observation.
     """
 
-    begin, end, path = task
+    begin, end, path, maximum_samples = task
     serialized_rows = sorted(
         _PARALLEL_DIGEST_ROWS[index]._cached_canonical_json
         for index in range(begin, end)
@@ -78,7 +93,102 @@ def _serialize_canonical_digest_range(
         for serialized_row in serialized_rows:
             output.write(serialized_row.encode())
             output.write(b"\n")
-    return path
+    sample_count = min(maximum_samples, len(serialized_rows))
+    samples = tuple(
+        serialized_rows[
+            (sample_index + 1) * len(serialized_rows) // (sample_count + 1)
+        ].encode()
+        for sample_index in range(sample_count)
+    )
+    return _SerializedDigestShard(
+        path=path,
+        row_count=len(serialized_rows),
+        samples=samples,
+    )
+
+
+def _partition_serialized_digest_shard(
+    task: tuple[Path, tuple[bytes, ...]],
+) -> tuple[tuple[int, int], ...]:
+    """Locate disjoint lexical-bucket byte ranges in one sorted shard.
+
+    Every canonical row remains in the original shard. The returned offsets
+    let range workers seek directly to their portion, avoiding another
+    corpus-sized copy before the global merge. Equal rows use ``bisect_right``
+    so all copies land in one bucket and can never straddle adjacent fragments.
+    """
+
+    path, splitters = task
+    ranges: list[list[int | None]] = [
+        [None, None] for _unused in range(len(splitters) + 1)
+    ]
+    previous_bucket = 0
+    with path.open("rb") as handle:
+        while True:
+            begin = handle.tell()
+            serialized_line = handle.readline()
+            if not serialized_line:
+                break
+            if not serialized_line.endswith(b"\n"):
+                raise ValueError("corpus digest shard contains a partial row")
+            bucket = bisect_right(splitters, serialized_line[:-1])
+            if bucket < previous_bucket:
+                raise ValueError("corpus digest shard is not lexically sorted")
+            previous_bucket = bucket
+            end = handle.tell()
+            if ranges[bucket][0] is None:
+                ranges[bucket][0] = begin
+            ranges[bucket][1] = end
+    return tuple(
+        (0, 0) if begin is None else (int(begin), int(end))
+        for begin, end in ranges
+    )
+
+
+def _iter_serialized_digest_range(
+    path: Path,
+    begin: int,
+    end: int,
+) -> Iterator[bytes]:
+    """Yield canonical rows from exactly one prevalidated shard range."""
+
+    with path.open("rb") as handle:
+        handle.seek(begin)
+        while handle.tell() < end:
+            serialized_line = handle.readline()
+            if not serialized_line.endswith(b"\n") or handle.tell() > end:
+                raise ValueError("corpus digest shard range contains a partial row")
+            yield serialized_line[:-1]
+        if handle.tell() != end:
+            raise ValueError("corpus digest shard range ended at the wrong offset")
+
+
+def _merge_serialized_digest_bucket(
+    task: tuple[Path, tuple[tuple[Path, int, int], ...]],
+) -> tuple[Path, int]:
+    """Merge one global lexical range into a comma-joined digest fragment.
+
+    Bucket workers own all per-row comparisons and punctuation. The parent can
+    consequently feed large contiguous fragments to OpenSSL's SHA-256
+    implementation without revisiting individual Python objects or lines.
+    """
+
+    output_path, shard_ranges = task
+    iterators = tuple(
+        _iter_serialized_digest_range(path, begin, end)
+        for path, begin, end in shard_ranges
+        if begin != end
+    )
+    row_count = 0
+    first = True
+    with output_path.open("wb") as output:
+        for serialized_row in heapq.merge(*iterators):
+            if not first:
+                output.write(b",")
+            output.write(serialized_row)
+            first = False
+            row_count += 1
+    return output_path, row_count
 
 
 def _digest_serialized_rows(
@@ -111,19 +221,62 @@ def _digest_serialized_rows(
 
 
 def _digest_serialized_files(
-    paths: Iterable[Path],
+    shards: Iterable[_SerializedDigestShard],
     *,
     distinguish_execution_mode: bool,
     distinguish_aspect_bucket: bool,
+    directory: Path,
+    workers: int,
+    executor: ProcessPoolExecutor,
 ) -> str:
-    """Hash sorted binary shards as the historical canonical JSON array.
+    """Range-merge sorted shards and hash the historical canonical JSON array.
 
-    The final SHA-256 state is inherently ordered, but it need not receive one
-    freshly encoded Python string at a time.  This reducer merges worker-sorted
-    byte streams and feeds multi-megabyte buffers to OpenSSL-backed ``hashlib``.
-    It therefore preserves the exact legacy digest while avoiding a corpus-sized
-    multiprocessing return value and hundreds of thousands of tiny hash calls.
+    SHA-256 is ordered and cannot combine independently hashed ranges. Lexical
+    sorting, however, *can* be partitioned. Representative local-sort samples
+    define deterministic global splitters; workers then merge disjoint ranges
+    into comma-joined fragments. The coordinator streams those fragments in
+    splitter order, doing only large buffered reads and the irreducible ordered
+    SHA update. This retains the exact legacy digest bytes without a serial
+    Python comparison or punctuation loop over the complete corpus.
     """
+
+    materialized_shards = tuple(shards)
+    if not materialized_shards:
+        raise ValueError("corpus digest requires at least one serialized shard")
+    samples = sorted(
+        sample
+        for shard in materialized_shards
+        for sample in shard.samples
+    )
+    desired_bucket_count = min(workers, max(1, len(samples)))
+    splitters = tuple(sorted(set(
+        samples[len(samples) * bucket_index // desired_bucket_count]
+        for bucket_index in range(1, desired_bucket_count)
+    )))
+    bucket_count = len(splitters) + 1
+
+    shard_partitions = tuple(executor.map(
+        _partition_serialized_digest_shard,
+        (
+            (shard.path, splitters)
+            for shard in materialized_shards
+        ),
+    ))
+
+    bucket_tasks = tuple(
+        (
+            directory / f"merged-{bucket_index:04d}.json",
+            tuple(
+                (shard.path, *shard_partitions[shard_index][bucket_index])
+                for shard_index, shard in enumerate(materialized_shards)
+            ),
+        )
+        for bucket_index in range(bucket_count)
+    )
+    merged_buckets = tuple(executor.map(
+        _merge_serialized_digest_bucket,
+        bucket_tasks,
+    ))
 
     digest = hashlib.sha256()
     if not distinguish_aspect_bucket:
@@ -131,25 +284,21 @@ def _digest_serialized_files(
     if not distinguish_execution_mode:
         digest.update(b"mode-collapsed:")
     digest.update(b"[")
-    buffer = bytearray()
     first = True
-    handles = tuple(path.open("rb") for path in paths)
-    try:
-        for serialized_line in heapq.merge(*handles):
-            if not serialized_line.endswith(b"\n"):
-                raise ValueError("corpus digest shard contains a partial row")
-            if not first:
-                buffer.extend(b",")
-            buffer.extend(serialized_line[:-1])
-            first = False
-            if len(buffer) >= 8 * 1024 * 1024:
-                digest.update(buffer)
-                buffer.clear()
-        if buffer:
-            digest.update(buffer)
-    finally:
-        for handle in handles:
-            handle.close()
+    merged_row_count = 0
+    for path, row_count in merged_buckets:
+        if row_count == 0:
+            continue
+        if not first:
+            digest.update(b",")
+        with path.open("rb") as fragment:
+            while chunk := fragment.read(8 * 1024 * 1024):
+                digest.update(chunk)
+        first = False
+        merged_row_count += row_count
+    expected_row_count = sum(shard.row_count for shard in materialized_shards)
+    if merged_row_count != expected_row_count:
+        raise ValueError("parallel corpus digest merge changed the row inventory")
     digest.update(b"]")
     return "sha256:" + digest.hexdigest()
 
@@ -444,10 +593,14 @@ class ObservationCorpus:
     def subset(self, predicate) -> "ObservationCorpus":
         """Create a validated corpus containing rows accepted by ``predicate``."""
 
+        rows = tuple(row for row in self._observations if predicate(row))
+        if len(rows) == len(self._observations):
+            return self
         return ObservationCorpus._from_validated(
-            (row for row in self._observations if predicate(row)),
+            rows,
             distinguish_execution_mode=self._distinguish_execution_mode,
             distinguish_aspect_bucket=self._distinguish_aspect_bucket,
+            revalidate_candidate_identities=False,
         )
 
     def shape_groups(self) -> tuple[str, ...]:
@@ -459,11 +612,12 @@ class ObservationCorpus:
         """Hash canonical observations with deterministic parallel reduction.
 
         Serialization is independent per row, while the historical ABI sorts
-        every serialized row before hashing.  Large corpora therefore split
-        serialization and local sorting across fork workers, then merge those
-        sorted shards in the parent.  The parent streams exactly the bytes the
-        former monolithic ``json.dumps``/``join`` implementation produced, so
-        existing manifests and fit-cache identities remain valid.
+        every serialized row before hashing. Large corpora therefore split
+        serialization and local sorting across fork workers, then range-merge
+        disjoint portions of the global lexical order on the same worker pool.
+        The parent streams exactly the bytes the former monolithic
+        ``json.dumps``/``join`` implementation produced, so existing manifests
+        and fit-cache identities remain valid.
 
         Small unit-test corpora stay in-process because process startup would
         cost more than the work.  ``LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS``
@@ -512,6 +666,7 @@ class ObservationCorpus:
                         begin,
                         begin + size,
                         Path(directory) / f"shard-{worker_index:04d}.jsonl",
+                        worker_count,
                     ))
                     begin += size
                 _PARALLEL_DIGEST_ROWS = self._observations
@@ -520,17 +675,29 @@ class ObservationCorpus:
                         max_workers=worker_count,
                         mp_context=multiprocessing.get_context("fork"),
                     ) as executor:
-                        shard_paths = tuple(executor.map(
+                        serialized_shards = tuple(executor.map(
                             _serialize_canonical_digest_range,
                             tasks,
                         ))
+                        # Every worker has now inherited the immutable rows.
+                        # Reuse this expensive pool for partition and merge;
+                        # repeatedly forking the corpus-sized parent dominates
+                        # fit-only replay on large GPU evidence generations.
+                        _PARALLEL_DIGEST_ROWS = ()
+                        self._digest_cache = _digest_serialized_files(
+                            serialized_shards,
+                            distinguish_execution_mode=(
+                                self._distinguish_execution_mode
+                            ),
+                            distinguish_aspect_bucket=(
+                                self._distinguish_aspect_bucket
+                            ),
+                            directory=Path(directory),
+                            workers=worker_count,
+                            executor=executor,
+                        )
                 finally:
                     _PARALLEL_DIGEST_ROWS = ()
-                self._digest_cache = _digest_serialized_files(
-                    shard_paths,
-                    distinguish_execution_mode=self._distinguish_execution_mode,
-                    distinguish_aspect_bucket=self._distinguish_aspect_bucket,
-                )
                 return self._digest_cache
 
         self._digest_cache = _digest_serialized_rows(

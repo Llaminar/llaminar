@@ -442,7 +442,8 @@
       "exact_overlay": false,
       "aspect_bucket": "balanced",
       "fast_partition": "development",
-      "verifier_partition": null
+      "verifier_partition": null,
+      "prefill_partition": "development"
     },
     {
       "name": "CPUDecodeKPart_Balanced_Sealed_3200x4096",
@@ -1344,7 +1345,8 @@
       "exact_overlay": false,
       "aspect_bucket": "tall",
       "fast_partition": "development",
-      "verifier_partition": "development"
+      "verifier_partition": "development",
+      "prefill_partition": "development"
     },
     {
       "name": "V3VerifierSealed_Tall_4352x14336",

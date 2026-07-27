@@ -21,13 +21,14 @@ from typing import Any, Iterable
 from .schema import Backend, SemanticContract
 
 
-CANDIDATE_REGISTRY_VERSION = "native-vnni-candidates-v9"
+CANDIDATE_REGISTRY_VERSION = "native-vnni-candidates-v11"
 COMPATIBLE_CANDIDATE_REGISTRY_VERSIONS = tuple(
-    f"native-vnni-candidates-v{version}" for version in range(1, 10)
+    f"native-vnni-candidates-v{version}" for version in range(1, 12)
 )
 
 ROCM_MOE_GROUPED_PREFILL = "rocm_moe_grouped_prefill"
 ROCM_NATIVE_VNNI_DECODE = "rocm_native_vnni_decode"
+ROCM_NATIVE_VNNI_DECODE_FORMULA = "rocm_native_vnni_decode_formula"
 CUDA_NATIVE_VNNI_GEMV = "cuda_native_vnni_gemv"
 CPU_NATIVE_VNNI_DECODE = "cpu_native_vnni_decode"
 CPU_NATIVE_VNNI_VERIFIER_ROWS = "cpu_native_vnni_verifier_rows"
@@ -317,6 +318,53 @@ def rocm_native_vnni_decode_registry() -> CandidateRegistry:
 
 
 @lru_cache(maxsize=1)
+def rocm_native_vnni_decode_formula_registry() -> CandidateRegistry:
+    """Return total generic ROCm policies backed by concrete KB evidence.
+
+    The production launcher interprets a generated policy KB as a requested
+    partition count and clamps it to ``K / 32`` before launch. A literal KB row
+    is therefore an exact-shape candidate, while this registry names the
+    geometry-dependent operation that generic dispatch actually performs.
+    Projection resolves every formula to a directly measured concrete row; no
+    timing or correctness evidence is synthesized.
+    """
+
+    return CandidateRegistry(
+        _candidate(
+            backend=Backend.ROCM,
+            surface=ROCM_NATIVE_VNNI_DECODE_FORMULA,
+            candidate_id=(
+                "rocm.nvnni.decode.fast.clamped_formula."
+                f"kb{requested_kb}"
+            ),
+            aliases=(),
+            family="rocm_native_vnni_serial_clamped_kpart_formula",
+            config={
+                "family": "clamped_kb_formula",
+                "formula_kind": "requested_kb_clamped_to_k_groups",
+                "kb": requested_kb,
+                "k_group_width": 32,
+            },
+            arithmetic=(
+                "ordered K-part partials with requested KB clamped to K/32 "
+                "and serial-order FP32 reduction-v1"
+            ),
+            schedule=(
+                "hip-native-vnni-serial-requested-kb-"
+                f"{requested_kb}-shape-clamped-v1"
+            ),
+            contracts=(SemanticContract.FAST,),
+            resources=(
+                "native_vnni_prepared_weights",
+                "ordered_kpart_partials",
+            ),
+            workspace="ROCmNativeVNNIKPartWorkspace-v1",
+        )
+        for requested_kb in range(1, 65)
+    )
+
+
+@lru_cache(maxsize=1)
 def cpu_native_vnni_decode_registry() -> CandidateRegistry:
     """Return forceable CPU M=1 task-ownership schedules.
 
@@ -513,7 +561,12 @@ def cpu_native_vnni_prefill_registry() -> CandidateRegistry:
         arithmetic="independent ordered serial-M1 K accumulation per row-v1",
         schedule="cpu-native-vnni-row-chunk-grid-full-k-v1",
     )]
-    for n_block_chunks in (1, 2, 4, 8, 16):
+    # NBC16 is intentionally absent from the N-major family. Across 1,827
+    # historical cells it never won, and the focused short-prefill audit found
+    # its best result still 36.5% behind the cell winner. Keep NBC16 in the
+    # pair-grid family below because that physically different schedule has
+    # demonstrated rare wins.
+    for n_block_chunks in (1, 2, 4, 8):
         entries.append(_candidate(
             **common,
             candidate_id=(
@@ -854,6 +907,7 @@ def candidate_registry_digest() -> str:
         cpu_native_vnni_prefill_registry(),
         cuda_native_vnni_gemv_registry(),
         rocm_native_vnni_decode_registry(),
+        rocm_native_vnni_decode_formula_registry(),
         rocm_moe_grouped_prefill_registry(),
     )
     return _sha256_json({

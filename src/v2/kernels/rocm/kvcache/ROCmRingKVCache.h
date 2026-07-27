@@ -691,7 +691,7 @@ namespace llaminar2
          */
         DataT **d_batched_k_entry_table_ = nullptr;
         DataT **d_batched_v_entry_table_ = nullptr;
-        /// True after bindWorkspace() publishes every immutable entry pointer.
+        /// True after construction publishes every immutable entry pointer.
         bool batched_pointer_tables_ready_ = false;
 
         // Diagnostic scalar-read statistics. Canonical ring state remains on device.
@@ -713,17 +713,41 @@ namespace llaminar2
         /// [n_layers][batch_size] — lazily initialized
         mutable std::vector<std::vector<RoPEShadow>> rope_shadows_;
 
-        /// Allocate shadow buffers for a layer/seq if needed
-        void ensureRoPEShadow(int layer, int seq_idx) const;
+        /// Bind a layer/sequence shadow view to graph-planned conversion output.
+        void ensureRoPEShadow(int layer, int seq_idx);
 
         /// Invalidate shadow after append/evict
         void invalidateRoPEShadow(int layer, int seq_idx) const;
 
         // Helper methods
-        void allocate_pool(); // Single hipMalloc for all entries
-        void free_pool();     // Single hipFree for all entries
+        void allocate_pool(); // One backend allocation for all entries
+        void free_pool();     // Release the one backend allocation
         void assign_entry_from_pool(EntryT &entry, int linear_index);
         void allocate_all_entries();        // Pool + assign entries + tensor_views + device_params
+
+        /**
+         * @brief Publish immutable K/V entry topology before graph capture can begin.
+         *
+         * Grouped cache kernels consume one device array of K pointers and one
+         * device array of V pointers. The entry addresses are fixed when the
+         * cache pool is assigned, so construction publishes these arrays
+         * exactly once. Keeping publication out of bindWorkspace() makes
+         * repeated workspace binding a host-only operation and prevents an
+         * implicit default-stream H2D copy from invalidating HIP graph capture.
+         *
+         * @throws std::runtime_error if either table cannot be allocated or
+         *         copied to the owning device.
+         */
+        void initializeBatchedEntryPointerTables();
+
+        /**
+         * @brief Release cache-owned entry topology during teardown or failed construction.
+         *
+         * This method is noexcept so partially constructed caches can clean up
+         * both tables before propagating their original initialization error.
+         */
+        void releaseBatchedEntryPointerTables() noexcept;
+
         bool linearize_entry(
             EntryT &entry,
             int head,

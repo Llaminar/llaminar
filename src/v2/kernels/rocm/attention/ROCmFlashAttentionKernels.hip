@@ -2468,7 +2468,9 @@ static int launch_grouped_decode(
 
     if (!Q || !K_cache || !V_cache || !O || !O_partial || !m_partial ||
         !l_partial || !device_params || !hip_stream || row_count < 2 ||
-        row_count > 4 || query_rows_per_request <= 0 || max_kv_len <= 0 ||
+        row_count >
+            llaminar2::attention::kMaxGroupedVerifierAttentionRows ||
+        query_rows_per_request <= 0 || max_kv_len <= 0 ||
         n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || head_dim > 256 ||
         max_num_splits <= 0 || max_num_splits > FD_MAX_SPLITS_SUPPORTED)
     {
@@ -3111,7 +3113,10 @@ extern "C"
     {
         const int total_rows = request_count * query_rows;
         if (!device_params || !post_append_cached_tokens || request_count < 2 ||
-            query_rows <= 0 || total_rows > 4 || kv_stride <= 0 || !stream)
+            query_rows <= 0 ||
+            total_rows >
+                llaminar2::attention::kMaxGroupedVerifierAttentionRows ||
+            kv_stride <= 0 || !stream)
         {
             return -1;
         }
@@ -3136,49 +3141,6 @@ extern "C"
             return -1;
         }
         return 0;
-    }
-
-    /**
-     * @brief Allocate workspace for Flash Decoding
-     */
-    int hipFlashAttn_allocWorkspace(
-        void **partial_output, void **partial_m, void **partial_l,
-        int batch_size, int n_heads, int head_dim, int num_splits)
-    {
-        size_t num_partials = static_cast<size_t>(batch_size) * n_heads * num_splits;
-
-        size_t output_size = num_partials * head_dim * sizeof(float);
-        size_t m_size = num_partials * sizeof(float);
-        size_t l_size = num_partials * sizeof(float);
-
-        if (hipMalloc(partial_output, output_size) != hipSuccess)
-            return -1;
-        if (hipMalloc(partial_m, m_size) != hipSuccess)
-        {
-            (void)hipFree(*partial_output);
-            return -1;
-        }
-        if (hipMalloc(partial_l, l_size) != hipSuccess)
-        {
-            (void)hipFree(*partial_output);
-            (void)hipFree(*partial_m);
-            return -1;
-        }
-
-        return 0;
-    }
-
-    /**
-     * @brief Free workspace for Flash Decoding
-     */
-    void hipFlashAttn_freeWorkspace(void *partial_output, void *partial_m, void *partial_l)
-    {
-        if (partial_output)
-            (void)hipFree(partial_output);
-        if (partial_m)
-            (void)hipFree(partial_m);
-        if (partial_l)
-            (void)hipFree(partial_l);
     }
 
     /**

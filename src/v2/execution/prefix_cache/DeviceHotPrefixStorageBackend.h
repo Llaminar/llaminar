@@ -1,3 +1,14 @@
+/**
+ * @file DeviceHotPrefixStorageBackend.h
+ * @brief Pure-device ownership for optional hot prefix-cache replicas.
+ *
+ * A device-hot block is populated either directly from serialized GPU staging
+ * on the harvest stream or by one asynchronous H2D promotion after a lower-tier
+ * hit. Once resident, restore reads it directly without a host-visible replay.
+ * Pinned RAM and disk remain durable capacity tiers; this backend owns only an
+ * acceleration replica.
+ */
+
 #pragma once
 
 #include "execution/prefix_cache/PrefixStorageBackend.h"
@@ -20,16 +31,18 @@ namespace llaminar2
         PrefixBlockHandle allocate(const PrefixCacheKey &key,
                                    const PrefixPayloadLayout &layout) override;
         bool release(const PrefixBlockHandle &handle) override;
-        bool hydrateToRam(const PrefixBlockHandle &handle,
-                          PrefixBlockHandle *ram_handle) override;
 
-        bool promoteFromRam(const PrefixBlockHandle &ram_handle,
-                            PrefixBlockHandle *device_handle,
-                            std::string *error = nullptr);
-        bool hydrateToRamBackend(const PrefixBlockHandle &handle,
-                                 IPrefixStorageBackend &ram_backend,
-                                 PrefixBlockHandle *ram_handle,
-                                 std::string *error = nullptr);
+        /**
+         * @brief Allocate a persistent VRAM replica with archive-identical layout.
+         *
+         * This method allocates only. The orchestrator fills every section by
+         * D2D copies on its explicit archive stream and publishes one readiness
+         * event after the final copy.
+         */
+        bool allocateDeviceBlock(
+            const PrefixBlockHandle &ram_archive,
+            PrefixBlockHandle *device_handle,
+            std::string *error = nullptr);
 
         size_t budgetBytes() const { return budget_bytes_; }
         size_t usedBytes() const { return used_bytes_; }

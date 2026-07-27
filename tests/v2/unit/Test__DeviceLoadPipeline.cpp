@@ -12,6 +12,8 @@
 #include <cstring>
 #include <cstdint>
 #include <cmath>
+#include <fstream>
+#include <sstream>
 #include <vector>
 #include <string>
 
@@ -41,6 +43,17 @@ namespace llaminar2
 
 namespace
 {
+
+std::string readDeviceLoadPipelineSource()
+{
+    std::ifstream input(
+        "/workspaces/llaminar/src/v2/loaders/gpu_pipeline/DeviceLoadPipeline.cpp");
+    if (!input)
+        return {};
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    return contents.str();
+}
 
 inline float cpu_fp16_to_fp32(uint16_t h)
 {
@@ -229,6 +242,34 @@ inline bool fp16_approx_equal(uint16_t a, uint16_t b)
 }
 
 } // anonymous namespace
+
+/**
+ * @brief Guard authoritative bounded loading against advisory provenance bits.
+ *
+ * Buffered pread fills the bounded pinned ring without serially faulting the
+ * tensor's mmap address range, while retaining Linux readahead and page-cache
+ * throughput. The concrete source range must therefore be resolved through
+ * MmapRegion for every job, including expert views whose tensor wrapper does
+ * not own the root mmap token. Applying MADV_DONTNEED after each GPU job can
+ * invalidate PTEs still used by another loader or CPU consumer, so reclamation
+ * remains a model-lifetime act.
+ */
+TEST(Test__DeviceLoadPipelineSourceContract, ConcreteRangeOwnsBufferedReadProvenance)
+{
+    const std::string source = readDeviceLoadPipelineSource();
+    ASSERT_FALSE(source.empty());
+
+    EXPECT_EQ(source.find("O_DIRECT"), std::string::npos);
+    EXPECT_NE(source.find("::pread("), std::string::npos);
+    EXPECT_NE(source.find("POSIX_FADV_SEQUENTIAL"), std::string::npos);
+    EXPECT_NE(source.find("MmapRegion::resolveFileSource(job.host_raw_data, job.raw_bytes)"),
+              std::string::npos);
+    EXPECT_EQ(source.find("source_is_mmap_backed"), std::string::npos)
+        << "Tensor/view capability hints must not gate authoritative range resolution";
+    EXPECT_EQ(source.find("adviseDontneedRange"), std::string::npos);
+    EXPECT_EQ(source.find("buildMmapReclaimPlan"), std::string::npos);
+    EXPECT_EQ(source.find("gpu_pipeline_mmap_reclaimed_bytes"), std::string::npos);
+}
 
 // ============================================================================
 // Test fixture
@@ -478,7 +519,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_0_SingleWeight)
 #endif
 }
 
-TEST_F(Test__DeviceLoadPipeline, Q4_0_KChunkedWeightMatchesUnchunkedLayout)
+TEST_F(Test__DeviceLoadPipeline, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
 {
 #ifdef HAVE_ROCM
     const int N = 64;
@@ -520,7 +561,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_0_KChunkedWeightMatchesUnchunkedLayout)
 #endif
 }
 
-TEST_F(Test__DeviceLoadPipeline, Q4_K_KChunkedWeightMatchesUnchunkedLayout)
+TEST_F(Test__DeviceLoadPipeline, Q4_K_RowChunkedWeightMatchesUnchunkedLayout)
 {
 #ifdef HAVE_ROCM
     const int N = 32;
@@ -561,7 +602,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_K_KChunkedWeightMatchesUnchunkedLayout)
 #endif
 }
 
-TEST(Test__DeviceLoadPipelineCUDA, Q4_0_KChunkedWeightMatchesUnchunkedLayout)
+TEST(Test__DeviceLoadPipelineCUDA, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
 {
 #ifdef HAVE_CUDA
     auto *backend = getCUDABackend();

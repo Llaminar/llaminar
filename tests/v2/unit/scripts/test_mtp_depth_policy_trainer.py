@@ -59,9 +59,7 @@ class MTPDepthPolicyTrainerTest(unittest.TestCase):
                     "--summary",
                     str(report),
                     "--holdout-modulus",
-                    "999",
-                    "--holdout-bucket",
-                    "998",
+                    "0",
                 ],
                 cwd=REPO_ROOT,
                 text=True,
@@ -156,9 +154,7 @@ class MTPDepthPolicyTrainerTest(unittest.TestCase):
                     "--summary",
                     str(report),
                     "--holdout-modulus",
-                    "999",
-                    "--holdout-bucket",
-                    "998",
+                    "0",
                 ],
                 cwd=REPO_ROOT,
                 text=True,
@@ -208,9 +204,7 @@ class MTPDepthPolicyTrainerTest(unittest.TestCase):
                     "--summary",
                     str(report),
                     "--holdout-modulus",
-                    "999",
-                    "--holdout-bucket",
-                    "998",
+                    "0",
                 ],
                 cwd=REPO_ROOT,
                 text=True,
@@ -281,9 +275,7 @@ class MTPDepthPolicyTrainerTest(unittest.TestCase):
                     "--summary",
                     str(report),
                     "--holdout-modulus",
-                    "999",
-                    "--holdout-bucket",
-                    "998",
+                    "0",
                 ],
                 cwd=REPO_ROOT,
                 text=True,
@@ -302,6 +294,51 @@ class MTPDepthPolicyTrainerTest(unittest.TestCase):
                 "MTPDepthPolicyModelClass::MoE, 1, 0.460000, 0.740000",
                 include_text,
             )
+
+    def test_holdout_split_is_invariant_to_corpus_relocation(self) -> None:
+        """Moving identical evidence must not change generated policy rules."""
+
+        with tempfile.TemporaryDirectory() as first_dir:
+            with tempfile.TemporaryDirectory() as second_dir:
+                generated: list[tuple[str, str]] = []
+                for directory in (first_dir, second_dir):
+                    root = Path(directory)
+                    summary = root / "summary.tsv"
+                    output = root / "MTPDepthPolicyGenerated.inc"
+                    report = root / "report.txt"
+                    self.write_summary(summary)
+
+                    result = subprocess.run(
+                        [
+                            "python3",
+                            str(TRAINER),
+                            "--input",
+                            str(summary),
+                            "--output",
+                            str(output),
+                            "--summary",
+                            str(report),
+                            "--holdout-modulus",
+                            "4",
+                            "--holdout-bucket",
+                            "0",
+                        ],
+                        cwd=REPO_ROOT,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    generated.append(
+                        (
+                            output.read_text(encoding="utf-8"),
+                            report.read_text(encoding="utf-8"),
+                        )
+                    )
+
+                self.assertEqual(generated[0], generated[1])
 
 
 if __name__ == "__main__":

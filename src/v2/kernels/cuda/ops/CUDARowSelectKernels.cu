@@ -9,6 +9,7 @@
  */
 
 #include "CUDARowSelectKernels.h"
+#include "../../../utils/Logger.h"
 
 #ifdef HAVE_CUDA
 
@@ -193,39 +194,6 @@ namespace llaminar2::cuda
             cudaFreeHost(host_selected_row);
     }
 
-    bool allocateRowSelectParam(
-        int device_ordinal,
-        int **host_selected_row,
-        int **device_selected_row)
-    {
-        if (!host_selected_row || !device_selected_row)
-            return false;
-
-        *host_selected_row = nullptr;
-        *device_selected_row = nullptr;
-
-        if (!allocateRowSelectHostParam(device_ordinal, host_selected_row))
-            return false;
-        if (!ok(cudaMalloc(reinterpret_cast<void **>(device_selected_row), sizeof(int))))
-        {
-            freeRowSelectHostParam(device_ordinal, *host_selected_row);
-            *host_selected_row = nullptr;
-            return false;
-        }
-        return true;
-    }
-
-    void freeRowSelectParam(
-        int device_ordinal,
-        int *host_selected_row,
-        int *device_selected_row)
-    {
-        cudaSetDevice(device_ordinal);
-        if (device_selected_row)
-            cudaFree(device_selected_row);
-        freeRowSelectHostParam(device_ordinal, host_selected_row);
-    }
-
     bool uploadRowSelectParam(
         int *device_selected_row,
         const int *host_selected_row,
@@ -282,6 +250,39 @@ namespace llaminar2::cuda
         return ok(cudaGetLastError());
     }
 
+    bool launchFixedRowSelectFP32(
+        const float *input,
+        float *output,
+        int selected_row,
+        int seq_len,
+        int d_model,
+        void *stream)
+    {
+        if (!input || !output || selected_row < 0 ||
+            selected_row >= seq_len || seq_len <= 0 || d_model <= 0 ||
+            !stream)
+        {
+            return false;
+        }
+
+        /*
+         * The graph geometry fixes both row and width. A contiguous D2D copy
+         * therefore gives the runtime's copy engine the complete transfer,
+         * avoids per-thread bounds work, and captures no host-owned replay
+         * scalar. Rebuilding for another geometry naturally records another
+         * immutable source address.
+         */
+        const size_t source_offset =
+            static_cast<size_t>(selected_row) *
+            static_cast<size_t>(d_model);
+        return ok(cudaMemcpyAsync(
+            output,
+            input + source_offset,
+            static_cast<size_t>(d_model) * sizeof(float),
+            cudaMemcpyDeviceToDevice,
+            reinterpret_cast<cudaStream_t>(stream)));
+    }
+
     bool launchRowsSelectFP32(
         const float *input,
         float *output,
@@ -324,6 +325,18 @@ namespace llaminar2::cuda
             request_count <= 0 ||
             request_count * request_row_stride != seq_len)
         {
+            LOG_ERROR(
+                "[CUDARowSelectKernels] Request-terminal row selection "
+                "rejected an incomplete launch contract"
+                << " input=" << static_cast<const void *>(input)
+                << " output=" << static_cast<void *>(output)
+                << " lengths="
+                << static_cast<const void *>(request_sequence_lengths)
+                << " stream=" << stream
+                << " seq_len=" << seq_len
+                << " request_row_stride=" << request_row_stride
+                << " d_model=" << d_model
+                << " request_count=" << request_count);
             return false;
         }
 
@@ -347,7 +360,25 @@ namespace llaminar2::cuda
             request_row_stride,
             d_model,
             request_count);
-        return ok(cudaGetLastError());
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess)
+        {
+            LOG_ERROR(
+                "[CUDARowSelectKernels] Request-terminal row-selection launch "
+                "failed: "
+                << cudaGetErrorString(launch_status)
+                << " stream=" << stream
+                << " input=" << static_cast<const void *>(input)
+                << " output=" << static_cast<void *>(output)
+                << " lengths="
+                << static_cast<const void *>(request_sequence_lengths)
+                << " seq_len=" << seq_len
+                << " request_row_stride=" << request_row_stride
+                << " d_model=" << d_model
+                << " request_count=" << request_count);
+            return false;
+        }
+        return true;
     }
 
     bool launchMTPConcatFP32(

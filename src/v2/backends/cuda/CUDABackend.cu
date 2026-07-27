@@ -93,6 +93,8 @@ namespace llaminar2
             device_count_ = 0;
             // Log warning but don't throw - allow CPU-only execution
         }
+        penalty_buffers_.resize(
+            static_cast<size_t>(std::max(device_count_, 0)));
     }
 
     CUDABackend::~CUDABackend()
@@ -1148,6 +1150,13 @@ namespace llaminar2
         int position_offset,
         int request_count,
         int32_t *out_condition_tokens,
+        int32_t *out_position_ids,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_prepare_mtp_verifier_position_ids(
+        const int32_t *base_positions,
+        int request_count,
+        int padded_seq_len,
         int32_t *out_position_ids,
         int device_idx,
         void *stream);
@@ -2708,6 +2717,34 @@ namespace llaminar2
             stream);
     }
 
+    bool CUDABackend::enqueuePrepareMTPVerifierPositionIds(
+        const void *base_positions_device,
+        int request_count,
+        int padded_seq_len,
+        int device_id,
+        void *stream,
+        void *out_position_ids_device)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !base_positions_device ||
+            request_count <= 0 ||
+            padded_seq_len <= 0 ||
+            !stream ||
+            !out_position_ids_device)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_prepare_mtp_verifier_position_ids(
+            static_cast<const int32_t *>(base_positions_device),
+            request_count,
+            padded_seq_len,
+            static_cast<int32_t *>(out_position_ids_device),
+            device_id,
+            stream);
+    }
+
     bool CUDABackend::enqueueInitializeMTPDeviceLogicalState(
         const void *sampled_tokens_device,
         const void *target_positions_device,
@@ -2759,6 +2796,66 @@ namespace llaminar2
         float *logits, const int *token_ids, const float *penalties,
         int num_penalties, int vocab_size, int device_idx, void *stream);
 
+    bool CUDABackend::prepareLogitPenaltyWorkspace(
+        int vocab_size,
+        int device_id)
+    {
+        if (device_id < 0 ||
+            device_id >= device_count_ ||
+            vocab_size <= 0 ||
+            static_cast<size_t>(device_id) >= penalty_buffers_.size())
+        {
+            return false;
+        }
+
+        auto &bufs = penalty_buffers_[static_cast<size_t>(device_id)];
+        if (bufs.allocated_count >= vocab_size &&
+            bufs.token_ids_ptr &&
+            bufs.penalties_ptr &&
+            bufs.ready_event)
+        {
+            return true;
+        }
+        if (bufs.allocated_count != 0 ||
+            bufs.token_ids_ptr ||
+            bufs.penalties_ptr ||
+            bufs.ready_event)
+        {
+            LOG_ERROR("[CUDABackend] Refusing to resize an active logit-penalty workspace");
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        cudaError_t err =
+            cudaMalloc(&bufs.token_ids_ptr, vocab_size * sizeof(int));
+        if (err != cudaSuccess)
+            return false;
+        err = cudaMalloc(
+            &bufs.penalties_ptr,
+            vocab_size * sizeof(float));
+        if (err != cudaSuccess)
+        {
+            CUDA_WARN_IF_FAIL(cudaFree(bufs.token_ids_ptr));
+            bufs.token_ids_ptr = nullptr;
+            return false;
+        }
+        cudaEvent_t ready_event = nullptr;
+        err = cudaEventCreateWithFlags(
+            &ready_event,
+            cudaEventDisableTiming);
+        if (err != cudaSuccess)
+        {
+            CUDA_WARN_IF_FAIL(cudaFree(bufs.penalties_ptr));
+            CUDA_WARN_IF_FAIL(cudaFree(bufs.token_ids_ptr));
+            bufs.penalties_ptr = nullptr;
+            bufs.token_ids_ptr = nullptr;
+            return false;
+        }
+        bufs.ready_event = ready_event;
+        bufs.allocated_count = vocab_size;
+        return true;
+    }
+
     bool CUDABackend::applyLogitPenaltiesF32(void *logits_device,
                                               const int *token_ids_host,
                                               const float *penalties_host,
@@ -2769,41 +2866,30 @@ namespace llaminar2
             !token_ids_host || !penalties_host || num_penalties <= 0)
             return false;
 
-        // Lazily allocate per-device penalty upload buffers
-        if (penalty_buffers_.empty())
-            penalty_buffers_.resize(device_count_);
-
-        auto &bufs = penalty_buffers_[device_id];
-
-        // Reallocate if num_penalties exceeds current allocation
-        if (bufs.allocated_count < num_penalties)
-        {
-            CUDA_WARN_IF_FAIL(cudaSetDevice(device_id));
-            if (bufs.token_ids_ptr)
-                CUDA_WARN_IF_FAIL(cudaFree(bufs.token_ids_ptr));
-            if (bufs.penalties_ptr)
-                CUDA_WARN_IF_FAIL(cudaFree(bufs.penalties_ptr));
-
-            cudaError_t err = cudaMalloc(&bufs.token_ids_ptr, num_penalties * sizeof(int));
-            if (err != cudaSuccess)
-            {
-                bufs.token_ids_ptr = nullptr;
-                bufs.allocated_count = 0;
-                return false;
-            }
-            err = cudaMalloc(&bufs.penalties_ptr, num_penalties * sizeof(float));
-            if (err != cudaSuccess)
-            {
-                CUDA_WARN_IF_FAIL(cudaFree(bufs.token_ids_ptr));
-                bufs.token_ids_ptr = nullptr;
-                bufs.allocated_count = 0;
-                return false;
-            }
-            bufs.allocated_count = num_penalties;
-        }
+        auto &bufs = penalty_buffers_[static_cast<size_t>(device_id)];
+        if (num_penalties > bufs.allocated_count ||
+            !bufs.token_ids_ptr ||
+            !bufs.penalties_ptr ||
+            !bufs.ready_event)
+            return false;
 
         CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
         cudaStream_t s = resolveStream(device_id, stream);
+        if (!s)
+            return false;
+
+        /*
+         * The penalty slot may follow main, sidecar, or verifier logits. Queue
+         * cross-stream ownership on device before overwriting the shared slot.
+         */
+        if (bufs.publication_valid &&
+            bufs.producer_stream != stream)
+        {
+            CUDA_CHECK_OR_THROW(cudaStreamWaitEvent(
+                s,
+                static_cast<cudaEvent_t>(bufs.ready_event),
+                0));
+        }
 
         // Upload penalty data to device
         CUDA_CHECK_OR_THROW(cudaMemcpyAsync(bufs.token_ids_ptr, token_ids_host,
@@ -2823,7 +2909,11 @@ namespace llaminar2
             return false;
         }
 
-        CUDA_CHECK_OR_THROW(cudaStreamSynchronize(s));
+        CUDA_CHECK_OR_THROW(cudaEventRecord(
+            static_cast<cudaEvent_t>(bufs.ready_event),
+            s));
+        bufs.producer_stream = stream;
+        bufs.publication_valid = true;
         return true;
     }
 
@@ -2882,9 +2972,8 @@ namespace llaminar2
         }
         catch (...)
         {
-            // Fallback: execute synchronously
             std::promise<bool> p;
-            p.set_value(deviceToHost(dst, src, bytes, device_id));
+            p.set_exception(std::current_exception());
             return p.get_future();
         }
     }
@@ -2914,9 +3003,8 @@ namespace llaminar2
         }
         catch (...)
         {
-            // Fallback: execute synchronously
             std::promise<bool> p;
-            p.set_value(hostToDevice(dst, src, bytes, device_id));
+            p.set_exception(std::current_exception());
             return p.get_future();
         }
     }
@@ -2944,9 +3032,8 @@ namespace llaminar2
         }
         catch (...)
         {
-            // Fallback: execute synchronously
             std::promise<bool> p;
-            p.set_value(synchronize(device_id));
+            p.set_exception(std::current_exception());
             return p.get_future();
         }
     }
@@ -2975,9 +3062,8 @@ namespace llaminar2
         }
         catch (...)
         {
-            // Fallback: execute synchronously
             std::promise<void *> p;
-            p.set_value(allocate(bytes, device_id));
+            p.set_exception(std::current_exception());
             return p.get_future();
         }
     }
@@ -3005,10 +3091,8 @@ namespace llaminar2
         }
         catch (...)
         {
-            // Fallback: execute synchronously
-            free(ptr, device_id);
             std::promise<void> p;
-            p.set_value();
+            p.set_exception(std::current_exception());
             return p.get_future();
         }
     }
@@ -3045,9 +3129,8 @@ namespace llaminar2
         }
         catch (...)
         {
-            // Fallback: execute synchronously
             std::promise<bool> p;
-            p.set_value(memset(ptr, value, bytes, device_id));
+            p.set_exception(std::current_exception());
             return p.get_future();
         }
     }

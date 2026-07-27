@@ -36,6 +36,48 @@ def _mapping_digest(payload: Mapping[str, object]) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def _first_json_difference(
+    expected: object,
+    actual: object,
+    path: str = "$",
+) -> str | None:
+    """Return the first deterministic path where two JSON values diverge."""
+
+    if type(expected) is not type(actual):
+        return (
+            f"{path}: expected_type={type(expected).__name__} "
+            f"actual_type={type(actual).__name__}"
+        )
+    if isinstance(expected, dict):
+        expected_keys = set(expected)
+        actual_keys = set(actual)
+        if expected_keys != actual_keys:
+            return (
+                f"{path}: missing_keys={sorted(expected_keys - actual_keys)} "
+                f"unexpected_keys={sorted(actual_keys - expected_keys)}"
+            )
+        for key in sorted(expected):
+            difference = _first_json_difference(
+                expected[key], actual[key], f"{path}.{key}"
+            )
+            if difference is not None:
+                return difference
+        return None
+    if isinstance(expected, list):
+        if len(expected) != len(actual):
+            return f"{path}: expected_length={len(expected)} actual_length={len(actual)}"
+        for index, (expected_item, actual_item) in enumerate(zip(expected, actual)):
+            difference = _first_json_difference(
+                expected_item, actual_item, f"{path}[{index}]"
+            )
+            if difference is not None:
+                return difference
+        return None
+    if expected != actual:
+        return f"{path}: expected={expected!r} actual={actual!r}"
+    return None
+
+
 def _generic_policy_mapping(policy: Mapping[str, object]) -> dict[str, object]:
     """Extract exactly the fields covered by ``PolicyIR.digest(generic_only)``."""
 
@@ -228,8 +270,14 @@ def validate_frozen_policy_file(path: Path, frozen: FrozenPolicy) -> None:
         "frozen_generic_policy_digest": frozen.generic_digest,
     }
     if payload != expected:
+        difference = _first_json_difference(payload, expected)
         raise ValueError(
-            "development policy does not match the pre-sealed frozen artifact"
+            "development policy does not match the pre-sealed frozen artifact: "
+            f"persisted_policy_digest={payload.get('policy_digest')} "
+            f"reconstructed_policy_digest={expected['policy_digest']} "
+            f"persisted_generic_digest={payload.get('frozen_generic_policy_digest')} "
+            f"reconstructed_generic_digest={expected['frozen_generic_policy_digest']} "
+            f"first_difference={difference}"
         )
 
 

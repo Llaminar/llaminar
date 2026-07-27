@@ -159,7 +159,7 @@ namespace llaminar2
                 DeviceWorkspaceManager *workspace = nullptr,
                 int activation_row_offset = 0) override;
 
-            bool supports_fused_projection() const override { return precision_ == Precision::FP32; }
+            bool supports_fused_projection() const override { return true; }
 
             bool multiply_fused_tensor(
                 const TensorBase *input,

@@ -1,20 +1,21 @@
 /**
  * @file Test__TensorBase_TransferTo.cpp
- * @brief Unit tests for TensorBase::transferTo() direct GPU-to-GPU transfer
+ * @brief Integration tests for TransferEngine activation movement
  *
  * Tests Phase 2 of GPU-Native Tensor Coherence:
- * - transferTo() for direct GPU-to-GPU transfers
- * - copyTo() for non-authoritative copy operations
+ * - Direct same-vendor GPU-to-GPU transfers
+ * - Deliberately host-staged cross-vendor transfers
  * - Precondition validation
- * - Cross-vendor transfers (CUDA↔ROCm)
  * - Multi-hop transfers
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include "v2/tensors/TensorClasses.h"
 #include "v2/backends/DeviceId.h"
 #include "v2/backends/BackendManager.h"
 #include "v2/collective/BackendRouter.h"
+#include "../../utils/ScopedGPUStream.h"
 
 using namespace llaminar2;
 
@@ -42,6 +43,8 @@ protected:
         {
             cuda_available_ = true;
             cuda_device_ = DeviceId::cuda(0);
+            cuda_stream_ =
+                std::make_unique<llaminar2::test::ScopedGPUStream>(cuda_device_);
 
             // Check for second CUDA device
             if (DeviceManager::instance().cuda_device_count() >= 2)
@@ -56,6 +59,8 @@ protected:
         {
             rocm_available_ = true;
             rocm_device_ = DeviceId::rocm(0);
+            rocm_stream_ =
+                std::make_unique<llaminar2::test::ScopedGPUStream>(rocm_device_);
 
             // Check for second ROCm device
             if (DeviceManager::instance().rocm_device_count() >= 2)
@@ -65,6 +70,16 @@ protected:
             }
         }
 #endif
+    }
+
+    void *streamFor(DeviceId device) const
+    {
+        if (device.type == DeviceType::CUDA && cuda_stream_)
+            return cuda_stream_->get();
+        if (device.type == DeviceType::ROCm && rocm_stream_)
+            return rocm_stream_->get();
+        throw std::runtime_error(
+            "No explicit transfer-test stream for requested GPU");
     }
 
     /**
@@ -103,35 +118,48 @@ protected:
     DeviceId cuda_device_1_ = DeviceId::cpu();
     DeviceId rocm_device_ = DeviceId::cpu();
     DeviceId rocm_device_1_ = DeviceId::cpu();
+    std::unique_ptr<llaminar2::test::ScopedGPUStream> cuda_stream_;
+    std::unique_ptr<llaminar2::test::ScopedGPUStream> rocm_stream_;
 };
 
 // =============================================================================
 // Precondition Tests
 // =============================================================================
 
-TEST_F(Test__TensorBase_TransferTo, NotOnGPU_Fails)
-{
-    // Tensor is on host, not GPU - should fail
-    EXPECT_TRUE(tensor_->isHostAuthoritative());
-
-    DeviceId target = DeviceId::cuda(0);
-    EXPECT_FALSE(tensor_->transferTo(target));
-}
-
-TEST_F(Test__TensorBase_TransferTo, NotDeviceAuthoritative_Fails)
+TEST_F(Test__TensorBase_TransferTo, HostSourceUploads)
 {
     if (!cuda_available_)
     {
         GTEST_SKIP() << "No CUDA device available";
     }
 
-    // Upload to GPU but don't mark dirty (host still authoritative)
-    ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
     EXPECT_TRUE(tensor_->isHostAuthoritative());
 
-    // Transfer should fail because device isn't authoritative
-    DeviceId target = DeviceId::cuda(1);
-    EXPECT_FALSE(tensor_->transferTo(target));
+    const auto result = TransferEngine::instance().transferActivation(
+        tensor_.get(),
+        cuda_device_);
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
+    EXPECT_TRUE(verifyData());
+}
+
+TEST_F(Test__TensorBase_TransferTo, SynchronizedSourceCanMove)
+{
+    if (!cuda_available_)
+    {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+
+    // An upload leaves matching host and device copies. TransferEngine may
+    // select either valid source; callers do not need to invent authority.
+    ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
+    EXPECT_TRUE(tensor_->isSynced());
+
+    const auto result = TransferEngine::instance().transferActivation(
+        tensor_.get(),
+        cuda_device_);
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_TRUE(verifyData());
 }
 
 TEST_F(Test__TensorBase_TransferTo, SameDevice_NoOp)
@@ -143,15 +171,18 @@ TEST_F(Test__TensorBase_TransferTo, SameDevice_NoOp)
 
     // Setup: upload and mark dirty
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(cuda_device_));
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
 
     // Transfer to same device should succeed (no-op)
-    EXPECT_TRUE(tensor_->transferTo(cuda_device_));
+    const auto result = TransferEngine::instance().transferActivation(
+        tensor_.get(),
+        cuda_device_);
+    EXPECT_TRUE(result.success) << result.error;
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
 }
 
-TEST_F(Test__TensorBase_TransferTo, CPUTarget_Fails)
+TEST_F(Test__TensorBase_TransferTo, CPUTargetDownloads)
 {
     if (!cuda_available_)
     {
@@ -160,10 +191,13 @@ TEST_F(Test__TensorBase_TransferTo, CPUTarget_Fails)
 
     // Setup: upload and mark dirty
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(cuda_device_));
 
-    // Transfer to CPU should fail (use ensureOnHost instead)
-    EXPECT_FALSE(tensor_->transferTo(DeviceId::cpu()));
+    const auto result = TransferEngine::instance().transferActivation(
+        tensor_.get(),
+        DeviceId::cpu());
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_TRUE(tensor_->hostValid());
 }
 
 // =============================================================================
@@ -179,7 +213,7 @@ TEST_F(Test__TensorBase_TransferTo, CUDA_to_CUDA)
 
     // Setup: upload and mark dirty on source
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(cuda_device_));
     ASSERT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
 
     // Check if GlobalBackendRouter is initialized
@@ -190,7 +224,10 @@ TEST_F(Test__TensorBase_TransferTo, CUDA_to_CUDA)
     }
 
     // Transfer
-    ASSERT_TRUE(tensor_->transferTo(cuda_device_1_));
+    const auto result = TransferEngine::instance().transferActivation(
+        tensor_.get(),
+        cuda_device_1_);
+    ASSERT_TRUE(result.success) << result.error;
 
     // Verify state
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_1_));
@@ -214,7 +251,7 @@ TEST_F(Test__TensorBase_TransferTo, ROCm_to_ROCm)
 
     // Setup: upload and mark dirty on source
     ASSERT_TRUE(tensor_->ensureOnDevice(rocm_device_));
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(rocm_device_));
 
     // Check if GlobalBackendRouter is initialized
     auto *router = GlobalBackendRouter::get();
@@ -224,7 +261,10 @@ TEST_F(Test__TensorBase_TransferTo, ROCm_to_ROCm)
     }
 
     // Transfer
-    ASSERT_TRUE(tensor_->transferTo(rocm_device_1_));
+    const auto result = TransferEngine::instance().transferActivation(
+        tensor_.get(),
+        rocm_device_1_);
+    ASSERT_TRUE(result.success) << result.error;
 
     // Verify state
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(rocm_device_1_));
@@ -249,19 +289,15 @@ TEST_F(Test__TensorBase_TransferTo, CUDA_to_ROCm)
         GTEST_SKIP() << "GlobalBackendRouter not initialized";
     }
 
-    // Check if HOST backend supports this transfer
-    auto *backend = router->getBackendForCopy(cuda_device_, rocm_device_);
-    if (!backend || !backend->supportsCopy(cuda_device_, rocm_device_))
-    {
-        GTEST_SKIP() << "HOST backend doesn't support CUDA->ROCm";
-    }
-
     // Setup: upload and mark dirty on CUDA
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(cuda_device_));
 
     // Transfer CUDA -> ROCm
-    ASSERT_TRUE(tensor_->transferTo(rocm_device_));
+    const auto result = TransferEngine::instance().transferActivation(
+        tensor_.get(),
+        rocm_device_);
+    ASSERT_TRUE(result.success) << result.error;
 
     // Verify state
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(rocm_device_));
@@ -282,19 +318,15 @@ TEST_F(Test__TensorBase_TransferTo, ROCm_to_CUDA)
         GTEST_SKIP() << "GlobalBackendRouter not initialized";
     }
 
-    // Check if HOST backend supports this transfer
-    auto *backend = router->getBackendForCopy(rocm_device_, cuda_device_);
-    if (!backend || !backend->supportsCopy(rocm_device_, cuda_device_))
-    {
-        GTEST_SKIP() << "HOST backend doesn't support ROCm->CUDA";
-    }
-
     // Setup: upload and mark dirty on ROCm
     ASSERT_TRUE(tensor_->ensureOnDevice(rocm_device_));
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(rocm_device_));
 
     // Transfer ROCm -> CUDA
-    ASSERT_TRUE(tensor_->transferTo(cuda_device_));
+    const auto result = TransferEngine::instance().transferActivation(
+        tensor_.get(),
+        cuda_device_);
+    ASSERT_TRUE(result.success) << result.error;
 
     // Verify state
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
@@ -319,93 +351,26 @@ TEST_F(Test__TensorBase_TransferTo, MultiHop_CUDA_ROCm_CUDA)
         GTEST_SKIP() << "GlobalBackendRouter not initialized";
     }
 
-    // Check if HOST backend supports both directions
-    auto *backend1 = router->getBackendForCopy(cuda_device_, rocm_device_);
-    auto *backend2 = router->getBackendForCopy(rocm_device_, cuda_device_);
-    if (!backend1 || !backend2 ||
-        !backend1->supportsCopy(cuda_device_, rocm_device_) ||
-        !backend2->supportsCopy(rocm_device_, cuda_device_))
-    {
-        GTEST_SKIP() << "HOST backend doesn't support bidirectional CUDA<->ROCm";
-    }
-
     // CUDA -> ROCm
     ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    ASSERT_TRUE(tensor_->transferTo(rocm_device_));
+    TransferEngine::publishCurrentDeviceWrite(tensor_, streamFor(cuda_device_));
+    const auto cuda_to_rocm =
+        TransferEngine::instance().transferActivation(
+            tensor_.get(),
+            rocm_device_);
+    ASSERT_TRUE(cuda_to_rocm.success) << cuda_to_rocm.error;
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(rocm_device_));
 
     // ROCm -> CUDA (round-trip)
-    ASSERT_TRUE(tensor_->transferTo(cuda_device_));
+    const auto rocm_to_cuda =
+        TransferEngine::instance().transferActivation(
+            tensor_.get(),
+            cuda_device_);
+    ASSERT_TRUE(rocm_to_cuda.success) << rocm_to_cuda.error;
     EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
 
     // Verify data survived round-trip
     EXPECT_TRUE(verifyData());
-}
-
-// =============================================================================
-// copyTo() Tests (Non-Authoritative Copy)
-// =============================================================================
-
-TEST_F(Test__TensorBase_TransferTo, CopyTo_KeepsSourceAuthoritative)
-{
-    if (!multi_cuda_)
-    {
-        GTEST_SKIP() << "Need 2+ CUDA devices";
-    }
-
-    // Check if GlobalBackendRouter is initialized
-    auto *router = GlobalBackendRouter::get();
-    if (!router)
-    {
-        GTEST_SKIP() << "GlobalBackendRouter not initialized";
-    }
-
-    // Setup: upload and mark dirty on source
-    ASSERT_TRUE(tensor_->ensureOnDevice(cuda_device_));
-    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    ASSERT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
-
-    // Copy to second device
-    ASSERT_TRUE(tensor_->copyTo(cuda_device_1_));
-
-    // Source should STILL be authoritative
-    EXPECT_TRUE(tensor_->isDeviceAuthoritative(cuda_device_));
-    EXPECT_FALSE(tensor_->isDeviceAuthoritative(cuda_device_1_));
-}
-
-TEST_F(Test__TensorBase_TransferTo, CopyTo_NotAuthoritative_Fails)
-{
-    if (!cuda_available_)
-    {
-        GTEST_SKIP() << "No CUDA device available";
-    }
-
-    // Tensor is on host (not device authoritative)
-    EXPECT_TRUE(tensor_->isHostAuthoritative());
-
-    // copyTo should fail
-    EXPECT_FALSE(tensor_->copyTo(DeviceId::cuda(1)));
-}
-
-// =============================================================================
-// Host-Only Tests (API Surface Verification)
-// =============================================================================
-
-TEST_F(Test__TensorBase_TransferTo, API_Surface_TransferTo_Exists)
-{
-    // Verify the API compiles - tensor is on host, so this should fail cleanly
-    DeviceId target = DeviceId::cuda(0);
-    bool result = tensor_->transferTo(target);
-    EXPECT_FALSE(result); // Should fail - not on GPU
-}
-
-TEST_F(Test__TensorBase_TransferTo, API_Surface_CopyTo_Exists)
-{
-    // Verify the API compiles - tensor is on host, so this should fail cleanly
-    DeviceId target = DeviceId::cuda(0);
-    bool result = tensor_->copyTo(target);
-    EXPECT_FALSE(result); // Should fail - not on GPU
 }
 
 int main(int argc, char **argv)

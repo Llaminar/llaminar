@@ -106,6 +106,10 @@
 #   LLAMINAR_E2E_ENABLE_MOE_REBALANCE_CLEAR_PROBE Enable CUDA2/ROCm2 Qwen3.6
 #                       MoE prefix-cache + dynamic-rebalance clear-cache probes
 #                       in the default suite list (default: 0).
+#   LLAMINAR_E2E_PREFIX_REBALANCE_CLEAR_PROBE_REQUESTS
+#                       Number of repeated requests in each targeted
+#                       prefix-cache/rebalance probe (default: 3). Raise this
+#                       for focused lifecycle stress without reloading the model.
 #   LLAMINAR_E2E_ENABLE_QWEN36_MOE_REBALANCE_E2E Enable CUDA2/ROCm2 Qwen3.6
 #                       MoE Dynamic/LLEP long-context rebalance suites in the
 #                       default list (default: 1).
@@ -346,7 +350,7 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     S9_TP_ROCM2_FLAGS="--tp-devices rocm:0,rocm:1"
     S9_TP_ROCM4_FLAGS="--tp-devices rocm:0,rocm:1,rocm:2,rocm:3"
     S9_REBALANCE_FLAGS="--moe-rebalance dynamic --moe-hot-expert-cache 2 --moe-rebalance-window 8 --moe-rebalance-max-window 8 --moe-rebalance-window-growth 1 --moe-release-raw-expert-weights"
-    S9_REBALANCE_MOVEMENT_FLAGS="--moe-hot-expert-cache off --moe-rebalance-window 4 --moe-rebalance-max-window 4 --moe-rebalance-window-growth 1 --moe-dynamic-imbalance-threshold-permille 0 --moe-dynamic-min-improvement-permille 0 --moe-dynamic-max-swaps-per-layer 20 --moe-dynamic-max-plan-entries-per-wave 20 --moe-dynamic-min-window-activations 0 --moe-device-rebalance-min-load-spread-improvement 0 --moe-device-rebalance-min-load-spread-improvement-divisor 0 --moe-device-rebalance-min-wave-spread-improvement-per-payload-slot 0 --moe-device-rebalance-min-foreign-rows-per-transfer 0 --moe-device-rebalance-min-router-spread-improvement-per-payload-slot 0 --moe-device-rebalance-max-post-wave-load-spread-permille 1000 --moe-release-raw-expert-weights"
+    S9_REBALANCE_MOVEMENT_FLAGS="--moe-hot-expert-cache off --moe-rebalance-window 4 --moe-rebalance-max-window 4 --moe-rebalance-window-growth 1 --moe-dynamic-imbalance-threshold-permille 0 --moe-dynamic-min-improvement-permille 0 --moe-dynamic-max-swaps-per-layer 20 --moe-dynamic-max-plan-entries-per-wave 20 --moe-dynamic-min-window-activations 0 --moe-device-rebalance-min-load-spread-improvement 0 --moe-device-rebalance-min-load-spread-improvement-divisor 0 --moe-device-rebalance-min-wave-spread-improvement-per-payload-slot 0 --moe-device-rebalance-min-foreign-rows-per-transfer 0 --moe-device-rebalance-min-router-spread-improvement-per-payload-slot 0 --moe-device-rebalance-max-post-wave-load-spread-permille 1000 --moe-device-llep-alpha-numerator 1 --moe-device-llep-alpha-denominator 2 --moe-device-llep-disable-balanced-skip --moe-release-raw-expert-weights"
     S9_OVERLAY_CUDA2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy prefill-tensor-parallel-decode-replicated --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;routed_compute=apportioned;owner=0 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
     S9_OVERLAY_ROCM2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot --moe-routed-expert-shared-domain qwen36_moe_rocm_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy prefill-tensor-parallel-decode-replicated --moe-routed-expert-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;routed_compute=apportioned;owner=0 --moe-routed-expert-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
     # Remote NodeLocal CPU-cold ExpertOverlay shapes are the production target,
@@ -359,33 +363,33 @@ if [ ${#SUITES[@]} -eq 0 ]; then
         SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200||qwen36-moe-baseline")
         SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_PREFIX_FLAGS}|qwen36-moe-prefix-ram|no-long-context")
         SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_MTP_FLAGS}|qwen36-moe-mtp-greedy-d2|no-long-context")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-prefix-ram-cuda2tp|no-long-context,no-prefill-graph-buckets")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-mtp-greedy-d2-cuda2tp|no-long-context,no-prefill-graph-buckets")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-prefix-ram-rocm2tp|no-long-context,no-prefill-graph-buckets")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm2tp|no-long-context,no-prefill-graph-buckets")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-prefix-ram-rocm4tp|no-long-context,no-prefill-graph-buckets")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm4tp|no-long-context,no-prefill-graph-buckets")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-prefix-ram-cuda2tp|no-long-context,prefill-graph-probe")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-mtp-greedy-d2-cuda2tp|no-long-context,prefill-graph-probe")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-prefix-ram-rocm2tp|no-long-context,prefill-graph-probe")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm2tp|no-long-context,prefill-graph-probe")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-prefix-ram-rocm4tp|no-long-context,prefill-graph-probe")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm4tp|no-long-context,prefill-graph-probe")
         if [[ "$QWEN36_MOE_REBALANCE_E2E" == "1" ]]; then
-            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-cuda2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-rocm2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-cuda2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-rocm2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-ram-cuda2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-ram-rocm2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-ram-cuda2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-ram-rocm2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-cuda2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-rocm2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-cuda2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-rocm2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-greedy-d2-cuda2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-greedy-d2-rocm2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-greedy-d2-cuda2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-greedy-d2-rocm2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-ram-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-ram-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-ram-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-ram-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
         fi
         if [[ "$MOE_REBALANCE_CLEAR_PROBE_E2E" == "1" ]]; then
-            SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS} --backend nccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-cuda2tp|no-long-context,no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe")
-            SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS} --backend rccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-rocm2tp|no-long-context,no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe")
+            SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS} --backend nccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-cuda2tp|no-long-context,prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe")
+            SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS} --backend rccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-rocm2tp|no-long-context,prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe")
         fi
         if [[ "$REMOTE_EXPERT_OVERLAY_E2E" == "1" ]]; then
             SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
@@ -1035,6 +1039,56 @@ is_prefix_cache_case() {
 is_mtp_case() {
     local extra_flags="$1"
     [[ " ${extra_flags} " == *" --mtp "* ]]
+}
+
+moe_rebalance_window_from_flags() {
+    local extra_flags="$1"
+
+    # Parse the command exactly as the server will see it.  The E2E suite uses
+    # both "--option value" and "--option=value" spellings, and ad-hoc shell
+    # splitting would mis-handle quoted expert-domain arguments elsewhere in
+    # the same flag string.
+    python3 - "$extra_flags" <<'PY'
+import shlex
+import sys
+
+try:
+    tokens = shlex.split(sys.argv[1])
+except Exception:
+    tokens = sys.argv[1].split()
+
+for idx, token in enumerate(tokens):
+    if token == "--moe-rebalance-window" and idx + 1 < len(tokens):
+        print(tokens[idx + 1])
+        break
+    if token.startswith("--moe-rebalance-window="):
+        print(token.split("=", 1)[1])
+        break
+PY
+}
+
+mtp_draft_tokens_from_flags() {
+    local extra_flags="$1"
+
+    # Keep this parser symmetric with moe_rebalance_window_from_flags(): both
+    # values participate in the same transaction-budget calculation below.
+    python3 - "$extra_flags" <<'PY'
+import shlex
+import sys
+
+try:
+    tokens = shlex.split(sys.argv[1])
+except Exception:
+    tokens = sys.argv[1].split()
+
+for idx, token in enumerate(tokens):
+    if token == "--mtp-draft-tokens" and idx + 1 < len(tokens):
+        print(tokens[idx + 1])
+        break
+    if token.startswith("--mtp-draft-tokens="):
+        print(token.split("=", 1)[1])
+        break
+PY
 }
 
 suite_disables_long_context() {
@@ -1973,7 +2027,7 @@ validate_perf_stats() {
     fi
 
     if [ ! -s "$perf_path" ]; then
-        if (is_mtp_case "$extra_flags" && is_gpu_backend "$backend") ||
+        if is_gpu_backend "$backend" ||
            suite_runs_prefill_graph_probe "$suite_options" ||
            suite_runs_prefix_cache_rebalance_clear_probe "$suite_options" ||
            suite_runs_moe_rebalance_movement_probe "$suite_options"; then
@@ -1985,12 +2039,19 @@ validate_perf_stats() {
     fi
 
     local validation
-    validation=$(python3 - "$perf_path" "$backend" "$extra_flags" "$long_context_run" "$suite_options" <<'PY'
+    validation=$(python3 - "$perf_path" "$backend" "$extra_flags" "$long_context_run" "$suite_options" "$SCRIPT_DIR" <<'PY'
 import json
 import shlex
 import sys
 
-path, backend, extra_flags, long_context_run, suite_options = sys.argv[1:6]
+path, backend, extra_flags, long_context_run, suite_options, policy_module_dir = sys.argv[1:7]
+sys.path.insert(0, policy_module_dir)
+
+from graph_capture_perf_policy import validate_graph_capture_policy
+from request_input_lifetime_perf_policy import (
+    validate_request_input_lifetime_policy,
+)
+
 is_gpu = backend.startswith(("cuda:", "rocm:")) or backend in {"tp", "pp"}
 is_mtp = f" {extra_flags} ".find(" --mtp ") >= 0
 suite_option_set = {
@@ -2023,6 +2084,22 @@ records = data.get("records")
 if not isinstance(records, list):
     print("FAIL: missing records array")
     sys.exit(0)
+
+if is_gpu:
+    graph_capture_validation = validate_graph_capture_policy(
+        records,
+        backend,
+        extra_flags,
+        require_prefill_lifecycle=expect_prefill_phase,
+    )
+    if graph_capture_validation.error:
+        print(f"FAIL: {graph_capture_validation.error}")
+        sys.exit(0)
+
+    request_input_validation = validate_request_input_lifetime_policy(records)
+    if request_input_validation.error:
+        print(f"FAIL: {request_input_validation.error}")
+        sys.exit(0)
 
 def has_record(name=None, domain=None, tags=None):
     tags = tags or {}
@@ -2102,36 +2179,20 @@ decode_graph_captured = (
 decode_graph_replayed = (
     has_record("decode_graph_phase", "forward_graph", {"phase": "replay"})
 )
-decode_graph_explicitly_unsupported = has_record(
-    "decode_capture_policy",
-    "forward_graph",
-    {
-        "has_collectives": "true",
-        "collectives_graph_capturable": "false",
-    },
-)
 
 if is_mtp and not has_record(domain="mtp"):
     print("FAIL: MTP case emitted no mtp-domain counters")
     sys.exit(0)
 
 if is_gpu:
-    if not decode_graph_captured and not decode_graph_explicitly_unsupported:
+    if not decode_graph_captured:
         print("FAIL: GPU case emitted no decode graph capture counter")
         sys.exit(0)
     # Short arithmetic probes may finish immediately after warmup/capture,
     # especially on ROCm.  Require replay only for cases that deliberately
-    # create enough decode work or explicitly ask for a replay proof.  LocalTP
-    # and PP suites that include non-capturable collectives must emit an
-    # explicit policy counter instead of quietly pretending graph replay was
-    # available.
-    if expect_decode_replay and not decode_graph_replayed and not decode_graph_explicitly_unsupported:
+    # create enough decode work or explicitly ask for a replay proof.
+    if expect_decode_replay and not decode_graph_replayed:
         print("FAIL: GPU case expected decode graph replay but emitted no replay counter")
-        sys.exit(0)
-
-if expect_prefill_phase:
-    if not has_record("prefill_graph_phase", "forward_graph"):
-        print("FAIL: eligible GPU long-context case emitted no prefill graph phase counters")
         sys.exit(0)
 
 if require_prefill_capture:
@@ -2213,13 +2274,12 @@ if require_prefix_rebalance_clear:
     movement_score = (
         record_value_sum(
             (
+                "device_rebalance_prefill_active_transfer_slot_experts",
                 "device_rebalance_apply_applied_arrivals",
                 "device_rebalance_transfer_current_applied_arrivals",
-                "device_rebalance_transfer_useful_payload_bytes",
                 "device_rebalance_wave_applied_arrivals",
                 "device_rebalance_wave_applied_arrivals_total",
                 "device_rebalance_windows_applied",
-                "device_rebalance_llep_weight_transfer_count",
                 "gpu_direct_transfer_count",
                 "gpu_direct_transfer_bytes",
                 "gpu_direct_transfer_slot_publish_experts",
@@ -2233,14 +2293,26 @@ if require_prefix_rebalance_clear:
                 "applied_arrivals",
                 "copied_arrivals",
                 "windows_applied",
-                "payload_bucket_slots",
-                "llep_weight_transfer_count",
             ),
             domain="moe_rebalance",
         )
     )
     if movement_score <= 0.0:
         print("FAIL: prefix-cache rebalance clear probe saw no applied/imported expert movement")
+        sys.exit(0)
+    maintenance_launch_score = record_value_sum(
+        ("device_maintenance_graph_launches",),
+        "moe_rebalance",
+    )
+    maintenance_consumer_wait_score = record_value_sum(
+        ("device_maintenance_graph_consumer_event_waits",),
+        "moe_rebalance",
+    )
+    if maintenance_launch_score > 0.0 and maintenance_consumer_wait_score <= 0.0:
+        print(
+            "FAIL: device MoE maintenance launched without a main/MTP graph "
+            "consumer event wait"
+        )
         sys.exit(0)
     pending_publish_drains = record_value_sum(
         ("clear_cache_pending_publish_drains",),
@@ -2289,7 +2361,18 @@ if require_moe_rebalance_movement:
         print("FAIL: MoE rebalance movement probe emitted no moe_rebalance counters")
         sys.exit(0)
 
+    # A live transfer-slot expert is stronger evidence than any intermediate
+    # planner counter: its descriptor is valid, resident, locally executable,
+    # and published in the active runtime bank. Count that final state toward
+    # every phase so prefill movement is proven even when the following short
+    # decode-maintenance window correctly chooses resident-only assignments.
+    prefill_applied_movement = record_value_sum(
+        ("device_rebalance_prefill_active_transfer_slot_experts",),
+        "moe_rebalance",
+    )
     planned_score = (
+        prefill_applied_movement
+        +
         record_value_sum(
             (
                 "device_rebalance_planned_arrivals",
@@ -2312,16 +2395,40 @@ if require_moe_rebalance_movement:
             domain="moe_rebalance",
         )
     )
+    materialized_score = (
+        prefill_applied_movement
+        +
+        record_value_sum(
+            (
+                "device_rebalance_plan_count",
+                "device_rebalance_planned_arrivals",
+                "device_rebalance_payload_bucket_slots",
+                "device_rebalance_transfer_current_command_count",
+                "device_rebalance_transfer_useful_payload_bytes",
+                "device_rebalance_wave_command_count",
+                "device_rebalance_wave_command_count_total",
+            ),
+            "moe_rebalance",
+        )
+        + tag_value_sum(
+            (
+                "planned_arrivals",
+                "payload_bucket_slots",
+                "command_count",
+            ),
+            domain="moe_rebalance",
+        )
+    )
     applied_score = (
+        prefill_applied_movement
+        +
         record_value_sum(
             (
                 "device_rebalance_apply_applied_arrivals",
                 "device_rebalance_transfer_current_applied_arrivals",
-                "device_rebalance_transfer_useful_payload_bytes",
                 "device_rebalance_wave_applied_arrivals",
                 "device_rebalance_wave_applied_arrivals_total",
                 "device_rebalance_windows_applied",
-                "device_rebalance_llep_weight_transfer_count",
                 "gpu_direct_transfer_count",
                 "gpu_direct_transfer_bytes",
                 "gpu_direct_transfer_slot_publish_experts",
@@ -2335,8 +2442,6 @@ if require_moe_rebalance_movement:
                 "applied_arrivals",
                 "copied_arrivals",
                 "windows_applied",
-                "payload_bucket_slots",
-                "llep_weight_transfer_count",
             ),
             domain="moe_rebalance",
         )
@@ -2344,8 +2449,11 @@ if require_moe_rebalance_movement:
     if planned_score <= 0.0:
         print("FAIL: MoE rebalance movement probe saw no planned expert movement")
         sys.exit(0)
+    if materialized_score <= 0.0:
+        print("FAIL: MoE rebalance movement probe saw a policy proposal but no materialized transfer command/payload")
+        sys.exit(0)
     if applied_score <= 0.0:
-        print("FAIL: MoE rebalance movement probe saw planned work but no applied/imported expert movement")
+        print("FAIL: MoE rebalance movement probe saw materialized work but no applied/imported expert movement")
         sys.exit(0)
 
 print(f"ok {len(records)}")
@@ -2657,35 +2765,26 @@ run_prefix_cache_rebalance_clear_probe() {
 
     local probe_max_tokens="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MAX_TOKENS:-16}"
     local min_completion_tokens="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MIN_COMPLETION_TOKENS:-8}"
-    local probe_max_tokens_overridden="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MAX_TOKENS+x}"
     local min_completion_tokens_overridden="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MIN_COMPLETION_TOKENS+x}"
     local rebalance_window
-    rebalance_window=$(python3 - "$extra_flags" <<'PY'
-import shlex
-import sys
-
-try:
-    tokens = shlex.split(sys.argv[1])
-except Exception:
-    tokens = sys.argv[1].split()
-
-for idx, token in enumerate(tokens):
-    if token == "--moe-rebalance-window" and idx + 1 < len(tokens):
-        print(tokens[idx + 1])
-        break
-    if token.startswith("--moe-rebalance-window="):
-        print(token.split("=", 1)[1])
-        break
-PY
-)
+    rebalance_window=$(moe_rebalance_window_from_flags "$extra_flags")
     if [[ "$rebalance_window" =~ ^[0-9]+$ ]] && [ "$rebalance_window" -gt 0 ]; then
         local completion_tokens_for_window=$((rebalance_window + 1))
-        if [ -z "$min_completion_tokens_overridden" ]; then
+        if is_mtp_case "$extra_flags"; then
+            local mtp_draft_tokens
+            mtp_draft_tokens=$(mtp_draft_tokens_from_flags "$extra_flags")
+            if [[ "$mtp_draft_tokens" =~ ^[0-9]+$ ]]; then
+                # One verifier transaction can publish at most draft+1 output
+                # tokens.  To force W scheduler boundaries, request one token
+                # beyond the maximum that W-1 transactions could satisfy.
+                completion_tokens_for_window=$(( (rebalance_window - 1) * (mtp_draft_tokens + 1) + 1 ))
+            fi
+        fi
+        if [ -z "$min_completion_tokens_overridden" ] &&
+           [ "$min_completion_tokens" -lt "$completion_tokens_for_window" ]; then
             min_completion_tokens="$completion_tokens_for_window"
         fi
-        if [ -z "$probe_max_tokens_overridden" ]; then
-            probe_max_tokens="$min_completion_tokens"
-        elif [ "$probe_max_tokens" -lt "$min_completion_tokens" ]; then
+        if [ "$probe_max_tokens" -lt "$min_completion_tokens" ]; then
             probe_max_tokens="$min_completion_tokens"
         fi
     fi
@@ -2715,7 +2814,13 @@ print(json.dumps(messages, separators=(",", ":")))
 PY
 )
 
-    for i in 1 2 3; do
+    local probe_request_count="${LLAMINAR_E2E_PREFIX_REBALANCE_CLEAR_PROBE_REQUESTS:-3}"
+    if [[ ! "$probe_request_count" =~ ^[1-9][0-9]*$ ]]; then
+        fail "[${tag}] Prefix-cache rebalance clear probe request count must be a positive integer, got '${probe_request_count}'"
+        return
+    fi
+
+    for ((i = 1; i <= probe_request_count; ++i)); do
         payload=$(make_chat_payload "$messages_json" "$probe_max_tokens" "false" "false")
         response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
             -H "Content-Type: application/json" \
@@ -2831,10 +2936,40 @@ run_backend_tests() {
     fi
     if suite_runs_moe_rebalance_movement_probe "$suite_options"; then
         local probe_transfer_slots="${LLAMINAR_E2E_MOE_REBALANCE_COMPACT_PAYLOAD_SLOTS:-32}"
-        echo -e "  ${BLUE}INFO${NC} [${tag}] MoE rebalance movement probe: forcing short windows, zero movement floors, compact_payload_slots=${probe_transfer_slots}"
+        local probe_maintenance_slack=1
+        local probe_initial_maintenance_period=1
+        local probe_rebalance_window
+        local probe_effective_window
+        probe_rebalance_window=$(moe_rebalance_window_from_flags "$extra_flags")
+        probe_effective_window="${LLAMINAR_E2E_MOE_REBALANCE_WINDOW:-4}"
+        if [[ ! "$probe_effective_window" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid LLAMINAR_E2E_MOE_REBALANCE_WINDOW='${probe_effective_window}'" >&2
+            return 1
+        fi
+        if is_mtp_case "$extra_flags"; then
+            local probe_mtp_draft_tokens
+            probe_mtp_draft_tokens=$(mtp_draft_tokens_from_flags "$extra_flags")
+            if [[ "$probe_mtp_draft_tokens" =~ ^[0-9]+$ ]]; then
+                local probe_grouped_rows=$((probe_mtp_draft_tokens + 1))
+                if [ "$probe_grouped_rows" -lt "$probe_effective_window" ]; then
+                    probe_effective_window="$probe_grouped_rows"
+                fi
+            fi
+        fi
+        if [[ "$probe_rebalance_window" =~ ^[0-9]+$ ]] &&
+           [ "$probe_rebalance_window" -gt 0 ]; then
+            # The device controller defines readiness in routed work rows, not
+            # host-visible committed tokens. One grouped MTP transaction
+            # publishes at most draft+1 such rows, so cap the diagnostic
+            # evidence window at that real production launch geometry. The
+            # first replay remains window+slack, matching the ordinary
+            # scheduler cadence for the effective window.
+            probe_initial_maintenance_period=$((probe_effective_window + probe_maintenance_slack))
+        fi
+        echo -e "  ${BLUE}INFO${NC} [${tag}] MoE rebalance movement probe: forcing short windows, zero movement floors, evidence_window=${probe_effective_window}, compact_payload_slots=${probe_transfer_slots}, initial_maintenance_period=${probe_initial_maintenance_period}"
         server_env+=(
-            "LLAMINAR_MOE_REBALANCE_WINDOW=4"
-            "LLAMINAR_MOE_REBALANCE_MAX_WINDOW=4"
+            "LLAMINAR_MOE_REBALANCE_WINDOW=${probe_effective_window}"
+            "LLAMINAR_MOE_REBALANCE_MAX_WINDOW=${probe_effective_window}"
             "LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH=1"
             "LLAMINAR_MOE_REBALANCE_DYNAMIC_IMBALANCE_THRESHOLD_PER_MILLE=0"
             "LLAMINAR_MOE_REBALANCE_DYNAMIC_MIN_IMPROVEMENT_PER_MILLE=0"
@@ -2843,9 +2978,12 @@ run_backend_tests() {
             "LLAMINAR_MOE_REBALANCE_DYNAMIC_MIN_WINDOW_ACTIVATIONS=0"
             "LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS=0"
             "LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE=full"
-            "LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS=4"
+            # The first replay waits for the complete evidence window derived
+            # above.  Subsequent windows retain the ordinary window+slack
+            # cadence, while request cleanup drains any prepared wave.
+            "LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS=${probe_initial_maintenance_period}"
             "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS=4"
-            "LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS=1"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS=${probe_maintenance_slack}"
             "LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS=0"
             "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT=0"
             "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR=0"

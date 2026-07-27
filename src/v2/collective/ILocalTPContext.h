@@ -371,6 +371,37 @@ namespace llaminar2
         }
 
         /**
+         * @brief Establish a device-domain fence before a graph lifecycle transition.
+         *
+         * A host rendezvous alone cannot order GPU work already queued by sibling
+         * participants. Homogeneous LocalTP implementations must enqueue a tiny
+         * NCCL/RCCL collective on each participant's exact graph stream, then
+         * verify through the named rendezvous that every peer enqueued the same
+         * fence. Returning true guarantees that subsequent work on each stream is
+         * ordered after all device work preceding the fence across the domain.
+         *
+         * @param boundary_name Stable lifecycle boundary identifier.
+         * @param device_index Participant index in devices().
+         * @param stream Exact stream that will begin capture or launch a graph.
+         * @param timeout_ms Host contract timeout for matching peer arrivals.
+         * @return true only when the device fence and both contract rendezvous complete.
+         */
+        virtual bool graphCaptureBoundaryOnStream(
+            const std::string &boundary_name,
+            int device_index,
+            void *stream,
+            int timeout_ms)
+        {
+            (void)boundary_name;
+            (void)device_index;
+            (void)timeout_ms;
+            if (!stream)
+                throw std::invalid_argument(
+                    "ILocalTPContext::graphCaptureBoundaryOnStream requires a non-null GPU stream");
+            return false;
+        }
+
+        /**
          * @brief Gather shards from multiple devices into a single output tensor
          *
          * This is the orchestrator-friendly variant of allgather. Instead of requiring
@@ -569,23 +600,35 @@ namespace llaminar2
         virtual void clearBARBackedOutputs() = 0;
 
         /**
-         * @brief Reserve temporary buffer capacity for collective operations
+         * @brief Reserve every persistent buffer required by collective execution.
          *
-         * Pre-allocates internal temp buffers to avoid allocation in the hot path.
-         * The buffer will grow if needed but never shrink during operation.
-         * Buffer is only freed during shutdown().
+         * This setup-only call makes the collective memory contract explicit:
+         * the backend receives its transport workspace byte capacity, while the
+         * LocalTP context receives the maximum logical element count needed by
+         * FP16 transport. Keeping these dimensions separate prevents quantized
+         * activation byte counts from accidentally under-sizing FP16 scratch.
+         *
+         * No collective execution method may grow either reservation. A request
+         * that exceeds this setup contract is a fatal planning error, not an
+         * invitation to allocate while a graph is executing or being captured.
          *
          * Call this during initialization after model dimensions are known:
          * @code
-         * size_t max_elements = max_seq_len * hidden_size;
-         * size_t buffer_bytes = activationPrecisionBufferBytes(max_elements, precision);
-         * tp_ctx->reserveTempBufferBytes(buffer_bytes * 1.1);  // 10% margin
+         * const size_t max_elements = max_seq_len * hidden_size;
+         * const size_t transport_bytes =
+         *     activationPrecisionBufferBytes(max_elements, precision);
+         * tp_ctx->reserveCollectiveResources(
+         *     transport_bytes_with_margin,
+         *     max_elements_with_margin);
          * @endcode
          *
-         * @param bytes Minimum buffer capacity in bytes
-         * @return true if reservation succeeded
+         * @param backend_temp_bytes Minimum backend transport workspace capacity.
+         * @param fp16_scratch_elements Maximum logical FP16 transport element count.
+         * @return true only when every participant is fully reserved.
          */
-        virtual bool reserveTempBufferBytes(size_t bytes) = 0;
+        virtual bool reserveCollectiveResources(
+            size_t backend_temp_bytes,
+            size_t fp16_scratch_elements) = 0;
     };
 
     /**

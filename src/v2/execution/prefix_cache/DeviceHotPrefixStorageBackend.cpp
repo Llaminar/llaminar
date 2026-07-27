@@ -1,88 +1,62 @@
+/**
+ * @file DeviceHotPrefixStorageBackend.cpp
+ * @brief Pure-device allocation and ownership for prefix-cache hot replicas.
+ */
+
 #include "execution/prefix_cache/DeviceHotPrefixStorageBackend.h"
 
-#include "execution/prefix_cache/RamPrefixStorageBackend.h"
-#include "tensors/TensorClasses.h"
-#include "transfer/TransferEngine.h"
+#include "backends/BackendManager.h"
 
 #include <algorithm>
-#include <cstring>
 #include <memory>
-#include <vector>
+#include <utility>
 
 namespace llaminar2
 {
     namespace
     {
-        size_t tensorElementCountForBytes(size_t bytes)
-        {
-            return (bytes + sizeof(float) - 1) / sizeof(float);
-        }
-
-        std::shared_ptr<TensorBase> uploadBytesToDevice(
-            const std::shared_ptr<std::vector<uint8_t>> &bytes,
+        /**
+         * @brief Allocate one archive section in VRAM with event-safe lifetime.
+         *
+         * A prepared hot handle can be discarded while D2D copies are still
+         * queued. The owner therefore retains the block readiness object and
+         * waits only for that block's event before returning its allocation.
+         */
+        std::shared_ptr<void> allocateDeviceSection(
+            IBackend *backend,
             DeviceId device,
+            size_t bytes,
+            const std::shared_ptr<PrefixPayloadReadiness> &readiness,
             std::string *error)
         {
-            if (!bytes || bytes->empty())
+            if (bytes == 0)
+                return nullptr;
+            if (!backend || !device.is_gpu())
             {
+                if (error)
+                    *error = "device-hot allocation requires a GPU backend";
                 return nullptr;
             }
 
-            auto tensor = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{tensorElementCountForBytes(bytes->size())},
-                DeviceId::cpu());
-            auto *host = static_cast<uint8_t *>(tensor->raw_mutable_data());
-            if (!host)
+            const int ordinal = device.gpu_ordinal();
+            void *raw = backend->allocate(bytes, ordinal);
+            if (!raw)
             {
                 if (error)
-                    *error = "failed to allocate device-hot staging tensor";
+                    *error = "device-hot VRAM allocation failed";
                 return nullptr;
             }
-            std::memset(host, 0, tensor->size_bytes());
-            std::memcpy(host, bytes->data(), bytes->size());
 
-            auto result = TransferEngine::instance().upload(tensor.get(), device);
-            if (!result.success)
-            {
-                if (error)
-                    *error = result.error;
-                return nullptr;
-            }
-            return tensor;
-        }
-
-        bool downloadBytesFromDevice(const std::shared_ptr<TensorBase> &tensor,
-                                     std::shared_ptr<std::vector<uint8_t>> &bytes,
-                                     std::string *error)
-        {
-            if (!bytes || bytes->empty())
-            {
-                return true;
-            }
-            if (!tensor)
-            {
-                if (error)
-                    *error = "missing device-hot tensor";
-                return false;
-            }
-
-            auto result = TransferEngine::instance().download(tensor.get());
-            if (!result.success)
-            {
-                if (error)
-                    *error = result.error;
-                return false;
-            }
-
-            const auto *host = static_cast<const uint8_t *>(tensor->raw_data());
-            if (!host)
-            {
-                if (error)
-                    *error = "device-hot tensor host data unavailable";
-                return false;
-            }
-            std::memcpy(bytes->data(), host, bytes->size());
-            return true;
+            return std::shared_ptr<void>(
+                raw,
+                [backend, ordinal, readiness](void *pointer)
+                {
+                    if (!pointer)
+                        return;
+                    if (readiness)
+                        (void)readiness->waitOnHost();
+                    backend->free(pointer, ordinal);
+                });
         }
     } // namespace
 
@@ -91,14 +65,18 @@ namespace llaminar2
     {
     }
 
-    DeviceHotPrefixStorageBackend::DeviceHotPrefixStorageBackend(DeviceId device, size_t budget_bytes)
-        : device_(device), budget_bytes_(budget_bytes)
+    DeviceHotPrefixStorageBackend::DeviceHotPrefixStorageBackend(
+        DeviceId device,
+        size_t budget_bytes)
+        : device_(device),
+          budget_bytes_(budget_bytes)
     {
     }
 
     bool DeviceHotPrefixStorageBackend::canStore(size_t bytes) const
     {
-        return device_.is_gpu() && bytes > 0 &&
+        return device_.is_gpu() &&
+               bytes > 0 &&
                bytes <= budget_bytes_ &&
                used_bytes_ <= budget_bytes_ &&
                bytes <= budget_bytes_ - used_bytes_;
@@ -113,132 +91,114 @@ namespace llaminar2
         handle.tier = PrefixStorageTier::DeviceHot;
         handle.layout = layout;
         handle.total_bytes = layout.totalBytes();
-        return key.valid() && canStore(handle.total_bytes) ? handle : PrefixBlockHandle{};
+        return key.valid() && canStore(handle.total_bytes)
+                   ? handle
+                   : PrefixBlockHandle{};
     }
 
-    bool DeviceHotPrefixStorageBackend::promoteFromRam(
-        const PrefixBlockHandle &ram_handle,
+    bool DeviceHotPrefixStorageBackend::allocateDeviceBlock(
+        const PrefixBlockHandle &ram_archive,
         PrefixBlockHandle *device_handle,
         std::string *error)
     {
         if (!device_handle)
-        {
             return false;
-        }
-        if (!ram_handle.valid() || !device_.is_gpu() || !canStore(ram_handle.total_bytes))
-        {
-            if (error)
-                *error = "invalid RAM handle or device-hot budget exceeded";
-            return false;
-        }
-
-        PrefixBlockHandle out = allocate(ram_handle.key, ram_handle.layout);
-        if (!out.valid())
+        if (!ram_archive.valid() ||
+            ram_archive.tier != PrefixStorageTier::Ram ||
+            !device_.is_gpu() ||
+            !canStore(ram_archive.total_bytes))
         {
             if (error)
-                *error = "failed to allocate device-hot handle";
+                *error = "invalid RAM archive or device-hot budget exceeded";
             return false;
         }
-        out.total_bytes = ram_handle.total_bytes;
-        out.has_hybrid_state = ram_handle.has_hybrid_state;
-        out.has_terminal_hidden = ram_handle.has_terminal_hidden;
-        out.has_terminal_logits = ram_handle.has_terminal_logits;
-        out.has_model_runtime_state = ram_handle.has_model_runtime_state;
-        out.model_runtime_state_storage = ram_handle.model_runtime_state_storage;
+        if (allocations_.find(ram_archive.key) != allocations_.end())
+        {
+            if (error)
+                *error = "device-hot key is already allocated";
+            return false;
+        }
 
-        out.device_kv_storage = uploadBytesToDevice(ram_handle.kv_storage, device_, error);
-        if (ram_handle.kv_storage && !ram_handle.kv_storage->empty() && !out.device_kv_storage)
+        PrefixBlockHandle out;
+        out.key = ram_archive.key;
+        out.tier = PrefixStorageTier::DeviceHot;
+        out.layout = ram_archive.layout;
+        out.total_bytes = ram_archive.total_bytes;
+        out.has_hybrid_state = ram_archive.has_hybrid_state;
+        out.has_terminal_hidden = ram_archive.has_terminal_hidden;
+        out.has_terminal_logits = ram_archive.has_terminal_logits;
+        out.has_model_runtime_state = ram_archive.has_model_runtime_state;
+        out.model_runtime_state_storage = ram_archive.model_runtime_state_storage;
+        out.payload_readiness = std::make_shared<PrefixPayloadReadiness>();
+
+        IBackend *backend = getBackendFor(device_);
+        out.device_kv_allocation = allocateDeviceSection(
+            backend,
+            device_,
+            out.kvBytes(),
+            out.payload_readiness,
+            error);
+        if (out.kvBytes() > 0 && !out.device_kv_allocation)
             return false;
 
-        out.device_hybrid_storage = uploadBytesToDevice(ram_handle.hybrid_storage, device_, error);
-        if (ram_handle.hybrid_storage && !ram_handle.hybrid_storage->empty() && !out.device_hybrid_storage)
+        out.device_hybrid_allocation = allocateDeviceSection(
+            backend,
+            device_,
+            out.hybridBytes(),
+            out.payload_readiness,
+            error);
+        if (out.hybridBytes() > 0 && !out.device_hybrid_allocation)
             return false;
 
-        out.device_mtp_storage = uploadBytesToDevice(ram_handle.mtp_storage, device_, error);
-        if (ram_handle.mtp_storage && !ram_handle.mtp_storage->empty() && !out.device_mtp_storage)
+        out.device_mtp_allocation = allocateDeviceSection(
+            backend,
+            device_,
+            out.layout.mtpKVBytes(),
+            out.payload_readiness,
+            error);
+        if (out.layout.mtpKVBytes() > 0 && !out.device_mtp_allocation)
             return false;
 
-        out.device_terminal_hidden_storage = uploadBytesToDevice(ram_handle.terminal_hidden_storage, device_, error);
-        if (ram_handle.terminal_hidden_storage && !ram_handle.terminal_hidden_storage->empty() &&
-            !out.device_terminal_hidden_storage)
+        out.device_terminal_hidden_allocation = allocateDeviceSection(
+            backend,
+            device_,
+            out.terminalHiddenBytes(),
+            out.payload_readiness,
+            error);
+        if (out.terminalHiddenBytes() > 0 &&
+            !out.device_terminal_hidden_allocation)
+        {
             return false;
+        }
 
-        out.device_terminal_logits_storage = uploadBytesToDevice(ram_handle.terminal_logits_storage, device_, error);
-        if (ram_handle.terminal_logits_storage && !ram_handle.terminal_logits_storage->empty() &&
-            !out.device_terminal_logits_storage)
+        out.device_terminal_logits_allocation = allocateDeviceSection(
+            backend,
+            device_,
+            out.terminalLogitsBytes(),
+            out.payload_readiness,
+            error);
+        if (out.terminalLogitsBytes() > 0 &&
+            !out.device_terminal_logits_allocation)
+        {
             return false;
+        }
 
-        allocations_[out.key] = out.total_bytes;
+        allocations_.emplace(out.key, out.total_bytes);
         used_bytes_ += out.total_bytes;
         *device_handle = std::move(out);
         return true;
     }
 
-    bool DeviceHotPrefixStorageBackend::release(const PrefixBlockHandle &handle)
+    bool DeviceHotPrefixStorageBackend::release(
+        const PrefixBlockHandle &handle)
     {
         auto it = allocations_.find(handle.key);
         if (it == allocations_.end())
-        {
             return false;
-        }
+
         used_bytes_ -= std::min(used_bytes_, it->second);
         allocations_.erase(it);
         return true;
     }
 
-    bool DeviceHotPrefixStorageBackend::hydrateToRam(const PrefixBlockHandle &handle,
-                                                     PrefixBlockHandle *ram_handle)
-    {
-        RamPrefixStorageBackend ram(handle.layout.totalBytes());
-        return hydrateToRamBackend(handle, ram, ram_handle, nullptr);
-    }
-
-    bool DeviceHotPrefixStorageBackend::hydrateToRamBackend(
-        const PrefixBlockHandle &handle,
-        IPrefixStorageBackend &ram_backend,
-        PrefixBlockHandle *ram_handle,
-        std::string *error)
-    {
-        if (!ram_handle || handle.tier != PrefixStorageTier::DeviceHot || !handle.valid())
-        {
-            return false;
-        }
-
-        PrefixBlockHandle out = ram_backend.allocate(handle.key, handle.layout);
-        if (!out.valid())
-        {
-            if (error)
-                *error = "failed to allocate RAM hydration handle";
-            return false;
-        }
-        out.total_bytes = handle.total_bytes;
-
-        if (!downloadBytesFromDevice(handle.device_kv_storage, out.kv_storage, error) ||
-            !downloadBytesFromDevice(handle.device_hybrid_storage, out.hybrid_storage, error) ||
-            !downloadBytesFromDevice(handle.device_mtp_storage, out.mtp_storage, error) ||
-            !downloadBytesFromDevice(handle.device_terminal_hidden_storage, out.terminal_hidden_storage, error) ||
-            !downloadBytesFromDevice(handle.device_terminal_logits_storage, out.terminal_logits_storage, error))
-        {
-            ram_backend.release(out);
-            return false;
-        }
-
-        out.kv_payload = out.kv_storage && !out.kv_storage->empty() ? out.kv_storage->data() : nullptr;
-        out.hybrid_payload = out.hybrid_storage && !out.hybrid_storage->empty() ? out.hybrid_storage->data() : nullptr;
-        out.mtp_payload = out.mtp_storage && !out.mtp_storage->empty() ? out.mtp_storage->data() : nullptr;
-        out.terminal_hidden = out.terminal_hidden_storage && !out.terminal_hidden_storage->empty()
-                                  ? out.terminal_hidden_storage->data()
-                                  : nullptr;
-        out.terminal_logits = out.terminal_logits_storage && !out.terminal_logits_storage->empty()
-                                  ? out.terminal_logits_storage->data()
-                                  : nullptr;
-        out.has_hybrid_state = handle.has_hybrid_state;
-        out.has_terminal_hidden = handle.has_terminal_hidden;
-        out.has_terminal_logits = handle.has_terminal_logits;
-        out.has_model_runtime_state = handle.has_model_runtime_state;
-        out.model_runtime_state_storage = handle.model_runtime_state_storage;
-
-        *ram_handle = std::move(out);
-        return true;
-    }
-}
+} // namespace llaminar2

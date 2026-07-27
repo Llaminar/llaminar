@@ -18,14 +18,24 @@
 #include <gtest/gtest.h>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <memory>
+#include <string>
 #include <vector>
+
+#include <unistd.h>
 
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
+#include "loaders/MmapRegion.h"
+#include "loaders/gpu_pipeline/LoadOrchestrator.h"
 #include "loaders/gpu_pipeline/GpuPackedWeightsFormat.h"
 #include "loaders/gpu_pipeline/RepackFormat.h"
 #include "loaders/gpu_pipeline/WeightTranslator.h"
 #include "tensors/BlockStructures.h"
+#include "../utils/TestTensorFactory.h"
 
 #ifdef HAVE_CUDA
 #include "kernels/cuda/repack/CUDAVnniRepackKernels.h"
@@ -117,6 +127,48 @@ void fill_q8_k_blocks(Q8_KBlock* blocks, int count) {
     }
 }
 
+/**
+ * @brief Owns a temporary file and its demand-paged mapping for direct-I/O tests.
+ *
+ * Destruction releases the mapping before unlinking the file so MmapRegion's
+ * live-source registry cannot retain a path that no longer exists.
+ */
+class TemporaryMappedSourceFile {
+public:
+    TemporaryMappedSourceFile(
+        const std::string& backend_name,
+        const std::vector<uint8_t>& bytes)
+        : path_(
+              std::filesystem::temp_directory_path() /
+              ("llaminar_direct_loader_" + backend_name + "_" +
+               std::to_string(::getpid()) + ".bin")) {
+        std::ofstream output(path_, std::ios::binary | std::ios::trunc);
+        if (!output)
+            return;
+        output.write(
+            reinterpret_cast<const char*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+        output.close();
+        region_ = MmapRegion::create(
+            path_.string(),
+            /*numa_node=*/-1,
+            /*skip_cache_eviction=*/false,
+            MmapRegion::PrefaultPolicy::DemandPaged);
+    }
+
+    ~TemporaryMappedSourceFile() {
+        region_.reset();
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+
+    MmapRegion* region() const { return region_.get(); }
+
+private:
+    std::filesystem::path path_;
+    std::unique_ptr<MmapRegion> region_;
+};
+
 // ============================================================================
 // Test fixture — parameterized over backend name
 // ============================================================================
@@ -179,6 +231,7 @@ protected:
         GpuMem& operator=(const GpuMem&) = delete;
         uint8_t*  u8()  { return static_cast<uint8_t*>(ptr); }
         uint16_t* u16() { return static_cast<uint16_t*>(ptr); }
+        uint32_t* u32() { return static_cast<uint32_t*>(ptr); }
     };
 
     // ========================================================================
@@ -190,6 +243,39 @@ protected:
         return WeightTranslator::forwardRepackOnDevice(
             format, d_raw, d_payload, d_scales, d_mins, nullptr,
             N, K, device_type_, stream_);
+    }
+
+    /**
+     * @brief Launch the production row-chunk-aware forward repack entry point.
+     *
+     * The source contains only N contiguous rows, while the destination has the
+     * complete output_N stride. This is the exact contract used by the bounded
+     * model loader for matrices larger than a pinned staging slot.
+     */
+    bool forwardRepackChunk(RepackFormat format, const void* d_raw,
+                            uint8_t* d_payload, uint16_t* d_scales,
+                            uint16_t* d_mins, uint32_t* d_emins,
+                            int N, int K, int output_N,
+                            int output_row_offset) {
+        if (device_type_ == DeviceType::CUDA) {
+#ifdef HAVE_CUDA
+            return launchVnniRepackCUDA(
+                format, d_raw, d_payload, d_scales, d_mins, d_emins,
+                N, K, output_N, output_row_offset, stream_);
+#else
+            return false;
+#endif
+        }
+        if (device_type_ == DeviceType::ROCm) {
+#ifdef HAVE_ROCM
+            return launchVnniRepack(
+                format, d_raw, d_payload, d_scales, d_mins, d_emins,
+                N, K, output_N, output_row_offset, stream_);
+#else
+            return false;
+#endif
+        }
+        return false;
     }
 
     // ========================================================================
@@ -332,6 +418,421 @@ TEST_P(VnniUnpackTest, RoundTrip_Q8_K) {
                              /*payload_bytes=*/32, /*asymmetric=*/false,
                              /*N=*/64, /*K=*/512,
                              /*source_block_elements=*/256);
+}
+
+/**
+ * @brief Prove bounded row-chunk publication is byte-identical for every format.
+ *
+ * This regression compares one whole-matrix repack with three contiguous source
+ * row chunks that publish into the same full-N destination geometry. It covers
+ * every launchable GGUF quantization format symmetrically on CUDA and ROCm, so a
+ * format-specific kernel cannot accidentally retain the old chunk-local output
+ * stride.
+ */
+TEST_P(VnniUnpackTest, RowChunkedRepackMatchesWholeMatrixForEveryFormat) {
+    using Factory =
+        std::function<std::unique_ptr<TensorBase>(size_t, size_t)>;
+    struct FormatCase {
+        const char* name;
+        Factory create;
+    };
+
+    const std::vector<FormatCase> formats = {
+        {"Q4_0", [](size_t n, size_t k) { return test::TestTensorFactory::createQ4_0Random({n, k}); }},
+        {"IQ4_NL", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ4_NLRandom({n, k}); }},
+        {"Q4_1", [](size_t n, size_t k) { return test::TestTensorFactory::createQ4_1Random({n, k}); }},
+        {"Q5_0", [](size_t n, size_t k) { return test::TestTensorFactory::createQ5_0Random({n, k}); }},
+        {"Q5_1", [](size_t n, size_t k) { return test::TestTensorFactory::createQ5_1Random({n, k}); }},
+        {"Q8_0", [](size_t n, size_t k) { return test::TestTensorFactory::createQ8_0Random({n, k}); }},
+        {"Q8_1", [](size_t n, size_t k) { return test::TestTensorFactory::createQ8_1Random({n, k}); }},
+        {"Q8_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ8_KRandom({n, k}); }},
+        {"IQ4_XS", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ4_XSRandom({n, k}); }},
+        {"Q4_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ4_KRandom({n, k}); }},
+        {"Q5_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ5_KRandom({n, k}); }},
+        {"Q6_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ6_KRandom({n, k}); }},
+        {"Q3_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ3_KRandom({n, k}); }},
+        {"Q2_K", [](size_t n, size_t k) { return test::TestTensorFactory::createQ2_KRandom({n, k}); }},
+        {"IQ3_S", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ3_SRandom({n, k}); }},
+        {"IQ3_XXS", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ3_XXSRandom({n, k}); }},
+        {"IQ2_S", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ2_SRandom({n, k}); }},
+        {"IQ2_XS", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ2_XSRandom({n, k}); }},
+        {"IQ2_XXS", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ2_XXSRandom({n, k}); }},
+        {"IQ1_S", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ1_SRandom({n, k}); }},
+        {"IQ1_M", [](size_t n, size_t k) { return test::TestTensorFactory::createIQ1_MRandom({n, k}); }},
+    };
+
+    constexpr int N = 11;
+    constexpr int K = 256;
+    constexpr int kMaximumChunkRows = 5;
+    constexpr int kChunkRows[] = {3, 5, 3};
+    const size_t output_blocks = static_cast<size_t>(N) * (K / 32);
+
+    for (const auto& format_case : formats) {
+        SCOPED_TRACE(::testing::Message()
+                     << GetParam() << "/" << format_case.name);
+
+        auto tensor = format_case.create(N, K);
+        ASSERT_NE(tensor, nullptr);
+        const auto* unpackable = dynamic_cast<const IINT8Unpackable*>(tensor.get());
+        ASSERT_NE(unpackable, nullptr);
+        const auto* info = unpackable->vnniFormatInfo();
+        ASSERT_NE(info, nullptr);
+        const auto format =
+            codebookIdToRepackFormat(info->codebook_id, info->is_superblock);
+        ASSERT_TRUE(format.has_value());
+        ASSERT_EQ(tensor->size_bytes() % static_cast<size_t>(N), 0u);
+
+        const size_t source_row_bytes =
+            tensor->size_bytes() / static_cast<size_t>(N);
+        const size_t payload_bytes =
+            output_blocks * static_cast<size_t>(info->payload_bytes);
+        const size_t scales_bytes = output_blocks * sizeof(uint16_t);
+        const size_t mins_bytes =
+            info->is_asymmetric ? scales_bytes : 0;
+        const size_t emins_bytes =
+            info->has_emins ? output_blocks * sizeof(uint32_t) : 0;
+
+        GpuMem d_raw_whole(backend_, device_id_, tensor->size_bytes());
+        GpuMem d_raw_chunk(
+            backend_, device_id_,
+            source_row_bytes * static_cast<size_t>(kMaximumChunkRows));
+        GpuMem whole_payload(backend_, device_id_, payload_bytes);
+        GpuMem whole_scales(backend_, device_id_, scales_bytes);
+        GpuMem whole_mins(backend_, device_id_, mins_bytes);
+        GpuMem whole_emins(backend_, device_id_, emins_bytes);
+        GpuMem chunked_payload(backend_, device_id_, payload_bytes);
+        GpuMem chunked_scales(backend_, device_id_, scales_bytes);
+        GpuMem chunked_mins(backend_, device_id_, mins_bytes);
+        GpuMem chunked_emins(backend_, device_id_, emins_bytes);
+
+        ASSERT_NE(d_raw_whole.ptr, nullptr);
+        ASSERT_NE(d_raw_chunk.ptr, nullptr);
+        ASSERT_NE(whole_payload.ptr, nullptr);
+        ASSERT_NE(whole_scales.ptr, nullptr);
+        ASSERT_NE(chunked_payload.ptr, nullptr);
+        ASSERT_NE(chunked_scales.ptr, nullptr);
+
+        ASSERT_TRUE(backend_->hostToDevice(
+            d_raw_whole.ptr, tensor->raw_data(), tensor->size_bytes(),
+            device_id_, stream_));
+        ASSERT_TRUE(forwardRepackChunk(
+            *format, d_raw_whole.ptr,
+            whole_payload.u8(), whole_scales.u16(),
+            info->is_asymmetric ? whole_mins.u16() : nullptr,
+            info->has_emins ? whole_emins.u32() : nullptr,
+            N, K, N, 0));
+
+        int row_offset = 0;
+        const auto* source = static_cast<const uint8_t*>(tensor->raw_data());
+        for (const int chunk_rows : kChunkRows) {
+            const size_t chunk_bytes =
+                source_row_bytes * static_cast<size_t>(chunk_rows);
+            ASSERT_TRUE(backend_->hostToDevice(
+                d_raw_chunk.ptr,
+                source + static_cast<size_t>(row_offset) * source_row_bytes,
+                chunk_bytes, device_id_, stream_));
+            ASSERT_TRUE(forwardRepackChunk(
+                *format, d_raw_chunk.ptr,
+                chunked_payload.u8(), chunked_scales.u16(),
+                info->is_asymmetric ? chunked_mins.u16() : nullptr,
+                info->has_emins ? chunked_emins.u32() : nullptr,
+                chunk_rows, K, N, row_offset));
+            row_offset += chunk_rows;
+        }
+        ASSERT_EQ(row_offset, N);
+        ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
+
+        auto expect_device_bytes_equal =
+            [&](const GpuMem& whole, const GpuMem& chunked,
+                size_t bytes, const char* field) {
+                if (bytes == 0)
+                    return;
+                std::vector<uint8_t> whole_host(bytes);
+                std::vector<uint8_t> chunked_host(bytes);
+                ASSERT_TRUE(backend_->deviceToHost(
+                    whole_host.data(), whole.ptr, bytes, device_id_, stream_));
+                ASSERT_TRUE(backend_->deviceToHost(
+                    chunked_host.data(), chunked.ptr, bytes, device_id_, stream_));
+                ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
+                EXPECT_EQ(chunked_host, whole_host) << field;
+            };
+
+        expect_device_bytes_equal(
+            whole_payload, chunked_payload, payload_bytes, "payload");
+        expect_device_bytes_equal(
+            whole_scales, chunked_scales, scales_bytes, "scales");
+        expect_device_bytes_equal(
+            whole_mins, chunked_mins, mins_bytes, "mins");
+        expect_device_bytes_equal(
+            whole_emins, chunked_emins, emins_bytes, "emins");
+    }
+}
+
+/**
+ * @brief Proves bounded buffered-file staging across producer-lane reuse.
+ *
+ * Six unaligned matrix ranges force every one of the three pinned lanes to be
+ * refilled after its first H2D. No tensor metadata advertises that those ranges
+ * are mapped: production must discover that fact from the concrete addresses.
+ * The output is compared byte-for-byte with a CPU layout oracle, catching
+ * provenance, exact source offsets, short reads, early pinned overwrite, and
+ * device-staging reuse bugs.
+ */
+TEST_P(VnniUnpackTest, BoundedBufferedMmapPipelineMatchesAcrossLaneReuse) {
+    constexpr int N = 11;
+    constexpr int K = 256;
+    constexpr int kJobCount = 6;
+    constexpr size_t kPageBytes = 4096;
+    constexpr size_t kSourcePrefix = 37;
+    constexpr size_t kPinnedSlotBytes = 16 * 1024;
+    constexpr int kLaneCount = 3;
+    constexpr size_t kBlocksPerMatrix =
+        static_cast<size_t>(N) * (K / 32);
+    constexpr size_t kRawBytes =
+        kBlocksPerMatrix * sizeof(Q4_0Block);
+
+    std::vector<std::vector<Q4_0Block>> matrices(kJobCount);
+    std::vector<uint8_t> file_bytes(
+        static_cast<size_t>(kJobCount + 1) * kPageBytes, 0xA5);
+    for (int job_index = 0; job_index < kJobCount; ++job_index) {
+        auto& blocks = matrices[static_cast<size_t>(job_index)];
+        blocks.resize(kBlocksPerMatrix);
+        fill_q4_0_blocks(blocks.data(), static_cast<int>(blocks.size()));
+        for (size_t block = 0; block < blocks.size(); ++block) {
+            blocks[block].d = static_cast<uint16_t>(
+                0x3000 + job_index * 0x20 + static_cast<int>(block % 0x1F));
+            for (int byte = 0; byte < 16; ++byte) {
+                blocks[block].qs[byte] ^= static_cast<uint8_t>(
+                    job_index * 29 + static_cast<int>(block));
+            }
+        }
+
+        const size_t source_offset =
+            static_cast<size_t>(job_index) * kPageBytes + kSourcePrefix;
+        std::memcpy(
+            file_bytes.data() + source_offset,
+            blocks.data(),
+            kRawBytes);
+    }
+
+    TemporaryMappedSourceFile mapped(GetParam(), file_bytes);
+    ASSERT_NE(mapped.region(), nullptr);
+
+    LoadOrchestrator orchestrator(backend_);
+    orchestrator.addDevice(device_id_);
+    for (int job_index = 0; job_index < kJobCount; ++job_index) {
+        orchestrator.planWeight(
+            device_id_,
+            "direct_q4_" + std::to_string(job_index),
+            N, K,
+            /*payload_bytes_per_block=*/16,
+            /*is_asymmetric=*/false,
+            /*has_emins=*/false,
+            kRawBytes);
+    }
+    orchestrator.allocate(kPinnedSlotBytes, kLaneCount);
+
+    for (int job_index = 0; job_index < kJobCount; ++job_index) {
+        const size_t source_offset =
+            static_cast<size_t>(job_index) * kPageBytes + kSourcePrefix;
+        WeightJob job{
+            .name = "direct_q4_" + std::to_string(job_index),
+            .host_raw_data = mapped.region()->data() + source_offset,
+            .raw_bytes = kRawBytes,
+            .format = RepackFormat::Q4_0,
+            .N = N,
+            .K = K,
+            .is_asymmetric = false,
+        };
+        orchestrator.addWeightJob(device_id_, job);
+    }
+
+    ASSERT_NO_THROW(orchestrator.load());
+    auto* pool = orchestrator.getPool(device_id_);
+    ASSERT_NE(pool, nullptr);
+
+    for (int job_index = 0; job_index < kJobCount; ++job_index) {
+        const auto slot =
+            pool->getSlot("direct_q4_" + std::to_string(job_index));
+        ASSERT_TRUE(slot.has_value());
+
+        std::vector<uint8_t> expected_payload(kBlocksPerMatrix * 16);
+        std::vector<uint16_t> expected_scales(kBlocksPerMatrix);
+        const auto& blocks = matrices[static_cast<size_t>(job_index)];
+        for (int row = 0; row < N; ++row) {
+            for (int block = 0; block < K / 32; ++block) {
+                const size_t source_index =
+                    static_cast<size_t>(row) * (K / 32) +
+                    static_cast<size_t>(block);
+                const size_t destination_index =
+                    static_cast<size_t>(block) * N +
+                    static_cast<size_t>(row);
+                std::memcpy(
+                    expected_payload.data() + destination_index * 16,
+                    blocks[source_index].qs,
+                    16);
+                expected_scales[destination_index] = blocks[source_index].d;
+            }
+        }
+
+        std::vector<uint8_t> actual_payload(expected_payload.size());
+        std::vector<uint16_t> actual_scales(expected_scales.size());
+        ASSERT_TRUE(backend_->deviceToHost(
+            actual_payload.data(),
+            slot->d_native_vnni_payload,
+            actual_payload.size(),
+            device_id_, stream_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            actual_scales.data(),
+            slot->d_native_vnni_scales,
+            actual_scales.size() * sizeof(uint16_t),
+            device_id_, stream_));
+        ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
+        EXPECT_EQ(actual_payload, expected_payload)
+            << "payload job=" << job_index;
+        EXPECT_EQ(actual_scales, expected_scales)
+            << "scales job=" << job_index;
+    }
+
+    orchestrator.finalize();
+}
+
+/**
+ * @brief Reproduces the multi-GPU bounded-budget staging alignment failure.
+ *
+ * Production divides one bounded startup budget first across GPU devices and
+ * then across three upload lanes. Those integer divisions can produce an odd
+ * logical slot capacity. Historically WeightVRAMPool also used that capacity
+ * as its physical device stride, so lane 1 and lane 2 became under-aligned and
+ * Q6_K repack faulted on its naturally aligned packed-source loads.
+ *
+ * This test deliberately requests an odd capacity smaller than one Q6_K
+ * matrix. LoadOrchestrator consequently splits the matrix into three row
+ * chunks, exercising every production staging lane. It verifies both the
+ * device-address invariant and byte equality against a whole-matrix launch.
+ */
+TEST_P(
+    VnniUnpackTest,
+    OddBoundedDeviceStagingCapacityKeepsEveryLaneAlignedAndQ6KExact) {
+    constexpr int N = 2048;
+    constexpr int K = 256;
+    constexpr int kLaneCount = 3;
+    constexpr size_t kOddSlotCapacity = 160001;
+    constexpr size_t kRequiredDeviceAlignment = 256;
+
+    auto tensor = test::TestTensorFactory::createQ6_KRandom({N, K});
+    ASSERT_NE(tensor, nullptr);
+    const auto* unpackable =
+        dynamic_cast<const IINT8Unpackable*>(tensor.get());
+    ASSERT_NE(unpackable, nullptr);
+    const auto* info = unpackable->vnniFormatInfo();
+    ASSERT_NE(info, nullptr);
+    ASSERT_EQ(info->codebook_id, 8);
+    ASSERT_TRUE(info->is_superblock);
+    ASSERT_EQ(tensor->size_bytes(), static_cast<size_t>(N) * sizeof(Q6_KBlock));
+    ASSERT_GT(tensor->size_bytes(), kOddSlotCapacity);
+
+    LoadOrchestrator orchestrator(backend_);
+    orchestrator.addDevice(device_id_);
+    orchestrator.planWeight(
+        device_id_, "odd_stride_q6_k", N, K,
+        info->payload_bytes, info->is_asymmetric, info->has_emins,
+        tensor->size_bytes());
+    orchestrator.allocate(kOddSlotCapacity, kLaneCount);
+
+    auto* pool = orchestrator.getPool(device_id_);
+    ASSERT_NE(pool, nullptr);
+    ASSERT_EQ(pool->maxStagingSlotBytes(), kOddSlotCapacity);
+    ASSERT_GE(pool->stagingSlotStrideBytes(), kOddSlotCapacity);
+    ASSERT_EQ(
+        pool->stagingSlotStrideBytes() % kRequiredDeviceAlignment, 0u);
+    for (int lane = 0; lane < kLaneCount; ++lane) {
+        const auto* staging = pool->getStagingSlot(lane);
+        ASSERT_NE(staging, nullptr);
+        ASSERT_EQ(
+            reinterpret_cast<uintptr_t>(staging) %
+                kRequiredDeviceAlignment,
+            0u)
+            << "under-aligned device staging lane " << lane;
+    }
+
+    const size_t output_blocks =
+        static_cast<size_t>(N) * static_cast<size_t>(K / 32);
+    const size_t payload_bytes =
+        output_blocks * static_cast<size_t>(info->payload_bytes);
+    const size_t scales_bytes = output_blocks * sizeof(uint16_t);
+    const size_t mins_bytes =
+        info->is_asymmetric ? scales_bytes : 0;
+    const size_t emins_bytes =
+        info->has_emins ? output_blocks * sizeof(uint32_t) : 0;
+
+    GpuMem whole_raw(
+        backend_, device_id_, tensor->size_bytes());
+    GpuMem whole_payload(backend_, device_id_, payload_bytes);
+    GpuMem whole_scales(backend_, device_id_, scales_bytes);
+    GpuMem whole_mins(backend_, device_id_, mins_bytes);
+    GpuMem whole_emins(backend_, device_id_, emins_bytes);
+    ASSERT_NE(whole_raw.ptr, nullptr);
+    ASSERT_NE(whole_payload.ptr, nullptr);
+    ASSERT_NE(whole_scales.ptr, nullptr);
+    ASSERT_TRUE(backend_->hostToDevice(
+        whole_raw.ptr, tensor->raw_data(), tensor->size_bytes(),
+        device_id_, stream_));
+    ASSERT_TRUE(forwardRepackChunk(
+        RepackFormat::Q6_K,
+        whole_raw.ptr,
+        whole_payload.u8(),
+        whole_scales.u16(),
+        info->is_asymmetric ? whole_mins.u16() : nullptr,
+        info->has_emins ? whole_emins.u32() : nullptr,
+        N, K, N, 0));
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
+
+    WeightJob job{
+        .name = "odd_stride_q6_k",
+        .host_raw_data = tensor->raw_data(),
+        .raw_bytes = tensor->size_bytes(),
+        .format = RepackFormat::Q6_K,
+        .N = N,
+        .K = K,
+        .is_asymmetric = info->is_asymmetric,
+    };
+    orchestrator.addWeightJob(device_id_, job);
+    ASSERT_EQ(orchestrator.pendingJobCount(device_id_), 3u);
+    ASSERT_NO_THROW(orchestrator.load());
+
+    const auto chunked = pool->getSlot("odd_stride_q6_k");
+    ASSERT_TRUE(chunked.has_value());
+    auto expect_pool_field_equal =
+        [&](const GpuMem& whole, const void* chunked_device,
+            size_t bytes, const char* field) {
+            if (bytes == 0)
+                return;
+            ASSERT_NE(chunked_device, nullptr);
+            std::vector<uint8_t> expected(bytes);
+            std::vector<uint8_t> actual(bytes);
+            ASSERT_TRUE(backend_->deviceToHost(
+                expected.data(), whole.ptr, bytes, device_id_, stream_));
+            ASSERT_TRUE(backend_->deviceToHost(
+                actual.data(), chunked_device, bytes, device_id_, stream_));
+            ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
+            EXPECT_EQ(actual, expected) << field;
+        };
+
+    expect_pool_field_equal(
+        whole_payload, chunked->d_native_vnni_payload,
+        payload_bytes, "payload");
+    expect_pool_field_equal(
+        whole_scales, chunked->d_native_vnni_scales,
+        scales_bytes, "scales");
+    expect_pool_field_equal(
+        whole_mins, chunked->d_native_vnni_mins,
+        mins_bytes, "mins");
+    expect_pool_field_equal(
+        whole_emins, chunked->d_native_vnni_emins,
+        emins_bytes, "emins");
+
+    orchestrator.finalize();
 }
 
 // ============================================================================

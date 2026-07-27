@@ -143,7 +143,16 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
-            // ===== Typed API =====
+            /**
+             * @brief Enqueue FP32 RMS normalization on the bound CUDA stream.
+             *
+             * The method is deliberately asynchronous. The caller must bind a
+             * non-null executor-owned stream before invocation and must order
+             * consumers with that stream or an event recorded from it.
+             *
+             * @return `true` when the launch was accepted; `false` when stream
+             *         ownership or launch validation failed.
+             */
             bool apply_typed(
                 const float *input,
                 const float *gamma,
@@ -257,7 +266,13 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
-            // ===== Typed API =====
+            /**
+             * @brief Enqueue BF16 RMS normalization on the bound CUDA stream.
+             *
+             * This entry point never synchronizes the stream or device. A
+             * non-null stream is mandatory so graph capture and event-based
+             * publication retain sole ownership of execution ordering.
+             */
             bool apply_typed(
                 const uint16_t *input,
                 const float *gamma,
@@ -371,7 +386,13 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
-            // ===== Typed API =====
+            /**
+             * @brief Enqueue FP16 RMS normalization on the bound CUDA stream.
+             *
+             * This entry point never synchronizes the stream or device. A
+             * non-null stream is mandatory so graph capture and event-based
+             * publication retain sole ownership of execution ordering.
+             */
             bool apply_typed(
                 const uint16_t *input,
                 const float *gamma,

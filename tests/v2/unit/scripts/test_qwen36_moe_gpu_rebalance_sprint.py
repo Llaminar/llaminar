@@ -138,12 +138,15 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         self.assertIn("routed_assignment=least-loaded-resident", result.stdout)
         self.assertIn("owner=0", result.stdout)
 
-    def test_no_capture_collectives_dry_run_forces_segmented_collective_graphs(self) -> None:
+    def test_no_capture_collectives_is_rejected_for_homogeneous_twocard(self) -> None:
         result = self.run_script(no_capture_collectives=True)
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=1", result.stdout)
-        self.assertNotIn("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES=1", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "homogeneous two-card runs require graph-captured collectives",
+            result.stderr,
+        )
+        self.assertNotIn("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=1", result.stdout)
 
     def test_perfstats_dry_run_includes_allreduce_bom_without_stage_gpu_timing(self) -> None:
         result = self.run_script(perfstats=True)

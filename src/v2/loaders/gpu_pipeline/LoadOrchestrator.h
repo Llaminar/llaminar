@@ -72,9 +72,9 @@ namespace llaminar2
         size_t numDevices() const;
 
         /// Add a weight job to be loaded on a specific device.
-        /// Jobs larger than the allocated staging slot are split at FP row
-        /// boundaries or quantized K-block boundaries so staging stays bounded
-        /// while preserving the final packed layout.
+        /// Jobs larger than the allocated staging slot are split at complete
+        /// source-row boundaries. GPU repack kernels publish each row chunk into
+        /// the correct full-N packed coordinates.
         void addWeightJob(int device_id, const WeightJob &job);
 
         /// Total raw bytes of pending jobs for a specific device.

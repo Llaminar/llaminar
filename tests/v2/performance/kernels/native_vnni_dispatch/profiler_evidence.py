@@ -2,11 +2,13 @@
 
 Canonical latency collection and hardware-counter collection are deliberately
 different transactions.  The timing trainer first emits immutable common
-observations.  This module derives one profiler request from each observation,
-then validates profiler evidence gathered by a separate process invocation.
-Consequently, Nsight Compute replay, rocprofiler counter passes, and Linux
-``perf`` instrumentation can never perturb the latency samples used to choose
-or certify a dispatch policy.
+observations.  This module retains every timing observation, then derives exact
+profiler requests for the fastest, middle, and slowest timing 5% in every
+format/shape/work-size contest.  The separate profiler process can therefore
+teach the learner why candidates win or lose without repeating counters for
+the uninformative interior of every timing rank.  Nsight Compute replay,
+rocprofiler counter passes, and Linux ``perf`` instrumentation can never
+perturb the latency samples used to choose or certify a dispatch policy.
 
 A candidate may execute more than one device kernel (for example a CUDA K-part
 producer followed by an ordered reducer).  Profiler evidence therefore owns an
@@ -49,6 +51,7 @@ from .candidate_registry import (
     cpu_native_vnni_verifier_registry,
     cuda_native_vnni_gemv_registry,
     rocm_moe_grouped_prefill_registry,
+    rocm_native_vnni_decode_formula_registry,
     rocm_native_vnni_decode_registry,
 )
 from .corpus import ObservationCorpus
@@ -68,21 +71,30 @@ from .schema import (
 
 
 LEGACY_PROFILER_REQUEST_SCHEMA_VERSION = "native-vnni-profiler-request-v3"
-PROFILER_REQUEST_SCHEMA_VERSION = "native-vnni-profiler-request-v4-exact-point"
+EXHAUSTIVE_PROFILER_REQUEST_SCHEMA_VERSION = (
+    "native-vnni-profiler-request-v4-exact-point"
+)
+PROFILER_REQUEST_SCHEMA_VERSION = (
+    "native-vnni-profiler-request-v5-stratified-exact-point"
+)
 SUPPORTED_PROFILER_REQUEST_SCHEMA_VERSIONS = frozenset({
     LEGACY_PROFILER_REQUEST_SCHEMA_VERSION,
+    EXHAUSTIVE_PROFILER_REQUEST_SCHEMA_VERSION,
     PROFILER_REQUEST_SCHEMA_VERSION,
 })
+PROFILER_TIMING_STRATUM_FRACTION = 0.05
 PROFILER_EVIDENCE_SCHEMA_VERSION = "native-vnni-profiler-evidence-v1"
 PROFILER_METRIC_SET_VERSION = "native-vnni-profiler-metrics-v1"
 PROFILER_COLLECTOR_VERSION = (
-    "native-vnni-isolated-profiler-v5-direct-per-tid-gpu-stream-batched"
+    "native-vnni-isolated-profiler-v7-rocm-exact-process-batches"
 )
 SUPPORTED_PROFILER_COLLECTOR_VERSIONS = frozenset({
     "native-vnni-isolated-profiler-v1",
     "native-vnni-isolated-profiler-v2",
     "native-vnni-isolated-profiler-v3-direct-per-tid-batched",
     "native-vnni-isolated-profiler-v4-direct-per-tid-gpu-batched",
+    "native-vnni-isolated-profiler-v5-direct-per-tid-gpu-stream-batched",
+    "native-vnni-isolated-profiler-v6-rocm-instruction-work",
     PROFILER_COLLECTOR_VERSION,
 })
 PROFILE_PROTOCOL = "isolated-production-candidate-launch-v1"
@@ -106,6 +118,8 @@ _PARALLEL_EXPORT_EVIDENCE: tuple[Mapping[str, Any], ...] = ()
 _PARALLEL_EXPORT_OBSERVATIONS: dict[str, NativeVNNIObservation] = {}
 _PARALLEL_EXPORT_OBSERVATION_ROWS: tuple[NativeVNNIObservation, ...] = ()
 _PARALLEL_REQUEST_DECODE_RECORDS: tuple[Mapping[str, Any], ...] = ()
+_PARALLEL_PROFILER_GROUP_CORPUS: ObservationCorpus | None = None
+_PARALLEL_PROFILER_RUNTIME_GROUPS: tuple[tuple[Any, ...], ...] = ()
 _PARALLEL_EVIDENCE_DECODE_RECORDS: tuple[Mapping[str, Any], ...] = ()
 _PARALLEL_REQUEST_BUILD_OBSERVATIONS: tuple[NativeVNNIObservation, ...] = ()
 
@@ -125,6 +139,173 @@ def _parse_manifest_array_range(
     ):
         raise ValueError("profiler manifest records must be JSON objects")
     return tuple(decoded)
+
+
+def _parse_pretty_manifest_array_range(
+    task: tuple[Path, int, int],
+) -> tuple[Mapping[str, Any], ...]:
+    """Decode one legacy indented manifest range in a worker process.
+
+    Older profiler collectors published semantically canonical manifests with
+    ``indent=2``. A multi-gigabyte evidence file must not be copied into one
+    Python string and decoded under one GIL merely because its presentation
+    contains whitespace. The parent supplies ranges that begin at a top-level
+    record and end immediately before another top-level record or the array
+    close. Trimming a trailing separator turns each range back into a valid
+    standalone JSON array without touching nested dispatch or metric objects.
+    """
+
+    path, begin, end = task
+    with path.open("rb") as handle:
+        handle.seek(begin)
+        encoded = handle.read(end - begin).strip()
+    if encoded.endswith(b","):
+        encoded = encoded[:-1].rstrip()
+    decoded = json.loads(b"[" + encoded + b"]")
+    if not isinstance(decoded, list) or not all(
+        isinstance(record, Mapping) for record in decoded
+    ):
+        raise ValueError("profiler manifest records must be JSON objects")
+    return tuple(decoded)
+
+
+def _read_pretty_manifest_document(
+    path: Path,
+    array_name: str,
+    *,
+    workers: int | None = None,
+    parallel_threshold: int = 4096,
+) -> dict[str, Any] | None:
+    """Parse and authenticate an older indented manifest in parallel.
+
+    The legacy collector used deterministic ``sort_keys=True, indent=2`` JSON.
+    Top-level array members therefore start two spaces deeper than the root
+    member, while every nested object starts deeper still. Those indentation
+    boundaries let physical-core workers decode disjoint record ranges without
+    a corpus-sized UTF-8 string or serial ``json.loads`` call.
+
+    Authentication remains semantic and presentation-independent: after
+    parallel decode, the existing canonical manifest reducer hashes the compact
+    sorted-key representation and compares it with the retained root digest.
+    Hand-authored JSON that does not match the deterministic indented layout
+    returns ``None`` and remains on the compatibility parser.
+    """
+
+    member = json.dumps(array_name, separators=(",", ":")).encode()
+    with path.open("rb") as handle:
+        with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as document:
+            member_offset = document.find(member)
+            if member_offset < 0:
+                return None
+            line_begin = document.rfind(b"\n", 0, member_offset) + 1
+            member_indent = bytes(document[line_begin:member_offset])
+            if not member_indent or member_indent.strip():
+                return None
+            colon = document.find(b":", member_offset + len(member))
+            array_open = document.find(b"[", colon + 1 if colon >= 0 else 0)
+            if colon < 0 or array_open < 0:
+                return None
+            close_marker = b"\n" + member_indent + b"]"
+            array_end = document.find(close_marker, array_open + 1)
+            if array_end < 0:
+                return None
+
+            scalar_document = (
+                document[: array_open + 1] + document[array_end:]
+            )
+            try:
+                root = json.loads(scalar_document)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(root, dict) or root.get(array_name) != []:
+                return None
+            declared_count_name = (
+                "request_count" if array_name == "requests" else "evidence_count"
+            )
+            try:
+                declared_count = int(root[declared_count_name])
+                expected_digest = str(root["manifest_digest"])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+            content_begin = array_open + 1
+            while content_begin < array_end and document[content_begin] in b" \t\r\n":
+                content_begin += 1
+            if content_begin == array_end:
+                records: tuple[Mapping[str, Any], ...] = ()
+            else:
+                record_indent = member_indent + b"  "
+                if document[content_begin] != ord("{"):
+                    return None
+                record_start = b"\n" + record_indent + b"{"
+                if workers is None:
+                    worker_count = _offline_worker_count(
+                        declared_count,
+                        environment_name="LLAMINAR_NATIVE_VNNI_IO_WORKERS",
+                    )
+                else:
+                    if workers < 1:
+                        raise ValueError(
+                            "profiler manifest parse workers must be positive"
+                        )
+                    worker_count = min(
+                        workers,
+                        _physical_core_count(),
+                        max(1, declared_count),
+                    )
+                if declared_count < parallel_threshold:
+                    worker_count = 1
+
+                boundaries = [content_begin]
+                for worker_index in range(1, worker_count):
+                    target = content_begin + (
+                        (array_end - content_begin) * worker_index // worker_count
+                    )
+                    separator = document.find(record_start, target, array_end)
+                    if separator < 0:
+                        return None
+                    boundaries.append(separator + 1 + len(record_indent))
+                boundaries.append(array_end)
+                boundaries = sorted(set(boundaries))
+                tasks = tuple(
+                    (path, begin, end)
+                    for begin, end in zip(boundaries, boundaries[1:])
+                    if begin < end
+                )
+                if len(tasks) == 1:
+                    partitions = (_parse_pretty_manifest_array_range(tasks[0]),)
+                else:
+                    with ProcessPoolExecutor(
+                        max_workers=len(tasks),
+                        mp_context=multiprocessing.get_context("fork"),
+                    ) as executor:
+                        partitions = tuple(executor.map(
+                            _parse_pretty_manifest_array_range,
+                            tasks,
+                        ))
+                records = tuple(
+                    record for partition in partitions for record in partition
+                )
+
+    if len(records) != declared_count:
+        raise ValueError(f"profiler {array_name} count does not match inventory")
+    scalar_fields = {
+        name: value
+        for name, value in root.items()
+        if name not in {array_name, "manifest_digest"}
+    }
+    actual_digest = _sha256_manifest_records(
+        scalar_fields,
+        array_name,
+        records,
+    )
+    if actual_digest != expected_digest:
+        manifest_label = "request" if array_name == "requests" else "evidence"
+        raise ValueError(
+            f"profiler {manifest_label} manifest digest does not match contents"
+        )
+    root[array_name] = list(records)
+    return root
 
 
 def _read_canonical_manifest_document(
@@ -716,6 +897,7 @@ def _candidate_registries(backend: Backend) -> tuple[CandidateRegistry, ...]:
     if backend == Backend.ROCM:
         return (
             rocm_native_vnni_decode_registry(),
+            rocm_native_vnni_decode_formula_registry(),
             rocm_moe_grouped_prefill_registry(),
         )
     raise ValueError(f"unsupported profiler backend {backend}")
@@ -726,10 +908,10 @@ def _registry_for_observation(
 ) -> tuple[CandidateRegistry, Any]:
     """Resolve one observation to exactly one reviewed forceable candidate.
 
-    Shape-resolved CUDA formula rows are synthetic learner evidence backed by a
-    concrete exact-KB timing row.  They are intentionally rejected here: the
-    concrete source row is the physical launch that must be profiled, while the
-    formula itself does not name another kernel variant.
+    Shape-resolved CUDA and ROCm formula rows are synthetic learner evidence
+    backed by a concrete exact-KB timing row. They are intentionally rejected
+    here: the concrete source row is the physical launch that must be profiled,
+    while the formula itself does not name another kernel variant.
     """
 
     matches = []
@@ -744,7 +926,10 @@ def _registry_for_observation(
             f"found {len(matches)}"
         )
     registry, candidate = matches[0]
-    if candidate.config_json.get("family") == "kpar_formula":
+    if candidate.config_json.get("family") in {
+        "kpar_formula",
+        "clamped_kb_formula",
+    }:
         raise ValueError(
             f"{observation.candidate_id}: a shape-resolved policy formula is not "
             "a physical profiler launch; use the unprojected concrete observation"
@@ -1218,14 +1403,14 @@ class ProfilerRequestManifest:
 def build_profiler_request_manifest(
     corpus: ObservationCorpus,
 ) -> ProfilerRequestManifest:
-    """Create one isolated request for every measured physical invocation.
+    """Create exact requests for three timing strata in every work contest.
 
     Dynamic counters are point evidence. IPC, cache behavior, occupancy,
     throughput, and duration observed at one ``(M,N,K)`` launch must never be
-    attached to another work size. The v4 manifest therefore covers every
-    launchable generic timing point independently across backend, ISA/runtime,
-    prepared codebook, execution mode, geometry, work size, and effective
-    candidate.
+    attached to another work size. The current manifest profiles the fastest
+    5%, centered median 5%, and slowest 5% of physical candidates in every
+    backend/ISA/format/shape/mode/M contest. Canonical timing remains exhaustive
+    and is still the only latency label used for dispatch regret.
 
     Timing rows may still contain genuine aliases: two source formats can
     prepare the identical execution codebook, and two shape names can describe
@@ -1235,42 +1420,10 @@ def build_profiler_request_manifest(
     no unsupported or non-forceable row can stand in for executable evidence.
     """
 
-    launchable, never_launchable = _group_profiler_observations(corpus)
-
-    selected: dict[str, NativeVNNIObservation] = {}
-    launchable_candidates = {key[:-5] for key in launchable}
-    for rows in launchable.values():
-        representative = min(
-            rows,
-            key=lambda row: (
-                row.source_format,
-                row.source_codebook_id,
-                row.shape_name,
-                row.shape_group_id,
-                row.digest(),
-            ),
-        )
-        selected[representative.digest()] = representative
-
-    # Retain one explicit capability record only for candidates that are never
-    # launchable anywhere in the corpus. It creates no profiler process because
-    # ``profile_required`` is false, but preserves the reviewed reason that the
-    # registry member has no executable point in this generation.
-    for candidate_key, rows in never_launchable.items():
-        if candidate_key in launchable_candidates:
-            continue
-        representative = min(
-            rows,
-            key=lambda row: (
-                row.m,
-                row.aggregate_n,
-                row.k,
-                row.source_format,
-                row.shape_name,
-                row.digest(),
-            ),
-        )
-        selected[representative.digest()] = representative
+    selected = {
+        row.digest(): row
+        for row in _stratified_profiler_observations(corpus)
+    }
 
     requests = tuple(sorted(
         _profiler_requests_for_observations(tuple(selected.values())),
@@ -1296,6 +1449,375 @@ def build_profiler_request_manifest(
     )
 
 
+def _profiler_contest_key(row: NativeVNNIObservation) -> tuple[object, ...]:
+    """Identify one candidate timing contest that requires three strata.
+
+    Source format and shape aliases stay explicit here even when they happen to
+    prepare the same physical kernel. The sampling guarantee is user-facing:
+    every measured format, shape, and M must contribute its own fastest,
+    centered, and slowest evidence. Physical-launch deduplication happens only
+    after those per-contest obligations have been selected.
+    """
+
+    return (
+        row.backend,
+        row.architecture_class,
+        row.build_id,
+        row.compiler_id,
+        row.device_name,
+        row.driver_runtime,
+        row.threading_or_stream_mode,
+        row.semantic_contract,
+        row.operation_kind,
+        row.bundle_signature,
+        row.source_format,
+        row.source_codebook_id,
+        row.prepared_family_id,
+        row.packing_abi,
+        row.runtime_codebook_id,
+        row.shape_group_id,
+        row.shape_name,
+        row.execution_mode,
+        row.m,
+        row.projection_n_vector,
+        row.aggregate_n,
+        row.k,
+    )
+
+
+def _profiler_representative_key(
+    row: NativeVNNIObservation,
+) -> tuple[object, ...]:
+    """Choose one deterministic timing witness for a physical launch alias."""
+
+    return (
+        row.source_format,
+        row.source_codebook_id,
+        row.shape_name,
+        row.shape_group_id,
+        row.candidate_id,
+        row.digest(),
+    )
+
+
+def _profiler_timing_rank_key(
+    item: tuple[tuple[object, ...], NativeVNNIObservation],
+) -> tuple[object, ...]:
+    """Rank physical candidates from fastest to slowest deterministically."""
+
+    launch_key, row = item
+    return (
+        row.median_us,
+        row.p95_us,
+        row.min_us,
+        row.mad_us,
+        row.cv,
+        row.effective_candidate_id,
+        repr(launch_key),
+        row.digest(),
+    )
+
+
+def _timing_stratum_indices(candidate_count: int) -> tuple[int, ...]:
+    """Return the union of fastest, centered, and slowest timing bands.
+
+    ``ceil`` and a minimum of one keep small candidate contests informative.
+    Overlapping strata are deduplicated, so a contest with one or two physical
+    candidates profiles each candidate exactly once.
+    """
+
+    if candidate_count <= 0:
+        raise ValueError("profiler timing strata require at least one candidate")
+    stratum_size = max(
+        1,
+        math.ceil(candidate_count * PROFILER_TIMING_STRATUM_FRACTION),
+    )
+    median_begin = (candidate_count - stratum_size) // 2
+    return tuple(sorted({
+        *range(stratum_size),
+        *range(median_begin, median_begin + stratum_size),
+        *range(candidate_count - stratum_size, candidate_count),
+    }))
+
+
+def _stratified_profiler_observations(
+    corpus: ObservationCorpus,
+) -> tuple[NativeVNNIObservation, ...]:
+    """Return only the timing witnesses from stratified launch entries."""
+
+    return tuple(
+        row for _, row in _stratified_profiler_observation_entries(corpus)
+    )
+
+
+def _stratified_profiler_observation_entries(
+    corpus: ObservationCorpus,
+    *,
+    workers: int | None = None,
+) -> tuple[tuple[tuple[object, ...], NativeVNNIObservation], ...]:
+    """Select deterministic exact-point profiler witnesses for one corpus.
+
+    Every launchable physical candidate first participates in each canonical
+    format/shape/M contest represented by its timing aliases. The three timing
+    strata are selected independently per contest, then their physical launch
+    keys are unioned. True aliases consequently share one profiler process
+    while no contest can disappear merely because another format prepared the
+    same runtime codebook.
+    """
+
+    runtime_groups = _profiler_runtime_groups(corpus)
+    if workers is None:
+        worker_count = _offline_worker_count(
+            len(corpus),
+            environment_name="LLAMINAR_NATIVE_VNNI_PROFILER_GROUP_WORKERS",
+            records_per_worker=32768,
+        )
+    else:
+        if workers < 1:
+            raise ValueError("profiler grouping workers must be positive")
+        worker_count = min(workers, _physical_core_count(), len(runtime_groups))
+
+    if worker_count <= 1:
+        selected_entries, launchable_candidates, never_launchable = (
+            _select_profiler_strata(corpus)
+        )
+        shards = ((selected_entries, launchable_candidates, never_launchable),)
+    else:
+        assignments = _balanced_profiler_runtime_group_assignments(
+            corpus,
+            runtime_groups,
+            worker_count,
+        )
+        global _PARALLEL_PROFILER_GROUP_CORPUS
+        global _PARALLEL_PROFILER_RUNTIME_GROUPS
+        _PARALLEL_PROFILER_GROUP_CORPUS = corpus
+        _PARALLEL_PROFILER_RUNTIME_GROUPS = runtime_groups
+        try:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                shards = tuple(executor.map(
+                    _select_profiler_strata_for_runtime_groups,
+                    assignments,
+                ))
+        finally:
+            _PARALLEL_PROFILER_GROUP_CORPUS = None
+            _PARALLEL_PROFILER_RUNTIME_GROUPS = ()
+
+    selected_by_launch: dict[
+        tuple[object, ...], NativeVNNIObservation
+    ] = {}
+    all_launchable_candidates: set[tuple[object, ...]] = set()
+    unsupported_by_candidate: dict[
+        tuple[object, ...], NativeVNNIObservation
+    ] = {}
+    for selected_entries, launchable_candidates, never_launchable in shards:
+        all_launchable_candidates.update(launchable_candidates)
+        for launch_key, row in selected_entries:
+            previous = selected_by_launch.get(launch_key)
+            if (
+                previous is None
+                or _profiler_representative_key(row)
+                < _profiler_representative_key(previous)
+            ):
+                selected_by_launch[launch_key] = row
+        for candidate_key, row in never_launchable:
+            previous = unsupported_by_candidate.get(candidate_key)
+            if (
+                previous is None
+                or _unsupported_profiler_representative_key(row)
+                < _unsupported_profiler_representative_key(previous)
+            ):
+                unsupported_by_candidate[candidate_key] = row
+
+    selected: dict[
+        str,
+        tuple[tuple[object, ...], NativeVNNIObservation],
+    ] = {
+        row.digest(): (launch_key, row)
+        for launch_key, row in selected_by_launch.items()
+    }
+
+    # Retain one explicit capability record only for candidates that are never
+    # launchable anywhere in the corpus. It creates no profiler process because
+    # ``profile_required`` is false, but preserves the reviewed reason that the
+    # registry member has no executable point in this generation.
+    for candidate_key, representative in unsupported_by_candidate.items():
+        if candidate_key in all_launchable_candidates:
+            continue
+        unsupported_launch_key = (
+            *candidate_key,
+            representative.execution_mode,
+            representative.m,
+            representative.projection_n_vector,
+            representative.aggregate_n,
+            representative.k,
+        )
+        selected[representative.digest()] = (
+            unsupported_launch_key,
+            representative,
+        )
+
+    return tuple(selected[digest] for digest in sorted(selected))
+
+
+def _profiler_workload_partition_key(runtime_key: Any) -> tuple[object, ...]:
+    """Keep every alias and candidate for one physical workload together.
+
+    ``launch_k_tiles`` is deliberately absent. Shape-resolved formula rows may
+    carry a projected tile count, but they describe the same concrete physical
+    launch and must remain in the same profiler contest as that launch.
+    """
+
+    return (
+        runtime_key.backend,
+        runtime_key.architecture_class,
+        runtime_key.operation_kind,
+        runtime_key.bundle_signature,
+        runtime_key.projection_n_vector,
+        runtime_key.prepared_family_id,
+        runtime_key.packing_abi,
+        runtime_key.runtime_codebook_id,
+        runtime_key.execution_mode,
+        runtime_key.m,
+        runtime_key.aggregate_n,
+        runtime_key.k,
+    )
+
+
+def _profiler_runtime_groups(
+    corpus: ObservationCorpus,
+) -> tuple[tuple[Any, ...], ...]:
+    """Group indexed runtime keys without scanning the observation inventory."""
+
+    grouped: dict[tuple[object, ...], list[Any]] = {}
+    for runtime_key in corpus.runtime_keys():
+        grouped.setdefault(
+            _profiler_workload_partition_key(runtime_key), []
+        ).append(runtime_key)
+    return tuple(
+        tuple(sorted(grouped[key]))
+        for key in sorted(grouped)
+    )
+
+
+def _balanced_profiler_runtime_group_assignments(
+    corpus: ObservationCorpus,
+    runtime_groups: tuple[tuple[Any, ...], ...],
+    worker_count: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Balance whole workload groups by row count across fork workers."""
+
+    sizes = tuple(
+        sum(len(corpus.rows_for_runtime_key(key)) for key in group)
+        for group in runtime_groups
+    )
+    assignments: list[list[int]] = [[] for _ in range(worker_count)]
+    loads = [0] * worker_count
+    for group_index in sorted(
+        range(len(runtime_groups)),
+        key=lambda index: (-sizes[index], index),
+    ):
+        worker_index = min(
+            range(worker_count),
+            key=lambda index: (loads[index], index),
+        )
+        assignments[worker_index].append(group_index)
+        loads[worker_index] += sizes[group_index]
+    return tuple(tuple(sorted(assignment)) for assignment in assignments)
+
+
+def _select_profiler_strata_for_runtime_groups(
+    group_indices: tuple[int, ...],
+) -> tuple[
+    tuple[tuple[tuple[object, ...], NativeVNNIObservation], ...],
+    frozenset[tuple[object, ...]],
+    tuple[tuple[tuple[object, ...], NativeVNNIObservation], ...],
+]:
+    """Select strata for inherited whole-workload groups in one worker."""
+
+    if _PARALLEL_PROFILER_GROUP_CORPUS is None:
+        raise RuntimeError("parallel profiler grouping corpus is not installed")
+    rows = (
+        row
+        for group_index in group_indices
+        for runtime_key in _PARALLEL_PROFILER_RUNTIME_GROUPS[group_index]
+        for row in _PARALLEL_PROFILER_GROUP_CORPUS.rows_for_runtime_key(runtime_key)
+    )
+    return _select_profiler_strata(rows)
+
+
+def _unsupported_profiler_representative_key(
+    row: NativeVNNIObservation,
+) -> tuple[object, ...]:
+    """Choose one deterministic capability witness across work points."""
+
+    return (
+        row.m,
+        row.aggregate_n,
+        row.k,
+        *_profiler_representative_key(row),
+    )
+
+
+def _select_profiler_strata(
+    rows: Iterable[NativeVNNIObservation],
+) -> tuple[
+    tuple[tuple[tuple[object, ...], NativeVNNIObservation], ...],
+    frozenset[tuple[object, ...]],
+    tuple[tuple[tuple[object, ...], NativeVNNIObservation], ...],
+]:
+    """Reduce complete workload groups to selected and capability witnesses."""
+
+    launchable, never_launchable = _group_profiler_observation_rows(rows)
+    launchable_candidates = frozenset(key[:-5] for key in launchable)
+    contests: dict[
+        tuple[object, ...],
+        dict[tuple[object, ...], NativeVNNIObservation],
+    ] = {}
+    for launch_key, rows in launchable.items():
+        for row in rows:
+            members = contests.setdefault(_profiler_contest_key(row), {})
+            previous = members.get(launch_key)
+            if (
+                previous is None
+                or _profiler_representative_key(row)
+                < _profiler_representative_key(previous)
+            ):
+                members[launch_key] = row
+
+    selected_launch_keys: set[tuple[object, ...]] = set()
+    for members in contests.values():
+        ranked = sorted(members.items(), key=_profiler_timing_rank_key)
+        selected_launch_keys.update(
+            ranked[index][0]
+            for index in _timing_stratum_indices(len(ranked))
+        )
+
+    selected: dict[tuple[object, ...], NativeVNNIObservation] = {}
+    for launch_key in selected_launch_keys:
+        representative = min(
+            launchable[launch_key],
+            key=_profiler_representative_key,
+        )
+        selected[launch_key] = representative
+
+    unsupported = {}
+    for candidate_key, rows in never_launchable.items():
+        representative = min(
+            rows,
+            key=_unsupported_profiler_representative_key,
+        )
+        unsupported[candidate_key] = representative
+
+    return (
+        tuple(selected.items()),
+        launchable_candidates,
+        tuple(unsupported.items()),
+    )
+
+
 def _group_profiler_observations(
     corpus: ObservationCorpus,
 ) -> tuple[
@@ -1313,6 +1835,17 @@ def _group_profiler_observations(
     with ``M``, ``N``, or ``K``.
     """
 
+    return _group_profiler_observation_rows(corpus)
+
+
+def _group_profiler_observation_rows(
+    rows: Iterable[NativeVNNIObservation],
+) -> tuple[
+    dict[tuple[object, ...], list[NativeVNNIObservation]],
+    dict[tuple[object, ...], list[NativeVNNIObservation]],
+]:
+    """Group an arbitrary complete-workload row iterable by launch identity."""
+
     launchable: dict[
         tuple[object, ...], list[NativeVNNIObservation]
     ] = {}
@@ -1320,7 +1853,7 @@ def _group_profiler_observations(
         tuple[object, ...], list[NativeVNNIObservation]
     ] = {}
     physical_keys: dict[tuple[object, ...], tuple[object, ...]] = {}
-    for row in corpus:
+    for row in rows:
         candidate_identity = (
             row.backend,
             row.architecture_class,
@@ -1402,51 +1935,17 @@ def build_missing_profiler_request_transaction(
         if covered_launch_keys is not None
         else _covered_profiler_launch_keys(covered_manifests)
     )
-    launchable, never_launchable = _group_profiler_observations(corpus)
-    launchable_candidates = {key[:-5] for key in launchable}
+    missing_rows = tuple(
+        row
+        for launch_key, row in _stratified_profiler_observation_entries(corpus)
+        if launch_key not in covered_keys
+    )
 
-    selected: dict[str, NativeVNNIObservation] = {}
-    for launch_key, rows in launchable.items():
-        if launch_key in covered_keys:
-            continue
-        representative = min(
-            rows,
-            key=lambda row: (
-                row.source_format,
-                row.source_codebook_id,
-                row.shape_name,
-                row.shape_group_id,
-                row.digest(),
-            ),
-        )
-        selected[representative.digest()] = representative
-
-    # Unsupported capability records are rare, but they remain part of the
-    # immutable manifest contract. Materialize only the representative needed
-    # to compare its geometry-bearing request key with prior coverage.
-    for physical_key, rows in never_launchable.items():
-        if physical_key in launchable_candidates:
-            continue
-        representative = min(
-            rows,
-            key=lambda row: (
-                row.m,
-                row.aggregate_n,
-                row.k,
-                row.source_format,
-                row.shape_name,
-                row.digest(),
-            ),
-        )
-        request = profiler_request_for_observation(representative)
-        if _profiled_exact_launch_key(request) not in covered_keys:
-            selected[representative.digest()] = representative
-
-    if not selected:
+    if not missing_rows:
         return None, None
 
     missing_requests = tuple(sorted(
-        (profiler_request_for_observation(row) for row in selected.values()),
+        _profiler_requests_for_observations(missing_rows),
         key=lambda request: (
             request.backend.value,
             request.architecture_class,
@@ -1462,16 +1961,18 @@ def build_missing_profiler_request_transaction(
         ),
     ))
 
-    rows_by_digest = {row.digest(): row for row in corpus}
-    missing_rows = []
+    missing_by_digest = {row.digest(): row for row in missing_rows}
+    ordered_missing_rows = []
     for request in missing_requests:
         try:
-            missing_rows.append(rows_by_digest[request.observation_digest])
+            ordered_missing_rows.append(
+                missing_by_digest[request.observation_digest]
+            )
         except KeyError as error:
             raise ValueError(
                 f"{request.request_id}: missing request lost its timing witness"
             ) from error
-    observations = ObservationCorpus._from_validated(missing_rows)
+    observations = ObservationCorpus._from_validated(ordered_missing_rows)
     requests = ProfilerRequestManifest(
         corpus_digest=observations.digest(),
         candidate_registry_digest=candidate_registry_digest(),
@@ -1560,7 +2061,17 @@ def _read_profiler_request_document(
         workers=workers,
         parallel_threshold=parallel_threshold,
     )
-    raw = canonical_raw
+    pretty_raw = (
+        None
+        if canonical_raw is not None
+        else _read_pretty_manifest_document(
+            path,
+            "requests",
+            workers=workers,
+            parallel_threshold=parallel_threshold,
+        )
+    )
+    raw = canonical_raw if canonical_raw is not None else pretty_raw
     if raw is None:
         raw = json.loads(path.read_text(encoding="utf-8"))
     root_fields = {
@@ -1618,7 +2129,7 @@ def _read_profiler_request_document(
         raise ValueError("profiler request_count does not match request inventory")
     # Canonical files were authenticated directly from their immutable bytes.
     # The compatibility parser must recreate the semantic canonical payload.
-    if canonical_raw is None:
+    if canonical_raw is None and pretty_raw is None:
         digest = _sha256_manifest_records(
             {
                 "schema_version": raw["schema_version"],
@@ -1844,6 +2355,18 @@ ROCM_METRIC_DEFINITIONS = (
     MetricDefinition("gpu.write_kib", MetricCategory.DYNAMIC_COUNTER, "KiB", False),
     MetricDefinition("gpu.wavefront_count", MetricCategory.DYNAMIC_COUNTER, "count", False),
     MetricDefinition("gpu.lds_bank_conflict_pct", MetricCategory.DYNAMIC_COUNTER, "percent", False),
+    MetricDefinition(
+        "gpu.valu_instructions_per_workitem",
+        MetricCategory.DYNAMIC_COUNTER,
+        "instructions_per_workitem",
+        False,
+    ),
+    MetricDefinition(
+        "gpu.flat_vmem_instructions_per_workitem",
+        MetricCategory.DYNAMIC_COUNTER,
+        "instructions_per_workitem",
+        False,
+    ),
 )
 
 
@@ -2259,7 +2782,17 @@ def _read_profiler_evidence_document(
         workers=workers,
         parallel_threshold=parallel_threshold,
     )
-    raw = canonical_raw
+    pretty_raw = (
+        None
+        if canonical_raw is not None
+        else _read_pretty_manifest_document(
+            path,
+            "evidence",
+            workers=workers,
+            parallel_threshold=parallel_threshold,
+        )
+    )
+    raw = canonical_raw if canonical_raw is not None else pretty_raw
     if raw is None:
         raw = json.loads(path.read_text(encoding="utf-8"))
     root_fields = {
@@ -2292,7 +2825,7 @@ def _read_profiler_evidence_document(
         raise ValueError("profiler evidence inventory must be a JSON array")
     if int(raw["evidence_count"]) != len(evidence_raw):
         raise ValueError("profiler evidence_count does not match inventory")
-    if canonical_raw is None:
+    if canonical_raw is None and pretty_raw is None:
         digest = _sha256_manifest_records(
             {
                 "schema_version": raw["schema_version"],
@@ -2735,14 +3268,27 @@ def compose_profiler_evidence(
         source_evidence_by_id = {item.request_id: item for item in evidence.evidence}
         for request in requests.requests:
             previous_request = request_by_id.setdefault(request.request_id, request)
-            if previous_request.canonical_mapping() != request.canonical_mapping():
+            if (
+                previous_request is not request
+                and previous_request.canonical_mapping()
+                != request.canonical_mapping()
+            ):
                 raise ValueError(
                     f"{request.request_id}: profiler sources disagree on request contents"
                 )
 
             item = source_evidence_by_id[request.request_id]
             previous_evidence = evidence_by_id.setdefault(request.request_id, item)
-            if previous_evidence.canonical_mapping() != item.canonical_mapping():
+            # Nearly every additive request ID is unique. ``setdefault`` then
+            # returns ``item`` itself, so recursively converting its dispatches
+            # and metrics to dictionaries twice cannot discover a conflict.
+            # Reserve the expensive canonical comparison for a genuine
+            # duplicate ID supplied by another source transaction.
+            if (
+                previous_evidence is not item
+                and previous_evidence.canonical_mapping()
+                != item.canonical_mapping()
+            ):
                 raise ValueError(
                     f"{request.request_id}: profiler sources publish conflicting evidence"
                 )
@@ -3108,14 +3654,25 @@ def _validate_feature_observation_join(
     deliberately does not duplicate timing values.  Export therefore requires
     the original common-observation CSV and proves both corpus identity and the
     exact bounded-subset request derivation before exposing timing and profiler
-    fields in one table. Request construction deliberately selects one
-    representative per physical candidate rather than profiling every
-    canonical timing row.
+    fields in one table. Request construction deliberately selects the three
+    timing strata rather than profiling every canonical timing row.
     """
 
-    observations_by_digest = {
-        observation.digest(): observation for observation in observations
-    }
+    observation_rows = observations.observations
+    digest_worker_count = _offline_worker_count(
+        len(observation_rows),
+        environment_name="LLAMINAR_NATIVE_VNNI_FEATURE_JOIN_WORKERS",
+        records_per_worker=4096,
+    )
+    observation_digests = _parallel_export_observation_digests(
+        observation_rows,
+        workers=digest_worker_count,
+    )
+    observations_by_digest = dict(zip(
+        observation_digests,
+        observation_rows,
+        strict=True,
+    ))
     if len(observations_by_digest) != len(observations):
         raise ValueError("profiler feature observations contain duplicate rows")
     exact_request_witnesses = (
@@ -3183,16 +3740,34 @@ def compact_profiler_observation_witnesses(
         for item in evidence.evidence
         if item.status == ProfilerEvidenceStatus.COMPLETE
     )
-    observations_by_digest = {
-        observation.digest(): observation for observation in observations
-    }
+    observation_rows = observations.observations
+    digest_worker_count = _offline_worker_count(
+        len(observation_rows),
+        environment_name="LLAMINAR_NATIVE_VNNI_COMPACT_WITNESS_WORKERS",
+        records_per_worker=4096,
+    )
+    observation_digests = _parallel_export_observation_digests(
+        observation_rows,
+        workers=digest_worker_count,
+    )
+    observations_by_digest = dict(zip(
+        observation_digests,
+        observation_rows,
+        strict=True,
+    ))
     if len(observations_by_digest) != len(observations):
         raise ValueError("profiler witness source contains duplicate rows")
     missing = required_observation_digests.difference(observations_by_digest)
     if missing:
+        ordered_missing = sorted(missing)
+        preview_limit = 16
+        preview = ordered_missing[:preview_limit]
+        remainder = len(ordered_missing) - len(preview)
+        suffix = f"; {remainder} more omitted" if remainder else ""
         raise ValueError(
-            "profiler witness source omits requested timing observations: "
-            f"{sorted(missing)}"
+            "profiler witness source omits "
+            f"{len(ordered_missing)} requested timing observations: "
+            f"{preview}{suffix}"
         )
 
     compact = ObservationCorpus._from_validated(
@@ -3756,6 +4331,9 @@ def _export_features(args: argparse.Namespace) -> int:
 def _compact_witnesses(args: argparse.Namespace) -> int:
     """CLI implementation for publishing an exact profiler timing witness."""
 
+    evidence_path = Path(args.evidence)
+    with evidence_path.open("rb") as handle:
+        legacy_pretty_evidence = handle.read(2) != b'{"'
     observations = (
         read_observation_csv(Path(path) for path in args.observation)
         if args.observation
@@ -3764,7 +4342,7 @@ def _compact_witnesses(args: argparse.Namespace) -> int:
         )
     )
     requests = read_profiler_request_manifest(Path(args.requests))
-    evidence = read_profiler_evidence_manifest(Path(args.evidence))
+    evidence = read_profiler_evidence_manifest(evidence_path)
     compact = compact_profiler_observation_witnesses(
         observations,
         requests,
@@ -3773,39 +4351,84 @@ def _compact_witnesses(args: argparse.Namespace) -> int:
     )
     output = Path(args.output)
     write_observation_csv(output, compact.observations)
+    if legacy_pretty_evidence:
+        # Old collectors used deterministic indented JSON. The parallel reader
+        # above has now authenticated every record and the exact timing join, so
+        # replace only its presentation with the compact canonical encoding.
+        # The semantic manifest digest remains identical, while subsequent
+        # export/certification phases can use direct mmap byte authentication.
+        write_profiler_evidence_manifest(evidence_path, evidence)
     print(json.dumps({
         "corpus_digest": compact.digest(),
+        "evidence_encoding_migrated": legacy_pretty_evidence,
         "observation_count": len(compact),
         "output": str(output),
     }, sort_keys=True))
     return 0
 
 
-def _compose_evidence(args: argparse.Namespace) -> int:
-    """CLI implementation for unioning authenticated additive transactions."""
+def _ordered_compose_source_paths(
+    observations: Sequence[str],
+    requests: Sequence[str],
+    evidence: Sequence[str],
+) -> tuple[tuple[Path, Path, Path], ...]:
+    """Order source triples to minimize large-parent profiler-reader forks."""
 
-    source_counts = {
-        len(args.source_observation),
-        len(args.source_requests),
-        len(args.source_evidence),
-    }
+    source_counts = {len(observations), len(requests), len(evidence)}
     if len(source_counts) != 1:
         raise ValueError(
             "compose-evidence requires one observation, request, and evidence "
             "path per source transaction"
         )
+    # Manifest readers fork physical-core workers for large record arrays. If
+    # the largest base transaction is parsed first, every later worker pool
+    # inherits that already-decoded object graph and spends most of its startup
+    # copying page tables for data it never reads. Composition is explicitly
+    # source-order independent: provenance, requests, evidence, and witnesses
+    # all receive canonical sorting below. Parse the smallest request inventory
+    # first so the parent reaches its peak size only for the final reader.
+    ordered = tuple(sorted(
+        (
+            (
+                Path(observation_path),
+                Path(request_path),
+                Path(evidence_path),
+                source_index,
+            )
+            for source_index, (
+                observation_path,
+                request_path,
+                evidence_path,
+            ) in enumerate(zip(
+                observations,
+                requests,
+                evidence,
+                strict=True,
+            ))
+        ),
+        key=lambda item: (item[1].stat().st_size, item[3]),
+    ))
+    return tuple(
+        (observation, request, item_evidence)
+        for observation, request, item_evidence, _index in ordered
+    )
+
+
+def _compose_evidence(args: argparse.Namespace) -> int:
+    """CLI implementation for unioning authenticated additive transactions."""
+
+    source_paths = _ordered_compose_source_paths(
+        args.source_observation,
+        args.source_requests,
+        args.source_evidence,
+    )
     composed = compose_profiler_evidence(
         (
-            read_observation_csv((Path(observation_path),)),
-            read_profiler_request_manifest(Path(request_path)),
-            read_profiler_evidence_manifest(Path(evidence_path)),
+            read_observation_csv((observation_path,)),
+            read_profiler_request_manifest(request_path),
+            read_profiler_evidence_manifest(evidence_path),
         )
-        for observation_path, request_path, evidence_path in zip(
-            args.source_observation,
-            args.source_requests,
-            args.source_evidence,
-            strict=True,
-        )
+        for observation_path, request_path, evidence_path in source_paths
     )
     output_observations = Path(args.output_observation)
     output_requests = Path(args.output_requests)

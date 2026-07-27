@@ -18,6 +18,7 @@
 
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -26,7 +27,11 @@
 #include <cstring>
 #include <iomanip>
 #include <memory>
+#include <mutex>
+#include <limits>
+#include <optional>
 #include <string>
+#include <vector>
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -58,6 +63,21 @@ namespace llaminar2
     {
     public:
         /**
+         * @brief File coordinates for an address inside a live mmap region.
+         *
+         * GPU startup loading uses this descriptor to replace serialized mmap
+         * faults with exact buffered pread() calls into its fixed pinned
+         * staging ring. The descriptor owns its path string, so callers do not
+         * retain a pointer into the registry after the lookup lock is released.
+         */
+        struct FileSource
+        {
+            std::string path;
+            uint64_t offset = 0;
+            size_t available_bytes = 0;
+        };
+
+        /**
          * @brief Controls whether mmap creation eagerly faults file pages.
          *
          * CPU weight paths benefit from eager prefaulting because decode may read
@@ -76,6 +96,7 @@ namespace llaminar2
         ~MmapRegion()
         {
 #ifdef __linux__
+            unregisterFileSource(base_);
             if (base_ != MAP_FAILED && base_ != nullptr)
             {
                 ::munmap(base_, length_);
@@ -107,6 +128,7 @@ namespace llaminar2
             if (this != &other)
             {
 #ifdef __linux__
+                unregisterFileSource(base_);
                 if (base_ != MAP_FAILED && base_ != nullptr)
                 {
                     ::munmap(base_, length_);
@@ -137,6 +159,49 @@ namespace llaminar2
 
         /** @brief Get the file path that was mapped */
         const std::string &path() const { return path_; }
+
+        /**
+         * @brief Resolve an arbitrary live mmap pointer to file path and offset.
+         *
+         * Tensor classes intentionally retain only a type-erased lifetime owner
+         * for their mmap backing. This process-wide registry lets the bounded GPU
+         * loader recover immutable file coordinates without adding file-system
+         * concerns to every quantized tensor type.
+         *
+         * @param addr First source byte requested by the caller.
+         * @param len Number of contiguous bytes required.
+         * @return File coordinates when the complete range belongs to one live
+         *         MmapRegion; std::nullopt for heap data or invalid ranges.
+         */
+        static std::optional<FileSource> resolveFileSource(const void *addr, size_t len)
+        {
+#ifdef __linux__
+            if (!addr || len == 0)
+                return std::nullopt;
+
+            const auto raw = reinterpret_cast<uintptr_t>(addr);
+            if (raw > std::numeric_limits<uintptr_t>::max() - len)
+                return std::nullopt;
+            const uintptr_t raw_end = raw + len;
+
+            std::lock_guard<std::mutex> lock(fileSourceRegistryMutex());
+            for (const auto &entry : fileSourceRegistry())
+            {
+                if (raw >= entry.begin && raw_end <= entry.end)
+                {
+                    return FileSource{
+                        .path = entry.path,
+                        .offset = static_cast<uint64_t>(raw - entry.begin),
+                        .available_bytes = static_cast<size_t>(entry.end - raw),
+                    };
+                }
+            }
+#else
+            (void)addr;
+            (void)len;
+#endif
+            return std::nullopt;
+        }
 
         /**
          * @brief Whether create() used a synchronous eager prefault path.
@@ -516,8 +581,63 @@ namespace llaminar2
         }
 
     private:
+        struct RegisteredFileSource
+        {
+            uintptr_t begin = 0;
+            uintptr_t end = 0;
+            std::string path;
+        };
+
+        static std::mutex &fileSourceRegistryMutex()
+        {
+            // Deliberately process-lifetime: model mappings can be destroyed from
+            // late static teardown paths where normal static destruction order is
+            // not reliable.
+            static auto *mutex = new std::mutex();
+            return *mutex;
+        }
+
+        static std::vector<RegisteredFileSource> &fileSourceRegistry()
+        {
+            static auto *registry = new std::vector<RegisteredFileSource>();
+            return *registry;
+        }
+
+        static void unregisterFileSource(const void *base)
+        {
+#ifdef __linux__
+            if (!base || base == MAP_FAILED)
+                return;
+            const auto begin = reinterpret_cast<uintptr_t>(base);
+            std::lock_guard<std::mutex> lock(fileSourceRegistryMutex());
+            auto &registry = fileSourceRegistry();
+            registry.erase(
+                std::remove_if(
+                    registry.begin(), registry.end(),
+                    [begin](const RegisteredFileSource &entry)
+                    { return entry.begin == begin; }),
+                registry.end());
+#else
+            (void)base;
+#endif
+        }
+
         MmapRegion(void *base, size_t length, int fd, const std::string &path, bool eager_prefaulted)
-            : base_(base), length_(length), fd_(fd), path_(path), eager_prefaulted_(eager_prefaulted) {}
+            : base_(base), length_(length), fd_(fd), path_(path), eager_prefaulted_(eager_prefaulted)
+        {
+#ifdef __linux__
+            if (base_ && base_ != MAP_FAILED && length_ > 0)
+            {
+                const auto begin = reinterpret_cast<uintptr_t>(base_);
+                std::lock_guard<std::mutex> lock(fileSourceRegistryMutex());
+                fileSourceRegistry().push_back({
+                    .begin = begin,
+                    .end = begin + length_,
+                    .path = path_,
+                });
+            }
+#endif
+        }
 
         void *base_ = nullptr;
         size_t length_ = 0;

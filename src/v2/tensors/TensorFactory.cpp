@@ -50,7 +50,15 @@ namespace llaminar2
         if (use_mapped_memory_for_gpu_ && device.is_gpu())
         {
             LOG_TRACE("[TensorFactory::createFP32] Using mapped memory for GPU tensor");
-            return FP32Tensor::createMapped(shape, device);
+            auto mapped = FP32Tensor::createMapped(shape, device);
+            if (!mapped)
+            {
+                throw std::runtime_error(
+                    "TensorFactory::createFP32 required mapped GPU storage but "
+                    "allocation failed on " +
+                    device.toString());
+            }
+            return mapped;
         }
 
         return std::make_unique<FP32Tensor>(shape, device);

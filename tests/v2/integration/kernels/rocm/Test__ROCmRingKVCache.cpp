@@ -82,6 +82,55 @@ namespace
     };
 
     /**
+     * @brief Owns one cache workspace binding for the surrounding test scope.
+     *
+     * Wrapped-ring linearization and conversion use graph-stable workspace in
+     * production. Keeping unbind-before-release in one RAII type makes the same
+     * lifecycle mandatory in tests and prevents assertion exits from tearing
+     * down workspace while a cache still references it.
+     */
+    class ScopedWorkspaceBinding
+    {
+    public:
+        ScopedWorkspaceBinding(
+            IWorkspaceConsumer *consumer,
+            DeviceId device,
+            int graph_rows,
+            int batch_size,
+            int head_dim)
+            : consumer_(consumer)
+        {
+            if (!consumer_)
+                throw std::invalid_argument("ROCm KV cache lacks IWorkspaceConsumer");
+
+            const WorkspaceRequirements requirements =
+                consumer_->getWorkspaceRequirements(
+                    graph_rows, batch_size, head_dim);
+            workspace_ = std::make_unique<DeviceWorkspaceManager>(
+                device,
+                requirements.total_bytes_with_alignment() + 4096);
+            if (!workspace_->allocate(requirements))
+                throw std::runtime_error("Failed to allocate ROCm KV cache workspace");
+            consumer_->bindWorkspace(workspace_.get());
+            if (!consumer_->hasWorkspace())
+                throw std::runtime_error("ROCm KV cache rejected its workspace");
+        }
+
+        ~ScopedWorkspaceBinding()
+        {
+            if (consumer_)
+                consumer_->unbindWorkspace();
+        }
+
+        ScopedWorkspaceBinding(const ScopedWorkspaceBinding &) = delete;
+        ScopedWorkspaceBinding &operator=(const ScopedWorkspaceBinding &) = delete;
+
+    private:
+        IWorkspaceConsumer *consumer_ = nullptr;
+        std::unique_ptr<DeviceWorkspaceManager> workspace_;
+    };
+
+    /**
      * @brief Prove one captured resident HIP gather follows a growing count.
      *
      * A prefill graph is captured at one chunk boundary and reused after the
@@ -315,6 +364,9 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP32)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        cache.get(), DeviceId::rocm(0),
+        max_seq_len, batch_size, head_dim);
 
     // Verify initial state
     EXPECT_EQ(cache->n_layers(), n_layers);
@@ -398,6 +450,9 @@ TEST(Test__ROCmRingKVCache, DeviceResidentSequenceStatePublicationRemainsDeviceO
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        cache.get(), DeviceId::rocm(0),
+        max_seq_len, batch_size, head_dim);
     ASSERT_TRUE(cache->supportsDeviceResidentSequenceStatePublication());
     ScopedHipStream stream;
 
@@ -512,6 +567,9 @@ TEST(Test__ROCmRingKVCache, WrapAround_FP32)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        cache.get(), DeviceId::rocm(0),
+        max_seq_len, batch_size, head_dim);
 
     // Generate test data: 12 tokens (exceeds max_seq_len=8)
     const int total_tokens = 12;
@@ -586,6 +644,9 @@ TEST(Test__ROCmRingKVCache, WrapAround_ExactlyDouble_FP32)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        cache.get(), DeviceId::rocm(0),
+        max_seq_len, batch_size, head_dim);
 
     // Exactly 2x buffer size: 16 tokens into 8-slot buffer
     const int total_tokens = 16;
@@ -650,6 +711,9 @@ TEST(Test__ROCmRingKVCache, WrapAround_BarelyOver_FP32)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        cache.get(), DeviceId::rocm(0),
+        max_seq_len, batch_size, head_dim);
 
     // Just 1 more than buffer: 9 tokens into 8-slot buffer
     const int total_tokens = 9;
@@ -713,6 +777,9 @@ TEST(Test__ROCmRingKVCache, WrapAround_TripleBuffer_FP32)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        cache.get(), DeviceId::rocm(0),
+        max_seq_len, batch_size, head_dim);
 
     // 3x buffer size: 24 tokens into 8-slot buffer
     const int total_tokens = 24;
@@ -1272,6 +1339,10 @@ TEST(Test__ROCmRingKVCache, FP16RoPEOnRead_Qwen35LongPartialRotary)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP16>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        cache.get(), DeviceId::rocm(0),
+        max_seq_len, batch_size, head_dim);
+    ScopedHipStream stream;
 
     auto h_K_fp32 = generateRandomFP32(total, 3551);
     auto h_V_fp32 = generateRandomFP32(total, 3552);
@@ -1319,7 +1390,8 @@ TEST(Test__ROCmRingKVCache, FP16RoPEOnRead_Qwen35LongPartialRotary)
     ASSERT_EQ(hipMemcpy(d_K, h_K.data(), total * sizeof(_Float16), hipMemcpyHostToDevice), hipSuccess);
     ASSERT_EQ(hipMemcpy(d_V, h_V.data(), total * sizeof(_Float16), hipMemcpyHostToDevice), hipSuccess);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, num_tokens, stream.stream()));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
     IKVCache::KVReadParams rope_params;
@@ -1328,6 +1400,7 @@ TEST(Test__ROCmRingKVCache, FP16RoPEOnRead_Qwen35LongPartialRotary)
     rope_params.n_kv_heads = n_kv_heads;
     rope_params.head_dim = head_dim;
     rope_params.rope_dim = rope_dim;
+    rope_params.gpu_stream = stream.opaque();
 
     ITensor *out_k = nullptr;
     ITensor *out_v = nullptr;
@@ -1337,7 +1410,7 @@ TEST(Test__ROCmRingKVCache, FP16RoPEOnRead_Qwen35LongPartialRotary)
     ASSERT_EQ(kv_len, num_tokens);
     ASSERT_NE(out_k, nullptr);
     ASSERT_NE(out_v, nullptr);
-    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    stream.synchronize();
 
     std::vector<_Float16> actual_K(total);
     std::vector<_Float16> actual_V(total);
@@ -1380,6 +1453,9 @@ TEST(Test__ROCmRingKVCache, LinearizationStatistics_FP32)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        cache.get(), DeviceId::rocm(0),
+        max_seq_len, batch_size, head_dim);
 
     // Initial stats
     EXPECT_EQ(cache->get_linearization_count(), 0);
@@ -1913,6 +1989,9 @@ TEST(Test__ROCmRingKVCache, WrapAround_Q81)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::Q8_1>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        cache.get(), DeviceId::rocm(0),
+        max_seq_len, batch_size, head_dim);
 
     const int total_tokens = 12;
     const size_t total_blocks = static_cast<size_t>(total_tokens) * static_cast<size_t>(kv_blocks);

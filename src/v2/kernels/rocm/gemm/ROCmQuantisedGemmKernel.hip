@@ -13,11 +13,9 @@
  *
  *   Dispatch Functions (extern "C"):
  *     - rocmQuantGemm_setDevice()              : HIP device selection
- *     - rocmQuantGemm_uploadWeights()          : Weight upload H2D
- *     - rocmQuantGemm_ensureWorkBuffers()      : Work buffer management
  *     - rocmQuantGemm_applyScaling()           : INT32 → FP32 scaling epilogue
  *     - rocmQuantGemm_biasAdd()                : In-place bias addition
- *     - rocmQuantGemm_alloc*(), copy*(), free* : Memory management utilities
+ *     - rocmQuantGemm_alloc*(), free* : Setup-owned packed-weight storage
  *
  * Backend-specific GEMM implementations live in separate files:
  *   - ROCmQuantisedGemmKernel_INT8_VNNI.hip : INT8 VNNI prefill kernels (gfx906)
@@ -32,8 +30,10 @@
 #include <cfloat>
 #include <cmath>
 #include <chrono>
+#include <stdexcept>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../utils/DebugEnv.h"
 
 // ============================================================================
@@ -1008,167 +1008,21 @@ extern "C"
         return true;
     }
 
-    // -------------------------------------------------------------------------
-    // Weight upload (Phase 1)
-    // -------------------------------------------------------------------------
-
-    bool rocmQuantGemm_uploadWeights(
-        const int8_t *h_weights_int8,
-        const float *h_scales_B,
-        int8_t **d_weights_int8,
-        float **d_scales_B,
-        int K, int N,
-        int rocm_device_id)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        // Allocate device memory for weights
-        size_t weight_bytes = static_cast<size_t>(K) * N * sizeof(int8_t);
-        hipError_t err = hipMalloc(d_weights_int8, weight_bytes);
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMalloc weights failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        // CRITICAL: Verify hipMalloc actually allocated memory
-        if (*d_weights_int8 == nullptr)
-        {
-            fprintf(stderr, "[rocmQuantGemm_uploadWeights] CRITICAL: hipMalloc returned success but pointer is NULL! "
-                    "(bytes=%zu K=%d N=%d device=%d)\n",
-                    weight_bytes, K, N, rocm_device_id);
-            return false;
-        }
-
-        // Allocate device memory for scales
-        size_t scale_bytes = static_cast<size_t>(N) * sizeof(float);
-        err = hipMalloc(d_scales_B, scale_bytes);
-        if (err != hipSuccess)
-        {
-            (void)hipFree(*d_weights_int8);
-            *d_weights_int8 = nullptr;
-            fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMalloc scales failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-
-        // Copy weights H2D
-        err = hipMemcpy(*d_weights_int8, h_weights_int8, weight_bytes, hipMemcpyHostToDevice);
-        if (err != hipSuccess)
-        {
-            (void)hipFree(*d_weights_int8);
-            (void)hipFree(*d_scales_B);
-            *d_weights_int8 = nullptr;
-            *d_scales_B = nullptr;
-            fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMemcpy weights failed: %s "
-                    "(src=%p dst=%p bytes=%zu K=%d N=%d device=%d)\n",
-                    hipGetErrorString(err), (void*)h_weights_int8, (void*)*d_weights_int8,
-                    weight_bytes, K, N, rocm_device_id);
-            return false;
-        }
-
-        // Copy scales H2D
-        err = hipMemcpy(*d_scales_B, h_scales_B, scale_bytes, hipMemcpyHostToDevice);
-        if (err != hipSuccess)
-        {
-            (void)hipFree(*d_weights_int8);
-            (void)hipFree(*d_scales_B);
-            *d_weights_int8 = nullptr;
-            *d_scales_B = nullptr;
-            fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMemcpy scales failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-
-        return true;
-    }
-
-    // -------------------------------------------------------------------------
-    // Work buffer allocation (Phase 2)
-    // -------------------------------------------------------------------------
-
-    bool rocmQuantGemm_ensureWorkBuffers(
-        int8_t **d_A_int8,
-        float **d_scales_A,
-        int32_t **d_C_int32,
-        int *work_buffer_M,
-        int M, int K, int N,
-        int rocm_device_id)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        // Only reallocate if M increased
-        if (M <= *work_buffer_M)
-        {
-            return true;
-        }
-
-        // Free existing buffers
-        if (*d_A_int8) {
-            (void)hipFree(*d_A_int8);
-        }
-        if (*d_scales_A) {
-            (void)hipFree(*d_scales_A);
-        }
-        if (*d_C_int32) {
-            (void)hipFree(*d_C_int32);
-        }
-
-        *d_A_int8 = nullptr;
-        *d_scales_A = nullptr;
-        *d_C_int32 = nullptr;
-
-        // Allocate new buffers
-        hipError_t err = hipMalloc(d_A_int8, static_cast<size_t>(M) * K * sizeof(int8_t));
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_ensureWorkBuffers] hipMalloc A_int8 failed: %s\n", hipGetErrorString(err));
-            return false;
-        }
-
-        err = hipMalloc(d_scales_A, static_cast<size_t>(M) * sizeof(float));
-        if (err != hipSuccess)
-        {
-            (void)hipFree(*d_A_int8);
-            *d_A_int8 = nullptr;
-            fprintf(stderr, "[rocmQuantGemm_ensureWorkBuffers] hipMalloc scales_A failed: %s\n", hipGetErrorString(err));
-            return false;
-        }
-
-        err = hipMalloc(d_C_int32, static_cast<size_t>(M) * N * sizeof(int32_t));
-        if (err != hipSuccess)
-        {
-            (void)hipFree(*d_A_int8);
-            (void)hipFree(*d_scales_A);
-            *d_A_int8 = nullptr;
-            *d_scales_A = nullptr;
-            fprintf(stderr, "[rocmQuantGemm_ensureWorkBuffers] hipMalloc C_int32 failed: %s\n", hipGetErrorString(err));
-            return false;
-        }
-
-        *work_buffer_M = M;
-        return true;
-    }
-
     // =========================================================================
     // INT8 ALLOCATION HELPER
     // =========================================================================
     
     bool rocmQuantGemm_allocInt8(int8_t **d_ptr, size_t count, int rocm_device_id)
     {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
+        *d_ptr = nullptr;
+        if (count == 0)
+            return true;
+        auto *backend = llaminar2::getROCmBackend();
+        if (!backend)
             return false;
-
-        hipError_t err = hipMalloc(d_ptr, count * sizeof(int8_t));
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_allocInt8] hipMalloc failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
+        *d_ptr = static_cast<int8_t *>(
+            backend->allocate(count * sizeof(int8_t), rocm_device_id));
+        return *d_ptr != nullptr;
     }
 
     // =========================================================================
@@ -1375,98 +1229,26 @@ extern "C"
 
     void rocmQuantGemm_freeDevice(void *d_ptr, int rocm_device_id)
     {
-        if (d_ptr)
-        {
-            // Set device before freeing - required by HIP/CUDA
-            hipError_t set_err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(rocm_device_id));
-            if (set_err == hipErrorDeinitialized || set_err == hipErrorNoDevice)
-            {
-                // HIP runtime is shutting down, skip cleanup
-                // This is normal during static destruction at program exit
-                return;
-            }
-            hipError_t err = hipFree(d_ptr);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                // Only log actual errors, not shutdown-related ones
-                fprintf(stderr, "WARNING: hipFree failed: %s\n", hipGetErrorString(err));
-            }
-        }
+        if (!d_ptr)
+            return;
+        auto *backend = llaminar2::getROCmBackend();
+        if (!backend)
+            throw std::runtime_error(
+                "[ROCmQuantGemm] ROCm backend unavailable while releasing packed weights");
+        backend->free(d_ptr, rocm_device_id);
     }
 
     bool rocmQuantGemm_allocFloat(float **d_ptr, size_t count, int rocm_device_id)
     {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
+        *d_ptr = nullptr;
+        if (count == 0)
+            return true;
+        auto *backend = llaminar2::getROCmBackend();
+        if (!backend)
             return false;
-
-        hipError_t err = hipMalloc(d_ptr, count * sizeof(float));
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_allocFloat] hipMalloc failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
-    }
-
-    bool rocmQuantGemm_allocInt32(int32_t **d_ptr, size_t count, int rocm_device_id)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        hipError_t err = hipMalloc(d_ptr, count * sizeof(int32_t));
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_allocInt32] hipMalloc failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
-    }
-
-    bool rocmQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int rocm_device_id)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        hipError_t err = hipMemcpy(d_dst, h_src, count * sizeof(float), hipMemcpyHostToDevice);
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_copyHostToDevice] hipMemcpy failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
-    }
-
-    bool rocmQuantGemm_copyDeviceToHost(float *h_dst, const float *d_src, size_t count, int rocm_device_id)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        hipError_t err = hipMemcpy(h_dst, d_src, count * sizeof(float), hipMemcpyDeviceToHost);
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_copyDeviceToHost] hipMemcpy failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
-    }
-
-    bool rocmQuantGemm_copyInt32DeviceToHost(int32_t *h_dst, const int32_t *d_src, size_t count, int rocm_device_id)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        hipError_t err = hipMemcpy(h_dst, d_src, count * sizeof(int32_t), hipMemcpyDeviceToHost);
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_copyInt32DeviceToHost] hipMemcpy failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
+        *d_ptr = static_cast<float *>(
+            backend->allocate(count * sizeof(float), rocm_device_id));
+        return *d_ptr != nullptr;
     }
 
     // =========================================================================

@@ -12,8 +12,9 @@ src/v2/kernels/{cuda,rocm}/gemm.
 
 Options:
   --backend cuda|rocm|cpu|cpu-prefill|both|all
-                              Backend to refresh (default: both; all includes
-                              CPU verifier and ordinary-prefill policies)
+                              Backend to refresh (default: both; all installs
+                              M=1/grouped policies for CPU, CUDA, and ROCm).
+                              cpu-prefill is offline research only.
   --profile quick|family-smoke|qwen36-core|qwen36-lm-head|qwen36-moe|qwen36|all
                               Sweep breadth (default: quick)
   --output-dir DIR             Output directory for CSVs, includes, summaries
@@ -62,6 +63,21 @@ Options:
   --cuda-development-build-change-audit NOTE
                               Reviewed explanation for retaining CUDA
                               development evidence across a harness rebuild
+  --resume-cuda-after-m1-seal Reuse authenticated CUDA development and sealed
+                              M=1 evidence, then certify and continue with
+                              grouped-verifier collection
+  --cuda-generic-max-leaves N Maximum CUDA Fast/grouped generic-tree leaf
+                              budget (default: 16). A deliberate best-effort
+                              install may lower this while preserving totality.
+  --reuse-rocm-development     Reuse and authenticate canonical ROCm M=1
+                              development timing/profiler evidence, then open
+                              a fresh seal and continue the full transaction
+  --rocm-development-build-change-audit NOTE
+                              Reviewed explanation for retaining ROCm
+                              development evidence across a harness rebuild
+  --rocm-generic-max-leaves N Maximum ROCm Fast generic-tree leaf budget
+                              (default: 1). Exact overlays remain additive;
+                              the immutable GPU seal must exercise every leaf.
   --stop-after-cpu-decode      Certify and install the complete CPU M=1 policy,
                                rebuild both CPU trainers, then stop before
                                grouped-verifier collection
@@ -239,7 +255,9 @@ Options:
                                is run once with AVX2 and once with AVX512
                                runtime dispatch
   --skip-sweep                 Reuse existing CSVs in output-dir
-  --install                    Publish a complete --profile all artifact
+  --install                    Publish complete M=1/grouped --profile all
+                               artifacts. Rejected for cpu-prefill because
+                               ordinary prefill remains heuristic-only.
   --dry-run                    Print commands without running them
   -h, --help                   Show this help
 
@@ -283,6 +301,9 @@ cpu_minimum_promotion_samples="${LLAMINAR_NATIVE_VNNI_CPU_MINIMUM_PROMOTION_SAMP
 resume_cpu_partials="${LLAMINAR_NATIVE_VNNI_RESUME_CPU_PARTIALS:-0}"
 reuse_cuda_development="${LLAMINAR_NATIVE_VNNI_REUSE_CUDA_DEVELOPMENT:-0}"
 cuda_development_build_change_audit="${LLAMINAR_NATIVE_VNNI_CUDA_DEVELOPMENT_BUILD_CHANGE_AUDIT:-}"
+resume_cuda_after_m1_seal="${LLAMINAR_NATIVE_VNNI_RESUME_CUDA_AFTER_M1_SEAL:-0}"
+reuse_rocm_development="${LLAMINAR_NATIVE_VNNI_REUSE_ROCM_DEVELOPMENT:-0}"
+rocm_development_build_change_audit="${LLAMINAR_NATIVE_VNNI_ROCM_DEVELOPMENT_BUILD_CHANGE_AUDIT:-}"
 stop_after_cpu_decode="${LLAMINAR_NATIVE_VNNI_STOP_AFTER_CPU_DECODE:-0}"
 resume_after_cpu_decode="${LLAMINAR_NATIVE_VNNI_RESUME_AFTER_CPU_DECODE:-0}"
 skip_cpu_prefill_baseline="${LLAMINAR_NATIVE_VNNI_SKIP_CPU_PREFILL_BASELINE:-0}"
@@ -328,6 +349,8 @@ cpu_decode_burned_sealed_paired_dirs=()
 cpu_grouped_burned_sealed_plans=()
 cpu_grouped_burned_sealed_paired_dirs=()
 cpu_grouped_max_leaves="${LLAMINAR_NATIVE_VNNI_CPU_GROUPED_MAX_LEAVES:-16}"
+cuda_generic_max_leaves="${LLAMINAR_NATIVE_VNNI_CUDA_GENERIC_MAX_LEAVES:-16}"
+rocm_generic_max_leaves="${LLAMINAR_NATIVE_VNNI_ROCM_GENERIC_MAX_LEAVES:-1}"
 cpu_prefill_fit_replay_recipe=""
 cpu_prefill_diagnostic_max_leaves=""
 cpu_prefill_ablate_profiler_features=0
@@ -448,6 +471,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cuda-development-build-change-audit)
       cuda_development_build_change_audit="${2:-}"
+      shift 2
+      ;;
+    --resume-cuda-after-m1-seal)
+      resume_cuda_after_m1_seal=1
+      shift
+      ;;
+    --cuda-generic-max-leaves)
+      cuda_generic_max_leaves="${2:-}"
+      shift 2
+      ;;
+    --reuse-rocm-development)
+      reuse_rocm_development=1
+      shift
+      ;;
+    --rocm-development-build-change-audit)
+      rocm_development_build_change_audit="${2:-}"
+      shift 2
+      ;;
+    --rocm-generic-max-leaves)
+      rocm_generic_max_leaves="${2:-}"
       shift 2
       ;;
     --stop-after-cpu-decode)
@@ -735,6 +778,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if (( resume_cuda_after_m1_seal )); then
+  reuse_cuda_development=1
+fi
+
 if (( ${#cpu_decode_burned_sealed_plans[@]} !=
       ${#cpu_decode_burned_sealed_paired_dirs[@]} )); then
   echo "error: burned CPU decode plans and paired directories must pair by position" >&2
@@ -766,7 +813,7 @@ validate_promotion_percent \
   --maximum-p95-regret-percent "${maximum_p95_regret_percent}" 0
 validate_promotion_percent \
   --minimum-passing-domain-percent "${minimum_passing_domain_percent}" 1
-cpu_grouped_paired_max_regret_fraction="$(awk \
+paired_max_regret_fraction="$(awk \
   -v regret_percent="${maximum_p95_regret_percent}" \
   'BEGIN { printf "%.12g\n", regret_percent / 100.0 }')"
 if [[ ! "${cpu_minimum_promotion_warmups}" =~ ^[1-9][0-9]*$ ]]; then
@@ -948,6 +995,10 @@ if [[ "${backend}" == "cpu-prefill" ]] &&
   echo "error: --backend cpu-prefill supports quick, family-smoke, or all" >&2
   exit 2
 fi
+if [[ "${backend}" == "cpu-prefill" && ${install} -eq 1 ]]; then
+  echo "error: ordinary prefill is heuristic-only; cpu-prefill cannot install a generated policy" >&2
+  exit 2
+fi
 if (( stop_after_cpu_decode )) &&
    [[ "${backend}" != "cpu" || "${profile}" != "all" ]]; then
   echo "error: --stop-after-cpu-decode requires --backend cpu --profile all" >&2
@@ -979,8 +1030,15 @@ if (( reuse_cuda_development )) &&
   echo "error: --reuse-cuda-development requires --backend cuda --profile all" >&2
   exit 2
 fi
-if (( reuse_cuda_development && skip_sweep )); then
-  echo "error: --reuse-cuda-development and --skip-sweep are mutually exclusive" >&2
+if (( reuse_cuda_development && skip_sweep &&
+      ! resume_cuda_after_m1_seal )); then
+  echo "error: --reuse-cuda-development and --skip-sweep require " \
+       "--resume-cuda-after-m1-seal so retained seal provenance is explicit" >&2
+  exit 2
+fi
+if (( resume_cuda_after_m1_seal )) &&
+   [[ "${backend}" != "cuda" || "${profile}" != "all" ]]; then
+  echo "error: --resume-cuda-after-m1-seal requires --backend cuda --profile all" >&2
   exit 2
 fi
 if (( reuse_cuda_development )) && [[ "${shape_partition}" != "all" ]]; then
@@ -996,6 +1054,36 @@ if (( ! reuse_cuda_development )) &&
    [[ -n "${cuda_development_build_change_audit}" ]]; then
   echo "error: --cuda-development-build-change-audit requires " \
        "--reuse-cuda-development" >&2
+  exit 2
+fi
+if (( reuse_rocm_development )) &&
+   [[ "${backend}" != "rocm" || "${profile}" != "all" ]]; then
+  echo "error: --reuse-rocm-development requires --backend rocm --profile all" >&2
+  exit 2
+fi
+if (( reuse_rocm_development )) && [[ "${shape_partition}" != "all" ]]; then
+  echo "error: --reuse-rocm-development cannot use --shape-partition" >&2
+  exit 2
+fi
+if (( reuse_rocm_development )) &&
+   [[ -z "${rocm_development_build_change_audit//[[:space:]]/}" ]]; then
+  echo "error: --reuse-rocm-development requires a non-empty --rocm-development-build-change-audit" >&2
+  exit 2
+fi
+if (( ! reuse_rocm_development )) &&
+   [[ -n "${rocm_development_build_change_audit}" ]]; then
+  echo "error: --rocm-development-build-change-audit requires " \
+       "--reuse-rocm-development" >&2
+  exit 2
+fi
+if [[ ! "${rocm_generic_max_leaves}" =~ ^[1-9][0-9]*$ ]] ||
+   (( rocm_generic_max_leaves > 32 )); then
+  echo "error: --rocm-generic-max-leaves must be in [1, 32]" >&2
+  exit 2
+fi
+if [[ ! "${cuda_generic_max_leaves}" =~ ^[1-9][0-9]*$ ]] ||
+   (( cuda_generic_max_leaves > 32 )); then
+  echo "error: --cuda-generic-max-leaves must be in [1, 32]" >&2
   exit 2
 fi
 if [[ ! "${cpu_grouped_max_leaves}" =~ ^[1-9][0-9]*$ ]] ||
@@ -1560,6 +1648,79 @@ print(next(iter(values)))
 PY
 }
 
+csv_unique_fields() {
+  local path="$1"
+  shift
+  python3 - "${path}" "$@" <<'PY'
+import csv
+import sys
+
+path, *fields = sys.argv[1:]
+values = {field: set() for field in fields}
+with open(path, newline="", encoding="utf-8") as handle:
+    reader = csv.DictReader(handle)
+    missing = [field for field in fields if field not in (reader.fieldnames or ())]
+    if missing:
+        raise SystemExit(f"{path}: CSV does not contain {missing!r}")
+    for row in reader:
+        for field in fields:
+            value = row[field].strip()
+            if not value:
+                raise SystemExit(f"{path}: CSV contains an empty {field!r}")
+            values[field].add(value)
+            if len(values[field]) > 1:
+                raise SystemExit(
+                    f"{path}: CSV contains multiple {field!r} values"
+                )
+for field in fields:
+    if len(values[field]) != 1:
+        raise SystemExit(f"{path}: CSV contains no data rows")
+    print(next(iter(values[field])))
+PY
+}
+
+csv_unique_fields_except() {
+  local path="$1"
+  local excluded_field="$2"
+  local excluded_value="$3"
+  shift 3
+  python3 - "${path}" "${excluded_field}" "${excluded_value}" "$@" <<'PY'
+import csv
+import sys
+
+path, excluded_field, excluded_value, *fields = sys.argv[1:]
+values = {field: set() for field in fields}
+selected = 0
+with open(path, newline="", encoding="utf-8") as handle:
+    reader = csv.DictReader(handle)
+    required = {excluded_field, *fields}
+    missing = sorted(required - set(reader.fieldnames or ()))
+    if missing:
+        raise SystemExit(f"{path}: CSV does not contain {missing!r}")
+    for row in reader:
+        if row[excluded_field].strip() == excluded_value:
+            continue
+        selected += 1
+        for field in fields:
+            value = row[field].strip()
+            if not value:
+                raise SystemExit(f"{path}: CSV contains an empty {field!r}")
+            values[field].add(value)
+            if len(values[field]) > 1:
+                raise SystemExit(
+                    f"{path}: selected rows contain multiple {field!r} values"
+                )
+if selected == 0:
+    raise SystemExit(
+        f"{path}: CSV contains no rows outside {excluded_field}={excluded_value!r}"
+    )
+for field in fields:
+    if len(values[field]) != 1:
+        raise SystemExit(f"{path}: selected rows contain no {field!r} value")
+    print(next(iter(values[field])))
+PY
+}
+
 csv_unique_field_prefix() {
   local path="$1"
   local field="$2"
@@ -1816,7 +1977,7 @@ shape_manifest_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispa
 cpu_serial_arithmetic_contract_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/cpu_native_vnni_serial_m1_arithmetic_v1.json"
 gpu_measurement_plan_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/native_vnni_gpu_measurement_plan_v1.json"
 if [[ -z "${cpu_prefill_split_manifest_path}" ]]; then
-  cpu_prefill_split_manifest_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/native_vnni_cpu_prefill_split_v12.json"
+  cpu_prefill_split_manifest_path="${repo_root}/tests/v2/performance/kernels/native_vnni_dispatch/manifests/native_vnni_cpu_prefill_split_v13.json"
 fi
 shape_manifest_python_root="${repo_root}/tests/v2/performance/kernels"
 cpu_prefill_training_plan_module="native_vnni_dispatch.cpu_prefill_training_plan"
@@ -2165,6 +2326,7 @@ cuda_m1_development_scoped_csv="${output_dir}/cuda_decode_m1.development-cuda-q4
 cuda_m1_development_scoped_timing_csv="${output_dir}/cuda_decode_m1.development-cuda-q4-refinement.timing.csv"
 cuda_m1_sealed_csv="${output_dir}/cuda_decode_m1.sealed.csv"
 cuda_m1_sealed_timing_csv="${output_dir}/cuda_decode_m1.sealed.timing.csv"
+cuda_m1_sealed_context="${output_dir}/cuda_decode_m1.sealed.context"
 cuda_verifier_csv="${output_dir}/cuda_decode_verifier.csv"
 cuda_verifier_timing_csv="${output_dir}/cuda_decode_verifier.timing.csv"
 cuda_verifier_development_csv="${output_dir}/cuda_decode_verifier.development.csv"
@@ -2182,6 +2344,11 @@ cuda_inc="${output_dir}/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc"
 cuda_summary="${output_dir}/cuda_decode_dispatch_summary.txt"
 cuda_common_csv="${output_dir}/cuda_decode_common_observations.csv"
 cuda_policy_json="${output_dir}/cuda_decode_policy.json"
+# Paired planning, development freeze, sealed certification, and grouped
+# publication are consecutive views of one immutable CUDA policy transaction.
+# They must share the same content-addressed cache so a green planning fit is
+# replayed byte-for-byte instead of launching the full tournament again.
+cuda_fit_cache_dir="${output_dir}/cuda_paired_refinement/fit-cache"
 rocm_csv="${output_dir}/rocm_decode_sweep.csv"
 rocm_timing_csv="${output_dir}/rocm_decode_sweep.timing.csv"
 rocm_fast_csv="${output_dir}/rocm_decode_fast.csv"
@@ -2199,9 +2366,11 @@ rocm_frozen_policy_json="${output_dir}/rocm_decode_frozen_policy.json"
 rocm_policy_json="${output_dir}/rocm_decode_policy.json"
 rocm_summary="${output_dir}/rocm_decode_dispatch_summary.txt"
 rocm_common_csv="${output_dir}/rocm_decode_common_observations.csv"
+rocm_fast_development_common_csv="${output_dir}/rocm_decode_fast.development-common.csv"
 rocm_fast_common_csv="${output_dir}/rocm_decode_fast_common_observations.csv"
 rocm_verifier_common_csv="${output_dir}/rocm_decode_verifier_common_observations.csv"
 rocm_base_include="${repo_root}/src/v2/kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc"
+rocm_fit_cache_dir="${output_dir}/policy_fit_cache/rocm_decode"
 cpu_csv="${output_dir}/cpu_verifier_rows_sweep.csv"
 cpu_timing_csv="${output_dir}/cpu_verifier_rows_sweep.timing.csv"
 cpu_development_csv="${output_dir}/cpu_verifier_rows.development.csv"
@@ -2294,6 +2463,7 @@ cuda_final_profiler_raw="${output_dir}/cuda_final_profiler_raw"
 rocm_profiler_requests="${output_dir}/rocm_profiler_requests.json"
 rocm_profiler_evidence="${output_dir}/rocm_profiler_evidence.json"
 rocm_profiler_features="${output_dir}/rocm_profiler_features.csv"
+rocm_profiler_witnesses="${output_dir}/rocm_profiler_observation_witnesses.csv"
 rocm_profiler_raw="${output_dir}/rocm_profiler_raw"
 rocm_final_profiler_requests="${output_dir}/rocm_final_profiler_requests.json"
 rocm_final_profiler_evidence="${output_dir}/rocm_final_profiler_evidence.json"
@@ -2401,6 +2571,30 @@ collect_backend_profiler_evidence() {
       --output "${witness_table}"
   }
 
+  export_and_diagnose_profiler_features() {
+    local diagnostic_report="${feature_table%_features.csv}_signal_diagnostics.json"
+    run_cmd \
+      "PYTHONPATH=${profiler_python_root}" \
+      python3 -m native_vnni_dispatch.profiler_evidence \
+      export-features \
+      --observation "${witness_table}" \
+      --requests "${request_manifest}" \
+      --evidence "${evidence_manifest}" \
+      --output "${feature_table}"
+    # Fit admission uses the same normalized catalog as the learner. This
+    # catches candidate-invariant, incomplete, tied, or directionally broken
+    # profiler transactions before an expensive policy search starts.
+    run_cmd \
+      "PYTHONPATH=${profiler_python_root}" \
+      python3 -m native_vnni_dispatch.profiler_diagnostics \
+      --observation "${witness_table}" \
+      --requests "${request_manifest}" \
+      --evidence "${evidence_manifest}" \
+      --output "${diagnostic_report}" \
+      --require-meaningful-signal \
+      --quiet
+  }
+
   if (( reuse_this_evidence )); then
     local required_profiler_path
     if (( ! dry_run )); then
@@ -2417,14 +2611,7 @@ collect_backend_profiler_evidence() {
     # canonical observation digest, per-dispatch requests, and isolated
     # profiler evidence before any fit may consume the bundle.
     materialize_profiler_observation_witnesses reuse
-    run_cmd \
-      "PYTHONPATH=${profiler_python_root}" \
-      python3 -m native_vnni_dispatch.profiler_evidence \
-      export-features \
-      --observation "${witness_table}" \
-      --requests "${request_manifest}" \
-      --evidence "${evidence_manifest}" \
-      --output "${feature_table}"
+    export_and_diagnose_profiler_features
     return
   fi
 
@@ -2542,6 +2729,98 @@ collect_backend_profiler_evidence() {
       published_coverage_requests+=("${retained_request}")
     done
 
+    # A regenerated timing corpus can choose another representative row for
+    # the same physical launch. Its observation digest and derived request ID
+    # then change even though the already measured kernel invocation does not.
+    # Recover terminal journal members into immutable subset transactions
+    # before deriving the next delta. The recovery command preserves every
+    # original request/evidence record byte-for-byte and subtracts coverage by
+    # exact arithmetic/schedule/codebook/mode/M/N/K launch identity. Failed or
+    # missing journal members remain ordinary obligations for the new delta.
+    local partial_request
+    for partial_request in "${delta_request_candidates[@]}"; do
+      local partial_tag="${partial_request#${request_prefix}.delta-}"
+      partial_tag="${partial_tag%.requests.json}"
+      local partial_evidence="${evidence_prefix}.delta-${partial_tag}.evidence.json"
+      local partial_journal="${partial_evidence}.inprogress.jsonl"
+      local partial_observations="${request_prefix}.delta-${partial_tag}.observations.csv"
+      if [[ -s "${partial_evidence}" || ! -s "${partial_journal}" ]]; then
+        continue
+      fi
+      if [[ ! -s "${partial_observations}" ]]; then
+        echo "error: interrupted profiler delta has no timing observations: ${partial_request}" >&2
+        exit 2
+      fi
+
+      local recovered_prefix="${request_prefix}.recovered-${partial_tag}.inprogress"
+      local recovered_observations="${recovered_prefix}.observations.csv"
+      local recovered_requests="${recovered_prefix}.requests.json"
+      local recovered_evidence="${recovered_prefix}.evidence.json"
+      rm -f \
+        "${recovered_observations}" \
+        "${recovered_requests}" \
+        "${recovered_evidence}"
+      local -a recover_command=(
+        python3 -m native_vnni_dispatch.profiler_checkpoint
+        --source-observations "${partial_observations}"
+        --source-requests "${partial_request}"
+        --source-evidence "${partial_evidence}"
+        --output-observations "${recovered_observations}"
+        --output-requests "${recovered_requests}"
+        --output-evidence "${recovered_evidence}"
+      )
+      local covered_request
+      for covered_request in "${published_coverage_requests[@]}"; do
+        recover_command+=(--covered-requests "${covered_request}")
+      done
+      run_cmd "PYTHONPATH=${profiler_python_root}" "${recover_command[@]}"
+      if [[ ! -s "${recovered_requests}" ]]; then
+        rm -f \
+          "${recovered_observations}" \
+          "${recovered_requests}" \
+          "${recovered_evidence}"
+        continue
+      fi
+
+      local recovered_digest
+      recovered_digest="$(sha256sum "${recovered_requests}" | cut -d' ' -f1)"
+      local recovered_tag="${recovered_digest:0:16}"
+      local published_observations="${request_prefix}.delta-${recovered_tag}.observations.csv"
+      local published_requests="${request_prefix}.delta-${recovered_tag}.requests.json"
+      local published_evidence="${evidence_prefix}.delta-${recovered_tag}.evidence.json"
+      local published_witness="${witness_prefix}.delta-${recovered_tag}.csv"
+      if [[ -e "${published_observations}" ||
+            -e "${published_requests}" ||
+            -e "${published_evidence}" ]]; then
+        if ! cmp --silent "${recovered_observations}" "${published_observations}" ||
+           ! cmp --silent "${recovered_requests}" "${published_requests}" ||
+           ! cmp --silent "${recovered_evidence}" "${published_evidence}"; then
+          echo "error: recovered profiler delta identity collides with different contents" >&2
+          exit 2
+        fi
+        rm -f \
+          "${recovered_observations}" \
+          "${recovered_requests}" \
+          "${recovered_evidence}"
+      else
+        mv "${recovered_observations}" "${published_observations}"
+        mv "${recovered_requests}" "${published_requests}"
+        mv "${recovered_evidence}" "${published_evidence}"
+      fi
+      run_cmd \
+        "PYTHONPATH=${profiler_python_root}" \
+        python3 -m native_vnni_dispatch.profiler_evidence \
+        compact-witnesses \
+        --observation "${published_observations}" \
+        --requests "${published_requests}" \
+        --evidence "${published_evidence}" \
+        --output "${published_witness}"
+      retained_delta_requests+=("${published_requests}")
+      retained_delta_evidence+=("${published_evidence}")
+      retained_delta_witnesses+=("${published_witness}")
+      published_coverage_requests+=("${published_requests}")
+    done
+
     local delta_observations_inprogress="${request_manifest%.json}.delta.observations.inprogress.csv"
     local delta_requests_inprogress="${request_manifest%.json}.delta.requests.inprogress.json"
     rm -f "${delta_observations_inprogress}" "${delta_requests_inprogress}"
@@ -2564,14 +2843,7 @@ collect_backend_profiler_evidence() {
       # timing corpus. Publish recovered deltas before exporting features.
       if (( ${#retained_delta_requests[@]} == 0 )); then
         materialize_profiler_observation_witnesses reuse
-        run_cmd \
-          "PYTHONPATH=${profiler_python_root}" \
-          python3 -m native_vnni_dispatch.profiler_evidence \
-          export-features \
-          --observation "${witness_table}" \
-          --requests "${request_manifest}" \
-          --evidence "${evidence_manifest}" \
-          --output "${feature_table}"
+        export_and_diagnose_profiler_features
         return
       fi
       extending_profiler_transaction=1
@@ -2712,14 +2984,7 @@ collect_backend_profiler_evidence() {
   else
     materialize_profiler_observation_witnesses collect
   fi
-  run_cmd \
-    "PYTHONPATH=${profiler_python_root}" \
-    python3 -m native_vnni_dispatch.profiler_evidence \
-    export-features \
-    --observation "${witness_table}" \
-    --requests "${request_manifest}" \
-    --evidence "${evidence_manifest}" \
-    --output "${feature_table}"
+  export_and_diagnose_profiler_features
 }
 
 reuse_identical_backend_profiler_evidence() {
@@ -2772,6 +3037,76 @@ reuse_identical_backend_profiler_evidence() {
   run_cmd mv "${final_evidence_inprogress}" "${final_evidence}"
   run_cmd mv "${final_witnesses_inprogress}" "${final_witnesses}"
   run_cmd mv "${final_features_inprogress}" "${final_features}"
+}
+
+seed_backend_profiler_evidence_for_extension() {
+  local source_requests="$1"
+  local source_evidence="$2"
+  local source_features="$3"
+  local final_requests="$4"
+  local final_evidence="$5"
+  local final_features="$6"
+  local source_witnesses="${source_features%_features.csv}_observation_witnesses.csv"
+  local final_witnesses="${final_features%_features.csv}_observation_witnesses.csv"
+
+  # The generic collector can extend a complete exact-point transaction by
+  # deriving only physical launches absent from its retained request catalog.
+  # Seed the final combined surface with development evidence so opening the
+  # seal or adding grouped rows never pays for those M=1 counters again.
+  if (( ! dry_run )); then
+    local source_path
+    for source_path in \
+        "${source_requests}" "${source_evidence}" "${source_witnesses}"; do
+      if [[ ! -s "${source_path}" ]]; then
+        echo "error: profiler extension seed is incomplete: ${source_path}" >&2
+        exit 2
+      fi
+    done
+  fi
+
+  local existing=0
+  local final_path
+  for final_path in \
+      "${final_requests}" "${final_evidence}" "${final_witnesses}"; do
+    [[ -s "${final_path}" ]] && existing=$((existing + 1))
+  done
+  if (( existing == 3 )); then
+    return
+  fi
+  if (( existing != 0 )); then
+    local -a seed_sources=(
+      "${source_requests}" "${source_evidence}" "${source_witnesses}"
+    )
+    local -a seed_targets=(
+      "${final_requests}" "${final_evidence}" "${final_witnesses}"
+    )
+    local seed_index
+    for ((seed_index = 0; seed_index < 3; ++seed_index)); do
+      if [[ -s "${seed_targets[seed_index]}" ]] &&
+         ! cmp --silent \
+           "${seed_sources[seed_index]}" "${seed_targets[seed_index]}"; then
+        echo "error: profiler extension seed is partially published with non-seed contents" >&2
+        exit 2
+      fi
+    done
+  fi
+
+  local request_seed="${final_requests}.seed.inprogress"
+  local evidence_seed="${final_evidence}.seed.inprogress"
+  local witness_seed="${final_witnesses}.seed.inprogress"
+  run_cmd rm -f "${request_seed}" "${evidence_seed}" "${witness_seed}"
+  if [[ ! -s "${final_requests}" ]]; then
+    run_cmd cp --reflink=auto "${source_requests}" "${request_seed}"
+    run_cmd mv "${request_seed}" "${final_requests}"
+  fi
+  if [[ ! -s "${final_evidence}" ]]; then
+    run_cmd cp --reflink=auto "${source_evidence}" "${evidence_seed}"
+    run_cmd mv "${evidence_seed}" "${final_evidence}"
+  fi
+  if [[ ! -s "${final_witnesses}" ]]; then
+    run_cmd cp --reflink=auto "${source_witnesses}" "${witness_seed}"
+    run_cmd mv "${witness_seed}" "${final_witnesses}"
+  fi
 }
 
 compose_cpu_prefill_final_profiler_evidence() {
@@ -3951,15 +4286,27 @@ run_rocm_sweep_phase() {
   fi
 
   if (( rocm_measurement_lanes > 1 )); then
-    local -a lane_formats=()
+    # Every format must cover every shape, but formats are indivisible units.
+    # Partitioning 21 formats over four devices therefore produced a 6/5/5/5
+    # assignment and left three cards idle for the entire final format. Shapes
+    # are much finer-grained, so shard them instead and run the complete format
+    # matrix on every lane's disjoint geometry set. The Cartesian union remains
+    # identical while the slowest lane owns at most one extra shape.
+    local -a phase_shape_items=()
+    mapfile -t phase_shape_items < <(csv_values "${phase_shapes}")
+    local phase_lane_count="${rocm_measurement_lanes}"
+    if (( phase_lane_count > ${#phase_shape_items[@]} )); then
+      phase_lane_count="${#phase_shape_items[@]}"
+    fi
+    local -a lane_shapes=()
     partition_csv_values \
-      "${rocm_formats}" "${rocm_measurement_lanes}" lane_formats
+      "${phase_shapes}" "${phase_lane_count}" lane_shapes
     local -a partials=()
     local -a timing_partials=()
     local -a logs=()
     local -a pids=()
     local lane
-    for ((lane = 0; lane < rocm_measurement_lanes; ++lane)); do
+    for ((lane = 0; lane < phase_lane_count; ++lane)); do
       local partial="${output_dir}/rocm_decode_${phase}.lane${lane}.csv"
       local timing_partial="${output_dir}/rocm_decode_${phase}.lane${lane}.timing.csv"
       local log="${output_dir}/rocm_decode_${phase}.lane${lane}.log"
@@ -3969,8 +4316,8 @@ run_rocm_sweep_phase() {
       if (( dry_run )); then
         run_cmd \
           "ROCR_VISIBLE_DEVICES=${lane}" \
-          "LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=${lane_formats[${lane}]}" \
-          "LLAMINAR_ROCM_NVNNI_DECODE_SHAPES=${phase_shapes}" \
+          "LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=${rocm_formats}" \
+          "LLAMINAR_ROCM_NVNNI_DECODE_SHAPES=${lane_shapes[${lane}]}" \
           "LLAMINAR_ROCM_NVNNI_DECODE_M=${phase_m_values}" \
           "LLAMINAR_ROCM_NVNNI_DECODE_MAX_CASES=${rocm_max_cases}" \
           "LLAMINAR_ROCM_NVNNI_DECODE_VARIANTS=${rocm_variants}" \
@@ -3985,8 +4332,8 @@ run_rocm_sweep_phase() {
         (
           run_cmd \
             "ROCR_VISIBLE_DEVICES=${lane}" \
-            "LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=${lane_formats[${lane}]}" \
-            "LLAMINAR_ROCM_NVNNI_DECODE_SHAPES=${phase_shapes}" \
+            "LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=${rocm_formats}" \
+            "LLAMINAR_ROCM_NVNNI_DECODE_SHAPES=${lane_shapes[${lane}]}" \
             "LLAMINAR_ROCM_NVNNI_DECODE_M=${phase_m_values}" \
             "LLAMINAR_ROCM_NVNNI_DECODE_MAX_CASES=${rocm_max_cases}" \
             "LLAMINAR_ROCM_NVNNI_DECODE_VARIANTS=${rocm_variants}" \
@@ -4003,7 +4350,7 @@ run_rocm_sweep_phase() {
     done
     if (( ! dry_run )); then
       local failed=0
-      for ((lane = 0; lane < rocm_measurement_lanes; ++lane)); do
+      for ((lane = 0; lane < phase_lane_count; ++lane)); do
         if ! wait "${pids[${lane}]}"; then
           echo "error: ROCm measurement lane ${lane} failed; tail of ${logs[${lane}]}:" >&2
           tail -n 40 "${logs[${lane}]}" >&2 || true
@@ -4073,6 +4420,8 @@ run_cuda_paired_refinement() {
       --development-profiler-requests "${cuda_profiler_requests}"
       --development-profiler-evidence "${cuda_profiler_evidence}"
       --fit-cache-dir "${paired_dir}/fit-cache"
+      --max-leaves "${cuda_generic_max_leaves}"
+      --max-regret "${paired_max_regret_fraction}"
     )
     local dry_evidence
     for dry_evidence in "${cuda_paired_evidence[@]}"; do
@@ -4115,6 +4464,8 @@ run_cuda_paired_refinement() {
       --development-profiler-requests "${cuda_profiler_requests}"
       --development-profiler-evidence "${cuda_profiler_evidence}"
       --fit-cache-dir "${paired_dir}/fit-cache"
+      --max-leaves "${cuda_generic_max_leaves}"
+      --max-regret "${paired_max_regret_fraction}"
     )
     local path
     for path in "${cuda_paired_evidence[@]}"; do
@@ -4249,6 +4600,30 @@ destination.write_text(
 PY
 }
 
+write_cuda_measurement_context() {
+  local output_path="$1"
+  shift
+  if (( $# != 8 )); then
+    echo "error: CUDA measurement context requires exactly eight fields" >&2
+    exit 2
+  fi
+  local value
+  for value in "$@"; do
+    if [[ -z "${value}" || "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
+      echo "error: CUDA measurement context contains an invalid field" >&2
+      exit 2
+    fi
+  done
+  if (( dry_run )); then
+    printf 'dry-run: write_cuda_measurement_context %q\n' "${output_path}"
+    return
+  fi
+  local temporary_path="${output_path}.inprogress"
+  rm -f "${temporary_path}"
+  printf '%s\n' "$@" > "${temporary_path}"
+  mv -f "${temporary_path}" "${output_path}"
+}
+
 refresh_cuda() {
   begin_backend_collection_target "CUDA"
   require_executable "${cuda_sweep_bin}"
@@ -4329,7 +4704,7 @@ print(payload.get("schema_version", ""))
 PY
 )"
           if [[ "${canonical_profiler_schema}" == \
-                "native-vnni-profiler-request-v4-exact-point" ]]; then
+                "native-vnni-profiler-request-v5-stratified-exact-point" ]]; then
             cuda_exact_profiler_transaction=1
             printf 'Resuming current CUDA exact-point profiler transaction alongside retained v2 provenance\n'
           fi
@@ -4412,6 +4787,29 @@ PY
       # previous invocation stopped during profiler collection.
       if [[ -s "${cuda_reuse_common_source}" ]]; then
         cuda_reuse_context_source="${cuda_reuse_common_source}"
+      elif (( resume_cuda_after_m1_seal )); then
+        if [[ ! -s "${cuda_m1_sealed_context}" ]]; then
+          echo "error: CUDA development recovery is missing " \
+               "${cuda_m1_sealed_context}" >&2
+          exit 2
+        fi
+        local excluded_sealed_run_id
+        IFS= read -r excluded_sealed_run_id < "${cuda_m1_sealed_context}"
+        PYTHONPATH="${profiler_python_root}" \
+          python3 -m native_vnni_dispatch.cuda_resume \
+            --source "${cuda_m1_common_csv}" \
+            --output "${cuda_reuse_common_source}" \
+            --context-output "${context_fields}" \
+            --exclude-run-id "${excluded_sealed_run_id}"
+        cuda_reuse_context_source="${cuda_reuse_common_source}"
+      else
+        rm -f "${cuda_reuse_common_source}.inprogress"
+        cp --reflink=auto \
+          "${cuda_m1_common_csv}" "${cuda_reuse_common_source}.inprogress"
+        mv -f \
+          "${cuda_reuse_common_source}.inprogress" \
+          "${cuda_reuse_common_source}"
+        cuda_reuse_context_source="${cuda_reuse_common_source}"
       fi
       load_cuda_development_context \
         "${cuda_reuse_context_source}" "${context_fields}"
@@ -4430,14 +4828,53 @@ PY
       cuda_device_name="${retained_context[5]}"
       cuda_driver_runtime="${retained_context[6]}"
       cuda_serial_policy_hash="${retained_context[7]}"
-      if [[ ! -s "${cuda_reuse_common_source}" ]]; then
-        rm -f "${cuda_reuse_common_source}.inprogress"
-        cp --reflink=auto \
-          "${cuda_m1_common_csv}" "${cuda_reuse_common_source}.inprogress"
-        mv -f \
-          "${cuda_reuse_common_source}.inprogress" \
-          "${cuda_reuse_common_source}"
+    fi
+  fi
+  if (( resume_cuda_after_m1_seal )); then
+    if (( dry_run )); then
+      printf 'dry-run: load_cuda_measurement_context %q\n' \
+        "${cuda_m1_sealed_context}"
+      cuda_sealed_run_id="dry-run-retained-cuda-sealed"
+      cuda_sealed_git_revision="dry-run-retained-sealed-git-revision"
+      cuda_sealed_build_id="sha256:dry-run-retained-sealed-cuda-build"
+      cuda_sealed_compiler_id="dry-run-retained-sealed-nvcc"
+      cuda_sealed_arch_class="dry-run-retained-sealed-sm"
+      cuda_sealed_device_name="dry-run-retained-sealed-cuda-device"
+      cuda_sealed_driver_runtime="dry-run-retained-sealed-runtime"
+      cuda_sealed_serial_policy_hash="sha256:dry-run-retained-sealed-policy"
+    else
+      local required_sealed_path
+      for required_sealed_path in \
+          "${cuda_m1_sealed_csv}" \
+          "${cuda_m1_sealed_timing_csv}" \
+          "${cuda_m1_sealed_context}"; do
+        if [[ ! -s "${required_sealed_path}" ]]; then
+          echo "error: CUDA M1-seal resume is missing ${required_sealed_path}" >&2
+          exit 2
+        fi
+      done
+      local -a retained_sealed_context=()
+      mapfile -t retained_sealed_context < "${cuda_m1_sealed_context}"
+      if (( ${#retained_sealed_context[@]} != 8 )); then
+        echo "error: retained CUDA sealed context is incomplete" >&2
+        exit 2
       fi
+      local sealed_context_value
+      for sealed_context_value in "${retained_sealed_context[@]}"; do
+        if [[ -z "${sealed_context_value}" ||
+              "${sealed_context_value}" == *$'\r'* ]]; then
+          echo "error: retained CUDA sealed context contains an invalid field" >&2
+          exit 2
+        fi
+      done
+      cuda_sealed_run_id="${retained_sealed_context[0]}"
+      cuda_sealed_git_revision="${retained_sealed_context[1]}"
+      cuda_sealed_build_id="${retained_sealed_context[2]}"
+      cuda_sealed_compiler_id="${retained_sealed_context[3]}"
+      cuda_sealed_arch_class="${retained_sealed_context[4]}"
+      cuda_sealed_device_name="${retained_sealed_context[5]}"
+      cuda_sealed_driver_runtime="${retained_sealed_context[6]}"
+      cuda_sealed_serial_policy_hash="${retained_sealed_context[7]}"
     fi
   fi
 
@@ -4532,8 +4969,16 @@ PY
       --exact-only \
       --require-fast-m1-complete
 
+    local cuda_profiler_observation_source="${cuda_m1_common_csv}"
+    if (( reuse_cuda_development )); then
+      # Existing request IDs are cryptographic derivatives of the retained
+      # common observations. Compact their witnesses before the explicit
+      # current-schema migration audit below; the analyzer is allowed to
+      # regenerate the canonical current common corpus at the normal path.
+      cuda_profiler_observation_source="${cuda_reuse_common_source}"
+    fi
     collect_backend_profiler_evidence \
-      cuda "${cuda_m1_common_csv}" "${cuda_sweep_bin}" \
+      cuda "${cuda_profiler_observation_source}" "${cuda_sweep_bin}" \
       "${cuda_profiler_requests}" "${cuda_profiler_evidence}" \
       "${cuda_profiler_features}" "${cuda_profiler_raw}"
 
@@ -4547,8 +4992,9 @@ PY
             native_vnni_dispatch.common_observation_migration \
           --retained "${cuda_reuse_common_source}" \
           --replayed "${cuda_m1_common_csv}" \
-          --require-learner-transition
-        run_cmd rm -f "${cuda_reuse_common_source}"
+          --allow-current-schema-rebind \
+          --require-transition \
+          --finalize-retained-identity
       elif cmp --silent \
           "${cuda_reuse_common_source}" "${cuda_m1_common_csv}"; then
         printf '%s\n' \
@@ -4559,8 +5005,9 @@ PY
           python3 -m native_vnni_dispatch.common_observation_migration \
             --retained "${cuda_reuse_common_source}" \
             --replayed "${cuda_m1_common_csv}" \
-            --require-learner-transition
-        rm -f "${cuda_reuse_common_source}"
+            --allow-current-schema-rebind \
+            --require-transition \
+            --finalize-retained-identity
       fi
     fi
 
@@ -4594,6 +5041,8 @@ PY
       --measurement-plan "${gpu_measurement_plan_path}"
       --development-profiler-requests "${cuda_profiler_requests}"
       --development-profiler-evidence "${cuda_profiler_evidence}"
+      --fit-cache-dir "${cuda_fit_cache_dir}"
+      --generic-max-leaves "${cuda_generic_max_leaves}"
       --require-fast-m1-complete
     )
     if (( reuse_cuda_development )); then
@@ -4611,7 +5060,17 @@ PY
     # The sealed aggregate does not exist until the development-only policy has
     # been atomically published above. The certification process recomputes and
     # byte-validates that frozen artifact before it opens this sealed evidence.
-    if (( ! skip_sweep )); then
+    if (( ! skip_sweep && ! resume_cuda_after_m1_seal )); then
+      write_cuda_measurement_context \
+        "${cuda_m1_sealed_context}" \
+        "${cuda_sealed_run_id}" \
+        "${cuda_sealed_git_revision}" \
+        "${cuda_sealed_build_id}" \
+        "${cuda_sealed_compiler_id}" \
+        "${cuda_sealed_arch_class}" \
+        "${cuda_sealed_device_name}" \
+        "${cuda_sealed_driver_runtime}" \
+        "${cuda_sealed_serial_policy_hash}"
       run_cuda_sweep_phase \
         "m1-sealed" "1" \
         "${cuda_m1_sealed_csv}" \
@@ -4644,6 +5103,8 @@ PY
       --measurement-plan "${gpu_measurement_plan_path}"
       --development-profiler-requests "${cuda_profiler_requests}"
       --development-profiler-evidence "${cuda_profiler_evidence}"
+      --fit-cache-dir "${cuda_fit_cache_dir}"
+      --generic-max-leaves "${cuda_generic_max_leaves}"
       --require-fast-m1-complete
     )
     if (( reuse_cuda_development )); then
@@ -4743,6 +5204,7 @@ PY
       --measurement-plan "${gpu_measurement_plan_path}"
       --certified-m1-include "${cuda_m1_inc}"
       --certified-m1-policy-json "${cuda_m1_policy_json}"
+      --generic-max-leaves "${cuda_generic_max_leaves}"
       --require-complete
     )
     run_cmd "${cuda_final_compile[@]}"
@@ -4753,6 +5215,11 @@ PY
       python3 -m native_vnni_dispatch.policy_artifact \
       --policy-json "${cuda_m1_policy_json}" \
       --include "${cuda_m1_inc}"
+    seed_backend_profiler_evidence_for_extension \
+      "${cuda_profiler_requests}" "${cuda_profiler_evidence}" \
+      "${cuda_profiler_features}" \
+      "${cuda_final_profiler_requests}" "${cuda_final_profiler_evidence}" \
+      "${cuda_final_profiler_features}"
     collect_backend_profiler_evidence \
       cuda "${cuda_common_csv}" "${cuda_sweep_bin}" \
       "${cuda_final_profiler_requests}" "${cuda_final_profiler_evidence}" \
@@ -4821,7 +5288,7 @@ refresh_rocm() {
   begin_backend_collection_target "ROCm"
   require_executable "${rocm_decode_bin}"
   validate_rocm_measurement_devices
-  printf 'ROCm measurement lanes: %s disjoint format shard(s)\n' \
+  printf 'ROCm measurement lanes: %s parallel sweep lane(s)\n' \
     "${rocm_measurement_lanes}"
   local rocm_git_revision rocm_build_id rocm_compiler_id rocm_arch_class
   local rocm_device_name rocm_driver_runtime rocm_serial_policy_hash
@@ -4844,11 +5311,118 @@ refresh_rocm() {
       "${repo_root}/src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip" \
       "${repo_root}/src/v2/kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc")"
   fi
+  # A resumed development generation keeps the provenance of the executable
+  # that produced its canonical timings. The fresh sealed generation below is
+  # measured by the currently built trainer, so retain that identity before
+  # loading the immutable development context.
+  local rocm_sealed_run_id="${timestamp}-rocm-${profile}-fast-sealed"
+  local rocm_sealed_git_revision="${rocm_git_revision}"
+  local rocm_sealed_build_id="${rocm_build_id}"
+  local rocm_sealed_compiler_id="${rocm_compiler_id}"
+  local rocm_sealed_arch_class="${rocm_arch_class}"
+  local rocm_sealed_device_name="${rocm_device_name}"
+  local rocm_sealed_driver_runtime="${rocm_driver_runtime}"
+  local rocm_sealed_serial_policy_hash="${rocm_serial_policy_hash}"
+  local rocm_verifier_run_id="${timestamp}-rocm-${profile}-verifier"
+  local rocm_verifier_git_revision="${rocm_git_revision}"
+  local rocm_verifier_build_id="${rocm_build_id}"
+  local rocm_verifier_compiler_id="${rocm_compiler_id}"
+  local rocm_verifier_arch_class="${rocm_arch_class}"
+  local rocm_verifier_device_name="${rocm_device_name}"
+  local rocm_verifier_driver_runtime="${rocm_driver_runtime}"
+  local rocm_verifier_serial_policy_hash="${rocm_serial_policy_hash}"
+  local rocm_run_id="${timestamp}-rocm-${profile}-development"
+  if (( reuse_rocm_development )); then
+    local rocm_reuse_input
+    for rocm_reuse_input in \
+        "${rocm_fast_development_csv}" \
+        "${rocm_fast_development_timing_csv}" \
+        "${rocm_fast_development_common_csv}" \
+        "${rocm_profiler_requests}" \
+        "${rocm_profiler_evidence}"; do
+      if [[ ! -s "${rocm_reuse_input}" ]]; then
+        echo "error: reusable ROCm development corpus is missing ${rocm_reuse_input}" >&2
+        exit 2
+      fi
+    done
+    local -a rocm_development_provenance=()
+    mapfile -t rocm_development_provenance < <(
+      csv_unique_fields "${rocm_fast_development_common_csv}" \
+        run_id git_revision build_id compiler_id architecture_class \
+        device_name driver_runtime serial_m1_policy_hash
+    )
+    if (( ${#rocm_development_provenance[@]} != 8 )); then
+      echo "error: reusable ROCm development provenance is incomplete" >&2
+      exit 2
+    fi
+    rocm_run_id="${rocm_development_provenance[0]}"
+    rocm_git_revision="${rocm_development_provenance[1]}"
+    rocm_build_id="${rocm_development_provenance[2]}"
+    rocm_compiler_id="${rocm_development_provenance[3]}"
+    rocm_arch_class="${rocm_development_provenance[4]}"
+    rocm_device_name="${rocm_development_provenance[5]}"
+    rocm_driver_runtime="${rocm_development_provenance[6]}"
+    rocm_serial_policy_hash="${rocm_development_provenance[7]}"
+    printf 'Reusing authenticated ROCm development generation %s (%s)\n' \
+      "${rocm_run_id}" "${rocm_build_id}"
+    if (( skip_sweep )); then
+      local rocm_resume_input
+      for rocm_resume_input in \
+          "${rocm_fast_common_csv}" \
+          "${rocm_verifier_common_csv}"; do
+        if [[ ! -s "${rocm_resume_input}" ]]; then
+          echo "error: complete ROCm fit-only resume is missing ${rocm_resume_input}" >&2
+          exit 2
+        fi
+      done
+
+      local -a rocm_sealed_provenance=()
+      mapfile -t rocm_sealed_provenance < <(
+        csv_unique_fields_except "${rocm_fast_common_csv}" \
+          run_id "${rocm_run_id}" \
+          run_id git_revision build_id compiler_id architecture_class \
+          device_name driver_runtime serial_m1_policy_hash
+      )
+      if (( ${#rocm_sealed_provenance[@]} != 8 )); then
+        echo "error: reusable ROCm sealed provenance is incomplete" >&2
+        exit 2
+      fi
+      rocm_sealed_run_id="${rocm_sealed_provenance[0]}"
+      rocm_sealed_git_revision="${rocm_sealed_provenance[1]}"
+      rocm_sealed_build_id="${rocm_sealed_provenance[2]}"
+      rocm_sealed_compiler_id="${rocm_sealed_provenance[3]}"
+      rocm_sealed_arch_class="${rocm_sealed_provenance[4]}"
+      rocm_sealed_device_name="${rocm_sealed_provenance[5]}"
+      rocm_sealed_driver_runtime="${rocm_sealed_provenance[6]}"
+      rocm_sealed_serial_policy_hash="${rocm_sealed_provenance[7]}"
+
+      local -a rocm_verifier_provenance=()
+      mapfile -t rocm_verifier_provenance < <(
+        csv_unique_fields "${rocm_verifier_common_csv}" \
+          run_id git_revision build_id compiler_id architecture_class \
+          device_name driver_runtime serial_m1_policy_hash
+      )
+      if (( ${#rocm_verifier_provenance[@]} != 8 )); then
+        echo "error: reusable ROCm verifier provenance is incomplete" >&2
+        exit 2
+      fi
+      rocm_verifier_run_id="${rocm_verifier_provenance[0]}"
+      rocm_verifier_git_revision="${rocm_verifier_provenance[1]}"
+      rocm_verifier_build_id="${rocm_verifier_provenance[2]}"
+      rocm_verifier_compiler_id="${rocm_verifier_provenance[3]}"
+      rocm_verifier_arch_class="${rocm_verifier_provenance[4]}"
+      rocm_verifier_device_name="${rocm_verifier_provenance[5]}"
+      rocm_verifier_driver_runtime="${rocm_verifier_provenance[6]}"
+      rocm_verifier_serial_policy_hash="${rocm_verifier_provenance[7]}"
+      printf 'Reusing authenticated ROCm sealed and verifier generations %s / %s\n' \
+        "${rocm_sealed_run_id}" "${rocm_verifier_run_id}"
+    fi
+  fi
   local rocm_sweep_m_values="${m_values}"
   if (( partitioned_measurement )); then
     rocm_sweep_m_values="${partition_m_values}"
   fi
-  if (( ! skip_sweep )); then
+  if (( ! skip_sweep && ! reuse_rocm_development )); then
     if [[ "${measurement_profile}" == "production" ]] &&
        (( ! partitioned_measurement )); then
       # Fast M=1 and grouped verifier rows are distinct semantic contracts.
@@ -4873,38 +5447,56 @@ refresh_rocm() {
   fi
 
   if [[ "${measurement_profile}" == "production" ]]; then
-    local rocm_run_id="${timestamp}-rocm-${profile}-development"
-    run_cmd python3 "${rocm_generator}" \
-      --input "${rocm_fast_development_csv}" \
-      --timing-sidecar "${rocm_fast_development_timing_csv}" \
-      --output "${rocm_provisional_inc}" \
-      --common-observations "${rocm_fast_common_csv}" \
-      --adapt-only \
-      --profile production \
-      --run-id "${rocm_run_id}" \
-      --git-revision "${rocm_git_revision}" \
-      --build-id "${rocm_build_id}" \
-      --compiler-id "${rocm_compiler_id}" \
-      --architecture-class "${rocm_arch_class}" \
-      --device-name "${rocm_device_name}" \
-      --driver-runtime "${rocm_driver_runtime}" \
-      --serial-m1-policy-hash "${rocm_serial_policy_hash}" \
-      --shape-manifest "${shape_manifest_path}" \
-      --measurement-plan "${gpu_measurement_plan_path}"
-    collect_backend_profiler_evidence \
-      rocm "${rocm_fast_common_csv}" "${rocm_decode_bin}" \
-      "${rocm_profiler_requests}" "${rocm_profiler_evidence}" \
-      "${rocm_profiler_features}" "${rocm_profiler_raw}"
+    if (( reuse_rocm_development )); then
+      collect_backend_profiler_evidence \
+        rocm "${rocm_fast_development_common_csv}" "${rocm_decode_bin}" \
+        "${rocm_profiler_requests}" "${rocm_profiler_evidence}" \
+        "${rocm_profiler_features}" "${rocm_profiler_raw}" reuse
+    else
+      run_cmd python3 "${rocm_generator}" \
+        --input "${rocm_fast_development_csv}" \
+        --timing-sidecar "${rocm_fast_development_timing_csv}" \
+        --output "${rocm_provisional_inc}" \
+        --common-observations "${rocm_fast_development_common_csv}" \
+        --adapt-only \
+        --profile production \
+        --run-id "${rocm_run_id}" \
+        --git-revision "${rocm_git_revision}" \
+        --build-id "${rocm_build_id}" \
+        --compiler-id "${rocm_compiler_id}" \
+        --architecture-class "${rocm_arch_class}" \
+        --device-name "${rocm_device_name}" \
+        --driver-runtime "${rocm_driver_runtime}" \
+        --serial-m1-policy-hash "${rocm_serial_policy_hash}" \
+        --shape-manifest "${shape_manifest_path}" \
+        --measurement-plan "${gpu_measurement_plan_path}"
+      collect_backend_profiler_evidence \
+        rocm "${rocm_fast_development_common_csv}" "${rocm_decode_bin}" \
+        "${rocm_profiler_requests}" "${rocm_profiler_evidence}" \
+        "${rocm_profiler_features}" "${rocm_profiler_raw}"
+    fi
+
+    local -a rocm_development_audit_args=()
+    if (( reuse_rocm_development )); then
+      rocm_development_audit_args=(
+        --development-build-change-audit
+        "${rocm_development_build_change_audit}"
+      )
+    fi
 
     run_cmd python3 "${rocm_generator}" \
       --input "${rocm_fast_development_csv}" \
       --timing-sidecar "${rocm_fast_development_timing_csv}" \
       --output "${rocm_frozen_inc}" \
       --summary "${rocm_summary}" \
-      --common-observations "${rocm_fast_common_csv}" \
+      --common-observations "${rocm_fast_development_common_csv}" \
       --policy-json "${rocm_frozen_policy_json}" \
       --development-profiler-requests "${rocm_profiler_requests}" \
       --development-profiler-evidence "${rocm_profiler_evidence}" \
+      --development-profiler-observations "${rocm_profiler_witnesses}" \
+      --fit-cache-dir "${rocm_fit_cache_dir}" \
+      --generic-max-leaves "${rocm_generic_max_leaves}" \
+      "${rocm_development_audit_args[@]}" \
       --freeze-generic \
       --profile production \
       --run-id "${rocm_run_id}" \
@@ -4919,10 +5511,22 @@ refresh_rocm() {
       --measurement-plan "${gpu_measurement_plan_path}"
 
     if (( ! skip_sweep )); then
-      run_rocm_sweep_phase \
-        "fast-sealed" "1" \
-        "${rocm_fast_sealed_csv}" "${rocm_fast_sealed_timing_csv}" \
-        "${fast_sealed_shapes}"
+      if (( reuse_rocm_development )) &&
+         [[ -s "${rocm_fast_sealed_csv}" &&
+            -s "${rocm_fast_sealed_timing_csv}" ]]; then
+        # A failed fit may occur after every sealed lane has already completed.
+        # Keep that untouched holdout closed during the replacement fit and
+        # reopen the existing aggregate only in the certifier below, which
+        # authenticates its raw timings, exact inventory, and current sealed
+        # provenance before any row can influence installation.
+        printf 'Reusing existing ROCm Fast sealed aggregate %s\n' \
+          "${rocm_fast_sealed_csv}"
+      else
+        run_rocm_sweep_phase \
+          "fast-sealed" "1" \
+          "${rocm_fast_sealed_csv}" "${rocm_fast_sealed_timing_csv}" \
+          "${fast_sealed_shapes}"
+      fi
     else
       local rocm_fit_input
       for rocm_fit_input in \
@@ -4947,6 +5551,10 @@ refresh_rocm() {
       --policy-json "${rocm_policy_json}" \
       --development-profiler-requests "${rocm_profiler_requests}" \
       --development-profiler-evidence "${rocm_profiler_evidence}" \
+      --development-profiler-observations "${rocm_profiler_witnesses}" \
+      --fit-cache-dir "${rocm_fit_cache_dir}" \
+      --generic-max-leaves "${rocm_generic_max_leaves}" \
+      "${rocm_development_audit_args[@]}" \
       --output "${rocm_inc}" \
       --summary "${rocm_summary}" \
       --common-observations "${rocm_fast_common_csv}" \
@@ -4960,6 +5568,14 @@ refresh_rocm() {
       --device-name "${rocm_device_name}" \
       --driver-runtime "${rocm_driver_runtime}" \
       --serial-m1-policy-hash "${rocm_serial_policy_hash}" \
+      --sealed-run-id "${rocm_sealed_run_id}" \
+      --sealed-git-revision "${rocm_sealed_git_revision}" \
+      --sealed-build-id "${rocm_sealed_build_id}" \
+      --sealed-compiler-id "${rocm_sealed_compiler_id}" \
+      --sealed-architecture-class "${rocm_sealed_arch_class}" \
+      --sealed-device-name "${rocm_sealed_device_name}" \
+      --sealed-driver-runtime "${rocm_sealed_driver_runtime}" \
+      --sealed-serial-m1-policy-hash "${rocm_sealed_serial_policy_hash}" \
       --shape-manifest "${shape_manifest_path}" \
       --measurement-plan "${gpu_measurement_plan_path}"
     run_cmd python3 "${dispatch_validator}" "${rocm_inc}"
@@ -4993,6 +5609,10 @@ refresh_rocm() {
         "${repo_root}/src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip" \
         "${rocm_source_include}")"
     fi
+    if (( ! skip_sweep )); then
+      rocm_verifier_build_id="${rocm_staged_build_id}"
+      rocm_verifier_serial_policy_hash="${rocm_staged_serial_policy_hash}"
+    fi
 
     if (( ! skip_sweep )); then
       run_rocm_sweep_phase \
@@ -5008,14 +5628,14 @@ refresh_rocm() {
       --certified-policy-include "${rocm_source_include}" \
       --certified-policy-json "${rocm_policy_json}" \
       --profile production \
-      --run-id "${timestamp}-rocm-${profile}-verifier" \
-      --git-revision "${rocm_git_revision}" \
-      --build-id "${rocm_staged_build_id}" \
-      --compiler-id "${rocm_compiler_id}" \
-      --architecture-class "${rocm_arch_class}" \
-      --device-name "${rocm_device_name}" \
-      --driver-runtime "${rocm_driver_runtime}" \
-      --serial-m1-policy-hash "${rocm_staged_serial_policy_hash}" \
+      --run-id "${rocm_verifier_run_id}" \
+      --git-revision "${rocm_verifier_git_revision}" \
+      --build-id "${rocm_verifier_build_id}" \
+      --compiler-id "${rocm_verifier_compiler_id}" \
+      --architecture-class "${rocm_verifier_arch_class}" \
+      --device-name "${rocm_verifier_device_name}" \
+      --driver-runtime "${rocm_verifier_driver_runtime}" \
+      --serial-m1-policy-hash "${rocm_verifier_serial_policy_hash}" \
       --shape-manifest "${shape_manifest_path}" \
       --measurement-plan "${gpu_measurement_plan_path}"
     run_cmd cmp --silent "${rocm_source_include}" "${rocm_inc}"
@@ -5033,6 +5653,11 @@ refresh_rocm() {
     combine_csvs \
       "${rocm_common_csv}" \
       "${rocm_fast_common_csv}" "${rocm_verifier_common_csv}"
+    seed_backend_profiler_evidence_for_extension \
+      "${rocm_profiler_requests}" "${rocm_profiler_evidence}" \
+      "${rocm_profiler_features}" \
+      "${rocm_final_profiler_requests}" "${rocm_final_profiler_evidence}" \
+      "${rocm_final_profiler_features}"
     collect_backend_profiler_evidence \
       rocm "${rocm_common_csv}" "${rocm_decode_bin}" \
       "${rocm_final_profiler_requests}" "${rocm_final_profiler_evidence}" \
@@ -5606,7 +6231,7 @@ run_cpu_grouped_paired_refinement() {
       --development-profiler-evidence "${cpu_profiler_evidence}"
       --development-profiler-observations "${common_observations}"
       --max-leaves "${cpu_grouped_max_leaves}"
-      --max-regret "${cpu_grouped_paired_max_regret_fraction}"
+      --max-regret "${paired_max_regret_fraction}"
     )
     local burned_index
     for burned_index in "${!cpu_grouped_burned_sealed_plans[@]}"; do
@@ -6209,10 +6834,6 @@ authenticate_completed_cpu_decode() {
 
 refresh_cpu() {
   begin_backend_collection_target "CPU grouped verifier"
-  if [[ "${measurement_profile}" == "production" ||
-        "${measurement_profile}" == "partial-production" ]]; then
-    require_cpu_performance_governor
-  fi
   require_executable "${cpu_avx2_sweep_bin}"
   require_executable "${cpu_avx512_sweep_bin}"
   local cpu_git_revision cpu_build_id cpu_compiler_id cpu_arch_class
@@ -6234,6 +6855,13 @@ refresh_cpu() {
   if (( resume_after_cpu_decode )); then
     authenticate_completed_cpu_decode
   elif [[ "${shape_partition}" != verifier-* ]]; then
+    # Validate the timing environment immediately before the first operation
+    # that can collect evidence.  Resume-contract authentication below must be
+    # able to reject stale state without requiring a production-tuned host.
+    if [[ "${measurement_profile}" == "production" ||
+          "${measurement_profile}" == "partial-production" ]]; then
+      require_cpu_performance_governor
+    fi
     refresh_cpu_decode \
       "${cpu_git_revision}" "${cpu_build_id}" "${cpu_compiler_id}" \
       "${cpu_arch_class}" "${cpu_device_name}" "${cpu_driver_runtime}" \
@@ -6346,6 +6974,11 @@ refresh_cpu() {
       printf '%s\n' "${cpu_contract_digest}" > "${cpu_contract_path}.inprogress"
       mv "${cpu_contract_path}.inprogress" "${cpu_contract_path}"
     fi
+  fi
+  if (( ! skip_sweep )) &&
+     [[ "${measurement_profile}" == "production" ||
+        "${measurement_profile}" == "partial-production" ]]; then
+    require_cpu_performance_governor
   fi
   if (( ! skip_sweep )); then
     local partials=()
@@ -8546,13 +9179,6 @@ refresh_cpu_prefill() {
         "${cpu_prefill_final_profiler_raw}" \
         auto
     fi
-    if (( install )); then
-      local cpu_prefill_install_target="${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIPrefillPolicyGenerated.inc"
-      run_cmd cp "${cpu_prefill_inc}" \
-        "${cpu_prefill_install_target}.inprogress"
-      run_cmd mv "${cpu_prefill_install_target}.inprogress" \
-        "${cpu_prefill_install_target}"
-    fi
     finish_backend_collection_target
     return
   fi
@@ -8585,10 +9211,6 @@ refresh_cpu_prefill() {
     cpu "${cpu_prefill_common_csv}" "${cpu_avx2_sweep_bin}" \
     "${cpu_prefill_profiler_requests}" "${cpu_prefill_profiler_evidence}" \
     "${cpu_prefill_profiler_features}" "${cpu_prefill_profiler_raw}"
-  if (( install )); then
-    run_cmd cp "${cpu_prefill_inc}" \
-      "${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIPrefillPolicyGenerated.inc"
-  fi
   finish_backend_collection_target
 }
 
@@ -8613,7 +9235,6 @@ case "${backend}" in
     refresh_cuda
     refresh_rocm
     refresh_cpu
-    refresh_cpu_prefill
     ;;
 esac
 

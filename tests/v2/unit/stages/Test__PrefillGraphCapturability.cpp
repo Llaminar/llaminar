@@ -23,6 +23,7 @@
 #include "tensors/TensorKernels.h"
 #include "kernels/IMoEKernel.h"
 #include "mocks/MockComputeStage.h"
+#include "../../mocks/MockBackend.h"
 #include "mocks/MockLocalTPContext.h"
 #include "utils/TestTensorFactory.h"
 #include "utils/DebugEnv.h"
@@ -206,8 +207,17 @@ namespace
             MoEDecodeDescriptorSource::RuntimePlacementTable;
 
         bool supports_device(int) const override { return true; }
-        bool route(const float *, const float *, int, int, int, int, bool,
-                   MoERoutingResult &) override
+        bool routeWithTensors(
+            ITensor *,
+            ITensor *,
+            int,
+            int,
+            int,
+            int,
+            bool,
+            ITensor *,
+            ITensor *,
+            MoERoutingResult &) override
         {
             return false;
         }
@@ -328,6 +338,15 @@ namespace
         bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
         {
             out = runtimeDesc(0x71000000u, desc_n_, desc_k_);
+            return true;
+        }
+        bool canReleaseSourceWeightTensor() const override
+        {
+            /*
+             * This descriptor-only test engine owns no TensorBase view. Marking
+             * that fact explicitly exercises the same lifetime contract used by
+             * independently packed production GEMM engines.
+             */
             return true;
         }
 
@@ -646,6 +665,9 @@ protected:
     static constexpr int SEQ_LEN = 16;
     static constexpr int INTERMEDIATE = 128;
 
+    // Declared before the tensors so the simulated backend outlives every
+    // allocation that refers to it during fixture teardown.
+    test::MockBackend backend_{DeviceType::ROCm};
     std::unique_ptr<FP32Tensor> input_;
     std::unique_ptr<FP32Tensor> output_;
     std::unique_ptr<FP32Tensor> routing_indices_;
@@ -655,13 +677,23 @@ protected:
     std::vector<ITensorGemm *> gate_gemm_ptrs_;
     std::vector<ITensorGemm *> up_gemm_ptrs_;
     std::vector<ITensorGemm *> down_gemm_ptrs_;
+    void *execution_stream_ = nullptr;
 
     void SetUp() override
     {
+        execution_stream_ = backend_.createStream(0);
+        ASSERT_NE(execution_stream_, nullptr);
+
         input_ = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
         output_ = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
         routing_indices_ = TestTensorFactory::createFP32({SEQ_LEN * TOP_K, 1});
         routing_weights_ = TestTensorFactory::createFP32({SEQ_LEN * TOP_K, 1});
+
+        // The execute-based warmup tests publish output completion. Give the
+        // tensor physically consistent, host-backed simulated ROCm storage so
+        // publication remains event-backed without performing real GPU work.
+        output_->setBackendForTesting(&backend_);
+        ASSERT_TRUE(output_->allocateOnDevice(DeviceId::rocm(0)));
 
         // Create stub GEMM engines for all experts (gate, up, down × num_experts)
         stub_gemms_.resize(static_cast<size_t>(NUM_EXPERTS * 3));
@@ -677,6 +709,15 @@ protected:
             gate_gemm_ptrs_[static_cast<size_t>(e)] = &stub_gemms_[static_cast<size_t>(e * 3 + 0)];
             up_gemm_ptrs_[static_cast<size_t>(e)] = &stub_gemms_[static_cast<size_t>(e * 3 + 1)];
             down_gemm_ptrs_[static_cast<size_t>(e)] = &stub_gemms_[static_cast<size_t>(e * 3 + 2)];
+        }
+    }
+
+    void TearDown() override
+    {
+        if (execution_stream_)
+        {
+            backend_.destroyStream(execution_stream_, 0);
+            execution_stream_ = nullptr;
         }
     }
 
@@ -789,7 +830,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithPartialExpertOwnership)
         << "Should reject when not all experts are locally owned";
 }
 
-TEST_F(MoEExpertPrefillGraphCapture, ForcedDecodeReplayFixedTopologyRequiresFullOwnership)
+TEST_F(MoEExpertPrefillGraphCapture, ForcedDecodeReplaySupportsPublishedPartialOwnershipMask)
 {
     ScopedMoEGraphCaptureFlags flags(true, true);
 
@@ -809,11 +850,18 @@ TEST_F(MoEExpertPrefillGraphCapture, ForcedDecodeReplayFixedTopologyRequiresFull
 
         auto partial_params = full_params;
         partial_params.local_expert_count = NUM_EXPERTS - 1;
+        partial_params.expert_mask = {true, true, true, false};
+        partial_params.prepared_gate_gemm[3] = nullptr;
+        partial_params.prepared_up_gemm[3] = nullptr;
+        partial_params.prepared_down_gemm[3] = nullptr;
         MoEExpertComputeStage partial_stage(partial_params);
         partial_stage.setMoEKernelForTesting(&stub_kernel_);
-        EXPECT_FALSE(partial_stage.usesFixedTopologyGroupedVerifierReplayForTesting())
-            << backend_name << " LocalTP partial expert ownership must not claim the "
-            << "full-ownership fixed descriptor-table verifier replay path";
+        EXPECT_EQ(
+            partial_stage.usesFixedTopologyGroupedVerifierReplayForTesting(),
+            backend_supported)
+            << backend_name
+            << " partial ownership must use the same economical grouped "
+               "descriptor route with a graph-published local expert mask";
     };
 
 #if defined(HAVE_CUDA)
@@ -829,7 +877,7 @@ TEST_F(MoEExpertPrefillGraphCapture, ForcedDecodeReplayFixedTopologyRequiresFull
 #endif
 }
 
-TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyCapturableWithLocalEnginesOnly)
+TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyRequiresPublishedDeviceMask)
 {
     ScopedMoEGraphCaptureFlags flags(true, true);
 
@@ -846,11 +894,107 @@ TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyCapturableWithLocalEngin
 
 #if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
-    EXPECT_TRUE(stage.isGraphCapturable())
-        << "Masked LocalTP prefill should capture when local expert engines are ready";
+    EXPECT_FALSE(stage.hasPublishedFixedTopologyMaskForTesting());
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "Static masked LocalTP prefill must warm and publish its owner mask "
+           "before graph capture can consume the backend-owned device slot";
+    EXPECT_NE(stage.graphCaptureReadinessDebugString().find(
+                  "fixed_mask_publication=needs_publication"),
+              std::string::npos);
 #else
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_FALSE(stage.isGraphCapturable());
+#endif
+}
+
+TEST_F(MoEExpertPrefillGraphCapture, RuntimeGroupedLLEPDoesNotRequireUnusedFixedMaskPublication)
+{
+    ScopedMoEGraphCaptureFlags flags(true, true);
+
+    const auto expect_runtime_table_is_authoritative =
+        [&](DeviceId device, const char *backend_name)
+    {
+        MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+        auto params = makeValidPrefillParams();
+        params.device_id = device;
+        params.layer_idx = 0;
+        params.expert_mask = {true, false, true, false};
+        params.prepared_gate_gemm[1] = nullptr;
+        params.prepared_up_gemm[1] = nullptr;
+        params.prepared_down_gemm[1] = nullptr;
+        params.prepared_gate_gemm[3] = nullptr;
+        params.prepared_up_gemm[3] = nullptr;
+        params.prepared_down_gemm[3] = nullptr;
+        params.moe_runtime_table = &runtime_table;
+        params.use_runtime_prefill_grouping = true;
+        params.routed_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
+
+        MoEExpertComputeStage stage(params);
+        stage.setMoEKernelForTesting(&stub_kernel_);
+
+        /*
+         * Model the already allocated device-resident prefill workspace without
+         * allocating GPU memory in a unit test.  The production predicate checks
+         * every stable pointer and capacity below on each capture boundary.
+         */
+        int32_t route_expert_ids = 0;
+        float route_weights = 0.0f;
+        int32_t route_participant_ids = 0;
+        int32_t expert_counts = 0;
+        int32_t expert_offsets = 0;
+        int32_t grouped_token_ids = 0;
+        float grouped_route_weights = 0.0f;
+        int32_t llep_split_ends = 0;
+        least_loaded_ep::LeastLoadedExpertAssignmentSpan assignment_span{};
+        least_loaded_ep::LeastLoadedExpertWeightTransfer weight_transfer{};
+        auto &runtime_state = runtime_table.hostLayerState(0);
+        runtime_state.prefill_token_capacity =
+            static_cast<uint32_t>(params.seq_len);
+        runtime_state.prefill_route_capacity =
+            static_cast<uint32_t>(params.seq_len * params.top_k);
+        runtime_state.route_expert_ids = &route_expert_ids;
+        runtime_state.route_weights = &route_weights;
+        runtime_state.route_participant_ids = &route_participant_ids;
+        runtime_state.expert_counts = &expert_counts;
+        runtime_state.expert_offsets = &expert_offsets;
+        runtime_state.grouped_token_ids = &grouped_token_ids;
+        runtime_state.grouped_route_weights = &grouped_route_weights;
+        runtime_state.reserved_ptrs[0] = &llep_split_ends;
+        runtime_state.reserved_ptrs[1] = &assignment_span;
+        runtime_state.reserved_ptrs[2] = &weight_transfer;
+        runtime_state.reserved_u64[0] =
+            static_cast<uint64_t>(NUM_EXPERTS) *
+            kDeviceMoEMaxParticipants;
+        runtime_state.reserved_u64[1] = runtime_state.reserved_u64[0];
+        stage.setRuntimePrefillGroupingAvailableForTesting(true);
+
+        ASSERT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight())
+            << backend_name;
+        EXPECT_FALSE(stage.hasPublishedFixedTopologyMaskForTesting())
+            << backend_name
+            << " runtime-table grouping must not publish the unused static owner mask";
+        EXPECT_TRUE(stage.isGraphCapturable())
+            << backend_name
+            << " warmed LLEP runtime table is the sole placement source and must be "
+               "capture-ready without an unrelated fixed-mask publication";
+        const std::string readiness = stage.graphCaptureReadinessDebugString();
+        EXPECT_NE(readiness.find("route=runtime_table_prefill"), std::string::npos)
+            << backend_name;
+        EXPECT_NE(readiness.find("fixed_mask_consumed=false"), std::string::npos)
+            << backend_name;
+        EXPECT_NE(readiness.find("runtime_prefill_ready=true"), std::string::npos)
+            << backend_name;
+    };
+
+#if defined(HAVE_CUDA)
+    expect_runtime_table_is_authoritative(DeviceId::cuda(0), "CUDA");
+#endif
+#if defined(HAVE_ROCM)
+    expect_runtime_table_is_authoritative(DeviceId::rocm(0), "ROCm");
+#endif
+#if !defined(HAVE_CUDA) && !defined(HAVE_ROCM)
+    GTEST_SKIP() << "GPU graph capture is not compiled in this build";
 #endif
 }
 
@@ -1119,6 +1263,7 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndF
 
     MoEExpertComputeStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
+    stage.setGPUStream(execution_stream_);
     stage.releaseRawExpertWeights();
     MockDeviceContext ctx(params.device_id, ComputeBackendType::GPU_ROCM);
 
@@ -1138,6 +1283,8 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndF
     EXPECT_TRUE(stage.isGraphCapturable())
         << "After the first warmup token, cached graph capture should be armed "
            "without requiring a fallback decode step.";
+    EXPECT_FALSE(backend_.getEventRecordsForStream(execution_stream_).empty())
+        << "GPU output publication must record completion on the executor-provided stream.";
 #else
     GTEST_SKIP() << "ROCm graph-capture path is not compiled in this build";
 #endif
@@ -1166,6 +1313,7 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankWith
 
     MoEExpertComputeStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
+    stage.setGPUStream(execution_stream_);
     stage.releaseRawExpertWeights();
     stage.setReplicaSet(replicas, /*socket_id=*/0);
     MockDeviceContext ctx(params.device_id, ComputeBackendType::GPU_ROCM);
@@ -1178,6 +1326,8 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankWith
     EXPECT_TRUE(stage.isGraphCapturable())
         << "Replica-aware runtime-table metadata should make the warmed decode "
            "stage graph-capturable.";
+    EXPECT_FALSE(backend_.getEventRecordsForStream(execution_stream_).empty())
+        << "Replica-aware output publication must retain the exact producer stream.";
 
     const auto &state = runtime_table.hostLayerState(0);
     ASSERT_LT(state.active_bank, 2u);

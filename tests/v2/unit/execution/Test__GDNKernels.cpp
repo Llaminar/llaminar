@@ -16,6 +16,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include <gmock/gmock.h>
 #include <algorithm>
 #include <array>
@@ -2153,6 +2154,8 @@ TEST(Test__GDNKernels, Recurrence_GPUDeinterleaveRequiresBoundWorkspaceBeforeKer
 
     GDNRecurrenceStage stage(p);
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+    int stream_token = 0;
+    stage.setGPUStream(&stream_token);
 
     EXPECT_FALSE(stage.execute(&ctx))
         << "Graph-stage GPU deinterleave must require the declared workspace buffer "
@@ -3060,6 +3063,8 @@ TEST(Test__GDNKernels, Recurrence_DeviceOwnedGPUStateDoesNotRequireHostPointer)
         p.kernel = &kernel;
 
         GDNRecurrenceStage stage(p);
+        int stream_token = 0;
+        stage.setGPUStream(&stream_token);
         llaminar2::testing::MockDeviceContext ctx(device, backend);
         EXPECT_TRUE(stage.execute(&ctx)) << "device=" << device.toString();
     }
@@ -3831,7 +3836,7 @@ TEST(Test__GDNKernels, ROCmMergedQKVDeinterleaveUsesModularQKTiling)
     ASSERT_EQ(d_k_out, d_scratch + q_dst_dim);
     ASSERT_EQ(d_v_out, d_scratch + q_dst_dim + k_dst_dim);
 
-    scratch->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    TransferEngine::publishGraphOwnedDeviceWrite(scratch, device);
     ASSERT_TRUE(scratch->ensureOnHost(stream));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
@@ -3955,7 +3960,7 @@ TEST(Test__GDNKernels, ROCmSequentialDecodeMatchesCPUReferenceQwen36Shape)
             /*use_qk_l2norm=*/true));
     }
 
-    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    TransferEngine::publishGraphOwnedDeviceWrite(output, device);
     ASSERT_TRUE(output->ensureOnHost(stream));
     std::vector<float> device_state(state_elems, 0.0f);
     ASSERT_TRUE(kernel.exportState(device_state.data(), nullptr, stream));
@@ -4067,7 +4072,7 @@ TEST(Test__GDNKernels, ROCmPrefillThenDecodeMatchesCPUReferenceQwen36DenseShape)
             /*use_qk_l2norm=*/true));
     }
 
-    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    TransferEngine::publishGraphOwnedDeviceWrite(output, device);
     ASSERT_TRUE(output->ensureOnHost(stream));
     std::vector<float> device_state(state_elems, 0.0f);
     ASSERT_TRUE(kernel.exportState(device_state.data(), nullptr, stream));
@@ -4197,8 +4202,8 @@ TEST(Test__GDNKernels, ROCmPrefillMatchesSequentialDecodeQwen35Shape)
             /*use_qk_l2norm=*/true));
     }
 
-    prefill_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-    decode_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    TransferEngine::publishGraphOwnedDeviceWrite(prefill_out, device);
+    TransferEngine::publishGraphOwnedDeviceWrite(decode_out, device);
     ASSERT_TRUE(prefill_out->ensureOnHost(stream.get()));
     ASSERT_TRUE(decode_out->ensureOnHost(stream.get()));
     ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
@@ -4345,9 +4350,9 @@ TEST(Test__GDNKernels, ROCmChunkForwardFromNonZeroStateMatchesSequentialDecodeQw
             /*use_qk_l2norm=*/true));
     }
 
-    suffix_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-    next_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-    ref_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    TransferEngine::publishGraphOwnedDeviceWrite(suffix_out, device);
+    TransferEngine::publishGraphOwnedDeviceWrite(next_out, device);
+    TransferEngine::publishGraphOwnedDeviceWrite(ref_out, device);
     ASSERT_TRUE(suffix_out->ensureOnHost(stream.get()));
     ASSERT_TRUE(next_out->ensureOnHost(stream.get()));
     ASSERT_TRUE(ref_out->ensureOnHost(stream.get()));
@@ -4490,8 +4495,8 @@ TEST(Test__GDNKernels, ROCmPaddedGDNRealLengthStateMatchesUnpaddedDecodeAcrossRe
             n_heads, d_k, d_v,
             /*use_qk_l2norm=*/true));
 
-        padded_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-        ref_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        TransferEngine::publishGraphOwnedDeviceWrite(padded_out, device);
+        TransferEngine::publishGraphOwnedDeviceWrite(ref_out, device);
         ASSERT_TRUE(padded_out->ensureOnHost(stream.get()));
         ASSERT_TRUE(ref_out->ensureOnHost(stream.get()));
         ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
@@ -4590,8 +4595,8 @@ TEST(Test__GDNKernels, ROCmPaddedShortConvRealLengthStateMatchesUnpaddedDecodeAc
             1, channels, kernel_size,
             /*apply_silu=*/true));
 
-        padded_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-        ref_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        TransferEngine::publishGraphOwnedDeviceWrite(padded_out, device);
+        TransferEngine::publishGraphOwnedDeviceWrite(ref_out, device);
         ASSERT_TRUE(padded_out->ensureOnHost(stream.get()));
         ASSERT_TRUE(ref_out->ensureOnHost(stream.get()));
         ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
@@ -4691,9 +4696,9 @@ TEST(Test__GDNKernels, ROCmShortConvChunkForwardFromNonZeroStateMatchesSequentia
             /*apply_silu=*/true));
     }
 
-    suffix_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-    next_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-    ref_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    TransferEngine::publishGraphOwnedDeviceWrite(suffix_out, device);
+    TransferEngine::publishGraphOwnedDeviceWrite(next_out, device);
+    TransferEngine::publishGraphOwnedDeviceWrite(ref_out, device);
     ASSERT_TRUE(suffix_out->ensureOnHost(stream.get()));
     ASSERT_TRUE(next_out->ensureOnHost(stream.get()));
     ASSERT_TRUE(ref_out->ensureOnHost(stream.get()));
@@ -4723,6 +4728,7 @@ TEST(Test__GDNKernels, ROCmProjectionDecodeAllNativeCodebooksMatchesReference)
 
     const DeviceId device = DeviceId::rocm(0);
     ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    ScopedROCmIntegrationStream stream;
 
     ScopedEnvVar concurrent_decode("LLAMINAR_ROCM_CONCURRENT_DECODE");
     ScopedEnvVar gdn_concurrent_decode("LLAMINAR_ROCM_GDN_CONCURRENT_DECODE");
@@ -4764,6 +4770,7 @@ TEST(Test__GDNKernels, ROCmProjectionDecodeAllNativeCodebooksMatchesReference)
                 << fmt.name << ": native-VNNI payload missing for projection " << projection;
 
             bundle->kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(&bundle->packed, 0);
+            bundle->kernel->setGPUStream(stream.get());
             combined_requirements.merge(bundle->kernel->getWorkspaceRequirements(M, rows, K));
             bundles[projection] = std::move(bundle);
         }
@@ -4781,7 +4788,7 @@ TEST(Test__GDNKernels, ROCmProjectionDecodeAllNativeCodebooksMatchesReference)
         auto out_a = test::TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(n_a)});
         auto out_b = test::TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(n_b)});
 
-        ASSERT_TRUE(input->ensureOnDevice(device));
+        ASSERT_TRUE(input->ensureOnDevice(device, stream.get()));
         ASSERT_TRUE(out_qkv->allocateOnDevice(device));
         ASSERT_TRUE(out_z->allocateOnDevice(device));
         ASSERT_TRUE(out_a->allocateOnDevice(device));
@@ -4797,12 +4804,12 @@ TEST(Test__GDNKernels, ROCmProjectionDecodeAllNativeCodebooksMatchesReference)
         ASSERT_TRUE(bundles[0]->kernel->multiply_fused_tensor(
             input.get(), projections, M, K, nullptr, &workspace))
             << fmt.name << ": fused GDN projection failed";
-        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
 
-        out_qkv->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-        out_z->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-        out_a->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-        out_b->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        TransferEngine::publishGraphOwnedDeviceWrite(out_qkv, device);
+        TransferEngine::publishGraphOwnedDeviceWrite(out_z, device);
+        TransferEngine::publishGraphOwnedDeviceWrite(out_a, device);
+        TransferEngine::publishGraphOwnedDeviceWrite(out_b, device);
 
         const float *input_host = input->data();
         std::vector<float> expected;

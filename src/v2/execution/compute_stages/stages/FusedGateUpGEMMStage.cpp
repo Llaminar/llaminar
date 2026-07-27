@@ -8,6 +8,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/GemmContext.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -17,16 +18,6 @@
 
 namespace llaminar2
 {
-    namespace
-    {
-        void markGpuTensorWritten(TensorBase *output, DeviceId device, void *stream)
-        {
-            if (!output || !device.is_gpu())
-                return;
-            output->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
-        }
-    }
-
     // =============================================================================
     // FusedGateUpGEMMStage Implementation
     // =============================================================================
@@ -301,8 +292,9 @@ namespace llaminar2
         {
             if (is_gpu)
             {
-                markGpuTensorWritten(output_gate, params_.device_id, stream);
-                markGpuTensorWritten(output_up, params_.device_id, stream);
+                const StageGPUExecution gpu = gpuExecution();
+                gpu.publish(output_gate);
+                gpu.publish(output_up);
             }
             PerfStatsCollector::addCounter(
                 "mtp",
@@ -503,11 +495,17 @@ namespace llaminar2
             .addInput(*params_.input_buffer_id)
             .addOutput(*params_.output_gate_buffer_id)
             .addOutput(*params_.output_up_buffer_id);
-        // Model weights are not arena-managed
+        // Gate/up kernels consume store-owned prepared representations.
         if (params_.w_gate)
-            contract.addWeight(const_cast<ITensor *>(params_.w_gate));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.w_gate),
+                params_.prepared_store,
+                params_.prepared_ref_gate.value_or(PreparedWeightRef{}));
         if (params_.w_up)
-            contract.addWeight(const_cast<ITensor *>(params_.w_up));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.w_up),
+                params_.prepared_store,
+                params_.prepared_ref_up.value_or(PreparedWeightRef{}));
         if (params_.bias_gate)
             contract.addWeight(const_cast<ITensor *>(static_cast<const ITensor *>(params_.bias_gate)));
         if (params_.bias_up)

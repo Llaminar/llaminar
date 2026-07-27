@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "loaders/PreparedWeightStore.h"
+#include "tensors/TensorSlice.h"
 #include "tensors/Tensors.h"
 #include "../../utils/PreparedWeightTestHarness.h"
 
@@ -42,6 +43,16 @@ namespace
         }
 
         return std::make_unique<Q8_0Tensor>(std::vector<size_t>{rows, cols}, std::move(raw_data));
+    }
+
+    PreparedEmbeddingHandle makeEmbeddingHandle(TensorBase *tensor, DeviceId device)
+    {
+        PreparedEmbeddingHandle handle;
+        handle.tensor = tensor;
+        handle.device_id = device;
+        handle.weights = std::make_shared<PreparedEmbeddingWeights>();
+        handle.weights->device_id = device;
+        return handle;
     }
 }
 
@@ -141,6 +152,31 @@ TEST(Test__PreparedWeightStore, ResolvesPreparedRefByBindingAndDevice)
     EXPECT_EQ(resolved->binding_id, ref.binding_id);
     EXPECT_EQ(resolved->kind, PreparedWeightKind::RocmInt8PackedGemm);
     EXPECT_FALSE(store.preparedRefForBinding(binding.binding_id, DeviceId::rocm(1)).has_value());
+}
+
+TEST(Test__PreparedWeightStore, SameBindingIdRetainsDistinctGemmEntriesPerDevice)
+{
+    PreparedWeightStore store(ModelContextId{99});
+    auto cuda0_tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto cuda1_tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+
+    auto cuda0_binding = makeStoreBinding(12, "blk.0.ffn_gate.weight", DeviceId::cuda(0));
+    cuda0_binding.tensor = cuda0_tensor.get();
+    auto cuda1_binding = makeStoreBinding(12, "blk.0.ffn_gate.weight", DeviceId::cuda(1));
+    cuda1_binding.tensor = cuda1_tensor.get();
+
+    const auto cuda0_ref = store.registerPreparedForTest(
+        cuda0_binding, PreparedWeightKind::CudaInt8PackedGemm, DeviceId::cuda(0));
+    const auto cuda1_ref = store.registerPreparedForTest(
+        cuda1_binding, PreparedWeightKind::CudaInt8PackedGemm, DeviceId::cuda(1));
+
+    EXPECT_EQ(store.size(), 2u);
+    EXPECT_TRUE(store.contains(cuda0_ref));
+    EXPECT_TRUE(store.contains(cuda1_ref));
+    ASSERT_TRUE(store.binding(cuda0_ref).has_value());
+    ASSERT_TRUE(store.binding(cuda1_ref).has_value());
+    EXPECT_EQ(store.binding(cuda0_ref)->tensor, cuda0_tensor.get());
+    EXPECT_EQ(store.binding(cuda1_ref)->tensor, cuda1_tensor.get());
 }
 
 TEST(Test__PreparedWeightStore, RegistersOwnedPipelineHandleByBinding)
@@ -340,8 +376,9 @@ TEST(Test__PreparedWeightStore, ResolvesPreparedEmbeddingRefsByBinding)
     binding.identity.role = WeightRole::Embedding;
     binding.tensor = tensor.get();
 
+    auto handle = makeEmbeddingHandle(tensor.get(), DeviceId::cuda(0));
     auto ref = store.registerPreparedEmbeddingFromPipeline(
-        binding, DeviceId::cuda(0), nullptr);
+        binding, DeviceId::cuda(0), &handle);
 
     EXPECT_EQ(ref.kind, PreparedWeightKind::PreparedEmbedding);
     EXPECT_TRUE(store.contains(ref));
@@ -353,6 +390,79 @@ TEST(Test__PreparedWeightStore, ResolvesPreparedEmbeddingRefsByBinding)
     auto stored = store.binding(ref);
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ(stored->identity.role, WeightRole::Embedding);
+}
+
+TEST(Test__PreparedWeightStore, SameBindingIdRetainsDistinctEmbeddingEntriesPerDevice)
+{
+    PreparedWeightStore store(ModelContextId{99});
+    auto cuda0_tensor = makeQ8_0Tensor(64, 96);
+    auto cuda1_tensor = makeQ8_0Tensor(64, 96);
+
+    auto cuda0_binding = makeStoreBinding(15, "token_embd.weight", DeviceId::cuda(0));
+    cuda0_binding.identity.role = WeightRole::Embedding;
+    cuda0_binding.tensor = cuda0_tensor.get();
+    auto cuda1_binding = makeStoreBinding(15, "token_embd.weight", DeviceId::cuda(1));
+    cuda1_binding.identity.role = WeightRole::Embedding;
+    cuda1_binding.tensor = cuda1_tensor.get();
+
+    auto cuda0_handle = makeEmbeddingHandle(cuda0_tensor.get(), DeviceId::cuda(0));
+    auto cuda1_handle = makeEmbeddingHandle(cuda1_tensor.get(), DeviceId::cuda(1));
+    const auto cuda0_ref = store.registerPreparedEmbeddingFromPipeline(
+        cuda0_binding, DeviceId::cuda(0), &cuda0_handle);
+    const auto cuda1_ref = store.registerPreparedEmbeddingFromPipeline(
+        cuda1_binding, DeviceId::cuda(1), &cuda1_handle);
+
+    EXPECT_TRUE(store.contains(cuda0_ref));
+    EXPECT_TRUE(store.contains(cuda1_ref));
+    ASSERT_NE(store.embeddingHandle(cuda0_ref), nullptr);
+    ASSERT_NE(store.embeddingHandle(cuda1_ref), nullptr);
+    EXPECT_NE(store.embeddingHandle(cuda0_ref), store.embeddingHandle(cuda1_ref));
+    EXPECT_EQ(store.embeddingHandle(cuda0_ref)->device_id, DeviceId::cuda(0));
+    EXPECT_EQ(store.embeddingHandle(cuda1_ref)->device_id, DeviceId::cuda(1));
+}
+
+TEST(Test__PreparedWeightStore, PreparedEmbeddingPublicationDelegatesThroughTensorSlice)
+{
+    PreparedWeightStore store(ModelContextId{99});
+    auto inner = std::shared_ptr<TensorBase>(makeQ8_0Tensor(64, 96).release());
+    TensorSlice slice(
+        inner,
+        SliceMetadata::forRowParallel(64, 96, 0, 1, true));
+    auto binding = makeStoreBinding(16, "token_embd.weight", DeviceId::cuda(0));
+    binding.identity.role = WeightRole::Embedding;
+    binding.tensor = &slice;
+    auto handle = makeEmbeddingHandle(&slice, DeviceId::cuda(0));
+
+    ASSERT_FALSE(inner->hasPreparedDeviceState());
+    ASSERT_FALSE(slice.hasPreparedDeviceState());
+    store.registerPreparedEmbeddingFromPipeline(binding, DeviceId::cuda(0), &handle);
+
+    EXPECT_TRUE(inner->hasPreparedDeviceState());
+    EXPECT_TRUE(slice.hasPreparedDeviceState());
+}
+
+TEST(Test__PreparedWeightStore, RejectsInvalidPreparedEmbeddingIdentity)
+{
+    PreparedWeightStore store(ModelContextId{99});
+    auto tensor = makeQ8_0Tensor(64, 96);
+    auto other = makeQ8_0Tensor(64, 96);
+    auto binding = makeStoreBinding(17, "token_embd.weight", DeviceId::cuda(0));
+    binding.identity.role = WeightRole::Embedding;
+    binding.tensor = tensor.get();
+
+    EXPECT_THROW(
+        store.registerPreparedEmbeddingFromPipeline(binding, DeviceId::cuda(0), nullptr),
+        std::runtime_error);
+
+    auto wrong_tensor = makeEmbeddingHandle(other.get(), DeviceId::cuda(0));
+    EXPECT_THROW(
+        store.registerPreparedEmbeddingFromPipeline(binding, DeviceId::cuda(0), &wrong_tensor),
+        std::runtime_error);
+
+    auto wrong_device = makeEmbeddingHandle(tensor.get(), DeviceId::cuda(1));
+    EXPECT_THROW(
+        store.registerPreparedEmbeddingFromPipeline(binding, DeviceId::cuda(0), &wrong_device),
+        std::runtime_error);
 }
 
 TEST(Test__PreparedWeightStore, ResolvesSlicedGemmKernelByPreparedRef)

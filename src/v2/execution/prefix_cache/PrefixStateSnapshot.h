@@ -3,6 +3,7 @@
 #include "backends/DeviceId.h"
 #include "execution/prefix_cache/PrefixStorageBackend.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -25,6 +26,42 @@ namespace llaminar2
 
     const char *toString(PrefixStateProvenance provenance);
     bool isDecodeEquivalent(PrefixStateProvenance provenance);
+
+    /**
+     * @brief Opaque device-owned checkpoint of one KV cache sequence.
+     *
+     * The checkpoint contains backend-private canonical ring metadata, never
+     * KV payload bytes and never a host mirror. @ref cache_depth identifies
+     * the primary cache with -1 and shifted MTP cache N with N. The allocation
+     * is retained through shared ownership so an asynchronous capture cannot
+     * outlive or race reuse of its pool slot.
+     */
+    struct DeviceKVSequenceStateCheckpoint
+    {
+        int cache_depth = -1;
+        int sequence_index = -1;
+        int metadata_layer_count = 0;
+        size_t bytes = 0;
+        DeviceId device = DeviceId::invalid();
+        std::shared_ptr<void> storage;
+        std::shared_ptr<void> ready_event;
+
+        void *data() const
+        {
+            return storage.get();
+        }
+
+        bool valid() const
+        {
+            return cache_depth >= -1 &&
+                   sequence_index >= 0 &&
+                   metadata_layer_count > 0 &&
+                   bytes > 0 &&
+                   device.is_gpu() &&
+                   storage != nullptr &&
+                   ready_event != nullptr;
+        }
+    };
 
     struct PrefixLookupResult
     {
@@ -73,6 +110,8 @@ namespace llaminar2
         PrefixStateProvenance provenance = PrefixStateProvenance::Unknown;
         int cached_tokens = 0;
         std::vector<int> mtp_cached_tokens;
+        std::vector<DeviceKVSequenceStateCheckpoint>
+            device_sequence_state_checkpoints;
         std::vector<PrefixBlockHandle> blocks;
         std::vector<PrefixBlockHandle> mtp_blocks;
         std::vector<PrefixStateSnapshot> participant_snapshots;
@@ -104,6 +143,8 @@ namespace llaminar2
             swap(provenance, other.provenance);
             swap(cached_tokens, other.cached_tokens);
             mtp_cached_tokens.swap(other.mtp_cached_tokens);
+            device_sequence_state_checkpoints.swap(
+                other.device_sequence_state_checkpoints);
             blocks.swap(other.blocks);
             mtp_blocks.swap(other.mtp_blocks);
             participant_snapshots.swap(other.participant_snapshots);

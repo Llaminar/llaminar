@@ -243,6 +243,34 @@ namespace llaminar2
         TensorType native_type() const override { return inner()->native_type(); }
         const std::vector<size_t> &shape() const override { return inner()->shape(); }
         DeviceId home_device() const override { return inner()->home_device(); }
+        std::optional<DeviceId> current_device() const override
+        {
+            return inner()->current_device();
+        }
+        TensorBase *transferStorageOwner() override
+        {
+            return inner()->transferStorageOwner();
+        }
+        const TensorBase *transferStorageOwner() const override
+        {
+            return inner()->transferStorageOwner();
+        }
+        std::optional<DeviceId> getAuthoritativeDevice() const override
+        {
+            return inner()->getAuthoritativeDevice();
+        }
+        TensorCoherenceState coherenceState() const override
+        {
+            return inner()->coherenceState();
+        }
+        MemoryResidency memoryResidency() const override
+        {
+            return inner()->memoryResidency();
+        }
+        bool hasPreparedDeviceState() const override
+        {
+            return inner()->hasPreparedDeviceState();
+        }
         bool is_on_device(DeviceId device) const override { return inner()->is_on_device(device); }
         const float *data() const override { return inner()->data(); }
         float *mutable_data() override { return inner()->mutable_data(); }
@@ -257,6 +285,11 @@ namespace llaminar2
         size_t size_bytes() const override { return inner()->byte_size(); }
 
     protected:
+        void publishPreparedDeviceState() override
+        {
+            inner()->publishPreparedDeviceState();
+        }
+
         /**
          * @brief Get raw host data pointer for GPU transfer
          *
@@ -309,17 +342,35 @@ namespace llaminar2
             return inner()->ensureOnHost(stream);
         }
 
-        void mark_host_dirty() override
+    private:
+        void publishHostWriteState() override
         {
-            inner()->mark_host_dirty();
+            inner()->publishHostWriteState();
         }
 
-        void transitionTo(TensorCoherenceState new_state,
-                          std::optional<DeviceId> authoritative_dev = std::nullopt) override
+        void publishGraphOwnedDeviceWriteState(DeviceId device) override
         {
-            inner()->transitionTo(new_state, authoritative_dev);
+            inner()->publishGraphOwnedDeviceWriteState(device);
         }
 
+        void publishSynchronizedState() override
+        {
+            inner()->publishSynchronizedState();
+        }
+
+        void publishCompletedDeviceWriteState(DeviceId device) override
+        {
+            inner()->publishCompletedDeviceWriteState(device);
+        }
+
+        void publishDeviceWriteStateWithEvent(
+            DeviceId device,
+            void *stream) override
+        {
+            inner()->publishDeviceWriteStateWithEvent(device, stream);
+        }
+
+    public:
         bool isHostValid() const override
         {
             return inner()->isHostValid();

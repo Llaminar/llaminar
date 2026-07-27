@@ -9,6 +9,7 @@
 #include "../../utils/DebugEnv.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorVerification.h"
+#include "../../transfer/TransferEngine.h"
 #include "../../utils/Logger.h"
 #include "../../kernels/KernelFactory.h"
 #include <chrono>
@@ -16,6 +17,68 @@
 
 namespace llaminar2
 {
+
+    StageGPUExecution::StageGPUExecution(DeviceId device, void *stream)
+        : device_(device), stream_(stream)
+    {
+        if (!device_.is_gpu())
+        {
+            throw std::invalid_argument(
+                "StageGPUExecution requires a GPU device");
+        }
+        if (!stream_)
+        {
+            throw std::invalid_argument(
+                "StageGPUExecution requires the executor-bound non-null stream");
+        }
+    }
+
+    void StageGPUExecution::prepareInput(ITensor *tensor) const
+    {
+        TransferEngine::prepareDeviceInput(tensor, device_, stream_);
+    }
+
+    void StageGPUExecution::prepareOutput(ITensor *tensor) const
+    {
+        TransferEngine::prepareDeviceOutput(tensor, device_, stream_);
+    }
+
+    void StageGPUExecution::requirePreparedInput(ITensor *tensor) const
+    {
+        TransferEngine::requireDeviceInput(tensor, device_, stream_);
+    }
+
+    void StageGPUExecution::requirePreparedOutput(ITensor *tensor) const
+    {
+        if (!tensor)
+        {
+            throw std::invalid_argument(
+                "StageGPUExecution::requirePreparedOutput requires a tensor");
+        }
+
+        const auto *base = dynamic_cast<const TensorBase *>(tensor);
+        const auto current_device =
+            base ? base->current_device() : std::optional<DeviceId>{};
+        if (!base ||
+            !base->gpu_data_ptr() ||
+            !current_device.has_value() ||
+            *current_device != device_)
+        {
+            throw std::runtime_error(
+                "Stage output storage was not prepared on executor-bound device " +
+                device_.to_string());
+        }
+    }
+
+    void StageGPUExecution::publish(ITensor *tensor) const
+    {
+        if (!tensor)
+        {
+            throw std::invalid_argument(
+                "StageGPUExecution::publish requires a tensor");
+        }
+        TransferEngine::publishDeviceWrite(tensor, device_, stream_);
+    }
 
     // =============================================================================
     // Default Layout Expectation (Phase 3: Tensor Layout Contracts)
@@ -78,8 +141,6 @@ namespace llaminar2
             return "MOE_SHARED_EXPERT_GATE";
         case ComputeStageType::MOE_EXPERT_DISPATCH:
             return "MOE_EXPERT_DISPATCH";
-        case ComputeStageType::MOE_ROUTED_EXPERT_PARTIAL_REDUCE:
-            return "MOE_ROUTED_EXPERT_PARTIAL_REDUCE";
         case ComputeStageType::MOE_SPARSE_DISPATCH:
             return "MOE_SPARSE_DISPATCH";
         case ComputeStageType::MOE_LOCAL_EXPERT:

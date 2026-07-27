@@ -35,11 +35,11 @@ from native_vnni_dispatch.adapters.rocm_decode import (  # noqa: E402
     raw_corpus_id,
 )
 from native_vnni_dispatch.candidate_observation import (  # noqa: E402
-    read_observation_csv,
     write_observation_csv,
 )
 from native_vnni_dispatch.candidate_registry import (  # noqa: E402
     candidate_registry_digest,
+    rocm_native_vnni_decode_formula_registry,
     rocm_native_vnni_decode_registry,
 )
 from native_vnni_dispatch.certification import CertificationReport  # noqa: E402
@@ -67,6 +67,9 @@ from native_vnni_dispatch.measurement_plan import (  # noqa: E402
     load_gpu_measurement_plan,
 )
 from native_vnni_dispatch.profiles import MeasurementProfile  # noqa: E402
+from native_vnni_dispatch.rocm_shape_resolved import (  # noqa: E402
+    project_rocm_shape_resolved_candidates,
+)
 from native_vnni_dispatch.profiler_model import (  # noqa: E402
     ProfilerFeatureCatalog,
     load_profiler_feature_catalog,
@@ -84,7 +87,9 @@ from native_vnni_dispatch.schema import (  # noqa: E402
     SemanticContract,
 )
 from native_vnni_dispatch.segmented_policy import (  # noqa: E402
+    DEFAULT_TREE_LEAVES,
     GenericDispatchRule,
+    PolicyFitCache,
     fit_generic_policy,
 )
 from native_vnni_dispatch.shape_manifest import (  # noqa: E402
@@ -143,16 +148,34 @@ def _mode_robust_policy_corpus(corpus: ObservationCorpus) -> ObservationCorpus:
 
     if not corpus.distinguishes_execution_mode:
         return corpus
-    return ObservationCorpus(
+    return ObservationCorpus._from_validated(
         corpus.observations,
+        distinguish_execution_mode=False,
+        revalidate_candidate_identities=False,
+    )
+
+
+def _generic_policy_corpus(corpus: ObservationCorpus) -> ObservationCorpus:
+    """Project total ROCm KB formulas directly into the collapsed mode ABI.
+
+    Formula projection already creates a new immutable corpus. Asking that
+    constructor to build the public mode-collapsed indices avoids immediately
+    scanning the trainer-scale projected rows a second time.
+    """
+
+    return project_rocm_shape_resolved_candidates(
+        corpus,
         distinguish_execution_mode=False,
     )
 
 
 def _candidate_kb(candidate_id: str) -> int:
-    """Resolve one common Fast candidate and return its effective KB."""
+    """Resolve one concrete or shape-clamped Fast policy's requested KB."""
 
-    candidate = rocm_native_vnni_decode_registry().resolve(candidate_id)
+    try:
+        candidate = rocm_native_vnni_decode_registry().resolve(candidate_id)
+    except ValueError:
+        candidate = rocm_native_vnni_decode_formula_registry().resolve(candidate_id)
     if not candidate.supports_contract(SemanticContract.FAST):
         raise ValueError(f"{candidate_id} is not a Fast ROCm decode candidate")
     return int(candidate.config_json["kb"])
@@ -221,7 +244,7 @@ def select_fast_generic_rules(
 ) -> list[GenericDispatchRule]:
     """Fit the shared bounded regret learner and retain Fast M=1 domains."""
 
-    policy_corpus = _mode_robust_policy_corpus(corpus)
+    policy_corpus = _generic_policy_corpus(corpus)
     generic = fit_generic_policy(
         policy_corpus,
         serial_m1_hashes=_serial_hashes(policy_corpus, serial_m1_policy_hash),
@@ -244,7 +267,14 @@ def _fast_m1_corpus(corpus: ObservationCorpus) -> ObservationCorpus:
     )
     if not rows:
         raise ValueError("ROCm policy transaction contains no Fast M=1 evidence")
-    return ObservationCorpus(rows)
+    if len(rows) == len(corpus.observations):
+        return corpus
+    return ObservationCorpus._from_validated(
+        rows,
+        distinguish_execution_mode=corpus.distinguishes_execution_mode,
+        distinguish_aspect_bucket=corpus.distinguishes_aspect_bucket,
+        revalidate_candidate_identities=False,
+    )
 
 
 def _fast_partition_surfaces(
@@ -367,6 +397,9 @@ def freeze_fast_policy(
     manifest: NativeVNNIShapeManifest,
     measurement_plan: NativeVNNIGPUMeasurementPlan,
     profiler_feature_catalog: ProfilerFeatureCatalog,
+    development_build_change_audit: str | None = None,
+    fit_cache_directory: Path | None = None,
+    generic_max_leaves: int = DEFAULT_TREE_LEAVES,
 ) -> FrozenPolicy:
     """Fit mode-robust ROCm Fast rules without receiving sealed rows."""
 
@@ -376,21 +409,32 @@ def freeze_fast_policy(
         measurement_plan,
         ShapePartition.DEVELOPMENT,
     )
-    development = _mode_robust_policy_corpus(direct)
+    development = _generic_policy_corpus(direct)
+    metadata = {
+        "backend": "rocm",
+        "semantic_contract": SemanticContract.FAST.value,
+        "shape_manifest_schema": manifest.schema_version,
+        "shape_manifest_digest": manifest.digest(),
+        "measurement_plan_schema": measurement_plan.schema_version,
+        "measurement_plan_digest": measurement_plan.digest(manifest),
+        "execution_mode_policy": "alias_robust_collapsed",
+    }
+    if development_build_change_audit is not None:
+        metadata["development_build_change_audit"] = (
+            development_build_change_audit.strip()
+        )
     return freeze_policy(
         development,
         sealed_commitment=_fast_sealed_commitment(manifest, measurement_plan),
         split_manifest_digest=measurement_plan.digest(manifest),
         profiler_feature_catalog=profiler_feature_catalog,
-        metadata={
-            "backend": "rocm",
-            "semantic_contract": SemanticContract.FAST.value,
-            "shape_manifest_schema": manifest.schema_version,
-            "shape_manifest_digest": manifest.digest(),
-            "measurement_plan_schema": measurement_plan.schema_version,
-            "measurement_plan_digest": measurement_plan.digest(manifest),
-            "execution_mode_policy": "alias_robust_collapsed",
-        },
+        max_leaves=generic_max_leaves,
+        fit_cache=(
+            PolicyFitCache(directory=fit_cache_directory)
+            if fit_cache_directory is not None
+            else None
+        ),
+        metadata=metadata,
     )
 
 
@@ -403,13 +447,13 @@ def certify_fast_policy(
 ) -> CompiledPolicy:
     """Open ROCm sealed rows and certify the already-frozen generic IR."""
 
-    development = _mode_robust_policy_corpus(_require_fast_partition(
+    development = _generic_policy_corpus(_require_fast_partition(
         development_corpus,
         manifest,
         measurement_plan,
         ShapePartition.DEVELOPMENT,
     ))
-    sealed = _mode_robust_policy_corpus(_require_fast_partition(
+    sealed = _generic_policy_corpus(_require_fast_partition(
         sealed_corpus,
         manifest,
         measurement_plan,
@@ -816,15 +860,29 @@ def _strip_existing_overlay(text: str) -> str:
 
 
 def _base_generic_codebooks(text: str) -> frozenset[int]:
-    """Return codebooks already totalized by the base aspect selector."""
+    """Return codebooks already totalized by either generated base ABI.
+
+    Older partial-profile artifacts placed their generic rules in a separate
+    aspect selector. Certified common-policy artifacts place them after the
+    exact tables in the sole generated selector. Additive exact-overlay refresh
+    must understand both layouts so installing the modern target state does not
+    make a later overlay transaction depend on the retired fallback function.
+    """
 
     begin = text.find(
         "inline bool selectROCmNativeVNNIDecodeAspectFallback("
     )
-    end = text.find(
-        "inline bool selectROCmNativeVNNIDecodeGenerated(",
-        begin,
-    )
+    if begin >= 0:
+        end = text.find(
+            "inline bool selectROCmNativeVNNIDecodeGenerated(",
+            begin,
+        )
+    else:
+        selector = text.find(
+            "inline bool selectROCmNativeVNNIDecodeGenerated("
+        )
+        begin = text.find("    if (m != 1)", selector)
+        end = text.find("    return false;\n}", begin)
     if begin < 0 or end < 0:
         raise ValueError("base include lacks the ROCm generic selector surface")
     return frozenset(
@@ -1051,6 +1109,7 @@ def _context_from_args(
     timing_sidecars: tuple[Path, ...],
     *,
     run_id: str | None = None,
+    sealed: bool = False,
 ) -> ROCmDecodeAdapterContext:
     """Build conspicuous smoke provenance or strict installable provenance."""
 
@@ -1058,17 +1117,25 @@ def _context_from_args(
     profile = MeasurementProfile(args.profile)
     if not profile.installable:
         return ROCmDecodeAdapterContext.workflow_smoke(corpus_id=corpus_id)
+    prefix = "sealed_" if sealed else ""
+
+    def provenance(name: str) -> str:
+        """Read one complete sealed override or the development default."""
+
+        value = getattr(args, prefix + name, None)
+        return value if value is not None else getattr(args, name)
+
     return ROCmDecodeAdapterContext(
         profile=profile,
-        run_id=run_id or args.run_id,
+        run_id=run_id or provenance("run_id"),
         corpus_id=corpus_id,
-        git_revision=args.git_revision,
-        build_id=args.build_id,
-        compiler_id=args.compiler_id,
-        architecture_class=args.architecture_class,
-        device_name=args.device_name,
-        driver_runtime=args.driver_runtime,
-        serial_m1_policy_hash=args.serial_m1_policy_hash,
+        git_revision=provenance("git_revision"),
+        build_id=provenance("build_id"),
+        compiler_id=provenance("compiler_id"),
+        architecture_class=provenance("architecture_class"),
+        device_name=provenance("device_name"),
+        driver_runtime=provenance("driver_runtime"),
+        serial_m1_policy_hash=provenance("serial_m1_policy_hash"),
         raw_timing_sidecar_retained=bool(timing_sidecars),
     )
 
@@ -1104,6 +1171,24 @@ def main() -> int:
     parser.add_argument("--development-profiler-requests", type=Path)
     parser.add_argument("--development-profiler-evidence", type=Path)
     parser.add_argument(
+        "--fit-cache-dir",
+        type=Path,
+        help="Persistent content-addressed candidate-cost and CV cache",
+    )
+    parser.add_argument(
+        "--generic-max-leaves",
+        type=int,
+        default=DEFAULT_TREE_LEAVES,
+        help="Maximum leaves in each ROCm Fast generic dispatch tree",
+    )
+    parser.add_argument(
+        "--development-build-change-audit",
+        help=(
+            "Reviewed explanation for profiling retained development rows "
+            "with a harness-only rebuilt executable"
+        ),
+    )
+    parser.add_argument(
         "--development-profiler-observations",
         type=Path,
         help="Original common CSV bound to reusable profiler sidecars",
@@ -1131,6 +1216,14 @@ def main() -> int:
     parser.add_argument("--device-name", default="")
     parser.add_argument("--driver-runtime", default="")
     parser.add_argument("--serial-m1-policy-hash", default="")
+    parser.add_argument("--sealed-run-id")
+    parser.add_argument("--sealed-git-revision")
+    parser.add_argument("--sealed-build-id")
+    parser.add_argument("--sealed-compiler-id")
+    parser.add_argument("--sealed-architecture-class")
+    parser.add_argument("--sealed-device-name")
+    parser.add_argument("--sealed-driver-runtime")
+    parser.add_argument("--sealed-serial-m1-policy-hash")
     parser.add_argument(
         "--shape-manifest",
         type=Path,
@@ -1144,6 +1237,8 @@ def main() -> int:
         help="Reviewed bounded and backend-scoped GPU timing plan",
     )
     args = parser.parse_args()
+    if not 1 <= args.generic_max_leaves <= 32:
+        parser.error("--generic-max-leaves must be in [1, 32]")
 
     positional = tuple(args.inputs)
     optional = tuple(args.input_options or ())
@@ -1157,6 +1252,26 @@ def main() -> int:
         )
     if args.freeze_generic and args.certify_generic:
         parser.error("--freeze-generic and --certify-generic are mutually exclusive")
+    if (
+        args.development_build_change_audit is not None
+        and not args.development_build_change_audit.strip()
+    ):
+        parser.error("--development-build-change-audit must not be empty")
+    sealed_provenance = (
+        args.sealed_run_id,
+        args.sealed_git_revision,
+        args.sealed_build_id,
+        args.sealed_compiler_id,
+        args.sealed_architecture_class,
+        args.sealed_device_name,
+        args.sealed_driver_runtime,
+        args.sealed_serial_m1_policy_hash,
+    )
+    if any(value is not None for value in sealed_provenance):
+        if not args.certify_generic:
+            parser.error("sealed provenance overrides require --certify-generic")
+        if not all(value is not None and value.strip() for value in sealed_provenance):
+            parser.error("sealed provenance overrides must be supplied together")
     if args.adapt_only and (args.freeze_generic or args.certify_generic):
         parser.error("--adapt-only cannot freeze or certify a policy")
     certified_replay = bool(
@@ -1277,17 +1392,16 @@ def main() -> int:
             corpus,
             args.development_profiler_requests,
             args.development_profiler_evidence,
-            source_corpus=(
-                read_observation_csv((args.development_profiler_observations,))
-                if args.development_profiler_observations
-                else None
-            ),
+            source_corpus_path=args.development_profiler_observations,
         )
         frozen = freeze_fast_policy(
             corpus,
             manifest,
             measurement_plan,
             profiler_catalog,
+            args.development_build_change_audit,
+            args.fit_cache_dir,
+            args.generic_max_leaves,
         )
         policy_corpus = _mode_robust_policy_corpus(_fast_m1_corpus(corpus))
         entries, exact = select_fast_entries(
@@ -1335,17 +1449,16 @@ def main() -> int:
             development,
             args.development_profiler_requests,
             args.development_profiler_evidence,
-            source_corpus=(
-                read_observation_csv((args.development_profiler_observations,))
-                if args.development_profiler_observations
-                else None
-            ),
+            source_corpus_path=args.development_profiler_observations,
         )
         frozen = freeze_fast_policy(
             development,
             manifest,
             measurement_plan,
             profiler_catalog,
+            args.development_build_change_audit,
+            args.fit_cache_dir,
+            args.generic_max_leaves,
         )
         # This complete byte comparison precedes the first sealed file read.
         validate_frozen_policy_file(args.frozen_policy_json, frozen)
@@ -1356,7 +1469,12 @@ def main() -> int:
             args,
             sealed_inputs,
             sealed_timing,
-            run_id=f"{args.run_id}-sealed",
+            run_id=(
+                args.sealed_run_id
+                if args.sealed_run_id is not None
+                else f"{args.run_id}-sealed"
+            ),
+            sealed=True,
         )
         sealed = adapt_rocm_decode_csv(
             sealed_inputs,
@@ -1372,10 +1490,10 @@ def main() -> int:
         )
         development_fast = _fast_m1_corpus(development)
         sealed_fast = _fast_m1_corpus(sealed)
-        policy_corpus = _mode_robust_policy_corpus(ObservationCorpus((
+        policy_corpus = _mode_robust_policy_corpus(ObservationCorpus._from_validated((
             *development_fast.observations,
             *sealed_fast.observations,
-        )))
+        ), revalidate_candidate_identities=True))
         entries, exact = select_fast_entries(
             policy_corpus,
             development_context.serial_m1_policy_hash,
@@ -1397,10 +1515,10 @@ def main() -> int:
             args.summary.parent.mkdir(parents=True, exist_ok=True)
             write_summary(args.summary, entries, exact)
         if args.common_observations:
-            combined = ObservationCorpus((
+            combined = ObservationCorpus._from_validated((
                 *development.observations,
                 *sealed.observations,
-            ))
+            ), revalidate_candidate_identities=True)
             args.common_observations.parent.mkdir(parents=True, exist_ok=True)
             write_observation_csv(args.common_observations, combined)
         print(

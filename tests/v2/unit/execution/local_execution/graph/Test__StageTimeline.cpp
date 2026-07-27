@@ -111,7 +111,7 @@ namespace
 
         void synchronize() override {}
         void synchronizeStream(void *) override {}
-        void insertStreamDependency(void *, void *) override {}
+        bool insertStreamDependency(void *, void *) override { return true; }
 
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override { return nullptr; }
         std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *) override { return nullptr; }

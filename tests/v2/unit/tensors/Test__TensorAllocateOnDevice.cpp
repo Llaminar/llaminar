@@ -17,6 +17,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/CoherenceState.h"
 #include "v2/backends/DeviceId.h"
@@ -361,7 +362,7 @@ namespace llaminar2::test
         EXPECT_EQ(tensor_->coherenceState(), TensorCoherenceState::SYNCED);
 
         // Simulate kernel write → DEVICE_AUTHORITATIVE
-        tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishGraphOwnedCurrentDeviceWrite(tensor_);
         EXPECT_EQ(tensor_->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
         void *ptr_before = tensor_->gpu_data_ptr();

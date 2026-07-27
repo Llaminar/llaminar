@@ -20,10 +20,12 @@
  */
 
 #include "../ops/CUDAHelpers.cuh"
+#include "../../../backends/BackendManager.h"
 #include "../../../utils/DebugEnv.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace
 { // anonymous namespace to avoid symbol conflicts with ROCm kernels
@@ -1548,16 +1550,26 @@ namespace
 extern "C"
 {
 
-    bool cudaGDN_gpu_malloc(float **ptr, size_t count)
+    bool cudaGDN_gpu_malloc(float **ptr, size_t count, int device_ordinal)
     {
-        cudaError_t err = cudaMalloc(ptr, count * sizeof(float));
-        return err == cudaSuccess;
+        auto *backend = llaminar2::getCUDABackend();
+        if (!backend)
+            return false;
+        *ptr = static_cast<float *>(
+            backend->allocate(count * sizeof(float), device_ordinal));
+        return *ptr != nullptr;
     }
 
-    void cudaGDN_gpu_free(float *ptr)
+    void cudaGDN_gpu_free(float *ptr, int device_ordinal)
     {
         if (ptr)
-            cudaFree(ptr);
+        {
+            auto *backend = llaminar2::getCUDABackend();
+            if (!backend)
+                throw std::runtime_error(
+                    "[CUDA GDN] CUDA backend unavailable during state teardown");
+            backend->free(ptr, device_ordinal);
+        }
     }
 
     void cudaGDN_gpu_memset_zero(float *ptr, size_t count)

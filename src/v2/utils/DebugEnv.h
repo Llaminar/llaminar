@@ -375,7 +375,6 @@ namespace llaminar2
         int gemm_n_tile = 0;                ///< N-dimension tile size (0=no tiling is optimal for large batches)
 
         bool deterministic = false;               ///< Enable deterministic CUDA GEMM dispatch when LLAMINAR_DETERMINISTIC is non-zero.
-        bool cuda_cublas_gemm = false;            ///< Use cuBLAS FP16 GEMM path only when LLAMINAR_CUBLAS_GEMM=1.
         int cuda_bk256_mode = 0;                  ///< CUDA native-VNNI BK256 mode override (LLAMINAR_BK256_MODE, default 0=auto).
         int cuda_stream_k_mode = 0;               ///< CUDA native-VNNI stream-K force mode (LLAMINAR_STREAM_K, default 0=auto).
         int cuda_force_prefill_tile = -1;         ///< CUDA native-VNNI prefill tile override (LLAMINAR_FORCE_PREFILL_TILE, -1=auto, 0..5=TileId).
@@ -506,8 +505,6 @@ namespace llaminar2
                 cuda_concurrent_decode = false;
             }
 
-            const char *cublas_gemm_env = std::getenv("LLAMINAR_CUBLAS_GEMM");
-            cuda_cublas_gemm = cublas_gemm_env && std::atoi(cublas_gemm_env) == 1;
 
             const char *bk256_env = std::getenv("LLAMINAR_BK256_MODE");
             cuda_bk256_mode = bk256_env ? std::atoi(bk256_env) : 0;
@@ -942,8 +939,9 @@ namespace llaminar2
      *   LLAMINAR_AUTO_WEIGHT_TRANSFER      - Auto-transfer weights to target device (default: 1)
      *   LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT - Use DeviceGraphBufferManager for buffers (default: 1 - ON)
      *   LLAMINAR_EXEC_FULL_FORWARD         - Use full forward graph execution (default: 1 - ON)
-     *   LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED - Allow segmented GPU-graph replay for decode graphs
-     *                                        containing collectives (default: 0 - OFF, diagnostic fallback)
+     *   LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED - Opt a proven heterogeneous mixed-device
+     *                                        collective domain into segmented replay (default: 0 - OFF).
+     *                                        This flag never authorizes homogeneous segmentation.
      *   LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES - Capture homogeneous LocalTP NCCL/RCCL collectives directly
      *                                        into decode GPU graphs (default: 1 - ON)
      *
@@ -987,10 +985,10 @@ namespace llaminar2
         bool gpu_graph_verify = false;                                         ///< Verify graph replay vs direct execution (default: OFF, env: LLAMINAR_GPU_GRAPH_VERIFY)
         bool gpu_graph_recapture = false;                                      ///< Re-capture each decode step instead of replaying cached graph (default: OFF, env: LLAMINAR_GPU_GRAPH_RECAPTURE)
         int gpu_graph_max_stages = 0;                                          ///< Max stages per capturable segment (0=unlimited, env: LLAMINAR_GPU_GRAPH_MAX_STAGES)
-        bool gpu_graph_collective_segmented = false;                           ///< Enable segmented replay for collective decode graphs (default: OFF, env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED)
+        bool gpu_graph_collective_segmented = false;                           ///< Admit segmented replay only after a mixed-device collective topology proof (default: OFF, env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED)
         bool gpu_graph_capture_collectives = true;                             ///< Capture homogeneous LocalTP NCCL/RCCL collectives inside decode GPU graphs (default: ON, env: LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES=0 to opt out)
         bool gpu_graph_defer_captured_collective_final_sync = false;           ///< Allow final-sync deferral when collective nodes are captured in the replay graph (env: LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC)
-        std::vector<std::string> gpu_graph_collective_segmented_capture_allow; ///< Optional stage-name allowlist for segmented collective capture (env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED_CAPTURE_ALLOW)
+        std::vector<std::string> gpu_graph_collective_segmented_capture_allow; ///< Optional stage-name allowlist inside an already admitted heterogeneous collective segmented plan (env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED_CAPTURE_ALLOW)
         bool gpu_graph_stream_only = false;                                    ///< Execute segmented path on stream-only mode (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY)
         bool gpu_graph_stream_only_default = false;                            ///< Stream-only mode uses default stream (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY_DEFAULT)
         bool gpu_graph_trace_replay = false;                                   ///< Trace per-segment progress during graph replay (env: LLAMINAR_GPU_GRAPH_TRACE_REPLAY)

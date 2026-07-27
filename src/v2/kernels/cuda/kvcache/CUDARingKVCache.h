@@ -659,12 +659,37 @@ namespace llaminar2
         /// Per-cache immutable device topology; never shared with MTP caches.
         DataT **d_batched_k_entry_table_ = nullptr;
         DataT **d_batched_v_entry_table_ = nullptr;
-        /// True after bindWorkspace() uploads every immutable entry pointer.
+        /// True after construction uploads every immutable entry pointer.
         bool batched_pointer_tables_ready_ = false;
 
         // Helper methods
         void allocate_entry(EntryT &entry);
         void free_entry(EntryT &entry);
+        void allocate_all_entries();
+
+        /**
+         * @brief Publish immutable K/V entry topology before graph capture can begin.
+         *
+         * Grouped cache kernels consume one device array of K pointers and one
+         * device array of V pointers. CUDA entry allocations remain stable for
+         * the cache lifetime, so construction publishes these arrays exactly
+         * once. bindWorkspace() must never allocate these tables or perform H2D
+         * copies because workspace rebinding can occur while an outer graph
+         * transaction is recording.
+         *
+         * @throws std::runtime_error if either table cannot be allocated or
+         *         copied to the owning device.
+         */
+        void initializeBatchedEntryPointerTables();
+
+        /**
+         * @brief Release cache-owned entry topology during teardown or failed construction.
+         *
+         * This method is noexcept so partially constructed caches can clean up
+         * both tables before propagating their original initialization error.
+         */
+        void releaseBatchedEntryPointerTables() noexcept;
+
         void linearize_entry(
             EntryT &entry,
             int head,
@@ -727,10 +752,10 @@ namespace llaminar2
          * For Q8_1 caches: linearize + dequant → FP16 + RoPE → shadow buffer
          * For FP32 caches: linearize + convert → FP16 + RoPE → shadow buffer
          *
-         * Shadow buffers are allocated lazily and reused across calls. This
+         * Shadow views use graph-planned K/V workspace as FP16 output. This
          * scalar API is an observation boundary and rebuilds from one temporary
          * device-state snapshot. Production attention uses the grouped device
-         * conversion path and never validates a host shadow generation.
+         * conversion path.
          *
          * FP32/Q8_1/BF16 paths use pre-allocated conv_scratch buffers
          * (via ensureConvScratch) to avoid cudaMalloc/cudaFree in the hot path.
@@ -758,8 +783,8 @@ namespace llaminar2
         // [n_layers][batch_size] — lazily initialized
         mutable std::vector<std::vector<RoPEShadow>> rope_shadows_;
 
-        /// Allocate shadow buffers for a layer/seq if needed
-        void ensureRoPEShadow(int layer, int seq_idx) const;
+        /// Bind a layer/sequence shadow view to graph-planned conversion output.
+        void ensureRoPEShadow(int layer, int seq_idx);
 
         /// Invalidate shadow after append/evict
         void invalidateRoPEShadow(int layer, int seq_idx) const;

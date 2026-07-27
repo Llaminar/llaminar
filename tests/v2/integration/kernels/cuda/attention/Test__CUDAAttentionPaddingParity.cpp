@@ -15,9 +15,11 @@
 #include "execution/compute_stages/stages/LMHeadStage.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/KernelFactory.h"
 #include "utils/MPIContext.h"
 #include "../../../../utils/PreparedWeightTestHarness.h"
+#include "../../../../utils/ScopedGPUStream.h"
 
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
@@ -527,6 +529,8 @@ TEST_F(Test__CUDAAttentionPaddingParity, LMHeadPaddedBucketUsesLastRealRowOnGPU)
     params.prepared_store = prepared_lm_head.store.get();
 
     LMHeadStage stage(params);
+    ScopedGPUStream producer_stream(device);
+    stage.setGPUStream(producer_stream.get());
     stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{
         real_seq_len,
         bucket_seq_len,
@@ -537,6 +541,7 @@ TEST_F(Test__CUDAAttentionPaddingParity, LMHeadPaddedBucketUsesLastRealRowOnGPU)
         device,
         {hidden_states.get(), lm_head_weight.get()},
         {logits.get()},
+        producer_stream.get(),
         [&]()
         { return stage.execute(nullptr); }));
     ASSERT_FALSE(hasNaNOrInf(std::vector<float>(logits->data(), logits->data() + vocab_size)));
@@ -617,6 +622,25 @@ TEST_F(Test__CUDAAttentionPaddingParity, DecodeContinuationUsesRealKVLengthOnGPU
     auto kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(config);
     ASSERT_NE(kv_cache, nullptr);
 
+    /*
+     * Device-owned cache reads consume pointer tables and gather storage that
+     * graph construction publishes through the cache workspace. Bind that
+     * persistent storage before append so this regression exercises the same
+     * fully prepared cache lifetime as production graph execution.
+     */
+    auto *kv_workspace_consumer =
+        dynamic_cast<IWorkspaceConsumer *>(kv_cache.get());
+    ASSERT_NE(kv_workspace_consumer, nullptr);
+    const WorkspaceRequirements kv_reqs =
+        kv_workspace_consumer->getWorkspaceRequirements(
+            bucket_kv_len,
+            /*n=*/1,
+            head_dim);
+    DeviceWorkspaceManager kv_workspace(
+        device, kv_reqs.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(kv_workspace.allocate(kv_reqs));
+    kv_workspace_consumer->bindWorkspace(&kv_workspace);
+
     int32_t *device_real_kv_len = nullptr;
     ASSERT_EQ(cudaMalloc(&device_real_kv_len, sizeof(int32_t)), cudaSuccess);
     ASSERT_EQ(
@@ -676,6 +700,7 @@ TEST_F(Test__CUDAAttentionPaddingParity, DecodeContinuationUsesRealKVLengthOnGPU
         device,
         {query.get()},
         {output.get(), workspace_scores.get(), workspace_context.get(), workspace_mask.get()},
+        stream,
         [&]()
         { return stage.execute(nullptr); }));
     gpu_ctx.synchronizeStream(stream);

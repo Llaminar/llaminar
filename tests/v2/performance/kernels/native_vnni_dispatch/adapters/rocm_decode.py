@@ -13,6 +13,9 @@ import csv
 import hashlib
 import json
 import math
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -122,50 +125,43 @@ def _timing_key(raw: Mapping[str, str]) -> RawTimingKey:
     )
 
 
-def read_rocm_decode_timing_sidecars(
-    paths: Iterable[Path],
+def _read_rocm_decode_timing_rows(
+    rows: Iterable[Mapping[str, str]],
+    *,
+    location_prefix: str,
 ) -> dict[RawTimingKey, tuple[float, ...]]:
-    """Read exact HIP-event microseconds and validate sidecar continuity."""
+    """Validate complete trial rows and return their exact sorted samples."""
 
     indexed: dict[RawTimingKey, list[float]] = {}
-    for path in (Path(item) for item in paths):
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            missing = REQUIRED_TIMING_COLUMNS.difference(reader.fieldnames or ())
-            if missing:
-                raise ValueError(
-                    f"{path}: missing ROCm decode timing columns {sorted(missing)}"
-                )
-            for row_number, raw in enumerate(reader, start=2):
-                if raw["backend"].strip().lower() != "rocm" or (
-                    raw["phase"].strip() != "decode"
-                ):
-                    raise ValueError(f"{path}:{row_number}: wrong timing sidecar surface")
-                _execution_mode(raw["execution_mode"])
-                if int(raw["timed_replays"]) != 1:
-                    raise ValueError(
-                        f"{path}:{row_number}: decode timing rows require one replay"
-                    )
-                key = _timing_key(raw)
-                sample_index = int(raw["sample_index"])
-                samples = indexed.setdefault(key, [])
-                if sample_index != len(samples):
-                    raise ValueError(
-                        f"{path}:{row_number}: timing sample index {sample_index} "
-                        f"is not the next contiguous index {len(samples)}"
-                    )
+    for row_number, raw in enumerate(rows, start=1):
+        location = f"{location_prefix}+{row_number}"
+        if raw["backend"].strip().lower() != "rocm" or (
+            raw["phase"].strip() != "decode"
+        ):
+            raise ValueError(f"{location}: wrong timing sidecar surface")
+        _execution_mode(raw["execution_mode"])
+        if int(raw["timed_replays"]) != 1:
+            raise ValueError(f"{location}: decode timing rows require one replay")
+        key = _timing_key(raw)
+        sample_index = int(raw["sample_index"])
+        samples = indexed.setdefault(key, [])
+        if sample_index != len(samples):
+            raise ValueError(
+                f"{location}: timing sample index {sample_index} "
+                f"is not the next contiguous index {len(samples)}"
+            )
 
-                latency_us = float.fromhex(raw["latency_us_hex"].strip())
-                readable_us = float(raw["latency_us"])
-                if latency_us <= 0.0 or not math.isfinite(latency_us):
-                    raise ValueError(f"{path}:{row_number}: invalid raw latency")
-                if not math.isclose(
-                    readable_us, latency_us, rel_tol=0.0, abs_tol=5.1e-7
-                ):
-                    raise ValueError(
-                        f"{path}:{row_number}: readable and exact latency fields disagree"
-                    )
-                samples.append(latency_us)
+        latency_us = float.fromhex(raw["latency_us_hex"].strip())
+        readable_us = float(raw["latency_us"])
+        if latency_us <= 0.0 or not math.isfinite(latency_us):
+            raise ValueError(f"{location}: invalid raw latency")
+        if not math.isclose(
+            readable_us, latency_us, rel_tol=0.0, abs_tol=5.1e-7
+        ):
+            raise ValueError(
+                f"{location}: readable and exact latency fields disagree"
+            )
+        samples.append(latency_us)
 
     result = {}
     for key, samples in indexed.items():
@@ -173,6 +169,207 @@ def read_rocm_decode_timing_sidecars(
         if tuple(sorted(values)) != values:
             raise ValueError(f"timing sidecar samples are not trainer-sorted for {key}")
         result[key] = values
+    return result
+
+
+def _rocm_timing_header(path: Path) -> tuple[tuple[str, ...], int]:
+    """Validate one sidecar header and return its first data-byte offset."""
+
+    with path.open("rb") as handle:
+        header_line = handle.readline()
+        data_begin = handle.tell()
+    try:
+        rows = list(csv.reader([header_line.decode("utf-8")]))
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{path}: timing header is not UTF-8") from error
+    if len(rows) != 1:
+        raise ValueError(f"{path}: malformed ROCm decode timing header")
+    fieldnames = tuple(rows[0])
+    missing = REQUIRED_TIMING_COLUMNS.difference(fieldnames)
+    if missing:
+        raise ValueError(
+            f"{path}: missing ROCm decode timing columns {sorted(missing)}"
+        )
+    return fieldnames, data_begin
+
+
+def _rocm_timing_row_at(
+    raw_line: bytes,
+    fieldnames: tuple[str, ...],
+    path: Path,
+) -> dict[str, str]:
+    """Decode one physical sidecar row while locating trial boundaries."""
+
+    try:
+        rows = list(csv.reader([raw_line.decode("utf-8")]))
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{path}: timing row is not UTF-8") from error
+    if len(rows) != 1 or len(rows[0]) != len(fieldnames):
+        raise ValueError(f"{path}: malformed physical timing CSV row")
+    return dict(zip(fieldnames, rows[0], strict=True))
+
+
+def _next_rocm_timing_trial_boundary(
+    path: Path,
+    fieldnames: tuple[str, ...],
+    data_begin: int,
+    target: int,
+    file_size: int,
+) -> int:
+    """Advance an approximate byte target past its complete candidate trial."""
+
+    if target <= data_begin:
+        return data_begin
+    if target >= file_size:
+        return file_size
+    with path.open("rb") as handle:
+        handle.seek(target - 1)
+        if handle.read(1) != b"\n":
+            handle.readline()
+        first_line = handle.readline()
+        if not first_line:
+            return file_size
+        first_key = _timing_key(_rocm_timing_row_at(first_line, fieldnames, path))
+        while True:
+            row_begin = handle.tell()
+            raw_line = handle.readline()
+            if not raw_line:
+                return file_size
+            key = _timing_key(_rocm_timing_row_at(raw_line, fieldnames, path))
+            if key != first_key:
+                return row_begin
+
+
+def _rocm_timing_byte_ranges(
+    path: Path,
+    fieldnames: tuple[str, ...],
+    data_begin: int,
+    worker_count: int,
+) -> tuple[tuple[int, int], ...]:
+    """Partition one sidecar without splitting a candidate's sample sequence."""
+
+    file_size = path.stat().st_size
+    if file_size <= data_begin:
+        return ()
+    boundaries = [data_begin]
+    data_bytes = file_size - data_begin
+    for worker_index in range(1, worker_count):
+        target = data_begin + data_bytes * worker_index // worker_count
+        boundary = _next_rocm_timing_trial_boundary(
+            path,
+            fieldnames,
+            data_begin,
+            target,
+            file_size,
+        )
+        if boundaries[-1] < boundary < file_size:
+            boundaries.append(boundary)
+    boundaries.append(file_size)
+    return tuple(zip(boundaries[:-1], boundaries[1:], strict=True))
+
+
+def _read_rocm_decode_timing_shard(
+    task: tuple[str, tuple[str, ...], int, int],
+) -> dict[RawTimingKey, tuple[float, ...]]:
+    """Parse one complete-trial-aligned physical byte range."""
+
+    path_text, fieldnames, begin, end = task
+    path = Path(path_text)
+    with path.open("rb") as handle:
+        handle.seek(begin)
+
+        def rows() -> Iterable[dict[str, str]]:
+            while handle.tell() < end:
+                raw_line = handle.readline()
+                if not raw_line or handle.tell() > end:
+                    raise ValueError(f"{path}: timing shard contains a partial row")
+                yield _rocm_timing_row_at(raw_line, fieldnames, path)
+            if handle.tell() != end:
+                raise ValueError(f"{path}: timing shard ended at the wrong offset")
+
+        return _read_rocm_decode_timing_rows(
+            rows(),
+            location_prefix=f"{path}:range-{begin}",
+        )
+
+
+def _rocm_timing_physical_core_count() -> int:
+    """Return physical cores visible through the analyzer's affinity mask."""
+
+    visible = tuple(sorted(os.sched_getaffinity(0)))
+    physical = set()
+    for cpu in visible:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package = (topology / "physical_package_id").read_text().strip()
+            core = (topology / "core_id").read_text().strip()
+        except OSError:
+            return max(1, len(visible))
+        physical.add((package, core))
+    return max(1, len(physical))
+
+
+def read_rocm_decode_timing_sidecars(
+    paths: Iterable[Path],
+    *,
+    workers: int | None = None,
+) -> dict[RawTimingKey, tuple[float, ...]]:
+    """Read exact HIP-event samples on complete-trial-aligned workers."""
+
+    resolved_paths = tuple(Path(item) for item in paths)
+    if not resolved_paths:
+        return {}
+    physical_cores = _rocm_timing_physical_core_count()
+    if workers is None:
+        requested_workers = int(os.environ.get(
+            "LLAMINAR_NATIVE_VNNI_ROCM_TIMING_WORKERS",
+            str(physical_cores),
+        ))
+    else:
+        requested_workers = workers
+    if requested_workers < 1:
+        raise ValueError("ROCm timing worker count must be positive")
+    worker_count = min(requested_workers, physical_cores)
+
+    tasks: list[tuple[str, tuple[str, ...], int, int]] = []
+    for path in resolved_paths:
+        fieldnames, data_begin = _rocm_timing_header(path)
+        data_bytes = max(0, path.stat().st_size - data_begin)
+        useful_workers = (
+            worker_count
+            if workers is not None
+            else max(1, data_bytes // (32 * 1024 * 1024))
+        )
+        path_workers = min(worker_count, useful_workers)
+        tasks.extend(
+            (str(path), fieldnames, begin, end)
+            for begin, end in _rocm_timing_byte_ranges(
+                path,
+                fieldnames,
+                data_begin,
+                path_workers,
+            )
+        )
+    if not tasks:
+        return {}
+    if len(tasks) == 1:
+        shards = (_read_rocm_decode_timing_shard(tasks[0]),)
+    else:
+        with ProcessPoolExecutor(
+            max_workers=min(worker_count, len(tasks)),
+            mp_context=multiprocessing.get_context("fork"),
+        ) as executor:
+            shards = tuple(executor.map(_read_rocm_decode_timing_shard, tasks))
+
+    result: dict[RawTimingKey, tuple[float, ...]] = {}
+    for shard in shards:
+        overlap = result.keys() & shard.keys()
+        if overlap:
+            raise ValueError(
+                "ROCm timing shards repeat complete trial keys: "
+                f"{next(iter(overlap))}"
+            )
+        result.update(shard)
     return result
 
 

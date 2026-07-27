@@ -95,11 +95,8 @@ namespace llaminar2
             return false;
         }
 
-        if (params_.device_id.is_gpu() && !gpuStream())
-        {
-            LOG_ERROR("[RoPEStage] GPU RoPE requires an explicit non-null stage stream");
-            return false;
-        }
+        void *const stage_stream =
+            params_.device_id.is_gpu() ? requireGPUStream() : nullptr;
 
         // Cast ITensor* to TensorBase* for CPU operations
         auto *Q_base = requireTensorBasePtr(params_.Q, "Q");
@@ -199,7 +196,7 @@ namespace llaminar2
             position_ids_ptr = position_ids_cache_.data();
         }
 
-        if (!params_.position_ids_device && gpuStream() != nullptr && position_ids_ptr != nullptr)
+        if (!params_.position_ids_device && stage_stream && position_ids_ptr != nullptr)
         {
             // Explicit non-contiguous/batched position ids must use a stable
             // host pointer. Contiguous GPU positions intentionally stay null.

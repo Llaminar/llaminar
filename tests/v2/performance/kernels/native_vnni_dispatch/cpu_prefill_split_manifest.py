@@ -29,8 +29,10 @@ production ownership declarative: every canonical production geometry is
 resolved into development in stable measurement-plan order. Version 11 bounds
 new CPU evidence at M=2048, introduces M=512, and caps geometries owned by a
 14B-or-larger model at M=512. Version 12 profiles sub-14B overlays only at
-M={64,128,256,512} and 14B-or-larger overlays only at M={64,128}. Versions 8
-through 11 remain readable so
+M={64,128,256,512} and 14B-or-larger overlays only at M={64,128}. Version 13
+keeps the full overlay inventory while profiling below-7B owners at M={32,128},
+7B-to-below-14B owners at M={32,64}, and 14B-or-larger owners at M={32}.
+Versions 8 through 12 remain readable so
 in-flight, digest-bound refinement rounds can finish without rewriting their
 historical split identities.
 """
@@ -47,28 +49,31 @@ from .corpus import ObservationCorpus
 from .prefill_matrix import (
     CPU_PREFILL_M_BUCKETS,
     CPU_PREFILL_MAXIMUM_WEIGHT_ELEMENTS,
-    HISTORICAL_CPU_PREFILL_M_BUCKETS,
+    GPU_PREFILL_M_BUCKETS,
     cpu_prefill_measurements,
 )
 from .shape_manifest import ShapePartition, ShapeRole, load_shape_manifest
 
 
 MANIFEST_PATH = Path(__file__).with_name("manifests") / (
-    "native_vnni_cpu_prefill_split_v12.json"
+    "native_vnni_cpu_prefill_split_v13.json"
 )
-SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v12"
+SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v13"
 LEGACY_SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v8"
 V9_SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v9"
 V10_SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v10"
 V11_SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v11"
+V12_SCHEMA_VERSION = "native-vnni-cpu-prefill-split-v12"
 SUPPORTED_SCHEMA_VERSIONS = frozenset((
     LEGACY_SCHEMA_VERSION,
     V9_SCHEMA_VERSION,
     V10_SCHEMA_VERSION,
     V11_SCHEMA_VERSION,
+    V12_SCHEMA_VERSION,
     SCHEMA_VERSION,
 ))
 V11_CPU_PREFILL_M_BUCKETS = (64, 256, 512, 1024, 2048)
+V12_CPU_PREFILL_M_BUCKETS = (64, 128, 256, 512)
 V9_QWEN36_MOE_PRODUCTION_SHAPES = frozenset((
     "35BMoE_Expert_GateUp",
     "35BMoE_Expert_Down",
@@ -118,11 +123,7 @@ class CPUPrefillSplitManifest:
             for shape in shape_manifest.shapes
             if shape.prefill_partition == ShapePartition.DEVELOPMENT
         }
-        if self.schema_version in {
-            V10_SCHEMA_VERSION,
-            V11_SCHEMA_VERSION,
-            SCHEMA_VERSION,
-        }:
+        if self.schema_version == SCHEMA_VERSION:
             if not self.include_all_production_shapes:
                 raise ValueError(
                     "current CPU prefill split must include every production "
@@ -140,6 +141,27 @@ class CPUPrefillSplitManifest:
                     f"missing={sorted(expected_development - development)} "
                     f"unexpected={sorted(development - expected_development)}"
                 )
+        elif self.schema_version in {
+            V10_SCHEMA_VERSION,
+            V11_SCHEMA_VERSION,
+            V12_SCHEMA_VERSION,
+        }:
+            if not self.include_all_production_shapes:
+                raise ValueError(
+                    "declarative CPU prefill split must include every "
+                    "production shape"
+                )
+            production = {
+                measurement.shape.name
+                for measurement in cpu_prefill_measurements()
+            }
+            unknown = development.difference(production, declared_refinement)
+            if not production.issubset(development) or unknown:
+                raise ValueError(
+                    "historical declarative CPU prefill ownership is invalid: "
+                    f"missing_production={sorted(production - development)} "
+                    f"unexpected={sorted(unknown)}"
+                )
         else:
             if self.include_all_production_shapes:
                 raise ValueError(
@@ -151,11 +173,10 @@ class CPUPrefillSplitManifest:
                 if shape_manifest.by_name(name).role != ShapeRole.PRODUCTION
                 and name not in declared_refinement
             }
-            if unknown or not declared_refinement.issubset(development):
+            if unknown:
                 raise ValueError(
                     "historical CPU prefill development split contains an "
                     "invalid ownership assignment: "
-                    f"missing_refinement={sorted(declared_refinement - development)} "
                     f"unexpected={sorted(unknown)}"
                 )
         if len(sealed) < 8:
@@ -166,8 +187,10 @@ class CPUPrefillSplitManifest:
             expected_sealed_m_values = CPU_PREFILL_M_BUCKETS
         elif self.schema_version == V11_SCHEMA_VERSION:
             expected_sealed_m_values = V11_CPU_PREFILL_M_BUCKETS
+        elif self.schema_version == V12_SCHEMA_VERSION:
+            expected_sealed_m_values = V12_CPU_PREFILL_M_BUCKETS
         else:
-            expected_sealed_m_values = HISTORICAL_CPU_PREFILL_M_BUCKETS
+            expected_sealed_m_values = GPU_PREFILL_M_BUCKETS
         if self.sealed_m_values != expected_sealed_m_values:
             raise ValueError(
                 "CPU prefill sealed pool must expose every canonical "
@@ -218,6 +241,7 @@ class CPUPrefillSplitManifest:
         if self.schema_version in {
             V10_SCHEMA_VERSION,
             V11_SCHEMA_VERSION,
+            V12_SCHEMA_VERSION,
             SCHEMA_VERSION,
         }:
             payload["include_all_production_shapes"] = (
@@ -359,6 +383,7 @@ def load_cpu_prefill_split_manifest(
     if schema_version in {
         V10_SCHEMA_VERSION,
         V11_SCHEMA_VERSION,
+        V12_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
         expected_fields.add("include_all_production_shapes")

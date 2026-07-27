@@ -212,6 +212,26 @@ namespace llaminar2
         return total;
     }
 
+    std::unordered_set<std::string> ComputeGraph::collectiveNodeNames() const
+    {
+        std::unordered_set<std::string> collective_nodes;
+        collective_nodes.reserve(nodes_.size());
+
+        /*
+         * Walk execution order rather than the private storage vector so this
+         * query observes the same finalized node population used by capture
+         * planning and fast-schedule construction. The result is a set because
+         * callers need constant-time membership while classifying stages.
+         */
+        for (const auto &node_name : getExecutionOrder())
+        {
+            const ComputeNode *node = getNode(node_name);
+            if (node && node->stage && node->stage->isCollectiveStage())
+                collective_nodes.insert(node_name);
+        }
+        return collective_nodes;
+    }
+
     void ComputeGraph::clear()
     {
         nodes_.clear();
@@ -239,10 +259,7 @@ namespace llaminar2
             }
             else
             {
-                auto t = node->stage->type();
-                is_coll = (t == ComputeStageType::ALLREDUCE ||
-                           t == ComputeStageType::ALLGATHER ||
-                           t == ComputeStageType::ALLGATHER_V);
+                is_coll = node->stage->isCollectiveStage();
             }
 
             fast_schedule_.push_back({node, is_coll});

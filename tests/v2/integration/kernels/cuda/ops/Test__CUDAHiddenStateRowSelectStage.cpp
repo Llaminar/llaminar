@@ -2,9 +2,10 @@
  * @file Test__CUDAHiddenStateRowSelectStage.cpp
  * @brief CUDA integration tests for graph-capturable hidden-state row selection.
  *
- * Covers stage-owned rows, external verifier metadata, and request-terminal
- * rows derived directly from device-resident unequal request lengths. Captured
- * graph replays prove each mutable device source is observed without recapture.
+ * Covers dynamic stage-owned rows, immutable device-only checkpoint rows,
+ * external verifier metadata, and request-terminal rows derived directly from
+ * device-resident unequal request lengths. Captured graph replays prove each
+ * ownership policy executes without host work inside capture.
  */
 
 #include <gtest/gtest.h>
@@ -30,6 +31,53 @@ using namespace llaminar2;
 
 namespace
 {
+#ifdef HAVE_CUDA
+    /**
+     * @brief Simulate a preceding library stage that temporarily binds another GPU.
+     *
+     * This is the CUDA twin of the HIP handoff regression. The row-selection
+     * stage must not rely on whichever device a preceding collective or helper
+     * happened to leave current on the host thread.
+     */
+    class ForeignCUDADeviceStage final : public IComputeStage
+    {
+    public:
+        ForeignCUDADeviceStage(DeviceId graph_device, int foreign_device)
+            : IComputeStage(graph_device),
+              foreign_device_(foreign_device)
+        {
+        }
+
+        bool execute(IDeviceContext *) override
+        {
+            return cudaSetDevice(foreign_device_) == cudaSuccess;
+        }
+
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::COPY;
+        }
+
+        bool supportsBackend(ComputeBackendType backend) const override
+        {
+            return backend == ComputeBackendType::GPU_CUDA;
+        }
+
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
+
+    private:
+        StageDumpInfo buildDumpInfoImpl() const override
+        {
+            return {};
+        }
+
+        int foreign_device_ = -1;
+    };
+#endif
+
     /// @brief Fill hidden rows with deterministic values that identify the row.
     std::unique_ptr<FP32Tensor> makeHiddenStates(int seq_len, int d_model, DeviceId device, void *stream)
     {
@@ -178,6 +226,323 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
     cudaGraphExecDestroy(graph_exec);
     cudaGraphDestroy(graph);
     cudaStreamDestroy(stream);
+#endif
+}
+
+/**
+ * @brief Prove fixed diagnostic rows capture without scalar workspace or H2D.
+ */
+TEST(Test__CUDAHiddenStateRowSelectStage, CapturedFixedDeviceRowUsesDeviceOnlyCopy)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    const DeviceId device = DeviceId::cuda(0);
+    const int seq_len = 8;
+    const int d_model = 32;
+    const int selected_row = 5;
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+
+    auto hidden = makeHiddenStates(seq_len, d_model, device, stream);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+    ASSERT_TRUE(scratch->allocateOnDevice(device, stream));
+
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = scratch.get();
+    params.seq_len = seq_len;
+    params.d_model = d_model;
+    params.selected_row_idx = selected_row;
+    params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow;
+    HiddenStateRowSelectStage stage(params);
+    stage.setGPUStream(stream);
+
+    ASSERT_TRUE(stage.getWorkspaceRequirements(seq_len, d_model, 0).buffers.empty());
+    ASSERT_TRUE(stage.execute(nullptr));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    expectRow(
+        downloadScratchRow(*scratch, d_model, stream),
+        *hidden,
+        selected_row,
+        d_model);
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(
+            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+            cudaSuccess);
+        ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(
+        cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+        cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    expectRow(
+        downloadScratchRow(*scratch, d_model, stream),
+        *hidden,
+        selected_row,
+        d_model);
+
+    EXPECT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+    EXPECT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
+/**
+ * @brief Reproduce padded M=512 checkpoint selection from resident metadata.
+ *
+ * A single captured executable first observes a 443-row request and then a
+ * 257-row request. Only the persistent device length changes between launches;
+ * no stage replay setter or graph-launch preparation hook participates.
+ */
+TEST(Test__CUDAHiddenStateRowSelectStage, CapturedCheckpointReadsResidentPrefillLength)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    const DeviceId device = DeviceId::cuda(0);
+    constexpr int bucket_seq_len = 512;
+    constexpr int d_model = 32;
+    int32_t initial_length = 443;
+    int32_t replay_length = 257;
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    auto hidden = makeHiddenStates(
+        bucket_seq_len,
+        d_model,
+        device,
+        stream);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+    ASSERT_TRUE(scratch->allocateOnDevice(device, stream));
+
+    int32_t *length_device = nullptr;
+    ASSERT_EQ(
+        cudaMalloc(
+            reinterpret_cast<void **>(&length_device),
+            sizeof(int32_t)),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            length_device,
+            &initial_length,
+            sizeof(int32_t),
+            cudaMemcpyHostToDevice,
+            stream),
+        cudaSuccess);
+
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = scratch.get();
+    params.seq_len = bucket_seq_len;
+    params.d_model = d_model;
+    params.selected_row_idx = bucket_seq_len - 1;
+    params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::
+            DeviceResidentRequestLength;
+    params.request_sequence_length_device = length_device;
+    HiddenStateRowSelectStage stage(params);
+    stage.setGPUStream(stream);
+
+    ASSERT_TRUE(
+        stage.getWorkspaceRequirements(
+                 bucket_seq_len,
+                 d_model,
+                 0)
+            .buffers.empty());
+    ASSERT_FALSE(stage.needsGraphLaunchPreparation());
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(
+            cudaStreamBeginCapture(
+                stream,
+                cudaStreamCaptureModeGlobal),
+            cudaSuccess);
+        ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(
+        cudaGraphInstantiate(
+            &graph_exec,
+            graph,
+            nullptr,
+            nullptr,
+            0),
+        cudaSuccess);
+
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    expectRow(
+        downloadScratchRow(*scratch, d_model, stream),
+        *hidden,
+        /*selected_row=*/442,
+        d_model);
+
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            length_device,
+            &replay_length,
+            sizeof(int32_t),
+            cudaMemcpyHostToDevice,
+            stream),
+        cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    expectRow(
+        downloadScratchRow(*scratch, d_model, stream),
+        *hidden,
+        /*selected_row=*/256,
+        d_model);
+
+    EXPECT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+    EXPECT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    EXPECT_EQ(cudaFree(length_device), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
+/**
+ * @brief Reproduce the first production M=39 mirrored checkpoint through the executor.
+ *
+ * This is the CUDA twin of the ROCm long-context regression. It exercises the
+ * exact 39x2048 graph-managed checkpoint geometry and delegates stream binding
+ * to DeviceGraphExecutor, proving that both GPU backends enforce the same
+ * explicit-stream and device-resident-length contract.
+ */
+TEST(Test__CUDAHiddenStateRowSelectStage, ExecutorRunsProductionM39ResidentCheckpoint)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    const DeviceId device = DeviceId::cuda(0);
+    constexpr int seq_len = 39;
+    constexpr int d_model = 2048;
+    const int32_t request_length = seq_len;
+
+    cudaStream_t setup_stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&setup_stream), cudaSuccess);
+    auto hidden = makeHiddenStates(seq_len, d_model, device, setup_stream);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+
+    int32_t *length_device = nullptr;
+    ASSERT_EQ(
+        cudaMalloc(
+            reinterpret_cast<void **>(&length_device),
+            sizeof(int32_t)),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            length_device,
+            &request_length,
+            sizeof(int32_t),
+            cudaMemcpyHostToDevice,
+            setup_stream),
+        cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(setup_stream), cudaSuccess);
+
+    BufferArena arena;
+    ASSERT_TRUE(
+        arena.registerExternalBuffer(
+            BufferId::HIDDEN_STATE,
+            hidden.get()));
+    ASSERT_TRUE(
+        arena.registerExternalBuffer(
+            BufferId::PREFIX_TERMINAL_HIDDEN,
+            scratch.get()));
+
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = scratch.get();
+    params.seq_len = seq_len;
+    params.d_model = d_model;
+    params.selected_row_idx = seq_len - 1;
+    params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::
+            DeviceResidentRequestLength;
+    params.request_sequence_length_device = length_device;
+    params.input_buffer_id = BufferId::HIDDEN_STATE;
+    params.output_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
+
+    auto stage = std::make_unique<HiddenStateRowSelectStage>(params);
+    auto *stage_ptr = stage.get();
+    ComputeGraph graph;
+    if (device_count > 1)
+    {
+        graph.addNode(
+            "foreign_cuda_device_binding",
+            std::make_unique<ForeignCUDADeviceStage>(device, 1),
+            device);
+    }
+    graph.addNode("production_m39_resident_checkpoint", std::move(stage), device);
+    if (device_count > 1)
+    {
+        graph.addDependency(
+            "production_m39_resident_checkpoint",
+            "foreign_cuda_device_binding");
+    }
+
+    GraphExecutorConfig config;
+    config.enable_profiling = false;
+    config.enable_validation = false;
+    DeviceGraphExecutor executor(config);
+    executor.setArena(&arena);
+    auto ctx = IDeviceContext::create(device, 1);
+    ASSERT_NE(ctx, nullptr);
+
+    ASSERT_TRUE(executor.execute(graph, ctx.get()));
+    ASSERT_NE(stage_ptr->gpuStream(), nullptr);
+    int active_device = -1;
+    ASSERT_EQ(cudaGetDevice(&active_device), cudaSuccess);
+    EXPECT_EQ(active_device, 0)
+        << "The checkpoint handoff must restore its stream-owning device";
+    auto execution_stream =
+        static_cast<cudaStream_t>(stage_ptr->gpuStream());
+    ASSERT_EQ(cudaStreamSynchronize(execution_stream), cudaSuccess);
+    expectRow(
+        downloadScratchRow(*scratch, d_model, execution_stream),
+        *hidden,
+        /*selected_row=*/seq_len - 1,
+        d_model);
+
+    EXPECT_EQ(cudaFree(length_device), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(setup_stream), cudaSuccess);
 #endif
 }
 

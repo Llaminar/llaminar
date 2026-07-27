@@ -201,6 +201,8 @@ namespace llaminar2
             device_count_ = 0;
             // Log warning but don't throw - allow CPU-only execution
         }
+        penalty_buffers_.resize(
+            static_cast<size_t>(std::max(device_count_, 0)));
     }
 
     ROCmBackend::~ROCmBackend()
@@ -851,6 +853,13 @@ namespace llaminar2
         int position_offset,
         int request_count,
         int32_t *out_condition_tokens,
+        int32_t *out_position_ids,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_prepare_mtp_verifier_position_ids(
+        const int32_t *base_positions,
+        int request_count,
+        int padded_seq_len,
         int32_t *out_position_ids,
         int device_idx,
         void *stream);
@@ -2223,6 +2232,34 @@ namespace llaminar2
             stream);
     }
 
+    bool ROCmBackend::enqueuePrepareMTPVerifierPositionIds(
+        const void *base_positions_device,
+        int request_count,
+        int padded_seq_len,
+        int device_id,
+        void *stream,
+        void *out_position_ids_device)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !base_positions_device ||
+            request_count <= 0 ||
+            padded_seq_len <= 0 ||
+            !stream ||
+            !out_position_ids_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_prepare_mtp_verifier_position_ids(
+            static_cast<const int32_t *>(base_positions_device),
+            request_count,
+            padded_seq_len,
+            static_cast<int32_t *>(out_position_ids_device),
+            device_id,
+            stream);
+    }
+
     bool ROCmBackend::enqueueInitializeMTPDeviceLogicalState(
         const void *sampled_tokens_device,
         const void *target_positions_device,
@@ -2274,6 +2311,66 @@ namespace llaminar2
         float *logits, const int *token_ids, const float *penalties,
         int num_penalties, int vocab_size, int device_idx, void *stream);
 
+    bool ROCmBackend::prepareLogitPenaltyWorkspace(
+        int vocab_size,
+        int device_id)
+    {
+        if (device_id < 0 ||
+            device_id >= device_count_ ||
+            vocab_size <= 0 ||
+            static_cast<size_t>(device_id) >= penalty_buffers_.size())
+        {
+            return false;
+        }
+
+        auto &bufs = penalty_buffers_[static_cast<size_t>(device_id)];
+        if (bufs.allocated_count >= vocab_size &&
+            bufs.token_ids_ptr &&
+            bufs.penalties_ptr &&
+            bufs.ready_event)
+        {
+            return true;
+        }
+        if (bufs.allocated_count != 0 ||
+            bufs.token_ids_ptr ||
+            bufs.penalties_ptr ||
+            bufs.ready_event)
+        {
+            LOG_ERROR("[ROCmBackend] Refusing to resize an active logit-penalty workspace");
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        hipError_t err =
+            hipMalloc(&bufs.token_ids_ptr, vocab_size * sizeof(int));
+        if (err != hipSuccess)
+            return false;
+        err = hipMalloc(
+            &bufs.penalties_ptr,
+            vocab_size * sizeof(float));
+        if (err != hipSuccess)
+        {
+            HIP_WARN_IF_FAIL(hipFree(bufs.token_ids_ptr));
+            bufs.token_ids_ptr = nullptr;
+            return false;
+        }
+        hipEvent_t ready_event = nullptr;
+        err = hipEventCreateWithFlags(
+            &ready_event,
+            hipEventDisableTiming);
+        if (err != hipSuccess)
+        {
+            HIP_WARN_IF_FAIL(hipFree(bufs.penalties_ptr));
+            HIP_WARN_IF_FAIL(hipFree(bufs.token_ids_ptr));
+            bufs.penalties_ptr = nullptr;
+            bufs.token_ids_ptr = nullptr;
+            return false;
+        }
+        bufs.ready_event = ready_event;
+        bufs.allocated_count = vocab_size;
+        return true;
+    }
+
     bool ROCmBackend::applyLogitPenaltiesF32(void *logits_device,
                                               const int *token_ids_host,
                                               const float *penalties_host,
@@ -2284,41 +2381,26 @@ namespace llaminar2
             !token_ids_host || !penalties_host || num_penalties <= 0)
             return false;
 
-        // Lazily allocate per-device penalty upload buffers
-        if (penalty_buffers_.empty())
-            penalty_buffers_.resize(device_count_);
-
-        auto &bufs = penalty_buffers_[device_id];
-
-        // Reallocate if num_penalties exceeds current allocation
-        if (bufs.allocated_count < num_penalties)
-        {
-            HIP_CHECK_OR_THROW(hipSetDevice(device_id));
-            if (bufs.token_ids_ptr)
-                HIP_WARN_IF_FAIL(hipFree(bufs.token_ids_ptr));
-            if (bufs.penalties_ptr)
-                HIP_WARN_IF_FAIL(hipFree(bufs.penalties_ptr));
-
-            hipError_t err = hipMalloc(&bufs.token_ids_ptr, num_penalties * sizeof(int));
-            if (err != hipSuccess)
-            {
-                bufs.token_ids_ptr = nullptr;
-                bufs.allocated_count = 0;
-                return false;
-            }
-            err = hipMalloc(&bufs.penalties_ptr, num_penalties * sizeof(float));
-            if (err != hipSuccess)
-            {
-                HIP_WARN_IF_FAIL(hipFree(bufs.token_ids_ptr));
-                bufs.token_ids_ptr = nullptr;
-                bufs.allocated_count = 0;
-                return false;
-            }
-            bufs.allocated_count = num_penalties;
-        }
+        auto &bufs = penalty_buffers_[static_cast<size_t>(device_id)];
+        if (num_penalties > bufs.allocated_count ||
+            !bufs.token_ids_ptr ||
+            !bufs.penalties_ptr ||
+            !bufs.ready_event)
+            return false;
 
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
         hipStream_t s = resolveStream(device_id, stream);
+        if (!s)
+            return false;
+
+        if (bufs.publication_valid &&
+            bufs.producer_stream != stream)
+        {
+            HIP_CHECK_OR_THROW(hipStreamWaitEvent(
+                s,
+                static_cast<hipEvent_t>(bufs.ready_event),
+                0));
+        }
 
         // Upload penalty data to device
         HIP_CHECK_OR_THROW(hipMemcpyAsync(bufs.token_ids_ptr, token_ids_host,
@@ -2338,7 +2420,11 @@ namespace llaminar2
             return false;
         }
 
-        HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
+        HIP_CHECK_OR_THROW(hipEventRecord(
+            static_cast<hipEvent_t>(bufs.ready_event),
+            s));
+        bufs.producer_stream = stream;
+        bufs.publication_valid = true;
         return true;
     }
 
@@ -2426,12 +2512,9 @@ namespace llaminar2
         }
 
         hipError_t err = hipDeviceSynchronize();
-        if (err == hipErrorStreamCaptureUnsupported ||
-            err == hipErrorStreamCaptureImplicit)
-        {
-            // Benign: graph capture is active on this device — skip sync.
-            return true;
-        }
+        if (err != hipSuccess)
+            LOG_ERROR("[ROCmBackend::synchronize] hipDeviceSynchronize failed: "
+                      << hipGetErrorString(err));
         return (err == hipSuccess);
     }
 

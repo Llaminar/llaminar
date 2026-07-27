@@ -1,4 +1,5 @@
 #include "loaders/GPUVramPreflight.h"
+#include "loaders/GPUHostLoadPreflight.h"
 
 #include <gtest/gtest.h>
 
@@ -60,5 +61,67 @@ namespace llaminar2::test
     TEST(Test__GPUVramPreflight, GpuDirectRebalanceUsesSmallRuntimeMargin)
     {
         EXPECT_EQ(gpuDirectRebalanceVramSafetyMarginBytes(), 16ULL * kMiB);
+    }
+
+    TEST(Test__GPUVramPreflight, MappedGpuLoadUsesBoundedPinnedWorkingSet)
+    {
+        const size_t model_bytes = 8ULL * 1024ULL * kMiB;
+        const size_t staging_bytes = 512ULL * kMiB;
+
+        EXPECT_EQ(
+            gpuHostLoadWorkingSetBytes(
+                model_bytes,
+                /*target_is_gpu=*/true,
+                /*uses_mmap=*/true,
+                staging_bytes),
+            staging_bytes);
+    }
+
+    TEST(Test__GPUVramPreflight, BoundedRingDoesNotInflateSmallModels)
+    {
+        const size_t model_bytes = 128ULL * kMiB;
+        const size_t staging_bytes = 512ULL * kMiB;
+
+        EXPECT_EQ(
+            gpuHostLoadWorkingSetBytes(
+                model_bytes,
+                /*target_is_gpu=*/true,
+                /*uses_mmap=*/true,
+                staging_bytes),
+            model_bytes);
+    }
+
+    TEST(Test__GPUVramPreflight, CpuAndNonMappedLoadsRequireFullEagerBytes)
+    {
+        const size_t model_bytes = 8ULL * 1024ULL * kMiB;
+        const size_t staging_bytes = 512ULL * kMiB;
+
+        EXPECT_EQ(
+            gpuHostLoadWorkingSetBytes(
+                model_bytes,
+                /*target_is_gpu=*/false,
+                /*uses_mmap=*/true,
+                staging_bytes),
+            model_bytes);
+        EXPECT_EQ(
+            gpuHostLoadWorkingSetBytes(
+                model_bytes,
+                /*target_is_gpu=*/true,
+                /*uses_mmap=*/false,
+                staging_bytes),
+            model_bytes);
+    }
+
+    TEST(Test__GPUVramPreflight, ZeroBudgetPreservesExplicitUnlimitedMode)
+    {
+        const size_t model_bytes = 8ULL * 1024ULL * kMiB;
+
+        EXPECT_EQ(
+            gpuHostLoadWorkingSetBytes(
+                model_bytes,
+                /*target_is_gpu=*/true,
+                /*uses_mmap=*/true,
+                /*staging_budget_bytes=*/0),
+            model_bytes);
     }
 } // namespace llaminar2::test

@@ -103,28 +103,6 @@ namespace llaminar2
             (void)hipHostFree(h_token_ids_);
             h_token_ids_ = nullptr;
         }
-
-        std::lock_guard<std::mutex> lock(canary_mutex_);
-        for (auto &entry : canary_by_device_)
-        {
-            auto &buf = entry.second;
-            if (!buf.base)
-            {
-                continue;
-            }
-
-            try
-            {
-                (void)HipDeviceGuard::setDevice(entry.first);
-                (void)hipFree(buf.base);
-            }
-            catch (...)
-            {
-                // Best-effort cleanup in destructor.
-            }
-
-            buf = DebugCanaryBuffer{};
-        }
     }
 
     void ROCmEmbeddingKernelT::setGPUStream(void *stream)
@@ -732,7 +710,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (sync_embedding_stage)
+            if (allow_sync_embedding_stage)
             {
                 hipError_t sync_err = hipStreamSynchronize(stream);
                 if (sync_err != hipSuccess)
@@ -806,10 +784,6 @@ namespace llaminar2
         // --- Quantized path: consume model-owned prepared EmbedQ8 weights ---
         if (dynamic_cast<const IINT8Unpackable *>(embed_table))
         {
-            constexpr size_t kCanaryGuardBytes = 64 * 1024;
-            constexpr unsigned char kCanaryPrePattern = 0xA5;
-            constexpr unsigned char kCanaryPostPattern = 0x5A;
-
             const DeviceId dev_id = DeviceId::rocm(dev);
             const PreparedEmbeddingHandle *prepared = prepared_embedding_handle_;
             const bool prepared_matches =
@@ -887,62 +861,7 @@ namespace llaminar2
                               << " in_local_range=" << (in_local_range ? 1 : 0));
                 }
             }
-            const size_t output_bytes = static_cast<size_t>(num_tokens) * static_cast<size_t>(d_model) * sizeof(float);
-            const bool use_dev0_canary = validate_gpu_ptrs && (dev == 0) && !capture_active;
-            float *kernel_output = d_output;
-            void *canary_base = nullptr;
-
-            if (use_dev0_canary)
-            {
-                std::lock_guard<std::mutex> lock(canary_mutex_);
-                auto &canary = canary_by_device_[dev];
-                const size_t required_total = output_bytes + (2 * kCanaryGuardBytes);
-
-                if (!canary.base || canary.total_bytes < required_total || canary.payload_bytes < output_bytes)
-                {
-                    if (canary.base)
-                    {
-                        (void)hipFree(canary.base);
-                        canary = DebugCanaryBuffer{};
-                    }
-
-                    void *new_base = nullptr;
-                    err = hipMalloc(&new_base, required_total);
-                    if (err != hipSuccess)
-                    {
-                        LOG_ERROR("[ROCmEmbeddingKernelT] Failed to allocate EmbedQ8 canary buffer: "
-                                  << hipGetErrorString(err) << " bytes=" << required_total << " dev=" << dev);
-                        return false;
-                    }
-
-                    canary.base = new_base;
-                    canary.guard_bytes = kCanaryGuardBytes;
-                    canary.payload_bytes = output_bytes;
-                    canary.total_bytes = required_total;
-                    canary.payload = reinterpret_cast<float *>(static_cast<unsigned char *>(new_base) + kCanaryGuardBytes);
-                }
-
-                canary_base = canary.base;
-                kernel_output = canary.payload;
-
-                err = hipMemsetAsync(canary_base, kCanaryPrePattern, kCanaryGuardBytes, stream);
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to init pre-guard: " << hipGetErrorString(err));
-                    return false;
-                }
-                err = hipMemsetAsync(static_cast<unsigned char *>(canary_base) + kCanaryGuardBytes + output_bytes,
-                                     kCanaryPostPattern,
-                                     kCanaryGuardBytes,
-                                     stream);
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to init post-guard: " << hipGetErrorString(err));
-                    return false;
-                }
-            }
-
-            err = hipOps_embedding_q8(d_embed_q8, d_token_ids, kernel_output,
+            err = hipOps_embedding_q8(d_embed_q8, d_token_ids, d_output,
                                       num_tokens, d_model,
                                       static_cast<int>(blocks_per_row),
                                       local_vocab_size,
@@ -970,90 +889,12 @@ namespace llaminar2
                 return false;
             }
 
-            if (use_dev0_canary)
-            {
-                hipError_t sync_err = hipStreamSynchronize(stream);
-                if (sync_err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 canary sync failed: "
-                              << hipGetErrorString(sync_err));
-                    ROCmBackend::dumpRecentPointerEvents(64);
-                    return false;
-                }
-
-                std::vector<unsigned char> pre(kCanaryGuardBytes);
-                std::vector<unsigned char> post(kCanaryGuardBytes);
-
-                err = hipMemcpyAsync(pre.data(), canary_base, kCanaryGuardBytes, hipMemcpyDeviceToHost,
-                                     static_cast<hipStream_t>(getStream()));
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to read pre-guard: " << hipGetErrorString(err));
-                    return false;
-                }
-                err = hipMemcpyAsync(post.data(), static_cast<unsigned char *>(canary_base) + kCanaryGuardBytes + output_bytes,
-                                     kCanaryGuardBytes, hipMemcpyDeviceToHost,
-                                     static_cast<hipStream_t>(getStream()));
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to read post-guard: " << hipGetErrorString(err));
-                    return false;
-                }
-                // Synchronize to ensure canary data is available on host
-                (void)hipStreamSynchronize(static_cast<hipStream_t>(getStream()));
-
-                auto find_mismatch = [](const std::vector<unsigned char> &buf, unsigned char expected) -> size_t
-                {
-                    for (size_t i = 0; i < buf.size(); ++i)
-                    {
-                        if (buf[i] != expected)
-                        {
-                            return i;
-                        }
-                    }
-                    return static_cast<size_t>(-1);
-                };
-
-                const size_t pre_bad = find_mismatch(pre, kCanaryPrePattern);
-                const size_t post_bad = find_mismatch(post, kCanaryPostPattern);
-                if (pre_bad != static_cast<size_t>(-1) || post_bad != static_cast<size_t>(-1))
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 canary corruption detected"
-                              << " dev=" << dev
-                              << " pre_bad=" << ((pre_bad == static_cast<size_t>(-1)) ? -1 : static_cast<int>(pre_bad))
-                              << " post_bad=" << ((post_bad == static_cast<size_t>(-1)) ? -1 : static_cast<int>(post_bad))
-                              << " d_output=" << static_cast<void *>(d_output)
-                              << " kernel_output=" << static_cast<void *>(kernel_output));
-                    ROCmBackend::dumpRecentPointerEvents(64);
-                    return false;
-                }
-
-                err = hipMemcpyAsync(d_output, kernel_output, output_bytes, hipMemcpyDeviceToDevice, stream);
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to copy canary payload to output: "
-                              << hipGetErrorString(err));
-                    return false;
-                }
-            }
-
             if (allow_sync_embedding_stage)
             {
                 hipError_t sync_err = hipStreamSynchronize(stream);
                 if (sync_err != hipSuccess)
                 {
                     LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 stream sync failed: "
-                              << hipGetErrorString(sync_err));
-                    ROCmBackend::dumpRecentPointerEvents(64);
-                    return false;
-                }
-            }
-            else if (use_dev0_canary)
-            {
-                hipError_t sync_err = hipStreamSynchronize(stream);
-                if (sync_err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 post-copy sync failed: "
                               << hipGetErrorString(sync_err));
                     ROCmBackend::dumpRecentPointerEvents(64);
                     return false;

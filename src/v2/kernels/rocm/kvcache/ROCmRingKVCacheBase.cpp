@@ -2,13 +2,14 @@
  * @file ROCmRingKVCacheBase.cpp
  * @brief Implementation of ROCmRingKVCacheBase common ring buffer operations
  *
- * Uses HIP runtime API for device param allocation (hipMalloc, hipFree,
- * hipHostMalloc, hipHostFree). No custom kernels — just memory management
- * and host-side bookkeeping.
+ * Device sequence metadata is allocated through the canonical ROCm backend.
+ * No custom kernels are defined here.
  */
 
 #include "ROCmRingKVCacheBase.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../backends/GPUDeviceContextPool.h"
+#include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
@@ -58,6 +59,45 @@ namespace llaminar2
         int max_seq_len,
         hipStream_t stream);
 
+    extern "C" bool hip_kv_sequence_state_checkpoint_capture(
+        const int *d_heads,
+        const int *d_counts,
+        int *checkpoint,
+        int n_layers,
+        int batch_size,
+        int seq_idx,
+        hipStream_t stream);
+
+    extern "C" bool hip_kv_sequence_state_checkpoint_restore(
+        int *d_heads,
+        int *d_counts,
+        const int *checkpoint,
+        int n_layers,
+        int batch_size,
+        int seq_idx,
+        hipStream_t stream);
+
+    extern "C" bool hip_kv_sequence_state_truncate(
+        int *d_heads,
+        int *d_counts,
+        int n_layers,
+        int batch_size,
+        int seq_idx,
+        int cached_tokens,
+        int max_seq_len,
+        hipStream_t stream);
+
+    extern "C" bool hip_kv_sequence_state_evict_oldest(
+        int *d_heads,
+        int *d_counts,
+        int n_layers,
+        int batch_size,
+        int layer,
+        int seq_idx,
+        int num_tokens,
+        int max_seq_len,
+        hipStream_t stream);
+
     // =========================================================================
     // Construction / Destruction
     // =========================================================================
@@ -81,6 +121,32 @@ namespace llaminar2
         freeDeviceParams();
     }
 
+    bool ROCmRingKVCacheBase::activateOwningDevice(
+        const char *operation,
+        std::string *error) const
+    {
+        /*
+         * This is an execution boundary rather than an inner kernel loop.
+         * Force the runtime selection so direct HIP callers cannot leave the
+         * thread-local HipDeviceGuard cache disagreeing with the HIP runtime.
+         */
+        const hipError_t status = static_cast<hipError_t>(
+            HipDeviceGuard::forceSetDevice(device_id_));
+        if (status == hipSuccess)
+            return true;
+
+        const std::string message =
+            std::string("ROCm KV ") +
+            (operation && operation[0] != '\0' ? operation : "device operation") +
+            " could not activate owning device " +
+            std::to_string(device_id_) + ": " +
+            hipGetErrorString(status);
+        if (error)
+            *error = message;
+        LOG_ERROR("[ROCmRingKVCacheBase] " << message);
+        return false;
+    }
+
     // =========================================================================
     // Graph Capture Device Params Management
     // =========================================================================
@@ -93,49 +159,40 @@ namespace llaminar2
             // All-GDN hybrid caches have no FA ring metadata to publish.
             return;
         }
-        hipError_t err = hipMalloc(&d_head_params_, num_entries * sizeof(int));
-        if (err != hipSuccess)
-        {
-            LOG_WARN("[ROCmRingKVCacheBase] Failed to allocate device head params: "
-                     << hipGetErrorString(err) << " - graph capture disabled");
-            d_head_params_ = nullptr;
+        if (!activateOwningDevice("device-parameter allocation"))
             return;
+
+        auto *backend = getROCmBackend();
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "[ROCmRingKVCacheBase] ROCm backend unavailable during metadata allocation");
         }
 
-        err = hipMalloc(&d_count_params_, num_entries * sizeof(int));
-        if (err != hipSuccess)
+        const size_t metadata_bytes =
+            static_cast<size_t>(num_entries) * sizeof(int);
+        d_head_params_ =
+            static_cast<int *>(backend->allocate(metadata_bytes, device_id_));
+        d_count_params_ =
+            static_cast<int *>(backend->allocate(metadata_bytes, device_id_));
+        if (!d_head_params_ || !d_count_params_)
         {
-            LOG_WARN("[ROCmRingKVCacheBase] Failed to allocate device count params: "
-                     << hipGetErrorString(err) << " - device-resident KV sequence publication disabled");
             freeDeviceParams();
-            return;
+            throw std::runtime_error(
+                "[ROCmRingKVCacheBase] Failed to allocate mandatory device sequence metadata");
         }
 
         hipStream_t init_stream = static_cast<hipStream_t>(
             GPUDeviceContextPool::instance().getAMDContext(device_id_).defaultStream());
-        err = hipMemsetAsync(d_head_params_, 0, num_entries * sizeof(int), init_stream);
-        if (err != hipSuccess)
+        if (!init_stream ||
+            !backend->memset(
+                d_head_params_, 0, metadata_bytes, device_id_, init_stream) ||
+            !backend->memset(
+                d_count_params_, 0, metadata_bytes, device_id_, init_stream))
         {
-            LOG_WARN("[ROCmRingKVCacheBase] Failed to initialize device head params: "
-                     << hipGetErrorString(err) << " - graph capture disabled");
             freeDeviceParams();
-            return;
-        }
-        err = hipMemsetAsync(d_count_params_, 0, num_entries * sizeof(int), init_stream);
-        if (err != hipSuccess)
-        {
-            LOG_WARN("[ROCmRingKVCacheBase] Failed to initialize device count params: "
-                     << hipGetErrorString(err) << " - graph capture disabled");
-            freeDeviceParams();
-            return;
-        }
-        err = hipStreamSynchronize(init_stream);
-        if (err != hipSuccess)
-        {
-            LOG_WARN("[ROCmRingKVCacheBase] Failed to synchronize device param initialization: "
-                     << hipGetErrorString(err) << " - graph capture disabled");
-            freeDeviceParams();
-            return;
+            throw std::runtime_error(
+                "[ROCmRingKVCacheBase] Failed to initialize mandatory device sequence metadata");
         }
         LOG_DEBUG("[ROCmRingKVCacheBase] Allocated device params for graph capture: "
                   << num_entries << " entries (" << num_entries * sizeof(int) * 2 << " bytes)");
@@ -143,22 +200,20 @@ namespace llaminar2
 
     void ROCmRingKVCacheBase::freeDeviceParams()
     {
+        auto *backend = getROCmBackend();
+        if ((d_head_params_ || d_count_params_) && !backend)
+        {
+            throw std::runtime_error(
+                "[ROCmRingKVCacheBase] ROCm backend unavailable during metadata release");
+        }
         if (d_head_params_)
         {
-            hipError_t err = hipFree(d_head_params_);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: hipFree(d_head_params_) failed: %s\n", hipGetErrorString(err));
-            }
+            backend->free(d_head_params_, device_id_);
             d_head_params_ = nullptr;
         }
         if (d_count_params_)
         {
-            hipError_t err = hipFree(d_count_params_);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: hipFree(d_count_params_) failed: %s\n", hipGetErrorString(err));
-            }
+            backend->free(d_count_params_, device_id_);
             d_count_params_ = nullptr;
         }
         std::fill(
@@ -202,6 +257,40 @@ namespace llaminar2
         return state;
     }
 
+    bool ROCmRingKVCacheBase::truncateSequence(
+        int seq_idx,
+        int cached_tokens,
+        void *stream)
+    {
+        if (!stream ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            cached_tokens < 0 || cached_tokens > max_seq_len_ ||
+            !d_head_params_ || !d_count_params_)
+        {
+            return false;
+        }
+        if (!activateOwningDevice("sequence-state truncation"))
+            return false;
+
+        if (!hip_kv_sequence_state_truncate(
+                d_head_params_,
+                d_count_params_,
+                n_layers_,
+                batch_size_,
+                seq_idx,
+                cached_tokens,
+                max_seq_len_,
+                static_cast<hipStream_t>(stream)))
+        {
+            return false;
+        }
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            onClearSequence(layer, seq_idx);
+        }
+        return true;
+    }
+
     bool ROCmRingKVCacheBase::observeDeviceSequenceState(
         int layer,
         int seq_idx,
@@ -218,7 +307,9 @@ namespace llaminar2
             return false;
         }
 
-        (void)hipSetDevice(device_id_);
+        if (!activateOwningDevice("sequence-state observation"))
+            return false;
+
         const int index = layer * batch_size_ + seq_idx;
         int head = 0;
         int count = 0;
@@ -349,6 +440,106 @@ namespace llaminar2
         return &d_head_params_[idx];
     }
 
+    size_t ROCmRingKVCacheBase::deviceSequenceStateCheckpointBytes() const
+    {
+        if (!d_head_params_ || !d_count_params_ || n_layers_ <= 0)
+            return 0;
+        return sizeof(int32_t) * static_cast<size_t>(n_layers_) * 2u;
+    }
+
+    bool ROCmRingKVCacheBase::captureDeviceSequenceStateCheckpoint(
+        int seq_idx,
+        void *checkpoint_device,
+        size_t checkpoint_bytes,
+        void *stream,
+        std::string *error) const
+    {
+        const size_t required_bytes = deviceSequenceStateCheckpointBytes();
+        if (!checkpoint_device || !stream ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            required_bytes == 0 || checkpoint_bytes < required_bytes)
+        {
+            if (error)
+            {
+                *error =
+                    "invalid ROCm device sequence-state checkpoint capture request";
+            }
+            return false;
+        }
+        if (!activateOwningDevice(
+                "device sequence-state checkpoint capture",
+                error))
+        {
+            return false;
+        }
+
+        const bool enqueued = hip_kv_sequence_state_checkpoint_capture(
+            d_head_params_,
+            d_count_params_,
+            static_cast<int *>(checkpoint_device),
+            n_layers_,
+            batch_size_,
+            seq_idx,
+            static_cast<hipStream_t>(stream));
+        if (!enqueued && error)
+        {
+            *error =
+                "failed to enqueue ROCm device sequence-state checkpoint capture";
+        }
+        return enqueued;
+    }
+
+    bool ROCmRingKVCacheBase::restoreDeviceSequenceStateCheckpoint(
+        int seq_idx,
+        const void *checkpoint_device,
+        size_t checkpoint_bytes,
+        void *stream,
+        std::string *error)
+    {
+        const size_t required_bytes = deviceSequenceStateCheckpointBytes();
+        if (!checkpoint_device || !stream ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            required_bytes == 0 || checkpoint_bytes < required_bytes)
+        {
+            if (error)
+            {
+                *error =
+                    "invalid ROCm device sequence-state checkpoint restore request";
+            }
+            return false;
+        }
+        if (!activateOwningDevice(
+                "device sequence-state checkpoint restore",
+                error))
+        {
+            return false;
+        }
+
+        const bool enqueued = hip_kv_sequence_state_checkpoint_restore(
+            d_head_params_,
+            d_count_params_,
+            static_cast<const int *>(checkpoint_device),
+            n_layers_,
+            batch_size_,
+            seq_idx,
+            static_cast<hipStream_t>(stream));
+        if (!enqueued)
+        {
+            if (error)
+            {
+                *error =
+                    "failed to enqueue ROCm device sequence-state checkpoint restore";
+            }
+            return false;
+        }
+
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            onClearSequence(layer, seq_idx);
+        }
+        return true;
+    }
+
     const int *ROCmRingKVCacheBase::deviceDynamicAppendCountPtr(int layer, int seq_idx) const
     {
         if (!validLayerSeq(layer, seq_idx) || append_count_sources_.empty())
@@ -373,12 +564,44 @@ namespace llaminar2
             count < 0 ||
             count > max_seq_len_)
             return false;
+        if (!activateOwningDevice("sequence-state replacement"))
+            return false;
+
         const int idx = layer * batch_size_ + seq_idx;
         return hip_kv_sequence_state_set(
             &d_head_params_[idx],
             &d_count_params_[idx],
             head,
             count,
+            max_seq_len_,
+            static_cast<hipStream_t>(gpu_stream));
+    }
+
+    bool ROCmRingKVCacheBase::evictOldestDeviceSequenceState(
+        int layer,
+        int seq_idx,
+        int num_tokens,
+        void *gpu_stream)
+    {
+        if (!validLayerSeq(layer, seq_idx) ||
+            num_tokens < 0 ||
+            !gpu_stream ||
+            !d_head_params_ ||
+            !d_count_params_)
+        {
+            return false;
+        }
+        if (!activateOwningDevice("oldest-sequence-state eviction"))
+            return false;
+
+        return hip_kv_sequence_state_evict_oldest(
+            d_head_params_,
+            d_count_params_,
+            n_layers_,
+            batch_size_,
+            layer,
+            seq_idx,
+            num_tokens,
             max_seq_len_,
             static_cast<hipStream_t>(gpu_stream));
     }
@@ -412,6 +635,12 @@ namespace llaminar2
                 *error =
                     "ROCm KV device sequence-state publication request exceeds batch size";
             }
+            return false;
+        }
+        if (!activateOwningDevice(
+                "device sequence-state publication",
+                error))
+        {
             return false;
         }
 

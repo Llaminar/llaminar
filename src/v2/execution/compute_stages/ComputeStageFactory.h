@@ -29,7 +29,6 @@
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/MoEExpertComputeStage.h"
 #include "stages/MoEExpertDispatchStage.h"
-#include "stages/MoERoutedExpertPartialReduceStage.h"
 #include "stages/MoELocalExpertStage.h"
 #include "stages/MoESparseDispatchStage.h"
 #include "stages/MoESparseReturnReduceStage.h"
@@ -211,12 +210,6 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createMoEExpertDispatch(
             const MoEExpertDispatchStage::Params &params);
-
-        /**
-         * @brief Create a cross-domain routed partial reduce stage
-         */
-        static std::unique_ptr<IComputeStage> createMoERoutedExpertPartialReduce(
-            const MoERoutedExpertPartialReduceStage::Params &params);
 
         static std::unique_ptr<IComputeStage> createMoESparseDispatch(
             const MoESparseDispatchStage::Params &params);

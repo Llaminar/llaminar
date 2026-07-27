@@ -153,6 +153,21 @@ class ProfilerPredictionSurface(
     def __len__(self) -> int:
         return len(self.inventory.points)
 
+    def contains_only_finite(
+        self,
+        points: Iterable[tuple[RuntimeKey, str, str]],
+    ) -> bool:
+        """Check an arbitrary point subset with one vectorized memmap read."""
+
+        try:
+            row_indices = np.fromiter(
+                (self.inventory.rows[point] for point in points),
+                dtype=np.int64,
+            )
+        except KeyError:
+            return False
+        return bool(np.all(np.isfinite(self.values[row_indices])))
+
 
 @lru_cache(maxsize=512)
 def _profiler_prediction_point_inventory(
@@ -185,6 +200,52 @@ def _profiler_prediction_point_inventory(
     return _ProfilerPredictionPointInventory(
         points=ordered,
         digest="sha256:" + digest.hexdigest(),
+    )
+
+
+def _profiler_inventory_rank_bytes(
+    points: frozenset[tuple[RuntimeKey, str, str]],
+    inventory: _ProfilerPredictionPointInventory,
+) -> bytes:
+    """Encode canonical row numbers in the inherited set iteration order.
+
+    Fork workers and their parent share the exact immutable ``frozenset`` and
+    Python hash seed. Returning one uint32 row number per inherited point is
+    substantially smaller than pickling the sorted runtime-key objects, while
+    still allowing the parent to reconstruct the worker-authenticated order in
+    linear time without repeating Python comparison and JSON hashing work.
+    """
+
+    if len(inventory.points) >= 2**32:
+        raise ValueError("profiler prediction inventory exceeds uint32 rows")
+    return np.fromiter(
+        (inventory.rows[point] for point in points),
+        dtype="<u4",
+        count=len(points),
+    ).tobytes(order="C")
+
+
+def _profiler_inventory_from_rank_bytes(
+    points: frozenset[tuple[RuntimeKey, str, str]],
+    digest: str,
+    encoded_ranks: bytes,
+) -> _ProfilerPredictionPointInventory:
+    """Reconstruct a worker-authenticated canonical inventory in O(points)."""
+
+    ranks = np.frombuffer(encoded_ranks, dtype="<u4")
+    if len(ranks) != len(points):
+        raise ValueError("profiler prediction rank payload changed point count")
+    ordered: list[tuple[RuntimeKey, str, str] | None] = [None] * len(points)
+    for point, rank_value in zip(points, ranks, strict=True):
+        rank = int(rank_value)
+        if rank >= len(ordered) or ordered[rank] is not None:
+            raise ValueError("profiler prediction rank payload is not a permutation")
+        ordered[rank] = point
+    if any(point is None for point in ordered):
+        raise ValueError("profiler prediction rank payload omitted a point")
+    return _ProfilerPredictionPointInventory(
+        points=tuple(point for point in ordered if point is not None),
+        digest=digest,
     )
 
 
@@ -2330,14 +2391,20 @@ class PolicyFitCache:
         held_out_geometries: Iterable[tuple[int, int]],
         prediction_points: Iterable[ProfilerPredictionPoint],
         authenticate_values: bool = True,
+        point_inventory: _ProfilerPredictionPointInventory | None = None,
     ) -> Mapping[ProfilerPredictionPoint, float | None] | None:
-        """Load one exact profiler surface and reject partial point maps."""
+        """Load one exact profiler surface and reject partial point maps.
+
+        ``point_inventory`` is an internal fast path populated by the parallel
+        cache authenticator. Its digest and cardinality are still checked
+        against the immutable manifest before the values mapping is exposed.
+        """
 
         raw = self._read("profiler-prediction-surface", content_key)
         if raw is None:
             return None
         expected_geometries = tuple(sorted(set(held_out_geometries)))
-        inventory = _profiler_prediction_point_inventory(
+        inventory = point_inventory or _profiler_prediction_point_inventory(
             frozenset(prediction_points)
         )
         if raw.get("training_pool_digest") != training_pool_digest:
@@ -3424,6 +3491,105 @@ def build_domain_candidate_point_costs(
                 mean_surface_regret=statistics.fmean(regrets),
             ))
     return result
+
+
+_PARALLEL_DOMAIN_COST_CORPORA: Mapping[
+    GenericDomain, ObservationCorpus
+] = {}
+_PARALLEL_DOMAIN_COST_DOMAINS: tuple[GenericDomain, ...] = ()
+_PARALLEL_DOMAIN_COST_SERIAL_HASHES: Mapping[RuntimeKey, str] | None = None
+_PARALLEL_DOMAIN_COST_COMPARISONS: Mapping[
+    RuntimeKey, tuple[PairedTimingComparison, ...]
+] | None = None
+_PARALLEL_DOMAIN_COST_SUPPLEMENTAL: Mapping[
+    GenericDomain, tuple[CandidatePointCost, ...]
+] = {}
+
+
+def _build_domain_candidate_costs_at(
+    index: int,
+) -> tuple[GenericDomain, tuple[CandidatePointCost, ...]]:
+    """Build one inherited domain cost matrix without shared mutation."""
+
+    domain = _PARALLEL_DOMAIN_COST_DOMAINS[index]
+    costs = build_domain_candidate_point_costs(
+        _PARALLEL_DOMAIN_COST_CORPORA[domain],
+        domain,
+        serial_m1_hashes=_PARALLEL_DOMAIN_COST_SERIAL_HASHES,
+        paired_comparisons=_PARALLEL_DOMAIN_COST_COMPARISONS,
+    )
+    costs.extend(_PARALLEL_DOMAIN_COST_SUPPLEMENTAL.get(domain, ()))
+    return domain, tuple(costs)
+
+
+def _build_domain_candidate_costs_parallel(
+    domain_corpora: Mapping[GenericDomain, ObservationCorpus],
+    domains: tuple[GenericDomain, ...],
+    *,
+    serial_m1_hashes: Mapping[RuntimeKey, str] | None,
+    paired_comparisons: Mapping[
+        RuntimeKey, tuple[PairedTimingComparison, ...]
+    ] | None,
+    supplemental_costs: Mapping[
+        GenericDomain, tuple[CandidatePointCost, ...]
+    ],
+) -> dict[GenericDomain, list[CandidatePointCost]]:
+    """Build independent cache-miss domains on physical cores.
+
+    Domain corpora are materialized by the parent before forking so lazy
+    providers run exactly once and workers inherit read-only pages. Results are
+    reduced in ``domains`` order; scheduling cannot perturb floating-point row
+    order or cache publication.
+    """
+
+    if not domains:
+        return {}
+    requested_workers = int(os.environ.get(
+        "LLAMINAR_NATIVE_VNNI_POLICY_WORKERS",
+        str(_physical_core_worker_count()),
+    ))
+    if requested_workers < 1:
+        raise ValueError("policy worker count must be positive")
+    row_count = sum(len(domain_corpora[domain]) for domain in domains)
+    worker_count = min(
+        requested_workers,
+        _physical_core_worker_count(),
+        len(domains),
+        max(1, row_count // 4096),
+    )
+
+    global _PARALLEL_DOMAIN_COST_CORPORA
+    global _PARALLEL_DOMAIN_COST_DOMAINS
+    global _PARALLEL_DOMAIN_COST_SERIAL_HASHES
+    global _PARALLEL_DOMAIN_COST_COMPARISONS
+    global _PARALLEL_DOMAIN_COST_SUPPLEMENTAL
+    _PARALLEL_DOMAIN_COST_CORPORA = domain_corpora
+    _PARALLEL_DOMAIN_COST_DOMAINS = domains
+    _PARALLEL_DOMAIN_COST_SERIAL_HASHES = serial_m1_hashes
+    _PARALLEL_DOMAIN_COST_COMPARISONS = paired_comparisons
+    _PARALLEL_DOMAIN_COST_SUPPLEMENTAL = supplemental_costs
+    try:
+        if worker_count > 1:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                built = tuple(executor.map(
+                    _build_domain_candidate_costs_at,
+                    range(len(domains)),
+                ))
+        else:
+            built = tuple(
+                _build_domain_candidate_costs_at(index)
+                for index in range(len(domains))
+            )
+    finally:
+        _PARALLEL_DOMAIN_COST_CORPORA = {}
+        _PARALLEL_DOMAIN_COST_DOMAINS = ()
+        _PARALLEL_DOMAIN_COST_SERIAL_HASHES = None
+        _PARALLEL_DOMAIN_COST_COMPARISONS = None
+        _PARALLEL_DOMAIN_COST_SUPPLEMENTAL = {}
+    return {domain: list(costs) for domain, costs in built}
 
 
 def build_candidate_point_costs(
@@ -5533,6 +5699,16 @@ def _profiler_teacher_surface_is_complete(
 ) -> bool:
     """Check teacher totality without allocating a transformed cost surface."""
 
+    if isinstance(predictions, ProfilerPredictionSurface):
+        return predictions.contains_only_finite(
+            (
+                cost.runtime_key,
+                cost.shape_group_id,
+                cost.candidate_id,
+            )
+            for cost in costs
+        )
+
     for cost in costs:
         value = predictions.get((
             cost.runtime_key,
@@ -7162,11 +7338,17 @@ _PARALLEL_PROFILER_MODEL_RECORD_INDICES: Mapping[
 ] = {}
 _PARALLEL_PROFILER_PREDICTION_POINTS: ProfilerPredictionPointRequests = {}
 _PARALLEL_PROFILER_PERSISTENT_CACHE_TASKS: tuple[tuple, ...] = ()
+_PARALLEL_PROFILER_PERSISTENT_CACHE_GROUPS: tuple[tuple[int, ...], ...] = ()
 _PARALLEL_PROFILER_FIT_CACHE: PolicyFitCache | None = None
 _PARALLEL_PROFILER_STORE_IDENTITIES: Mapping[
     ProfilerPredictionCacheKey, tuple[str, str, str]
 ] = {}
 _PARALLEL_PROFILER_SURROGATE_DEVICE: str | None = None
+_PARALLEL_PROFILER_REQUEST_DOMAINS: tuple[GenericDomain, ...] = ()
+_PARALLEL_PROFILER_REQUEST_COSTS: Mapping[
+    GenericDomain, list[CandidatePointCost]
+] = {}
+_PARALLEL_PROFILER_REQUEST_SEED = ""
 
 
 def _initialize_parallel_profiler_gpu_worker(
@@ -7187,6 +7369,8 @@ def _load_parallel_profiler_prediction_cache_index(
     ProfilerPredictionCacheKey,
     str,
     bool,
+    str | None,
+    bytes | None,
 ]:
     """Hash and load one inherited persistent prediction surface."""
 
@@ -7217,7 +7401,43 @@ def _load_parallel_profiler_prediction_cache_index(
         if load_cached_predictions
         else None
     )
-    return request_key, persistent_key, cached_predictions is not None
+    if cached_predictions is None:
+        return request_key, persistent_key, False, None, None
+    inventory = _profiler_prediction_point_inventory(prediction_points)
+    return (
+        request_key,
+        persistent_key,
+        True,
+        inventory.digest,
+        _profiler_inventory_rank_bytes(prediction_points, inventory),
+    )
+
+
+def _load_parallel_profiler_prediction_cache_group(
+    group_index: int,
+) -> tuple[
+    tuple[
+        int,
+        tuple[
+            ProfilerPredictionCacheKey,
+            str,
+            bool,
+            str | None,
+            bytes | None,
+        ],
+    ], ...
+]:
+    """Resolve cache tasks that share one inherited point inventory.
+
+    All fold surfaces in one domain reference the same immutable frozenset.
+    Keeping those indices in one process lets the process-local inventory LRU
+    pay for sorting and canonical SHA-256 serialization exactly once.
+    """
+
+    return tuple(
+        (task_index, _load_parallel_profiler_prediction_cache_index(task_index))
+        for task_index in _PARALLEL_PROFILER_PERSISTENT_CACHE_GROUPS[group_index]
+    )
 
 
 def _load_persistent_profiler_prediction_cache(
@@ -7246,6 +7466,7 @@ def _load_persistent_profiler_prediction_cache(
     """
 
     global _PARALLEL_PROFILER_PERSISTENT_CACHE_TASKS
+    global _PARALLEL_PROFILER_PERSISTENT_CACHE_GROUPS
     global _PARALLEL_PROFILER_FIT_CACHE
 
     if not request_keys:
@@ -7257,11 +7478,6 @@ def _load_persistent_profiler_prediction_cache(
         ))
     if requested_workers < 1:
         raise ValueError("policy worker count must be positive")
-    worker_count = min(
-        requested_workers,
-        _physical_core_worker_count(),
-        len(request_keys),
-    )
     tasks = tuple(
         (
             request_key,
@@ -7272,18 +7488,44 @@ def _load_persistent_profiler_prediction_cache(
         )
         for request_key in request_keys
     )
+    group_indices_by_inventory: dict[int, list[int]] = {}
+    for index, task in enumerate(tasks):
+        point_inventory_identity = id(task[3])
+        group_indices_by_inventory.setdefault(
+            point_inventory_identity, []
+        ).append(index)
+    groups = tuple(
+        tuple(indices) for indices in group_indices_by_inventory.values()
+    )
+    worker_count = min(
+        requested_workers,
+        _physical_core_worker_count(),
+        len(groups),
+    )
     _PARALLEL_PROFILER_PERSISTENT_CACHE_TASKS = tasks
+    _PARALLEL_PROFILER_PERSISTENT_CACHE_GROUPS = groups
     _PARALLEL_PROFILER_FIT_CACHE = fit_cache
     try:
-        if worker_count > 1 and len(tasks) >= 4:
+        if worker_count > 1 and len(groups) >= 4:
             with ProcessPoolExecutor(
                 max_workers=worker_count,
                 mp_context=multiprocessing.get_context("fork"),
             ) as executor:
-                results = tuple(executor.map(
-                    _load_parallel_profiler_prediction_cache_index,
-                    range(len(tasks)),
+                grouped_results = tuple(executor.map(
+                    _load_parallel_profiler_prediction_cache_group,
+                    range(len(groups)),
                 ))
+            ordered_results = [None] * len(tasks)
+            for group_result in grouped_results:
+                for task_index, result in group_result:
+                    ordered_results[task_index] = result
+            if any(result is None for result in ordered_results):
+                raise RuntimeError(
+                    "parallel profiler cache resolution omitted a task"
+                )
+            results = tuple(
+                result for result in ordered_results if result is not None
+            )
         else:
             results = tuple(
                 _load_parallel_profiler_prediction_cache_index(index)
@@ -7291,21 +7533,43 @@ def _load_persistent_profiler_prediction_cache(
             )
     finally:
         _PARALLEL_PROFILER_PERSISTENT_CACHE_TASKS = ()
+        _PARALLEL_PROFILER_PERSISTENT_CACHE_GROUPS = ()
         _PARALLEL_PROFILER_FIT_CACHE = None
 
     persistent_keys = {}
     cache_hits = 0
-    for request_key, persistent_key, cache_hit in results:
+    inventories_by_points = {}
+    for (
+        request_key,
+        persistent_key,
+        cache_hit,
+        inventory_digest,
+        inventory_ranks,
+    ) in results:
         persistent_keys[request_key] = persistent_key
         if cache_hit:
             pool_key, held_out_geometries = request_key
+            prediction_points = prediction_points_by_request[request_key]
+            inventory = inventories_by_points.get(prediction_points)
+            if inventory is None:
+                if inventory_digest is None or inventory_ranks is None:
+                    raise RuntimeError(
+                        "profiler prediction cache hit omitted its inventory"
+                    )
+                inventory = _profiler_inventory_from_rank_bytes(
+                    prediction_points,
+                    inventory_digest,
+                    inventory_ranks,
+                )
+                inventories_by_points[prediction_points] = inventory
             cached_predictions = fit_cache.load_profiler_predictions(
                 persistent_key,
                 training_pool_digest=training_pool_digests[pool_key],
                 profiler_model_digest=profiler_model_digests[pool_key],
                 held_out_geometries=held_out_geometries,
-                prediction_points=prediction_points_by_request[request_key],
+                prediction_points=prediction_points,
                 authenticate_values=False,
+                point_inventory=inventory,
             )
             if cached_predictions is None:
                 raise RuntimeError(
@@ -7381,6 +7645,82 @@ def _domain_profiler_prediction_requests(
         request_key = (pool_key, tuple(sorted(held_out_geometries)))
         requests[request_key] = requested_points
     return requests
+
+
+def _domain_profiler_prediction_requests_at(
+    index: int,
+) -> tuple[
+    GenericDomain,
+    dict[ProfilerPredictionCacheKey, frozenset[ProfilerPredictionPoint]],
+]:
+    """Build one domain's inherited profiler prediction inventory."""
+
+    domain = _PARALLEL_PROFILER_REQUEST_DOMAINS[index]
+    return domain, _domain_profiler_prediction_requests(
+        domain,
+        _PARALLEL_PROFILER_REQUEST_COSTS[domain],
+        seed=_PARALLEL_PROFILER_REQUEST_SEED,
+    )
+
+
+def _build_domain_profiler_prediction_requests_parallel(
+    domains: tuple[GenericDomain, ...],
+    costs: Mapping[GenericDomain, list[CandidatePointCost]],
+    *,
+    seed: str,
+) -> dict[
+    GenericDomain,
+    dict[ProfilerPredictionCacheKey, frozenset[ProfilerPredictionPoint]],
+]:
+    """Build independent fold inventories across physical CPU cores.
+
+    Each domain owns disjoint candidate rows, so its point-set hashing and
+    held-geometry fold scans are independent. Fork workers inherit the large
+    immutable cost matrices without serializing them on submission. Ordered
+    ``map`` reduction preserves the domain and fold order used by the serial
+    implementation, including shared frozenset identity within each domain.
+    """
+
+    if not domains:
+        return {}
+    requested_workers = int(os.environ.get(
+        "LLAMINAR_NATIVE_VNNI_POLICY_WORKERS",
+        str(_physical_core_worker_count()),
+    ))
+    if requested_workers < 1:
+        raise ValueError("policy worker count must be positive")
+    worker_count = min(
+        requested_workers,
+        _physical_core_worker_count(),
+        len(domains),
+    )
+
+    global _PARALLEL_PROFILER_REQUEST_DOMAINS
+    global _PARALLEL_PROFILER_REQUEST_COSTS
+    global _PARALLEL_PROFILER_REQUEST_SEED
+    _PARALLEL_PROFILER_REQUEST_DOMAINS = domains
+    _PARALLEL_PROFILER_REQUEST_COSTS = costs
+    _PARALLEL_PROFILER_REQUEST_SEED = seed
+    try:
+        if worker_count > 1:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                results = tuple(executor.map(
+                    _domain_profiler_prediction_requests_at,
+                    range(len(domains)),
+                ))
+        else:
+            results = tuple(
+                _domain_profiler_prediction_requests_at(index)
+                for index in range(len(domains))
+            )
+    finally:
+        _PARALLEL_PROFILER_REQUEST_DOMAINS = ()
+        _PARALLEL_PROFILER_REQUEST_COSTS = {}
+        _PARALLEL_PROFILER_REQUEST_SEED = ""
+    return dict(results)
 
 
 def _fit_profiler_prediction_pool(
@@ -7963,6 +8303,7 @@ def fit_generic_policy(
     ] = {}
     validation_cache_hits = 0
     validation_incremental_hits = 0
+    validation_leaf_budget_hits = 0
     cache_identity_inputs = {
         domain: (
             paired_domain_digest,
@@ -8156,6 +8497,7 @@ def fit_generic_policy(
                 )
             )
             loaded_validation_key = validation_key if hit else None
+            loaded_validation_is_leaf_budget_predecessor = False
             incremental_hit = False
             if not hit and len(fit_feature_policies) > 1:
                 # Feature expansion is monotonic. Probe every one-family-smaller
@@ -8239,6 +8581,80 @@ def fit_generic_policy(
                     incremental_hit = True
                     break
 
+            if not hit and not incremental_hit and max_leaves > 1:
+                # A leaf budget is an upper bound, not a requirement that every
+                # already-promotable domain be searched again at the larger
+                # complexity. Probe smaller reviewed budgets from nearest to
+                # smallest and retain a complete, promotable incumbent. Domains
+                # that were structurally incomplete or missed the current
+                # promotion threshold continue into the expanded tournament.
+                #
+                # This is the important incremental path for heterogeneous
+                # format inventories: adding one split for the handful of
+                # domains that need it must not repay CV for every domain whose
+                # one-leaf rule is already certified.
+                for predecessor_max_leaves in range(max_leaves - 1, 0, -1):
+                    predecessor_key = fit_cache.validation_key(
+                        domain,
+                        cost_key,
+                        max_leaves=predecessor_max_leaves,
+                        min_shape_groups_per_leaf=min_shape_groups_per_leaf,
+                        cross_validation_seed=cross_validation_seed,
+                        profiler_feature_catalog_digest=(
+                            profiler_model_digest
+                        ),
+                        fit_final_rules=fit_final_rules,
+                        profiler_training_pool_digest=(
+                            profiler_pool_digests.get(domain)
+                        ),
+                        feature_policies=_leaf_budget_feature_policies(
+                            predecessor_max_leaves
+                        ),
+                        boundary_placements=(
+                            _leaf_budget_boundary_placements(
+                                predecessor_max_leaves
+                            )
+                        ),
+                    )
+                    (
+                        predecessor_hit,
+                        predecessor_validation,
+                        predecessor_rules,
+                    ) = fit_cache.load_validation_entry(
+                        predecessor_key,
+                        domain,
+                    )
+                    if (
+                        not predecessor_hit
+                        or predecessor_validation is None
+                        or not domain_cross_validation_has_complete_coverage(
+                            predecessor_validation
+                        )
+                        or not domain_cross_validation_is_promotable(
+                            predecessor_validation
+                        )
+                    ):
+                        continue
+                    if fit_final_rules and predecessor_rules is None:
+                        predecessor_final_fit = fit_cache.load_final_fit(
+                            predecessor_key,
+                            domain,
+                        )
+                        if predecessor_final_fit is not None:
+                            (
+                                predecessor_validation,
+                                predecessor_rules,
+                            ) = predecessor_final_fit
+                    if fit_final_rules and predecessor_rules is None:
+                        continue
+                    hit = True
+                    cached_validation = predecessor_validation
+                    cached_rules = predecessor_rules
+                    loaded_validation_key = predecessor_key
+                    loaded_validation_is_leaf_budget_predecessor = True
+                    validation_leaf_budget_hits += 1
+                    break
+
             if not hit and not incremental_hit:
                 # Current cache generations use model-visible descriptor
                 # identities and a cross-M transfer-pool digest. Cheap/current
@@ -8313,7 +8729,10 @@ def fit_generic_policy(
                     if hit:
                         break
             if hit:
-                if loaded_validation_key != validation_key:
+                if (
+                    loaded_validation_key != validation_key
+                    and not loaded_validation_is_leaf_budget_predecessor
+                ):
                     # Cost-key migrations do not change CV semantics. Publish
                     # the canonical CV address before consulting publication
                     # leaves so subsequent aggregate relabeling is lookup-only.
@@ -8341,7 +8760,10 @@ def fit_generic_policy(
                         )
                     if cached_final_fit is not None:
                         cached_validation, cached_rules = cached_final_fit
-                        if loaded_validation_key != validation_key:
+                        if (
+                            loaded_validation_key != validation_key
+                            and not loaded_validation_is_leaf_budget_predecessor
+                        ):
                             fit_cache.store_final_fit(
                                 validation_key,
                                 domain,
@@ -8404,6 +8826,7 @@ def fit_generic_policy(
         if fit_cache is not None
         else {}
     )
+    uncached_cost_domains = []
     for domain in domains:
         if domain not in domains_requiring_costs:
             cost_cache_bypasses += 1
@@ -8423,14 +8846,22 @@ def fit_generic_policy(
             costs[domain] = cached_costs
             cost_cache_hits += 1
             continue
-        domain_corpus = corpus_for_domain(domain)
-        domain_costs = build_domain_candidate_point_costs(
-            domain_corpus,
-            domain,
-            serial_m1_hashes=serial_m1_hashes,
-            paired_comparisons=runtime_paired_comparisons,
-        )
-        domain_costs.extend(supplemental_costs.get(domain, ()))
+        uncached_cost_domains.append(domain)
+
+    uncached_cost_domains = tuple(uncached_cost_domains)
+    uncached_domain_corpora = {
+        domain: corpus_for_domain(domain)
+        for domain in uncached_cost_domains
+    }
+    built_costs = _build_domain_candidate_costs_parallel(
+        uncached_domain_corpora,
+        uncached_cost_domains,
+        serial_m1_hashes=serial_m1_hashes,
+        paired_comparisons=runtime_paired_comparisons,
+        supplemental_costs=supplemental_costs,
+    )
+    for domain in uncached_cost_domains:
+        domain_costs = built_costs[domain]
         costs[domain] = domain_costs
         if fit_cache is not None:
             fit_cache.store_costs(cost_keys[domain], domain, domain_costs)
@@ -8482,14 +8913,18 @@ def fit_generic_policy(
         ProfilerPredictionCacheKey, frozenset[ProfilerPredictionPoint]
     ] = {}
     if profiler_feature_catalog is not None:
-        for domain in domains:
-            if domain in validations:
-                continue
-            domain_requests = _domain_profiler_prediction_requests(
-                domain,
-                costs.get(domain, []),
+        prediction_request_domains = tuple(
+            domain for domain in domains if domain not in validations
+        )
+        prediction_requests_by_domain = (
+            _build_domain_profiler_prediction_requests_parallel(
+                prediction_request_domains,
+                costs,
                 seed=cross_validation_seed,
             )
+        )
+        for domain in prediction_request_domains:
+            domain_requests = prediction_requests_by_domain[domain]
             profiler_prediction_request_keys.extend(domain_requests)
             for request_key, points in domain_requests.items():
                 existing = profiler_prediction_point_sets.get(request_key)
@@ -8815,6 +9250,8 @@ def fit_generic_policy(
             f"cv_cache_hits={validation_cache_hits}/{len(domains)} "
             "cv_incremental_hits="
             f"{validation_incremental_hits}/{len(domains)} "
+            "cv_leaf_budget_hits="
+            f"{validation_leaf_budget_hits}/{len(domains)} "
             f"final_rule_cache_hits={len(cached_final_rules)}/{len(domains)} "
             f"profiler_model_workers={profiler_model_workers} "
             f"task_construction_workers={task_construction_workers} "

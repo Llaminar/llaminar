@@ -205,6 +205,19 @@ namespace llaminar2
          */
         void logAllocationSummary() const;
 
+        /**
+         * @brief Establish storage for an arena buffer during graph construction.
+         *
+         * This allocation-only operation intentionally has no stream parameter:
+         * it cannot publish a write or establish device authority. Runtime
+         * producers must instead call prepareForWrite() with their exact stream.
+         *
+         * @param id Buffer whose stable GPU address is required.
+         * @param target GPU that will own the allocation.
+         * @return true after storage exists on @p target.
+         */
+        bool allocateDeviceStorage(BufferId id, DeviceId target);
+
         // =====================================================================
         // Runtime coherence (called per-stage by GraphExecutor)
         // =====================================================================
@@ -225,7 +238,7 @@ namespace llaminar2
          *
          * @return true on success
          */
-        bool prepareForWrite(BufferId id, DeviceId target, void *stream = nullptr);
+        bool prepareForWrite(BufferId id, DeviceId target, void *stream);
 
         /**
          * @brief Mark buffer as written on the given device.
@@ -236,7 +249,8 @@ namespace llaminar2
          *
          * @param id      Buffer that was written
          * @param device  Device that now holds authoritative data
-         * @param stream  GPU stream where the kernel ran (nullptr = default)
+         * @param stream  Exact non-null GPU stream where the write was
+         *                enqueued. May be omitted only for CPU writes.
          */
         void markWritten(BufferId id, DeviceId device, void *stream = nullptr);
 
@@ -244,8 +258,9 @@ namespace llaminar2
          * @brief Lightweight mark for graph replay (Phase 3).
          *
          * Updates coherence state and tensor flags without recording
-         * a GPU completion event. Use when the executor will do a
-         * final synchronizeStream() at the end of the step.
+         * a per-tensor GPU completion event. Use only when the graph executor
+         * publishes the replay's graph-level completion event before any
+         * external consumer can observe the tensor.
          *
          * @param id      Buffer that was written
          * @param device  Device that now holds authoritative data

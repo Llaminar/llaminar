@@ -10,6 +10,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 #ifdef HAVE_ROCM
 
@@ -389,7 +390,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, TensorInterface_Basic)
     ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get()));
 
     // Verify output is not all zeros (sanity check)
-    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE); // Ensure sync back from GPU
+    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output);  // Ensure sync back from GPU
     const float *out_data = output->data();
 
     float sum = 0.0f;
@@ -528,8 +529,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedBatchedFusedProjectionAlp
     ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_alpha);
+    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_beta);
     const float *actual_alpha = output_alpha->data();
     const float *actual_beta = output_beta->data();
     std::vector<float> got_alpha(actual_alpha, actual_alpha + M * N);
@@ -653,8 +654,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionVerifierRowsM234
             input.get(), grouped_projections, M, static_cast<int>(K), nullptr, &workspace))
             << "ROCm FP32 grouped verifier projection failed";
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-        output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_alpha);
+        TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_beta);
 
         for (int row = 0; row < M; ++row)
         {
@@ -679,8 +680,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionVerifierRowsM234
                 row_input.get(), serial_projections, 1, static_cast<int>(K), nullptr, &workspace))
                 << "ROCm FP32 serial decode projection failed for row " << row;
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            alpha_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            beta_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishGraphOwnedCurrentDeviceWrite(alpha_serial);
+            TransferEngine::publishGraphOwnedCurrentDeviceWrite(beta_serial);
 
             EXPECT_EQ(
                 std::memcmp(
@@ -819,8 +820,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FP16BF16VerifierRowsM234MatchSerialDec
                 input.get(), grouped_projections, M, static_cast<int>(K), nullptr, &workspace))
                 << "ROCm " << dtype_tag << " grouped verifier projection failed";
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_alpha);
+            TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_beta);
 
             for (int row = 0; row < M; ++row)
             {
@@ -845,8 +846,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FP16BF16VerifierRowsM234MatchSerialDec
                     row_input.get(), beta_serial.get(), 1, static_cast<int>(N), static_cast<int>(K),
                     true, 1.0f, 0.0f, nullptr, nullptr, -1, &workspace));
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-                alpha_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                beta_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishGraphOwnedCurrentDeviceWrite(alpha_serial);
+                TransferEngine::publishGraphOwnedCurrentDeviceWrite(beta_serial);
 
                 EXPECT_EQ(
                     std::memcmp(
@@ -983,7 +984,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FloatingSwiGLUDownVerifierRowsM234Matc
                 1.0f, 0.0f, &workspace))
                 << "ROCm " << dtype_tag << " grouped floating SwiGLU/down failed";
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            grouped_down->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishGraphOwnedCurrentDeviceWrite(grouped_down);
 
             for (int row = 0; row < M; ++row)
             {
@@ -1011,7 +1012,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FloatingSwiGLUDownVerifierRowsM234Matc
                     1.0f, 0.0f, &workspace))
                     << "ROCm " << dtype_tag << " serial floating SwiGLU/down failed for row " << row;
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-                serial_down->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishGraphOwnedCurrentDeviceWrite(serial_down);
 
                 EXPECT_EQ(
                     std::memcmp(
@@ -1138,8 +1139,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedQwen36AlphaBetaM1MatchesR
     ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_alpha);
+    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_beta);
     const float *actual_alpha = output_alpha->data();
     const float *actual_beta = output_beta->data();
     std::vector<float> got_alpha(actual_alpha, actual_alpha + M * N);
@@ -1250,8 +1251,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedQwen36AlphaBetaPrefillM25
     ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_alpha);
+    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_beta);
     const float *actual_alpha = output_alpha->data();
     const float *actual_beta = output_beta->data();
     std::vector<float> got_alpha(actual_alpha, actual_alpha + M * N);
@@ -1360,8 +1361,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionRestagesPointers
         input.get(), projections, static_cast<int>(M), static_cast<int>(K), nullptr, &workspace));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_alpha);
+    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_beta);
     const float *actual_alpha = output_alpha->data();
     const float *actual_beta = output_beta->data();
     std::vector<float> got_alpha(actual_alpha, actual_alpha + M * N);

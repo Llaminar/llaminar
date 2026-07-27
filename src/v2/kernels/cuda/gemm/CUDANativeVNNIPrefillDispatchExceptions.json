@@ -1,6 +1,6 @@
 {
     "_comment": "Manual dispatch overrides for GEMM prefill tile selection.",
-    "_usage": "These entries take priority over sweep-derived dispatch in CUDANativeVNNIPrefillDispatchGenerated.inc.",
+    "_usage": "Offline tuning exceptions consumed by the prefill research generator; production ordinary-prefill dispatch remains heuristic-only.",
     "_fields": {
         "format": "Quantization format name (must match FORMAT_TO_CODEBOOK in codegen script)",
         "m_bin": "M bin value (64, 128, 256, or 512)",

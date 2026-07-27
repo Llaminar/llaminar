@@ -1963,6 +1963,72 @@ set_tests_properties(V2_Unit_MTPPerfStatsSummary PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_ServerGraphCapturePerfPolicy
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_server_graph_capture_perf_policy.py
+)
+set_tests_properties(V2_Unit_ServerGraphCapturePerfPolicy PROPERTIES
+    LABELS "V2;Unit;E2E;Server;GPU;GraphCapture;PerfStats;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_GPUBlockingSynchronizationPolicySelfTest
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_blocking_sync_policy.py
+)
+set_tests_properties(V2_Unit_GPUBlockingSynchronizationPolicySelfTest PROPERTIES
+    LABELS "V2;Unit;GPU;CUDA;ROCm;Synchronization;SourcePolicy;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_GPUBlockingSynchronizationPolicy
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/check_gpu_blocking_sync_policy.py
+            --repo-root ${CMAKE_SOURCE_DIR}/../..
+)
+set_tests_properties(V2_Unit_GPUBlockingSynchronizationPolicy PROPERTIES
+    LABELS "V2;Unit;GPU;CUDA;ROCm;Synchronization;SourcePolicy;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_GPUEventlessPublicationPolicySelfTest
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_eventless_publication_policy.py
+)
+set_tests_properties(V2_Unit_GPUEventlessPublicationPolicySelfTest PROPERTIES
+    LABELS "V2;Unit;GPU;CUDA;ROCm;Synchronization;Coherence;SourcePolicy;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_GPUEventlessPublicationPolicy
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/check_gpu_eventless_publication_policy.py
+            --repo-root ${CMAKE_SOURCE_DIR}/../..
+)
+set_tests_properties(V2_Unit_GPUEventlessPublicationPolicy PROPERTIES
+    LABELS "V2;Unit;GPU;CUDA;ROCm;Synchronization;Coherence;SourcePolicy;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_TensorTransitionEncapsulationPolicySelfTest
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_tensor_transition_encapsulation.py
+)
+set_tests_properties(V2_Unit_TensorTransitionEncapsulationPolicySelfTest PROPERTIES
+    LABELS "V2;Unit;TensorOperations;Synchronization;Coherence;SourcePolicy;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_TensorTransitionEncapsulationPolicy
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/check_tensor_transition_encapsulation.py
+            --repo-root ${CMAKE_SOURCE_DIR}/../..
+)
+set_tests_properties(V2_Unit_TensorTransitionEncapsulationPolicy PROPERTIES
+    LABELS "V2;Unit;TensorOperations;Synchronization;Coherence;SourcePolicy;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_MTPIterationBenchmarkMatrix
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_mtp_iteration_benchmark_matrix.py
@@ -2190,7 +2256,8 @@ add_v2_test(V2_Unit_NativeVNNIPairedRequestManifest
 )
 set_tests_properties(V2_Unit_CUDANativeVNNIDecodeTrainer PROPERTIES
     LABELS "V2;Unit;MTP;CUDA;NativeVNNI;Decode;Dispatch;Trainer;Regression"
-    TIMEOUT 30
+    PROCESSORS 4
+    TIMEOUT 60
 )
 
 add_test(NAME V2_Unit_CPUNativeVNNIVerifierAdapter
@@ -2235,7 +2302,8 @@ add_test(NAME V2_Unit_CPUNativeVNNIVerifierTrainer
 )
 set_tests_properties(V2_Unit_CPUNativeVNNIVerifierTrainer PROPERTIES
     LABELS "V2;Unit;MTP;CPU;NativeVNNI;Decode;Dispatch;ISA;Trainer;Regression"
-    TIMEOUT 30
+    PROCESSORS 4
+    TIMEOUT 60
 )
 
 add_test(NAME V2_Unit_CPUNativeVNNIGroupedSealedPlan
@@ -2307,7 +2375,8 @@ add_test(NAME V2_Unit_NativeVNNICommonDispatchPolicy
 )
 set_tests_properties(V2_Unit_NativeVNNICommonDispatchPolicy PROPERTIES
     LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Dispatch;Trainer;Certification;Regression"
-    TIMEOUT 30
+    PROCESSORS 4
+    TIMEOUT 60
 )
 
 add_test(NAME V2_Unit_NativeVNNIPolicyAccelerator
@@ -2319,14 +2388,27 @@ set_tests_properties(V2_Unit_NativeVNNIPolicyAccelerator PROPERTIES
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIProfilerEvidence
-    COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_profiler_evidence.py
-)
-set_tests_properties(V2_Unit_NativeVNNIProfilerEvidence PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Performance;Profiler;Evidence;Trainer;Regression"
-    TIMEOUT 30
-)
+# Profiler evidence is a large pure-Python regression module. Eight disjoint
+# shards keep the slowest focused shard comfortably below the unit-test timeout,
+# while PROCESSORS tells the canonical fully parallel CTest gate about each
+# shard's internal process-pool work.
+set(NATIVE_VNNI_PROFILER_EVIDENCE_SHARD_COUNT 8)
+math(EXPR NATIVE_VNNI_PROFILER_EVIDENCE_LAST_SHARD
+     "${NATIVE_VNNI_PROFILER_EVIDENCE_SHARD_COUNT} - 1")
+foreach(SHARD_INDEX RANGE 0 ${NATIVE_VNNI_PROFILER_EVIDENCE_LAST_SHARD})
+    add_test(NAME V2_Unit_NativeVNNIProfilerEvidence_${SHARD_INDEX}
+        COMMAND ${CMAKE_COMMAND} -E env
+                LLAMINAR_UNIT_SHARD_INDEX=${SHARD_INDEX}
+                LLAMINAR_UNIT_SHARD_COUNT=${NATIVE_VNNI_PROFILER_EVIDENCE_SHARD_COUNT}
+                ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_profiler_evidence.py
+    )
+    set_tests_properties(V2_Unit_NativeVNNIProfilerEvidence_${SHARD_INDEX} PROPERTIES
+        LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Performance;Profiler;Evidence;Trainer;Regression"
+        PROCESSORS 4
+        TIMEOUT 60
+    )
+endforeach()
 
 add_test(NAME V2_Unit_NativeVNNIProfilerDiagnostics
     COMMAND ${Python3_EXECUTABLE}
@@ -2429,9 +2511,8 @@ add_test(NAME V2_Unit_NativeVNNIGeneratedDispatchCodebooks
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_generated_dispatch_ids.py
             ${CMAKE_SOURCE_DIR}/kernels/cuda/gemm/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc
-            ${CMAKE_SOURCE_DIR}/kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc
             ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc
-            ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeVNNIPrefillDispatchGenerated.inc
+            ${CMAKE_SOURCE_DIR}/kernels/cpu/native_vnni/CPUNativeVNNIDecodePolicyGenerated.inc
             ${CMAKE_SOURCE_DIR}/kernels/cpu/native_vnni/CPUNativeVNNIVerifierRowsPolicyGenerated.inc
 )
 set_tests_properties(V2_Unit_NativeVNNIGeneratedDispatchCodebooks PROPERTIES
@@ -2488,6 +2569,36 @@ set_tests_properties(V2_Unit_ROCmNativeVNNIBatchedDecodeTrainerGenerator PROPERT
     LABELS "V2;Unit;ROCm;GEMV;NativeVNNI;Codebook;Trainer;Dispatch;Regression"
     TIMEOUT 30
 )
+
+# The NativeVNNI Python suite exercises process pools, NumPy/BLAS code, compiler
+# probes, and subprocess-based artifact validation.  Raw add_test() calls
+# otherwise consume one CTest slot, which lets the canonical `ctest --parallel`
+# gate launch roughly sixty CPU-active trainer tests on 56 physical cores.
+# Match add_v2_test()'s accounting so the suite remains parallel without
+# oversubscribing both hardware threads on every physical core.
+get_property(NATIVE_VNNI_UNIT_TESTS DIRECTORY PROPERTY TESTS)
+foreach(NATIVE_VNNI_UNIT_TEST IN LISTS NATIVE_VNNI_UNIT_TESTS)
+    if(NATIVE_VNNI_UNIT_TEST MATCHES "^V2_Unit_.*NativeVNNI")
+        set_tests_properties(${NATIVE_VNNI_UNIT_TEST} PROPERTIES PROCESSORS 4)
+    endif()
+endforeach()
+
+# These tests intentionally create nested worker pools or run the largest
+# policy reductions. Advertise sixteen logical CTest slots per process: on the
+# canonical 112-thread/56-core host this admits at most seven heavy jobs, whose
+# nested pools still fit on the physical cores. Eight slots admitted every
+# profiler shard plus all heavy trainers in the first wave and could starve an
+# otherwise five-second shard beyond its sixty-second timeout.
+set(NATIVE_VNNI_HEAVY_UNIT_TESTS
+    V2_Unit_CUDANativeVNNIDecodeTrainer
+    V2_Unit_CPUNativeVNNIVerifierTrainer
+    V2_Unit_NativeVNNICommonDispatchPolicy
+)
+foreach(SHARD_INDEX RANGE 0 ${NATIVE_VNNI_PROFILER_EVIDENCE_LAST_SHARD})
+    list(APPEND NATIVE_VNNI_HEAVY_UNIT_TESTS
+         V2_Unit_NativeVNNIProfilerEvidence_${SHARD_INDEX})
+endforeach()
+set_tests_properties(${NATIVE_VNNI_HEAVY_UNIT_TESTS} PROPERTIES PROCESSORS 16)
 
 # Performance: Q16 Fixed-Scale SIMD Quantization
 add_executable(v2_perf_q16_fixed_scale_simd performance/tensors/Perf__Q16_FixedScaleSIMD.cpp)
@@ -3142,8 +3253,7 @@ add_v2_test(V2_Integration_KernelFactoryTensorSliceCUDA
 # Test: TensorSlice device coherence delegation
 # Verifies TensorSlice properly delegates coherence methods to inner tensor
 # Critical for MPI tensor parallelism where weights are wrapped in TensorSlice
-# Root cause: TensorSlice inherits from CPUTensorBase but doesn't override coherence methods
-# Solution: StageCoherence.cpp unwraps TensorSlice to access inner tensor
+# TensorSlice delegates transfer/coherence operations to its inner tensor.
 add_executable(v2_test_tensorslice_coherence unit/tensors/Test__TensorSliceCoherence.cpp)
 target_link_libraries(v2_test_tensorslice_coherence
     llaminar2_core
@@ -5284,18 +5394,6 @@ add_v2_test(V2_Integration_HostReleaseAfterGpuUpload
     MPI_PROCS 1  # Tests GPU pinned memory locally, no MPI needed
 )
 
-# Test: GPU-Resident Data Flow (Phase 1: verifies no unnecessary D2H transfers)
-# Tests StageCoherence functions with MockBackend transfer tracking
-# Verifies: cohereInputs, cohereOutputs, markOutputsDirty behavior
-# See: docs/v2/projects/2026-01/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
-add_executable(v2_integration_gpu_resident_data_flow integration/execution/Test__GpuResidentDataFlow.cpp)
-target_link_libraries(v2_integration_gpu_resident_data_flow llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Integration_GpuResidentDataFlow
-    COMMAND $<TARGET_FILE:v2_integration_gpu_resident_data_flow>
-    LABELS "V2;Integration;StageCoherence;GpuResident;TransferTracking;MockBackend;FP32"
-    MPI_PROCS 1  # Tests coherence logic locally, no MPI needed
-)
-
 # Test: Mapped Memory Coherence (Phase 3: verifies zero-copy snapshot mode)
 # Tests FP32Tensor::createMapped() behavior for GPU↔CPU shared memory
 # Verifies: gpu_data_ptr valid after creation, ensureOnHost is no-op, 
@@ -5510,7 +5608,7 @@ add_v2_test(V2_Integration_CUDAGemmParity
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_AllFormats
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
-            --gtest_filter=Test__CUDAGemmParity.NativeVNNISpecializedRuntimeM_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats_LargeKKPARMatchesSerialDecode:Test__CUDAGemmParity.MTP_RuntimeM_FusedSwiGLUDown_AllNativeFormatsMatchSerialDecode:Test__CUDAGemmParity.MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI:Test__CUDAGemmParity.MTP_FP32FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FP16BF16FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FloatingSwiGLUDown_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeVNNI
+            --gtest_filter=Test__CUDAGemmParity.NativeVNNISpecializedRuntimeM_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats_LargeKKPARMatchesSerialDecode:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats_Qwen36MoEQKVMatchesSerialDecode:Test__CUDAGemmParity.MTP_RuntimeM_FusedSwiGLUDown_AllNativeFormatsMatchSerialDecode:Test__CUDAGemmParity.MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI:Test__CUDAGemmParity.MTP_FP32FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FP16BF16FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FloatingSwiGLUDown_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeVNNI
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;FP32;FP16;BF16;Regression"
     MPI_PROCS 1
@@ -5529,6 +5627,13 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNProjection
     LABELS "V2;Integration;CUDA;GEMM;GDN;MTP;GroupedVerifierRows;DecodeEquivalent;RuntimeM;LocalTP;Regression"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_RealQwen36MoEGDNQKV
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
+            --gtest_filter=Test__CUDAGemmParity.RealQwen36MoEGDNQKVGroupedVerifierRowsMatchSerialDecodeStrict
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;GEMM;GDN;MTP;GroupedVerifierRows;DecodeEquivalent;Qwen36;MoE;RealWeights;Q6_K;Regression"
+    MPI_PROCS 1
+)
 
 # Test: CUDA GEMM Non-Determinism (self-consistency across repeated calls)
 # Exercises multiply_fused_tensor() N times with same input and checks output stability.
@@ -5538,6 +5643,20 @@ target_link_libraries(v2_integration_cuda_gemm_nondet llaminar2_core GTest::gtes
 add_v2_test(V2_Integration_CUDAGemmNonDeterminism
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_nondet>
     LABELS "V2;Integration;CUDA;GEMM;NonDeterminism;Quantized;SplitK"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillHeuristic
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
+            --gtest_filter=Test__CUDAGemmParity.NativeVNNIPrefillHeuristicAllFormatsMatchesCPU
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;GEMM;Prefill;Heuristic;AllFormats;NativeVNNI;Parity;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillHeuristicQwen36
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_nondet>
+            --gtest_filter=Test__CUDAGemmNonDeterminism.NativeVNNI_Qwen36DensePromptPrefillUsesTotalHeuristic
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;GEMM;Prefill;Heuristic;NativeVNNI;Qwen36;PerfStats;Regression"
     MPI_PROCS 1
 )
 
@@ -6926,6 +7045,13 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
+    add_v2_test(V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_MultilineMetadataAuthentication
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen36moe_expert_overlay_math>
+                --gtest_filter=Qwen36MoEExpertOverlayMetadata.MultilinePromptAuthenticatesWithoutRegeneration
+        LABELS "V2;Integration;Parity;Qwen36MoE;ExpertOverlay;LongContext;Metadata;Regression"
+        MPI_PROCS 1
+        TIMEOUT 30
+    )
     set(QWEN36_MOE_EXPERT_OVERLAY_PARITY_LABELS
         V2 Integration Parity Qwen36MoE MixtureOfExperts GatedDeltaNet
         CUDA ROCm NCCL RCCL LocalTP ExpertOverlay PrefillTensorParallelDecodeReplicated
@@ -6962,6 +7088,22 @@ if(ZLIB_FOUND)
             MPI_PROCS 1
             TIMEOUT 3600
         )
+        if(CASE_NAME STREQUAL "LongContextDecodeParity")
+            set(_qwen36_moe_long_context_test
+                V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_${CASE_NAME}_${CASE_SUFFIX})
+            # add_v2_test intentionally omits integration-only tests from a
+            # Release build. Property publication must follow that lifecycle:
+            # configuring production binaries must not depend on a test that
+            # was deliberately not registered.
+            if(TEST ${_qwen36_moe_long_context_test})
+                set_tests_properties(
+                    ${_qwen36_moe_long_context_test}
+                    PROPERTIES
+                        ENVIRONMENT
+                            "LLAMINAR_PERF_STATS_JSON=/tmp/llaminar_${CASE_SUFFIX}_perfstats.json;LLAMINAR_PERF_STATS_FILTER=moe_rebalance"
+                )
+            endif()
+        endif()
     endforeach()
 
     add_executable(v2_integration_parity_qwen36moe_single_device
@@ -7311,16 +7453,6 @@ target_link_libraries(v2_test_moe_expert_dispatch_stage llaminar2_core GTest::gt
 add_v2_test(V2_Unit_MoEExpertDispatchStage
     COMMAND $<TARGET_FILE:v2_test_moe_expert_dispatch_stage>
     LABELS "V2;Unit;Execution;ComputeStage;MoE;RoutedExpertDispatch"
-    MPI_PROCS 1
-)
-
-# Test: MoERoutedExpertPartialReduceStage (model-light dense partial reduce)
-add_executable(v2_test_moe_routed_expert_partial_reduce_stage unit/execution/compute_stages/Test__MoERoutedExpertPartialReduceStage.cpp)
-target_include_directories(v2_test_moe_routed_expert_partial_reduce_stage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_test_moe_routed_expert_partial_reduce_stage llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MoERoutedExpertPartialReduceStage
-    COMMAND $<TARGET_FILE:v2_test_moe_routed_expert_partial_reduce_stage>
-    LABELS "V2;Unit;Execution;ComputeStage;MoE;RoutedExpertPartialReduce"
     MPI_PROCS 1
 )
 
@@ -7762,6 +7894,18 @@ add_v2_test(V2_Unit_MTPDecodeCatchup
     MPI_PROCS 1
 )
 
+# Test: Total graph-cache and device-token-slot ownership for captured MTP sidecars
+add_executable(v2_test_mtp_sidecar_capture_layout unit/mtp/Test__MTPSidecarCaptureLayout.cpp)
+target_link_libraries(v2_test_mtp_sidecar_capture_layout llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_mtp_sidecar_capture_layout PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPSidecarCaptureLayout
+    COMMAND $<TARGET_FILE:v2_test_mtp_sidecar_capture_layout>
+    LABELS "V2;Unit;MTP;GraphCapture;DeviceResidency"
+    MPI_PROCS 1
+)
+
 # Test: Shared vLLM-style MTP rejection sampler contract
 add_executable(v2_test_mtp_rejection_sampler unit/mtp/Test__MTPRejectionSampler.cpp)
 target_link_libraries(v2_test_mtp_rejection_sampler llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)
@@ -8037,12 +8181,6 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmPrefixSmoke
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPSmoke
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmLocalTPMTPRealModelSmoke
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;LocalTP"
-    MPI_PROCS 1
-    TIMEOUT 1200
-)
-add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPExplicitSegmentedSmoke
-    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmLocalTPMTPExplicitSegmentedCollectiveSmoke
-    LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;LocalTP;Regression"
     MPI_PROCS 1
     TIMEOUT 1200
 )
@@ -8492,18 +8630,6 @@ target_link_libraries(v2_unit_pp_stage_config
 add_v2_test(V2_Unit_PPStageConfig
     COMMAND $<TARGET_FILE:v2_unit_pp_stage_config>
     LABELS "V2;Unit;PPStageConfig;PipelineParallelism;Factory;PP"
-    MPI_PROCS 1
-)
-
-# Test: StageCoherence (automatic device coherence at stage boundaries)
-# Tests CoherencePolicy enum, cohereInputs/markOutputsDirty, buffer extraction,
-# and stage coherence policy reporting.
-# Part of Device Abstraction Phase 2: Automatic Stage Boundary Coherence
-add_executable(v2_test_stage_coherence unit/execution/local_execution/coherence/Test__StageCoherence.cpp)
-target_link_libraries(v2_test_stage_coherence llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_StageCoherence
-    COMMAND $<TARGET_FILE:v2_test_stage_coherence>
-    LABELS "V2;Unit;Coherence;DeviceGraphExecutor;DeviceAbstraction;Execution"
     MPI_PROCS 1
 )
 
@@ -9953,6 +10079,13 @@ add_v2_test(V2_Integration_CPUNativeVNNI_GEMV
     LABELS "V2;Integration;GEMM;GEMV;NativeVNNI;CPU;Q4_0;IQ4_NL;Decode"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillHeuristic
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+            --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillFullKAllFormatsRuntimeMMatchesSerialDecode:CPUNativeVNNIGemvTest.NativeVNNIPrefillKPartAllFormatsRuntimeMMatchesSerialDecode
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;GEMM;Prefill;Heuristic;AllFormats;NativeVNNI;DecodeEquivalent;Regression"
+    MPI_PROCS 1
+)
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_AllFormats
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
             --gtest_filter=CPUNativeVNNIGemvTest.MTP_FusedExpertDown_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_SmallM_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_ForcedWideRows_AllFormatsRuntimeMMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.MTP_FP16BF16FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.NativeVNNIPrefillFullKAllFormatsRuntimeMMatchesSerialDecode
@@ -10919,6 +11052,13 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCm_NativeVNNI_GEMM
         COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemm>
         LABELS "V2;Integration;ROCm;GEMM;NativeVNNI;Quantized;gfx906;Accuracy"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_ROCm_NativeVNNI_PrefillHeuristic
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemm>
+                --gtest_filter=AllDispatchPaths/NativeVNNIGEMMTest.MatchesFP32Reference/*M32*
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;GEMM;Prefill;Heuristic;AllFormats;NativeVNNI;Accuracy;Regression"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added native-VNNI GEMM integration tests (all dispatch paths)")
@@ -12771,7 +12911,10 @@ endif()
 # Unit: SnapshotCapture (Phase 2 DGO refactor extraction)
 # =============================================================================
 
-add_executable(v2_test_snapshot_capture unit/snapshots/Test__SnapshotCapture.cpp)
+add_executable(v2_test_snapshot_capture
+    unit/snapshots/Test__SnapshotCapture.cpp
+    unit/snapshots/Test__ParitySnapshotSelection.cpp
+)
 target_link_libraries(v2_test_snapshot_capture llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_SnapshotCapture
     COMMAND $<TARGET_FILE:v2_test_snapshot_capture>
@@ -12983,6 +13126,12 @@ if(HAVE_CUDA OR HAVE_ROCM)
             LABELS "V2;Integration;Backend;GPU;CUDA;MTP;GroupedVerifierRows;Sampling;Stochastic;BatchInvariant;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
         )
+        add_v2_test(V2_Integration_MTPSidecarLivePosition_CUDA
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*MTPDeviceOwnedSidecarsTrackMutableLivePositionAcrossGraphReplays*CUDA
+            LABELS "V2;Integration;Backend;GPU;CUDA;MTP;Sidecar;PrefixCache;ByteExact;DeviceResident;GraphCapture;Regression"
+            MPI_PROCS 1
+        )
     endif()
     if(HAVE_ROCM)
         add_v2_test(V2_Integration_GPUSamplingKernels_ROCm
@@ -12995,6 +13144,12 @@ if(HAVE_CUDA OR HAVE_ROCM)
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
                 --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*ROCm
             LABELS "V2;Integration;Backend;GPU;ROCm;MTP;GroupedVerifierRows;Sampling;Stochastic;BatchInvariant;ByteExact;DeviceResident;GraphCapture;Regression"
+            MPI_PROCS 1
+        )
+        add_v2_test(V2_Integration_MTPSidecarLivePosition_ROCm
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*MTPDeviceOwnedSidecarsTrackMutableLivePositionAcrossGraphReplays*ROCm
+            LABELS "V2;Integration;Backend;GPU;ROCm;MTP;Sidecar;PrefixCache;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
         )
     endif()
@@ -13221,18 +13376,6 @@ target_link_libraries(v2_test_moe_rebalance_controller
 )
 add_v2_test(V2_Unit_MoERebalanceController
     COMMAND $<TARGET_FILE:v2_test_moe_rebalance_controller>
-    LABELS "V2;Unit;MoE;Rebalancer;Controller;DynamicPlacement"
-)
-
-# Test: MoEDeviceRebalanceHostRendezvous — domain-wide maintenance follow-up decisions
-add_executable(v2_test_moe_device_rebalance_host_rendezvous unit/moe/Test__MoEDeviceRebalanceHostRendezvous.cpp)
-target_link_libraries(v2_test_moe_device_rebalance_host_rendezvous
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoEDeviceRebalanceHostRendezvous
-    COMMAND $<TARGET_FILE:v2_test_moe_device_rebalance_host_rendezvous>
     LABELS "V2;Unit;MoE;Rebalancer;Controller;DynamicPlacement"
 )
 
@@ -13833,6 +13976,18 @@ target_link_libraries(v2_test_gpu_workspace_allocation_policy llaminar2_core GTe
 add_v2_test(V2_Unit_GpuWorkspaceAllocationPolicy
     COMMAND $<TARGET_FILE:v2_test_gpu_workspace_allocation_policy>
     LABELS "V2;Unit;CUDA;ROCm;Stages;GraphCapture;Workspace"
+    MPI_PROCS 1
+)
+
+add_executable(v2_test_device_execution_timeline
+    unit/execution/local_execution/graph/Test__DeviceExecutionTimeline.cpp)
+target_include_directories(v2_test_device_execution_timeline
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_device_execution_timeline
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceExecutionTimeline
+    COMMAND $<TARGET_FILE:v2_test_device_execution_timeline>
+    LABELS "V2;Unit;CUDA;ROCm;GraphCapture;Synchronization;DeviceResident"
     MPI_PROCS 1
 )
 

@@ -62,6 +62,177 @@ namespace llaminar2
     }
 
     /**
+     * @brief Normalize IEEE signed zero for canonical device prefix payloads.
+     *
+     * Native quantized blocks are copied unchanged. FP32, FP16, and BF16 keep
+     * every non-zero bit pattern and rewrite only positive/negative zero to the
+     * same all-zero representation used by host diagnostic serialization.
+     */
+    template <typename T>
+    __device__ __forceinline__ T canonical_logical_kv_value(T value)
+    {
+        if constexpr (std::is_same_v<T, float>)
+        {
+            union
+            {
+                float value;
+                uint32_t bits;
+            } cast;
+            cast.value = value;
+            return (cast.bits & 0x7fffffffu) == 0u ? 0.0f : value;
+        }
+        else if constexpr (
+            std::is_same_v<T, _Float16> ||
+            std::is_same_v<T, hip_bfloat16>)
+        {
+            union
+            {
+                T value;
+                uint16_t bits;
+            } cast;
+            cast.value = value;
+            if ((cast.bits & 0x7fffu) == 0u)
+                cast.bits = 0u;
+            return cast.value;
+        }
+        else
+        {
+            return value;
+        }
+    }
+
+    /**
+     * @brief Gather a logical ring slice into device-resident archive memory.
+     *
+     * Mutable head/count values are read directly from their canonical device
+     * rows. The host contributes immutable block geometry only.
+     */
+    template <typename T>
+    __global__ void rocm_ring_logical_block_export_device_kernel(
+        const T *__restrict__ ring_k,
+        const T *__restrict__ ring_v,
+        T *__restrict__ block_k,
+        T *__restrict__ block_v,
+        const int *__restrict__ ring_head,
+        const int *__restrict__ cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len,
+        int row_elements)
+    {
+        const int count = *cached_tokens;
+        const int head = *ring_head;
+        if (count < 0 || count > max_seq_len ||
+            head < 0 || head >= max_seq_len ||
+            logical_token_start < 0 ||
+            logical_token_start > count ||
+            token_count < 0 ||
+            token_count > count - logical_token_start)
+        {
+            return;
+        }
+
+        int tail = (head - count) % max_seq_len;
+        if (tail < 0)
+            tail += max_seq_len;
+
+        const size_t element_count =
+            static_cast<size_t>(token_count) *
+            static_cast<size_t>(row_elements);
+        for (size_t linear =
+                 static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             linear < element_count;
+             linear += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const int token =
+                static_cast<int>(linear / static_cast<size_t>(row_elements));
+            const int element =
+                static_cast<int>(linear % static_cast<size_t>(row_elements));
+            const int physical =
+                (tail + logical_token_start + token) % max_seq_len;
+            const size_t source =
+                static_cast<size_t>(physical) *
+                    static_cast<size_t>(row_elements) +
+                static_cast<size_t>(element);
+            block_k[linear] = canonical_logical_kv_value(ring_k[source]);
+            block_v[linear] = canonical_logical_kv_value(ring_v[source]);
+        }
+    }
+
+    /**
+     * @brief Scatter a device-resident prefix block into the live ring.
+     *
+     * Prefix blocks must arrive in logical order. Device metadata validates
+     * that invariant without a D2H probe or persistent host mirror.
+     */
+    template <typename T>
+    __global__ void rocm_ring_logical_block_import_device_kernel(
+        T *__restrict__ ring_k,
+        T *__restrict__ ring_v,
+        const T *__restrict__ block_k,
+        const T *__restrict__ block_v,
+        const int *__restrict__ ring_head,
+        const int *__restrict__ cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len,
+        int row_elements)
+    {
+        const int count = *cached_tokens;
+        const int head = *ring_head;
+        if (count != logical_token_start ||
+            head != (logical_token_start % max_seq_len))
+        {
+            return;
+        }
+
+        const size_t element_count =
+            static_cast<size_t>(token_count) *
+            static_cast<size_t>(row_elements);
+        for (size_t linear =
+                 static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             linear < element_count;
+             linear += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const int token =
+                static_cast<int>(linear / static_cast<size_t>(row_elements));
+            const int element =
+                static_cast<int>(linear % static_cast<size_t>(row_elements));
+            const int physical = (head + token) % max_seq_len;
+            const size_t destination =
+                static_cast<size_t>(physical) *
+                    static_cast<size_t>(row_elements) +
+                static_cast<size_t>(element);
+            ring_k[destination] = block_k[linear];
+            ring_v[destination] = block_v[linear];
+        }
+    }
+
+    /**
+     * @brief Advance canonical metadata after a stream-ordered block scatter.
+     */
+    __global__ void rocm_ring_logical_block_import_publish_kernel(
+        int *__restrict__ ring_head,
+        int *__restrict__ cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len)
+    {
+        if (blockIdx.x != 0 || threadIdx.x != 0)
+            return;
+        const int count = *cached_tokens;
+        const int head = *ring_head;
+        if (count != logical_token_start ||
+            head != (logical_token_start % max_seq_len))
+        {
+            return;
+        }
+        const int new_count = logical_token_start + token_count;
+        *cached_tokens = new_count;
+        *ring_head = new_count % max_seq_len;
+    }
+
+    /**
      * @brief Append tokens to ring buffer (graph-capturable variant)
      *
      * Reads head position from a device pointer instead of a scalar argument.
@@ -200,6 +371,136 @@ namespace llaminar2
     }
 
     /**
+     * @brief Gather one request's canonical ring metadata into device storage.
+     *
+     * Metadata is layer-major in the live cache and contiguous by layer in the
+     * checkpoint. The opaque layout is [heads for all layers][counts for all
+     * layers]. No host mirror or synchronization participates in this copy.
+     */
+    __global__ void hip_kv_sequence_state_checkpoint_capture_kernel(
+        const int *__restrict__ d_heads,
+        const int *__restrict__ d_counts,
+        int *__restrict__ checkpoint,
+        int n_layers,
+        int batch_size,
+        int seq_idx)
+    {
+        const int layer =
+            static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+        if (layer >= n_layers)
+            return;
+
+        const int entry_idx = layer * batch_size + seq_idx;
+        checkpoint[layer] = d_heads[entry_idx];
+        checkpoint[n_layers + layer] = d_counts[entry_idx];
+    }
+
+    /**
+     * @brief Restore one request's exact ring metadata from device storage.
+     *
+     * Speculative payload rows remain allocated but become unreachable after
+     * this kernel restores the checkpointed head/count window. Admission
+     * guarantees ensure those rows never overwrote checkpoint-visible state.
+     */
+    __global__ void hip_kv_sequence_state_checkpoint_restore_kernel(
+        int *__restrict__ d_heads,
+        int *__restrict__ d_counts,
+        const int *__restrict__ checkpoint,
+        int n_layers,
+        int batch_size,
+        int seq_idx)
+    {
+        const int layer =
+            static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+        if (layer >= n_layers)
+            return;
+
+        const int entry_idx = layer * batch_size + seq_idx;
+        d_heads[entry_idx] = checkpoint[layer];
+        d_counts[entry_idx] = checkpoint[n_layers + layer];
+    }
+
+    /**
+     * @brief Truncate one request across all layers from canonical device state.
+     *
+     * The requested logical length is control input. Existing ring tails are
+     * derived independently on device, removing all host observations and
+     * whole-device synchronization from rollback and archive restore.
+     */
+    __global__ void hip_kv_sequence_state_truncate_kernel(
+        int *__restrict__ d_heads,
+        int *__restrict__ d_counts,
+        int n_layers,
+        int batch_size,
+        int seq_idx,
+        int cached_tokens,
+        int max_seq_len)
+    {
+        const int layer =
+            static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+        if (layer >= n_layers)
+            return;
+
+        const int entry_idx = layer * batch_size + seq_idx;
+        const int old_head = d_heads[entry_idx];
+        const int old_count = d_counts[entry_idx];
+        if (old_head < 0 || old_head >= max_seq_len ||
+            old_count < 0 || old_count > max_seq_len ||
+            cached_tokens > old_count)
+        {
+            /*
+             * Truncation is a monotonic rollback operation. Silently deriving
+             * a larger head would expose stale ring payload as live KV state.
+             * Keep the canonical pair untouched when a caller requests an
+             * extension; production callers treat their target as an invariant.
+             */
+            return;
+        }
+
+        int tail = old_head - old_count;
+        tail %= max_seq_len;
+        if (tail < 0)
+            tail += max_seq_len;
+        d_heads[entry_idx] =
+            cached_tokens == 0
+                ? 0
+                : (tail + cached_tokens) % max_seq_len;
+        d_counts[entry_idx] = cached_tokens;
+    }
+
+    /**
+     * @brief Drop oldest visible rows using canonical device metadata only.
+     *
+     * The ring head remains the position after the newest row. Saturating the
+     * count therefore advances the logical tail without copying payload or
+     * consulting stale host state.
+     */
+    __global__ void hip_kv_sequence_state_evict_oldest_kernel(
+        int *__restrict__ d_heads,
+        int *__restrict__ d_counts,
+        int batch_size,
+        int layer,
+        int seq_idx,
+        int num_tokens,
+        int max_seq_len)
+    {
+        if (blockIdx.x != 0 || threadIdx.x != 0)
+            return;
+
+        const int entry_idx = layer * batch_size + seq_idx;
+        const int old_head = d_heads[entry_idx];
+        const int old_count = d_counts[entry_idx];
+        if (old_head < 0 || old_head >= max_seq_len ||
+            old_count < 0 || old_count > max_seq_len)
+        {
+            return;
+        }
+
+        d_counts[entry_idx] =
+            num_tokens >= old_count ? 0 : old_count - num_tokens;
+    }
+
+    /**
      * @brief Publish accepted verifier-row sequence metadata on device.
      *
      * Each block owns one [request, layer] pair.  The verifier graph may have
@@ -243,8 +544,15 @@ namespace llaminar2
         const int entry_idx = layer * batch_size + seq_idx;
         const int old_head = d_heads[entry_idx];
         const int old_count = d_counts[entry_idx];
-        if (old_count < 0 || old_count > max_seq_len)
+        if (old_head < 0 || old_head >= max_seq_len ||
+            old_count < 0 || old_count > max_seq_len ||
+            target_count > old_count)
         {
+            /*
+             * Accepted-state publication can only remove verifier rows. A
+             * larger target would manufacture history from stale ring bytes,
+             * so refuse the entire head/count update atomically.
+             */
             return;
         }
 
@@ -1052,6 +1360,233 @@ namespace llaminar2
         return rope_error == hipSuccess ? hipErrorInvalidValue : rope_error;
     }
 
+    /**
+     * @brief Launch one asynchronous device-domain logical block export.
+     */
+    template <typename T>
+    static hipError_t launch_ring_logical_block_export_device(
+        const T *ring_k,
+        const T *ring_v,
+        T *block_k,
+        T *block_v,
+        const int *ring_head,
+        const int *cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len,
+        int row_elements,
+        hipStream_t stream)
+    {
+        if (!ring_k || !ring_v || !block_k || !block_v ||
+            !ring_head || !cached_tokens || !stream ||
+            logical_token_start < 0 || token_count <= 0 ||
+            max_seq_len <= 0 || row_elements <= 0)
+        {
+            return hipErrorInvalidValue;
+        }
+        const size_t element_count =
+            static_cast<size_t>(token_count) *
+            static_cast<size_t>(row_elements);
+        const unsigned int blocks = std::max(
+            1u,
+            std::min(
+                65535u,
+                static_cast<unsigned int>(
+                    (element_count + BLOCK_SIZE - 1) / BLOCK_SIZE)));
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_ring_logical_block_export_device_kernel<T>),
+            dim3(blocks),
+            dim3(BLOCK_SIZE),
+            0,
+            stream,
+            ring_k,
+            ring_v,
+            block_k,
+            block_v,
+            ring_head,
+            cached_tokens,
+            logical_token_start,
+            token_count,
+            max_seq_len,
+            row_elements);
+        return hipGetLastError();
+    }
+
+    /**
+     * @brief Launch one asynchronous device-domain logical block import.
+     */
+    template <typename T>
+    static hipError_t launch_ring_logical_block_import_device(
+        T *ring_k,
+        T *ring_v,
+        const T *block_k,
+        const T *block_v,
+        int *ring_head,
+        int *cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len,
+        int row_elements,
+        hipStream_t stream)
+    {
+        if (!ring_k || !ring_v || !block_k || !block_v ||
+            !ring_head || !cached_tokens || !stream ||
+            logical_token_start < 0 || token_count <= 0 ||
+            max_seq_len <= 0 || row_elements <= 0)
+        {
+            return hipErrorInvalidValue;
+        }
+        const size_t element_count =
+            static_cast<size_t>(token_count) *
+            static_cast<size_t>(row_elements);
+        const unsigned int blocks = std::max(
+            1u,
+            std::min(
+                65535u,
+                static_cast<unsigned int>(
+                    (element_count + BLOCK_SIZE - 1) / BLOCK_SIZE)));
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_ring_logical_block_import_device_kernel<T>),
+            dim3(blocks),
+            dim3(BLOCK_SIZE),
+            0,
+            stream,
+            ring_k,
+            ring_v,
+            block_k,
+            block_v,
+            ring_head,
+            cached_tokens,
+            logical_token_start,
+            token_count,
+            max_seq_len,
+            row_elements);
+        hipLaunchKernelGGL(
+            rocm_ring_logical_block_import_publish_kernel,
+            dim3(1),
+            dim3(1),
+            0,
+            stream,
+            ring_head,
+            cached_tokens,
+            logical_token_start,
+            token_count,
+            max_seq_len);
+        return hipGetLastError();
+    }
+
+    extern "C" hipError_t hip_ring_logical_block_export_device_fp32(
+        const float *ring_k, const float *ring_v,
+        float *block_k, float *block_v,
+        const int *ring_head, const int *cached_tokens,
+        int logical_token_start, int token_count,
+        int max_seq_len, int row_elements, hipStream_t stream)
+    {
+        return launch_ring_logical_block_export_device(
+            ring_k, ring_v, block_k, block_v,
+            ring_head, cached_tokens,
+            logical_token_start, token_count,
+            max_seq_len, row_elements, stream);
+    }
+
+    extern "C" hipError_t hip_ring_logical_block_export_device_fp16(
+        const _Float16 *ring_k, const _Float16 *ring_v,
+        _Float16 *block_k, _Float16 *block_v,
+        const int *ring_head, const int *cached_tokens,
+        int logical_token_start, int token_count,
+        int max_seq_len, int row_elements, hipStream_t stream)
+    {
+        return launch_ring_logical_block_export_device(
+            ring_k, ring_v, block_k, block_v,
+            ring_head, cached_tokens,
+            logical_token_start, token_count,
+            max_seq_len, row_elements, stream);
+    }
+
+    extern "C" hipError_t hip_ring_logical_block_export_device_bf16(
+        const hip_bfloat16 *ring_k, const hip_bfloat16 *ring_v,
+        hip_bfloat16 *block_k, hip_bfloat16 *block_v,
+        const int *ring_head, const int *cached_tokens,
+        int logical_token_start, int token_count,
+        int max_seq_len, int row_elements, hipStream_t stream)
+    {
+        return launch_ring_logical_block_export_device(
+            ring_k, ring_v, block_k, block_v,
+            ring_head, cached_tokens,
+            logical_token_start, token_count,
+            max_seq_len, row_elements, stream);
+    }
+
+    extern "C" hipError_t hip_ring_logical_block_export_device_q8_1(
+        const Q8_1Block *ring_k, const Q8_1Block *ring_v,
+        Q8_1Block *block_k, Q8_1Block *block_v,
+        const int *ring_head, const int *cached_tokens,
+        int logical_token_start, int token_count,
+        int max_seq_len, int row_elements, hipStream_t stream)
+    {
+        return launch_ring_logical_block_export_device(
+            ring_k, ring_v, block_k, block_v,
+            ring_head, cached_tokens,
+            logical_token_start, token_count,
+            max_seq_len, row_elements, stream);
+    }
+
+    extern "C" hipError_t hip_ring_logical_block_import_device_fp32(
+        float *ring_k, float *ring_v,
+        const float *block_k, const float *block_v,
+        int *ring_head, int *cached_tokens,
+        int logical_token_start, int token_count,
+        int max_seq_len, int row_elements, hipStream_t stream)
+    {
+        return launch_ring_logical_block_import_device(
+            ring_k, ring_v, block_k, block_v,
+            ring_head, cached_tokens,
+            logical_token_start, token_count,
+            max_seq_len, row_elements, stream);
+    }
+
+    extern "C" hipError_t hip_ring_logical_block_import_device_fp16(
+        _Float16 *ring_k, _Float16 *ring_v,
+        const _Float16 *block_k, const _Float16 *block_v,
+        int *ring_head, int *cached_tokens,
+        int logical_token_start, int token_count,
+        int max_seq_len, int row_elements, hipStream_t stream)
+    {
+        return launch_ring_logical_block_import_device(
+            ring_k, ring_v, block_k, block_v,
+            ring_head, cached_tokens,
+            logical_token_start, token_count,
+            max_seq_len, row_elements, stream);
+    }
+
+    extern "C" hipError_t hip_ring_logical_block_import_device_bf16(
+        hip_bfloat16 *ring_k, hip_bfloat16 *ring_v,
+        const hip_bfloat16 *block_k, const hip_bfloat16 *block_v,
+        int *ring_head, int *cached_tokens,
+        int logical_token_start, int token_count,
+        int max_seq_len, int row_elements, hipStream_t stream)
+    {
+        return launch_ring_logical_block_import_device(
+            ring_k, ring_v, block_k, block_v,
+            ring_head, cached_tokens,
+            logical_token_start, token_count,
+            max_seq_len, row_elements, stream);
+    }
+
+    extern "C" hipError_t hip_ring_logical_block_import_device_q8_1(
+        Q8_1Block *ring_k, Q8_1Block *ring_v,
+        const Q8_1Block *block_k, const Q8_1Block *block_v,
+        int *ring_head, int *cached_tokens,
+        int logical_token_start, int token_count,
+        int max_seq_len, int row_elements, hipStream_t stream)
+    {
+        return launch_ring_logical_block_import_device(
+            ring_k, ring_v, block_k, block_v,
+            ring_head, cached_tokens,
+            logical_token_start, token_count,
+            max_seq_len, row_elements, stream);
+    }
+
     // ------ FP32 scalar diagnostic linearization ------
     extern "C" void hip_ring_linearize_fp32(
         float *d_out,
@@ -1392,6 +1927,145 @@ namespace llaminar2
             d_count,
             head,
             count);
+        return hipGetLastError() == hipSuccess;
+    }
+
+    extern "C" bool hip_kv_sequence_state_checkpoint_capture(
+        const int *d_heads,
+        const int *d_counts,
+        int *checkpoint,
+        int n_layers,
+        int batch_size,
+        int seq_idx,
+        hipStream_t stream)
+    {
+        if (!d_heads || !d_counts || !checkpoint || !stream ||
+            n_layers <= 0 || batch_size <= 0 ||
+            seq_idx < 0 || seq_idx >= batch_size)
+        {
+            return false;
+        }
+
+        constexpr int kThreads = 128;
+        const int blocks = (n_layers + kThreads - 1) / kThreads;
+        hipLaunchKernelGGL(
+            hip_kv_sequence_state_checkpoint_capture_kernel,
+            dim3(blocks),
+            dim3(kThreads),
+            0,
+            stream,
+            d_heads,
+            d_counts,
+            checkpoint,
+            n_layers,
+            batch_size,
+            seq_idx);
+        return hipGetLastError() == hipSuccess;
+    }
+
+    extern "C" bool hip_kv_sequence_state_checkpoint_restore(
+        int *d_heads,
+        int *d_counts,
+        const int *checkpoint,
+        int n_layers,
+        int batch_size,
+        int seq_idx,
+        hipStream_t stream)
+    {
+        if (!d_heads || !d_counts || !checkpoint || !stream ||
+            n_layers <= 0 || batch_size <= 0 ||
+            seq_idx < 0 || seq_idx >= batch_size)
+        {
+            return false;
+        }
+
+        constexpr int kThreads = 128;
+        const int blocks = (n_layers + kThreads - 1) / kThreads;
+        hipLaunchKernelGGL(
+            hip_kv_sequence_state_checkpoint_restore_kernel,
+            dim3(blocks),
+            dim3(kThreads),
+            0,
+            stream,
+            d_heads,
+            d_counts,
+            checkpoint,
+            n_layers,
+            batch_size,
+            seq_idx);
+        return hipGetLastError() == hipSuccess;
+    }
+
+    extern "C" bool hip_kv_sequence_state_truncate(
+        int *d_heads,
+        int *d_counts,
+        int n_layers,
+        int batch_size,
+        int seq_idx,
+        int cached_tokens,
+        int max_seq_len,
+        hipStream_t stream)
+    {
+        if (!d_heads || !d_counts || !stream ||
+            n_layers <= 0 || batch_size <= 0 ||
+            seq_idx < 0 || seq_idx >= batch_size ||
+            cached_tokens < 0 || cached_tokens > max_seq_len ||
+            max_seq_len <= 0)
+        {
+            return false;
+        }
+
+        constexpr int kThreads = 128;
+        const int blocks = (n_layers + kThreads - 1) / kThreads;
+        hipLaunchKernelGGL(
+            hip_kv_sequence_state_truncate_kernel,
+            dim3(blocks),
+            dim3(kThreads),
+            0,
+            stream,
+            d_heads,
+            d_counts,
+            n_layers,
+            batch_size,
+            seq_idx,
+            cached_tokens,
+            max_seq_len);
+        return hipGetLastError() == hipSuccess;
+    }
+
+    extern "C" bool hip_kv_sequence_state_evict_oldest(
+        int *d_heads,
+        int *d_counts,
+        int n_layers,
+        int batch_size,
+        int layer,
+        int seq_idx,
+        int num_tokens,
+        int max_seq_len,
+        hipStream_t stream)
+    {
+        if (!d_heads || !d_counts || !stream ||
+            n_layers <= 0 || batch_size <= 0 ||
+            layer < 0 || layer >= n_layers ||
+            seq_idx < 0 || seq_idx >= batch_size ||
+            num_tokens < 0 || max_seq_len <= 0)
+        {
+            return false;
+        }
+
+        hipLaunchKernelGGL(
+            hip_kv_sequence_state_evict_oldest_kernel,
+            dim3(1),
+            dim3(1),
+            0,
+            stream,
+            d_heads,
+            d_counts,
+            batch_size,
+            layer,
+            seq_idx,
+            num_tokens,
+            max_seq_len);
         return hipGetLastError() == hipSuccess;
     }
 

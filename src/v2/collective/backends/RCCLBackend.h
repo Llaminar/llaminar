@@ -93,6 +93,18 @@ namespace llaminar2
         void shutdown() override;
         void abort() override;
         void setComputeStreams(const std::vector<void *> &compute_streams) override;
+        [[nodiscard]] CollectiveSubmissionReceipt singleBufferSubmissionReceipt(
+            DeviceId device) const override
+        {
+#ifdef HAVE_RCCL
+            return device.is_rocm()
+                       ? CollectiveSubmissionReceipt::onDeviceStream(stream_)
+                       : CollectiveSubmissionReceipt{};
+#else
+            (void)device;
+            return {};
+#endif
+        }
 
         // =====================================================================
         // Collective Operations

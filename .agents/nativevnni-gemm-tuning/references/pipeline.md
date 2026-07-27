@@ -141,16 +141,18 @@ certification. The stable fit input names are
 - install target:
   `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIVerifierRowsPolicyGenerated.inc`.
 
-### CPU ordinary prefill
+### CPU ordinary prefill research
 
 - serial route manifests for each build/runtime ISA regime;
 - split manifest and authenticated development lineage;
 - all historical source splits when refinement rounds span split revisions;
 - candidate-expansion and generic-refinement plans plus additive timing;
 - immutable profiler source observations and profiler evidence;
-- frozen policy, sealed witness plan, sealed aggregate/timing, certificate;
-- install target:
-  `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIPrefillPolicyGenerated.inc`.
+- frozen policy, sealed witness plan, sealed aggregate/timing, and certificate.
+
+This surface is diagnostic only. It has no source-tree install target and must
+not be consumed by production; ordinary prefill remains on the total runtime
+heuristic for every backend.
 
 ## Fit Internals
 

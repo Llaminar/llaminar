@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,11 @@ extern "C"
     // RoPE WORKSPACE-AWARE (v3 - external inv_freq buffer)
     bool cudaOps_rope_populate_inv_freq(
         float *d_inv_freq, int head_dim, float freq_base, int device_idx, cudaStream_t stream);
+    bool cudaOps_rope_publish_device_params(
+        llaminar2::rope::RoPEDeviceParams *device_params,
+        int pos_offset,
+        int device_idx,
+        cudaStream_t stream);
     bool cudaOps_rope_fp32_v3(
         float *Q, float *K, const float *d_inv_freq, const int *position_ids,
         int seq_len, int n_heads, int n_kv_heads, int head_dim, int rotary_dim, int device_idx, cudaStream_t stream);
@@ -268,30 +274,30 @@ namespace
         return status == cudaStreamCaptureStatusActive;
     }
 
-    bool uploadCudaRoPEDeviceParams(
+    bool publishCudaRoPEDeviceParams(
         llaminar2::DeviceWorkspaceManager *workspace,
-        llaminar2::rope::RoPEDeviceParams *host_params,
         cudaStream_t stream,
         bool &device_valid,
         int &device_offset,
         int pos_offset,
+        int device_idx,
         const char *context)
     {
         device_valid = false;
 
         if (!stream)
         {
-            LOG_ERROR("[" << context << "] Cannot upload RoPE params on a null/default CUDA stream");
+            LOG_ERROR("[" << context << "] Cannot publish RoPE params on a null/default CUDA stream");
             return false;
         }
         if (!workspace)
         {
-            LOG_ERROR("[" << context << "] Cannot upload RoPE params without a bound workspace");
+            LOG_ERROR("[" << context << "] Cannot publish RoPE params without a bound workspace");
             return false;
         }
         if (isCudaStreamCapturing(stream, context))
         {
-            LOG_ERROR("[" << context << "] Refusing to record RoPE-param H2D inside CUDA graph capture");
+            LOG_ERROR("[" << context << "] Refusing to record mutable RoPE-param publication inside CUDA graph capture");
             return false;
         }
 
@@ -303,13 +309,13 @@ namespace
             return false;
         }
 
-        const cudaError_t copy_err =
-            cudaMemcpyAsync(d_params, host_params, sizeof(llaminar2::rope::RoPEDeviceParams),
-                            cudaMemcpyHostToDevice, stream);
-        if (copy_err != cudaSuccess)
+        if (!cudaOps_rope_publish_device_params(
+                static_cast<llaminar2::rope::RoPEDeviceParams *>(d_params),
+                pos_offset,
+                device_idx,
+                stream))
         {
-            LOG_ERROR("[" << context << "] cudaMemcpyAsync failed for RoPE params: "
-                          << cudaGetErrorString(copy_err));
+            LOG_ERROR("[" << context << "] Device-owned RoPE-param publication failed");
             return false;
         }
 
@@ -599,11 +605,14 @@ namespace llaminar2
             float epsilon,
             int device_idx)
         {
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDARMSNormKernelT<FP32>] apply_typed requires an explicit non-null CUDA stream");
+                return false;
+            }
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_rmsnorm_fp32(input, gamma, output, rows, cols, epsilon, dev, gpu_stream_);
-            if (ok)
-                cudaDeviceSynchronize();
-            return ok;
+            return cudaOps_rmsnorm_fp32(
+                input, gamma, output, rows, cols, epsilon, dev, gpu_stream_);
         }
 
         // =========================================================================
@@ -673,11 +682,14 @@ namespace llaminar2
             float epsilon,
             int device_idx)
         {
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDARMSNormKernelT<BF16>] apply_typed requires an explicit non-null CUDA stream");
+                return false;
+            }
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_rmsnorm_bf16(input, gamma, output, rows, cols, epsilon, dev, gpu_stream_);
-            if (ok)
-                cudaDeviceSynchronize();
-            return ok;
+            return cudaOps_rmsnorm_bf16(
+                input, gamma, output, rows, cols, epsilon, dev, gpu_stream_);
         }
 
         // =========================================================================
@@ -747,11 +759,14 @@ namespace llaminar2
             float epsilon,
             int device_idx)
         {
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDARMSNormKernelT<FP16>] apply_typed requires an explicit non-null CUDA stream");
+                return false;
+            }
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_rmsnorm_fp16(input, gamma, output, rows, cols, epsilon, dev, gpu_stream_);
-            if (ok)
-                cudaDeviceSynchronize();
-            return ok;
+            return cudaOps_rmsnorm_fp16(
+                input, gamma, output, rows, cols, epsilon, dev, gpu_stream_);
         }
 
         // =========================================================================
@@ -836,8 +851,12 @@ namespace llaminar2
             int size,
             int device_idx)
         {
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDASwiGLUKernelT<FP32>] apply_typed requires an explicit non-null CUDA stream");
+                return false;
+            }
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            // Launch kernel asynchronously
             return cudaOps_swiglu_fp32(gate, up, output, size, dev, gpu_stream_);
         }
 
@@ -921,11 +940,13 @@ namespace llaminar2
             int size,
             int device_idx)
         {
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDASwiGLUKernelT<BF16>] apply_typed requires an explicit non-null CUDA stream");
+                return false;
+            }
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_swiglu_bf16(gate, up, output, size, dev, gpu_stream_);
-            if (ok)
-                cudaDeviceSynchronize();
-            return ok;
+            return cudaOps_swiglu_bf16(gate, up, output, size, dev, gpu_stream_);
         }
 
         // =========================================================================
@@ -1008,39 +1029,28 @@ namespace llaminar2
             int size,
             int device_idx)
         {
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDASwiGLUKernelT<FP16>] apply_typed requires an explicit non-null CUDA stream");
+                return false;
+            }
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_swiglu_fp16(gate, up, output, size, dev, gpu_stream_);
-            if (ok)
-                cudaDeviceSynchronize();
-            return ok;
+            return cudaOps_swiglu_fp16(gate, up, output, size, dev, gpu_stream_);
         }
 
         // =========================================================================
         // CUDARoPEKernelT<FP32> Implementation
         // =========================================================================
 
-        CUDARoPEKernelT<ActivationPrecision::FP32>::~CUDARoPEKernelT()
-        {
-            if (h_device_params_)
-            {
-                cudaFreeHost(h_device_params_);
-                h_device_params_ = nullptr;
-            }
-        }
-
         void CUDARoPEKernelT<ActivationPrecision::FP32>::setDynamicPosOffset(int pos_offset)
         {
-            if (!h_device_params_)
-            {
-                cudaMallocHost(reinterpret_cast<void **>(&h_device_params_), sizeof(rope::RoPEDeviceParams));
-            }
-            if (h_device_params_)
-            {
-                h_device_params_->pos_offset = pos_offset;
-                uploadCudaRoPEDeviceParams(
-                    workspace_, h_device_params_, static_cast<cudaStream_t>(gpu_stream_),
+            if (!publishCudaRoPEDeviceParams(
+                    workspace_, static_cast<cudaStream_t>(gpu_stream_),
                     dynamic_pos_device_valid_, dynamic_pos_offset_, pos_offset,
-                    "CUDARoPEKernelT<FP32>");
+                    device_idx_, "CUDARoPEKernelT<FP32>"))
+            {
+                throw std::runtime_error(
+                    "CUDARoPEKernelT<FP32> failed to publish device-owned dynamic position");
             }
         }
 
@@ -1096,7 +1106,11 @@ namespace llaminar2
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::ROPE, gpu_stream_);
             cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
-            const bool sync_after = (stream == nullptr);
+            if (!stream)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<FP32>] apply_typed requires an explicit non-null CUDA stream");
+                return false;
+            }
 
             // Effective rotary dimension: 0 means full rotation (=head_dim)
             const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
@@ -1107,8 +1121,6 @@ namespace llaminar2
                     recordCudaGroupedRoPECall(
                         "FP32", seq_len, n_heads, n_kv_heads,
                         head_dim, eff_rotary, dev, position_route);
-                    if (sync_after)
-                        cudaDeviceSynchronize();
                 }
                 return ok;
             };
@@ -1251,28 +1263,15 @@ namespace llaminar2
         // CUDARoPEKernelT<BF16> Implementation
         // =========================================================================
 
-        CUDARoPEKernelT<ActivationPrecision::BF16>::~CUDARoPEKernelT()
-        {
-            if (h_device_params_)
-            {
-                cudaFreeHost(h_device_params_);
-                h_device_params_ = nullptr;
-            }
-        }
-
         void CUDARoPEKernelT<ActivationPrecision::BF16>::setDynamicPosOffset(int pos_offset)
         {
-            if (!h_device_params_)
-            {
-                cudaMallocHost(reinterpret_cast<void **>(&h_device_params_), sizeof(rope::RoPEDeviceParams));
-            }
-            if (h_device_params_)
-            {
-                h_device_params_->pos_offset = pos_offset;
-                uploadCudaRoPEDeviceParams(
-                    workspace_, h_device_params_, static_cast<cudaStream_t>(gpu_stream_),
+            if (!publishCudaRoPEDeviceParams(
+                    workspace_, static_cast<cudaStream_t>(gpu_stream_),
                     dynamic_pos_device_valid_, dynamic_pos_offset_, pos_offset,
-                    "CUDARoPEKernelT<BF16>");
+                    device_idx_, "CUDARoPEKernelT<BF16>"))
+            {
+                throw std::runtime_error(
+                    "CUDARoPEKernelT<BF16> failed to publish device-owned dynamic position");
             }
         }
 
@@ -1327,7 +1326,11 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
-            const bool sync_after = (stream == nullptr);
+            if (!stream)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<BF16>] apply_typed requires an explicit non-null CUDA stream");
+                return false;
+            }
 
             // Effective rotary dimension: 0 means full rotation (=head_dim)
             const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
@@ -1338,8 +1341,6 @@ namespace llaminar2
                     recordCudaGroupedRoPECall(
                         "BF16", seq_len, n_heads, n_kv_heads,
                         head_dim, eff_rotary, dev, position_route);
-                    if (sync_after)
-                        cudaDeviceSynchronize();
                 }
                 return ok;
             };
@@ -1476,28 +1477,15 @@ namespace llaminar2
         // CUDARoPEKernelT<FP16> Implementation
         // =========================================================================
 
-        CUDARoPEKernelT<ActivationPrecision::FP16>::~CUDARoPEKernelT()
-        {
-            if (h_device_params_)
-            {
-                cudaFreeHost(h_device_params_);
-                h_device_params_ = nullptr;
-            }
-        }
-
         void CUDARoPEKernelT<ActivationPrecision::FP16>::setDynamicPosOffset(int pos_offset)
         {
-            if (!h_device_params_)
-            {
-                cudaMallocHost(reinterpret_cast<void **>(&h_device_params_), sizeof(rope::RoPEDeviceParams));
-            }
-            if (h_device_params_)
-            {
-                h_device_params_->pos_offset = pos_offset;
-                uploadCudaRoPEDeviceParams(
-                    workspace_, h_device_params_, static_cast<cudaStream_t>(gpu_stream_),
+            if (!publishCudaRoPEDeviceParams(
+                    workspace_, static_cast<cudaStream_t>(gpu_stream_),
                     dynamic_pos_device_valid_, dynamic_pos_offset_, pos_offset,
-                    "CUDARoPEKernelT<FP16>");
+                    device_idx_, "CUDARoPEKernelT<FP16>"))
+            {
+                throw std::runtime_error(
+                    "CUDARoPEKernelT<FP16> failed to publish device-owned dynamic position");
             }
         }
 
@@ -1552,7 +1540,11 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
-            const bool sync_after = (stream == nullptr);
+            if (!stream)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<FP16>] apply_typed requires an explicit non-null CUDA stream");
+                return false;
+            }
 
             // Effective rotary dimension: 0 means full rotation (=head_dim)
             const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
@@ -1563,8 +1555,6 @@ namespace llaminar2
                     recordCudaGroupedRoPECall(
                         "FP16", seq_len, n_heads, n_kv_heads,
                         head_dim, eff_rotary, dev, position_route);
-                    if (sync_after)
-                        cudaDeviceSynchronize();
                 }
                 return ok;
             };
@@ -2219,7 +2209,11 @@ namespace llaminar2
                         LOG_ERROR("[CUDAEmbeddingKernelT] Device-token embedding would zero single-device token="
                                   << token_id << " local_vocab_size=" << local_vocab_size
                                   << " vocab_offset=" << vocab_offset
-                                  << " num_tokens=" << num_tokens);
+                                  << " token_index=" << i
+                                  << " num_tokens=" << num_tokens
+                                  << " token_ids_device=" << static_cast<void *>(d_token_ids)
+                                  << " output_device=" << static_cast<void *>(d_output)
+                                  << " stream=" << gpu_stream_);
                         return false;
                     }
                     LOG_DEBUG("[CUDAEmbeddingKernelT] Device-token embedding validation token="

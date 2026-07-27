@@ -89,9 +89,21 @@ namespace llaminar2
         uint32_t resident_participant_mask[kDeviceMoEMaxExperts] = {};
         uint32_t epoch = 0;
         uint32_t expert_count = 0;
-        // reserved[0]: count of experts resident on more than one participant.
-        // Decode uses this as a cheap hot-cache router-stats gate.
-        uint32_t reserved[2] = {};
+        /// Number of experts resident on more than one participant.
+        /// Decode uses this as a cheap hot-cache router-stats gate.
+        uint32_t multi_resident_expert_count = 0;
+        /**
+         * @brief Domain-wide marker for request-lifetime transfer-slot placement.
+         *
+         * This marker is published from the globally agreed transfer plan on
+         * every participant. It must never be inferred from a local expert
+         * descriptor because only the transfer destination owns that
+         * descriptor. Prefix capture uses the marker to preserve exact logical
+         * placement symmetrically while excluding pointer-bearing slot
+         * descriptors; restore rebuilds those payloads from immutable owners
+         * in a dedicated captured device transaction.
+         */
+        uint32_t transient_placement_observed = 0;
     };
 
     struct DeviceMoELayerRuntime
@@ -152,29 +164,62 @@ namespace llaminar2
     static_assert(std::is_trivially_copyable_v<DeviceMoEPlacementBank>);
     static_assert(std::is_trivially_copyable_v<DeviceMoELayerRuntime>);
 
-    inline bool deviceMoELayerUsesTransientLocalPayload(
+    /**
+     * @brief Count active experts backed by graph-owned transient transfer slots.
+     *
+     * A transfer-slot flag alone only proves that a descriptor was materialized.
+     * The active local-compute mask and the descriptor's valid, resident, and
+     * local-compute flags prove that the descriptor was subsequently published
+     * into the active placement bank and is eligible for expert execution.
+     * This stronger predicate is therefore suitable for request-boundary
+     * production-path evidence: a nonzero result means prefill movement reached
+     * the applied runtime state, not merely that a planner proposed movement.
+     *
+     * @param state Participant-local runtime placement for one MoE layer.
+     * @return Number of active, locally executable transfer-slot experts.
+     */
+    inline uint32_t deviceMoELayerActiveTransferSlotExpertCount(
         const DeviceMoELayerRuntime &state) noexcept
     {
         if (state.active_bank > 1u ||
             state.active_epoch == 0u ||
             state.expert_count > kDeviceMoEMaxExperts)
         {
-            return false;
+            return 0u;
         }
 
         const auto &bank = state.banks[state.active_bank];
         const uint32_t expert_count =
             std::min<uint32_t>(state.expert_count, kDeviceMoEMaxExperts);
+        constexpr uint32_t kAppliedTransferSlotFlags =
+            toMoEExpertFlags(DeviceMoEExpertFlags::Valid) |
+            toMoEExpertFlags(DeviceMoEExpertFlags::Resident) |
+            toMoEExpertFlags(DeviceMoEExpertFlags::LocalCompute) |
+            toMoEExpertFlags(DeviceMoEExpertFlags::TransferSlot);
+        uint32_t count = 0u;
         for (uint32_t expert = 0; expert < expert_count; ++expert)
         {
+            const uint32_t flags = bank.experts[expert].flags;
             if (bank.local_compute_mask[expert] != 0u &&
-                hasMoEExpertFlag(bank.experts[expert].flags,
-                                 DeviceMoEExpertFlags::TransferSlot))
+                (flags & kAppliedTransferSlotFlags) == kAppliedTransferSlotFlags)
             {
-                return true;
+                ++count;
             }
         }
-        return false;
+        return count;
+    }
+
+    /**
+     * @brief Return whether the active placement consumes any transient payload.
+     *
+     * This convenience predicate deliberately delegates to the stricter count
+     * helper so prefix-cache portability and PerfStats evidence share exactly
+     * one definition of an applied transient expert.
+     */
+    inline bool deviceMoELayerUsesTransientLocalPayload(
+        const DeviceMoELayerRuntime &state) noexcept
+    {
+        return deviceMoELayerActiveTransferSlotExpertCount(state) != 0u;
     }
 
     struct MoEPlacementUpdate
@@ -189,6 +234,14 @@ namespace llaminar2
         /// Optional [expert] bitmask of participants with resident weights.
         /// If omitted, prepareInactiveBank synthesizes owner/local residency.
         std::vector<uint32_t> resident_participant_mask;
+        /**
+         * @brief Whether this bank includes request-lifetime transfer placement.
+         *
+         * Callers constructing the same logical bank for several participants
+         * must publish the same value on every participant. Runtime transfer
+         * apply derives it from the globally gathered transfer plan.
+         */
+        bool transient_placement_observed = false;
     };
 
     struct DeviceMoEPortableExpertRuntimeState
@@ -209,6 +262,17 @@ namespace llaminar2
         uint32_t top_k = 0;
         uint32_t participant_id = 0;
         uint32_t participant_count = 1;
+        /**
+         * @brief Whether exact restore requires rebuilding request-owned payloads.
+         *
+         * The portable record below contains logical placement only. When this
+         * flag is set, one or more resident-participant bits name rolling
+         * transfer-slot replicas whose pointer-bearing descriptors deliberately
+         * are not serialized. Restore first publishes immutable model placement
+         * plus a device transfer plan; a dedicated captured graph then recreates
+         * those payloads before any restored-prefix route is assigned.
+         */
+        uint32_t requires_device_payload_rehydration = 0;
         std::vector<DeviceMoEPortableExpertRuntimeState> experts;
         std::vector<uint64_t> selected_histogram;
         std::vector<uint64_t> local_histogram;
@@ -300,17 +364,18 @@ namespace llaminar2
          * @brief Resolver used when a portable restore must rebind local expert payloads.
          *
          * Portable prefix-cache state stores logical placement, local-compute
-         * intent, and stable local slot ids, but it deliberately does not embed
-         * pointer-bearing DeviceMoELayerRuntime banks.  A graph builder that owns
-         * persistent transfer-slot directories may provide this resolver to turn
-         * the saved `(layer, expert, local_slot)` claim back into a live
+         * intent, and stable local slot ids, but deliberately does not embed
+         * pointer-bearing DeviceMoELayerRuntime banks. A runtime that owns a
+         * model-lifetime payload directory may provide this resolver to turn a
+         * saved `(layer, expert, local_slot)` claim back into a live
          * DeviceMoEExpertDescriptor.
          *
-         * Remote-owned local replicas are transfer-slot payloads owned by the
-         * graph-side slot directory, so a provided resolver is authoritative for
-         * those records.  Owned local experts may still bind from an existing
-         * ready runtime-bank descriptor because their payload lifetime is the
-         * model/runtime table itself rather than a transient rebalance slot.
+         * Rolling transfer-slot payloads are never resolver candidates.
+         * Portable capture preserves their pointer-free logical residency and
+         * restore publishes a device-side rehydration plan from immutable owner
+         * weights. Owned or statically mirrored local experts may still bind
+         * from an existing ready runtime-bank descriptor because their payload
+         * lifetime is the model itself.
          */
         using LocalPayloadDescriptorResolver =
             std::function<bool(int layer_idx,

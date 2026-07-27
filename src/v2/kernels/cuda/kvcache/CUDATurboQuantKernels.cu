@@ -14,6 +14,7 @@
  */
 
 #include "CUDATurboQuantKernels.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantCodebook.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../utils/Logger.h"
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <cstring>
 #include <atomic>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -105,14 +107,30 @@ namespace llaminar2
         result.n_layers = n_layers;
         result.n_kv_heads = n_kv_heads;
         result.head_dim = head_dim;
+        result.device_id = device_id;
 
         const size_t mat_size = static_cast<size_t>(head_dim) * head_dim;
         const size_t total_mats = static_cast<size_t>(n_layers) * n_kv_heads;
         const size_t total_floats = total_mats * mat_size;
 
-        // Allocate on GPU
-        cudaMalloc(&result.d_rotations, total_floats * sizeof(float));
-        cudaMalloc(&result.d_rotations_t, total_floats * sizeof(float));
+        // Rotation storage is a model-lifetime resource, owned by the backend.
+        auto *backend = getCUDABackend();
+        if (!backend)
+            throw std::runtime_error("[TurboQuant CUDA] CUDA backend unavailable");
+        const size_t rotation_bytes = total_floats * sizeof(float);
+        result.d_rotations =
+            static_cast<float *>(backend->allocate(rotation_bytes, device_id));
+        result.d_rotations_t =
+            static_cast<float *>(backend->allocate(rotation_bytes, device_id));
+        if (!result.d_rotations || !result.d_rotations_t)
+        {
+            if (result.d_rotations)
+                backend->free(result.d_rotations, device_id);
+            if (result.d_rotations_t)
+                backend->free(result.d_rotations_t, device_id);
+            throw std::runtime_error(
+                "[TurboQuant CUDA] Failed to allocate model-lifetime rotation storage");
+        }
 
         // Generate and upload each rotation matrix
         // Use the same derivation as CPU: TurboQuantContext → for_layer(head_idx)
@@ -160,16 +178,21 @@ namespace llaminar2
 
     void cuda_tq_free_rotations(CUDATurboQuantRotations &rotations)
     {
+        auto *backend = getCUDABackend();
+        if (!backend && (rotations.d_rotations || rotations.d_rotations_t))
+            throw std::runtime_error(
+                "[TurboQuant CUDA] CUDA backend unavailable during rotation teardown");
         if (rotations.d_rotations)
         {
-            cudaFree(rotations.d_rotations);
+            backend->free(rotations.d_rotations, rotations.device_id);
             rotations.d_rotations = nullptr;
         }
         if (rotations.d_rotations_t)
         {
-            cudaFree(rotations.d_rotations_t);
+            backend->free(rotations.d_rotations_t, rotations.device_id);
             rotations.d_rotations_t = nullptr;
         }
+        rotations.device_id = -1;
     }
 
     // =========================================================================

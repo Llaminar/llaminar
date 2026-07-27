@@ -52,6 +52,10 @@ namespace llaminar2
         int max_seq_len() const override { return max_seq_len_; }
         int get_cached_tokens(int layer, int seq_idx = 0) const override;
         KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override;
+        bool truncateSequence(
+            int seq_idx,
+            int cached_tokens,
+            void *stream = nullptr) override;
 
         void clear() override;
         void clear_sequence(int layer, int seq_idx) override;
@@ -77,6 +81,19 @@ namespace llaminar2
             void *gpu_stream) override;
         const int *deviceCachedTokenCountPtr(int layer, int seq_idx = 0) const override;
         const int *deviceRingHeadPtr(int layer, int seq_idx = 0) const override;
+        size_t deviceSequenceStateCheckpointBytes() const override;
+        bool captureDeviceSequenceStateCheckpoint(
+            int seq_idx,
+            void *checkpoint_device,
+            size_t checkpoint_bytes,
+            void *stream,
+            std::string *error = nullptr) const override;
+        bool restoreDeviceSequenceStateCheckpoint(
+            int seq_idx,
+            const void *checkpoint_device,
+            size_t checkpoint_bytes,
+            void *stream,
+            std::string *error = nullptr) override;
         bool publishSequenceStateFromDeviceMetadata(
             const DeviceSequenceStatePublicationRequest &request,
             std::string *error = nullptr) override;
@@ -126,6 +143,22 @@ namespace llaminar2
         std::vector<const int32_t *> append_count_sources_;
         bool wrap_warned_ = false;     ///< One-time warning when ring buffer wraps
 
+        /**
+         * @brief Establish this cache's allocation device on the calling thread.
+         *
+         * LocalTP participant calls share a coordinator thread, so CUDA's
+         * ambient current device can still name the previously executed sibling.
+         * Device-resident sequence-state operations call this method before
+         * touching owned pointers or launching on an owned stream.
+         *
+         * @param operation Human-readable operation name used in diagnostics.
+         * @param error Optional detailed failure destination for public APIs.
+         * @return true when the CUDA runtime selected @ref device_id_.
+         */
+        bool activateOwningDevice(
+            const char *operation,
+            std::string *error = nullptr) const;
+
         void allocateDeviceParams();
         void freeDeviceParams();
         const int *deviceDynamicAppendCountPtr(int layer, int seq_idx) const;
@@ -134,6 +167,26 @@ namespace llaminar2
             int seq_idx,
             int head,
             int count,
+            void *gpu_stream);
+
+        /**
+         * @brief Remove oldest visible rows by mutating canonical device metadata.
+         *
+         * The kernel reads the current count from device memory, subtracts
+         * `num_tokens` with saturation at zero, and leaves the ring head
+         * unchanged. The caller supplies the exact stream that owns the
+         * mutation; this method performs no D2H observation and no host wait.
+         *
+         * @param layer Local cache layer index.
+         * @param seq_idx Request index within the cache batch.
+         * @param num_tokens Number of oldest visible rows to discard.
+         * @param gpu_stream Explicit CUDA stream that owns the mutation.
+         * @return true when the metadata kernel was accepted for launch.
+         */
+        bool evictOldestDeviceSequenceState(
+            int layer,
+            int seq_idx,
+            int num_tokens,
             void *gpu_stream);
 
         /**

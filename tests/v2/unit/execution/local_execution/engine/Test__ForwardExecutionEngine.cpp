@@ -111,7 +111,9 @@ namespace
         int ensure_workspace_calls = 0;
         int last_workspace_seq_len = -1;
         int sync_logits_calls = 0;
-        int logits_tensor_calls = 0;
+        TensorBase *last_published_logits = nullptr;
+        int pending_all_position_verifier_stream_calls = 0;
+        int pending_main_decode_stream_calls = 0;
         int build_decode_policy_calls = 0;
         int resolve_pp_copy_calls = 0;
         int get_pipeline_contexts_calls = 0;
@@ -140,6 +142,10 @@ namespace
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
         bool mock_compute_all_position_logits = false;
+        bool mock_defer_all_position_verifier_sync = false;
+        bool mock_defer_main_decode_sync = false;
+        void *pending_all_position_verifier_stream = nullptr;
+        void *pending_main_decode_stream = nullptr;
         bool mock_moe_rebalancing_active = false;
         bool mock_moe_rebalancing_graph_stable = false;
         bool mock_prefill_graph_capture_disabled = false;
@@ -245,21 +251,21 @@ namespace
             return true;
         }
 
-        void syncLogitsAtBoundary(IDeviceContext *ctx) override
+        bool publishLogitsAtBoundary(
+            TensorBase *logits,
+            IDeviceContext *ctx,
+            void *producer_stream) override
         {
+            last_published_logits = logits;
+            (void)ctx;
+            (void)producer_stream;
             sync_logits_calls++;
-        }
-
-        TensorBase *logitsTensor() override
-        {
-            logits_tensor_calls++;
-            return nullptr;
+            return true;
         }
 
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
             bool has_collective_nodes,
-            IDeviceContext *ctx,
-            int segment_consecutive_failures) const override
+            IDeviceContext *ctx) const override
         {
             const_cast<MockForwardExecutionHost *>(this)->build_decode_policy_calls++;
             return mock_capture_policy;
@@ -274,6 +280,28 @@ namespace
         bool computeAllPositionLogitsEnabled() const override
         {
             return mock_compute_all_position_logits;
+        }
+
+        bool shouldDeferAllPositionVerifierFinalSync() const override
+        {
+            return mock_defer_all_position_verifier_sync;
+        }
+
+        void setPendingAllPositionVerifierStream(void *stream) override
+        {
+            ++pending_all_position_verifier_stream_calls;
+            pending_all_position_verifier_stream = stream;
+        }
+
+        bool shouldDeferMainDecodeFinalSync() const override
+        {
+            return mock_defer_main_decode_sync;
+        }
+
+        void setPendingMainDecodeStream(void *stream) override
+        {
+            ++pending_main_decode_stream_calls;
+            pending_main_decode_stream = stream;
         }
 
         bool isMoeRebalancingActive() const override
@@ -379,7 +407,7 @@ namespace
             probe_->real_seq_lens.push_back(params.real_seq_len);
             probe_->bucket_seq_lens.push_back(params.bucket_seq_len);
             probe_->token_offsets.push_back(params.token_offset);
-            probe_->saw_stream.push_back(gpuStream() != nullptr);
+            probe_->saw_stream.push_back(hasGPUStream());
         }
 
     private:
@@ -441,14 +469,14 @@ namespace
 
 } // namespace
 
-TEST(ForwardExecutionEngineSourceScan, DecodeCapturePolicyInstallsBoundaryHookBeforeExecutorCall)
+TEST(ForwardExecutionEngineSourceScan, DecodeCapturePolicyInstallsLifecycleBoundaryBeforeExecutorCall)
 {
     const std::string source = readTextFile(LLAMINAR_FORWARD_EXECUTION_ENGINE_SOURCE);
     ASSERT_FALSE(source.empty());
 
     const size_t policy_build = source.find("capture_policy = host.buildDecodeCapturePolicy(");
     ASSERT_NE(policy_build, std::string::npos);
-    const size_t hook_assignment = source.find("capture_policy.before_begin_capture", policy_build);
+    const size_t hook_assignment = source.find("capture_policy.capture_boundary", policy_build);
     ASSERT_NE(hook_assignment, std::string::npos);
     const size_t boundary_call = source.find("host.waitAtDecodeGraphCaptureBoundary(", hook_assignment);
     ASSERT_NE(boundary_call, std::string::npos);
@@ -456,36 +484,79 @@ TEST(ForwardExecutionEngineSourceScan, DecodeCapturePolicyInstallsBoundaryHookBe
     ASSERT_NE(execute_call, std::string::npos);
 
     EXPECT_LT(hook_assignment, execute_call)
-        << "Decode graph capture must install the LocalTP boundary hook before entering executor capture/replay.";
+        << "Decode graph capture must install the LocalTP lifecycle hook before entering executor capture/replay.";
     EXPECT_LT(boundary_call, execute_call)
-        << "The hook must route through the host so LocalTP can fence before beginCapture.";
+        << "The hook must route through the host so LocalTP can fence capture entry and exit.";
 }
 
-TEST(ForwardExecutionEngineSourceScan, DecodeSegmentCaptureFencesAfterStreamSyncBeforeBeginCapture)
+TEST(ForwardExecutionEngineSourceScan, DecodeCaptureFencesGraphOwnershipEntryAndExit)
 {
     const std::string source = readTextFile(LLAMINAR_DEVICE_GRAPH_CAPTURE_CONTROLLER_SOURCE);
     ASSERT_FALSE(source.empty());
 
-    const size_t stream_sync = source.find("Capture warmup stream sync failed before segment");
-    ASSERT_NE(stream_sync, std::string::npos);
-    const size_t boundary_hook = source.find("hooks.before_begin_capture", stream_sync);
+    const size_t boundary_hook = source.find("hooks.capture_boundary");
     ASSERT_NE(boundary_hook, std::string::npos);
     const size_t create_capture = source.find("createGraphCapture(capture_stream)", boundary_hook);
     ASSERT_NE(create_capture, std::string::npos);
-    const size_t begin_capture = source.find("seg.capture->beginCapture()", create_capture);
+    const size_t capture_owner = source.find(
+        "ScopedBackendGraphCapture capture_transaction(",
+        create_capture);
+    ASSERT_NE(capture_owner, std::string::npos);
+    const size_t begin_capture = source.find(
+        "capture_transaction.begin()",
+        capture_owner);
     ASSERT_NE(begin_capture, std::string::npos);
 
-    EXPECT_LT(stream_sync, boundary_hook)
-        << "Participants should drain local warmup work before entering the domain-level capture fence.";
     EXPECT_LT(boundary_hook, begin_capture)
         << "LocalTP participants must rendezvous before any device starts HIP/CUDA stream capture.";
+    const std::string capture_entry =
+        source.substr(boundary_hook, begin_capture - boundary_hook);
+    EXPECT_EQ(
+        capture_entry.find("synchronizeStreamChecked"),
+        std::string::npos)
+        << "Capture entry must be ordered by explicit stream dependencies and "
+           "the domain lifecycle barrier, never by a host-blocking stream drain.";
 
-    const size_t recapture_boundary = source.find("graphCaptureBoundaryName(\n                        \"recapture\"");
+    const size_t capture_finish = source.find(
+        "capture_transaction.finish()",
+        begin_capture);
+    ASSERT_NE(capture_finish, std::string::npos);
+    const size_t capture_exit_boundary = source.find(
+        "exec_ok ? \"capture_end\" : \"capture_end_failed\"",
+        capture_finish);
+    ASSERT_NE(capture_exit_boundary, std::string::npos);
+    const size_t capture_finalize = source.find(
+        "finalizeCapturePhaseCapturableSegment(",
+        capture_exit_boundary);
+    ASSERT_NE(capture_finalize, std::string::npos);
+    EXPECT_LT(capture_finish, capture_exit_boundary)
+        << "Capture-exit rendezvous must happen only after native endCapture completes.";
+    EXPECT_LT(capture_exit_boundary, capture_finalize)
+        << "No graph launch or following manual collective may proceed until all LocalTP participants exit capture.";
+
+    const size_t recapture_boundary = source.find("\"recapture_begin\"");
     ASSERT_NE(recapture_boundary, std::string::npos);
-    const size_t recapture_begin = source.find("segment.capture->beginCapture()", recapture_boundary);
+    const size_t recapture_owner = source.find(
+        "ScopedBackendGraphCapture capture_transaction(",
+        recapture_boundary);
+    ASSERT_NE(recapture_owner, std::string::npos);
+    const size_t recapture_begin = source.find(
+        "capture_transaction.begin()",
+        recapture_owner);
     ASSERT_NE(recapture_begin, std::string::npos);
     EXPECT_LT(recapture_boundary, recapture_begin)
         << "Forced recapture must use the same pre-beginCapture domain fence.";
+
+    const size_t recapture_finish = source.find(
+        "capture_transaction.finish()",
+        recapture_begin);
+    ASSERT_NE(recapture_finish, std::string::npos);
+    const size_t recapture_exit_boundary = source.find(
+        "exec_ok ? \"recapture_end\" : \"recapture_end_failed\"",
+        recapture_finish);
+    ASSERT_NE(recapture_exit_boundary, std::string::npos);
+    EXPECT_LT(recapture_finish, recapture_exit_boundary)
+        << "Forced recapture must rendezvous all participants after endCapture as well.";
 }
 
 /**
@@ -562,6 +633,25 @@ TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_ExactBucketSucceeds
     EXPECT_EQ(plan.chunk.bucket_seq_len, 4);
     EXPECT_EQ(plan.chunk.token_ids, tokens);
     EXPECT_EQ(plan.chunk.position_ids, (std::vector<int>{32, 33, 34, 35}));
+}
+
+TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_GPUUsesContiguousDeviceOffset)
+{
+    const std::vector<int> tokens = {10, 11, 12, 13};
+    auto input = makeTestInput(4, 1, DeviceId::cuda(0), tokens.data(), nullptr);
+    input.token_offset = 32;
+
+    auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+        input,
+        std::vector<int>{4, 8},
+        /*pad_token_id=*/99,
+        /*allow_padded_execution=*/false);
+
+    ASSERT_TRUE(plan) << plan.error;
+    EXPECT_EQ(plan.position_policy, ForwardPositionPolicy::ContiguousOffset);
+    EXPECT_TRUE(plan.chunk.position_ids.empty())
+        << "GPU contiguous prefill must not manufacture mutable host position rows";
+    EXPECT_EQ(plan.chunk.token_offset, 32);
 }
 
 TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_UsesPositionOffsetWhenTokenOffsetIsAbsent)
@@ -1144,9 +1234,13 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedPlanDelegatesWithBuck
     ASSERT_TRUE(host.has_last_forward_input);
     EXPECT_EQ(host.build_forward_graph_calls, 1);
     EXPECT_NE(host.last_token_ids_pointer, nullptr);
-    EXPECT_NE(host.last_position_ids_pointer, nullptr);
+    EXPECT_EQ(host.last_position_ids_pointer, nullptr);
     EXPECT_EQ(host.last_token_ids, (std::vector<int>{50, 51, 52, 7}));
-    EXPECT_EQ(host.last_position_ids, (std::vector<int>{88, 89, 90, 91}));
+    EXPECT_TRUE(host.last_position_ids.empty());
+    EXPECT_EQ(
+        host.last_forward_input.position_policy,
+        ForwardPositionPolicy::ContiguousOffset);
+    EXPECT_EQ(host.last_forward_input.position_ids_device, nullptr);
     EXPECT_EQ(host.last_forward_input.seq_len, 4);
     EXPECT_EQ(host.last_forward_input.real_seq_len, 3);
     EXPECT_EQ(host.last_forward_input.bucket_seq_len, 4);
@@ -1339,7 +1433,12 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawBucketedPrefillPadsBeforeBuild)
     ASSERT_TRUE(host.has_last_forward_input);
     EXPECT_EQ(host.build_forward_graph_calls, 1);
     EXPECT_EQ(host.last_token_ids, (std::vector<int>{80, 81, 82, 0}));
-    EXPECT_EQ(host.last_position_ids, (std::vector<int>{200, 201, 202, 203}));
+    EXPECT_EQ(host.last_position_ids_pointer, nullptr);
+    EXPECT_TRUE(host.last_position_ids.empty());
+    EXPECT_EQ(
+        host.last_forward_input.position_policy,
+        ForwardPositionPolicy::ContiguousOffset);
+    EXPECT_EQ(host.last_forward_input.position_ids_device, nullptr);
     EXPECT_EQ(host.last_forward_input.seq_len, 4);
     EXPECT_EQ(host.last_forward_input.real_seq_len, 3);
     EXPECT_EQ(host.last_forward_input.bucket_seq_len, 4);
@@ -1982,6 +2081,62 @@ TEST_F(Test__ForwardExecutionEngine, CacheMiss_NullPositionIds_NoCachePopulated)
     EXPECT_TRUE(engine.cacheEmpty());
 }
 
+/**
+ * @brief Prove first-use GPU MTP forwards use the same device handoff as replay.
+ *
+ * A cache miss is still an asynchronous GPU producer. The verifier sampler or
+ * main-decode sampler must inherit its explicit stream directly; synchronizing
+ * logits merely because no graph executable existed yet reintroduces a host
+ * coherence boundary on the first speculative step.
+ */
+TEST_F(Test__ForwardExecutionEngine, CacheMiss_GPUDecodeDefersLogitsToDeviceConsumer)
+{
+    llaminar2::testing::MockDeviceContext gpu_ctx{
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA};
+    int token = 42;
+    int position = 0;
+
+    {
+        auto engine = makeEngine();
+        MockForwardExecutionHost host(&gpu_ctx);
+        host.graph_stage_count = 1;
+        host.mock_compute_all_position_logits = true;
+        host.mock_defer_all_position_verifier_sync = true;
+
+        auto input =
+            makeTestInput(1, 1, DeviceId::cuda(0), &token, &position);
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input, output, host));
+
+        EXPECT_EQ(host.sync_logits_calls, 0);
+        EXPECT_EQ(host.pending_all_position_verifier_stream_calls, 1);
+        EXPECT_EQ(
+            host.pending_all_position_verifier_stream,
+            llaminar2::testing::sharedMockWorkerGPUContext().defaultStream());
+        EXPECT_EQ(host.pending_main_decode_stream_calls, 0);
+    }
+
+    {
+        auto engine = makeEngine();
+        MockForwardExecutionHost host(&gpu_ctx);
+        host.graph_stage_count = 1;
+        host.mock_defer_main_decode_sync = true;
+
+        auto input =
+            makeTestInput(1, 1, DeviceId::cuda(0), &token, &position);
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input, output, host));
+
+        EXPECT_EQ(host.sync_logits_calls, 0);
+        EXPECT_EQ(host.pending_main_decode_stream_calls, 1);
+        EXPECT_EQ(
+            host.pending_main_decode_stream,
+            llaminar2::testing::sharedMockWorkerGPUContext().defaultStream());
+        EXPECT_EQ(host.pending_all_position_verifier_stream_calls, 0);
+    }
+}
+
 // =========================================================================
 // execute() — Caching Disabled
 // =========================================================================
@@ -2095,7 +2250,10 @@ TEST_F(Test__ForwardExecutionEngine, CapturedCollectiveOptInRequestsDeferredMain
     PerfStatsCollector::reset();
 
     auto engine = makeEngine();
-    MockForwardExecutionHost host(&mock_ctx_);
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
     host.graph_stage_types = {ComputeStageType::ALLREDUCE};
     host.mock_capture_policy.allow_fast_decode = true;
     host.mock_capture_policy.allow_cached_graph_replay = true;
@@ -2103,7 +2261,7 @@ TEST_F(Test__ForwardExecutionEngine, CapturedCollectiveOptInRequestsDeferredMain
 
     int token = 42;
     int pos = 7;
-    auto input = makeTestInput(1, 1, DeviceId::cpu(), &token, &pos);
+    auto input = makeTestInput(1, 1, DeviceId::cuda(0), &token, &pos);
     ForwardOutput output{};
 
     ASSERT_TRUE(engine.execute(input, output, host));
@@ -2117,7 +2275,8 @@ TEST_F(Test__ForwardExecutionEngine, CapturedCollectiveOptInRequestsDeferredMain
         {"collectives_graph_capturable", "true"},
         {"context", "main_decode"},
         {"defer_final_sync", "true"},
-        {"has_collectives", "true"}};
+        {"has_collectives", "true"},
+        {"replay_plan_policy", "require_full_graph"}};
     EXPECT_DOUBLE_EQ(findForwardGraphCounterValue(records, "decode_capture_policy", tags), 1.0)
         << "Captured collective decode graphs must ask the replay controller to defer "
            "final sync when the explicit diagnostic opt-in is enabled.";

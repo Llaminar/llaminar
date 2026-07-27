@@ -6,6 +6,7 @@
 #include "LMHeadStage.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/GemmContext.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -181,11 +182,7 @@ namespace llaminar2
         }
 
         if (params_.device_id.is_gpu())
-        {
-            logits->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                                          params_.device_id,
-                                          gpuStream());
-        }
+            gpuExecution().publish(logits);
 
         return true;
     }
@@ -235,10 +232,7 @@ namespace llaminar2
         }
 
         if (is_gpu)
-            logits->transitionToWithEvent(
-                TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                params_.device_id,
-                stream);
+            gpuExecution().publish(logits);
         PerfStatsCollector::addCounter(
             "mtp",
             "lm_head_grouped_decode_equivalent_verifier_prefill_rows",
@@ -418,9 +412,14 @@ namespace llaminar2
         auto contract = StageBufferContract::build()
                             .addInput(*params_.input_buffer_id)
                             .addOutput(*params_.output_buffer_id);
-        // Model weight is not arena-managed
+        // The projection consumes its store-owned prepared representation.
         if (params_.lm_head_weight)
-            contract.addWeight(const_cast<ITensor *>(params_.lm_head_weight));
+        {
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.lm_head_weight),
+                params_.prepared_store,
+                params_.prepared_ref.value_or(PreparedWeightRef{}));
+        }
         if (params_.bias_tensor)
             contract.addWeight(const_cast<ITensor *>(static_cast<const ITensor *>(params_.bias_tensor)));
         return contract;

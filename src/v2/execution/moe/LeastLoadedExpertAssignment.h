@@ -41,6 +41,21 @@ namespace llaminar2::least_loaded_ep
         /// capacity. When the cap is exhausted, remaining rows stay on a
         /// resident participant instead of publishing an impossible plan.
         uint32_t max_weight_transfers = 0;
+        /**
+         * @brief Maximum distinct non-owner experts assigned to one participant.
+         *
+         * `max_weight_transfers` bounds new payload copies in this planning
+         * wave. This field bounds the complete non-owner expert working set
+         * consumed by the resulting assignment, including already-resident
+         * replicas. Retaining one cached replica and requesting one new arrival
+         * still requires two simultaneously valid expert payloads.
+         *
+         * Zero leaves the working set unbounded for resident-only policies.
+         * Graph-native GPU callers set this to the physical transfer-directory
+         * capacity so the planner cannot publish an assignment that the
+         * materializer would have to truncate or repair.
+         */
+        uint32_t max_non_owner_experts_per_participant = 0;
         bool enable_balanced_skip = true;
     };
 
@@ -604,6 +619,107 @@ namespace llaminar2::least_loaded_ep
                status.weight_transfer_count < transfer_capacity;
     }
 
+    /**
+     * @brief Report whether an expert already occupies a participant work-set slot.
+     *
+     * Multiple row chunks for the same `(expert, destination)` pair consume one
+     * expert payload. This predicate distinguishes another chunk from a new
+     * logical payload.
+     */
+    LLAMINAR_LLEP_HD bool hasNonOwnerExpertAssignment(
+        const LeastLoadedExpertAssignmentSpan *spans,
+        const LeastLoadedExpertAssignmentStatus &status,
+        uint32_t expert,
+        uint32_t destination_participant) noexcept
+    {
+        if (!spans)
+            return false;
+        for (uint32_t i = 0; i < status.span_count; ++i)
+        {
+            const auto &span = spans[i];
+            if (span.expert == expert &&
+                span.destination_participant == destination_participant &&
+                span.owner_participant != destination_participant)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @brief Count distinct non-owner experts assigned to one participant.
+     *
+     * The fixed caller-owned span array doubles as the deterministic work-set
+     * ledger. The duplicate check avoids adding scratch storage to every
+     * CPU/CUDA/ROCm caller and remains small because production transfer-slot
+     * capacities are intentionally tight.
+     */
+    LLAMINAR_LLEP_HD uint32_t countNonOwnerExpertAssignments(
+        const LeastLoadedExpertAssignmentSpan *spans,
+        const LeastLoadedExpertAssignmentStatus &status,
+        uint32_t destination_participant) noexcept
+    {
+        if (!spans)
+            return 0u;
+
+        uint32_t count = 0u;
+        for (uint32_t i = 0; i < status.span_count; ++i)
+        {
+            const auto &candidate = spans[i];
+            if (candidate.destination_participant != destination_participant ||
+                candidate.owner_participant == destination_participant)
+            {
+                continue;
+            }
+
+            bool already_counted = false;
+            for (uint32_t previous = 0u; previous < i; ++previous)
+            {
+                const auto &prior = spans[previous];
+                if (prior.expert == candidate.expert &&
+                    prior.destination_participant == destination_participant &&
+                    prior.owner_participant != destination_participant)
+                {
+                    already_counted = true;
+                    break;
+                }
+            }
+            if (!already_counted)
+                ++count;
+        }
+        return count;
+    }
+
+    /**
+     * @brief Validate the complete non-owner payload working-set capacity.
+     */
+    LLAMINAR_LLEP_HD bool canAssignDestinationWithWorkingSetCapacity(
+        const LeastLoadedExpertAssignmentSpan *spans,
+        const LeastLoadedExpertAssignmentStatus &status,
+        uint32_t expert,
+        uint32_t owner_participant,
+        uint32_t destination_participant,
+        uint32_t max_non_owner_experts_per_participant) noexcept
+    {
+        if (destination_participant == owner_participant ||
+            max_non_owner_experts_per_participant == 0u ||
+            hasNonOwnerExpertAssignment(
+                spans,
+                status,
+                expert,
+                destination_participant))
+        {
+            return true;
+        }
+
+        return countNonOwnerExpertAssignments(
+                   spans,
+                   status,
+                   destination_participant) <
+               max_non_owner_experts_per_participant;
+    }
+
     LLAMINAR_LLEP_HD void countConceptualAssignmentSpan(
         LeastLoadedExpertAssignmentStatus &status) noexcept
     {
@@ -624,11 +740,29 @@ namespace llaminar2::least_loaded_ep
         uint64_t begin,
         uint64_t end,
         bool forced,
+        uint32_t max_non_owner_experts_per_participant,
         uint32_t participant_count = 32u) noexcept
     {
         if (end <= begin)
             return true;
         if (status.span_count >= span_capacity || spans == nullptr)
+        {
+            status.overflow = 1u;
+            return false;
+        }
+
+        /*
+         * Candidate selection normally checks this constraint before append.
+         * Recheck at the publication boundary so future policy changes cannot
+         * accidentally emit an over-capacity assignment by bypassing selection.
+         */
+        if (!canAssignDestinationWithWorkingSetCapacity(
+                spans,
+                status,
+                expert,
+                owner_participant,
+                destination_participant,
+                max_non_owner_experts_per_participant))
         {
             status.overflow = 1u;
             return false;
@@ -754,7 +888,14 @@ namespace llaminar2::least_loaded_ep
                         owner_participant,
                         best,
                         resident_participant_mask,
-                        config.participant_count))
+                        config.participant_count) ||
+                    !canAssignDestinationWithWorkingSetCapacity(
+                        spans,
+                        status,
+                        expert,
+                        owner_participant,
+                        best,
+                        config.max_non_owner_experts_per_participant))
                 {
                     ++skipped_participants;
                     if (best < 64u)
@@ -796,6 +937,7 @@ namespace llaminar2::least_loaded_ep
                         route_row_offset,
                         route_row_offset + chunk,
                         false,
+                        config.max_non_owner_experts_per_participant,
                         config.participant_count))
                 {
                     return false;
@@ -822,7 +964,14 @@ namespace llaminar2::least_loaded_ep
                         owner_participant,
                         forced_participant,
                         resident_participant_mask,
-                        config.participant_count))
+                        config.participant_count) ||
+                    !canAssignDestinationWithWorkingSetCapacity(
+                        spans,
+                        status,
+                        expert,
+                        owner_participant,
+                        forced_participant,
+                        config.max_non_owner_experts_per_participant))
                 {
                     forced_participant = owner_participant;
                 }
@@ -839,6 +988,7 @@ namespace llaminar2::least_loaded_ep
                         route_row_offset,
                         route_row_offset + remaining_rows,
                         true,
+                        config.max_non_owner_experts_per_participant,
                         config.participant_count))
                 {
                     return false;
@@ -1000,6 +1150,7 @@ namespace llaminar2::least_loaded_ep
                         0ULL,
                         load,
                         false,
+                        config.max_non_owner_experts_per_participant,
                         config.participant_count))
                 {
                     if (status_out)
@@ -1027,6 +1178,7 @@ namespace llaminar2::least_loaded_ep
                         0ULL,
                         native_available,
                         false,
+                        config.max_non_owner_experts_per_participant,
                         config.participant_count))
                 {
                     if (status_out)

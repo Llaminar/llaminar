@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import math
+import multiprocessing
+import os
 import statistics
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from statistics import NormalDist
 from typing import Mapping
@@ -14,11 +17,13 @@ from .corpus import (
     ObservationCorpus,
     RuntimeKey,
     SurfaceKey,
+    _physical_core_count,
 )
 from .exact_oracle import build_exact_winner, candidate_is_eligible
 from .policy_ir import PolicyIR
 from .schema import (
     MINIMUM_PASSING_DOMAIN_FRACTION,
+    NativeVNNIObservation,
     P95_REGRET_BUDGET,
     SemanticContract,
 )
@@ -255,12 +260,30 @@ class CertificationReport:
             raise ValueError("generic policy is not promotable: " + "; ".join(failures))
 
 
-def _aggregate_candidate_surface(rows, candidate_id, serial_hash):
+def _aggregate_candidate_surface(
+    rows,
+    candidate_id,
+    serial_hash,
+    *,
+    require_generic_eligible=True,
+):
+    """Aggregate one nominal candidate without losing physical provenance.
+
+    Generic policy candidates may be shape-resolved formulas whose nominal
+    identity differs from the concrete launch recorded by the benchmark.  The
+    selected side of certification must remain generic-eligible, while the
+    exact oracle's reference side must read the concrete measured candidate
+    that formulas intentionally alias.
+    """
+
     grouped = defaultdict(list)
     for row in rows:
         if row.candidate_id != candidate_id:
             continue
-        if not row.generic_eligible or not candidate_is_eligible(row, serial_hash):
+        if (
+            (require_generic_eligible and not row.generic_eligible)
+            or not candidate_is_eligible(row, serial_hash)
+        ):
             continue
         grouped[(row.source_format, row.execution_mode)].append(row)
     return {
@@ -275,6 +298,150 @@ def _aggregate_candidate_surface(rows, candidate_id, serial_hash):
         }
         for surface, values in grouped.items()
     }
+
+
+_PARALLEL_CERTIFICATION_POLICY: PolicyIR | None = None
+_PARALLEL_CERTIFICATION_POINTS: tuple[
+    tuple[
+        RuntimeKey,
+        str,
+        GenericDomain,
+        tuple[NativeVNNIObservation, ...],
+    ],
+    ...,
+] = ()
+_PARALLEL_CERTIFICATION_SERIAL_HASHES: Mapping[RuntimeKey, str] = {}
+_PARALLEL_CERTIFICATION_PROMOTED_DOMAINS: frozenset[GenericDomain] = (
+    frozenset()
+)
+
+
+def _evaluate_certification_point(
+    policy: PolicyIR,
+    point: tuple[
+        RuntimeKey,
+        str,
+        GenericDomain,
+        tuple[NativeVNNIObservation, ...],
+    ],
+    serial_m1_hashes: Mapping[RuntimeKey, str],
+    promoted_domains: frozenset[GenericDomain],
+):
+    """Evaluate one sealed runtime-key/shape cell independently.
+
+    The returned counters preserve the original serial accounting even when a
+    selected rule lacks complete candidate evidence. The provisional payload
+    deliberately omits the simultaneous confidence bound; the parent computes
+    one deterministic Bonferroni correction after it knows the global surface
+    comparison count.
+    """
+
+    key, shape_group_id, domain, rows = point
+    if domain not in promoted_domains:
+        return 0, 1, 0, None, None
+
+    rule = policy.resolve_generic(
+        domain,
+        key.aggregate_n,
+        key.k,
+        key.launch_k_tiles,
+    )
+    if rule is None:
+        return 1, 0, 0, None, None
+
+    serial_hash = serial_m1_hashes.get(key)
+    verifier_failures = 0
+    if key.semantic_contract == SemanticContract.VERIFIER_SERIAL_M1_BITWISE:
+        verifier_failures = sum(
+            1
+            for row in rows
+            if row.candidate_id == rule.candidate_id
+            and (not row.bitwise_equal or not row.repeat_equal)
+        )
+    eligible_candidates = sorted({
+        row.candidate_id
+        for row in rows
+        if row.generic_eligible and candidate_is_eligible(row, serial_hash)
+    })
+    surfaces = {(row.source_format, row.execution_mode) for row in rows}
+    candidate_surfaces = {
+        candidate: _aggregate_candidate_surface(rows, candidate, serial_hash)
+        for candidate in eligible_candidates
+    }
+    complete = [
+        candidate
+        for candidate in eligible_candidates
+        if set(candidate_surfaces[candidate]) == surfaces
+    ]
+    if rule.candidate_id not in complete or not complete:
+        return 1, 0, verifier_failures, rule.identity(), None
+
+    exact_winner = build_exact_winner(
+        rows,
+        required_surfaces=frozenset(
+            SurfaceKey(source_format, execution_mode)
+            for source_format, execution_mode in surfaces
+        ),
+        current_serial_m1_hash=serial_hash,
+        runtime_key_override=key,
+    )
+    exact_candidate = exact_winner.candidate_id
+    exact_surface_stats = _aggregate_candidate_surface(
+        rows,
+        exact_candidate,
+        serial_hash,
+        require_generic_eligible=False,
+    )
+    if set(exact_surface_stats) != surfaces:
+        return 1, 0, verifier_failures, rule.identity(), None
+
+    selected = candidate_surfaces[rule.candidate_id]
+    surface_rows = []
+    for surface in sorted(surfaces, key=lambda item: (item[0], item[1].value)):
+        exact_stats = exact_surface_stats[surface]
+        exact_latency = exact_stats["median"]
+        selected_stats = selected[surface]
+        ratio = selected_stats["median"] / exact_latency
+        same_timing_evidence = bool(
+            selected_stats["timing_hashes"] & exact_stats["timing_hashes"]
+        )
+        variance = 0.0 if same_timing_evidence else (
+            selected_stats["cv"] ** 2 / max(1, selected_stats["samples"])
+            + exact_stats["cv"] ** 2 / max(1, exact_stats["samples"])
+        )
+        surface_rows.append((
+            ratio - 1.0,
+            ratio,
+            math.sqrt(variance),
+            exact_candidate,
+        ))
+    return (
+        1,
+        0,
+        verifier_failures,
+        rule.identity(),
+        (
+            key,
+            shape_group_id,
+            domain,
+            rule,
+            surfaces,
+            surface_rows,
+        ),
+    )
+
+
+def _evaluate_parallel_certification_point(index: int):
+    """Evaluate one fork-inherited sealed point by stable ordinal."""
+
+    if _PARALLEL_CERTIFICATION_POLICY is None:
+        raise RuntimeError("parallel certification policy is unavailable")
+    return _evaluate_certification_point(
+        _PARALLEL_CERTIFICATION_POLICY,
+        _PARALLEL_CERTIFICATION_POINTS[index],
+        _PARALLEL_CERTIFICATION_SERIAL_HASHES,
+        _PARALLEL_CERTIFICATION_PROMOTED_DOMAINS,
+    )
 
 
 def certify_generic_policy(
@@ -310,82 +477,77 @@ def certify_generic_policy(
     if promoted_domains & unpromoted_domains:
         raise ValueError("policy domain is both promoted and unpromoted")
 
-    for (key, shape_group_id), rows in sorted(point_rows.items(), key=lambda item: item[0]):
-        domain = sealed.generic_domain_for(rows[0])
-        if domain not in promoted_domains:
-            # Keep the cell in diagnostics, but never let an exact overlay turn
-            # this missing generic domain into an installable policy.
-            out_of_scope_count += 1
-            continue
-        required_count += 1
-        rule = policy.resolve_generic(
-            domain,
-            key.aggregate_n,
-            key.k,
-            key.launch_k_tiles,
+    points = tuple(
+        (
+            point_key[0],
+            point_key[1],
+            sealed.generic_domain_for(rows[0]),
+            tuple(rows),
         )
-        if rule is None:
-            continue
-        rule_hits[rule.identity()] += 1
-        serial_hash = (serial_m1_hashes or {}).get(key)
-
-        eligible_candidates = sorted({
-            row.candidate_id
-            for row in rows
-            if row.generic_eligible and candidate_is_eligible(row, serial_hash)
-        })
-        if key.semantic_contract == SemanticContract.VERIFIER_SERIAL_M1_BITWISE:
-            verifier_failures += sum(
-                1
-                for row in rows
-                if row.candidate_id == rule.candidate_id
-                and (not row.bitwise_equal or not row.repeat_equal)
-            )
-        surfaces = {(row.source_format, row.execution_mode) for row in rows}
-        candidate_surfaces = {
-            candidate: _aggregate_candidate_surface(rows, candidate, serial_hash)
-            for candidate in eligible_candidates
-        }
-        complete = [
-            candidate for candidate in eligible_candidates
-            if set(candidate_surfaces[candidate]) == surfaces
-        ]
-        if rule.candidate_id not in complete or not complete:
-            continue
-
-        exact_winner = build_exact_winner(
-            rows,
-            required_surfaces=frozenset(
-                SurfaceKey(source_format, execution_mode)
-                for source_format, execution_mode in surfaces
-            ),
-            current_serial_m1_hash=serial_hash,
+        for point_key, rows in sorted(
+            point_rows.items(),
+            key=lambda item: item[0],
         )
-        exact_candidate = exact_winner.candidate_id
-        if exact_candidate not in candidate_surfaces:
-            continue
-        selected = candidate_surfaces[rule.candidate_id]
-        exact_surface_stats = candidate_surfaces[exact_candidate]
-        surface_rows = []
-        for surface in sorted(surfaces, key=lambda item: (item[0], item[1].value)):
-            exact_stats = exact_surface_stats[surface]
-            exact_latency = exact_stats["median"]
-            selected_stats = selected[surface]
-            ratio = selected_stats["median"] / exact_latency
-            same_timing_evidence = bool(
-                selected_stats["timing_hashes"] & exact_stats["timing_hashes"]
+    )
+    requested_workers = int(os.environ.get(
+        "LLAMINAR_NATIVE_VNNI_CERTIFICATION_WORKERS",
+        str(_physical_core_count()),
+    ))
+    if requested_workers < 1:
+        raise ValueError("certification worker count must be positive")
+    worker_count = min(
+        requested_workers,
+        _physical_core_count(),
+        len(points),
+    )
+    if worker_count > 1 and len(points) >= 8:
+        global _PARALLEL_CERTIFICATION_POLICY
+        global _PARALLEL_CERTIFICATION_POINTS
+        global _PARALLEL_CERTIFICATION_SERIAL_HASHES
+        global _PARALLEL_CERTIFICATION_PROMOTED_DOMAINS
+        _PARALLEL_CERTIFICATION_POLICY = policy
+        _PARALLEL_CERTIFICATION_POINTS = points
+        _PARALLEL_CERTIFICATION_SERIAL_HASHES = serial_m1_hashes or {}
+        _PARALLEL_CERTIFICATION_PROMOTED_DOMAINS = frozenset(promoted_domains)
+        try:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                point_results = tuple(executor.map(
+                    _evaluate_parallel_certification_point,
+                    range(len(points)),
+                ))
+        finally:
+            _PARALLEL_CERTIFICATION_POLICY = None
+            _PARALLEL_CERTIFICATION_POINTS = ()
+            _PARALLEL_CERTIFICATION_SERIAL_HASHES = {}
+            _PARALLEL_CERTIFICATION_PROMOTED_DOMAINS = frozenset()
+    else:
+        point_results = tuple(
+            _evaluate_certification_point(
+                policy,
+                point,
+                serial_m1_hashes or {},
+                frozenset(promoted_domains),
             )
-            variance = 0.0 if same_timing_evidence else (
-                selected_stats["cv"] ** 2 / max(1, selected_stats["samples"])
-                + exact_stats["cv"] ** 2 / max(1, exact_stats["samples"])
-            )
-            surface_rows.append((
-                ratio - 1.0,
-                ratio,
-                math.sqrt(variance),
-                exact_candidate,
-            ))
-        provisional.append((key, shape_group_id, domain, rule, surfaces, surface_rows))
+            for point in points
+        )
+
+    for (
+        required_delta,
+        out_of_scope_delta,
+        point_verifier_failures,
+        rule_identity,
+        provisional_cell,
+    ) in point_results:
+        required_count += required_delta
+        out_of_scope_count += out_of_scope_delta
+        verifier_failures += point_verifier_failures
+        if rule_identity is not None:
+            rule_hits[rule_identity] += 1
+        if provisional_cell is not None:
+            provisional.append(provisional_cell)
 
     comparison_count = max(1, sum(len(item[4]) for item in provisional))
     z_score = NormalDist().inv_cdf(1.0 - familywise_alpha / comparison_count)

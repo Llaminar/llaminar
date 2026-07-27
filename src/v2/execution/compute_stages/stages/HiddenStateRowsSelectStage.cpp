@@ -9,6 +9,7 @@
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 
 #ifdef HAVE_CUDA
@@ -170,12 +171,7 @@ namespace llaminar2
             return true;
         if (stream)
             setGPUStream(stream);
-        if (!gpuStream())
-        {
-            LOG_ERROR("[HiddenStateRowsSelectStage] Graph launch preparation requires an explicit non-null stream on "
-                      << params_.device_id.toString());
-            return false;
-        }
+        (void)requireGPUStream();
         if (params_.device_row_index_source ==
             DeviceRowIndexSource::RequestTerminalLengths)
         {
@@ -412,11 +408,7 @@ namespace llaminar2
             gpu_state_->device_value_uploaded = true;
             return true;
         }
-        if (!gpuStream())
-        {
-            LOG_ERROR("[HiddenStateRowsSelectStage] GPU selected-row upload requires an explicit non-null stream");
-            return false;
-        }
+        (void)requireGPUStream();
 
         refreshPinnedSelectedRows();
 
@@ -568,12 +560,7 @@ namespace llaminar2
         }
 
         if (!graph_managed)
-        {
-            output_base->transitionToWithEvent(
-                TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                params_.device_id,
-                gpuStream());
-        }
+            gpuExecution().publish(output_base);
         return true;
     }
 

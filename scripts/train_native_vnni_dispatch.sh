@@ -23,7 +23,10 @@ Options:
                               benchmark_results/native_vnni_dispatch/corpora)
   --workspace-root DIR        Ignored resumable collection/refit root (default:
                               benchmark_results/native_vnni_dispatch/work)
-  --install                   Atomically install the certified generated .inc
+  --install                   Atomically install certified M=1/grouped .inc
+                              files. Ordinary prefill remains heuristic-only;
+                              cpu-prefill is an offline research surface and
+                              rejects this option.
   --skip-build                Reuse existing trainer/scorer binaries
   --skip-scorer-tests         Skip CUDA/ROCm scorer integration equivalence
   --no-lfs-pull               Do not run git lfs pull for an existing corpus
@@ -51,7 +54,7 @@ to the shared shape inventory instead of creating a backend-private corpus.
 
 Examples:
   scripts/train_native_vnni_dispatch.sh --backend cuda --install
-  scripts/train_native_vnni_dispatch.sh --backend cpu-prefill --install -- \
+  scripts/train_native_vnni_dispatch.sh --backend cpu-prefill -- \
     --cpu-format-shards
 USAGE
 }
@@ -172,6 +175,11 @@ if [[ ( -n "${cpu_minimum_promotion_warmups}" ||
   exit 2
 fi
 
+if [[ "${backend}" == "cpu-prefill" && ${install} -eq 1 ]]; then
+  echo "error: ordinary prefill is heuristic-only; cpu-prefill cannot install a generated policy" >&2
+  exit 2
+fi
+
 # Promotion criteria are fit-only controls. They must not enter the corpus
 # generation identity: one immutable timing/profiler dataset can be mined and
 # certified repeatedly under a stricter or more permissive installation gate.
@@ -217,7 +225,10 @@ fi
 
 if [[ "${backend}" == "all" ]]; then
   overall_status=0
-  for selected_backend in cpu cpu-prefill cuda rocm; do
+  # The production transaction installs learned policies only for serial M=1
+  # and grouped verifier rows. Ordinary prefill deliberately stays on each
+  # backend's total legacy heuristic and is not part of this install bundle.
+  for selected_backend in cpu cuda rocm; do
     command=(
       "$0"
       --backend "${selected_backend}"
@@ -303,7 +314,7 @@ if [[ "${backend}" == "cpu-prefill" ]]; then
     "${python_root}/native_vnni_dispatch/prefill_matrix.py"
     "${python_root}/native_vnni_dispatch/cpu_prefill_training_plan.py"
     "${python_root}/native_vnni_dispatch/cpu_prefill_split_manifest.py"
-    "${python_root}/native_vnni_dispatch/manifests/native_vnni_cpu_prefill_split_v12.json"
+    "${python_root}/native_vnni_dispatch/manifests/native_vnni_cpu_prefill_split_v13.json"
   )
 fi
 inventory_command=(

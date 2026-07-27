@@ -48,6 +48,30 @@ namespace llaminar2
          * request boundary, so GPU caches must fail clearly when a streamful
          * access is required but missing.
          */
+        /**
+         * @brief Memory domain that owns a logical KV block payload.
+         *
+         * The domain is explicit because a GPU pointer must never be guessed
+         * from the cache implementation or from the current tensor coherence
+         * flags.  Prefix-cache execution uses @ref Device so harvest and
+         * restore remain device-to-device and stream ordered.  @ref Host is
+         * reserved for CPU caches and explicit diagnostic publication.
+         */
+        enum class KVCacheLogicalBlockPayloadDomain : uint8_t
+        {
+            Host,
+            Device,
+        };
+
+        /**
+         * @brief Describe one logical KV block transfer.
+         *
+         * GPU device-domain transfers are asynchronous.  The caller owns
+         * readiness through @p stream and must record or consume an event
+         * before reusing either payload.  A GPU implementation must reject a
+         * null stream rather than silently entering the CUDA/HIP default
+         * stream.
+         */
         struct KVCacheLogicalBlockDescriptor
         {
             int layer = 0;
@@ -55,6 +79,8 @@ namespace llaminar2
             int logical_token_start = 0;
             int token_count = 0;
             void *stream = nullptr;
+            KVCacheLogicalBlockPayloadDomain payload_domain =
+                KVCacheLogicalBlockPayloadDomain::Host;
         };
 
         /**
@@ -259,11 +285,18 @@ namespace llaminar2
          * is preserved.  Prefix caches and diagnostics must compare this
          * canonical byte representation, not incidental backend scratch bytes.
          *
-         * CPU caches copy synchronously from host memory. GPU caches enqueue
-         * device-to-host copies on @ref KVCacheLogicalBlockDescriptor::stream
-         * and synchronize that explicit stream before returning. Callers must
-         * first order the stream through the live inference-state observation
-         * boundary so the export cannot race graph-captured KV writers.
+         * CPU caches accept host payloads and copy synchronously. GPU caches
+         * support two explicit modes:
+         *
+         * - `Host`: diagnostic D2H publication followed by an explicit-stream
+         *   wait before returning.
+         * - `Device`: asynchronous D2D publication whose gather kernel reads
+         *   the canonical ring head/count rows on device. No host sequence
+         *   mirror, D2H copy, or host synchronization is permitted.
+         *
+         * Callers must first order the stream through the live inference-state
+         * observation boundary so either export cannot race graph-captured KV
+         * writers.
          */
         virtual bool exportLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const
         {
@@ -276,9 +309,10 @@ namespace llaminar2
         /**
          * @brief Import a packed logical KV block into this cache.
          *
-         * CPU caches copy synchronously into host memory. GPU caches enqueue
-         * host-to-device payload copies and sequence-metadata publication on
-         * @ref KVCacheLogicalBlockDescriptor::stream. Prefix restore and
+         * CPU caches accept host payloads. GPU host-domain imports are explicit
+         * diagnostic/compatibility publication. GPU device-domain imports are
+         * asynchronous D2D scatter operations that validate and advance the
+         * canonical ring metadata entirely on device. Prefix restore and
          * related mutation paths must pass a stream that has already waited for
          * any live-state producers they are about to overwrite.
          */
@@ -298,6 +332,90 @@ namespace llaminar2
             (void)seq_idx;
             (void)cached_tokens;
             (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Return the bytes required to checkpoint one sequence's live metadata.
+         *
+         * GPU ring caches use this opaque payload to preserve every canonical
+         * head/count row without publishing those values to the host. The
+         * payload is backend-private: callers may retain and return the bytes
+         * to the same cache implementation, but must never inspect or modify
+         * them. A zero result means device-resident checkpointing is not
+         * implemented and is a hard capability failure for GPU MTP rollback.
+         */
+        virtual size_t deviceSequenceStateCheckpointBytes() const
+        {
+            return 0;
+        }
+
+        /**
+         * @brief Capture one sequence's canonical metadata into device memory.
+         *
+         * Implementations enqueue device-to-device work on @p stream. They
+         * must not allocate, synchronize, copy through host memory, or retain
+         * a host mirror. The destination must contain at least
+         * deviceSequenceStateCheckpointBytes() bytes and remain alive until an
+         * event recorded after this call has completed.
+         *
+         * @param seq_idx Sequence whose canonical state is captured.
+         * @param checkpoint_device Opaque device allocation owned by the caller.
+         * @param checkpoint_bytes Size of @p checkpoint_device.
+         * @param stream Explicit backend stream ordered after all state writers.
+         * @param error Optional diagnostic populated on failure.
+         */
+        virtual bool captureDeviceSequenceStateCheckpoint(
+            int seq_idx,
+            void *checkpoint_device,
+            size_t checkpoint_bytes,
+            void *stream,
+            std::string *error = nullptr) const
+        {
+            (void)seq_idx;
+            (void)checkpoint_device;
+            (void)checkpoint_bytes;
+            (void)stream;
+            if (error)
+            {
+                *error =
+                    "KV cache does not implement device-resident sequence-state checkpointing";
+            }
+            return false;
+        }
+
+        /**
+         * @brief Restore canonical metadata from an opaque device checkpoint.
+         *
+         * Implementations enqueue only device work on @p stream and restore
+         * the exact ring heads/counts captured earlier. This is deliberately
+         * different from truncateSequence(): speculative rows remain in
+         * payload storage but become unreachable when the canonical metadata
+         * is restored, preserving serial-decode state without a host-observed
+         * count or a row replay.
+         *
+         * @param seq_idx Sequence whose canonical state is replaced.
+         * @param checkpoint_device Opaque device checkpoint from this cache.
+         * @param checkpoint_bytes Size of @p checkpoint_device.
+         * @param stream Explicit backend stream ordered after checkpoint readiness.
+         * @param error Optional diagnostic populated on failure.
+         */
+        virtual bool restoreDeviceSequenceStateCheckpoint(
+            int seq_idx,
+            const void *checkpoint_device,
+            size_t checkpoint_bytes,
+            void *stream,
+            std::string *error = nullptr)
+        {
+            (void)seq_idx;
+            (void)checkpoint_device;
+            (void)checkpoint_bytes;
+            (void)stream;
+            if (error)
+            {
+                *error =
+                    "KV cache does not implement device-resident sequence-state restoration";
+            }
             return false;
         }
 

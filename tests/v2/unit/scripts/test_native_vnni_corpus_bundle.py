@@ -115,6 +115,24 @@ def test_checkpoint_option_requires_its_value() -> None:
         configuration_digest(("--cpu-batch-limit",))
 
 
+def test_rocm_development_resume_keeps_the_paid_corpus_identity() -> None:
+    """A post-profiler continuation must reopen the existing staging root."""
+
+    evidence_arguments = ("--rocm-formats", "Q8_0,Q4_0")
+    continuation_arguments = (
+        "--reuse-rocm-development",
+        "--rocm-development-build-change-audit",
+        "profiler lifetime guard only; candidate arithmetic unchanged",
+    )
+
+    assert canonical_refresh_arguments(
+        (*evidence_arguments, *continuation_arguments)
+    ) == evidence_arguments
+    assert configuration_digest(
+        (*evidence_arguments, *continuation_arguments)
+    ) == configuration_digest(evidence_arguments)
+
+
 def test_fit_only_evidence_floors_do_not_change_collection_identity() -> None:
     """Promotion thresholds may mine one immutable timing corpus repeatedly."""
 

@@ -7,7 +7,6 @@
 
 #include "MoEExpertOverlayRuntimePlan.h"
 #include "execution/compute_stages/stages/MoEExpertDispatchStage.h"
-#include "execution/compute_stages/stages/MoERoutedExpertPartialReduceStage.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
@@ -19,7 +18,6 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
-#include <set>
 #include <sstream>
 #include <system_error>
 #include <utility>
@@ -138,34 +136,6 @@ namespace llaminar2
                 placement.routed_expert_tier.begin(),
                 placement.routed_expert_tier.end(),
                 tier_index));
-        }
-
-        std::string finalReduceTransportMode(const MoERoutedExpertPartialReduceDiagnostics &diagnostics)
-        {
-            if (diagnostics.host_staged)
-                return "host-staged";
-            if (diagnostics.output_resident_on_continuation)
-                return "continuation-device";
-            return "direct";
-        }
-
-        std::string accumulationPathSummary(const MoERoutedExpertPartialReduceDiagnostics &diagnostics)
-        {
-            std::set<std::string> paths;
-            for (const auto &partial : diagnostics.partials)
-                paths.insert(toString(partial.accumulation_path));
-            if (paths.empty())
-                return diagnostics.host_staged ? "HostSummedCorrectnessFallback" : "unknown";
-            std::ostringstream out;
-            bool first = true;
-            for (const auto &path : paths)
-            {
-                if (!first)
-                    out << ";";
-                out << path;
-                first = false;
-            }
-            return out.str();
         }
 
         uint64_t msToNs(double ms)
@@ -509,28 +479,6 @@ namespace llaminar2
             row.return_bytes = tier.transfer_volume.return_bytes;
             recordRow(std::move(row));
         }
-    }
-
-    void MoEExpertOverlayProfiler::recordFinalReduce(
-        int layer,
-        const MoERoutedExpertPartialReduceDiagnostics &diagnostics)
-    {
-        if (!isEnabled())
-            return;
-
-        MoEExpertOverlayProfileRow row;
-        row.phase = "final_reduce";
-        row.layer = layer;
-        row.domain = diagnostics.continuation_domain.empty() ? "continuation" : diagnostics.continuation_domain;
-        row.transfer_bytes = diagnostics.total_transfer_bytes;
-        row.outbound_bytes = diagnostics.host_to_device_bytes;
-        row.return_bytes = diagnostics.device_to_host_bytes;
-        row.cross_domain_reduce_ms = diagnostics.reduce_ms;
-        row.participant_count = static_cast<int>(diagnostics.partial_count);
-        row.transport_mode = finalReduceTransportMode(diagnostics);
-        row.final_reduce_mode = toString(diagnostics.mode);
-        row.accumulation_path = accumulationPathSummary(diagnostics);
-        recordRow(std::move(row));
     }
 
     void MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(

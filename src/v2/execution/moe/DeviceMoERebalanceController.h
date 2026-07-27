@@ -17,7 +17,7 @@
 namespace llaminar2
 {
     inline constexpr uint32_t kDeviceMoERebalanceMagic = 0x4d4f4552u; // "MOER"
-    inline constexpr uint32_t kDeviceMoERebalanceVersion = 1;
+    inline constexpr uint32_t kDeviceMoERebalanceVersion = 3;
     inline constexpr uint32_t kDeviceMoERebalanceAssignmentStaticOwner = 0;
     inline constexpr uint32_t kDeviceMoERebalanceAssignmentLeastLoadedResident = 1;
 
@@ -187,7 +187,14 @@ namespace llaminar2
         uint32_t payload_bucket_slots = 0;
         uint32_t payload_bucket_index = 0;
         uint32_t payload_bucket_overflow = 0;
-        uint32_t reserved[1] = {};
+        /**
+         * Participant whose publication first poisoned this wave.
+         *
+         * This field is meaningful only when state is Error. Keeping it on the
+         * wave makes the failing edge visible after later graph replays without
+         * requiring a host-side diagnostic mirror in the execution path.
+         */
+        uint32_t error_participant = kDeviceMoEInvalidSlot;
     };
 
     /**
@@ -208,8 +215,21 @@ namespace llaminar2
         uint32_t maintenance_launches = 0;
         uint32_t decode_apply_polls = 0;
         uint32_t decode_apply_hits = 0;
+        /**
+         * First fatal controller error. A non-zero value permanently poisons
+         * this request-owned controller until explicit request teardown.
+         */
         uint32_t last_error_code = 0;
-        uint32_t reserved[5] = {};
+        /// Command-buffer wave that first published last_error_code.
+        uint32_t last_error_wave_index = kDeviceMoEInvalidSlot;
+        /// Command epoch associated with the first fatal publication.
+        uint32_t last_error_epoch = 0;
+        /// Payload arrivals required from the failing participant.
+        uint32_t last_error_expected_arrivals = 0;
+        /// Payload arrivals actually reported by the failing participant.
+        uint32_t last_error_copied_arrivals = 0;
+        /// Participant-local copy status code observed at the failure.
+        uint32_t last_error_copy_status_code = 0;
         DeviceMoERebalanceWaveProgress waves[2];
     };
 
@@ -232,6 +252,17 @@ namespace llaminar2
         uint32_t flags = 0;
         uint32_t destination_slot = kDeviceMoEInvalidSlot;
         uint32_t payload_slot = kDeviceMoEInvalidSlot;
+
+        /**
+         * Logical occupant observed by the destination participant when it
+         * leased destination_slot for this command. These fields turn a bare
+         * array index into an explicit compare-and-replace transaction. The
+         * unpack kernel must observe the same occupant and generation before
+         * mutating the shared transfer directory.
+         */
+        uint32_t destination_previous_layer = kDeviceMoEInvalidSlot;
+        uint32_t destination_previous_expert = kDeviceMoEInvalidSlot;
+        uint32_t destination_generation = 0;
     };
 
     enum class DeviceMoERebalanceDirectoryFlags : uint32_t
@@ -255,11 +286,6 @@ namespace llaminar2
         uint32_t flags = 0;
         uint32_t slot_index = kDeviceMoEInvalidSlot;
         uint32_t generation = 0;
-        uint8_t payload_bytes_per_block = 0;
-        uint8_t is_asymmetric = 0;
-        uint8_t has_emins = 0;
-        uint8_t reserved_u8 = 0;
-        uint32_t reserved = 0;
     };
 
     enum class DeviceMoERebalanceApplyStatusCode : uint32_t
@@ -456,8 +482,51 @@ namespace llaminar2
         uint32_t payload_source_participant_mask = 0;
         uint32_t payload_destination_participant_mask = 0;
         uint64_t payload_edge_mask = 0;
+        /**
+         * @brief Sum of routed rows represented by every layer before this wave.
+         *
+         * This value is retained even when the wave is rejected and the public
+         * post-policy fields are restored to the pre-wave placement.  Together
+         * with @ref post_wave_load_total it identifies accounting mismatches in
+         * a proposed transfer wave without requiring host reconstruction.
+         */
+        uint64_t pre_wave_load_total = 0;
+        /**
+         * @brief Sum of per-layer participant load spreads before this wave.
+         *
+         * Unlike pre_policy_load_max - pre_policy_load_min, this metric keeps
+         * layer boundaries intact.  It is the left-hand side of the aggregate
+         * wave-economy comparison used by both GPU backends.
+         */
+        uint64_t pre_wave_load_spread = 0;
         uint64_t post_wave_load_total = 0;
         uint64_t post_wave_load_spread = 0;
+        /** @brief Nonzero when aggregate participant placement did not improve. */
+        uint32_t skipped_participant_load_spread = 0;
+        /** @brief Nonzero when the sum of per-layer load spreads did not improve. */
+        uint32_t skipped_aggregate_load_spread = 0;
+        /** @brief Nonzero when the configured post-wave spread ceiling rejected the wave. */
+        uint32_t skipped_configured_load_spread_ceiling = 0;
+        /**
+         * @brief Candidates not selected because the configured transfer wave was full.
+         *
+         * This is scheduling backpressure, not command corruption. The planner
+         * records it before accepting the candidate and leaves the command
+         * buffer internally complete. By contrast, @ref plan_overflow is
+         * reserved for a command that could not be represented and is fatal.
+         */
+        uint32_t capacity_limited_candidates = 0;
+        /**
+         * @brief Applied prefill experts currently backed by transient payload slots.
+         *
+         * GPU controllers inspect the already-active placement before planning
+         * the next maintenance wave. A nonzero value therefore proves that an
+         * earlier prefill LLEP/dynamic transfer was materialized, applied, and
+         * published for local execution. The field is exported only through the
+         * existing request-boundary status readback; recording it introduces no
+         * hot-path host access, allocation, or synchronization.
+         */
+        uint32_t prefill_active_transfer_slot_experts = 0;
     };
 
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceConfig>);
@@ -590,6 +659,40 @@ namespace llaminar2
         }
 
         return entries;
+    }
+
+    /**
+     * @brief Size a merged prefill-LLEP command plan without truncation.
+     *
+     * Every participant materializes the transfers requested by its own
+     * destination-local runtime bank. Domain projection then allgathers those
+     * plans and selects participant P's destination commands from participant
+     * P's record. Consequently, the merged plan can contain one full payload
+     * bucket per participant even when each individual local plan is smaller.
+     *
+     * Payload bytes remain bounded by @p payload_slots_per_participant for each
+     * source participant. Only command metadata needs the domain-wide sum.
+     * Keeping this distinction explicit prevents the projection kernel from
+     * filling a local-sized plan, marking overflow, and applying a truncated
+     * transfer set whose assignment spans still describe the complete wave.
+     *
+     * @param config                        Rebalance participant topology.
+     * @param local_plan_capacity           Capacity needed by one local plan.
+     * @param payload_slots_per_participant Captured payload slots per source.
+     * @return Saturating domain-wide command capacity.
+     */
+    inline uint64_t deviceMoEPrefillLLEPMergedPlanCapacity(
+        const DeviceMoERebalanceConfig &config,
+        uint64_t local_plan_capacity,
+        uint32_t payload_slots_per_participant) noexcept
+    {
+        const uint64_t participant_count =
+            std::max<uint32_t>(1u, config.participant_count);
+        const uint64_t domain_payload_commands =
+            deviceMoERebalanceSaturatingMul(
+                participant_count,
+                static_cast<uint64_t>(payload_slots_per_participant));
+        return std::max(local_plan_capacity, domain_payload_commands);
     }
 
     inline uint64_t estimateDeviceMoERebalanceTransferPlanCapacity(
@@ -934,15 +1037,6 @@ namespace llaminar2
         }
     }
 
-    inline bool deviceMoEPopulateDirectoryFormat(DeviceMoEExpertDirectoryEntry &entry) noexcept
-    {
-        return deviceMoENativeVnniFormatForCodebook(
-            entry.descriptor.gate.codebook_id,
-            entry.payload_bytes_per_block,
-            entry.is_asymmetric,
-            entry.has_emins);
-    }
-
     inline bool deviceMoEProjectionFormat(
         const DeviceNativeVNNIMatrixDesc &desc,
         uint8_t &payload_bytes_per_block,
@@ -954,6 +1048,93 @@ namespace llaminar2
             payload_bytes_per_block,
             is_asymmetric,
             has_emins);
+    }
+
+    /**
+     * @brief Resolve immutable allocation capacity for a NativeVNNI descriptor.
+     *
+     * Model weights have an exact-format allocation and therefore leave the
+     * explicit capacity fields at zero. Transfer slots carry non-zero capacity
+     * metadata because their active codebook can change without reallocating or
+     * changing any graph-captured pointer.
+     */
+    inline bool deviceMoEProjectionAllocationCapacity(
+        const DeviceNativeVNNIMatrixDesc &desc,
+        uint8_t &payload_bytes_per_block,
+        uint8_t &has_mins,
+        uint8_t &has_emins) noexcept
+    {
+        if (desc.allocation_payload_bytes_per_block != 0u)
+        {
+            payload_bytes_per_block = desc.allocation_payload_bytes_per_block;
+            has_mins = desc.allocation_has_mins;
+            has_emins = desc.allocation_has_emins;
+            return true;
+        }
+
+        uint8_t is_asymmetric = 0;
+        if (!deviceMoEProjectionFormat(
+                desc,
+                payload_bytes_per_block,
+                is_asymmetric,
+                has_emins))
+        {
+            return false;
+        }
+        has_mins = is_asymmetric;
+        return true;
+    }
+
+    /**
+     * @brief Test whether one formatted matrix fits a stable transfer allocation.
+     */
+    inline bool deviceMoEMatrixFitsTransferCapacity(
+        const DeviceNativeVNNIMatrixDesc &src,
+        const DeviceNativeVNNIMatrixDesc &dst) noexcept
+    {
+        if (src.n != dst.n ||
+            src.k != dst.k ||
+            src.blocks_per_row != dst.blocks_per_row)
+        {
+            return false;
+        }
+
+        uint8_t src_payload_bytes = 0;
+        uint8_t src_is_asymmetric = 0;
+        uint8_t src_has_emins = 0;
+        uint8_t dst_payload_capacity = 0;
+        uint8_t dst_has_mins = 0;
+        uint8_t dst_has_emins = 0;
+        return deviceMoEProjectionFormat(
+                   src,
+                   src_payload_bytes,
+                   src_is_asymmetric,
+                   src_has_emins) &&
+               deviceMoEProjectionAllocationCapacity(
+                   dst,
+                   dst_payload_capacity,
+                   dst_has_mins,
+                   dst_has_emins) &&
+               src_payload_bytes <= dst_payload_capacity &&
+               (src_is_asymmetric == 0u || dst_has_mins != 0u) &&
+               (src_has_emins == 0u || dst_has_emins != 0u);
+    }
+
+    /**
+     * @brief Retarget a reusable allocation to the source matrix's active format.
+     *
+     * Allocation pointers and capacity metadata are intentionally preserved.
+     * Only the logical matrix geometry and codebook metadata consumed by grouped
+     * kernels are updated.
+     */
+    inline void deviceMoERetargetTransferMatrixFormat(
+        DeviceNativeVNNIMatrixDesc &dst,
+        const DeviceNativeVNNIMatrixDesc &src) noexcept
+    {
+        dst.n = src.n;
+        dst.k = src.k;
+        dst.blocks_per_row = src.blocks_per_row;
+        dst.codebook_id = src.codebook_id;
     }
 
     inline uint64_t deviceMoEMatrixBlockCount(const DeviceNativeVNNIMatrixDesc &desc) noexcept
@@ -1103,22 +1284,37 @@ namespace llaminar2
                (entry.flags & static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::CopyComplete)) != 0u;
     }
 
-    inline bool deviceMoEDirectoryFormatsCompatible(
+    inline bool deviceMoEDirectoryFitsTransferCapacity(
         const DeviceMoEExpertDirectoryEntry &src,
         const DeviceMoEExpertDirectoryEntry &dst) noexcept
     {
-        return src.descriptor.gate.n == dst.descriptor.gate.n &&
-               src.descriptor.gate.k == dst.descriptor.gate.k &&
-               src.descriptor.gate.blocks_per_row == dst.descriptor.gate.blocks_per_row &&
-               src.descriptor.gate.codebook_id == dst.descriptor.gate.codebook_id &&
-               src.descriptor.up.n == dst.descriptor.up.n &&
-               src.descriptor.up.k == dst.descriptor.up.k &&
-               src.descriptor.up.blocks_per_row == dst.descriptor.up.blocks_per_row &&
-               src.descriptor.up.codebook_id == dst.descriptor.up.codebook_id &&
-               src.descriptor.down.n == dst.descriptor.down.n &&
-               src.descriptor.down.k == dst.descriptor.down.k &&
-               src.descriptor.down.blocks_per_row == dst.descriptor.down.blocks_per_row &&
-               src.descriptor.down.codebook_id == dst.descriptor.down.codebook_id;
+        return deviceMoEMatrixFitsTransferCapacity(
+                   src.descriptor.gate,
+                   dst.descriptor.gate) &&
+               deviceMoEMatrixFitsTransferCapacity(
+                   src.descriptor.up,
+                   dst.descriptor.up) &&
+               deviceMoEMatrixFitsTransferCapacity(
+                   src.descriptor.down,
+                   dst.descriptor.down);
+    }
+
+    /**
+     * @brief Retarget all projection formats in a reusable expert transfer slot.
+     */
+    inline void deviceMoERetargetTransferDirectoryFormats(
+        DeviceMoEExpertDirectoryEntry &dst,
+        const DeviceMoEExpertDirectoryEntry &src) noexcept
+    {
+        deviceMoERetargetTransferMatrixFormat(
+            dst.descriptor.gate,
+            src.descriptor.gate);
+        deviceMoERetargetTransferMatrixFormat(
+            dst.descriptor.up,
+            src.descriptor.up);
+        deviceMoERetargetTransferMatrixFormat(
+            dst.descriptor.down,
+            src.descriptor.down);
     }
 
     inline int32_t deviceMoEFirstResidentParticipant(
@@ -1260,7 +1456,7 @@ namespace llaminar2
                     continue;
 
                 entry.descriptor = desc;
-                if (!deviceMoEPopulateDirectoryFormat(entry))
+                if (!deviceMoEDirectoryCopyReady(entry))
                 {
                     entry.descriptor = DeviceMoEExpertDescriptor{};
                     continue;
@@ -1475,6 +1671,19 @@ namespace llaminar2
             bank.experts[plan.expert] = desc;
             bank.resident_participant_mask[plan.expert] =
                 resident_mask & valid_mask;
+            if (plan.op == static_cast<uint32_t>(
+                               DeviceMoERebalancePlanOp::ExpertPayloadArrival) ||
+                ownership_transfer)
+            {
+                /*
+                 * Every participant consumes the same gathered plan, while
+                 * only the destination owns the transfer-slot descriptor.
+                 * Publish this sticky layer marker from the global command so
+                 * prefix capture cannot make a participant-local durability
+                 * decision.
+                 */
+                bank.transient_placement_observed = 1u;
+            }
             if (plan.layer < kDeviceMoEMaxExperts)
                 changed_layer[plan.layer] = 1u;
         }
@@ -1498,7 +1707,7 @@ namespace llaminar2
                         ++multi_resident;
                     }
                 }
-                bank.reserved[0] = multi_resident;
+                bank.multi_resident_expert_count = multi_resident;
                 ++status->changed_layers;
                 status->post_apply_multi_resident_experts += multi_resident;
             }
@@ -1671,6 +1880,7 @@ namespace llaminar2
         uint64_t post_wave_load_total = 0;
         uint64_t post_wave_load_spread = 0;
         uint32_t hot_cache_active_layers = 0;
+        uint32_t prefill_active_transfer_slot_experts = 0;
         uint32_t last_epoch = 0;
         uint64_t pre_policy_load[kDeviceMoEMaxParticipants] = {};
         uint64_t post_policy_load[kDeviceMoEMaxParticipants] = {};
@@ -1692,6 +1902,17 @@ namespace llaminar2
                 : std::min(config.layer_wave_count, layer_window_count);
         const uint32_t layer_window_start =
             config.num_layers == 0 ? 0 : (config.layer_window_start % config.num_layers);
+
+        /*
+         * Inspect every layer rather than only the rolling maintenance wave.
+         * Prefill placement publication is model-wide, while the maintenance
+         * cursor intentionally sees only a bounded layer slice per replay.
+         */
+        for (uint32_t layer = 0; layer < config.num_layers; ++layer)
+        {
+            prefill_active_transfer_slot_experts +=
+                deviceMoELayerActiveTransferSlotExpertCount(runtime_layers[layer]);
+        }
 
         for (uint32_t window_index = 0; window_index < layer_wave_count; ++window_index)
         {
@@ -2208,6 +2429,8 @@ namespace llaminar2
                 router_hot_cache_selected_expert_slots;
             status->router_hot_cache_replicated_selected_expert_slots =
                 router_hot_cache_replicated_selected_expert_slots;
+            status->prefill_active_transfer_slot_experts =
+                prefill_active_transfer_slot_experts;
             status->last_epoch = last_epoch;
             status->window_ready_slots =
                 deviceMoEClampU64ToU32(

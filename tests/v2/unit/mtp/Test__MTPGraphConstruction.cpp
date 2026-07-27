@@ -29,6 +29,7 @@
 #include "models/qwen35/Qwen35Graph.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "tensors/TensorSlice.h"
+#include "transfer/TransferEngine.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/TestTensorFactory.h"
@@ -2324,6 +2325,12 @@ TEST(Test__MTPGraphConstruction, ColumnParallelAllPositionLMHeadUsesVerifierShar
     fixture.config.compute_all_position_logits = true;
     fixture.config.lm_head_column_parallel = true;
     fixture.config.vocab_local = fixture.config.vocab_size / 2;
+    /*
+     * A half-vocabulary tensor is a distributed contract.  Use two logical
+     * participants so production must materialize the all-gather; a one-rank
+     * graph correctly has no distributed collective to execute.
+     */
+    fixture.mpi = std::make_shared<MockMPIContext>(0, 2);
 
     QwenStandardGraph graph_builder(fixture.config, fixture.mpi);
     graph_builder.setWeights(fixture.modelWeights());
@@ -3531,7 +3538,7 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeFullGraphRep
     ASSERT_NE(terminal_hidden, nullptr);
     for (int i = 0; i < fixture.config.d_model; ++i)
         terminal_hidden[i] = 0.01f * static_cast<float>((i % 23) + 1);
-    hidden->mark_host_dirty();
+    TransferEngine::publishHostWrite(hidden);
 
     auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture, *device);
     orchestrator.setFrozenWeightSet(std::move(frozen));
@@ -3640,7 +3647,7 @@ TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFro
     ASSERT_NE(terminal_hidden, nullptr);
     for (int i = 0; i < fixture.config.d_model; ++i)
         terminal_hidden[i] = 0.01f * static_cast<float>((i % 29) + 1);
-    hidden->mark_host_dirty();
+    TransferEngine::publishHostWrite(hidden);
 
     auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture, *device);
     orchestrator.setFrozenWeightSet(std::move(frozen));
@@ -3671,9 +3678,9 @@ TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFro
             DeviceDistributionBuffer::Target,
             /*slot=*/0,
             /*threshold=*/0.25f));
-        ASSERT_TRUE(orchestrator.forwardMTPFromDeviceTargetForDeviceSampling(
-            /*target_sample_slot=*/0,
-            orchestrator.getPosition(0)))
+        ASSERT_TRUE(
+            orchestrator.forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(
+                /*target_sample_slot=*/0))
             << "device-token first sidecar failed at step " << step;
         ASSERT_TRUE(orchestrator.flushPendingMTPWork());
     }
@@ -3702,8 +3709,14 @@ TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFro
 
     const auto host_plain_tags = capture_tags("mtp_decode_sidecar", "false", "plain_after_build");
     const auto host_full_graph_tags = capture_tags("mtp_decode_sidecar", "false", "full_graph");
-    const auto device_plain_tags = capture_tags("mtp_decode_sidecar_device_target_token", "true", "plain_after_build");
-    const auto device_full_graph_tags = capture_tags("mtp_decode_sidecar_device_target_token", "true", "full_graph");
+    const auto device_plain_tags = capture_tags(
+        "mtp_decode_sidecar_device_target_token_live_position",
+        "true",
+        "plain_after_build");
+    const auto device_full_graph_tags = capture_tags(
+        "mtp_decode_sidecar_device_target_token_live_position",
+        "true",
+        "full_graph");
 
     const PerfStatRecord *host_plain = findMTPRecord(
         records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", host_plain_tags);
@@ -3737,7 +3750,9 @@ TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFro
         records,
         PerfStatRecord::Kind::Counter,
         "sidecar_graph_cache_misses",
-        cache_tags("mtp_decode_sidecar_device_target_token", "true"));
+        cache_tags(
+            "mtp_decode_sidecar_device_target_token_live_position",
+            "true"));
     ASSERT_NE(device_misses, nullptr);
     EXPECT_DOUBLE_EQ(device_misses->value, 1.0);
 
@@ -3912,6 +3927,75 @@ TEST(Test__MTPGraphConstruction, CPUShiftedPrefillChunksAtConfiguredRuntimeCapac
     const auto after_prefill = orchestrator.prefixStateProbe();
     EXPECT_EQ(maxCachedTokens(after_prefill.mtp_kv_caches),
               static_cast<int>(prefix_tokens.size()) - 1);
+
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @brief Prove separate prefill transactions publish their cross-segment shifted row.
+ *
+ * LLEP deliberately divides one request into stable prefill windows so expert
+ * placement cannot change inside a routing window.  Each window publishes
+ * `window_rows - 1` shifted pairs internally, but the request also contains one
+ * pair from the previous window's terminal hidden row to the next window's
+ * first token.  Dropping that bridge made a 48-token prompt expose only 45 MTP
+ * KV rows after three 16-token windows, while serial prefill requires 47.
+ *
+ * This CPU regression uses the production grouped sidecar twice.  It avoids GPU
+ * work while proving both the final cache count and the dedicated bridge
+ * PerfStats record that the CUDA and ROCm stable-window paths share.
+ */
+TEST(Test__MTPGraphConstruction, CPUSeparatePrefillTransactionsPublishCrossSegmentShiftedRow)
+{
+    DeviceManager::instance().initialize(-1, false);
+    ScopedDebugEnv env({
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    TinyQwen35MTPForwardFixture fixture;
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    const std::vector<int> first_segment = {1, 2, 3, 4};
+    const std::vector<int> second_segment = {5, 6, 7, 8};
+    ASSERT_TRUE(orchestrator.forwardPrefill(
+        first_segment.data(),
+        static_cast<int>(first_segment.size())));
+    ASSERT_TRUE(orchestrator.forwardPrefill(
+        second_segment.data(),
+        static_cast<int>(second_segment.size())));
+
+    const int logical_tokens =
+        static_cast<int>(first_segment.size() + second_segment.size());
+    const auto after_segments = orchestrator.prefixStateProbe();
+    EXPECT_EQ(
+        maxCachedTokens(after_segments.mtp_kv_caches),
+        logical_tokens - 1)
+        << "Grouped shifted prefill must be serial-row-equivalent across transaction boundaries";
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const PerfStatRecord *bridge_record = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "shifted_prefill_segment_bridge_rows",
+        {{"position", std::to_string(first_segment.size())},
+         {"segment_rows", std::to_string(second_segment.size())}});
+    ASSERT_NE(bridge_record, nullptr);
+    EXPECT_DOUBLE_EQ(bridge_record->value, 1.0);
 
     PerfStatsCollector::reset();
 }

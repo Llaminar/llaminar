@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <iterator>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -126,6 +127,29 @@ static DeviceMoELayerRuntime makeDeviceRuntimeLayerForLoadStats()
 }
 
 // ── Tests ─────────────────────────────────────────────
+
+/**
+ * @brief Lock the generation-stamped transfer-slot transaction into the ABI.
+ *
+ * Destination projection turns a logical root command into a participant-local
+ * compare-and-replace transaction. The invalid prior identity is meaningful for
+ * an empty slot, while generation zero is the first valid directory generation.
+ * These defaults must therefore remain explicit and trivially transportable
+ * through device command buffers.
+ */
+TEST(Test__MoERebalanceController,
+     DevicePlanAbiCarriesAuthenticatedTransferSlotLease)
+{
+    static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 3u);
+
+    const DeviceMoERebalancePlanEntry plan{};
+    EXPECT_EQ(plan.destination_slot, kDeviceMoEInvalidSlot);
+    EXPECT_EQ(plan.payload_slot, kDeviceMoEInvalidSlot);
+    EXPECT_EQ(plan.destination_previous_layer, kDeviceMoEInvalidSlot);
+    EXPECT_EQ(plan.destination_previous_expert, kDeviceMoEInvalidSlot);
+    EXPECT_EQ(plan.destination_generation, 0u);
+}
 
 TEST(Test__MoERebalanceController, DeviceSideProjectedLoadSpreadTracksReplicaBenefit)
 {
@@ -341,6 +365,90 @@ TEST(Test__MoERebalanceController, DeviceSidePayloadBucketsRoundToPowerOfTwoCapa
         << "CUDA, ROCm, and CPU mirrors must share one bucket scheduler policy.";
 }
 
+TEST(Test__MoERebalanceController, TransferSlotStorageLifetimeIsIndependentOfComputeEligibility)
+{
+    constexpr uint32_t local_participant = 1u;
+    const uint32_t local_bit =
+        moe_rebalance_policy::participantBit(local_participant);
+
+    /*
+     * This is the production failure shape: the local participant owns a
+     * transfer-backed expert, but the current least-loaded assignment gives it
+     * no local rows. Compute eligibility is intentionally not an input to the
+     * policy; ownership alone keeps the allocation live and non-evictable.
+     */
+    const auto authoritative_without_local_work =
+        moe_rebalance_policy::classifyTransferSlotOccupancy(
+            /*transfer_backed=*/true,
+            /*assigned_locally=*/false,
+            /*resident_mask=*/local_bit,
+            /*local_participant_bit=*/local_bit,
+            /*owner_participant=*/static_cast<int32_t>(local_participant),
+            local_participant);
+    EXPECT_TRUE(authoritative_without_local_work.occupied);
+    EXPECT_TRUE(authoritative_without_local_work.protected_from_reuse);
+
+    /*
+     * Fail closed when owner and residency metadata momentarily disagree. The
+     * allocator must not destroy authoritative bytes; the runtime status gate
+     * can then report and terminate the invalid publication.
+     */
+    const auto authoritative_with_stale_resident_mask =
+        moe_rebalance_policy::classifyTransferSlotOccupancy(
+            /*transfer_backed=*/true,
+            /*assigned_locally=*/false,
+            /*resident_mask=*/0u,
+            /*local_participant_bit=*/local_bit,
+            /*owner_participant=*/static_cast<int32_t>(local_participant),
+            local_participant);
+    EXPECT_TRUE(authoritative_with_stale_resident_mask.occupied);
+    EXPECT_TRUE(authoritative_with_stale_resident_mask.protected_from_reuse);
+
+    const auto cold_cached_replica =
+        moe_rebalance_policy::classifyTransferSlotOccupancy(
+            /*transfer_backed=*/true,
+            /*assigned_locally=*/false,
+            /*resident_mask=*/local_bit,
+            /*local_participant_bit=*/local_bit,
+            /*owner_participant=*/0,
+            local_participant);
+    EXPECT_TRUE(cold_cached_replica.occupied);
+    EXPECT_FALSE(cold_cached_replica.protected_from_reuse);
+
+    const auto assigned_cached_replica =
+        moe_rebalance_policy::classifyTransferSlotOccupancy(
+            /*transfer_backed=*/true,
+            /*assigned_locally=*/true,
+            /*resident_mask=*/local_bit,
+            /*local_participant_bit=*/local_bit,
+            /*owner_participant=*/0,
+            local_participant);
+    EXPECT_TRUE(assigned_cached_replica.occupied);
+    EXPECT_TRUE(assigned_cached_replica.protected_from_reuse);
+
+    const auto stale_remote_descriptor =
+        moe_rebalance_policy::classifyTransferSlotOccupancy(
+            /*transfer_backed=*/true,
+            /*assigned_locally=*/false,
+            /*resident_mask=*/moe_rebalance_policy::participantBit(0),
+            /*local_participant_bit=*/local_bit,
+            /*owner_participant=*/0,
+            local_participant);
+    EXPECT_FALSE(stale_remote_descriptor.occupied);
+    EXPECT_FALSE(stale_remote_descriptor.protected_from_reuse);
+
+    const auto native_weight_descriptor =
+        moe_rebalance_policy::classifyTransferSlotOccupancy(
+            /*transfer_backed=*/false,
+            /*assigned_locally=*/true,
+            /*resident_mask=*/local_bit,
+            /*local_participant_bit=*/local_bit,
+            /*owner_participant=*/static_cast<int32_t>(local_participant),
+            local_participant);
+    EXPECT_FALSE(native_weight_descriptor.occupied);
+    EXPECT_FALSE(native_weight_descriptor.protected_from_reuse);
+}
+
 TEST(Test__MoERebalanceController, DeviceSideTransferWaveValueGateUsesPayloadSlots)
 {
     EXPECT_TRUE(moe_rebalance_policy::transferWaveMeetsSpreadImprovementFloor(
@@ -542,7 +650,7 @@ TEST(Test__MoERebalanceController, HostApplyRefreshesMultiResidentVisibility)
     EXPECT_EQ(status.changed_layers, 1u);
     EXPECT_EQ(status.post_apply_multi_resident_experts, 1u);
     EXPECT_EQ(bank.resident_participant_mask[1], 0b11u);
-    EXPECT_EQ(bank.reserved[0], 1u)
+    EXPECT_EQ(bank.multi_resident_expert_count, 1u)
         << "host mirror must refresh the cheap hot-cache visibility gate.";
 }
 

@@ -173,7 +173,8 @@ TEST(Test__BufferArena, PrepareForWriteThenMarkWritten)
     arena.registerBuffer(BufferId::FFN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
-    EXPECT_TRUE(arena.prepareForWrite(BufferId::FFN_OUTPUT, DeviceId::cpu()));
+    EXPECT_TRUE(arena.prepareForWrite(
+        BufferId::FFN_OUTPUT, DeviceId::cpu(), nullptr));
     arena.markWritten(BufferId::FFN_OUTPUT, DeviceId::cpu());
 
     auto state = arena.getCoherenceState(BufferId::FFN_OUTPUT);
@@ -831,7 +832,7 @@ TEST(Test__BufferArena, EndToEndCPUWorkflow)
 
     // 4. Prepare for stage execution
     EXPECT_TRUE(arena.prepareForRead(BufferId::HIDDEN_STATE, cpu));
-    EXPECT_TRUE(arena.prepareForWrite(BufferId::Q_PROJ, cpu));
+    EXPECT_TRUE(arena.prepareForWrite(BufferId::Q_PROJ, cpu, nullptr));
 
     // 5. Build bound buffers
     arena.acquireReadBorrow(BufferId::HIDDEN_STATE);
@@ -926,7 +927,7 @@ TEST(Test__ArenaContractCoherence, PrepareForReadWriteFromContract)
     // Simulate executor coherence: prepare writes
     for (const auto &binding : contract.allWrites())
     {
-        EXPECT_TRUE(arena.prepareForWrite(binding.id, cpu));
+        EXPECT_TRUE(arena.prepareForWrite(binding.id, cpu, nullptr));
     }
 
     // (Stage would execute here — we just verify coherence tracking)

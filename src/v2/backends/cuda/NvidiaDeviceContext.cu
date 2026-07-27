@@ -261,6 +261,28 @@ namespace llaminar2
         }
         LOG_TRACE("[NvidiaDeviceContext] - cuBLASLt handle: " << cublas_lt_handle_);
 
+        /*
+         * Inter-stream graph handoffs are part of the correctness contract, so
+         * their event resources belong to the device context rather than to an
+         * individual replay. Preallocating the complete pool here removes
+         * cudaEventCreate/cudaEventDestroy from every decode transaction.
+         */
+        for (auto &event : stream_dependency_events_)
+        {
+            cudaError_t event_status =
+                cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+            if (event_status != cudaSuccess)
+            {
+                LOG_ERROR("[NvidiaDeviceContext] Failed to create persistent stream "
+                          "dependency event: "
+                          << cudaGetErrorString(event_status));
+                cleanupOnWorker();
+                return false;
+            }
+        }
+        LOG_TRACE("[NvidiaDeviceContext] - Stream dependency events: "
+                  << stream_dependency_events_.size());
+
         return true;
     }
 
@@ -291,6 +313,26 @@ namespace llaminar2
         }
 
         resetAuxiliaryStreams();
+
+        /*
+         * Every queued record/wait pair has finished by the time the worker
+         * reaches context cleanup. Destroy the persistent handoff events once,
+         * after graph owners have stopped and before their streams disappear.
+         */
+        for (auto &event : stream_dependency_events_)
+        {
+            if (event == nullptr)
+                continue;
+
+            cudaError_t err = cudaEventDestroy(event);
+            if (err != cudaSuccess && err != cudaErrorCudartUnloading)
+            {
+                LOG_ERROR("[NvidiaDeviceContext] cudaEventDestroy(stream dependency) "
+                          "failed: "
+                          << cudaGetErrorString(err));
+            }
+            event = nullptr;
+        }
 
         // Destroy default stream (ignore cudaErrorCudartUnloading during shutdown)
         if (default_stream_ != nullptr)
@@ -760,42 +802,92 @@ namespace llaminar2
         return true;
     }
 
-    void NvidiaDeviceContext::insertStreamDependency(void *dependent_stream, void *dependency_stream)
+    bool NvidiaDeviceContext::insertStreamDependency(
+        void *dependent_stream,
+        void *dependency_stream)
     {
-        // GPU-side inter-stream synchronization via events.
-        // Records an event on dependency_stream, makes dependent_stream wait for it.
-        // Unlike synchronizeStream(), this does NOT block the CPU.
-        //
-        // nullptr maps to legacy stream 0 (NOT default_stream_) because manual stages
-        // in segmented graph capture dispatch kernels to the actual legacy default stream.
+        /*
+         * A stream cannot depend on itself: all work within one stream is
+         * already ordered. Avoid consuming a pool slot for this common no-op.
+         */
+        if (dependent_stream == dependency_stream)
+            return true;
+
+        /*
+         * CUDA runtime device selection is thread-local. This method is called
+         * directly from graph owner threads, not only from the context worker,
+         * so select this context's device before touching its persistent event.
+         */
+        cudaError_t set_status = cudaSetDevice(device_ordinal_);
+        if (set_status != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
+                      << ") failed in insertStreamDependency: "
+                      << cudaGetErrorString(set_status));
+            return false;
+        }
+
+        /*
+         * nullptr retains the interface's legacy-stream meaning. Production
+         * graph paths pass explicit streams, but preserving the mapping here
+         * keeps the primitive well-defined for diagnostics and tests.
+         */
         cudaStream_t dep_stream = dependent_stream ? static_cast<cudaStream_t>(dependent_stream) : cudaStream_t(0);
         cudaStream_t src_stream = dependency_stream ? static_cast<cudaStream_t>(dependency_stream) : cudaStream_t(0);
 
-        // Use lightweight event without timing to minimize overhead
-        cudaEvent_t event;
-        cudaError_t err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
-        if (err != cudaSuccess)
+        /*
+         * Round-robin selection prevents one busy graph owner from repeatedly
+         * contending with another. The per-slot flag covers the short host-side
+         * cudaEventRecord/cudaStreamWaitEvent pair only; the slot may be reused
+         * as soon as the wait has been enqueued because CUDA stream waits bind
+         * to the most recent record visible when cudaStreamWaitEvent is called.
+         */
+        const size_t event_index =
+            next_stream_dependency_event_.fetch_add(
+                1,
+                std::memory_order_relaxed) %
+            kStreamDependencyEventCount;
+        std::atomic_flag &in_use =
+            stream_dependency_event_in_use_[event_index];
+        while (in_use.test_and_set(std::memory_order_acquire))
+            std::this_thread::yield();
+
+        struct ScopedEventLease final
         {
-            LOG_ERROR("[NvidiaDeviceContext] cudaEventCreate failed in insertStreamDependency: "
-                      << cudaGetErrorString(err));
-            return;
+            std::atomic_flag &flag;
+            ~ScopedEventLease()
+            {
+                flag.clear(std::memory_order_release);
+            }
+        } lease{in_use};
+
+        cudaEvent_t event = stream_dependency_events_[event_index];
+        if (event == nullptr)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] Persistent stream dependency event "
+                      << event_index << " is not initialized");
+            return false;
         }
 
-        err = cudaEventRecord(event, src_stream);
+        cudaError_t err = cudaEventRecord(event, src_stream);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[NvidiaDeviceContext] cudaEventRecord failed: " << cudaGetErrorString(err));
-            cudaEventDestroy(event);
-            return;
+            LOG_ERROR("[NvidiaDeviceContext] cudaEventRecord failed in "
+                      "insertStreamDependency: "
+                      << cudaGetErrorString(err));
+            return false;
         }
 
         err = cudaStreamWaitEvent(dep_stream, event, 0);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[NvidiaDeviceContext] cudaStreamWaitEvent failed: " << cudaGetErrorString(err));
+            LOG_ERROR("[NvidiaDeviceContext] cudaStreamWaitEvent failed in "
+                      "insertStreamDependency: "
+                      << cudaGetErrorString(err));
+            return false;
         }
 
-        cudaEventDestroy(event);
+        return true;
     }
 
     std::unique_ptr<IGPUGraphCapture> NvidiaDeviceContext::createGraphCapture()
@@ -806,16 +898,6 @@ namespace llaminar2
     std::unique_ptr<IGPUGraphCapture> NvidiaDeviceContext::createGraphCapture(void *stream)
     {
         return std::make_unique<CUDAGraphCapture>(static_cast<cudaStream_t>(stream));
-    }
-
-    void NvidiaDeviceContext::clearLastError()
-    {
-        const cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            LOG_DEBUG("[NvidiaDeviceContext] Cleared sticky CUDA error on device "
-                      << device_ordinal_ << ": " << cudaGetErrorString(err));
-        }
     }
 
     PointerValidationResult NvidiaDeviceContext::validatePointerDevice(const void *gpu_ptr, int expected_ordinal)

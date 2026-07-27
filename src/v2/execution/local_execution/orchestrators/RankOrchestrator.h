@@ -496,12 +496,11 @@ namespace llaminar2
         bool forwardMTPFromLastDraftForDeviceSampling(
             int32_t draft_condition_token,
             int position_id) override;
-        bool forwardMTPFromDeviceDraftForDeviceSampling(
+        bool forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling(
             int draft_sample_slot,
-            int position_id) override;
-        bool forwardMTPFromDeviceTargetForDeviceSampling(
-            int target_sample_slot,
-            int position_id) override;
+            int position_offset) override;
+        bool forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(
+            int target_sample_slot) override;
         bool forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_index = 0) override;
@@ -582,9 +581,18 @@ namespace llaminar2
          * must pass it back to rank-level resident-state methods rather than
          * dereferencing its device-row pointers directly.  Rank then dispatches
          * the matching child-owned mailbox handle to every LocalTP participant.
-         */
+        */
         DeviceResidentLogicalSequenceStateHandle
         deviceResidentLogicalSequenceState() const override;
+        /**
+         * @brief Rebind every child mailbox after a rank-wide diagnostic restore.
+         *
+         * LocalTP owns one compact publication per mirrored verifier child. The
+         * rank must refresh all child events first and then atomically rebuild its
+         * aggregate identity token; a partial aggregate is never exposed.
+         */
+        bool rebindDeviceResidentLogicalStateAfterDiagnosticRestore(
+            int request_count) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,
@@ -850,6 +858,10 @@ namespace llaminar2
         bool stageStochasticTargetTokenForDeviceSampling(
             int32_t target_token,
             int target_sample_slot = 0) override;
+        bool publishDeviceResidentConditionTokenToTargetSampleSlot(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int target_sample_slot = 0) override;
         const void *prepareMTPVerifierInputTokensOnDevice(
             int32_t first_token,
             int first_draft_slot,
@@ -1020,6 +1032,7 @@ namespace llaminar2
          */
         void resetInferenceState(const InferenceStateResetRequest &request) override;
         void clear_cache() override;
+        bool maybeApplyDecodeBoundaryMaintenance() override;
         void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
 
         /**
@@ -1583,7 +1596,7 @@ namespace llaminar2
          * mock child runners that may advertise CUDA/ROCm-shaped device IDs to
          * exercise placement policy, but unit tests must never initialize those
          * physical backends. The private test constructor therefore disables
-         * backend pinning and mmap-release synchronization explicitly.
+         * backend pinning and explicit rank-wide synchronization.
          */
         bool external_device_backend_access_enabled_ = true;
         /**

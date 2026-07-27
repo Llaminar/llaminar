@@ -98,6 +98,7 @@
 
 #include <memory>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -408,6 +409,13 @@ namespace llaminar2
 
             std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope() override;
 
+            bool canReleaseSourceWeightTensor() const override
+            {
+                return packed_ != nullptr ||
+                       lifetime_owner_ != nullptr ||
+                       (weights_converted_ && d_weights_int8_ && d_scales_B_);
+            }
+
             /**
              * @brief Tensor-based GEMM with type introspection (PRIMARY ENTRY POINT)
              *
@@ -544,6 +552,28 @@ namespace llaminar2
             bool supports_device(int device_idx) const override;
 
             void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
+            /**
+             * @brief Return the exact non-null stream owned by this kernel.
+             *
+             * Kernel harnesses use this accessor when publishing an output so
+             * launch and coherence publication cannot name different streams.
+             * A kernel without an explicitly bound stream is not launchable
+             * under the device-owned execution contract.
+             *
+             * @return Opaque HIP stream previously supplied to setGPUStream().
+             * @throws std::runtime_error when no stream has been bound.
+             */
+            [[nodiscard]] void *requireGPUStream() const
+            {
+                if (!gpu_stream_)
+                {
+                    throw std::runtime_error(
+                        "ROCmQuantisedGemmKernel requires an explicit "
+                        "non-null producer stream");
+                }
+                return gpu_stream_;
+            }
 
             // =========================================================================
             // IKernelSnapshotCapable interface

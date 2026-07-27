@@ -28,7 +28,12 @@ namespace llaminar2
         bool endCapture() override;
         bool instantiate() override;
         bool launch() override;
+        [[nodiscard]] void *executionStream() const noexcept override
+        {
+            return static_cast<void *>(stream_);
+        }
         GraphUpdateResult tryUpdate() override;
+        [[nodiscard]] bool supportsExecutableUpdate() const noexcept override { return true; }
         bool hasExecutable() const override;
         size_t nodeCount() const override;
         void reset() override;
@@ -44,7 +49,6 @@ namespace llaminar2
         cudaGraph_t graph_ = nullptr;         ///< Captured graph (owned)
         cudaGraphExec_t exec_ = nullptr;      ///< Instantiated executable (owned)
         size_t node_count_ = 0;               ///< Cached node count from last capture
-        int consecutive_update_failures_ = 0; ///< Track failures for fallback heuristic
     };
 
 } // namespace llaminar2

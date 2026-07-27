@@ -240,6 +240,15 @@ namespace llaminar2
          * @return true when both cache-owned device tables are ready.
          */
         bool publishBatchedEntryTables(hipStream_t stream);
+
+        /**
+         * @brief Release all ROCm allocations owned by this cache instance.
+         *
+         * Both the constructor transaction guard and the destructor call this
+         * method. That keeps partial initialization from leaking compressed
+         * entries, grouped pointer tables, layer scratch, or rotations.
+         */
+        void releaseOwnedDeviceStorage() noexcept;
     };
 
 } // namespace llaminar2

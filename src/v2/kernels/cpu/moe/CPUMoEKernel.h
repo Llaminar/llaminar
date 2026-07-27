@@ -44,7 +44,21 @@ namespace llaminar2
             int seq_len, int d_model,
             int num_experts, int top_k,
             bool normalize_weights,
-            MoERoutingResult &result) override;
+            MoERoutingResult &result);
+
+        /**
+         * @brief Route CPU tensor rows and publish both tensor and host outputs.
+         *
+         * CPU expert dispatch is host-owned, so the CPU implementation is the
+         * one backend where @p host_result is a production output rather than
+         * an obsolete GPU mirror.
+         */
+        bool routeWithTensors(
+            ITensor *hidden, ITensor *gate_weights,
+            int seq_len, int d_model, int num_experts, int top_k,
+            bool normalize_weights,
+            ITensor *output_indices, ITensor *output_weights,
+            MoERoutingResult &host_result) override;
 
         void gatherTokenBatch(
             const float *hidden,

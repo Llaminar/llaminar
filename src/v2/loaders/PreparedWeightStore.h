@@ -198,6 +198,52 @@ namespace llaminar2
         size_t totalPopulatedExperts() const;
 
     private:
+        /**
+         * @brief Device-scoped identity for a frozen model-weight binding.
+         *
+         * LocalTP participants materialize symmetric plans, so binding ids are
+         * intentionally reused across devices. PreparedWeightRef already carries
+         * the device; the registry key must preserve the same identity instead
+         * of allowing the last participant to overwrite earlier entries.
+         */
+        struct PreparedBindingKey
+        {
+            uint64_t binding_id = 0;
+            DeviceId device = DeviceId::invalid();
+
+            bool operator==(const PreparedBindingKey &other) const
+            {
+                return binding_id == other.binding_id &&
+                       device == other.device;
+            }
+        };
+
+        struct PreparedBindingKeyHash
+        {
+            size_t operator()(const PreparedBindingKey &key) const noexcept
+            {
+                size_t hash = std::hash<uint64_t>{}(key.binding_id);
+                hash ^= std::hash<DeviceId>{}(key.device) +
+                        0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+                return hash;
+            }
+        };
+
+        static PreparedBindingKey keyFor(
+            uint64_t binding_id,
+            DeviceId device)
+        {
+            return PreparedBindingKey{
+                .binding_id = binding_id,
+                .device = device,
+            };
+        }
+
+        static PreparedBindingKey keyFor(const PreparedWeightRef &ref)
+        {
+            return keyFor(ref.binding_id, ref.device);
+        }
+
         struct Entry
         {
             WeightBinding binding;
@@ -217,16 +263,29 @@ namespace llaminar2
         {
             uint64_t gate_binding_id = 0;
             uint64_t up_binding_id = 0;
+            DeviceId gate_device = DeviceId::invalid();
+            DeviceId up_device = DeviceId::invalid();
+
             bool operator==(const FusedCacheKey &o) const
             {
-                return gate_binding_id == o.gate_binding_id && up_binding_id == o.up_binding_id;
+                return gate_binding_id == o.gate_binding_id &&
+                       up_binding_id == o.up_binding_id &&
+                       gate_device == o.gate_device &&
+                       up_device == o.up_device;
             }
         };
         struct FusedCacheHash
         {
             size_t operator()(const FusedCacheKey &k) const
             {
-                return std::hash<uint64_t>{}(k.gate_binding_id) ^ (std::hash<uint64_t>{}(k.up_binding_id) << 32);
+                size_t hash = std::hash<uint64_t>{}(k.gate_binding_id);
+                hash ^= std::hash<uint64_t>{}(k.up_binding_id) +
+                        0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+                hash ^= std::hash<DeviceId>{}(k.gate_device) +
+                        0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+                hash ^= std::hash<DeviceId>{}(k.up_device) +
+                        0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+                return hash;
             }
         };
 
@@ -235,7 +294,7 @@ namespace llaminar2
 
         ModelContextId model_id_;
         mutable std::mutex mutex_;
-        std::unordered_map<uint64_t, Entry> entries_;
+        std::unordered_map<PreparedBindingKey, Entry, PreparedBindingKeyHash> entries_;
         mutable std::unordered_map<FusedCacheKey, std::unique_ptr<ITensorFusedGateUpGemm>, FusedCacheHash> fused_cache_;
 
         // =========================================================================
@@ -255,7 +314,8 @@ namespace llaminar2
             }
         };
 
-        std::unordered_map<uint64_t, EmbeddingEntry> embedding_entries_;
+        std::unordered_map<PreparedBindingKey, EmbeddingEntry, PreparedBindingKeyHash>
+            embedding_entries_;
 
         // =========================================================================
         // Sliced GEMM Cache (Phase 8: owned by this store)
@@ -264,12 +324,14 @@ namespace llaminar2
         struct SlicedKey
         {
             uint64_t binding_id = 0;
+            DeviceId device = DeviceId::invalid();
             const TensorBase *tensor = nullptr;
             size_t row_start = 0;
             size_t row_end = 0;
             bool operator==(const SlicedKey &o) const
             {
                 return binding_id == o.binding_id &&
+                       device == o.device &&
                        tensor == o.tensor &&
                        row_start == o.row_start &&
                        row_end == o.row_end;
@@ -280,6 +342,7 @@ namespace llaminar2
             size_t operator()(const SlicedKey &k) const
             {
                 auto h = std::hash<uint64_t>{}(k.binding_id);
+                h ^= std::hash<DeviceId>{}(k.device) << 4;
                 h ^= std::hash<const void *>{}(k.tensor) << 8;
                 h ^= std::hash<size_t>{}(k.row_start) << 16;
                 h ^= std::hash<size_t>{}(k.row_end) << 32;

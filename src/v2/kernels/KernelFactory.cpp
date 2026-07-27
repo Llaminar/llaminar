@@ -2511,32 +2511,9 @@ namespace llaminar
                 return raw_ptr;
             }
 
-            llaminar2::IMoEKernel *KernelFactory::getOrCreateMoEKernel(
+            std::unique_ptr<llaminar2::IMoEKernel> KernelFactory::createMoEKernel(
                 llaminar2::DeviceId target_device)
             {
-                const DeviceKernelKey registry_key{
-                    target_device,
-                    KernelKind::MOE,
-                    0}; // No variant (always FP32)
-
-                MoECacheKey key{target_device};
-
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-
-                auto reg_it = device_kernel_registry_.find(registry_key);
-                if (reg_it != device_kernel_registry_.end())
-                {
-                    return static_cast<llaminar2::IMoEKernel *>(reg_it->second.get());
-                }
-
-                auto it = moe_cache_.find(key);
-                if (it != moe_cache_.end())
-                {
-                    auto *raw_ptr = it->second.get();
-                    device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
-                    return raw_ptr;
-                }
-
                 // Create device-appropriate MoE kernel. CUDA/ROCm devices must
                 // never silently fall through to CPU: that would pull routing
                 // tensors back to host and break graph-capture assumptions.
@@ -2550,7 +2527,7 @@ namespace llaminar
 #else
                 if (target_device.is_cuda())
                 {
-                    throw std::runtime_error("KernelFactory::getOrCreateMoEKernel: CUDA device requested but HAVE_CUDA is OFF");
+                    throw std::runtime_error("KernelFactory::createMoEKernel: CUDA device requested but HAVE_CUDA is OFF");
                 }
                 else
 #endif
@@ -2563,7 +2540,7 @@ namespace llaminar
 #else
                 if (target_device.is_rocm())
                 {
-                    throw std::runtime_error("KernelFactory::getOrCreateMoEKernel: ROCm device requested but HAVE_ROCM is OFF");
+                    throw std::runtime_error("KernelFactory::createMoEKernel: ROCm device requested but HAVE_ROCM is OFF");
                 }
                 else
 #endif
@@ -2573,16 +2550,13 @@ namespace llaminar
                 }
                 else
                 {
-                    throw std::runtime_error("KernelFactory::getOrCreateMoEKernel: invalid target device " + target_device.to_string());
+                    throw std::runtime_error("KernelFactory::createMoEKernel: invalid target device " + target_device.to_string());
                 }
 
-                auto *raw_ptr = kernel.get();
-                moe_cache_[key] = std::move(kernel);
-                device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                 LOG_DEBUG("[KernelFactory][MOE] create dev=" << static_cast<int>(target_device.type)
                                                              << ":" << target_device.ordinal
-                                                             << " kernel=" << static_cast<const void *>(raw_ptr));
-                return raw_ptr;
+                                                             << " kernel=" << static_cast<const void *>(kernel.get()));
+                return kernel;
             }
 
             std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
@@ -2936,7 +2910,6 @@ namespace llaminar
             std::unordered_map<KernelFactory::ResidualAddCacheKey, std::unique_ptr<llaminar2::ITensorResidualAdd>, KernelFactory::ResidualAddCacheKeyHash> KernelFactory::residual_add_cache_;
             std::unordered_map<KernelFactory::AttentionCacheKey, std::unique_ptr<llaminar2::ITensorAttention>, KernelFactory::AttentionCacheKeyHash> KernelFactory::attention_cache_;
             std::unordered_map<KernelFactory::EmbeddingCacheKey, std::unique_ptr<llaminar2::ITensorEmbedding>, KernelFactory::EmbeddingCacheKeyHash> KernelFactory::embedding_cache_;
-            std::unordered_map<KernelFactory::MoECacheKey, std::unique_ptr<llaminar2::IMoEKernel>, KernelFactory::MoECacheKeyHash> KernelFactory::moe_cache_;
             std::unordered_map<DeviceKernelKey, std::shared_ptr<void>, DeviceKernelKeyHash> KernelFactory::device_kernel_registry_;
             std::unordered_map<DeviceKernelKey, std::shared_ptr<KernelFactory::IGemmEngine>, DeviceKernelKeyHash> KernelFactory::device_gemm_engine_registry_;
             // NOTE: Device-level kernel caching (hipBLAS, cuBLAS handles, etc.)
@@ -3048,7 +3021,6 @@ namespace llaminar
                 residual_add_cache_.clear();
                 attention_cache_.clear();
                 embedding_cache_.clear();
-                moe_cache_.clear();
                 device_kernel_registry_.clear();
                 device_gemm_engine_registry_.clear();
 #ifdef HAVE_CUDA
@@ -3091,8 +3063,6 @@ namespace llaminar
                 reset_kernel_cache(residual_add_cache_);
                 reset_kernel_cache(attention_cache_);
                 reset_kernel_cache(embedding_cache_);
-                reset_kernel_cache(moe_cache_);
-
 #if LLAMINAR_ASSERTIONS_ACTIVE
                 // Post-reset assertion: no kernel should retain stale dynamic state
                 for (const auto &[key, kernel] : embedding_cache_)
@@ -3108,8 +3078,7 @@ namespace llaminar
                 LOG_DEBUG("[KernelFactory] Reset dynamic state on "
                           << embedding_cache_.size() << " embedding, "
                           << attention_cache_.size() << " attention, "
-                          << rope_cache_.size() << " RoPE, "
-                          << moe_cache_.size() << " MoE kernels");
+                          << rope_cache_.size() << " RoPE kernels");
             }
 
             std::pair<size_t, size_t> KernelFactory::cacheStats()
@@ -3118,7 +3087,7 @@ namespace llaminar
                 size_t total_bytes = 0;
                 // Note: packed_bytes not tracked per-kernel
                 // For now, just return count (includes all caches)
-                return {fused_gate_up_cache_.size() + rope_cache_.size() + rmsnorm_cache_.size() + swiglu_cache_.size() + softmax_cache_.size() + residual_add_cache_.size() + attention_cache_.size() + embedding_cache_.size() + moe_cache_.size() + device_kernel_registry_.size(), total_bytes};
+                return {fused_gate_up_cache_.size() + rope_cache_.size() + rmsnorm_cache_.size() + swiglu_cache_.size() + softmax_cache_.size() + residual_add_cache_.size() + attention_cache_.size() + embedding_cache_.size() + device_kernel_registry_.size(), total_bytes};
             }
 
             std::shared_ptr<void> KernelFactory::getDeviceKernelEntry(const DeviceKernelKey &key)

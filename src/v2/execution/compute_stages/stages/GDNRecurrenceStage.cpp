@@ -9,9 +9,10 @@
  * [seq_len, q_dim + k_dim + v_dim]), this stage deinterleaves them into
  * separate contiguous arrays before passing to the kernel.
  *
- * GPU path: Uses ensureOnDevice() / allocateOnDevice() / gpu_data_ptr() to
- * keep data on-device. Merged QKV deinterleave is done on-device via the
- * kernel's deinterleave_qkv_device() method. No H2D/D2H copies in the hot path.
+ * GPU path: The executor and TransferEngine prepare arena bindings on the
+ * stage's explicit stream; this stage consumes device pointers only. Merged
+ * QKV deinterleave is done on-device via deinterleave_qkv_device(). No H2D/D2H
+ * copies occur in the hot path.
  *
  * CPU path: Uses data() / mutable_data() host pointers with CPU-side deinterleave.
  *
@@ -766,7 +767,7 @@ namespace llaminar2
         refreshPinnedEffectiveSeqLen();
         if (gpu_effective_seq_len_state_)
             gpu_effective_seq_len_state_->device_value_uploaded = false;
-        if (params_.device_id.is_gpu() && gpuStream() && bound_workspace_)
+        if (params_.device_id.is_gpu() && hasGPUStream() && bound_workspace_)
             (void)(ensureGpuEffectiveSeqLenStateInitialized() && uploadGpuEffectiveSeqLen());
     }
 

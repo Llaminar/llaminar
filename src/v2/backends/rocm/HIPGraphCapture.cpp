@@ -30,14 +30,12 @@ namespace llaminar2
 
     HIPGraphCapture::HIPGraphCapture(HIPGraphCapture &&other) noexcept
         : stream_(other.stream_), graph_(other.graph_), exec_(other.exec_),
-          node_count_(other.node_count_),
-          consecutive_update_failures_(other.consecutive_update_failures_)
+          node_count_(other.node_count_)
     {
         other.stream_ = nullptr;
         other.graph_ = nullptr;
         other.exec_ = nullptr;
         other.node_count_ = 0;
-        other.consecutive_update_failures_ = 0;
     }
 
     HIPGraphCapture &HIPGraphCapture::operator=(HIPGraphCapture &&other) noexcept
@@ -49,12 +47,10 @@ namespace llaminar2
             graph_ = other.graph_;
             exec_ = other.exec_;
             node_count_ = other.node_count_;
-            consecutive_update_failures_ = other.consecutive_update_failures_;
             other.stream_ = nullptr;
             other.graph_ = nullptr;
             other.exec_ = nullptr;
             other.node_count_ = 0;
-            other.consecutive_update_failures_ = 0;
         }
         return *this;
     }
@@ -64,7 +60,14 @@ namespace llaminar2
         // Destroy any previous graph (but keep exec_ for tryUpdate)
         if (graph_)
         {
-            HIP_WARN_IF_FAIL(hipGraphDestroy(graph_));
+            const hipError_t destroy_error = hipGraphDestroy(graph_);
+            if (destroy_error != hipSuccess)
+            {
+                LOG_ERROR("[HIPGraphCapture] Cannot begin a new capture because "
+                          "destroying the prior captured graph failed: "
+                          << hipGetErrorString(destroy_error));
+                return false;
+            }
             graph_ = nullptr;
             node_count_ = 0;
         }
@@ -114,7 +117,14 @@ namespace llaminar2
         // Destroy old executable
         if (exec_)
         {
-            HIP_WARN_IF_FAIL(hipGraphExecDestroy(exec_));
+            const hipError_t destroy_error = hipGraphExecDestroy(exec_);
+            if (destroy_error != hipSuccess)
+            {
+                LOG_ERROR("[HIPGraphCapture] Cannot replace graph executable because "
+                          "destroying the prior executable failed: "
+                          << hipGetErrorString(destroy_error));
+                return false;
+            }
             exec_ = nullptr;
         }
 
@@ -125,7 +135,6 @@ namespace llaminar2
             exec_ = nullptr;
             return false;
         }
-        consecutive_update_failures_ = 0;
         LOG_DEBUG("[HIPGraphCapture] Instantiated graph executable (" << node_count_ << " nodes)");
         return true;
     }
@@ -148,36 +157,8 @@ namespace llaminar2
 
     GraphUpdateResult HIPGraphCapture::tryUpdate()
     {
-        if (!exec_ || !graph_)
-        {
-            return GraphUpdateResult::Failed;
-        }
-
-        hipGraphExecUpdateResult update_result = hipGraphExecUpdateError;
-        hipError_t err = hipGraphExecUpdate(exec_, graph_, nullptr, &update_result);
-
-        if (err == hipSuccess && update_result == hipGraphExecUpdateSuccess)
-        {
-            consecutive_update_failures_ = 0;
-            LOG_TRACE("[HIPGraphCapture] Graph executable updated in-place");
-            return GraphUpdateResult::Success;
-        }
-
-        consecutive_update_failures_++;
-
-        if (update_result == hipGraphExecUpdateErrorTopologyChanged ||
-            update_result == hipGraphExecUpdateErrorNodeTypeChanged ||
-            update_result == hipGraphExecUpdateErrorNotSupported)
-        {
-            LOG_WARN("[HIPGraphCapture] Graph update needs reinstantiation: result="
-                     << static_cast<int>(update_result)
-                     << " (failure " << consecutive_update_failures_ << ")");
-            return GraphUpdateResult::NeedsReinstantiate;
-        }
-
-        LOG_WARN("[HIPGraphCapture] Graph update failed: " << hipGetErrorString(err)
-                                                           << " result=" << static_cast<int>(update_result)
-                                                           << " (failure " << consecutive_update_failures_ << ")");
+        LOG_ERROR("[HIPGraphCapture] tryUpdate() called even though HIP graph "
+                  "executable update is not an advertised backend capability");
         return GraphUpdateResult::Failed;
     }
 
@@ -204,7 +185,6 @@ namespace llaminar2
             graph_ = nullptr;
         }
         node_count_ = 0;
-        consecutive_update_failures_ = 0;
     }
 
 } // namespace llaminar2

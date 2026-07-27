@@ -111,6 +111,27 @@ namespace llaminar2::test
             << "CPU/non-GPU mmap keeps the historical eager-prefault behavior";
     }
 
+    TEST(Test__MmapRegion, ResolvesMappedSubrangeToFileCoordinates)
+    {
+        TemporaryMmapFile file;
+        auto region = MmapRegion::create(
+            file.path().string(),
+            /*numa_node=*/-1,
+            /*skip_cache_eviction=*/false,
+            MmapRegion::PrefaultPolicy::DemandPaged);
+        ASSERT_NE(region, nullptr);
+
+        const auto source =
+            MmapRegion::resolveFileSource(region->data() + 37, 113);
+
+        ASSERT_TRUE(source.has_value());
+        EXPECT_EQ(source->path, file.path().string());
+        EXPECT_EQ(source->offset, uint64_t{37});
+        EXPECT_EQ(source->available_bytes, region->size() - 37);
+        EXPECT_FALSE(MmapRegion::resolveFileSource(&source, sizeof(source)).has_value())
+            << "Heap addresses must never be mistaken for model-file ranges";
+    }
+
     TEST(Test__MmapRegion, RequestedNumaBindFailureFailsFastByDefault)
     {
         ScopedEnvVar allow_fallback("LLAMINAR_ALLOW_NUMA_BIND_FALLBACK", nullptr);

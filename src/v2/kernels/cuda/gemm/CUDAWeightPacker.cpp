@@ -15,7 +15,7 @@ namespace llaminar2::cuda
 {
     extern "C"
     {
-        void cudaQuantGemm_freeDevice(void *d_ptr);
+        void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id);
     }
 
     namespace
@@ -112,36 +112,28 @@ namespace llaminar2::cuda
 
     CUDAPackedWeights::~CUDAPackedWeights()
     {
-        // Free row-major transpose (per-weight, used by ROWPAR GEMV)
-        if (rowmajor_)
-        {
-            cudaRowMajorWeights_destroy(rowmajor_);
-            rowmajor_ = nullptr;
-        }
-
         for (auto &[device_id, upload] : device_uploads)
         {
-            (void)device_id;
             if (upload.d_native_vnni)
-                cudaQuantGemm_freeDevice(upload.d_native_vnni);
+                cudaQuantGemm_freeDevice(upload.d_native_vnni, device_id);
             if (upload.d_native_scales)
-                cudaQuantGemm_freeDevice(upload.d_native_scales);
+                cudaQuantGemm_freeDevice(upload.d_native_scales, device_id);
             if (upload.d_native_mins)
-                cudaQuantGemm_freeDevice(upload.d_native_mins);
+                cudaQuantGemm_freeDevice(upload.d_native_mins, device_id);
             if (upload.d_native_emins)
-                cudaQuantGemm_freeDevice(upload.d_native_emins);
+                cudaQuantGemm_freeDevice(upload.d_native_emins, device_id);
         }
 
         if (device_uploads.empty())
         {
             if (d_native_vnni)
-                cudaQuantGemm_freeDevice(d_native_vnni);
+                cudaQuantGemm_freeDevice(d_native_vnni, cuda_device_id);
             if (d_native_scales)
-                cudaQuantGemm_freeDevice(d_native_scales);
+                cudaQuantGemm_freeDevice(d_native_scales, cuda_device_id);
             if (d_native_mins)
-                cudaQuantGemm_freeDevice(d_native_mins);
+                cudaQuantGemm_freeDevice(d_native_mins, cuda_device_id);
             if (d_native_emins)
-                cudaQuantGemm_freeDevice(d_native_emins);
+                cudaQuantGemm_freeDevice(d_native_emins, cuda_device_id);
         }
     }
 
@@ -213,22 +205,21 @@ namespace llaminar2::cuda
     extern "C"
     {
         bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
-        void cudaQuantGemm_freeDevice(void *d_ptr);
+        void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id);
     }
 
     MoEBatchPackedWeightsCUDA::~MoEBatchPackedWeightsCUDA()
     {
         for (auto &[device_id, upload] : device_uploads)
         {
-            (void)device_id;
             if (upload.d_vnni)
-                cudaQuantGemm_freeDevice(upload.d_vnni);
+                cudaQuantGemm_freeDevice(upload.d_vnni, device_id);
             if (upload.d_scales)
-                cudaQuantGemm_freeDevice(upload.d_scales);
+                cudaQuantGemm_freeDevice(upload.d_scales, device_id);
             if (upload.d_mins)
-                cudaQuantGemm_freeDevice(upload.d_mins);
+                cudaQuantGemm_freeDevice(upload.d_mins, device_id);
             if (upload.d_emins)
-                cudaQuantGemm_freeDevice(upload.d_emins);
+                cudaQuantGemm_freeDevice(upload.d_emins, device_id);
         }
     }
 
@@ -261,10 +252,10 @@ namespace llaminar2::cuda
             !uploadArray(all_mins, &upload.d_mins) ||
             !uploadArray(all_emins, &upload.d_emins))
         {
-            if (upload.d_vnni) cudaQuantGemm_freeDevice(upload.d_vnni);
-            if (upload.d_scales) cudaQuantGemm_freeDevice(upload.d_scales);
-            if (upload.d_mins) cudaQuantGemm_freeDevice(upload.d_mins);
-            if (upload.d_emins) cudaQuantGemm_freeDevice(upload.d_emins);
+            if (upload.d_vnni) cudaQuantGemm_freeDevice(upload.d_vnni, cuda_device_id);
+            if (upload.d_scales) cudaQuantGemm_freeDevice(upload.d_scales, cuda_device_id);
+            if (upload.d_mins) cudaQuantGemm_freeDevice(upload.d_mins, cuda_device_id);
+            if (upload.d_emins) cudaQuantGemm_freeDevice(upload.d_emins, cuda_device_id);
             return false;
         }
 

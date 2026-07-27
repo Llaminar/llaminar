@@ -178,6 +178,33 @@ namespace
         return cudaMemcpy(destination, source, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
     }
 
+    /** @brief Allocate a CUDA assertion buffer outside production cache code. */
+    void *allocateDeviceBytes(size_t bytes)
+    {
+        void *pointer = nullptr;
+        return cudaMalloc(&pointer, bytes) == cudaSuccess ? pointer : nullptr;
+    }
+
+    /** @brief Release a CUDA assertion buffer after the matrix cell completes. */
+    void releaseDeviceBytes(void *pointer)
+    {
+        if (pointer)
+            (void)cudaFree(pointer);
+    }
+
+    /** @brief Enqueue the suite's final device-to-host observation copy. */
+    bool copyDeviceBytesAsync(
+        void *destination,
+        const void *source,
+        size_t bytes,
+        void *opaque_stream)
+    {
+        return opaque_stream &&
+               cudaMemcpyAsync(
+                   destination, source, bytes, cudaMemcpyDeviceToHost,
+                   static_cast<cudaStream_t>(opaque_stream)) == cudaSuccess;
+    }
+
     bool synchronizeStream(void *opaque_stream)
     {
         return opaque_stream &&
@@ -217,4 +244,28 @@ TEST(Test__CUDAKVCacheGroupedVerifier,
     runAllFormatConvertedDeviceReadSweep(
         DeviceId::cuda(0), "CUDA", stream.opaque(),
         readConvertedBatch, copyDeviceBytes, synchronizeStream);
+}
+
+TEST(Test__CUDAKVCacheGroupedVerifier,
+     AllNativeFormatsDeviceLogicalBlockHarvestRestoreAreByteExact)
+{
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 1)
+        GTEST_SKIP() << "CUDA device unavailable";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    runAllFormatDeviceLogicalBlockSweep(
+        DeviceId::cuda(0),
+        "CUDA",
+        "cuda_device_logical_kv_exports",
+        "cuda_device_logical_kv_imports",
+        "cuda_device_logical_tq_kv_exports",
+        "cuda_device_logical_tq_kv_imports",
+        stream.opaque(),
+        allocateDeviceBytes,
+        releaseDeviceBytes,
+        copyDeviceBytesAsync,
+        synchronizeStream);
 }

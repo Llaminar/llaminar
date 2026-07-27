@@ -177,6 +177,17 @@ namespace llaminar2
         bool compute_all_position_logits = false;
 
         /**
+         * @brief Runtime-only grouped MTP verifier graph policy.
+         *
+         * All-position logits are also required by main-model MTP prefill, so
+         * that output policy cannot identify verifier ownership. This explicit
+         * flag lets declarative graph builders omit state-publication and
+         * diagnostic stages that belong only to condition-producing main
+         * forwards.
+         */
+        bool grouped_mtp_verifier = false;
+
+        /**
          * @brief Runtime-only live request-batch condition transaction.
          *
          * A request-batched MTP step first advances one ordinary main-model row

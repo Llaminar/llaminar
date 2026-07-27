@@ -16,6 +16,7 @@
  */
 
 #include "../../IMoEKernel.h"
+#include "../../common/DeviceResidentRouterGateCache.h"
 #include "../CUDAKernelBase.h"
 #include "../gemm/CUDADeviceWorkspace.h"
 #include "../../../tensors/TensorType.h"
@@ -23,10 +24,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace llaminar2
 {
+    class PersistentWorkspaceSlotLease;
+
     /**
      * @brief CUDA backend for MoE router, grouping, gather/scatter, and elementwise glue.
      *
@@ -45,14 +49,6 @@ namespace llaminar2
 
         /// @brief Clear request-shaped host grouping metadata while retaining device scratch.
         void resetDynamicState() override;
-
-        bool route(
-            const float *hidden,
-            const float *gate_weights,
-            int seq_len, int d_model,
-            int num_experts, int top_k,
-            bool normalize_weights,
-            MoERoutingResult &result) override;
 
         void gatherTokenBatch(
             const float *hidden,
@@ -186,30 +182,38 @@ namespace llaminar2
             ITensor *routing_indices, ITensor *routing_weights,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
-            bool filter_to_local_runtime_experts = false) override;
+            bool filter_to_local_runtime_experts = false,
+            MoEGroupedHistogramUpdate histogram_update =
+                MoEGroupedHistogramUpdate::None) override;
 
         bool regroupPrefillRoutesFromRuntimeAssignments(
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
-            int num_experts, int top_k) override;
+            int num_experts, int top_k,
+            MoEGroupedHistogramUpdate histogram_update =
+                MoEGroupedHistogramUpdate::None) override;
 
         bool assignPrefillRoutesLeastLoadedResident(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k) override;
 
         bool planPrefillRoutesLeastLoadedCurrentBatch(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
             const least_loaded_ep::LeastLoadedExpertAssignmentConfig &config) override;
 
         bool assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k) override;
 
         bool assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
@@ -225,10 +229,6 @@ namespace llaminar2
             ITensor *output, ITensor *expert_results,
             DeviceMoELayerRuntime *runtime_layer,
             int expert_id, int max_tokens, int d_model) override;
-
-        bool prepareExpertGroups(
-            ITensor *routing_indices, ITensor *routing_weights,
-            int seq_len, int num_experts, int top_k) override;
 
         /// @brief Upload persistent down-projection descriptors for grouped CUDA prefill.
         int uploadGroupedExpertDownDescriptorTable(
@@ -265,10 +265,9 @@ namespace llaminar2
             ITensor *routing_indices, ITensor *routing_weights,
             int seq_len, int num_experts, int top_k) override;
 
-        bool prepareExpertGroupsAsyncMasked(
+        bool prepareExpertGroupsAsyncUsingPublishedMask(
             ITensor *routing_indices, ITensor *routing_weights,
-            int seq_len, int num_experts, int top_k,
-            const uint8_t *expert_mask) override;
+            int seq_len, int num_experts, int top_k) override;
 
         bool updateGroupedPrefillExpertMask(
             const uint8_t *expert_mask,
@@ -378,6 +377,7 @@ namespace llaminar2
                 MoEDecodeDescriptorSource::RuntimePlacementTable) override;
 
         bool runDeviceRebalanceController(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layers,
             const uint64_t *gathered_histograms,
             DeviceMoERebalanceStatus *status,
@@ -392,6 +392,7 @@ namespace llaminar2
             uint32_t command_buffer_count = 1) override;
 
         bool packDeviceRebalanceHistograms(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layers,
             uint64_t *local_histograms,
             const DeviceMoERebalanceConfig &config,
@@ -400,11 +401,13 @@ namespace llaminar2
             uint32_t command_buffer_count = 1) override;
 
         bool packDeviceRebalanceDirectory(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layers,
             DeviceMoEExpertDirectoryEntry *local_directory,
             const DeviceMoERebalanceConfig &config) override;
 
         bool packDeviceRebalanceSourceDescriptors(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layers,
             const DeviceMoERebalancePlanEntry *plan_entries,
             const DeviceMoERebalanceCommandBufferHeader *command_headers,
@@ -415,6 +418,7 @@ namespace llaminar2
             uint32_t command_buffer_count = 1) override;
 
         bool projectDeviceRebalanceDomainCommands(
+            const MoEKernelLaunchContext &launch,
             const DeviceMoERebalancePlanEntry *gathered_plan_entries,
             const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
             uint32_t plan_capacity,
@@ -425,9 +429,13 @@ namespace llaminar2
             uint32_t payload_slot_capacity = 0,
             uint32_t command_buffer_count = 1,
             const DeviceMoERebalanceWaveState *gathered_wave_states = nullptr,
-            DeviceMoERebalanceWaveState *local_wave_states = nullptr) override;
+            DeviceMoERebalanceWaveState *local_wave_states = nullptr,
+            DeviceMoELayerRuntime *runtime_layers = nullptr,
+            const DeviceMoEExpertDirectoryEntry *local_transfer_slots = nullptr,
+            uint32_t local_transfer_slot_count = 0) override;
 
         bool projectPrefillLeastLoadedDomainCommands(
+            const MoEKernelLaunchContext &launch,
             const DeviceMoERebalancePlanEntry *gathered_plan_entries,
             const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
             uint32_t plan_capacity,
@@ -437,9 +445,13 @@ namespace llaminar2
             const DeviceMoERebalanceConfig &config,
             DeviceMoERebalanceStatus *status,
             uint32_t payload_slot_capacity,
+            DeviceMoELayerRuntime *runtime_layers,
+            const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+            uint32_t local_transfer_slot_count,
             uint32_t command_buffer_count = 1) override;
 
         bool materializePrefillLeastLoadedTransferCommands(
+            const MoEKernelLaunchContext &launch,
             const DeviceMoELayerRuntime *runtime_layer,
             DeviceMoERebalancePlanEntry *plan_entries,
             uint32_t *plan_count,
@@ -452,6 +464,7 @@ namespace llaminar2
             uint32_t command_buffer_count = 1) override;
 
         bool packDeviceRebalanceCompactPayloads(
+            const MoEKernelLaunchContext &launch,
             const DeviceMoERebalancePlanEntry *plan_entries,
             const DeviceMoERebalanceCommandBufferHeader *command_headers,
             uint32_t plan_capacity,
@@ -465,6 +478,7 @@ namespace llaminar2
             uint32_t command_buffer_count = 1) override;
 
         bool packDeviceRebalanceCollectivePayloads(
+            const MoEKernelLaunchContext &launch,
             const DeviceMoERebalancePlanEntry *gathered_plan_entries,
             const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
             uint32_t plan_capacity,
@@ -478,6 +492,7 @@ namespace llaminar2
             uint32_t command_buffer_count = 1) override;
 
         bool unpackDeviceRebalanceCollectivePayloads(
+            const MoEKernelLaunchContext &launch,
             const DeviceMoERebalancePlanEntry *plan_entries,
             const uint32_t *plan_count,
             uint32_t plan_capacity,
@@ -493,10 +508,12 @@ namespace llaminar2
             uint32_t command_buffer_count = 1) override;
 
         bool initializeDeviceRebalanceGraphController(
+            const MoEKernelLaunchContext &launch,
             DeviceMoERebalanceGraphControllerState *controller_state,
             const DeviceMoERebalanceConfig &config) override;
 
         bool publishDeviceRebalanceTransferComplete(
+            const MoEKernelLaunchContext &launch,
             DeviceMoERebalanceGraphControllerState *controller_state,
             const DeviceMoERebalanceCommandBufferHeader *command_header,
             const DeviceMoERebalanceWaveState *wave_state,
@@ -508,6 +525,7 @@ namespace llaminar2
             uint32_t command_buffer_count = 1) override;
 
         bool applyReadyDeviceRebalanceWave(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layers,
             const DeviceMoERebalancePlanEntry *plan_entries,
             const uint32_t *plan_count,
@@ -522,6 +540,7 @@ namespace llaminar2
             uint32_t command_buffer_count = 1) override;
 
         bool applyDeviceRebalanceArrivals(
+            const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layers,
             const DeviceMoERebalancePlanEntry *plan_entries,
             const uint32_t *plan_count,
@@ -532,16 +551,6 @@ namespace llaminar2
             DeviceMoERebalanceApplyStatus *status,
             const DeviceMoERebalanceCommandBufferHeader *command_header = nullptr,
             int target_layer = -1) override;
-
-        int getExpertTokenCount(int expert_id) const override;
-
-        void gatherExpertBatch(
-            ITensor *hidden, ITensor *batch_buffer,
-            int expert_id, int d_model) override;
-
-        void scatterExpertResults(
-            ITensor *output, ITensor *expert_results,
-            int expert_id, int d_model) override;
 
         bool supports_device(int device_idx) const override
         {
@@ -571,11 +580,12 @@ namespace llaminar2
         /**
          * @brief Stable graph-capture slot bands for grouped decode pointer arrays.
          *
-         * Descriptor table ids identify the weight table, but not the scratch
-         * destination shape.  Table-driven decode, two-step runtime decode, and
-         * fused runtime decode can legally reuse the same descriptor table while
-         * writing to different scratch/output tensors.  CUDA graphs capture the
-         * pointer-array device address, so each semantic path gets a stable band.
+         * The persistent descriptor lease identifies graph ownership across all
+         * MoE kernel objects sharing one device workspace. Table-driven decode,
+         * two-step runtime decode, and fused runtime decode can legally reuse
+         * one descriptor while writing to different scratch/output tensors.
+         * CUDA graphs capture the pointer-array device address, so each semantic
+         * path gets a stable band within that globally leased descriptor slot.
          */
         enum class RuntimePointerArrayScope : std::size_t
         {
@@ -611,7 +621,6 @@ namespace llaminar2
         bool ensureRouteBufferCapacity(size_t logits_count, size_t topk_count);
         bool ensureGroupingBufferCapacity(int total_slots, int num_experts);
         bool ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate);
-        bool ensureRuntimePrefillDescriptorCapacity(int num_experts);
         /**
          * @brief Bind decode/Q8-publication scratch for the declared row count.
          *
@@ -669,7 +678,7 @@ namespace llaminar2
             int *d_original_expert_ids,
             float *d_grouped_weights);
         bool ensureRuntimeGateUpPointerArrays(
-            int table_id,
+            std::size_t persistent_descriptor_slot,
             RuntimePointerArrayScope scope,
             int top_k,
             const std::array<float *, kRuntimePointerArrayMaxTopK> &gate_ptrs,
@@ -677,7 +686,7 @@ namespace llaminar2
             float ***d_gate_ptrs,
             float ***d_up_ptrs);
         bool ensureRuntimeDownPointerArrays(
-            int table_id,
+            std::size_t persistent_descriptor_slot,
             RuntimePointerArrayScope scope,
             int top_k,
             const std::array<const float *, kRuntimePointerArrayMaxTopK> &gate_ptrs,
@@ -685,7 +694,7 @@ namespace llaminar2
             const float ***d_gate_ptrs,
             const float ***d_up_ptrs);
         bool runtimePointerWorkspaceSlot(
-            int table_id,
+            std::size_t persistent_descriptor_slot,
             RuntimePointerArrayScope scope,
             std::size_t *workspace_slot,
             const char *context) const;
@@ -720,12 +729,10 @@ namespace llaminar2
         void releaseDeviceBuffers() noexcept;
         struct RouterQ8GateCacheEntry;
         const RouterQ8GateCacheEntry *getOrCreateQ8RouterGateCache(
-            ITensor *gate_weights,
             const float *gate_device_ptr,
             int d_model,
             int num_experts);
         bool tryRouteDecodeLogitsQ8(
-            ITensor *gate_weights,
             const float *d_hidden,
             const float *d_gate,
             int d_model,
@@ -780,6 +787,7 @@ namespace llaminar2
         struct GroupedDownDescriptorTable
         {
             DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+            std::shared_ptr<PersistentWorkspaceSlotLease> workspace_lease;
             std::vector<DeviceNativeVNNIMatrixDesc> host_descs;
             std::size_t workspace_slot = 0;
             int num_experts = 0;
@@ -794,6 +802,7 @@ namespace llaminar2
         {
             DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
             DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
+            std::shared_ptr<PersistentWorkspaceSlotLease> workspace_lease;
             std::vector<DeviceNativeVNNIMatrixDesc> host_gate_descs;
             std::vector<DeviceNativeVNNIMatrixDesc> host_up_descs;
             std::size_t workspace_slot = 0;
@@ -805,18 +814,32 @@ namespace llaminar2
             bool valid = false;
         };
 
+        /**
+         * @brief Workspace-owned immutable CUDA router-weight publication.
+         *
+         * One instance is shared by every graph-local MoE kernel that consumes
+         * the same source weight in a workspace. The readiness event orders the
+         * one-time quantization producer before a kernel first adopts the
+         * publication on its explicit stream. It is never consulted during
+         * captured replay.
+         */
+        struct RouterGateWorkspacePublication
+        {
+            void *ready_event = nullptr;
+            void *primary_weights = nullptr;
+            void *scales = nullptr;
+            std::size_t workspace_slot = 0;
+        };
+
         struct RouterQ8GateCacheEntry
         {
-            std::uintptr_t source_tensor = 0;
-            std::uintptr_t source_host_ptr = 0;
-            std::uintptr_t source_device_ptr = 0;
-            int d_model = 0;
-            int num_experts = 0;
+            DeviceResidentRouterGateCacheKey key{};
             int blocks_per_row = 0;
             size_t element_count = 0;
             size_t scale_count = 0;
             int8_t *d_gate_weights_q8 = nullptr;
             float *d_gate_scales = nullptr;
+            std::shared_ptr<RouterGateWorkspacePublication> workspace_publication;
             std::size_t workspace_slot = 0;
         };
 
@@ -843,21 +866,18 @@ namespace llaminar2
         float *d_group_weights_ = nullptr;
         int *d_group_active_expert_ids_ = nullptr;
         uint8_t *d_group_expert_mask_ = nullptr;
+        std::shared_ptr<PersistentWorkspaceSlotLease> group_expert_mask_workspace_lease_;
         int group_active_expert_slots_ = 0;
         int group_slots_cap_ = 0;
         int group_experts_cap_ = 0;
         int group_expert_mask_cap_ = 0;
         uint64_t group_expert_mask_hash_ = 0;
+        int group_expert_mask_num_experts_ = 0;
+        int group_expert_mask_active_experts_ = 0;
+        bool group_expert_mask_published_ = false;
 
         std::vector<GroupedDownDescriptorTable> grouped_down_desc_tables_;
         std::vector<GroupedGateUpDescriptorTable> grouped_gateup_desc_tables_;
-        DeviceNativeVNNIMatrixDesc *d_runtime_prefill_gate_descs_ = nullptr;
-        DeviceNativeVNNIMatrixDesc *d_runtime_prefill_up_descs_ = nullptr;
-        DeviceNativeVNNIMatrixDesc *d_runtime_prefill_down_descs_ = nullptr;
-        int runtime_prefill_desc_cap_ = 0;
-        std::size_t next_grouped_down_desc_workspace_slot_ = 0;
-        std::size_t next_grouped_gateup_desc_workspace_slot_ = 0;
-        std::size_t next_router_q8_gate_workspace_slot_ = 0;
         /**
          * @brief Warmup readiness for graph-owned grouped-decode pointer slots.
          *

@@ -178,7 +178,7 @@ namespace
         }
         bool hasBARBackedOutputs(const std::string & /*stage_name*/) const override { return false; }
         void clearBARBackedOutputs() override {}
-        bool reserveTempBufferBytes(size_t /*bytes*/) override { return true; }
+        bool reserveCollectiveResources(size_t /*bytes*/, size_t /*fp16_scratch_elements*/) override { return true; }
 
         // Broadcast (no-op)
         bool broadcast(TensorBase * /*tensor*/, int /*source_device_index*/ = 0) override { return true; }

@@ -3,11 +3,13 @@
 #include <chrono>
 #include <cstring>
 #include <sstream>
+#include <stdexcept>
 
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
 #include "collective/BackendRouter.h"
 #include "collective/ICollectiveBackend.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/TensorClasses.h"
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
@@ -20,6 +22,93 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Resolve the coherence implementation hidden behind ITensor.
+         *
+         * Production tensors are TensorBase implementations. Keeping this
+         * checked conversion inside TransferEngine preserves ITensor as the
+         * orchestration-facing abstraction and turns an unsupported tensor
+         * implementation into an immediate contract failure.
+         */
+        TensorBase *requireTensorBase(ITensor *tensor, const char *operation)
+        {
+            if (!tensor)
+            {
+                throw std::invalid_argument(
+                    std::string(operation) + " requires a tensor");
+            }
+
+            auto *base = dynamic_cast<TensorBase *>(tensor);
+            if (!base)
+            {
+                throw std::runtime_error(
+                    std::string(operation) +
+                    " requires a coherence-aware TensorBase implementation");
+            }
+            return base;
+        }
+
+        /**
+         * @brief Resolve the one tensor that owns physical transfer state.
+         *
+         * Tensor wrappers deliberately delegate pointer and coherence queries
+         * to an inner tensor.  TransferEngine must therefore lock and mutate
+         * that same inner object, never the wrapper's dormant TensorBase
+         * fields.  Requiring a canonical owner at this boundary gives every
+         * transfer API the same structural rule.
+         */
+        TensorBase *requireTransferStorageOwner(
+            ITensor *tensor,
+            const char *operation)
+        {
+            TensorBase *base = requireTensorBase(tensor, operation);
+            TensorBase *owner = base->transferStorageOwner();
+            if (!owner)
+            {
+                throw std::runtime_error(
+                    std::string(operation) +
+                    " resolved a null transfer-storage owner");
+            }
+            if (owner->transferStorageOwner() != owner)
+            {
+                throw std::runtime_error(
+                    std::string(operation) +
+                    " resolved a non-canonical transfer-storage owner");
+            }
+            return owner;
+        }
+
+        /**
+         * @brief Describe the tensor ownership contract at a failed transfer boundary.
+         *
+         * A stage can prepare both arena activations and model weights through
+         * the same TransferEngine API.  Include the state that controls
+         * `uploadFull()` so a hard residency failure identifies the offending
+         * tensor and distinguishes an invalid arena publication from a
+         * host-resident or prepared-weight classification error.
+         */
+        std::string tensorTransferState(const TensorBase &tensor)
+        {
+            std::ostringstream description;
+            description
+                << " tensor='"
+                << (tensor.debugName().empty()
+                        ? std::string("(unnamed)")
+                        : tensor.debugName())
+                << "' coherence=" << to_string(tensor.coherenceState())
+                << " residency=" << to_string(tensor.memoryResidency())
+                << " prepared_device_state="
+                << (tensor.hasPreparedDeviceState() ? "true" : "false")
+                << " current_device="
+                << (tensor.current_device().has_value()
+                        ? tensor.current_device()->toString()
+                        : std::string("none"))
+                << " gpu_ptr=" << tensor.gpu_data_ptr();
+            return description.str();
+        }
+    } // namespace
 
     // ============================================================================
     // Singleton
@@ -29,6 +118,367 @@ namespace llaminar2
     {
         static TransferEngine engine;
         return engine;
+    }
+
+    void TransferEngine::prepareDeviceInput(
+        ITensor *tensor,
+        DeviceId target_device,
+        void *stream)
+    {
+        if (!target_device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "TransferEngine::prepareDeviceInput requires a GPU target");
+        }
+        if (!stream)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::prepareDeviceInput requires the exact "
+                "non-null consumer stream");
+        }
+
+        TensorBase *base = requireTransferStorageOwner(
+            tensor,
+            "TransferEngine::prepareDeviceInput");
+        if (!base->ensureOnDevice(target_device, stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine::prepareDeviceInput failed to place tensor on " +
+                target_device.toString());
+        }
+        if (!base->gpu_data_ptr() ||
+            !base->is_on_device(target_device))
+        {
+            throw std::runtime_error(
+                "TransferEngine::prepareDeviceInput completed without storage on " +
+                target_device.toString() +
+                tensorTransferState(*base));
+        }
+    }
+
+    void TransferEngine::requireDeviceInput(
+        ITensor *tensor,
+        DeviceId target_device,
+        void *consumer_stream)
+    {
+        if (!target_device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "TransferEngine::requireDeviceInput requires a GPU target");
+        }
+        if (!consumer_stream)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::requireDeviceInput requires the exact "
+                "non-null consumer stream");
+        }
+
+        TensorBase *base = requireTransferStorageOwner(
+            tensor,
+            "TransferEngine::requireDeviceInput");
+        std::lock_guard<std::mutex> lock(base->coherence_mutex_);
+
+        if (!base->gpu_data_ptr_ ||
+            !base->gpu_device_.has_value() ||
+            *base->gpu_device_ != target_device ||
+            !::llaminar2::isDeviceValid(base->coherence_state_))
+        {
+            throw std::runtime_error(
+                "TransferEngine::requireDeviceInput requires valid pre-existing "
+                "storage on " +
+                target_device.toString() + tensorTransferState(*base));
+        }
+
+        if (!base->device_completion_event_)
+            return;
+
+        /*
+         * A capture body may consume only dependencies established before
+         * beginCapture(). Importing an event recorded by uncaptured work here is
+         * rejected by CUDA/HIP and, more importantly, hides an incomplete graph
+         * boundary. The exact event/stream identity is established by the
+         * executor's pre-capture input pass.
+         */
+        if (isGraphCaptureActive())
+        {
+            if (base->last_joined_completion_event_ ==
+                    base->device_completion_event_ &&
+                base->last_joined_consumer_stream_ == consumer_stream)
+            {
+                return;
+            }
+
+            throw std::runtime_error(
+                "TransferEngine::requireDeviceInput found an external producer "
+                "event that was not joined to the exact consumer stream before "
+                "GPU graph capture began for " +
+                target_device.toString() + tensorTransferState(*base));
+        }
+
+        if (!base->event_device_.has_value() ||
+            *base->event_device_ != target_device)
+        {
+            throw std::runtime_error(
+                "TransferEngine::requireDeviceInput found completion-event "
+                "ownership that does not match " +
+                target_device.toString() + tensorTransferState(*base));
+        }
+
+        IBackend *backend = base->resolveBackend(target_device);
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "TransferEngine::requireDeviceInput could not resolve backend "
+                "for " +
+                target_device.toString() + tensorTransferState(*base));
+        }
+
+        const int backend_device_id = target_device.gpu_ordinal();
+        if (!backend->streamWaitEvent(
+                consumer_stream,
+                base->device_completion_event_,
+                backend_device_id))
+        {
+            throw std::runtime_error(
+                "TransferEngine::requireDeviceInput failed to join producer "
+                "event on consumer stream for " +
+                target_device.toString() + tensorTransferState(*base));
+        }
+
+        /*
+         * Record only after the backend accepts the wait. This is a proof about
+         * one event generation on one stream, not a general coherence flag.
+         * The next device publication clears it before re-recording the event.
+         */
+        base->last_joined_completion_event_ = base->device_completion_event_;
+        base->last_joined_consumer_stream_ = consumer_stream;
+    }
+
+    void TransferEngine::prepareHostInput(ITensor *tensor)
+    {
+        TensorBase *base = requireTransferStorageOwner(
+            tensor,
+            "TransferEngine::prepareHostInput");
+        const TransferResult result = instance().download(base);
+        if (!result.success)
+        {
+            throw std::runtime_error(
+                "TransferEngine::prepareHostInput failed to materialize tensor: " +
+                result.error);
+        }
+        if (!base->hostValid())
+        {
+            throw std::runtime_error(
+                "TransferEngine::prepareHostInput completed without valid host storage");
+        }
+    }
+
+    void TransferEngine::allocateDeviceStorage(
+        ITensor *tensor,
+        DeviceId target_device)
+    {
+        if (!target_device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "TransferEngine::allocateDeviceStorage requires a GPU target");
+        }
+
+        TensorBase *base = requireTransferStorageOwner(
+            tensor,
+            "TransferEngine::allocateDeviceStorage");
+        if (!base->allocateOnDevice(target_device))
+        {
+            throw std::runtime_error(
+                "TransferEngine::allocateDeviceStorage failed to allocate tensor on " +
+                target_device.toString());
+        }
+        if (!base->gpu_data_ptr() ||
+            !base->current_device().has_value() ||
+            *base->current_device() != target_device)
+        {
+            throw std::runtime_error(
+                "TransferEngine::allocateDeviceStorage completed without storage on " +
+                target_device.toString());
+        }
+    }
+
+    void TransferEngine::prepareDeviceOutput(
+        ITensor *tensor,
+        DeviceId target_device,
+        void *stream)
+    {
+        if (!stream)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::prepareDeviceOutput requires the exact "
+                "non-null producer stream");
+        }
+        allocateDeviceStorage(tensor, target_device);
+    }
+
+    void TransferEngine::publishDeviceWrite(
+        TensorBase *tensor,
+        DeviceId device,
+        void *producer_stream)
+    {
+        tensor = requireTransferStorageOwner(
+            tensor,
+            "TransferEngine::publishDeviceWrite");
+        if (!device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "TransferEngine::publishDeviceWrite requires a GPU device");
+        }
+        if (!producer_stream)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::publishDeviceWrite requires the exact "
+                "non-null producer stream");
+        }
+        tensor->publishDeviceWriteStateWithEvent(device, producer_stream);
+    }
+
+    void TransferEngine::publishDeviceWrite(
+        ITensor *tensor,
+        DeviceId device,
+        void *producer_stream)
+    {
+        publishDeviceWrite(
+            requireTensorBase(tensor, "TransferEngine::publishDeviceWrite"),
+            device,
+            producer_stream);
+    }
+
+    void TransferEngine::publishCompletedDeviceWrite(
+        TensorBase *tensor,
+        DeviceId device)
+    {
+        tensor = requireTransferStorageOwner(
+            tensor,
+            "TransferEngine::publishCompletedDeviceWrite");
+        if (!device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "TransferEngine::publishCompletedDeviceWrite requires a GPU device");
+        }
+        tensor->publishCompletedDeviceWriteState(device);
+    }
+
+    void TransferEngine::publishCompletedDeviceWrite(
+        ITensor *tensor,
+        DeviceId device)
+    {
+        publishCompletedDeviceWrite(
+            requireTensorBase(
+                tensor,
+                "TransferEngine::publishCompletedDeviceWrite"),
+            device);
+    }
+
+    void TransferEngine::publishCurrentDeviceWrite(
+        TensorBase *tensor,
+        void *producer_stream)
+    {
+        tensor = requireTransferStorageOwner(
+            tensor,
+            "TransferEngine::publishCurrentDeviceWrite");
+        const auto device = tensor->current_device();
+        if (!device.has_value() || !device->is_gpu())
+        {
+            throw std::runtime_error(
+                "TransferEngine::publishCurrentDeviceWrite requires an "
+                "unambiguous current GPU device");
+        }
+        publishDeviceWrite(tensor, *device, producer_stream);
+    }
+
+    void TransferEngine::publishCurrentDeviceWrite(
+        ITensor *tensor,
+        void *producer_stream)
+    {
+        publishCurrentDeviceWrite(
+            requireTensorBase(
+                tensor,
+                "TransferEngine::publishCurrentDeviceWrite"),
+            producer_stream);
+    }
+
+    void TransferEngine::publishGraphOwnedDeviceWrite(
+        TensorBase *tensor,
+        DeviceId device)
+    {
+        tensor = requireTransferStorageOwner(
+            tensor,
+            "TransferEngine::publishGraphOwnedDeviceWrite");
+        if (!device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "TransferEngine::publishGraphOwnedDeviceWrite requires a GPU device");
+        }
+        tensor->publishGraphOwnedDeviceWriteState(device);
+    }
+
+    void TransferEngine::publishGraphOwnedDeviceWrite(
+        ITensor *tensor,
+        DeviceId device)
+    {
+        publishGraphOwnedDeviceWrite(
+            requireTensorBase(
+                tensor,
+                "TransferEngine::publishGraphOwnedDeviceWrite"),
+            device);
+    }
+
+    void TransferEngine::publishGraphOwnedCurrentDeviceWrite(
+        TensorBase *tensor)
+    {
+        tensor = requireTransferStorageOwner(
+            tensor,
+            "TransferEngine::publishGraphOwnedCurrentDeviceWrite");
+        const auto device = tensor->current_device();
+        if (!device.has_value() || !device->is_gpu())
+        {
+            throw std::runtime_error(
+                "TransferEngine::publishGraphOwnedCurrentDeviceWrite requires "
+                "an unambiguous current GPU device");
+        }
+        publishGraphOwnedDeviceWrite(tensor, *device);
+    }
+
+    void TransferEngine::publishGraphOwnedCurrentDeviceWrite(ITensor *tensor)
+    {
+        publishGraphOwnedCurrentDeviceWrite(
+            requireTensorBase(
+                tensor,
+                "TransferEngine::publishGraphOwnedCurrentDeviceWrite"));
+    }
+
+    void TransferEngine::publishHostWrite(TensorBase *tensor)
+    {
+        tensor = requireTransferStorageOwner(
+            tensor,
+            "TransferEngine::publishHostWrite");
+        tensor->publishHostWriteState();
+    }
+
+    void TransferEngine::publishHostWrite(ITensor *tensor)
+    {
+        publishHostWrite(
+            requireTensorBase(tensor, "TransferEngine::publishHostWrite"));
+    }
+
+    void TransferEngine::publishSynchronized(TensorBase *tensor)
+    {
+        tensor = requireTransferStorageOwner(
+            tensor,
+            "TransferEngine::publishSynchronized");
+        tensor->publishSynchronizedState();
+    }
+
+    void TransferEngine::publishSynchronized(ITensor *tensor)
+    {
+        publishSynchronized(
+            requireTensorBase(tensor, "TransferEngine::publishSynchronized"));
     }
 
     // ============================================================================
@@ -135,116 +585,141 @@ namespace llaminar2
     {
         if (!tensor)
             return TransferResult::fail(TransferMethod::NOOP, "null tensor");
-
-        // Determine current residency and source device
-        MemoryResidency residency = tensor->memoryResidency();
-        DeviceId src = DeviceId::cpu();
-        if (tensor->gpu_device_.has_value() && tensor->deviceValid())
-            src = tensor->gpu_device_.value();
-
-        // Plan the transfer
-        TransferMethod method = planTransfer(src, target_device, residency);
-
-        // If already on the target device with valid data, no-op
-        if (method == TransferMethod::NOOP || method == TransferMethod::MAPPED_NOOP)
-            return TransferResult::ok(method);
-
-        // For H2D: we need host data to be valid
-        if (method == TransferMethod::HOST_TO_DEVICE && !tensor->hostValid())
-            return TransferResult::fail(method, "host data not valid for upload");
-
-        // Build the request
-        TransferRequest req;
-        req.source = makeMemoryDescriptor(tensor);
-        req.target_device = target_device;
-        req.method = method;
-
-        // Ensure we have a device buffer
-        void *dst_ptr = tensor->getOrAllocateDeviceBuffer(target_device);
-        if (!dst_ptr)
-            return TransferResult::fail(method, "failed to allocate device buffer on " + target_device.toString());
-        req.target_ptr = dst_ptr;
-
-        auto result = execute(req);
-
-        // Update tensor state on success
-        if (result.success)
+        tensor = tensor->transferStorageOwner();
+        if (!tensor || tensor->transferStorageOwner() != tensor)
         {
-            tensor->applyCoherenceOp_(CoherenceOp::UPLOAD); // Both host and device now valid
-
-            // GPU_ONLY policy: free host data now that device has it
-            if (tensor->memoryResidency() == MemoryResidency::GPU_ONLY &&
-                !tensor->is_raw_data_released())
-            {
-                tensor->release_host_weight_data();
-            }
+            return TransferResult::fail(
+                TransferMethod::NOOP,
+                "tensor has no canonical transfer-storage owner");
         }
 
-        return result;
+        /*
+         * uploadFull() is the single implementation of allocation, primary
+         * device promotion, H2D transfer, event joining, and coherence
+         * publication.  Keeping a second implementation here previously let a
+         * successful copy land in secondary storage without updating
+         * gpu_data_ptr_ or gpu_device_.  Public callers now enter the same
+         * lifecycle as TensorBase::ensureOnDevice().
+         */
+        std::lock_guard<std::mutex> lock(tensor->coherence_mutex_);
+        return uploadFull(tensor, target_device, nullptr);
     }
 
     TransferResult TransferEngine::download(TensorBase *tensor)
     {
         if (!tensor)
             return TransferResult::fail(TransferMethod::NOOP, "null tensor");
-
-        // If host is already valid, no-op
-        if (tensor->hostValid())
-            return TransferResult::ok(TransferMethod::NOOP);
-
-        // If device is not valid either, error
-        if (!tensor->deviceValid() || !tensor->gpu_device_.has_value())
-            return TransferResult::fail(TransferMethod::DEVICE_TO_HOST,
-                                        "neither host nor device data is valid");
-
-        MemoryResidency residency = tensor->memoryResidency();
-        DeviceId src = tensor->gpu_device_.value();
-        TransferMethod method = planTransfer(src, DeviceId::cpu(), residency);
-
-        if (method == TransferMethod::MAPPED_NOOP)
-            return TransferResult::ok(method);
-
-        TransferRequest req;
-        req.source = makeMemoryDescriptor(tensor);
-        req.target_device = DeviceId::cpu();
-        req.method = method;
-        req.target_ptr = nullptr; // Host pointer is already in source descriptor
-
-        auto result = execute(req);
-
-        if (result.success)
+        tensor = tensor->transferStorageOwner();
+        if (!tensor || tensor->transferStorageOwner() != tensor)
         {
-            tensor->applyCoherenceOp_(CoherenceOp::DOWNLOAD); // Both host and device now valid
+            return TransferResult::fail(
+                TransferMethod::NOOP,
+                "tensor has no canonical transfer-storage owner");
         }
 
-        return result;
+        /*
+         * downloadFull() owns completion-event validation, D2H ordering, and
+         * host publication.  Delegating to it prevents wrapper and concrete
+         * tensors from acquiring subtly different host-read semantics.
+         */
+        std::lock_guard<std::mutex> lock(tensor->coherence_mutex_);
+        return downloadFull(tensor, nullptr);
     }
 
-    TransferResult TransferEngine::transferActivation(TensorBase *tensor, DeviceId target_device)
+    TransferResult TransferEngine::transferActivation(
+        TensorBase *tensor,
+        DeviceId target_device,
+        size_t bytes_override)
     {
         if (!tensor)
             return TransferResult::fail(TransferMethod::NOOP, "null tensor");
+        tensor = tensor->transferStorageOwner();
+        if (!tensor || tensor->transferStorageOwner() != tensor)
+        {
+            return TransferResult::fail(
+                TransferMethod::NOOP,
+                "tensor has no canonical transfer-storage owner");
+        }
 
-        // Determine where the data currently lives
+        /*
+         * Select the actual authoritative source. The authoritative copy may
+         * live in a secondary device buffer after a previous pipeline handoff,
+         * so gpu_device_ alone is not a sufficient source-of-truth.
+         */
         DeviceId src = DeviceId::cpu();
-
-        // If device has authoritative data, source is GPU
-        if (tensor->gpu_device_.has_value() && tensor->deviceValid())
-            src = tensor->gpu_device_.value();
+        const auto authoritative_device = tensor->getAuthoritativeDevice();
+        if (authoritative_device.has_value() &&
+            authoritative_device->is_gpu() &&
+            tensor->deviceValid())
+        {
+            src = *authoritative_device;
+        }
         else if (!tensor->hostValid())
+        {
             return TransferResult::fail(TransferMethod::NOOP,
                                         "tensor has no valid data on any device");
+        }
 
-        // Determine residency
-        MemoryResidency residency = tensor->memoryResidency();
-
+        const MemoryResidency residency = tensor->memoryResidency();
         TransferMethod method = planTransfer(src, target_device, residency);
 
         if (method == TransferMethod::NOOP || method == TransferMethod::MAPPED_NOOP)
+        {
+            /*
+             * A valid copy can be stored in the secondary map. Promote it so
+             * gpu_data_ptr() and current_device() describe the same storage
+             * without pretending that a transfer occurred.
+             */
+            if (target_device.is_gpu() &&
+                (!tensor->gpu_device_.has_value() ||
+                 *tensor->gpu_device_ != target_device))
+            {
+                void *target_ptr =
+                    tensor->getOrAllocateDeviceBuffer(target_device);
+                if (!target_ptr)
+                {
+                    return TransferResult::fail(
+                        method,
+                        "authoritative device has no activation buffer on " +
+                            target_device.toString());
+                }
+                if (tensor->gpu_device_.has_value() && tensor->gpu_data_ptr_)
+                {
+                    tensor->secondary_device_buffers_
+                        [TensorBase::packDeviceId(*tensor->gpu_device_)] =
+                        tensor->gpu_data_ptr_;
+                }
+                tensor->gpu_device_ = target_device;
+                tensor->gpu_data_ptr_ = target_ptr;
+                tensor->secondary_device_buffers_.erase(
+                    TensorBase::packDeviceId(target_device));
+            }
             return TransferResult::ok(method);
+        }
 
         TransferRequest req;
         req.source = makeMemoryDescriptor(tensor);
+        if (bytes_override > req.source.size_bytes)
+        {
+            return TransferResult::fail(
+                method,
+                "activation byte override exceeds tensor allocation");
+        }
+        if (bytes_override != 0)
+            req.source.size_bytes = bytes_override;
+        req.source.device = src;
+        if (src.is_gpu())
+        {
+            req.source.device_ptr =
+                tensor->getOrAllocateDeviceBuffer(src);
+            if (!req.source.device_ptr)
+            {
+                return TransferResult::fail(
+                    method,
+                    "authoritative source has no activation buffer on " +
+                        src.toString());
+            }
+        }
         req.target_device = target_device;
         req.method = method;
 
@@ -265,8 +740,23 @@ namespace llaminar2
         {
             if (target_device.is_gpu())
             {
-                tensor->applyCoherenceOp_(CoherenceOp::MARK_DEVICE_DIRTY);
-                tensor->authoritative_device_ = target_device;
+                void *target_ptr = req.target_ptr;
+                if (!tensor->gpu_device_.has_value() ||
+                    *tensor->gpu_device_ != target_device)
+                {
+                    if (tensor->gpu_device_.has_value() &&
+                        tensor->gpu_data_ptr_)
+                    {
+                        tensor->secondary_device_buffers_
+                            [TensorBase::packDeviceId(*tensor->gpu_device_)] =
+                            tensor->gpu_data_ptr_;
+                    }
+                    tensor->gpu_device_ = target_device;
+                    tensor->gpu_data_ptr_ = target_ptr;
+                    tensor->secondary_device_buffers_.erase(
+                        TensorBase::packDeviceId(target_device));
+                }
+                publishCompletedDeviceWrite(tensor, target_device);
             }
             else
             {
@@ -282,6 +772,16 @@ namespace llaminar2
     {
         if (!src || !dst)
             return TransferResult::fail(TransferMethod::NOOP, "null tensor in copyActivation");
+        src = src->transferStorageOwner();
+        dst = dst->transferStorageOwner();
+        if (!src || !dst ||
+            src->transferStorageOwner() != src ||
+            dst->transferStorageOwner() != dst)
+        {
+            return TransferResult::fail(
+                TransferMethod::NOOP,
+                "activation has no canonical transfer-storage owner");
+        }
         if (bytes == 0)
             return TransferResult::ok(TransferMethod::NOOP);
 
@@ -298,8 +798,17 @@ namespace llaminar2
                 return TransferResult::fail(TransferMethod::DEVICE_TO_HOST,
                                             "null host pointer in copyActivation host path");
             std::memcpy(host_dst, host_src, bytes);
-            if (dst_device.is_gpu()) // mapped GPU dst: data is already device-visible
-                dst->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
+            if (dst_device.is_gpu())
+            {
+                /*
+                 * Mapped host memory is immediately visible to the GPU, but the
+                 * coherence publication still needs a concrete completion
+                 * token. Record it on the destination backend's owned default
+                 * stream so later GPU consumers never inherit eventless device
+                 * authority from this host-visible transfer boundary.
+                 */
+                publishCompletedDeviceWrite(dst, dst_device);
+            }
             return TransferResult::ok(dst->is_mapped_ ? TransferMethod::MAPPED_NOOP
                                                       : TransferMethod::DEVICE_TO_HOST);
         }
@@ -423,7 +932,15 @@ namespace llaminar2
             dst->gpu_data_ptr_ = dst_ptr;
             dst->secondary_device_buffers_.erase(TensorBase::packDeviceId(dst_device));
         }
-        dst->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
+        /*
+         * copyActivation() currently completes its selected transport before
+         * returning. Publish a fresh backend event after that boundary rather
+         * than erasing completion metadata with a plain coherence transition.
+         * The event gives every later device consumer one uniform dependency
+         * contract regardless of whether the bytes arrived via intra-device,
+         * peer, or deliberately heterogeneous host-staged transport.
+         */
+        publishCompletedDeviceWrite(dst, dst_device);
 
         return result;
     }
@@ -479,35 +996,43 @@ namespace llaminar2
         if (!req.target_ptr)
             return TransferResult::fail(req.method, "target device ptr is null");
 
-        // Same-vendor GPU P2P — use D2H + H2D through the backend.
-        // IBackend doesn't have a direct D2D method, so we bounce through host.
-        IBackend *src_backend = resolveBackend(req.source.device);
-        IBackend *dst_backend = resolveBackend(req.target_device);
-
-        if (!src_backend)
-            return TransferResult::fail(req.method,
-                                        "no backend for source " + req.source.device.toString());
-        if (!dst_backend)
-            return TransferResult::fail(req.method,
-                                        "no backend for target " + req.target_device.toString());
-
-        // Host bounce: D2H → memcpy is implicit if same host buffer
-        if (!req.source.host_ptr)
-            return TransferResult::fail(req.method, "host buffer needed for same-backend D2D bounce");
-
-        // Step 1: D2H from source
-        bool d2h = src_backend->deviceToHost(
-            req.source.host_ptr, req.source.device_ptr,
-            req.source.size_bytes, req.source.device.ordinal);
-        if (!d2h)
-            return TransferResult::fail(req.method, "D2H step of same-backend D2D failed");
-
-        // Step 2: H2D to target
-        bool h2d = dst_backend->hostToDevice(
-            req.target_ptr, req.source.host_ptr,
-            req.source.size_bytes, req.target_device.ordinal);
-        if (!h2d)
-            return TransferResult::fail(req.method, "H2D step of same-backend D2D failed");
+        /*
+         * Same-vendor movement is a collective-backend responsibility. NCCL
+         * and RCCL select their best available P2P transport; silently bouncing
+         * through host memory here would hide a broken device path and violate
+         * the device-owned pipeline contract.
+         */
+        auto *router = GlobalBackendRouter::get();
+        ICollectiveBackend *backend =
+            router
+                ? router->getBackendForCopy(
+                      req.source.device,
+                      req.target_device)
+                : nullptr;
+        if (!backend ||
+            !backend->supportsCopy(
+                req.source.device,
+                req.target_device))
+        {
+            return TransferResult::fail(
+                req.method,
+                "no direct collective backend supports " +
+                    req.source.device.toString() + " -> " +
+                    req.target_device.toString());
+        }
+        if (!backend->copy(
+                req.target_ptr,
+                req.target_device,
+                req.source.device_ptr,
+                req.source.device,
+                req.source.size_bytes))
+        {
+            return TransferResult::fail(
+                req.method,
+                "collective backend copy failed " +
+                    req.source.device.toString() + " -> " +
+                    req.target_device.toString());
+        }
 
         return TransferResult::ok(req.method);
     }
@@ -569,6 +1094,13 @@ namespace llaminar2
     {
         if (!tensor)
             return TransferResult::fail(TransferMethod::NOOP, "null tensor");
+        tensor = tensor->transferStorageOwner();
+        if (!tensor || tensor->transferStorageOwner() != tensor)
+        {
+            return TransferResult::fail(
+                TransferMethod::NOOP,
+                "tensor has no canonical transfer-storage owner");
+        }
 
         // ===== HOST-RESIDENT FAST PATH =====
         // Tensors marked HOST_RESIDENT are consumed on host only (e.g., embedding
@@ -595,7 +1127,7 @@ namespace llaminar2
 
             if (trace)
             {
-                LOG_DEBUG("[TransferEngine::uploadFull] ZERO-COPY: Tensor is mapped, no memcpy needed");
+                LOG_TRACE("[TransferEngine::uploadFull] ZERO-COPY: Tensor is mapped, no memcpy needed");
             }
             return TransferResult::ok(TransferMethod::MAPPED_NOOP);
         }
@@ -617,15 +1149,14 @@ namespace llaminar2
                         // Cross-stream waits correctly serialize without blocking the CPU.
                         if (!backend->streamWaitEvent(stream, tensor->device_completion_event_, backend_device_id))
                         {
-                            LOG_WARN("[TransferEngine::uploadFull] streamWaitEvent failed for tensor "
-                                     << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
-                                     << " on " << target_device.toString()
-                                     << ", falling back to host-blocking event sync");
-                            if (!waitForEventWithProxy(backend, tensor->device_completion_event_, backend_device_id, target_device))
-                            {
-                                return TransferResult::fail(TransferMethod::NOOP,
-                                                            "event sync failed for " + target_device.toString());
-                            }
+                            return TransferResult::fail(
+                                TransferMethod::NOOP,
+                                "Stream event wait failed for tensor '" +
+                                    (tensor->debug_name_.empty()
+                                         ? std::string("(unnamed)")
+                                         : tensor->debug_name_) +
+                                    "' on " + target_device.toString() +
+                                    "; refusing a host-blocking fallback");
                         }
                     }
                     else
@@ -659,7 +1190,7 @@ namespace llaminar2
         int backend_device_id = target_device.gpu_ordinal();
 
         // ===== DEVICE MIGRATION (secondary buffers) =====
-        LOG_DEBUG("[TransferEngine::uploadFull] tensor=" << static_cast<void *>(tensor)
+        LOG_TRACE("[TransferEngine::uploadFull] tensor=" << static_cast<void *>(tensor)
                                                          << " target_device=" << target_device.toString()
                                                          << " gpu_data_ptr_=" << tensor->gpu_data_ptr_
                                                          << " gpu_device_=" << (tensor->gpu_device_.has_value() ? tensor->gpu_device_->toString() : "none")
@@ -667,7 +1198,7 @@ namespace llaminar2
         if (tensor->gpu_data_ptr_ && tensor->gpu_device_.has_value() && *tensor->gpu_device_ != target_device)
         {
             DeviceId old_device = *tensor->gpu_device_;
-            LOG_DEBUG("[TransferEngine::uploadFull] Device migration: " << tensor->gpu_device_->toString()
+            LOG_TRACE("[TransferEngine::uploadFull] Device migration: " << tensor->gpu_device_->toString()
                                                                         << " -> " << target_device.toString());
 
             const int target_key = TensorBase::packDeviceId(target_device);
@@ -701,7 +1232,7 @@ namespace llaminar2
                     tensor->event_device_.reset();
                 }
 
-                LOG_DEBUG("[TransferEngine::uploadFull] Promoted secondary buffer to primary for "
+                LOG_TRACE("[TransferEngine::uploadFull] Promoted secondary buffer to primary for "
                           << target_device.toString() << " ptr=" << promoted_ptr);
             }
             else
@@ -719,7 +1250,7 @@ namespace llaminar2
                     int old_backend_device_id = tensor->gpu_device_->gpu_ordinal();
                     if (old_backend)
                     {
-                        LOG_DEBUG("[TransferEngine::uploadFull] Destroying old completion event on device "
+                        LOG_TRACE("[TransferEngine::uploadFull] Destroying old completion event on device "
                                   << tensor->gpu_device_->toString() << " before migrating to " << target_device.toString());
                         old_backend->destroyEvent(tensor->device_completion_event_, old_backend_device_id);
                     }
@@ -731,23 +1262,10 @@ namespace llaminar2
                 tensor->gpu_device_.reset();
                 tensor->applyCoherenceOp_(CoherenceOp::RELEASE_DEVICE);
 
-                LOG_DEBUG("[TransferEngine::uploadFull] Parked previous primary buffer for "
+                LOG_TRACE("[TransferEngine::uploadFull] Parked previous primary buffer for "
                           << old_device.toString() << " and allocating fresh buffer for "
                           << target_device.toString());
             }
-        }
-
-        // ===== KERNEL-MANAGED DATA SKIP =====
-        // If the tensor has GEMM weights registered in KernelFactory's prepared
-        // GEMM registry, the GPU pipeline has already uploaded the data into pooled
-        // VRAM.  The kernel owns the device copy — skip raw upload.
-        if (!tensor->gpu_data_ptr_ && !::llaminar2::isDeviceValid(tensor->coherence_state_) &&
-            target_device.is_gpu() && tensor->hasPreparedDeviceState())
-        {
-            LOG_DEBUG("[TransferEngine::uploadFull] Skipping raw upload for tensor "
-                      << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
-                      << " — kernel manages its own device representation (prepared GEMM registry)");
-            return TransferResult::ok(TransferMethod::NOOP);
         }
 
         // ===== ALLOCATE ON TARGET DEVICE =====
@@ -786,7 +1304,7 @@ namespace llaminar2
 
             if (trace && pin_us > 100)
             {
-                LOG_DEBUG("[TransferEngine::uploadFull] ensureHostPinned() took " << pin_us << " us");
+                LOG_TRACE("[TransferEngine::uploadFull] ensureHostPinned() took " << pin_us << " us");
             }
         }
 
@@ -850,7 +1368,7 @@ namespace llaminar2
 
             if (trace)
             {
-                LOG_DEBUG("[TransferEngine::uploadFull] hostToDevice(" << bytes << " bytes) took "
+                LOG_TRACE("[TransferEngine::uploadFull] hostToDevice(" << bytes << " bytes) took "
                                                                        << h2d_us << " us (" << bandwidth_gbps << " GB/s)");
             }
 
@@ -871,7 +1389,7 @@ namespace llaminar2
                 tensor->release_host_weight_data();
             }
 
-            LOG_DEBUG("[TransferEngine::uploadFull] Uploaded " << bytes
+            LOG_TRACE("[TransferEngine::uploadFull] Uploaded " << bytes
                                                                << " bytes to device " << target_device.toString()
                                                                << " (backend device ID: " << backend_device_id << ")");
         }
@@ -880,7 +1398,7 @@ namespace llaminar2
         auto overall_us = std::chrono::duration_cast<std::chrono::microseconds>(overall_end - overall_start).count();
         if (trace && overall_us > 1000)
         {
-            LOG_DEBUG("[TransferEngine::uploadFull] TOTAL took " << overall_us << " us for " << bytes << " bytes");
+            LOG_TRACE("[TransferEngine::uploadFull] TOTAL took " << overall_us << " us for " << bytes << " bytes");
         }
 
         return TransferResult::ok(TransferMethod::HOST_TO_DEVICE);
@@ -894,6 +1412,13 @@ namespace llaminar2
     {
         if (!tensor)
             return TransferResult::fail(TransferMethod::NOOP, "null tensor");
+        tensor = tensor->transferStorageOwner();
+        if (!tensor || tensor->transferStorageOwner() != tensor)
+        {
+            return TransferResult::fail(
+                TransferMethod::NOOP,
+                "tensor has no canonical transfer-storage owner");
+        }
 
         // ===== ZERO-COPY MAPPED MEMORY PATH =====
         if (tensor->is_mapped_)
@@ -912,13 +1437,16 @@ namespace llaminar2
                         LOG_TRACE("[TransferEngine::downloadFull] ZERO-COPY: Waiting on completion event");
                         if (!waitForEventWithProxy(backend, tensor->device_completion_event_, backend_device_id, *tensor->gpu_device_))
                         {
-                            LOG_WARN("[TransferEngine::downloadFull] Event wait failed for mapped tensor");
+                            return TransferResult::fail(
+                                TransferMethod::MAPPED_NOOP,
+                                "Mapped tensor completion event wait failed");
                         }
                     }
                     else
                     {
-                        LOG_WARN("[TransferEngine::downloadFull] ZERO-COPY: No completion event, using stream sync");
-                        backend->synchronize(backend_device_id);
+                        return TransferResult::fail(
+                            TransferMethod::MAPPED_NOOP,
+                            "Mapped GPU tensor has no completion event");
                     }
 
                     auto t1 = std::chrono::high_resolution_clock::now();
@@ -1001,8 +1529,9 @@ namespace llaminar2
             }
             else
             {
-                LOG_TRACE("[TransferEngine::downloadFull] No completion event, using full device sync");
-                backend->synchronize(backend_device_id);
+                return TransferResult::fail(
+                    TransferMethod::DEVICE_TO_HOST,
+                    "GPU tensor has no completion event or explicit producer stream");
             }
 
             // Transfer tracing for D2H debugging
@@ -1031,7 +1560,7 @@ namespace llaminar2
                 }
             }
 
-            LOG_DEBUG("[TransferEngine::downloadFull] ATTEMPTING D2H: "
+            LOG_TRACE("[TransferEngine::downloadFull] ATTEMPTING D2H: "
                       << "tensor=" << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
                       << " gpu_data_ptr=" << static_cast<const void *>(tensor->gpu_data_ptr_)
                       << " dst=" << static_cast<const void *>(dst)
@@ -1066,7 +1595,7 @@ namespace llaminar2
                 }
                 if (all_zero && check_count > 0 && bytes >= 1024)
                 {
-                    LOG_DEBUG("[TransferEngine::downloadFull] D2H leading sample is zero: tensor="
+                    LOG_TRACE("[TransferEngine::downloadFull] D2H leading sample is zero: tensor="
                               << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
                               << " bytes=" << bytes
                               << " device=" << tensor->gpu_device_->toString()
@@ -1087,7 +1616,7 @@ namespace llaminar2
             tensor->applyCoherenceOp_(CoherenceOp::DOWNLOAD);
             tensor->authoritative_device_ = std::nullopt;
 
-            LOG_DEBUG("[TransferEngine::downloadFull] Downloaded " << bytes
+            LOG_TRACE("[TransferEngine::downloadFull] Downloaded " << bytes
                                                                    << " bytes from device " << tensor->gpu_device_->toString()
                                                                    << " (backend device ID: " << backend_device_id << ")");
         }
@@ -1118,7 +1647,7 @@ namespace llaminar2
 
         if (result.success)
         {
-            LOG_DEBUG("[TransferEngine] " << method_str
+            LOG_TRACE("[TransferEngine] " << method_str
                                           << " " << src_str << " → " << dst_str
                                           << " (" << req.source.size_bytes << " bytes"
                                           << ", " << result.elapsed_ns / 1000 << " μs)");
@@ -1140,6 +1669,9 @@ namespace llaminar2
         MemoryDescriptor desc;
 
         if (!tensor)
+            return desc;
+        tensor = tensor->transferStorageOwner();
+        if (!tensor || tensor->transferStorageOwner() != tensor)
             return desc;
 
         // Host pointer

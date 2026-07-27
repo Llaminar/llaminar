@@ -26,25 +26,37 @@ namespace llaminar2
         int K;                     ///< Number of input features (columns)
         bool is_asymmetric;        ///< True if format has mins (Q4_K etc.)
 
-        /** Chunk coordinates for bounded staging. */
+        /**
+         * Chunk coordinates for bounded staging.
+         *
+         * Every chunk contains complete, contiguous source rows. Quantized
+         * repack kernels use full_N and row_offset when writing the final
+         * block-major destination, so bounded loading never gathers K slices
+         * from hundreds of thousands of source rows on the host.
+         */
         int row_offset = 0;
         int full_N = 0;
         int full_K = 0;
 
-        /**
-         * Quantized weights are chunked along K because the final VNNI layout is
-         * block-major (`block * N + row`). The host GGUF layout is row-major, so
-         * a K chunk is gathered from `N` source rows into the pinned slot.
-         */
-        size_t host_row_stride_bytes = 0;
-        size_t host_row_copy_bytes = 0;
-        int output_block_offset = 0;
-
-        /// Drop mmap PTEs for this source range once it has reached pinned memory.
-        bool advise_mmap_dontneed_after_staging = false;
-        const void *mmap_discard_data = nullptr;
-        size_t mmap_discard_bytes = 0;
     };
+
+    /**
+     * @brief Order upload jobs by source address to preserve GGUF read locality.
+     *
+     * Model weights are commonly discovered through unordered caches. The tensor
+     * data still points into one monotonically laid-out GGUF mmap, so discovery
+     * order otherwise turns a cold load into backward and forward page faults even
+     * though the mapping carries a sequential-access hint. This helper restores
+     * file order without changing destination slots or packed-layout coordinates.
+     *
+     * A stable sort is intentional. Aliases such as tied embeddings can share the
+     * same source address, and bounded row chunks occupy adjacent ranges; retaining
+     * their original relative order keeps publication deterministic.
+     *
+     * @param jobs Mutable upload job list to order in place.
+     * @return Number of backward source-address transitions before sorting.
+     */
+    size_t orderWeightJobsForSequentialHostAccess(std::vector<WeightJob> &jobs);
 
     /// Per-device pipelined H2D transfer + GPU repack engine.
     ///

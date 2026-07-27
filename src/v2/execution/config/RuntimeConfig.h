@@ -12,6 +12,7 @@
 
 #include "../../backends/ComputeBackend.h"
 #include "../../utils/CPUFeatures.h"
+#include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include "RoutedExpertPolicy.h"
 #include "../moe/DeviceMoERebalancePolicyShared.h"
@@ -19,6 +20,8 @@
 #include <cctype>
 #include <cstddef>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -397,6 +400,22 @@ namespace llaminar2
         return std::nullopt;
     }
 
+    /**
+     * @brief Resolve the default durable prefix-cache directory.
+     *
+     * The path is expanded here instead of storing a literal `~`, because C++
+     * filesystem APIs do not perform shell expansion. An empty result is a
+     * deliberate hard signal that the process has no usable HOME directory;
+     * callers enabling a disk budget can then report a configuration error.
+     */
+    inline std::string defaultPrefixCacheDiskDirectory()
+    {
+        const char *home = DebugEnv::envValue("HOME");
+        if (!home || home[0] == '\0')
+            return {};
+        return (std::filesystem::path(home) / ".llaminar" / "kvcache").string();
+    }
+
     struct PrefixCacheRuntimeConfig
     {
         bool enabled = false;
@@ -405,7 +424,7 @@ namespace llaminar2
         size_t ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
         size_t device_budget_bytes = 256ull * 1024ull * 1024ull;
         size_t disk_budget_bytes = 0;
-        std::string disk_dir;
+        std::string disk_dir = defaultPrefixCacheDiskDirectory();
         PrefixCacheTerminalStateMode terminal_state = PrefixCacheTerminalStateMode::Auto;
         PrefixCacheMoEPolicy moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;
     };

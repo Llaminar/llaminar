@@ -2110,7 +2110,7 @@ namespace llaminar2
             .long_name = "--prefix-cache-disk-dir",
             .category = "Prefix Cache",
             .value_label = "<path>",
-            .description = "Prefix cache disk backing directory",
+            .description = "Prefix cache disk directory (default: $HOME/.llaminar/kvcache)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {

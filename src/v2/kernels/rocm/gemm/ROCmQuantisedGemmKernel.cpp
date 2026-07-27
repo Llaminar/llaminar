@@ -72,6 +72,7 @@
  */
 
 #include "ROCmQuantisedGemmKernel.h"
+#include "transfer/TransferEngine.h"
 #include "../ROCmKernelBase.h"
 #include "../ROCmWeightPacker.h"     // packWeightsToROCm, packNativeVNNI
 #include "backends/ComputeBackend.h" // DeviceManager
@@ -141,6 +142,37 @@ namespace llaminar2
                 // mirroring launcher heuristics in host-side slicing code.
                 return ROCM_NATIVE_SMALL_M_GRAPH_SAFE_KB_CAP;
             }
+
+            /**
+             * @brief Publish a completed ROCm tensor write to the coherence system.
+             *
+             * ROCm GEMM entry points enqueue work directly into storage owned by a
+             * TensorBase. Merely returning success after the enqueue is insufficient:
+             * a tensor that remains marked SYNCED still advertises stale host bytes as
+             * current, and a consumer on another stream has no producer event to wait
+             * upon. This helper makes the write-completion contract identical for
+             * decode, grouped-verifier, and prefill paths.
+             *
+             * Mapped tensors retain their mapped ownership state while receiving the
+             * same event publication. Ordinary device allocations become
+             * DEVICE_AUTHORITATIVE. transitionToWithEvent records the event on the
+             * exact stream that enqueued the write, preserving asynchronous execution
+             * without a stream or device synchronization.
+             *
+             * @param output Tensor whose device allocation was written.
+             * @param device_id ROCm device ordinal that owns the allocation.
+             * @param stream Producer stream containing all writes to @p output.
+             */
+            void publishROCmTensorWrite(
+                TensorBase &output,
+                int device_id,
+                void *stream)
+            {
+                TransferEngine::publishDeviceWrite(
+                    &output,
+                    DeviceId::rocm(device_id),
+                    stream);
+            }
         }
 
         // =====================================================================
@@ -156,24 +188,6 @@ namespace llaminar2
         // These functions are implemented in ROCmQuantisedGemmKernel_*.hip
         extern "C"
         {
-            // Upload converted INT8 weights to device (common .hip)
-            bool rocmQuantGemm_uploadWeights(
-                const int8_t *h_weights_int8, // [K x N] ColumnMajor
-                const float *h_scales_B,      // [N] per-column scales
-                int8_t **d_weights_int8,      // Output device pointer
-                float **d_scales_B,           // Output device pointer
-                int K, int N,
-                int rocm_device_id);
-
-            // Upload work buffers for activation quantization (common .hip)
-            bool rocmQuantGemm_ensureWorkBuffers(
-                int8_t **d_A_int8,   // [M x K] quantized activations
-                float **d_scales_A,  // [M] per-row scales
-                int32_t **d_C_int32, // [M x N] INT32 accumulator
-                int *work_buffer_M,  // Current capacity
-                int M, int K, int N,
-                int rocm_device_id);
-
             // Blockwise quantize FP32 activations to INT8 with per-block scales (common .hip)
             bool rocmQuantGemm_quantizeActivationsBlockwise(
                 const float *d_A_fp32,     // [M x K]
@@ -200,10 +214,6 @@ namespace llaminar2
 
             // Memory management helpers (all common .hip)
             bool rocmQuantGemm_allocFloat(float **d_ptr, size_t count, int rocm_device_id);
-            bool rocmQuantGemm_allocInt32(int32_t **d_ptr, size_t count, int rocm_device_id);
-            bool rocmQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int rocm_device_id);
-            bool rocmQuantGemm_copyDeviceToHost(float *h_dst, const float *d_src, size_t count, int rocm_device_id);
-            bool rocmQuantGemm_copyInt32DeviceToHost(int32_t *h_dst, const int32_t *d_src, size_t count, int rocm_device_id);
             bool rocmQuantGemm_setDevice(int rocm_device_id);
 
             // Apply scaling with full epilogue (common .hip) - matches CUDA's cudaQuantGemm_applyScaling
@@ -960,11 +970,11 @@ namespace llaminar2
                         rocmQuantGemm_freeDevice(upload.d_native_vnni_payload, device_id);
 #ifdef HAVE_ROCM
                     if (upload.d_native_vnni_scales)
-                        (void)hipFree(upload.d_native_vnni_scales);
+                        rocmQuantGemm_freeDevice(upload.d_native_vnni_scales, device_id);
                     if (upload.d_native_vnni_mins)
-                        (void)hipFree(upload.d_native_vnni_mins);
+                        rocmQuantGemm_freeDevice(upload.d_native_vnni_mins, device_id);
                     if (upload.d_native_vnni_emins)
-                        (void)hipFree(upload.d_native_vnni_emins);
+                        rocmQuantGemm_freeDevice(upload.d_native_vnni_emins, device_id);
                     freeStartupPinnedStaging(upload);
                     if (upload.startup_h2d_stream)
                         (void)hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_h2d_stream));
@@ -986,25 +996,21 @@ namespace llaminar2
         // =====================================================================
 
         // =================================================================
-        // ConcurrentPrefillPool: lightweight stream + scratch pool for
+        // ConcurrentPrefillPool: lightweight stream/event pool for
         // overlapping fused GEMM projections during prefill (M>1).
         //
-        // Each stream gets its own scratch buffer so blockwise GEMM kernels
-        // can write intermediate results without conflicting with projections
-        // on other streams.  The pool is lazily initialized on first use
-        // (per-kernel instance, not static).
+        // Device scratch is never owned by this pool. Native-VNNI prefill does
+        // not need accumulator scratch, and concurrent decode takes disjoint
+        // slices from the graph-planned batched scatter workspace.
         // =================================================================
         struct ConcurrentPrefillPool
         {
-            static constexpr int MAX_STREAMS = 8;
+            static constexpr int MAX_STREAMS =
+                ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS;
 
             hipStream_t streams[MAX_STREAMS] = {};
             hipEvent_t completion[MAX_STREAMS] = {};
             hipEvent_t quant_ready = nullptr;
-            int32_t *scratch[MAX_STREAMS] = {};
-            size_t scratch_capacity[MAX_STREAMS] = {}; // in elements (M*N)
-            float *scatter_partial[MAX_STREAMS] = {};
-            size_t scatter_partial_capacity[MAX_STREAMS] = {}; // in elements (KB_MAX*N)
             int count = 0;
             int device_id = -1;
             bool initialized = false;
@@ -1027,69 +1033,6 @@ namespace llaminar2
                                                                  << " streams on device " << dev_id);
             }
 
-            // Ensure scratch buffer i has at least `elements` int32s
-            bool ensureScratch(int idx, size_t elements)
-            {
-                if (idx < 0 || idx >= count)
-                    return false;
-                if (scratch_capacity[idx] >= elements)
-                    return true; // Already big enough
-
-                // Free old
-                if (scratch[idx])
-                {
-                    (void)hipSetDevice(device_id);
-                    (void)hipFree(scratch[idx]);
-                    scratch[idx] = nullptr;
-                    scratch_capacity[idx] = 0;
-                }
-
-                (void)hipSetDevice(device_id);
-                hipError_t err = hipMalloc(&scratch[idx], elements * sizeof(int32_t));
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ConcurrentPrefillPool] Failed to allocate scratch["
-                              << idx << "] (" << (elements * 4 / 1024) << " KB): "
-                              << hipGetErrorString(err));
-                    return false;
-                }
-                scratch_capacity[idx] = elements;
-                LOG_DEBUG("[ConcurrentPrefillPool] Allocated scratch[" << idx
-                                                                       << "] = " << (elements * 4 / 1024) << " KB");
-                return true;
-            }
-
-            // Ensure scatter partial buffer i has at least `elements` floats
-            bool ensureScatterPartial(int idx, size_t elements)
-            {
-                if (idx < 0 || idx >= count)
-                    return false;
-                if (scatter_partial_capacity[idx] >= elements)
-                    return true;
-
-                if (scatter_partial[idx])
-                {
-                    (void)hipSetDevice(device_id);
-                    (void)hipFree(scatter_partial[idx]);
-                    scatter_partial[idx] = nullptr;
-                    scatter_partial_capacity[idx] = 0;
-                }
-
-                (void)hipSetDevice(device_id);
-                hipError_t err = hipMalloc(&scatter_partial[idx], elements * sizeof(float));
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ConcurrentPool] Failed to allocate scatter_partial["
-                              << idx << "] (" << (elements * 4 / 1024) << " KB): "
-                              << hipGetErrorString(err));
-                    return false;
-                }
-                scatter_partial_capacity[idx] = elements;
-                LOG_DEBUG("[ConcurrentPool] Allocated scatter_partial[" << idx
-                                                                        << "] = " << (elements * 4 / 1024) << " KB");
-                return true;
-            }
-
             void destroy()
             {
                 if (!initialized)
@@ -1106,18 +1049,6 @@ namespace llaminar2
                     {
                         (void)hipEventDestroy(completion[i]);
                         completion[i] = nullptr;
-                    }
-                    if (scratch[i])
-                    {
-                        (void)hipFree(scratch[i]);
-                        scratch[i] = nullptr;
-                        scratch_capacity[i] = 0;
-                    }
-                    if (scatter_partial[i])
-                    {
-                        (void)hipFree(scatter_partial[i]);
-                        scatter_partial[i] = nullptr;
-                        scatter_partial_capacity[i] = 0;
                     }
                 }
                 if (quant_ready)
@@ -1137,10 +1068,8 @@ namespace llaminar2
         //
         // Previously each ROCmQuantisedGemmKernel instance owned its own pool,
         // which for a 64-layer model meant ~80 separate pools each with its own
-        // scratch (M*N int32) and scatter_partial (64*N float) buffers —
-        // several GB of duplicated scratch on a single device. The pool is
-        // purely infrastructure (streams + events + scratch), so a single
-        // shared per-device instance is sufficient and dramatically cheaper.
+        // stream/event resources. The pool is purely ordering infrastructure,
+        // so a single shared per-device instance is sufficient.
         // =====================================================================
         static std::mutex &sharedPrefillPoolMutex()
         {
@@ -1179,8 +1108,7 @@ namespace llaminar2
         {
             std::lock_guard<std::mutex> lock(sharedPrefillPoolMutex());
             auto &pools = sharedPrefillPools();
-            // Pool destructor calls destroy() which frees streams, events, and
-            // all scratch/scatter GPU allocations per device.
+            // Pool destructor releases only stream/event infrastructure.
             pools.clear();
         }
 
@@ -1522,7 +1450,7 @@ namespace llaminar2
             // so d_scales_B may be null when only native-VNNI weights are present
             // (e.g. weights loaded via GPU pipeline / MoE batch constructor).
             const bool native_vnni_available = impl_ && impl_->has_native_vnni;
-            if (!impl_ || !d_A_int8 || !d_output || !d_scales_A || !effective_scratch_int32 ||
+            if (!impl_ || !d_A_int8 || !d_output || !d_scales_A ||
                 (!d_scales_B && !native_vnni_available))
             {
                 LOG_WARN("[" << callsite << "] Prefill GEMM null pointer diagnostic:"
@@ -1545,6 +1473,12 @@ namespace llaminar2
             }
 
             const PrefillDispatchPath path = selectPrefillDispatchPath(m, n, k);
+            if (path == PrefillDispatchPath::INT8_VNNI_NATIVE &&
+                !effective_scratch_int32)
+            {
+                logFallback("buffers");
+                return false;
+            }
             record_path_selected(path);
             bool native_ok = false;
             const bool profiling_enabled = debugEnv().profile.enabled;
@@ -2281,7 +2215,10 @@ namespace llaminar2
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
         {
-            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM, static_cast<hipStream_t>(gpu_stream_));
+            auto execution_stream =
+                static_cast<hipStream_t>(requireGPUStream());
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+                ROCmKernelType::GEMM, execution_stream);
             (void)mpi_ctx;
             (void)device_idx;
             (void)transpose_B;
@@ -2337,6 +2274,27 @@ namespace llaminar2
                 return false;
             }
 
+            /*
+             * Join the activation producer to the exact GEMM stream before
+             * reading its device pointer. DeviceGraphExecutor normally
+             * establishes this edge, but the tensor-aware API is also used by
+             * grouped MoE composition and direct integration tests. Leaving
+             * the edge implicit lets an asynchronous H2D upload race the first
+             * activation-quantization kernel.
+             */
+            const DeviceId target_device =
+                DeviceId::rocm(rocm_device_id_);
+            TransferEngine::prepareDeviceInput(
+                const_cast<FP32Tensor *>(A_fp32),
+                target_device,
+                gpu_stream_);
+            if (beta != 0.0f)
+                TransferEngine::prepareDeviceInput(
+                    C_fp32, target_device, gpu_stream_);
+            else
+                TransferEngine::prepareDeviceOutput(
+                    C_fp32, target_device, gpu_stream_);
+
             // Check if tensors are on GPU
             const float *d_input = static_cast<const float *>(A_fp32->gpu_data_ptr());
             float *d_output = static_cast<float *>(C_fp32->gpu_data_ptr());
@@ -2350,6 +2308,11 @@ namespace llaminar2
             }
 
             const bool use_gpu_path = (d_input != nullptr) && (d_output != nullptr);
+            if (!use_gpu_path)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] GPU execution requires device-resident input and output tensors");
+                return false;
+            }
 
             // Gate all phase timing behind LLAMINAR_PROFILING to eliminate ~18 chrono
             // calls per GEMM (~630ns × 140 GEMMs/token = ~88μs/token).
@@ -2357,7 +2320,6 @@ namespace llaminar2
             std::chrono::high_resolution_clock::time_point phase_start{};
             std::chrono::high_resolution_clock::time_point phase_end{};
 
-            if (use_gpu_path)
             {
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using GPU-to-GPU path (d_input="
                           << d_input << ", d_output=" << d_output << ")");
@@ -2395,8 +2357,7 @@ namespace llaminar2
             //
             // Handles optional bias in a single fused kernel launch.
             // =========================================================================
-            if (use_gpu_path &&
-                g_rocm_native_vnni_decode_equivalent_scope &&
+            if (g_rocm_native_vnni_decode_equivalent_scope &&
                 m > 1)
             {
                 ensureWeightsConverted();
@@ -2422,12 +2383,10 @@ namespace llaminar2
                 if (bias)
                 {
                     auto *bias_tensor = const_cast<TensorBase *>(bias);
-                    const auto target_device = DeviceId::rocm(rocm_device_id_);
-                    if (!bias_tensor->ensureOnDevice(target_device))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to upload small-M bias tensor to ROCm device");
-                        return false;
-                    }
+                    const auto target_device =
+                        DeviceId::rocm(rocm_device_id_);
+                    TransferEngine::prepareDeviceInput(
+                        bias_tensor, target_device, gpu_stream_);
 
                     d_bias = static_cast<const float *>(bias->gpu_data_ptr());
                 }
@@ -2554,6 +2513,7 @@ namespace llaminar2
                                 {"k", std::to_string(k)}});
                     }
 
+                    publishROCmTensorWrite(*C, rocm_device_id_, gpu_stream_);
                     return true;
                 }
 
@@ -2678,10 +2638,11 @@ namespace llaminar2
                         }
                     }
                 }
+                publishROCmTensorWrite(*C, rocm_device_id_, gpu_stream_);
                 return true;
             }
 
-            if (use_gpu_path && m == 1)
+            if (m == 1)
             {
                 // Ensure weights are on device
                 ensureWeightsConverted();
@@ -2705,12 +2666,10 @@ namespace llaminar2
                     if (bias)
                     {
                         auto *bias_tensor = const_cast<TensorBase *>(bias);
-                        const auto target_device = DeviceId::rocm(rocm_device_id_);
-                        if (!bias_tensor->ensureOnDevice(target_device))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to upload decode bias tensor to ROCm device");
-                            return false;
-                        }
+                        const auto target_device =
+                            DeviceId::rocm(rocm_device_id_);
+                        TransferEngine::prepareDeviceInput(
+                            bias_tensor, target_device, gpu_stream_);
 
                         d_bias = static_cast<const float *>(bias->gpu_data_ptr());
                     }
@@ -2843,6 +2802,7 @@ namespace llaminar2
                                            hipMemcpyDeviceToDevice,
                                            static_cast<hipStream_t>(gpu_stream_));
                         }
+                        publishROCmTensorWrite(*C, rocm_device_id_, gpu_stream_);
                         return true;
                     }
 
@@ -2888,6 +2848,7 @@ namespace llaminar2
                                            hipMemcpyDeviceToDevice,
                                            static_cast<hipStream_t>(gpu_stream_));
                         }
+                        publishROCmTensorWrite(*C, rocm_device_id_, gpu_stream_);
                         return true;
                     }
 
@@ -2987,41 +2948,8 @@ namespace llaminar2
             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Work buffers: A_int8=" << (void *)d_A_int8
                                                                                          << " scales_A=" << (void *)d_scales_A << " C_int32=" << (void *)d_C_int32);
 
-            const size_t a_fp32_size = static_cast<size_t>(m) * k;
-            float *d_A_fp32_src = nullptr;
-
-            if (use_gpu_path)
-            {
-                // GPU path: Use input directly from GPU memory
-                d_A_fp32_src = const_cast<float *>(d_input);
-                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Using GPU input directly: " << d_A_fp32_src);
-            }
-            else
-            {
-                // CPU path: Copy from host to device
-
-                // Workspace is required - d_A_fp32 buffer is pre-allocated
-                d_A_fp32_src = impl_->d_A_fp32;
-
-                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Using workspace d_A_fp32=" << (void *)d_A_fp32_src);
-
-                if (phase_timing)
-                    phase_start = std::chrono::high_resolution_clock::now();
-                const float *h_A_src = A_fp32->data() + static_cast<size_t>(activation_row_offset) * k;
-                if (!rocmQuantGemm_copyHostToDevice(d_A_fp32_src, h_A_src, a_fp32_size, rocm_device_id_))
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to copy activations to device");
-                    return false;
-                }
-                if (phase_timing)
-                {
-                    phase_end = std::chrono::high_resolution_clock::now();
-                    double h2d_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                    if (h2d_ms > 1.0)
-                        LOG_TRACE("[ROCmGEMM::PHASES] H2D copy (A_fp32): " << h2d_ms << "ms");
-                }
-                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Copied activations to device");
-            }
+            float *d_A_fp32_src = const_cast<float *>(d_input);
+            LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Using GPU input directly: " << d_A_fp32_src);
 
             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Now quantizing activations");
 
@@ -3057,9 +2985,9 @@ namespace llaminar2
                 //
                 // Fix: redirect scaling output to device workspace (d_C_fp32), then
                 // do a bulk hipMemcpyAsync to the mapped output.
-                const bool output_is_mapped = use_gpu_path && C_fp32->isMapped();
+                const bool output_is_mapped = C_fp32->isMapped();
                 const bool output_needs_copyout = output_is_mapped;
-                float *d_prefill_output = (use_gpu_path && !output_needs_copyout) ? d_output : impl_->d_C_fp32;
+                float *d_prefill_output = output_needs_copyout ? impl_->d_C_fp32 : d_output;
 
                 // One-time diagnostic for mapped output redirect
                 if (output_is_mapped && n > 100000)
@@ -3068,22 +2996,18 @@ namespace llaminar2
                     std::call_once(mapped_redirect_once, [&]()
                                    { LOG_WARN("[multiply_tensor] MAPPED OUTPUT REDIRECT: LM_Head M=" << m << " N=" << n
                                                                                                      << " gpu_ptr=" << d_output
-                                                                                                     << " host_ptr=" << static_cast<void *>(C_fp32->mutable_data())
                                                                                                      << " -> d_C_fp32=" << impl_->d_C_fp32
-                                                                                                     << " (" << (static_cast<size_t>(m) * n * 4 / (1024 * 1024)) << " MB)"
-                                                                                                     << " ptrs_same=" << (static_cast<void *>(C_fp32->mutable_data()) == static_cast<void *>(d_output) ? "YES" : "NO")); });
+                                                                                                     << " (" << (static_cast<size_t>(m) * n * 4 / (1024 * 1024)) << " MB)"); });
                 }
 
                 const float *d_prefill_bias = nullptr;
-                if (bias && use_gpu_path)
+                if (bias)
                 {
                     auto *bias_tensor = const_cast<TensorBase *>(bias);
-                    const auto target_device = DeviceId::rocm(rocm_device_id_);
-                    if (!bias_tensor->ensureOnDevice(target_device))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to upload prefill bias tensor to ROCm device");
-                        return false;
-                    }
+                    const auto target_device =
+                        DeviceId::rocm(rocm_device_id_);
+                    TransferEngine::prepareDeviceInput(
+                        bias_tensor, target_device, gpu_stream_);
 
                     d_prefill_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
                 }
@@ -3127,35 +3051,23 @@ namespace llaminar2
                             }
 
                             // Copy from workspace to output if needed.
-                            if (!use_gpu_path || output_needs_copyout)
+                            if (output_needs_copyout)
                             {
                                 const size_t nvnni_c_size = static_cast<size_t>(m) * n;
-                                if (!use_gpu_path)
+                                const hipError_t copy_err = hipMemcpyAsync(
+                                    d_output,
+                                    d_prefill_output,
+                                    nvnni_c_size * sizeof(float),
+                                    hipMemcpyDeviceToDevice,
+                                    static_cast<hipStream_t>(gpu_stream_));
+                                if (copy_err != hipSuccess)
                                 {
-                                    float *host_dst = C_fp32->mutable_data();
-                                    (void)hipMemcpyAsync(host_dst, d_prefill_output,
-                                                   nvnni_c_size * sizeof(float),
-                                                   hipMemcpyDeviceToHost,
-                                                   static_cast<hipStream_t>(gpu_stream_));
-                                    (void)hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
-                                }
-                                else if (output_is_mapped)
-                                {
-                                    float *host_dst = C_fp32->mutable_data();
-                                    (void)hipMemcpyAsync(host_dst, d_prefill_output,
-                                                   nvnni_c_size * sizeof(float),
-                                                   hipMemcpyDeviceToHost,
-                                                   static_cast<hipStream_t>(gpu_stream_));
-                                    (void)hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
-                                }
-                                else
-                                {
-                                    (void)hipMemcpyAsync(d_output, d_prefill_output,
-                                                   nvnni_c_size * sizeof(float),
-                                                   hipMemcpyDeviceToDevice,
-                                                   static_cast<hipStream_t>(gpu_stream_));
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Device-alias output publication failed: "
+                                              << hipGetErrorString(copy_err));
+                                    return false;
                                 }
                             }
+                            publishROCmTensorWrite(*C, rocm_device_id_, gpu_stream_);
                             return true;
                         }
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] "
@@ -3177,51 +3089,26 @@ namespace llaminar2
                 {
                     // Copy from device workspace to final destination when scaling
                     // was redirected away from d_output.
-                    if (!use_gpu_path || output_is_mapped)
+                    if (output_is_mapped)
                     {
                         const size_t prefill_c_size = static_cast<size_t>(m) * n;
-                        if (output_is_mapped)
+                        // A mapped tensor exposes a device alias. Publish to
+                        // that alias on the executor stream and leave host
+                        // visibility to the explicit result boundary.
+                        const hipError_t copy_err = hipMemcpyAsync(
+                            d_output,
+                            impl_->d_C_fp32,
+                            prefill_c_size * sizeof(float),
+                            hipMemcpyDeviceToDevice,
+                            static_cast<hipStream_t>(gpu_stream_));
+                        if (copy_err != hipSuccess)
                         {
-                            // Mapped output: copy from device workspace to mapped host.
-                            // First sync the stream to ensure scaling kernel is done,
-                            // then use synchronous hipMemcpy which should use the SDMA engine.
-                            float *host_dst = C_fp32->mutable_data();
-                            const size_t copy_bytes = prefill_c_size * sizeof(float);
-
-                            (void)hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
-
-                            auto copy_start = std::chrono::high_resolution_clock::now();
-                            hipError_t err = hipMemcpy(
-                                host_dst, impl_->d_C_fp32,
-                                copy_bytes,
-                                hipMemcpyDeviceToHost);
-                            auto copy_end = std::chrono::high_resolution_clock::now();
-
-                            static std::once_flag copy_timing_once;
-                            std::call_once(copy_timing_once, [&]()
-                                           {
-                                double copy_ms = std::chrono::duration<double, std::milli>(copy_end - copy_start).count();
-                                double bw_gbs = (copy_bytes / 1e9) / (copy_ms / 1e3);
-                                LOG_WARN("[multiply_tensor] D2H COPY TIMING: " << (copy_bytes / (1024*1024)) << " MB in "
-                                         << copy_ms << " ms = " << bw_gbs << " GB/s"); });
-
-                            if (err != hipSuccess)
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Mapped output D2H copy failed: "
-                                          << hipGetErrorString(err));
-                                return false;
-                            }
-                        }
-                        else
-                        {
-                            // CPU path: copy from workspace to host tensor
-                            if (!rocmQuantGemm_copyDeviceToHost(C_fp32->mutable_data(), impl_->d_C_fp32, prefill_c_size, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native prefill path succeeded but D2H copy failed");
-                                return false;
-                            }
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Device-alias output publication failed: "
+                                      << hipGetErrorString(copy_err));
+                            return false;
                         }
                     }
+                    publishROCmTensorWrite(*C, rocm_device_id_, gpu_stream_);
                     return true;
                 }
 
@@ -3258,7 +3145,10 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
-            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM, static_cast<hipStream_t>(gpu_stream_));
+            auto execution_stream =
+                static_cast<hipStream_t>(requireGPUStream());
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+                ROCmKernelType::GEMM, execution_stream);
 
             // Use passed workspace if provided, otherwise fall back to bound workspace
             DeviceWorkspaceManager *ws = workspace ? workspace : workspace_;
@@ -3291,6 +3181,33 @@ namespace llaminar2
                 return false;
             }
 
+            /**
+             * Publish every fused projection through TensorBase's event-backed
+             * device-write transition.
+             *
+             * Fused GEMM launches write directly into caller-owned output tensors.
+             * Returning while those tensors remain SYNCED leaves their stale host
+             * bytes apparently valid and also gives a later consumer stream no
+             * producer event to wait on. Keep publication centralized so every
+             * optimized return path has the same ownership semantics.
+             */
+            const auto publish_projection_outputs = [&]()
+            {
+                for (const TensorProjectionDesc &projection : projections)
+                {
+                    auto *output = dynamic_cast<TensorBase *>(projection.output);
+                    if (!output)
+                    {
+                        throw std::logic_error(
+                            "ROCm fused GEMM output publication requires event-capable TensorBase storage");
+                    }
+                    publishROCmTensorWrite(
+                        *output,
+                        rocm_device_id_,
+                        gpu_stream_);
+                }
+            };
+
             rocmQuantGemm_setDevice(rocm_device_id_);
 
             // Step 1: Ensure input is on the GPU
@@ -3303,7 +3220,10 @@ namespace llaminar2
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to cast input to FP32Tensor");
                     return false;
                 }
-                // Coherence handled automatically by DeviceGraphExecutor
+                TransferEngine::prepareDeviceInput(
+                    fp32_input,
+                    DeviceId::rocm(rocm_device_id_),
+                    gpu_stream_);
                 d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
                 // NOTE: Don't log fp32_input->data() here - it triggers D2H transfer!
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input);
@@ -3466,6 +3386,7 @@ namespace llaminar2
                 all_projections_native_vnni && m >= 2;
             if (m > 2 && projections.size() >= 2 &&
                 fused_uses_blockwise_shared_quant &&
+                all_projections_native_vnni &&
                 !small_m_native_verifier_fused &&
                 debugEnv().rocm.concurrent_prefill)
             {
@@ -3564,16 +3485,7 @@ namespace llaminar2
                             }
                         }
 
-                        // Ensure scratch buffer for this stream
-                        const size_t scratch_elements = static_cast<size_t>(m) * n;
                         int stream_idx = pi % pool.count;
-                        if (!pool.ensureScratch(stream_idx, scratch_elements))
-                        {
-                            throw std::runtime_error(
-                                "[ConcurrentPrefill] Failed to allocate scratch for projection " +
-                                std::to_string(pi) + " (" + std::to_string(scratch_elements * sizeof(int32_t)) +
-                                " bytes) — GPU OOM");
-                        }
 
                         // This stream waits for quantization to complete
                         (void)hipStreamWaitEvent(pool.streams[stream_idx], pool.quant_ready, 0);
@@ -3602,7 +3514,7 @@ namespace llaminar2
                             1.0f, 0.0f,
                             "ConcurrentPrefill",
                             pool.streams[stream_idx],
-                            pool.scratch[stream_idx]);
+                            nullptr);
 
                         if (!proj_ok)
                         {
@@ -3632,6 +3544,7 @@ namespace llaminar2
                     // Restore workspace and return success
                     if (ws && ws != saved_workspace)
                         workspace_ = saved_workspace;
+                    publish_projection_outputs();
                     return true;
                 }
             }
@@ -3699,6 +3612,23 @@ namespace llaminar2
                 {
                     const int num_proj = static_cast<int>(projections.size());
                     auto &pool = getSharedPrefillPool(rocm_device_id_, num_proj);
+                    const std::string batched_partial_name =
+                        scatterPartialBatchedBufferName();
+                    const size_t batched_partial_bytes =
+                        workspace_->getBufferSize(batched_partial_name);
+                    if (!impl_->d_scatter_partial_batched ||
+                        batched_partial_bytes == 0 ||
+                        batched_partial_bytes %
+                                ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS !=
+                            0)
+                    {
+                        throw std::runtime_error(
+                            "[ConcurrentDecode] Missing graph-planned batched "
+                            "scatter workspace");
+                    }
+                    const size_t scatter_slot_bytes =
+                        batched_partial_bytes /
+                        ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS;
 
                     // Record event after quantization completes on main stream
                     (void)hipEventRecord(pool.quant_ready,
@@ -3747,16 +3677,26 @@ namespace llaminar2
 
                         if (rocm_kernel->impl_->has_native_vnni)
                         {
-                            // Native-VNNI GEMV: needs per-stream scatter_partial
+                            // Each stream receives one disjoint graph-planned
+                            // scatter slot. Mixed-width projections use the
+                            // maximum merged stride, so slots cannot overlap.
                             constexpr int SCATTER_KB_MAX = 64;
-                            const size_t partial_elements = static_cast<size_t>(SCATTER_KB_MAX) * n;
-                            if (!pool.ensureScatterPartial(stream_idx, partial_elements))
+                            const size_t required_partial_bytes =
+                                static_cast<size_t>(SCATTER_KB_MAX) *
+                                static_cast<size_t>(n) * sizeof(float);
+                            if (required_partial_bytes > scatter_slot_bytes)
                             {
                                 throw std::runtime_error(
-                                    "[ConcurrentDecode] Failed to allocate scatter_partial for projection " +
-                                    std::to_string(pi) + " (" + std::to_string(partial_elements * sizeof(float)) +
-                                    " bytes) — GPU OOM");
+                                    "[ConcurrentDecode] Batched scatter workspace "
+                                    "slot is too small for projection " +
+                                    std::to_string(pi));
                             }
+                            auto *stream_partial =
+                                reinterpret_cast<float *>(
+                                    reinterpret_cast<unsigned char *>(
+                                        impl_->d_scatter_partial_batched) +
+                                    static_cast<size_t>(stream_idx) *
+                                        scatter_slot_bytes);
 
                             proj_ok = rocmGemv_native_vnni_fp32(
                                 impl_->d_A_int8,
@@ -3766,7 +3706,7 @@ namespace llaminar2
                                 rocm_kernel->impl_->d_weights_native_emins,
                                 d_output,
                                 impl_->d_scales_A,
-                                pool.scatter_partial[stream_idx],
+                                stream_partial,
                                 n, k,
                                 rocm_kernel->impl_->native_vnni_codebook_id,
                                 rocm_device_id_, pool.streams[stream_idx],
@@ -3828,6 +3768,7 @@ namespace llaminar2
 
                     if (ws && ws != saved_workspace)
                         workspace_ = saved_workspace;
+                    publish_projection_outputs();
                     return true;
                 }
             }
@@ -3943,24 +3884,16 @@ namespace llaminar2
                         auto *bias_tensor = const_cast<TensorBase *>(proj.bias);
                         const DeviceId target_device = DeviceId::rocm(rocm_device_id_);
                         const auto current_dev = bias_tensor->current_device();
-                        if (current_dev.has_value() && current_dev.value() == target_device)
-                        {
-                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
-                        }
-                        else if (current_dev.has_value() && current_dev->is_gpu())
+                        if (current_dev.has_value() &&
+                            current_dev->is_gpu() &&
+                            current_dev.value() != target_device)
                         {
                             mark_batched_bypass("bias_wrong_gpu");
                             break;
                         }
-                        else
-                        {
-                            if (!bias_tensor->ensureOnDevice(target_device))
-                            {
-                                mark_batched_bypass("bias_upload_failed");
-                                break;
-                            }
-                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
-                        }
+                        TransferEngine::prepareDeviceInput(
+                            bias_tensor, target_device, gpu_stream_);
+                        d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
 
                         if (!d_bias)
                         {
@@ -4299,6 +4232,7 @@ namespace llaminar2
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Batched native small-M verifier complete"
                               << " M=" << m << " K=" << k
                               << " projections=" << projections.size());
+                    publish_projection_outputs();
                     return true;
                 }
 
@@ -4418,11 +4352,9 @@ namespace llaminar2
                                                                                        << " gpu_data_ptr=" << bias_tensor->gpu_data_ptr()
                                                                                        << " rocm_device_id_=" << rocm_device_id_);
 
-                    if (current_dev.has_value() && current_dev.value() == target_device)
-                    {
-                        d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
-                    }
-                    else if (current_dev.has_value() && current_dev->is_gpu())
+                    if (current_dev.has_value() &&
+                        current_dev->is_gpu() &&
+                        current_dev.value() != target_device)
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] MULTI-GPU CONFLICT: Bias tensor is on "
                                   << current_dev->to_string() << " but we need ROCm:" << rocm_device_id_
@@ -4430,16 +4362,9 @@ namespace llaminar2
                         all_success = false;
                         break;
                     }
-                    else
-                    {
-                        if (!bias_tensor->ensureOnDevice(target_device))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to upload bias to ROCm:" << rocm_device_id_);
-                            all_success = false;
-                            break;
-                        }
-                        d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
-                    }
+                    TransferEngine::prepareDeviceInput(
+                        bias_tensor, target_device, gpu_stream_);
+                    d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
 
                     if (!d_bias)
                     {
@@ -4525,21 +4450,18 @@ namespace llaminar2
                         if (output_needs_copyout)
                         {
                             const size_t output_bytes = static_cast<size_t>(m) * n * sizeof(float);
-                            if (output_is_mapped)
+                            const hipError_t copy_err = hipMemcpyAsync(
+                                d_output,
+                                d_native_output,
+                                output_bytes,
+                                hipMemcpyDeviceToDevice,
+                                static_cast<hipStream_t>(gpu_stream_));
+                            if (copy_err != hipSuccess)
                             {
-                                float *host_dst = fp32_output->mutable_data();
-                                (void)hipMemcpyAsync(host_dst, d_native_output,
-                                               output_bytes,
-                                               hipMemcpyDeviceToHost,
-                                               static_cast<hipStream_t>(gpu_stream_));
-                                (void)hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
-                            }
-                            else
-                            {
-                                (void)hipMemcpyAsync(d_output, d_native_output,
-                                               output_bytes,
-                                               hipMemcpyDeviceToDevice,
-                                               static_cast<hipStream_t>(gpu_stream_));
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Device-alias GEMV publication failed: "
+                                          << hipGetErrorString(copy_err));
+                                all_success = false;
+                                break;
                             }
                         }
 
@@ -4684,21 +4606,18 @@ namespace llaminar2
                     if (output_needs_copyout)
                     {
                         const size_t output_bytes = static_cast<size_t>(m) * n * sizeof(float);
-                        if (output_is_mapped)
+                        const hipError_t copy_err = hipMemcpyAsync(
+                            d_output,
+                            d_prefill_output,
+                            output_bytes,
+                            hipMemcpyDeviceToDevice,
+                            static_cast<hipStream_t>(gpu_stream_));
+                        if (copy_err != hipSuccess)
                         {
-                            float *host_dst = fp32_output->mutable_data();
-                            (void)hipMemcpyAsync(host_dst, d_prefill_output,
-                                           output_bytes,
-                                           hipMemcpyDeviceToHost,
-                                           static_cast<hipStream_t>(gpu_stream_));
-                            (void)hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
-                        }
-                        else
-                        {
-                            (void)hipMemcpyAsync(d_output, d_prefill_output,
-                                           output_bytes,
-                                           hipMemcpyDeviceToDevice,
-                                           static_cast<hipStream_t>(gpu_stream_));
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Device-alias grouped verifier publication failed: "
+                                      << hipGetErrorString(copy_err));
+                            all_success = false;
+                            break;
                         }
                     }
 
@@ -4739,21 +4658,18 @@ namespace llaminar2
                     if (output_needs_copyout)
                     {
                         const size_t output_bytes = static_cast<size_t>(m) * n * sizeof(float);
-                        if (output_is_mapped)
+                        const hipError_t copy_err = hipMemcpyAsync(
+                            d_output,
+                            d_prefill_output,
+                            output_bytes,
+                            hipMemcpyDeviceToDevice,
+                            static_cast<hipStream_t>(gpu_stream_));
+                        if (copy_err != hipSuccess)
                         {
-                            float *host_dst = fp32_output->mutable_data();
-                            (void)hipMemcpyAsync(host_dst, d_prefill_output,
-                                           output_bytes,
-                                           hipMemcpyDeviceToHost,
-                                           static_cast<hipStream_t>(gpu_stream_));
-                            (void)hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
-                        }
-                        else
-                        {
-                            (void)hipMemcpyAsync(d_output, d_prefill_output,
-                                           output_bytes,
-                                           hipMemcpyDeviceToDevice,
-                                           static_cast<hipStream_t>(gpu_stream_));
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Device-alias prefill publication failed: "
+                                      << hipGetErrorString(copy_err));
+                            all_success = false;
+                            break;
                         }
                     }
 
@@ -4851,6 +4767,8 @@ namespace llaminar2
                 workspace_ = saved_workspace;
             }
 
+            if (all_success)
+                publish_projection_outputs();
             return all_success;
         }
 
@@ -4950,9 +4868,9 @@ namespace llaminar2
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, scales_a_blockwise_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::SUMS_A_BLOCKWISE, sums_a_blockwise_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
-            // Shared buffer names (matching CUDA).  Concurrent paths use
-            // ConcurrentPrefillPool's per-stream scratch — these workspace
-            // buffers are only used in serial execution paths.
+            // Shared buffer names (matching CUDA). Native-VNNI concurrent
+            // prefill needs no accumulator scratch; Q8 prefill uses the
+            // canonical serial grouped launch and this planned accumulator.
             reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_A_FP32, temp_a_fp32_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
 
@@ -5118,17 +5036,20 @@ namespace llaminar2
 #ifdef HAVE_ROCM
                         if (upload.d_native_vnni_scales)
                         {
-                            (void)hipFree(upload.d_native_vnni_scales);
+                            rocmQuantGemm_freeDevice(
+                                upload.d_native_vnni_scales, rocm_device_id_);
                             upload.d_native_vnni_scales = nullptr;
                         }
                         if (upload.d_native_vnni_mins)
                         {
-                            (void)hipFree(upload.d_native_vnni_mins);
+                            rocmQuantGemm_freeDevice(
+                                upload.d_native_vnni_mins, rocm_device_id_);
                             upload.d_native_vnni_mins = nullptr;
                         }
                         if (upload.d_native_vnni_emins)
                         {
-                            (void)hipFree(upload.d_native_vnni_emins);
+                            rocmQuantGemm_freeDevice(
+                                upload.d_native_vnni_emins, rocm_device_id_);
                             upload.d_native_vnni_emins = nullptr;
                         }
 #endif
@@ -5258,17 +5179,16 @@ namespace llaminar2
                             {
                                 const size_t scales_bytes = packed_->native_vnni_scales.size() * sizeof(uint16_t);
                                 void *d_scales_tmp = nullptr;
-#ifdef HAVE_ROCM
-                                hipError_t alloc_err = hipMalloc(&d_scales_tmp, scales_bytes);
-                                if (alloc_err != hipSuccess)
+                                if (!rocmQuantGemm_allocInt8(
+                                        reinterpret_cast<int8_t **>(&d_scales_tmp),
+                                        scales_bytes,
+                                        rocm_device_id_))
                                 {
-                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI scales: "
-                                              << hipGetErrorString(alloc_err));
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI scales");
                                     cleanup_startup_device_upload();
                                     cleanup_startup_async_resources();
                                     return;
                                 }
-#endif
                                 upload.d_native_vnni_scales = d_scales_tmp;
                                 if (d_scales_tmp)
                                 {
@@ -5305,17 +5225,16 @@ namespace llaminar2
                             {
                                 const size_t mins_bytes = packed_->native_vnni_mins.size() * sizeof(uint16_t);
                                 void *d_mins_tmp = nullptr;
-#ifdef HAVE_ROCM
-                                hipError_t alloc_err = hipMalloc(&d_mins_tmp, mins_bytes);
-                                if (alloc_err != hipSuccess)
+                                if (!rocmQuantGemm_allocInt8(
+                                        reinterpret_cast<int8_t **>(&d_mins_tmp),
+                                        mins_bytes,
+                                        rocm_device_id_))
                                 {
-                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI mins: "
-                                              << hipGetErrorString(alloc_err));
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI mins");
                                     cleanup_startup_device_upload();
                                     cleanup_startup_async_resources();
                                     return;
                                 }
-#endif
                                 upload.d_native_vnni_mins = d_mins_tmp;
                                 if (d_mins_tmp)
                                 {
@@ -5350,17 +5269,16 @@ namespace llaminar2
                             {
                                 const size_t emins_bytes = packed_->native_vnni_emins.size() * sizeof(uint32_t);
                                 void *d_emins_tmp = nullptr;
-#ifdef HAVE_ROCM
-                                hipError_t alloc_err = hipMalloc(&d_emins_tmp, emins_bytes);
-                                if (alloc_err != hipSuccess)
+                                if (!rocmQuantGemm_allocInt8(
+                                        reinterpret_cast<int8_t **>(&d_emins_tmp),
+                                        emins_bytes,
+                                        rocm_device_id_))
                                 {
-                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI emins: "
-                                              << hipGetErrorString(alloc_err));
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI emins");
                                     cleanup_startup_device_upload();
                                     cleanup_startup_async_resources();
                                     return;
                                 }
-#endif
                                 upload.d_native_vnni_emins = d_emins_tmp;
                                 if (d_emins_tmp)
                                 {
@@ -5579,11 +5497,12 @@ namespace llaminar2
                 }
 
                 const size_t native_scales_bytes = host_packed.native_vnni_scales.size() * sizeof(uint16_t);
-                err = hipMalloc(&impl_->d_weights_native_scales, native_scales_bytes);
-                if (err != hipSuccess)
+                if (!rocmQuantGemm_allocInt8(
+                        reinterpret_cast<int8_t **>(&impl_->d_weights_native_scales),
+                        native_scales_bytes,
+                        rocm_device_id_))
                 {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI scales: "
-                              << hipGetErrorString(err));
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI scales");
                     return;
                 }
 
@@ -5601,11 +5520,12 @@ namespace llaminar2
                 if (!host_packed.native_vnni_mins.empty())
                 {
                     const size_t native_mins_bytes = host_packed.native_vnni_mins.size() * sizeof(uint16_t);
-                    err = hipMalloc(&impl_->d_weights_native_mins, native_mins_bytes);
-                    if (err != hipSuccess)
+                    if (!rocmQuantGemm_allocInt8(
+                            reinterpret_cast<int8_t **>(&impl_->d_weights_native_mins),
+                            native_mins_bytes,
+                            rocm_device_id_))
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI mins: "
-                                  << hipGetErrorString(err));
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI mins");
                         return;
                     }
 
@@ -5624,11 +5544,12 @@ namespace llaminar2
                 if (!host_packed.native_vnni_emins.empty())
                 {
                     const size_t native_emins_bytes = host_packed.native_vnni_emins.size() * sizeof(uint32_t);
-                    err = hipMalloc(&impl_->d_weights_native_emins, native_emins_bytes);
-                    if (err != hipSuccess)
+                    if (!rocmQuantGemm_allocInt8(
+                            reinterpret_cast<int8_t **>(&impl_->d_weights_native_emins),
+                            native_emins_bytes,
+                            rocm_device_id_))
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI emins: "
-                                  << hipGetErrorString(err));
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI emins");
                         return;
                     }
 
@@ -5812,6 +5733,8 @@ namespace llaminar2
             float alpha, float beta,
             DeviceWorkspaceManager *workspace)
         {
+            (void)requireGPUStream();
+
             DeviceWorkspaceManager *ws = workspace ? workspace : workspace_;
             DeviceWorkspaceManager *saved_workspace = workspace_;
             if (ws && ws != workspace_)
@@ -5829,7 +5752,30 @@ namespace llaminar2
                 (ws && ws != saved_workspace) ? static_cast<void *>(this) : nullptr,
                 restore_workspace);
 
-            // Get GPU data pointers (tensors must already be on device via coherence)
+            /*
+             * Gate and up may have been produced by separate projection
+             * streams. Join both completion events to this down-projection
+             * stream before launching fused SwiGLU; pointer residency alone is
+             * not an ordering guarantee.
+             */
+            const DeviceId target_device =
+                DeviceId::rocm(rocm_device_id_);
+            TransferEngine::prepareDeviceInput(
+                const_cast<TensorBase *>(gate),
+                target_device,
+                gpu_stream_);
+            TransferEngine::prepareDeviceInput(
+                const_cast<TensorBase *>(up),
+                target_device,
+                gpu_stream_);
+            if (beta != 0.0f)
+                TransferEngine::prepareDeviceInput(
+                    output, target_device, gpu_stream_);
+            else
+                TransferEngine::prepareDeviceOutput(
+                    output, target_device, gpu_stream_);
+
+            // Get GPU data pointers after both producer events are joined.
             const float *d_gate = static_cast<const float *>(gate->gpu_data_ptr());
             const float *d_up = static_cast<const float *>(up->gpu_data_ptr());
             float *d_C = static_cast<float *>(output->gpu_data_ptr());
@@ -5961,6 +5907,7 @@ namespace llaminar2
                                 {"source", "fused_swiglu"}});
                     }
 
+                    publishROCmTensorWrite(*output, rocm_device_id_, gpu_stream_);
                     return true;
                 }
 
@@ -5981,6 +5928,7 @@ namespace llaminar2
                             cb_id,
                             rocm_device_id_, gpu_stream_))
                     {
+                        publishROCmTensorWrite(*output, rocm_device_id_, gpu_stream_);
                         return true;
                     }
                 }
@@ -6000,6 +5948,7 @@ namespace llaminar2
                         m, n, k, alpha, beta,
                         "ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu"))
                 {
+                    publishROCmTensorWrite(*output, rocm_device_id_, gpu_stream_);
                     return true;
                 }
 
@@ -6028,7 +5977,13 @@ namespace llaminar2
                 }
 
                 // Step 2: Quantize + GEMV via existing FP32→FP32 path
-                return multiply_fp32_to_fp32(impl_->d_A_fp32, d_C, m, n, k, alpha, beta);
+                const bool decode_ok =
+                    multiply_fp32_to_fp32(impl_->d_A_fp32, d_C, m, n, k, alpha, beta);
+                if (decode_ok)
+                {
+                    publishROCmTensorWrite(*output, rocm_device_id_, gpu_stream_);
+                }
+                return decode_ok;
             }
         }
 
@@ -6065,6 +6020,8 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
+            (void)requireGPUStream();
+
             LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] m=" << m << " n=" << n << " k=" << k
                                                                                       << " alpha=" << alpha << " beta=" << beta
                                                                                       << " d_A=" << static_cast<const void *>(d_A)

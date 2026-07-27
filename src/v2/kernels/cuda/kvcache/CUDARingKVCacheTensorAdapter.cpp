@@ -15,6 +15,7 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../tensors/TensorClasses.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KVCacheProfiler.h"
@@ -22,6 +23,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
 
 namespace llaminar2
 {
@@ -69,11 +72,6 @@ namespace llaminar2
                     return false;
                 }
 
-                if (conv_scratch_k_ && !conv_scratch_workspace_backed_)
-                    cudaFree(conv_scratch_k_);
-                if (conv_scratch_v_ && !conv_scratch_workspace_backed_)
-                    cudaFree(conv_scratch_v_);
-
                 conv_scratch_k_ = workspace_k;
                 conv_scratch_v_ = workspace_v;
                 conv_scratch_capacity_ = std::min(workspace_k_size, workspace_v_size);
@@ -82,78 +80,18 @@ namespace llaminar2
             }
         }
 
-        if (isGraphCaptureActive())
-        {
-            LOG_ERROR("[ICUDARingKVCache] Refusing to allocate conversion scratch during CUDA graph capture; "
-                      "bind KV-cache conversion scratch through IWorkspaceConsumer");
-            return false;
-        }
-
-        if (conv_scratch_workspace_backed_)
-        {
-            conv_scratch_k_ = nullptr;
-            conv_scratch_v_ = nullptr;
-            conv_scratch_capacity_ = 0;
-            conv_scratch_workspace_backed_ = false;
-        }
-
-        if (bytes <= conv_scratch_capacity_)
-            return true;
-
-        // Grow to requested size (round up to 4KB for alignment)
-        const size_t alloc_size = (bytes + 4095) & ~size_t(4095);
-
-        void *new_k = nullptr;
-        void *new_v = nullptr;
-        if (cudaMalloc(&new_k, alloc_size) != cudaSuccess ||
-            cudaMalloc(&new_v, alloc_size) != cudaSuccess)
-        {
-            if (new_k)
-                cudaFree(new_k);
-            if (new_v)
-                cudaFree(new_v);
-            LOG_ERROR("[ICUDARingKVCache] Failed to allocate conversion scratch buffers ("
-                      << alloc_size << " bytes each)");
-            return false;
-        }
-
-        // Free old buffers
-        if (conv_scratch_k_)
-            cudaFree(conv_scratch_k_);
-        if (conv_scratch_v_)
-            cudaFree(conv_scratch_v_);
-
-        conv_scratch_k_ = new_k;
-        conv_scratch_v_ = new_v;
-        conv_scratch_capacity_ = alloc_size;
-
-        LOG_DEBUG("[ICUDARingKVCache] Allocated conversion scratch: "
-                  << alloc_size << " bytes each (" << (alloc_size * 2 / 1024) << " KB total)");
-        return true;
+        LOG_ERROR("[ICUDARingKVCache] Conversion requires pre-bound graph workspace: required="
+                  << bytes << " bytes per K/V buffer");
+        return false;
     }
 
     void ICUDARingKVCache::freeConvScratch()
     {
-        if (conv_scratch_workspace_backed_)
-        {
-            conv_scratch_k_ = nullptr;
-            conv_scratch_v_ = nullptr;
-            conv_scratch_capacity_ = 0;
-            conv_scratch_workspace_backed_ = false;
-            return;
-        }
-
-        if (conv_scratch_k_)
-        {
-            cudaFree(conv_scratch_k_);
-            conv_scratch_k_ = nullptr;
-        }
-        if (conv_scratch_v_)
-        {
-            cudaFree(conv_scratch_v_);
-            conv_scratch_v_ = nullptr;
-        }
+        // Conversion scratch is always workspace-owned.
+        conv_scratch_k_ = nullptr;
+        conv_scratch_v_ = nullptr;
         conv_scratch_capacity_ = 0;
+        conv_scratch_workspace_backed_ = false;
     }
 
     // =========================================================================
@@ -193,37 +131,38 @@ namespace llaminar2
 
         const auto target = DeviceId::cuda(device_id());
 
+        const auto prepare_input = [&](const ITensor *tensor, const char *label)
+        {
+            if (const auto *prepared =
+                    dynamic_cast<const PreparedGpuTensorView *>(tensor))
+            {
+                if (!prepared->isPreparedFor(target, gpu_stream))
+                {
+                    throw std::runtime_error(
+                        std::string("[ICUDARingKVCache::appendWithStream] Prepared ") +
+                        label + " slice does not match the CUDA consumer device/stream");
+                }
+                return;
+            }
+
+            /*
+             * An ordinary tensor must publish its producer event through the
+             * canonical transfer owner. Only the stage-created prepared slice
+             * above may bypass this join, because it names the exact stream on
+             * which its parent was already ordered.
+             */
+            TransferEngine::prepareDeviceInput(
+                const_cast<ITensor *>(tensor), target, gpu_stream);
+        };
+        prepare_input(K, "K");
+        prepare_input(V, "V");
+
         const void *d_k = K->gpu_data_ptr();
         const void *d_v = V->gpu_data_ptr();
 
-        if (!d_k)
-        {
-            auto *k_mut = const_cast<ITensor *>(K);
-            auto *k_tensor = dynamic_cast<TensorBase *>(k_mut);
-            if (!(k_tensor ? k_tensor->ensureOnDevice(target, gpu_stream) : k_mut->ensureOnDevice(target)))
-            {
-                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Failed to ensure K on "
-                          << target.toString());
-                return false;
-            }
-            d_k = K->gpu_data_ptr();
-        }
-        if (!d_v)
-        {
-            auto *v_mut = const_cast<ITensor *>(V);
-            auto *v_tensor = dynamic_cast<TensorBase *>(v_mut);
-            if (!(v_tensor ? v_tensor->ensureOnDevice(target, gpu_stream) : v_mut->ensureOnDevice(target)))
-            {
-                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Failed to ensure V on "
-                          << target.toString());
-                return false;
-            }
-            d_v = V->gpu_data_ptr();
-        }
-
         if (!d_k || !d_v)
         {
-            LOG_ERROR("[ICUDARingKVCache::appendWithStream] K or V tensor lacks GPU data after ensureOnDevice().");
+            LOG_ERROR("[ICUDARingKVCache::appendWithStream] K or V tensor lacks GPU data after TransferEngine preparation");
             return false;
         }
 
@@ -775,7 +714,7 @@ namespace llaminar2
         cudaStream_t stream, int rope_dim = 0);
 
     template <ActivationPrecision Precision>
-    void CUDARingKVCache<Precision>::ensureRoPEShadow(int layer, int seq_idx) const
+    void CUDARingKVCache<Precision>::ensureRoPEShadow(int layer, int seq_idx)
     {
         // Lazy init the outer vectors
         if (rope_shadows_.empty())
@@ -786,12 +725,16 @@ namespace llaminar2
         }
 
         auto &shadow = rope_shadows_[layer][seq_idx];
-        if (!shadow.d_K)
+        const size_t fp16_bytes =
+            static_cast<size_t>(max_seq_len_) *
+            static_cast<size_t>(kv_dim_) * sizeof(__half);
+        if (!ensureConvScratch(fp16_bytes))
         {
-            const size_t buf_bytes = static_cast<size_t>(max_seq_len_) * kv_dim_ * sizeof(__half);
-            cudaMalloc(&shadow.d_K, buf_bytes);
-            cudaMalloc(&shadow.d_V, buf_bytes);
+            throw std::runtime_error(
+                "[CUDARingKVCache] RoPE conversion requires bound K/V workspace");
         }
+        shadow.d_K = static_cast<__half *>(conv_scratch_k_);
+        shadow.d_V = static_cast<__half *>(conv_scratch_v_);
     }
 
     template <ActivationPrecision Precision>
@@ -891,12 +834,8 @@ namespace llaminar2
         }
         else if constexpr (Precision == ActivationPrecision::FP32)
         {
-            const size_t row_bytes = static_cast<size_t>(kv_dim_) * sizeof(float);
-            const size_t total_bytes = static_cast<size_t>(read_count) * row_bytes;
-            if (!ensureConvScratch(total_bytes))
-                return false;
-            auto *d_temp_k = static_cast<float *>(conv_scratch_k_);
-            auto *d_temp_v = static_cast<float *>(conv_scratch_v_);
+            auto *d_temp_k = entry.d_K_scratch;
+            auto *d_temp_v = entry.d_V_scratch;
             launch_linearize_kernel(
                 entry, state.implementation_head, read_count,
                 d_temp_k, d_temp_v, stream);
@@ -916,12 +855,8 @@ namespace llaminar2
         }
         else if constexpr (Precision == ActivationPrecision::Q8_1)
         {
-            const size_t q8_row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(Q8_1Block);
-            const size_t q8_total = static_cast<size_t>(read_count) * q8_row_bytes;
-            if (!ensureConvScratch(q8_total))
-                return false;
-            auto *d_temp_k = static_cast<Q8_1Block *>(conv_scratch_k_);
-            auto *d_temp_v = static_cast<Q8_1Block *>(conv_scratch_v_);
+            auto *d_temp_k = entry.d_K_scratch;
+            auto *d_temp_v = entry.d_V_scratch;
             launch_linearize_kernel(
                 entry, state.implementation_head, read_count,
                 d_temp_k, d_temp_v, stream);
@@ -941,11 +876,8 @@ namespace llaminar2
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
-            const size_t bf16_bytes = static_cast<size_t>(read_count) * kv_dim_ * sizeof(__nv_bfloat16);
-            if (!ensureConvScratch(bf16_bytes))
-                return false;
-            auto *d_temp_k = static_cast<__nv_bfloat16 *>(conv_scratch_k_);
-            auto *d_temp_v = static_cast<__nv_bfloat16 *>(conv_scratch_v_);
+            auto *d_temp_k = entry.d_K_scratch;
+            auto *d_temp_v = entry.d_V_scratch;
             launch_linearize_kernel(
                 entry, state.implementation_head, read_count,
                 d_temp_k, d_temp_v, stream);
@@ -998,10 +930,10 @@ namespace llaminar2
     template bool CUDARingKVCache<ActivationPrecision::Q8_1>::get_kv_converted(int, int, ActivationPrecision, ITensor **, ITensor **, int *, const KVReadParams *);
 
     // Explicit template instantiations for shadow helpers
-    template void CUDARingKVCache<ActivationPrecision::FP32>::ensureRoPEShadow(int, int) const;
-    template void CUDARingKVCache<ActivationPrecision::FP16>::ensureRoPEShadow(int, int) const;
-    template void CUDARingKVCache<ActivationPrecision::BF16>::ensureRoPEShadow(int, int) const;
-    template void CUDARingKVCache<ActivationPrecision::Q8_1>::ensureRoPEShadow(int, int) const;
+    template void CUDARingKVCache<ActivationPrecision::FP32>::ensureRoPEShadow(int, int);
+    template void CUDARingKVCache<ActivationPrecision::FP16>::ensureRoPEShadow(int, int);
+    template void CUDARingKVCache<ActivationPrecision::BF16>::ensureRoPEShadow(int, int);
+    template void CUDARingKVCache<ActivationPrecision::Q8_1>::ensureRoPEShadow(int, int);
 
     template void CUDARingKVCache<ActivationPrecision::FP32>::invalidateRoPEShadow(int, int) const;
     template void CUDARingKVCache<ActivationPrecision::FP16>::invalidateRoPEShadow(int, int) const;
