@@ -66,31 +66,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Return the stream that produced the most recent cached output.
-         *
-         * Prefill owns a dedicated capture stream even before its executable
-         * reaches Ready state.  `applied_stream` normally names that same
-         * stream, but it is generic stage-binding metadata and can temporarily
-         * describe another stream after replay-state maintenance.  Prefer the
-         * typed prefill owner for prefill signatures so downstream device-only
-         * handoffs never order themselves against a merely associated stream.
-         */
-        void *executionStreamForCache(
-            const ForwardGraphCache &cache,
-            bool is_decode)
-        {
-            if (!is_decode && cache.prefill_capture_stream.stream)
-                return cache.prefill_capture_stream.stream;
-            if (cache.applied_stream)
-                return cache.applied_stream;
-            if (cache.segment_cache.capture_stream)
-                return cache.segment_cache.capture_stream;
-            if (cache.gpu_stream)
-                return cache.gpu_stream;
-            return nullptr;
-        }
-
-        /**
          * @brief Publish the ordering owner for one successful forward call.
          *
          * This helper deliberately writes the caller-owned ForwardOutput. The
@@ -1287,12 +1262,6 @@ namespace llaminar2
             if (success)
             {
                 recordLastExecutedForwardGraph(forward_signature, /*cache_hit=*/true);
-                publishForwardOutputProvenance(
-                    output,
-                    forward_signature.device,
-                    executionStreamForCache(*active_forward_cache, is_decode),
-                    is_decode,
-                    forward_signature.all_position_logits);
             }
             if (success && forward_signature.is_bucketed_prefill)
                 enforceBucketedPrefillForwardCapacity(&forward_signature);
@@ -1387,7 +1356,9 @@ namespace llaminar2
         view.graph = it->second.graph.get();
         view.signature = state.signature;
         view.device = view.signature.device;
-        view.stream = executionStreamForCache(it->second, state.signature.decode);
+        view.stream = it->second.outputProducerStream(
+            state.signature.decode,
+            /*used_graph_replay=*/state.signature.decode);
         view.cache_hit = state.cache_hit;
         view.is_decode = view.signature.decode;
         view.all_position_logits = view.signature.all_position_logits;
@@ -2232,6 +2203,33 @@ namespace llaminar2
             host.setPendingMainDecodeStream(nullptr);
         }
 
+        if (success)
+        {
+            /*
+             * Publish invocation provenance while `used_graph_replay` is still
+             * in scope. A decode replay must name the segment cache's typed
+             * capture stream, never the generic stream most recently applied
+             * to stage bindings. DeviceGraphOrchestrator immediately records
+             * its durable output event on this exact producer stream.
+             */
+            publishForwardOutputProvenance(
+                output,
+                input.device,
+                forward_cache.outputProducerStream(
+                    is_decode,
+                    used_graph_replay),
+                is_decode,
+                host.computeAllPositionLogitsEnabled());
+            if (input.device.is_gpu() && !output.execution.valid)
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Successful cached GPU forward has no exact output producer stream"
+                          << " device=" << input.device.toString()
+                          << " decode=" << is_decode
+                          << " replay=" << used_graph_replay);
+                return false;
+            }
+        }
+
         // Publish logits at the forward ownership boundary. Device consumers
         // inherit the producer stream; host consumers wait only on the exact
         // tensor or replay completion event.
@@ -2248,14 +2246,10 @@ namespace llaminar2
                  * instead inherit the producer stream through the deferred path
                  * above, so neither route needs a host or stream synchronization.
                  */
-                void *producer_stream =
-                    executionStreamForCache(
-                        forward_cache,
-                        is_decode);
                 if (!host.publishLogitsAtBoundary(
                         output.logits,
                         ctx,
-                        producer_stream))
+                        output.execution.stream))
                 {
                     LOG_ERROR("[ForwardExecutionEngine] Failed to publish cached forward logits at the device boundary");
                     return false;

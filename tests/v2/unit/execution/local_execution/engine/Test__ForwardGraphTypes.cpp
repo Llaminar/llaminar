@@ -765,6 +765,40 @@ TEST(Test__ForwardGraphCache, DefaultState)
     EXPECT_EQ(cache.gpu_graph_update_failures, 0);
 }
 
+/**
+ * @brief Decode replay provenance must name the graph's execution stream.
+ *
+ * Replay-state maintenance can temporarily bind stages to another stream.
+ * That generic binding is not evidence that the stream produced logits. This
+ * regression reproduces the stale grouped-verifier host observation race by
+ * giving every stream role a distinct sentinel and requiring replay to select
+ * the typed segment-capture owner.
+ */
+TEST(Test__ForwardGraphCache, DecodeReplayOutputProducerIgnoresGenericAppliedStream)
+{
+    ForwardGraphCache cache;
+    int replay_stream = 0;
+    int applied_stream = 0;
+    int worker_stream = 0;
+
+    cache.segment_cache.capture_stream = &replay_stream;
+    cache.applied_stream = &applied_stream;
+    cache.gpu_stream = &worker_stream;
+
+    EXPECT_EQ(cache.outputProducerStream(
+                  /*is_decode=*/true,
+                  /*used_graph_replay=*/true),
+              &replay_stream);
+    EXPECT_EQ(cache.outputProducerStream(
+                  /*is_decode=*/true,
+                  /*used_graph_replay=*/false),
+              &applied_stream);
+
+    // The sentinel is not an owned GPU stream; do not present it to the
+    // GraphSegmentCache lifecycle destructor as a live backend resource.
+    cache.segment_cache.capture_stream = nullptr;
+}
+
 TEST(Test__ForwardGraphCache, InvalidateResetsAllFields)
 {
     ForwardGraphCache cache;

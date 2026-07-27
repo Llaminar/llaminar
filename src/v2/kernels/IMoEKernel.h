@@ -796,6 +796,59 @@ namespace llaminar2
         }
 
         /**
+         * @brief Fused single-token expert decode from device routing tensors.
+         *
+         * This is the explicit-routing counterpart to
+         * groupedExpertDecodeFromRuntime().  The backend consumes one FP32
+         * routing-index row and one FP32 routing-weight row directly on the
+         * producer stream, converts the indices into backend-owned integer
+         * metadata, and executes gate/up, SwiGLU, and down projection through
+         * persistent workspace.  No per-route TensorBase intermediates may be
+         * created by the caller.
+         *
+         * @param input Device-resident hidden row with shape [1, d_model].
+         * @param routing_indices Device-resident FP32 expert ids with top_k
+         *        entries.
+         * @param routing_weights Device-resident FP32 route weights with top_k
+         *        entries.
+         * @param gateup_descriptor_table_id Persistent gate/up descriptor table.
+         * @param down_descriptor_table_id Persistent down descriptor table.
+         * @param top_k Number of routed expert slots in this row.
+         * @param output Device-resident weighted MoE output row.
+         * @param d_model Model hidden width.
+         * @param intermediate Expert intermediate width.
+         * @param expert_mask Optional immutable participant-local ownership
+         *        mask. Masked routes must become inactive device metadata
+         *        without modifying the original routing tensors.
+         * @return true after the output write has been published on the exact
+         *         producer stream; false on any contract or launch failure.
+         */
+        virtual bool groupedExpertDecodeFromRouting(
+            const TensorBase *input,
+            ITensor *routing_indices,
+            ITensor *routing_weights,
+            int gateup_descriptor_table_id,
+            int down_descriptor_table_id,
+            int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate,
+            const uint8_t *expert_mask = nullptr)
+        {
+            (void)input;
+            (void)routing_indices;
+            (void)routing_weights;
+            (void)gateup_descriptor_table_id;
+            (void)down_descriptor_table_id;
+            (void)top_k;
+            (void)output;
+            (void)d_model;
+            (void)intermediate;
+            (void)expert_mask;
+            return false;
+        }
+
+        /**
          * @brief Grouped decode down path from runtime-table top-k state.
          *
          * Reads DeviceMoELayerRuntime::topk_expert_ids and topk_weights directly

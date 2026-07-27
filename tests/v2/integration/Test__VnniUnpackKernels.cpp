@@ -368,6 +368,55 @@ INSTANTIATE_TEST_SUITE_P(
 // Round-trip tests: forward repack → reverse repack → compare
 // ============================================================================
 
+/**
+ * @brief Prove a previous runner's sticky launch status cannot poison repack.
+ *
+ * CUDA and HIP retain launch errors per host thread until get-last-error
+ * consumes them.  Model teardown and construction happen on that same thread,
+ * so the production repack entry point must clear any predecessor status
+ * immediately before dispatching its own kernel.
+ */
+TEST_P(VnniUnpackTest, ForwardRepackOwnsItsLaunchStatus) {
+    constexpr int N = 8;
+    constexpr int K = 32;
+    constexpr int blocks_per_row = K / 32;
+    constexpr size_t output_blocks =
+        static_cast<size_t>(N) * blocks_per_row;
+
+    std::vector<Q4_0Block> host_blocks(output_blocks);
+    fill_q4_0_blocks(host_blocks.data(), static_cast<int>(host_blocks.size()));
+
+    GpuMem d_raw(backend_, device_id_, host_blocks.size() * sizeof(Q4_0Block));
+    GpuMem d_payload(backend_, device_id_, output_blocks * 16);
+    GpuMem d_scales(backend_, device_id_, output_blocks * sizeof(uint16_t));
+    ASSERT_NE(d_raw.ptr, nullptr);
+    ASSERT_NE(d_payload.ptr, nullptr);
+    ASSERT_NE(d_scales.ptr, nullptr);
+    ASSERT_TRUE(backend_->hostToDevice(
+        d_raw.ptr,
+        host_blocks.data(),
+        host_blocks.size() * sizeof(Q4_0Block),
+        device_id_,
+        stream_));
+
+    /*
+     * This reaches cudaStreamWaitEvent/hipStreamWaitEvent with an invalid null
+     * event and therefore seeds runtime error state without changing the valid
+     * stream, current device, or allocations used by the repack below.
+     */
+    EXPECT_FALSE(backend_->streamWaitEvent(stream_, nullptr, device_id_));
+
+    ASSERT_TRUE(forwardRepack(
+        RepackFormat::Q4_0,
+        d_raw.ptr,
+        d_payload.u8(),
+        d_scales.u16(),
+        nullptr,
+        N,
+        K));
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
+}
+
 TEST_P(VnniUnpackTest, RoundTrip_Q4_0) {
     roundTripTest<Q4_0Block>(RepackFormat::Q4_0, fill_q4_0_blocks,
                              /*payload_bytes=*/16, /*asymmetric=*/false,

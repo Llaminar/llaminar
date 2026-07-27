@@ -502,6 +502,40 @@ namespace llaminar2
         /// Explicit stream for prefill warmup/capture/replay.
         CachedGraphStream prefill_capture_stream;
 
+        /**
+         * @brief Resolve the exact stream that produced one cached invocation.
+         *
+         * A cached graph owns several stream-shaped fields with different
+         * meanings. `applied_stream` only says which stream was most recently
+         * installed into stage bindings; replay-state maintenance may update
+         * that field without producing the graph output. When a decode
+         * invocation actually replayed its captured graph, the segment cache's
+         * capture stream is therefore the only valid producer provenance.
+         *
+         * Prefill has an independently typed capture stream. Non-replay
+         * warmup/eager executions retain the established applied-stream and
+         * worker-stream ordering because those are their actual launch owners.
+         *
+         * @param is_decode True for a decode or grouped-verifier invocation.
+         * @param used_graph_replay True only when this invocation launched the
+         *        cached decode graph executable.
+         * @return Exact producer stream, or nullptr when the required typed
+         *         stream was not published.
+         */
+        void *outputProducerStream(bool is_decode,
+                                   bool used_graph_replay) const noexcept
+        {
+            if (is_decode && used_graph_replay)
+                return segment_cache.capture_stream;
+            if (!is_decode && prefill_capture_stream.stream)
+                return prefill_capture_stream.stream;
+            if (applied_stream)
+                return applied_stream;
+            if (segment_cache.capture_stream)
+                return segment_cache.capture_stream;
+            return gpu_stream;
+        }
+
         /// Number of consecutive graph update failures (fallback heuristic)
         int gpu_graph_update_failures = 0;
 

@@ -15533,7 +15533,12 @@ namespace llaminar2
         const bool has_durable_publication = forward_graph_output_ready_.valid;
         const bool has_stream_publication =
             pendingLogitsStreamValue(pending_role) != nullptr;
-        if (!has_durable_publication && !has_stream_publication)
+        const bool has_verifier_event_publication =
+            surface == HostLogitsSurface::AllPositionVerifier &&
+            all_position_verifier_state_ready_.valid;
+        if (!has_durable_publication &&
+            !has_stream_publication &&
+            !has_verifier_event_publication)
         {
             std::ostringstream message;
             message << "GPU logits host observation has no producer publication"
@@ -15562,19 +15567,29 @@ namespace llaminar2
         }
 
         /*
-         * A role-specific handoff may describe a graph replay or an in-place
-         * mutation newer than the durable ordinary-forward event. The host
-         * bridge is the semantic consumer, so consume the handoff exactly once
-         * and join it onto the same stream before submitting D2H.
+         * Host publication is a read-only observation. It must not steal the
+         * one-shot handoff from a sampler, reducer, or state mutation. Grouped
+         * verifier replay additionally owns a durable event recorded on the
+         * exact replay stream, so a sampler may consume its raw stream token
+         * without making a later diagnostic/result D2H race the graph.
          */
-        if (has_stream_publication &&
-            !waitForPendingLogitsStream(
+        if (has_verifier_event_publication &&
+            !waitForPendingAllPositionVerifierStateReadyForObservation(
+                host_bridge_stream,
+                operation))
+        {
+            throw std::runtime_error(
+                "GPU logits host observation could not wait for verifier readiness");
+        }
+        if (!has_verifier_event_publication &&
+            has_stream_publication &&
+            !waitForPendingLogitsStreamForObservation(
                 pending_role,
                 host_bridge_stream,
                 operation))
         {
             throw std::runtime_error(
-                "GPU logits host observation could not consume the producer stream handoff");
+                "GPU logits host observation could not observe the producer stream handoff");
         }
         return host_bridge_stream;
     }
@@ -15804,9 +15819,11 @@ namespace llaminar2
         defer_all_position_verifier_sync_ = enabled;
         if (!enabled)
         {
-            // Only the one-shot logits handoff belongs to the deferral toggle.
-            // Accepted-state publication may still need the verifier-row state
-            // event after sampling has consumed logits and turned deferral off.
+            // Only the request-scoped logits stream token belongs to the
+            // deferral toggle. Read-only samplers and host observations leave
+            // it published; the transaction boundary clears it after every
+            // observer has enqueued its work. Accepted-state publication may
+            // still need the verifier-row event after deferral is disabled.
             clearPendingLogitsStream(
                 PendingLogitsStreamRole::AllPositionVerifier,
                 "setMTPAllPositionVerifierSyncDeferralEnabled(false)");
@@ -22974,9 +22991,8 @@ namespace llaminar2
             auto device_opt = state_.all_position_logits->current_device();
             if (device_opt.has_value() && device_opt->is_gpu())
             {
-                stream = consumePendingLogitsStream(
-                    PendingLogitsStreamRole::AllPositionVerifier,
-                    "sampleGreedyFromAllPositionLogitsOnDevice");
+                stream = peekPendingLogitsStream(
+                    PendingLogitsStreamRole::AllPositionVerifier);
                 if (!stream)
                     stream = explicitGPUStreamForOperation("sampleGreedyFromAllPositionLogitsOnDevice");
                 if (!stream)
@@ -23003,9 +23019,8 @@ namespace llaminar2
             auto device_opt = state_.all_position_logits_local->current_device();
             if (device_opt.has_value() && device_opt->is_gpu())
             {
-                stream = consumePendingLogitsStream(
-                    PendingLogitsStreamRole::AllPositionVerifier,
-                    "sampleGreedyFromAllPositionLogitsLocalOnDevice");
+                stream = peekPendingLogitsStream(
+                    PendingLogitsStreamRole::AllPositionVerifier);
                 if (!stream)
                     stream = explicitGPUStreamForOperation("sampleGreedyFromAllPositionLogitsLocalOnDevice");
                 if (!stream)
@@ -23095,10 +23110,9 @@ namespace llaminar2
             if (!backend || !gpu_ptr)
                 return false;
 
-            void *stream = consumePendingLogitsStream(
-                PendingLogitsStreamRole::AllPositionVerifier,
-                "sampleGreedyFromAllPositionLogitsOnDeviceRows");
-            const bool consumed_deferred_stream = stream != nullptr;
+            void *stream = peekPendingLogitsStream(
+                PendingLogitsStreamRole::AllPositionVerifier);
+            const bool using_deferred_stream = stream != nullptr;
             if (!stream)
                 stream = explicitGPUStreamForOperation("sampleGreedyFromAllPositionLogitsOnDeviceRows");
             if (!stream)
@@ -23124,7 +23138,7 @@ namespace llaminar2
                 argmax_partial_capacity_);
             if (!ok)
             {
-                if (consumed_deferred_stream)
+                if (using_deferred_stream)
                 {
                     LOG_ERROR("[DeviceGraphOrchestrator] Batched verifier argmax failed after deferred verifier replay");
                     return false;
@@ -30461,6 +30475,13 @@ namespace llaminar2
                 PendingLogitsStreamRole::AllPositionVerifier,
                 stream,
                 "applyPenaltiesToAllPositionLogitsOnDeviceRow");
+            if (!recordAllPositionVerifierStateReady(
+                    stream,
+                    "applyPenaltiesToAllPositionLogitsOnDeviceRow"))
+            {
+                throw std::runtime_error(
+                    "Failed to publish all-position logits penalty readiness");
+            }
         }
         return ok;
     }

@@ -7046,7 +7046,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEVerifierRoutingTensorDecodeDoesNotRe
     const auto routing_tensor_body = sliceBetween(
         stage_source,
         "if (can_try_device_routing_tensor_decode)",
-        "if (is_gpu && isGraphCaptureActive())");
+        "if (is_gpu)");
     const auto compact_verifier_replay =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(verifier_replay_body));
     const auto compact_predicate =
@@ -7078,6 +7078,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEVerifierRoutingTensorDecodeDoesNotRe
               std::string::npos)
         << "The device route calls must receive the participant mask so masked-off "
            "top-k slots become inactive on device.";
+    EXPECT_NE(compact_body.find("kernel->groupedExpertDecodeFromRouting("),
+              std::string::npos)
+        << "Explicit routing must use one fused workspace-native backend contract.";
+    EXPECT_EQ(compact_body.find("groupedExpertGateUpDecodeFromRouting("),
+              std::string::npos)
+        << "The production stage must not recreate per-slot gate/up tensors.";
+    EXPECT_EQ(compact_body.find("groupedExpertDownDecodeFromRouting("),
+              std::string::npos)
+        << "The production stage must not retain the split explicit-routing down path.";
     EXPECT_NE(routing_tensor_predicate.find(
                   "masked-off top-k slots to -1"),
               std::string::npos)
@@ -7957,6 +7966,46 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ROCmMoEDecodeRouteSelectStaysDeviceResi
         << "Keep an inline note explaining why host validation is intentionally absent.";
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, ROCmVerifierDispatchPolicyIsWorkerLocalAndExplicit)
+{
+    const auto root = repoRoot();
+    const auto launcher_source =
+        readFile(root / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip");
+    const auto kernel_source =
+        readFile(root / "src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp");
+
+    EXPECT_NE(
+        launcher_source.find(
+            "static thread_local int g_native_vnni_decode_equivalent_m1_config"),
+        std::string::npos)
+        << "ROCm LocalTP runs one verifier worker per GPU in one process. "
+           "Decode-equivalent dispatch mode must therefore be worker-local.";
+    EXPECT_EQ(
+        launcher_source.find(
+            "static std::atomic<int> g_native_vnni_decode_equivalent_m1_config"),
+        std::string::npos)
+        << "A process-global verifier mode lets one LocalTP worker clear a "
+           "sibling worker's serial-M1 dispatch contract.";
+
+    const auto grouped_policy = sliceBetween(
+        kernel_source,
+        "if (g_rocm_native_vnni_decode_equivalent_scope)",
+        "if (PerfStatsCollector::isEnabled() && !batched_bypass_reason.empty())");
+    EXPECT_FALSE(grouped_policy.empty());
+    EXPECT_EQ(
+        grouped_policy.find("projections.size() > 1"),
+        std::string::npos)
+        << "Single-projection grouped verifier stages such as LM_HEAD need the "
+           "same explicit serial-M1 policy as fused projection groups.";
+    EXPECT_NE(
+        grouped_policy.find("rocmGemv_native_vnni_query_serial_m1_config"),
+        std::string::npos);
+    EXPECT_NE(grouped_policy.find("policy.kb"), std::string::npos);
+    EXPECT_NE(grouped_policy.find("policy.target_waves"), std::string::npos)
+        << "The resolved serial reduction geometry must be passed into the HIP "
+           "launcher, not inferred from mutable process state.";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPVerifierGraphWaitsOnSidecarStreamWithoutHostFlush)
 {
     const auto source = readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
@@ -8573,6 +8622,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoERuntimeDecodeUsesFusedWorkspaceBefor
         "scratch_gate_batch_.resize(top_k)",
         "The workspace-native fused runtime route must return before any legacy "
         "per-slot scratch construction.");
+    expectNeedleBefore(
+        single_token,
+        "kernel->groupedExpertDecodeFromRouting(",
+        "scratch_gate_batch_.resize(top_k)",
+        "The workspace-native fused explicit route must return before CPU-only "
+        "per-slot scratch construction.");
 
     const auto runtime_route = sliceBetween(
         single_token,
@@ -8586,6 +8641,23 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoERuntimeDecodeUsesFusedWorkspaceBefor
         runtime_route.find("using host-routed fallback"),
         std::string::npos)
         << "A failed fused runtime route is fatal, not permission to change execution modes.";
+
+    const auto explicit_route = sliceBetween(
+        single_token,
+        "if (can_try_device_routing_tensor_decode)",
+        "if (is_gpu)");
+    EXPECT_EQ(
+        explicit_route.find("groupedExpertGateUpDecodeFromRouting("),
+        std::string::npos)
+        << "Production explicit routing must not retain a two-step gate/up path.";
+    EXPECT_EQ(
+        explicit_route.find("groupedExpertDownDecodeFromRouting("),
+        std::string::npos)
+        << "Production explicit routing must not retain a two-step down path.";
+    EXPECT_NE(
+        explicit_route.find("Mandatory fused explicit-routing"),
+        std::string::npos)
+        << "A failed fused explicit route must be fatal.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, ResidualAddCannotSplitHomogeneousGpuGraph)
@@ -9273,7 +9345,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixArchiveReadinessIsPreflightedAndN
  * This policy guard prevents direct tensor downloads and prevents TP gather
  * code from silently returning to non-consuming views or guessed streams.
  */
-TEST(Test__GpuWorkspaceAllocationPolicy, GPUHostLogitsPublicationUsesTypedConsumingBridge)
+TEST(Test__GpuWorkspaceAllocationPolicy, GPUHostLogitsPublicationUsesTypedObservationBridge)
 {
     const auto orchestrator_source =
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
@@ -9322,7 +9394,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUHostLogitsPublicationUsesTypedConsum
 
     EXPECT_NE(compact_bridge.find("explicitGPUStreamForOperation("), std::string::npos);
     EXPECT_NE(compact_bridge.find("waitForForwardGraphOutputReady("), std::string::npos);
-    EXPECT_NE(compact_bridge.find("waitForPendingLogitsStream("), std::string::npos);
+    EXPECT_NE(compact_bridge.find("waitForPendingLogitsStreamForObservation("), std::string::npos);
+    EXPECT_NE(compact_bridge.find("waitForPendingAllPositionVerifierStateReadyForObservation("),
+              std::string::npos);
+    EXPECT_EQ(compact_bridge.find("waitForPendingLogitsStream("), std::string::npos);
     EXPECT_NE(compact_bridge.find("DeviceTimelineRole::HostResultBridge"), std::string::npos);
 
     EXPECT_NE(compact_main.find("publishLogitsTensorToHost("), std::string::npos);
@@ -9363,4 +9438,46 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUHostLogitsPublicationUsesTypedConsum
     EXPECT_NE(
         compact_rank.find("consumeAllPositionLogitsLocalInfoForHostGather()"),
         std::string::npos);
+}
+
+/**
+ * @brief Keep read-only verifier sampling from stealing producer readiness.
+ *
+ * The grouped verifier may be sampled on device and then surfaced to the host
+ * for parity diagnostics or result gathering. Both operations are observers.
+ * The transaction boundary, not the first observer, owns invalidation of the
+ * request-scoped stream token.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy, AllPositionGreedyObserversPreserveProducerHandoff)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto single_sample = sliceBetween(
+        source,
+        "int DeviceGraphOrchestrator::sampleGreedyFromAllPositionLogitsOnDevice(",
+        "bool DeviceGraphOrchestrator::sampleGreedyFromAllPositionLogitsOnDeviceRows(");
+    const auto batched_sample = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::sampleGreedyFromAllPositionLogitsOnDeviceRows(",
+        "bool DeviceGraphOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDeviceResident(");
+
+    const auto compact_single =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(single_sample));
+    const auto compact_batched =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(batched_sample));
+
+    EXPECT_NE(compact_single.find(
+                  "peekPendingLogitsStream("
+                  "PendingLogitsStreamRole::AllPositionVerifier)"),
+              std::string::npos);
+    EXPECT_NE(compact_batched.find(
+                  "peekPendingLogitsStream("
+                  "PendingLogitsStreamRole::AllPositionVerifier)"),
+              std::string::npos);
+    EXPECT_EQ(compact_single.find("consumePendingLogitsStream("),
+              std::string::npos);
+    EXPECT_EQ(compact_batched.find("consumePendingLogitsStream("),
+              std::string::npos);
+    EXPECT_EQ(compact_single.find("clearPendingLogitsStream("),
+              std::string::npos);
 }

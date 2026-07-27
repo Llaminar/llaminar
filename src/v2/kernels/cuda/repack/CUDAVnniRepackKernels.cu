@@ -18,6 +18,41 @@
 
 namespace llaminar2 {
 
+namespace {
+
+/**
+ * @brief Print pointer ownership only after a repack launch has failed.
+ *
+ * Keeping this diagnostic on the exceptional path preserves load throughput
+ * while making a stale allocation immediately distinguishable from a launch
+ * configuration error.
+ */
+void reportCudaRepackPointer(const char* name, const void* ptr)
+{
+    if (!ptr) {
+        std::fprintf(stderr, "[launchVnniRepackCUDA] %s=null\n", name);
+        return;
+    }
+
+    cudaPointerAttributes attributes{};
+    const cudaError_t status = cudaPointerGetAttributes(&attributes, ptr);
+    if (status != cudaSuccess) {
+        std::fprintf(
+            stderr,
+            "[launchVnniRepackCUDA] %s=%p attributes=invalid error=%s\n",
+            name, ptr, cudaGetErrorString(status));
+        (void)cudaGetLastError();
+        return;
+    }
+
+    std::fprintf(
+        stderr,
+        "[launchVnniRepackCUDA] %s=%p type=%d device=%d\n",
+        name, ptr, static_cast<int>(attributes.type), attributes.device);
+}
+
+} // namespace
+
 // ============================================================================
 // Alignment-safe memory access helpers
 // ============================================================================
@@ -925,6 +960,13 @@ bool launchVnniRepackCUDA(
     cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     const int blocks_per_row = K / 32;
 
+    /*
+     * Attribute the status check below to this launch only.  CUDA launch
+     * errors are sticky until consumed, so an earlier runner's cleanup error
+     * must not be misreported as a failure of a fresh repack invocation.
+     */
+    (void)cudaGetLastError();
+
     switch (format) {
     case RepackFormat::Q4_0:
     case RepackFormat::IQ4_NL: {
@@ -1107,8 +1149,20 @@ bool launchVnniRepackCUDA(
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[launchVnniRepackCUDA] Kernel launch failed: %s\n",
-                cudaGetErrorString(err));
+        int current_device = -1;
+        (void)cudaGetDevice(&current_device);
+        std::fprintf(
+            stderr,
+            "[launchVnniRepackCUDA] Kernel launch failed: %s "
+            "(format=%d N=%d K=%d output_N=%d row_offset=%d "
+            "device=%d stream=%p)\n",
+            cudaGetErrorString(err), static_cast<int>(format), N, K, output_N,
+            output_row_offset, current_device, stream);
+        reportCudaRepackPointer("raw", d_raw_blocks);
+        reportCudaRepackPointer("payload", d_payload);
+        reportCudaRepackPointer("scales", d_scales);
+        reportCudaRepackPointer("mins", d_mins);
+        reportCudaRepackPointer("emins", d_emins);
         return false;
     }
     return true;

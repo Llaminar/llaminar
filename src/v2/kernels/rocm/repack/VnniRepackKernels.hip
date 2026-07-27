@@ -16,6 +16,42 @@
 
 namespace llaminar2 {
 
+namespace {
+
+/**
+ * @brief Print pointer ownership only after a repack launch has failed.
+ *
+ * The load pipeline normally pays no pointer-query cost.  On the exceptional
+ * path, however, identifying which launch argument no longer belongs to a HIP
+ * allocation is substantially more useful than reporting the runtime's generic
+ * "pointer does not correspond to a registered memory region" message.
+ */
+void reportHipRepackPointer(const char* name, const void* ptr)
+{
+    if (!ptr) {
+        std::fprintf(stderr, "[launchVnniRepack] %s=null\n", name);
+        return;
+    }
+
+    hipPointerAttribute_t attributes{};
+    const hipError_t status = hipPointerGetAttributes(&attributes, ptr);
+    if (status != hipSuccess) {
+        std::fprintf(
+            stderr,
+            "[launchVnniRepack] %s=%p attributes=invalid error=%s\n",
+            name, ptr, hipGetErrorString(status));
+        (void)hipGetLastError();
+        return;
+    }
+
+    std::fprintf(
+        stderr,
+        "[launchVnniRepack] %s=%p type=%d device=%d\n",
+        name, ptr, static_cast<int>(attributes.type), attributes.device);
+}
+
+} // namespace
+
 /** @brief Copy one aligned raw-INT8 execution block with vectorized stores. */
 __device__ __forceinline__ void hip_repack_copy32(
     uint8_t *__restrict__ dst,
@@ -1044,6 +1080,14 @@ bool launchVnniRepack(
     hipStream_t hip_stream = reinterpret_cast<hipStream_t>(stream);
     const int blocks_per_row = K / 32;
 
+    /*
+     * Scope launch-status attribution to this invocation.  HIP launch errors
+     * are thread-local and sticky until hipGetLastError() consumes them.  A
+     * prior runner's teardown must therefore never make the first repack of a
+     * newly constructed runner appear to have failed.
+     */
+    (void)hipGetLastError();
+
     switch (format) {
     case RepackFormat::Q4_0:
     case RepackFormat::IQ4_NL: {
@@ -1227,8 +1271,20 @@ bool launchVnniRepack(
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
-        fprintf(stderr, "[launchVnniRepack] Kernel launch failed: %s\n",
-                hipGetErrorString(err));
+        int current_device = -1;
+        (void)hipGetDevice(&current_device);
+        std::fprintf(
+            stderr,
+            "[launchVnniRepack] Kernel launch failed: %s "
+            "(format=%d N=%d K=%d output_N=%d row_offset=%d "
+            "device=%d stream=%p)\n",
+            hipGetErrorString(err), static_cast<int>(format), N, K, output_N,
+            output_row_offset, current_device, stream);
+        reportHipRepackPointer("raw", d_raw_blocks);
+        reportHipRepackPointer("payload", d_payload);
+        reportHipRepackPointer("scales", d_scales);
+        reportHipRepackPointer("mins", d_mins);
+        reportHipRepackPointer("emins", d_emins);
         return false;
     }
     return true;

@@ -5514,11 +5514,6 @@ namespace llaminar2
         void *stream = requireStream("CUDAMoEKernel::updateGroupedPrefillExpertMask");
         if (!stream)
             return false;
-        if (rejectCudaPersistentMetadataMutationDuringCapture(
-                stream, "update grouped prefill expert mask"))
-        {
-            return false;
-        }
 
         uint64_t mask_hash = 1469598103934665603ull;
         int active_experts = 0;
@@ -5530,6 +5525,23 @@ namespace llaminar2
         }
         mask_hash ^= static_cast<uint64_t>(num_experts);
         mask_hash *= 1099511628211ull;
+
+        /*
+         * Captured decode may consume an immutable mask published during
+         * warmup.  Check that exact identity before applying the mutation
+         * guard: reusing an already-published device table performs no host
+         * transfer and is therefore a valid graph-construction operation.
+         */
+        if (group_expert_mask_published_ &&
+            group_expert_mask_hash_ == mask_hash &&
+            group_expert_mask_num_experts_ == num_experts)
+            return true;
+
+        if (rejectCudaPersistentMetadataMutationDuringCapture(
+                stream, "update grouped prefill expert mask"))
+        {
+            return false;
+        }
 
         if (!d_group_expert_mask_ || group_expert_mask_cap_ < num_experts)
         {
@@ -5590,11 +5602,6 @@ namespace llaminar2
             group_expert_mask_active_experts_ = 0;
             group_expert_mask_published_ = false;
         }
-
-        if (group_expert_mask_published_ &&
-            group_expert_mask_hash_ == mask_hash &&
-            group_expert_mask_num_experts_ == num_experts)
-            return true;
 
         cudaError_t err = cudaMemcpyAsync(
             d_group_expert_mask_,
@@ -6823,6 +6830,115 @@ namespace llaminar2
         return ok;
     }
 
+    bool CUDAMoEKernel::groupedExpertDecodeFromRouting(
+        const TensorBase *input,
+        ITensor *routing_indices,
+        ITensor *routing_weights,
+        int gateup_table_id,
+        int down_table_id,
+        int top_k,
+        ITensor *output,
+        int d_model,
+        int intermediate,
+        const uint8_t *expert_mask)
+    {
+        if (!input || !routing_indices || !routing_weights ||
+            gateup_table_id < 0 || down_table_id < 0 || top_k <= 0 ||
+            !output || d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (top_k > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
+            gateup_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()))
+        {
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
+        if (!gateup_table.valid || gateup_table.num_experts <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRouting] "
+                      "gate/up descriptor table is unavailable");
+            return false;
+        }
+
+        void *stream = requireStream("CUDAMoEKernel::groupedExpertDecodeFromRouting");
+        const bool capture_active = isCudaMoEDecodeCaptureActive(stream);
+        const DeviceId device = deviceId();
+        if (!setMoEDevice(device_ordinal_, "groupedExpertDecodeFromRouting") ||
+            !ensureRoutingDecodeMetadataCapacity(top_k))
+        {
+            return false;
+        }
+
+        if ((!routing_indices->gpu_data_ptr() || !routing_weights->gpu_data_ptr()) &&
+            capture_active)
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRouting] "
+                      "routing upload is forbidden during graph capture");
+            return false;
+        }
+        if (!ensureTensorOnDevice(
+                routing_indices, device, stream, "routing_indices") ||
+            !ensureTensorOnDevice(
+                routing_weights, device, stream, "routing_weights"))
+        {
+            return false;
+        }
+
+        const float *device_routing_indices =
+            static_cast<const float *>(routing_indices->gpu_data_ptr());
+        const float *device_routing_weights =
+            static_cast<const float *>(routing_weights->gpu_data_ptr());
+        if (!device_routing_indices || !device_routing_weights)
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRouting] "
+                      "routing tensors have no device publication");
+            return false;
+        }
+
+        if (expert_mask)
+        {
+            if (!updateGroupedPrefillExpertMask(
+                    expert_mask, gateup_table.num_experts) ||
+                !cudaMoE_float_to_masked_int(
+                    device_routing_indices,
+                    d_routing_decode_expert_ids_,
+                    d_group_expert_mask_,
+                    top_k,
+                    gateup_table.num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                return false;
+            }
+        }
+        else if (!cudaMoE_float_to_int(
+                     device_routing_indices,
+                     d_routing_decode_expert_ids_,
+                     top_k,
+                     device_ordinal_,
+                     stream))
+        {
+            return false;
+        }
+
+        return groupedExpertDecodeResolved(
+            /*runtime_layer=*/nullptr,
+            input,
+            gateup_table_id,
+            down_table_id,
+            top_k,
+            output,
+            d_model,
+            intermediate,
+            d_routing_decode_expert_ids_,
+            device_routing_weights,
+            /*use_runtime_descriptors=*/false,
+            /*allow_router_q8_reuse=*/false,
+            "routing");
+    }
+
     bool CUDAMoEKernel::groupedExpertDecodeFromRuntime(
         DeviceMoELayerRuntime *runtime_layer,
         const TensorBase *input,
@@ -6834,8 +6950,47 @@ namespace llaminar2
         int intermediate,
         MoEDecodeDescriptorSource descriptor_source)
     {
-        if (!runtime_layer || !input || gateup_table_id < 0 || down_table_id < 0 ||
+        if (!runtime_layer)
+            return false;
+
+        return groupedExpertDecodeResolved(
+            runtime_layer,
+            input,
+            gateup_table_id,
+            down_table_id,
+            top_k,
+            output,
+            d_model,
+            intermediate,
+            runtimeTopKExpertIdsDevice(runtime_layer),
+            runtimeTopKWeightsDevice(runtime_layer),
+            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable,
+            /*allow_router_q8_reuse=*/true,
+            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable
+                ? "runtime"
+                : "runtime_static_table");
+    }
+
+    bool CUDAMoEKernel::groupedExpertDecodeResolved(
+        DeviceMoELayerRuntime *runtime_layer,
+        const TensorBase *input,
+        int gateup_table_id,
+        int down_table_id,
+        int top_k,
+        ITensor *output,
+        int d_model,
+        int intermediate,
+        const int *d_expert_ids,
+        const float *d_weights,
+        bool use_runtime_descriptors,
+        bool allow_router_q8_reuse,
+        const char *counter_source)
+    {
+        if (!input || gateup_table_id < 0 || down_table_id < 0 ||
             top_k <= 0 || !output || d_model <= 0 || intermediate <= 0)
+            return false;
+        if (!d_expert_ids || !d_weights ||
+            (use_runtime_descriptors && !runtime_layer))
             return false;
         if (top_k > static_cast<int>(kDeviceMoEMaxTopK) ||
             top_k > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
@@ -6937,8 +7092,6 @@ namespace llaminar2
                                             &d_down_gate_ptrs, &d_down_up_ptrs))
             return false;
 
-        const int *d_expert_ids = runtimeTopKExpertIdsDevice(runtime_layer);
-        const float *d_weights = runtimeTopKWeightsDevice(runtime_layer);
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
         if (!d_expert_ids || !d_weights || !d_output)
         {
@@ -6946,9 +7099,8 @@ namespace llaminar2
             return false;
         }
 
-        const bool use_runtime_descriptors =
-            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
         const bool reuse_router_q8_hidden =
+            allow_router_q8_reuse &&
             canReuseRouterQ8Hidden(d_hidden, /*rows=*/1, d_model);
         if (reuse_router_q8_hidden)
         {
@@ -7043,7 +7195,7 @@ namespace llaminar2
         markDeviceWritten(output, device, stream);
         recordGroupedDecodeCounter(
             "cuda_moe_grouped_decode_fused_calls",
-            use_runtime_descriptors ? "runtime" : "runtime_static_table",
+            counter_source,
             top_k, d_model, intermediate, "fused_block_down");
         if (!capture_active)
         {

@@ -285,6 +285,24 @@ namespace llaminar2
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::RuntimePlacementTable) override;
 
+        /**
+         * @brief Execute fused workspace-native decode from device routing tensors.
+         *
+         * Explicit verifier routing and runtime-table routing share the same
+         * ordered gate/up and down implementation after route normalization.
+         */
+        bool groupedExpertDecodeFromRouting(
+            const TensorBase *input,
+            ITensor *routing_indices,
+            ITensor *routing_weights,
+            int gateup_descriptor_table_id,
+            int down_descriptor_table_id,
+            int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate,
+            const uint8_t *expert_mask = nullptr) override;
+
         bool groupedExpertDownDecodeFromTable(
             ITensor *const *gate_tensors,
             ITensor *const *up_tensors,
@@ -650,6 +668,34 @@ namespace llaminar2
         }
 
     private:
+        /**
+         * @brief Shared fused decode implementation after route metadata is resolved.
+         *
+         * @param runtime_layer Device runtime placement table when runtime
+         *        descriptors are selected; null for static descriptor tables.
+         * @param device_expert_ids Device-owned normalized expert ids.
+         * @param device_weights Device-owned route weights.
+         * @param use_runtime_descriptors Select mutable placement descriptors
+         *        instead of immutable descriptor tables.
+         * @param allow_router_q8_reuse True only when this route source owns
+         *        the matching router quantization publication.
+         * @param counter_source Stable perfstats source label.
+         */
+        bool groupedExpertDecodeResolved(
+            DeviceMoELayerRuntime *runtime_layer,
+            const TensorBase *input,
+            int gateup_descriptor_table_id,
+            int down_descriptor_table_id,
+            int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate,
+            const int *device_expert_ids,
+            const float *device_weights,
+            bool use_runtime_descriptors,
+            bool allow_router_q8_reuse,
+            const char *counter_source);
+
         static constexpr std::size_t kRuntimePointerArrayMaxTopK = 16;
         static constexpr std::size_t kRuntimePointerArrayTableSlots = 1024;
         static constexpr std::size_t kRuntimePointerArrayWorkspaceScopes = 3;

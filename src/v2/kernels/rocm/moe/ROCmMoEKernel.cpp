@@ -6569,6 +6569,141 @@ namespace llaminar2
         return ok;
     }
 
+    bool ROCmMoEKernel::groupedExpertDecodeFromRouting(
+        const TensorBase *input,
+        ITensor *routing_indices,
+        ITensor *routing_weights,
+        int gateup_descriptor_table_id,
+        int down_descriptor_table_id,
+        int top_k,
+        ITensor *output,
+        int d_model,
+        int intermediate,
+        const uint8_t *expert_mask)
+    {
+        if (!input || !routing_indices || !routing_weights ||
+            gateup_descriptor_table_id < 0 || down_descriptor_table_id < 0 ||
+            top_k <= 0 || !output || d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (top_k > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
+            gateup_descriptor_table_id >=
+                static_cast<int>(grouped_gateup_desc_tables_.size()))
+        {
+            return false;
+        }
+
+        const auto &gateup_table =
+            grouped_gateup_desc_tables_[gateup_descriptor_table_id];
+        if (!gateup_table.valid || gateup_table.num_experts <= 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRouting] "
+                      "gate/up descriptor table is unavailable");
+            return false;
+        }
+        if (!setMoEDevice(
+                device_ordinal_, "groupedExpertDecodeFromRouting") ||
+            !ensureGroupedGateUpCapacity(top_k, d_model))
+        {
+            return false;
+        }
+
+        void *stream = getStream();
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRouting] "
+                      "an explicit stream is required");
+            return false;
+        }
+
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        const bool capture_active = isDecodeGraphCaptureActive();
+        const float *device_routing_indices =
+            static_cast<const float *>(routing_indices->gpu_data_ptr());
+        const float *device_routing_weights =
+            static_cast<const float *>(routing_weights->gpu_data_ptr());
+        if ((!device_routing_indices || !device_routing_weights) &&
+            capture_active)
+        {
+            rejectDecodeStagingDuringCapture(
+                "fused explicit-routing tensors");
+            return false;
+        }
+        if (!device_routing_indices &&
+            !ensureTensorOnDevice(
+                routing_indices,
+                device,
+                stream,
+                "routing_indices",
+                "groupedExpertDecodeFromRouting"))
+        {
+            return false;
+        }
+        if (!device_routing_weights &&
+            !ensureTensorOnDevice(
+                routing_weights,
+                device,
+                stream,
+                "routing_weights",
+                "groupedExpertDecodeFromRouting"))
+        {
+            return false;
+        }
+
+        device_routing_indices =
+            static_cast<const float *>(routing_indices->gpu_data_ptr());
+        device_routing_weights =
+            static_cast<const float *>(routing_weights->gpu_data_ptr());
+        if (!device_routing_indices || !device_routing_weights)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRouting] "
+                      "routing tensors have no device publication");
+            return false;
+        }
+
+        if (expert_mask)
+        {
+            if (!updateGroupedPrefillExpertMask(
+                    expert_mask, gateup_table.num_experts) ||
+                !hipMoE_float_to_masked_int(
+                    device_routing_indices,
+                    d_grouped_gateup_expert_ids_,
+                    d_group_expert_mask_,
+                    top_k,
+                    gateup_table.num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                return false;
+            }
+        }
+        else if (!hipMoE_float_to_int(
+                     device_routing_indices,
+                     d_grouped_gateup_expert_ids_,
+                     top_k,
+                     device_ordinal_,
+                     stream))
+        {
+            return false;
+        }
+
+        return groupedExpertDecodeResolved(
+            /*runtime_layer=*/nullptr,
+            input,
+            gateup_descriptor_table_id,
+            down_descriptor_table_id,
+            top_k,
+            output,
+            d_model,
+            intermediate,
+            d_grouped_gateup_expert_ids_,
+            device_routing_weights,
+            /*use_runtime_descriptors=*/false,
+            /*allow_router_q8_reuse=*/false,
+            "routing");
+    }
+
     bool ROCmMoEKernel::groupedExpertDecodeFromRuntime(
         DeviceMoELayerRuntime *runtime_layer,
         const TensorBase *input,
@@ -6580,11 +6715,52 @@ namespace llaminar2
         int intermediate,
         MoEDecodeDescriptorSource descriptor_source)
     {
+        if (!runtime_layer)
+            return false;
+
+        return groupedExpertDecodeResolved(
+            runtime_layer,
+            input,
+            gateup_descriptor_table_id,
+            down_descriptor_table_id,
+            top_k,
+            output,
+            d_model,
+            intermediate,
+            runtimeTopKExpertIdsDevice(runtime_layer),
+            runtimeTopKWeightsDevice(runtime_layer),
+            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable,
+            /*allow_router_q8_reuse=*/true,
+            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable
+                ? "runtime"
+                : "runtime_static_table");
+    }
+
+    bool ROCmMoEKernel::groupedExpertDecodeResolved(
+        DeviceMoELayerRuntime *runtime_layer,
+        const TensorBase *input,
+        int gateup_descriptor_table_id,
+        int down_descriptor_table_id,
+        int top_k,
+        ITensor *output,
+        int d_model,
+        int intermediate,
+        const int *d_expert_ids,
+        const float *d_weights,
+        bool use_runtime_descriptors,
+        bool allow_router_q8_reuse,
+        const char *counter_source)
+    {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_FFN, static_cast<hipStream_t>(getStream()));
 
-        if (!runtime_layer || !input || gateup_descriptor_table_id < 0 ||
+        if (!input || gateup_descriptor_table_id < 0 ||
             down_descriptor_table_id < 0 || top_k <= 0 || !output ||
             d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (!d_expert_ids || !d_weights ||
+            (use_runtime_descriptors && !runtime_layer))
         {
             return false;
         }
@@ -6650,8 +6826,6 @@ namespace llaminar2
             d_output = static_cast<float *>(output->gpu_data_ptr());
         }
 
-        const int *d_expert_ids = runtimeTopKExpertIdsDevice(runtime_layer);
-        const float *d_weights = runtimeTopKWeightsDevice(runtime_layer);
         if (!d_hidden || !d_output || !d_expert_ids || !d_weights ||
             !d_prefill_gate_ || !d_prefill_up_)
         {
@@ -6709,11 +6883,10 @@ namespace llaminar2
         }
         const bool capture_active = isDecodeGraphCaptureActive();
         const bool reuse_router_q8_hidden =
+            allow_router_q8_reuse &&
             canReuseRouterQ8Hidden(d_hidden, /*rows=*/1, d_model);
         int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
-        const bool use_runtime_descriptors =
-            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
         /*
          * Parallel down publishes route contributions with atomics.  Even when
          * the numerical delta is only a few ULPs, the operation is not
@@ -6965,7 +7138,7 @@ namespace llaminar2
         markDeviceWritten(output, device, stream);
         recordGroupedDecodeCounter(
             "rocm_moe_grouped_decode_fused_calls",
-            use_runtime_descriptors ? "runtime" : "runtime_static_table",
+            counter_source,
             top_k, d_model, intermediate,
             use_parallel_down ? "fused_parallel_down" : "fused_serial_down");
         return true;
@@ -8313,12 +8486,6 @@ namespace llaminar2
                       "an explicit stream is required");
             return false;
         }
-        if (isGraphCaptureActive() || isHipStreamCapturing(stream))
-        {
-            LOG_ERROR("[ROCmMoEKernel::updateGroupedPrefillExpertMask] "
-                      "host expert-mask publication is forbidden during graph capture");
-            return false;
-        }
 
         uint64_t mask_hash = 1469598103934665603ull;
         int active_experts = 0;
@@ -8330,6 +8497,23 @@ namespace llaminar2
         }
         mask_hash ^= static_cast<uint64_t>(num_experts);
         mask_hash *= 1099511628211ull;
+
+        /*
+         * Warmup publishes immutable participant ownership once. Graph
+         * construction may reuse that exact device table, but any attempt to
+         * change or allocate it while capture is active remains fatal.
+         */
+        if (group_expert_mask_published_ &&
+            group_expert_mask_hash_ == mask_hash &&
+            group_expert_mask_num_experts_ == num_experts)
+            return true;
+
+        if (isGraphCaptureActive() || isHipStreamCapturing(stream))
+        {
+            LOG_ERROR("[ROCmMoEKernel::updateGroupedPrefillExpertMask] "
+                      "host expert-mask publication is forbidden during graph capture");
+            return false;
+        }
 
         if (!d_group_expert_mask_ || group_expert_mask_cap_ < num_experts)
         {
@@ -8390,11 +8574,6 @@ namespace llaminar2
             group_expert_mask_active_experts_ = 0;
             group_expert_mask_published_ = false;
         }
-
-        if (group_expert_mask_published_ &&
-            group_expert_mask_hash_ == mask_hash &&
-            group_expert_mask_num_experts_ == num_experts)
-            return true;
 
         hipError_t err = hipMemcpyAsync(
             d_group_expert_mask_,

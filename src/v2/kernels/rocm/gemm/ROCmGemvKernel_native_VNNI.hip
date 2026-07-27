@@ -56,7 +56,15 @@
 // ============================================================================
 static std::atomic<int> g_native_vnni_kb_override{-1};
 static std::atomic<int> g_native_vnni_target_waves_override{-1};
-static std::atomic<int> g_native_vnni_decode_equivalent_m1_config{0};
+/*
+ * Decode-equivalent dispatch is a property of one host worker's verifier
+ * transaction. LocalTP drives one worker per GPU in the same process, so a
+ * process-global mode bit lets either worker clear the other worker's policy
+ * while it is still lowering a grouped launch. Keep this state thread-local,
+ * matching CUDA, and pass resolved serial-M1 launch geometry explicitly from
+ * ROCmQuantisedGemmKernel whenever a grouped projection is emitted.
+ */
+static thread_local int g_native_vnni_decode_equivalent_m1_config = 0;
 
 struct NativeVNNIDecodeGeneratedRuntimeConfig
 {
@@ -85,7 +93,7 @@ static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRu
         return resolved;
 
     const int lookup_m =
-        (g_native_vnni_decode_equivalent_m1_config.load(std::memory_order_relaxed) != 0 &&
+        (g_native_vnni_decode_equivalent_m1_config != 0 &&
          m > 1)
             ? 1
             : m;
@@ -190,7 +198,7 @@ extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_wav
 
 extern "C" void rocmGemv_native_vnni_set_decode_equivalent_m1_config(int enabled)
 {
-    g_native_vnni_decode_equivalent_m1_config.store(enabled ? 1 : 0, std::memory_order_relaxed);
+    g_native_vnni_decode_equivalent_m1_config = enabled ? 1 : 0;
 }
 
 extern "C" void rocmGemv_native_vnni_reset_tuning_overrides()
@@ -200,7 +208,7 @@ extern "C" void rocmGemv_native_vnni_reset_tuning_overrides()
 
 static bool nativeVNNIDecodeEquivalentSmallMMode()
 {
-    return g_native_vnni_decode_equivalent_m1_config.load(std::memory_order_relaxed) != 0;
+    return g_native_vnni_decode_equivalent_m1_config != 0;
 }
 
 /**

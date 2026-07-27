@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cmath>
@@ -5227,6 +5228,55 @@ namespace llaminar2::test::parity::qwen36
         return keys;
     }
 
+    /**
+     * @brief Resolve the grouped-verifier diagnostic snapshot filter.
+     *
+     * Capturing every stage adds hundreds of graph-resident D2D copies and can
+     * hide a stream or workspace race by substantially changing launch timing.
+     * `LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_KEYS` accepts a comma-separated
+     * list so a failing production graph can be bisected with one minimally
+     * perturbing checkpoint at a time. An unset or empty value retains the
+     * comprehensive diagnostic filter.
+     *
+     * @return Explicit diagnostic keys, or the comprehensive default set.
+     */
+    inline std::vector<std::string> qwen36MoEGroupedVerifierDiagnosticSnapshotKeys()
+    {
+        const char *raw =
+            std::getenv("LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_KEYS");
+        if (!raw || raw[0] == '\0')
+            return qwen36MoEGroupedVerifierSnapshotKeys();
+
+        std::vector<std::string> keys;
+        std::stringstream input(raw);
+        std::string key;
+        while (std::getline(input, key, ','))
+        {
+            const auto first = std::find_if_not(
+                key.begin(),
+                key.end(),
+                [](unsigned char c)
+                {
+                    return std::isspace(c) != 0;
+                });
+            const auto last = std::find_if_not(
+                key.rbegin(),
+                key.rend(),
+                [](unsigned char c)
+                {
+                    return std::isspace(c) != 0;
+                }).base();
+            if (first < last)
+                keys.emplace_back(first, last);
+        }
+        if (keys.empty())
+        {
+            throw std::runtime_error(
+                "LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_KEYS contains no valid keys");
+        }
+        return keys;
+    }
+
     inline std::string compareMoEPrefixLeadingSnapshotRows(
         const std::map<std::string, std::vector<float>> &full_prefill,
         int full_rows,
@@ -7486,7 +7536,7 @@ namespace llaminar2::test::parity::qwen36
         {
             grouped_snapshot_capture.enable(
                 *runner,
-                qwen36MoEGroupedVerifierSnapshotKeys());
+                qwen36MoEGroupedVerifierDiagnosticSnapshotKeys());
             grouped_snapshot_capture.clear();
         }
 

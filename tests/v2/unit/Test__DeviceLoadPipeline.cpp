@@ -55,6 +55,16 @@ std::string readDeviceLoadPipelineSource()
     return contents.str();
 }
 
+std::string readSourceFile(const char* path)
+{
+    std::ifstream input(path);
+    if (!input)
+        return {};
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    return contents.str();
+}
+
 inline float cpu_fp16_to_fp32(uint16_t h)
 {
     uint32_t sign = (h & 0x8000u) << 16;
@@ -269,6 +279,43 @@ TEST(Test__DeviceLoadPipelineSourceContract, ConcreteRangeOwnsBufferedReadProven
     EXPECT_EQ(source.find("adviseDontneedRange"), std::string::npos);
     EXPECT_EQ(source.find("buildMmapReclaimPlan"), std::string::npos);
     EXPECT_EQ(source.find("gpu_pipeline_mmap_reclaimed_bytes"), std::string::npos);
+}
+
+/**
+ * @brief Keep each GPU repack launch independent of prior runner error state.
+ *
+ * Both runtimes retain a thread-local launch error until get-last-error consumes
+ * it.  The clear must precede candidate dispatch, and the status read must follow
+ * it, so a model teardown cannot poison the first load kernel of the next runner.
+ */
+TEST(Test__DeviceLoadPipelineSourceContract, RepackLaunchStatusIsInvocationLocal)
+{
+    const auto verify = [](const std::string& source,
+                           const std::string& clear_expression,
+                           const std::string& status_expression) {
+        ASSERT_FALSE(source.empty());
+        const size_t dispatch = source.find("switch (format)");
+        ASSERT_NE(dispatch, std::string::npos);
+
+        const size_t clear = source.rfind(clear_expression, dispatch);
+        ASSERT_NE(clear, std::string::npos);
+        EXPECT_LT(clear, dispatch);
+
+        const size_t status = source.find(status_expression, dispatch);
+        ASSERT_NE(status, std::string::npos);
+        EXPECT_LT(dispatch, status);
+    };
+
+    verify(
+        readSourceFile(
+            "/workspaces/llaminar/src/v2/kernels/rocm/repack/VnniRepackKernels.hip"),
+        "(void)hipGetLastError();",
+        "hipError_t err = hipGetLastError();");
+    verify(
+        readSourceFile(
+            "/workspaces/llaminar/src/v2/kernels/cuda/repack/CUDAVnniRepackKernels.cu"),
+        "(void)cudaGetLastError();",
+        "cudaError_t err = cudaGetLastError();");
 }
 
 // ============================================================================

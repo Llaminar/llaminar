@@ -2523,25 +2523,6 @@ namespace llaminar2
             return true;
         }
 
-        /*
-         * CPU decode uses host-owned reusable tensors. GPU execution reaches
-         * this block only for the explicit routing-tensor path; until that path
-         * is promoted to the same fused workspace-native API, the allocation
-         * guard below intentionally fails instead of creating device scratch.
-         */
-        if (static_cast<int>(scratch_gate_batch_.size()) < top_k)
-        {
-            scratch_gate_batch_.resize(top_k);
-            scratch_up_batch_.resize(top_k);
-            for (int i = 0; i < top_k; ++i)
-            {
-                scratch_gate_batch_[i] = makeScratchFP32(1, intermediate, params_.device_id);
-                scratch_up_batch_[i] = makeScratchFP32(1, intermediate, params_.device_id);
-            }
-        }
-        if (!scratch_out_)
-            scratch_out_ = makeScratchFP32(1, d_model, params_.device_id);
-
         const bool require_device_routing_tensor_decode =
             params_.require_device_routing_tensor_decode;
         std::vector<uint8_t> device_routing_expert_mask;
@@ -2586,7 +2567,6 @@ namespace llaminar2
 
         if (can_try_device_routing_tensor_decode)
         {
-            bool device_routing_done = false;
             const bool have_grouped_tables =
                 grouped_gateup_desc_table_id_ >= 0 &&
                 grouped_gateup_desc_table_num_experts_ == num_experts &&
@@ -2615,52 +2595,28 @@ namespace llaminar2
                                        ensureGroupedDownDescriptorTable(kernel, d_model, intermediate);
             }
 
-            if (grouped_tables_ready)
+            if (!grouped_tables_ready)
             {
-                ITensor *gate_outputs[16] = {};
-                ITensor *up_outputs[16] = {};
-                for (int k = 0; k < top_k; ++k)
-                {
-                    gate_outputs[k] = scratch_gate_batch_[k].get();
-                    up_outputs[k] = scratch_up_batch_[k].get();
-                }
+                LOG_ERROR("[MoEExpertComputeStage] Explicit-routing GPU decode "
+                          "descriptor tables are unavailable for layer "
+                          << params_.layer_idx);
+                return false;
+            }
 
-                const bool gateup_done = kernel->groupedExpertGateUpDecodeFromRouting(
+            if (!kernel->groupedExpertDecodeFromRouting(
                     input_tensor,
                     params_.routing_indices,
+                    params_.routing_weights,
                     grouped_gateup_desc_table_id_,
+                    grouped_down_desc_table_id_,
                     top_k,
-                    gate_outputs,
-                    up_outputs,
+                    params_.output,
                     d_model,
                     intermediate,
-                    device_routing_expert_mask_ptr);
-
-                if (gateup_done)
-                {
-                    device_routing_done = kernel->groupedExpertDownDecodeFromRouting(
-                        gate_outputs,
-                        up_outputs,
-                        params_.routing_indices,
-                        params_.routing_weights,
-                        grouped_down_desc_table_id_,
-                        top_k,
-                        params_.output,
-                        d_model,
-                        intermediate,
-                        device_routing_expert_mask_ptr);
-                }
-            }
-
-            if (device_routing_done)
+                    device_routing_expert_mask_ptr))
             {
-                gpuExecution().publish(params_.output);
-                return true;
-            }
-
-            if (require_device_routing_tensor_decode || isGraphCaptureActive())
-            {
-                LOG_ERROR("[MoEExpertComputeStage] Device routing tensor decode failed for layer "
+                LOG_ERROR("[MoEExpertComputeStage] Mandatory fused explicit-routing "
+                          "GPU decode failed for layer "
                           << params_.layer_idx
                           << " (tables_ready=" << grouped_tables_ready
                           << ", top_k=" << top_k
@@ -2670,13 +2626,17 @@ namespace llaminar2
                 return false;
             }
 
-            kernel->zeroBuffer(params_.output, static_cast<size_t>(d_model) * sizeof(float));
+            gpuExecution().publish(params_.output);
+            return true;
         }
-        else if (require_device_routing_tensor_decode)
+
+        if (is_gpu)
         {
-            LOG_ERROR("[MoEExpertComputeStage] Device routing tensor decode required but unavailable for layer "
+            LOG_ERROR("[MoEExpertComputeStage] GPU decode has neither a usable "
+                      "runtime-table route nor a usable explicit-routing fused path for layer "
                       << params_.layer_idx
                       << " (device=" << params_.device_id.toString()
+                      << ", explicit_required=" << require_device_routing_tensor_decode
                       << ", grouped_decode=" << debugEnv().rocm.moe_grouped_decode
                       << ", device_routed_decode=" << debugEnv().rocm.moe_device_routed_decode
                       << ", top_k=" << top_k
@@ -2688,32 +2648,26 @@ namespace llaminar2
             return false;
         }
 
-        if (is_gpu && isGraphCaptureActive())
+        /*
+         * CPU decode owns reusable host tensors because CPU GEMV APIs consume
+         * TensorBase outputs directly. GPU execution has already returned
+         * through one of the fused workspace-native contracts above and can
+         * never reach these allocations.
+         */
+        if (static_cast<int>(scratch_gate_batch_.size()) < top_k)
         {
-            LOG_ERROR("[MoEExpertComputeStage] GPU MoE decode entered graph capture without "
-                      "a usable device-routed runtime table; refusing host-routed fallback for layer "
-                      << params_.layer_idx);
-            return false;
-        }
-
-        if (is_gpu &&
-            supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
-            params_.moe_runtime_table &&
-            !can_try_device_routed_decode)
-        {
-            if (params_.replica_set.num_replicated == 0)
+            scratch_gate_batch_.resize(top_k);
+            scratch_up_batch_.resize(top_k);
+            for (int i = 0; i < top_k; ++i)
             {
-                LOG_ERROR("[MoEExpertComputeStage] GPU MoE decode has a runtime table but cannot "
-                          "use the device-owned route/expert path; refusing host-routed fallback for layer "
-                          << params_.layer_idx
-                          << " (initialized=" << moe_runtime_table_initialized_
-                          << ", runtime_layer=" << (moe_runtime_layer_ != nullptr)
-                          << ", full_ownership=" << hasFullLocalExpertOwnership()
-                          << ", expert_mask_all_enabled=" << expertMaskAllEnabled()
-                          << ", replicas=" << params_.replica_set.num_replicated << ")");
-                return false;
+                scratch_gate_batch_[i] =
+                    makeScratchFP32(1, intermediate, params_.device_id);
+                scratch_up_batch_[i] =
+                    makeScratchFP32(1, intermediate, params_.device_id);
             }
         }
+        if (!scratch_out_)
+            scratch_out_ = makeScratchFP32(1, d_model, params_.device_id);
 
         if (!params_.routing_indices || !params_.routing_weights)
         {

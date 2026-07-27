@@ -13416,10 +13416,13 @@ TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures
     auto two_step_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
     auto fused_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
     auto routing_tensor_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+    auto fused_routing_tensor_output =
+        TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
     ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
     ASSERT_TRUE(two_step_output->ensureOnDevice(device, stream));
     ASSERT_TRUE(fused_output->ensureOnDevice(device, stream));
     ASSERT_TRUE(routing_tensor_output->ensureOnDevice(device, stream));
+    ASSERT_TRUE(fused_routing_tensor_output->ensureOnDevice(device, stream));
 
     std::array<std::shared_ptr<FP32Tensor>, top_k> gate_tensors;
     std::array<std::shared_ptr<FP32Tensor>, top_k> up_tensors;
@@ -13500,17 +13503,23 @@ TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures
         routing_indices->mutable_data()[slot] = static_cast<float>(host_runtime.topk_expert_ids[slot]);
         routing_weights->mutable_data()[slot] = host_runtime.topk_weights[slot];
     }
+    std::vector<uint8_t> verifier_expert_mask(
+        static_cast<size_t>(num_experts), 0u);
+    for (int expert = 0; expert < num_experts; expert += 2)
+        verifier_expert_mask[static_cast<size_t>(expert)] = 1u;
     ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
     ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
 
     moe_kernel.zeroBuffer(routing_tensor_output.get(), static_cast<size_t>(d_model) * sizeof(float));
     ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromRouting(
         hidden.get(), routing_indices.get(), gateup_table, top_k,
-        routing_gate_ptrs.data(), routing_up_ptrs.data(), d_model, intermediate));
+        routing_gate_ptrs.data(), routing_up_ptrs.data(), d_model, intermediate,
+        verifier_expert_mask.data()));
     ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromRouting(
         routing_gate_ptrs.data(), routing_up_ptrs.data(),
         routing_indices.get(), routing_weights.get(), down_table, top_k,
-        routing_tensor_output.get(), d_model, intermediate));
+        routing_tensor_output.get(), d_model, intermediate,
+        verifier_expert_mask.data()));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     ASSERT_TRUE(routing_tensor_output->ensureOnHost(stream));
@@ -13520,6 +13529,86 @@ TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures
         fused_output->data(),
         static_cast<size_t>(d_model),
         static_cast<size_t>(d_model));
+
+    /*
+     * The production stage now consumes explicit verifier routes through one
+     * workspace-native call.  Its output must preserve the exact arithmetic of
+     * the established explicit gate/up plus down sequence; a relaxed numerical
+     * comparison would allow later layers to amplify a one-row discrepancy.
+     */
+    moe_kernel.zeroBuffer(
+        fused_routing_tensor_output.get(),
+        static_cast<size_t>(d_model) * sizeof(float));
+    ASSERT_TRUE(moe_kernel.groupedExpertDecodeFromRouting(
+        hidden.get(),
+        routing_indices.get(),
+        routing_weights.get(),
+        gateup_table,
+        down_table,
+        top_k,
+        fused_routing_tensor_output.get(),
+        d_model,
+        intermediate,
+        verifier_expert_mask.data()));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_TRUE(fused_routing_tensor_output->ensureOnHost(stream));
+
+    const int max_dim = std::max(d_model, intermediate);
+    auto *fused_gate_workspace = static_cast<const float *>(
+        moe_workspace->getBuffer(MoEWorkspaceBuffers::PREFILL_GATE));
+    auto *fused_up_workspace = static_cast<const float *>(
+        moe_workspace->getBuffer(MoEWorkspaceBuffers::PREFILL_UP));
+    ASSERT_NE(fused_gate_workspace, nullptr);
+    ASSERT_NE(fused_up_workspace, nullptr);
+    std::vector<float> fused_gate_host(
+        static_cast<size_t>(top_k) * max_dim);
+    std::vector<float> fused_up_host(
+        static_cast<size_t>(top_k) * intermediate);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            fused_gate_host.data(),
+            fused_gate_workspace,
+            fused_gate_host.size() * sizeof(float),
+            hipMemcpyDeviceToHost,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            fused_up_host.data(),
+            fused_up_workspace,
+            fused_up_host.size() * sizeof(float),
+            hipMemcpyDeviceToHost,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    for (int slot = 0; slot < top_k; ++slot)
+    {
+        ASSERT_TRUE(routing_gate_tensors[slot]->ensureOnHost(stream));
+        ASSERT_TRUE(routing_up_tensors[slot]->ensureOnHost(stream));
+        EXPECT_EQ(
+            std::memcmp(
+                fused_gate_host.data() + static_cast<size_t>(slot) * max_dim,
+                routing_gate_tensors[slot]->data(),
+                static_cast<size_t>(intermediate) * sizeof(float)),
+            0)
+            << "Fused explicit gate row differs at route slot " << slot;
+        EXPECT_EQ(
+            std::memcmp(
+                fused_up_host.data() + static_cast<size_t>(slot) * intermediate,
+                routing_up_tensors[slot]->data(),
+                static_cast<size_t>(intermediate) * sizeof(float)),
+            0)
+            << "Fused explicit up row differs at route slot " << slot;
+    }
+
+    EXPECT_EQ(
+        std::memcmp(
+            fused_routing_tensor_output->data(),
+            routing_tensor_output->data(),
+            static_cast<size_t>(d_model) * sizeof(float)),
+        0)
+        << "Fused explicit-routing decode must be byte-identical to the split "
+           "explicit-routing oracle.";
 
     const auto counters = PerfStatsCollector::snapshot(
         {"kernel.rocm_moe_grouped_decode_fused_calls"});
@@ -17994,12 +18083,26 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 routing_weights.get());
             ASSERT_TRUE(route_ok)
                 << format_name << " production grouped router M=" << seq_len;
-            ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsync(
-                routing_indices.get(),
-                routing_weights.get(),
-                seq_len,
-                num_experts,
-                top_k));
+            if (masked_local_tp)
+            {
+                ASSERT_TRUE(moe_kernel.updateGroupedPrefillExpertMask(
+                    local_expert_mask.data(), num_experts));
+                ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsyncUsingPublishedMask(
+                    routing_indices.get(),
+                    routing_weights.get(),
+                    seq_len,
+                    num_experts,
+                    top_k));
+            }
+            else
+            {
+                ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsync(
+                    routing_indices.get(),
+                    routing_weights.get(),
+                    seq_len,
+                    num_experts,
+                    top_k));
+            }
             ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
                 hidden.get(),
                 grouped_output.get(),
@@ -18011,32 +18114,38 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 num_experts,
                 top_k));
 
-            ASSERT_TRUE(moe_kernel.groupPrefillRoutes(
-                runtime_table.deviceLayerState(0),
-                routing_indices.get(),
-                routing_weights.get(),
-                seq_len,
-                runtime_config.prefill_token_capacity,
-                num_experts,
-                top_k))
-                << format_name << " runtime route grouping M=" << seq_len;
-            ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromRuntime(
-                runtime_table.deviceLayerState(0),
-                runtime_host_state,
-                hidden.get(),
-                runtime_grouped_output.get(),
-                gateup_table,
-                down_table,
-                seq_len,
-                d_model,
-                intermediate,
-                num_experts,
-                top_k))
-                << format_name << " runtime-placement grouped verifier M="
-                << seq_len;
+            if (!masked_local_tp)
+            {
+                ASSERT_TRUE(moe_kernel.groupPrefillRoutes(
+                    runtime_table.deviceLayerState(0),
+                    routing_indices.get(),
+                    routing_weights.get(),
+                    seq_len,
+                    runtime_config.prefill_token_capacity,
+                    num_experts,
+                    top_k))
+                    << format_name << " runtime route grouping M=" << seq_len;
+                ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromRuntime(
+                    runtime_table.deviceLayerState(0),
+                    runtime_host_state,
+                    hidden.get(),
+                    runtime_grouped_output.get(),
+                    gateup_table,
+                    down_table,
+                    seq_len,
+                    d_model,
+                    intermediate,
+                    num_experts,
+                    top_k))
+                    << format_name << " runtime-placement grouped verifier M="
+                    << seq_len;
+            }
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
             ASSERT_TRUE(grouped_output->ensureOnHost(stream));
-            ASSERT_TRUE(runtime_grouped_output->ensureOnHost(stream));
+            if (!masked_local_tp)
+                ASSERT_TRUE(runtime_grouped_output->ensureOnHost(stream));
+            ASSERT_TRUE(routing_indices->ensureOnHost(stream));
+            ASSERT_TRUE(routing_weights->ensureOnHost(stream));
 
             std::vector<float> serial_expected(
                 static_cast<size_t>(seq_len) * static_cast<size_t>(d_model));
@@ -18070,18 +18179,77 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 moe_kernel.zeroBuffer(
                     row_output.get(),
                     static_cast<size_t>(d_model) * sizeof(float));
-                ASSERT_TRUE(moe_kernel.groupedExpertDecodeFromRuntime(
-                    device_runtime,
-                    row_hidden.get(),
-                    gateup_table,
-                    down_table,
-                    top_k,
-                    row_output.get(),
-                    d_model,
-                    intermediate,
-                    MoEDecodeDescriptorSource::RuntimePlacementTable))
-                    << format_name << " production serial expert decode M="
-                    << seq_len << " row=" << row;
+                if (masked_local_tp)
+                {
+                    auto row_indices = TestTensorFactory::createFP32(
+                        {1u, static_cast<size_t>(top_k)});
+                    auto row_weights = TestTensorFactory::createFP32(
+                        {1u, static_cast<size_t>(top_k)});
+                    ASSERT_TRUE(row_indices->ensureOnDevice(device, stream));
+                    ASSERT_TRUE(row_weights->ensureOnDevice(device, stream));
+                    ASSERT_TRUE(moe_kernel.decodeRouteSelect(
+                        device_runtime,
+                        row_hidden.get(),
+                        router_gate.get(),
+                        d_model,
+                        num_experts,
+                        top_k,
+                        /*normalize_weights=*/true,
+                        row_indices.get(),
+                        row_weights.get(),
+                        /*write_legacy_outputs=*/true,
+                        /*update_runtime_histogram=*/false))
+                        << format_name << " production serial explicit router M="
+                        << seq_len << " row=" << row;
+                    ASSERT_TRUE(moe_kernel.groupedExpertDecodeFromRouting(
+                        row_hidden.get(),
+                        row_indices.get(),
+                        row_weights.get(),
+                        gateup_table,
+                        down_table,
+                        top_k,
+                        row_output.get(),
+                        d_model,
+                        intermediate,
+                        local_expert_mask.data()))
+                        << format_name << " production serial masked explicit expert decode M="
+                        << seq_len << " row=" << row;
+                    ASSERT_TRUE(row_indices->ensureOnHost(stream));
+                    ASSERT_TRUE(row_weights->ensureOnHost(stream));
+                    for (int route = 0; route < top_k; ++route)
+                    {
+                        const size_t grouped_slot =
+                            static_cast<size_t>(row * top_k + route);
+                        const size_t serial_slot = static_cast<size_t>(route);
+                        EXPECT_EQ(
+                            row_indices->data()[serial_slot],
+                            routing_indices->data()[grouped_slot])
+                            << format_name << " M=" << seq_len
+                            << " row=" << row << " route=" << route
+                            << " grouped and serial routers selected different experts";
+                        EXPECT_EQ(
+                            row_weights->data()[serial_slot],
+                            routing_weights->data()[grouped_slot])
+                            << format_name << " M=" << seq_len
+                            << " row=" << row << " route=" << route
+                            << " grouped and serial routers published different route weights";
+                    }
+                }
+                else
+                {
+                    ASSERT_TRUE(moe_kernel.groupedExpertDecodeFromRuntime(
+                        device_runtime,
+                        row_hidden.get(),
+                        gateup_table,
+                        down_table,
+                        top_k,
+                        row_output.get(),
+                        d_model,
+                        intermediate,
+                        MoEDecodeDescriptorSource::RuntimePlacementTable))
+                        << format_name << " production serial expert decode M="
+                        << seq_len << " row=" << row;
+                }
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
                 ASSERT_TRUE(row_output->ensureOnHost(stream));
                 std::copy_n(row_output->data(),
@@ -18098,16 +18266,19 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 serial_expected.data(),
                 grouped_output->numel(),
                 static_cast<size_t>(d_model));
-            expectBitwiseVerifierRowsEqual(
-                ("ROCm " + format_name +
-                 " runtime-placement grouped verifier M=" +
-                 std::to_string(seq_len) +
-                 " must match runtime-placement serial decode")
-                    .c_str(),
-                runtime_grouped_output->data(),
-                serial_expected.data(),
-                runtime_grouped_output->numel(),
-                static_cast<size_t>(d_model));
+            if (!masked_local_tp)
+            {
+                expectBitwiseVerifierRowsEqual(
+                    ("ROCm " + format_name +
+                     " runtime-placement grouped verifier M=" +
+                     std::to_string(seq_len) +
+                     " must match runtime-placement serial decode")
+                        .c_str(),
+                    runtime_grouped_output->data(),
+                    serial_expected.data(),
+                    runtime_grouped_output->numel(),
+                    static_cast<size_t>(d_model));
+            }
 
             const auto reuse_records = PerfStatsCollector::snapshot(
                 {"kernel.rocm_moe_grouped_prefill_router_q8_reuse_calls"});
@@ -18130,24 +18301,27 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             EXPECT_NE(reuse_record, reuse_records.end())
                 << format_name << " M=" << seq_len
                 << " must consume the grouped router's published Q8 rows";
-            const auto runtime_reuse_record = std::find_if(
-                reuse_records.begin(),
-                reuse_records.end(),
-                [&](const PerfStatRecord &record)
-                {
-                    const auto seq_it = record.tags.find("seq_len");
-                    const auto source_it = record.tags.find("descriptor_source");
-                    return record.name ==
-                               "rocm_moe_grouped_prefill_router_q8_reuse_calls" &&
-                           seq_it != record.tags.end() &&
-                           seq_it->second == expected_seq_len &&
-                           source_it != record.tags.end() &&
-                           source_it->second == "runtime_table" &&
-                           record.count > 0;
-                });
-            EXPECT_NE(runtime_reuse_record, reuse_records.end())
-                << format_name << " M=" << seq_len
-                << " must consume router-Q8 rows through runtime placement";
+            if (!masked_local_tp)
+            {
+                const auto runtime_reuse_record = std::find_if(
+                    reuse_records.begin(),
+                    reuse_records.end(),
+                    [&](const PerfStatRecord &record)
+                    {
+                        const auto seq_it = record.tags.find("seq_len");
+                        const auto source_it = record.tags.find("descriptor_source");
+                        return record.name ==
+                                   "rocm_moe_grouped_prefill_router_q8_reuse_calls" &&
+                               seq_it != record.tags.end() &&
+                               seq_it->second == expected_seq_len &&
+                               source_it != record.tags.end() &&
+                               source_it->second == "runtime_table" &&
+                               record.count > 0;
+                    });
+                EXPECT_NE(runtime_reuse_record, reuse_records.end())
+                    << format_name << " M=" << seq_len
+                    << " must consume router-Q8 rows through runtime placement";
+            }
 
             if (seq_len == 8 || seq_len == row_inventory.back())
             {
@@ -18259,9 +18433,12 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 EXPECT_TRUE(saw_ordered_publication("static"))
                     << format_name << " M=" << seq_len
                     << " static descriptors must use ordered down publication";
-                EXPECT_TRUE(saw_ordered_publication("runtime"))
-                    << format_name << " M=" << seq_len
-                    << " runtime descriptors must use ordered down publication";
+                if (!masked_local_tp)
+                {
+                    EXPECT_TRUE(saw_ordered_publication("runtime"))
+                        << format_name << " M=" << seq_len
+                        << " runtime descriptors must use ordered down publication";
+                }
             }
         }
 
@@ -18296,6 +18473,10 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyGroupedPrefill_Qwen36AllNativeVNNIFormats_Ru
 TEST(Test__ROCmMoEKernel, MaskedLocalTPGroupedPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowDecode)
 {
     ScopedEnvOverride perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    ScopedROCmEnvOverride q8_router("LLAMINAR_ROCM_MOE_ROUTER_Q8", "1");
+    ScopedROCmEnvOverride q8_reuse(
+        "LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN", "1");
     for (const auto &format : allMoEVerifierFormatCases())
     {
         SCOPED_TRACE(format.name);
@@ -18304,7 +18485,8 @@ TEST(Test__ROCmMoEKernel, MaskedLocalTPGroupedPrefill_Qwen36AllNativeVNNIFormats
             format.make,
             format.make,
             format.make,
-            /*masked_local_tp=*/true);
+            /*masked_local_tp=*/true,
+            /*exercise_router_q8_publication=*/true);
     }
 }
 
@@ -18344,6 +18526,11 @@ TEST(Test__ROCmMoEKernel, MaskedLocalTPGroupedPrefill_Qwen36ShapeIQ2SGateUpIQ4XS
      * explicit so the full parity harness is not the first place to discover
      * masked LocalTP drift.
      */
+    ScopedEnvOverride perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    ScopedROCmEnvOverride q8_router("LLAMINAR_ROCM_MOE_ROUTER_Q8", "1");
+    ScopedROCmEnvOverride q8_reuse(
+        "LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN", "1");
     runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         "IQ2S_gateup_IQ4XS_down",
         [](std::vector<size_t> shape, int seed) -> std::unique_ptr<TensorBase>
@@ -18359,7 +18546,7 @@ TEST(Test__ROCmMoEKernel, MaskedLocalTPGroupedPrefill_Qwen36ShapeIQ2SGateUpIQ4XS
             return TestTensorFactory::createIQ4_XSRandom(shape, seed);
         },
         /*masked_local_tp=*/true,
-        /*exercise_router_q8_publication=*/false,
+        /*exercise_router_q8_publication=*/true,
         kGroupedVerifierBoundaryRows);
 }
 

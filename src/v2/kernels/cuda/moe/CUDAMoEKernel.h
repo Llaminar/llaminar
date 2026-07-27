@@ -352,6 +352,19 @@ namespace llaminar2
             int intermediate,
             const uint8_t *expert_mask = nullptr) override;
 
+        /// @brief Execute fused workspace-native decode from device routing tensors.
+        bool groupedExpertDecodeFromRouting(
+            const TensorBase *input,
+            ITensor *routing_indices,
+            ITensor *routing_weights,
+            int gateup_table_id,
+            int down_table_id,
+            int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate,
+            const uint8_t *expert_mask = nullptr) override;
+
         /// @brief Execute graph-capturable grouped SwiGLU/down decode from runtime-table ids and weights.
         bool groupedExpertDownDecodeFromRuntime(
             ITensor *const *gate_tensors,
@@ -571,6 +584,29 @@ namespace llaminar2
         void unbindWorkspace() override { bindWorkspace(nullptr); }
 
     private:
+        /**
+         * @brief Shared fused decode implementation after route metadata is resolved.
+         *
+         * Both runtime-table routing and explicit routing tensors terminate
+         * here.  Keeping one implementation makes their arithmetic plan,
+         * persistent pointer tables, and output publication structurally
+         * identical.
+         */
+        bool groupedExpertDecodeResolved(
+            DeviceMoELayerRuntime *runtime_layer,
+            const TensorBase *input,
+            int gateup_table_id,
+            int down_table_id,
+            int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate,
+            const int *device_expert_ids,
+            const float *device_weights,
+            bool use_runtime_descriptors,
+            bool allow_router_q8_reuse,
+            const char *counter_source);
+
         static constexpr std::size_t kRuntimePointerArrayMaxTopK = 16;
         static constexpr std::size_t kRuntimePointerArrayTableSlots = 1024;
         static constexpr std::size_t kRuntimePointerArrayWorkspaceScopes = 3;

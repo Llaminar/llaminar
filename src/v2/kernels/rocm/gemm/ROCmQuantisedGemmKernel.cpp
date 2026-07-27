@@ -4073,8 +4073,7 @@ namespace llaminar2
                     };
 
                     bool gemv_ok = true;
-                    if (g_rocm_native_vnni_decode_equivalent_scope &&
-                        projections.size() > 1)
+                    if (g_rocm_native_vnni_decode_equivalent_scope)
                     {
                         struct GeneratedGroupPolicy
                         {
@@ -4092,13 +4091,23 @@ namespace llaminar2
                             /*
                              * Decode-equivalent verifier publication is a
                              * state-commit path, not a generic M-aware GEMV
-                             * throughput path.  Grouping projections by the
+                             * throughput path. Grouping projections by the
                              * grouped-M table can choose a different split-K
                              * policy than the row-by-row decode oracle, which
                              * changes FP32 reduction order and breaks strict
-                             * row equivalence.  Use the explicit serial-M1
-                             * policy here; the launcher will enforce the same
-                             * policy again before it touches device state.
+                             * row equivalence.
+                             *
+                             * Resolve and pass the serial-M1 policy explicitly
+                             * even when this call contains only one projection.
+                             * ROCm LocalTP invokes this method concurrently from
+                             * one host worker per device. The HIP launcher's
+                             * compatibility mode bit is process-global, so it
+                             * cannot be the authority for a per-worker verifier
+                             * transaction: one worker may leave its scope while
+                             * another is still dispatching. Explicit launch
+                             * parameters make the grouped operation independent
+                             * of that shared compatibility bit and preserve the
+                             * serial reduction geometry by construction.
                              */
                             if (!rocmGemv_native_vnni_query_serial_m1_config(
                                     codebooks[i],
