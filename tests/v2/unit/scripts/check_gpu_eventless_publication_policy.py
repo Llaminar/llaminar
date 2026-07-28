@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import concurrent.futures
 import dataclasses
+import os
 import pathlib
 import re
 import sys
@@ -189,6 +191,7 @@ def call_arguments(source: str, open_paren: int) -> list[str] | None:
 def scan_gpu_kernel_publications(
     repo_root: pathlib.Path,
     path: pathlib.Path,
+    raw_source: str | None = None,
 ) -> list[KernelPublicationViolation]:
     """Reject implicit/default-stream publication from GPU kernel code.
 
@@ -208,7 +211,8 @@ def scan_gpu_kernel_publications(
     ):
         return []
 
-    raw_source = path.read_text(encoding="utf-8", errors="replace")
+    if raw_source is None:
+        raw_source = path.read_text(encoding="utf-8", errors="replace")
     source = strip_comments_and_literals(raw_source)
     starts = line_starts(source)
     violations: list[KernelPublicationViolation] = []
@@ -284,10 +288,15 @@ def enclosing_scope(
     return min(candidates, key=lambda interval: interval[1] - interval[0])
 
 
-def scan_file(repo_root: pathlib.Path, path: pathlib.Path) -> list[Violation]:
+def scan_file(
+    repo_root: pathlib.Path,
+    path: pathlib.Path,
+    raw_source: str | None = None,
+) -> list[Violation]:
     """Find blocking-sync-then-eventless-publication sequences in one file."""
 
-    raw_source = path.read_text(encoding="utf-8", errors="replace")
+    if raw_source is None:
+        raw_source = path.read_text(encoding="utf-8", errors="replace")
     if not any(
         token in raw_source
         for token in (
@@ -367,13 +376,88 @@ def scan_file(repo_root: pathlib.Path, path: pathlib.Path) -> list[Violation]:
     return violations
 
 
+def physical_core_count() -> int:
+    """Return a conservative physical-core ceiling for sanitizer workers."""
+
+    affinity_count = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else (os.cpu_count() or 1)
+    )
+    cpuinfo = pathlib.Path("/proc/cpuinfo")
+    if not cpuinfo.exists():
+        return max(1, affinity_count)
+
+    physical_cores: set[tuple[str, str]] = set()
+    physical_id = ""
+    core_id = ""
+    for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines() + [""]:
+        if not line:
+            if physical_id and core_id:
+                physical_cores.add((physical_id, core_id))
+            physical_id = ""
+            core_id = ""
+            continue
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        if key.strip() == "physical id":
+            physical_id = value.strip()
+        elif key.strip() == "core id":
+            core_id = value.strip()
+
+    if not physical_cores:
+        return max(1, affinity_count)
+    return max(1, min(affinity_count, len(physical_cores)))
+
+
+def scan_policy_path(
+    repo_root: pathlib.Path,
+    path: pathlib.Path,
+) -> tuple[list[Violation], list[KernelPublicationViolation]]:
+    """Read one source once and run both independent publication policies."""
+
+    raw_source = path.read_text(encoding="utf-8", errors="replace")
+    return (
+        scan_file(repo_root, path, raw_source),
+        scan_gpu_kernel_publications(repo_root, path, raw_source),
+    )
+
+
+def scan_policy_path_task(
+    task: tuple[pathlib.Path, pathlib.Path],
+) -> tuple[list[Violation], list[KernelPublicationViolation]]:
+    """Pickle-friendly process-pool entry point for one source path."""
+
+    return scan_policy_path(*task)
+
+
 def validate(repo_root: pathlib.Path) -> list[str]:
     """Return actionable diagnostics for every forbidden publication sequence."""
 
+    paths = list(source_files(repo_root))
+    max_workers = min(8, physical_core_count(), max(1, len(paths)))
+    if len(paths) < 32 or max_workers == 1:
+        scan_results = [
+            scan_policy_path(repo_root, path)
+            for path in paths
+        ]
+    else:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers,
+        ) as executor:
+            scan_results = list(
+                executor.map(
+                    scan_policy_path_task,
+                    ((repo_root, path) for path in paths),
+                    chunksize=8,
+                )
+            )
+
     violations = [
         violation
-        for path in source_files(repo_root)
-        for violation in scan_file(repo_root, path)
+        for file_violations, _ in scan_results
+        for violation in file_violations
     ]
     failures = [
         (
@@ -388,8 +472,8 @@ def validate(repo_root: pathlib.Path) -> list[str]:
     ]
     kernel_violations = [
         violation
-        for path in source_files(repo_root)
-        for violation in scan_gpu_kernel_publications(repo_root, path)
+        for _, file_violations in scan_results
+        for violation in file_violations
     ]
     failures.extend(
         (

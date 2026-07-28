@@ -71,13 +71,15 @@ namespace llaminar2
         return sum;
     }
 
-    void CPUShortConvolution::resetGPUState()
+    bool CPUShortConvolution::resetGPUState(void *stream)
     {
+        (void)stream;
         request_state_bank_.clear();
         request_state_size_ = 0;
         request_state_capacity_ = 0;
         request_input_copy_.clear();
         owned_speculative_state_work_.clear();
+        return true;
     }
 
     bool CPUShortConvolution::ensureRequestStateBank(

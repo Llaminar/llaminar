@@ -555,11 +555,11 @@ namespace
 
         HipFloatBuffer d_input_output(input);
         HipFloatBuffer d_weight(weight);
+        HipFloatBuffer d_scratch(static_cast<size_t>(channels));
 
         HipStream stream;
         state->conv_kernel->setGPUStream(stream.opaque());
-        if (!state->conv_kernel->allocateGPUScratch(channels))
-            throw std::runtime_error("failed to allocate in-place short-conv scratch");
+        state->conv_kernel->bindScratchWorkspace(d_scratch.ptr, channels);
         if (!state->conv_kernel->forward(
                 d_input_output.ptr, d_weight.ptr, nullptr,
                 d_input_output.ptr, nullptr,

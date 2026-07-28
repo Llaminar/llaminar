@@ -329,14 +329,17 @@ namespace llaminar2
                     return false;
                 }
             }
-            params_.conv_kernel->allocateGPUState(params_.full_conv_state_floats);
-            if (params_.conv_kernel->stateBytes() !=
-                static_cast<size_t>(params_.full_conv_state_floats) * sizeof(float))
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Short-conv full-state allocation failed");
-                return false;
-            }
-            if (!params_.conv_kernel->importState(nullptr, full, stream))
+            /*
+             * Kernel construction binds both local-prefill and mirrored-decode
+             * banks before any graph is captured. Importing by exact geometry
+             * selects that stable full-size bank; execution is never allowed to
+             * repair capacity or replace a captured address.
+             */
+            if (!params_.conv_kernel->importStateForSize(
+                    params_.full_conv_state_floats,
+                    nullptr,
+                    full,
+                    stream))
             {
                 LOG_ERROR("[GDNLiveStateAllGatherStage] Failed to import full short-conv state");
                 return false;
@@ -421,14 +424,11 @@ namespace llaminar2
                 LOG_ERROR("[GDNLiveStateAllGatherStage] Recurrence state allgather failed");
                 return false;
             }
-            params_.recurrence_kernel->allocateGPUState(params_.full_recurrence_state_floats);
-            if (params_.recurrence_kernel->stateBytes() !=
-                static_cast<size_t>(params_.full_recurrence_state_floats) * sizeof(float))
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Recurrence full-state allocation failed");
-                return false;
-            }
-            if (!params_.recurrence_kernel->importState(nullptr, full, stream))
+            if (!params_.recurrence_kernel->importStateForSize(
+                    params_.full_recurrence_state_floats,
+                    nullptr,
+                    full,
+                    stream))
             {
                 LOG_ERROR("[GDNLiveStateAllGatherStage] Failed to import full recurrence state");
                 return false;

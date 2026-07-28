@@ -4435,38 +4435,30 @@ namespace llaminar
                         gdn_state->conv_kernel = createShortConvolution(dev_type, dev_ordinal);
                         gdn_state->rec_kernel = createGatedDeltaNet(dev_type, dev_ordinal);
 
-                        // Allocate the participant-local bank before any graph is captured.
-                        // This is a no-op for CPU kernels, whose live state is the cache vector.
-                        gdn_state->conv_kernel->allocateGPUState(
-                            gdn_state->local_conv_state_size);
-                        // In-place prefill scratch is supplied by ShortConv1dStage
-                        // through DeviceWorkspaceManager. Keeping it out of the
-                        // per-layer KV-cache state avoids one persistent
-                        // max_seq_len * qkv_dim allocation for every GDN layer.
-                        gdn_state->rec_kernel->allocateGPUState(
-                            gdn_state->local_recurrence_state_size);
-
                         /*
-                         * GPU LocalTP may use a TP-local bank for suffix prefill and a
-                         * full mirrored bank for decode/MTP. Preallocating both banks
-                         * here makes their addresses stable before graph capture and
-                         * removes the former host-only checkpoint escape hatch. The
-                         * backend keeps one active and one secondary bank and selects
-                         * the required shape at each grouped invocation.
+                         * GPU state belongs to the hybrid cache, whose arena planned
+                         * every layer's local/full/request slices during construction.
+                         * Kernels receive non-owning views only. Missing or malformed
+                         * bindings are fatal because allocating a replacement here
+                         * would hide a planner defect and invalidate captured pointers.
                          */
                         if (config.device.is_gpu())
                         {
-                            if (gdn_state->full_conv_state_size !=
-                                gdn_state->local_conv_state_size)
+                            if (!gdn_state->conv_kernel->bindDeviceState(
+                                    gdn_state->conv_device_state))
                             {
-                                gdn_state->conv_kernel->allocateGPUState(
-                                    gdn_state->full_conv_state_size);
+                                throw std::runtime_error(
+                                    "KernelFactory::createHybridKVCache: short-conv kernel rejected "
+                                    "cache-owned device state for layer " +
+                                    std::to_string(global_layer));
                             }
-                            if (gdn_state->full_recurrence_state_size !=
-                                gdn_state->local_recurrence_state_size)
+                            if (!gdn_state->rec_kernel->bindDeviceState(
+                                    gdn_state->recurrence_device_state))
                             {
-                                gdn_state->rec_kernel->allocateGPUState(
-                                    gdn_state->full_recurrence_state_size);
+                                throw std::runtime_error(
+                                    "KernelFactory::createHybridKVCache: recurrence kernel rejected "
+                                    "cache-owned device state for layer " +
+                                    std::to_string(global_layer));
                             }
                         }
                     }

@@ -13,6 +13,7 @@
 #include "../utils/MPIContext.h"
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../kernels/IPackedWeights.h"
+#include "../kernels/GDNDeviceStateBinding.h"
 #include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
 #include <cstddef>
@@ -3243,14 +3244,17 @@ namespace llaminar2
         /// Set the GPU stream for kernel dispatch (no-op for CPU implementations)
         virtual void setGPUStream(void *stream) { (void)stream; }
 
-        /// Allocate GPU state buffer (no-op for CPU implementations)
-        virtual void allocateGPUState(int state_size) { (void)state_size; }
-
-        /// Allocate GPU scratch used by graph/stage execution (no-op for CPU implementations)
-        virtual bool allocateGPUScratch(int scratch_size)
+        /**
+         * @brief Bind cache-owned persistent GPU state before execution.
+         *
+         * GPU implementations must reject malformed or late bindings. CPU
+         * implementations are never asked to bind device state and retain the
+         * default false result.
+         */
+        virtual bool bindDeviceState(const GDNDeviceStateBinding &binding)
         {
-            (void)scratch_size;
-            return true;
+            (void)binding;
+            return false;
         }
 
         /**
@@ -3258,7 +3262,8 @@ namespace llaminar2
          *
          * GPU implementations use this shared workspace instead of allocating
          * one persistent scratch buffer per layer. Passing nullptr unbinds the
-         * shared buffer and restores the implementation's fallback behavior.
+         * shared buffer. GPU execution fails when required scratch is absent or
+         * undersized; implementations may not allocate replacement storage.
          *
          * @param scratch Device pointer to [max_seq_len * channels] floats.
          * @param scratch_size Number of float elements available in scratch.
@@ -3425,16 +3430,20 @@ namespace llaminar2
         /// Return true when padded prefill can commit state using a dynamic real length.
         virtual bool supportsPaddedPrefillRealLength() const { return false; }
 
-        /// Reset GPU state to zero (no-op for CPU implementations)
-        virtual void resetGPUState() {}
+        /// Reset bound GPU state on the exact producer stream.
+        virtual bool resetGPUState(void *stream)
+        {
+            (void)stream;
+            return true;
+        }
 
-        /// Size of implementation-owned recurrent state, if exportable.
+        /// Size of the currently selected persistent recurrent-state bank.
         virtual size_t stateBytes() const { return 0; }
 
         /// Largest resident conv-state bank, if multiple live banks are held.
         virtual size_t largestStateBytes() const { return stateBytes(); }
 
-        /// Export implementation-owned state. When stream is non-null, GPU
+        /// Export the selected persistent state. When stream is non-null, GPU
         /// implementations may enqueue async copies; callers must synchronize
         /// the stream before consuming the exported payload.
         virtual bool exportState(void *dst_host, void *dst_device, void *stream) const
@@ -3469,7 +3478,6 @@ namespace llaminar2
         {
             if (state_size <= 0)
                 return true;
-            allocateGPUState(state_size);
             if (stateBytes() != static_cast<size_t>(state_size) * sizeof(float))
                 return false;
             return importState(src_host, src_device, stream);
@@ -3699,19 +3707,29 @@ namespace llaminar2
         /// Set the GPU stream for kernel dispatch (no-op for CPU implementations)
         virtual void setGPUStream(void *stream) { (void)stream; }
 
-        /// Allocate GPU state buffer (no-op for CPU implementations)
-        virtual void allocateGPUState(int state_size) { (void)state_size; }
+        /**
+         * @brief Bind cache-owned persistent GPU state before execution.
+         */
+        virtual bool bindDeviceState(const GDNDeviceStateBinding &binding)
+        {
+            (void)binding;
+            return false;
+        }
 
-        /// Reset GPU state to zero (no-op for CPU implementations)
-        virtual void resetGPUState() {}
+        /// Reset bound GPU state on the exact producer stream.
+        virtual bool resetGPUState(void *stream)
+        {
+            (void)stream;
+            return true;
+        }
 
-        /// Size of implementation-owned recurrent state, if exportable.
+        /// Size of the currently selected persistent recurrent-state bank.
         virtual size_t stateBytes() const { return 0; }
 
         /// Largest resident recurrence-state bank, if multiple live banks are held.
         virtual size_t largestStateBytes() const { return stateBytes(); }
 
-        /// Export implementation-owned state. When stream is non-null, GPU
+        /// Export the selected persistent state. When stream is non-null, GPU
         /// implementations may enqueue async copies; callers must synchronize
         /// the stream before consuming the exported payload.
         virtual bool exportState(void *dst_host, void *dst_device, void *stream) const
@@ -3746,7 +3764,6 @@ namespace llaminar2
         {
             if (state_size <= 0)
                 return true;
-            allocateGPUState(state_size);
             if (stateBytes() != static_cast<size_t>(state_size) * sizeof(float))
                 return false;
             return importState(src_host, src_device, stream);

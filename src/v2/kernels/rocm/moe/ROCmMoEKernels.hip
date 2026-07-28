@@ -5438,9 +5438,7 @@ namespace
                     prior,
                     slot_index,
                     runtime_layers,
-                    config) ||
-                prior.descriptor.owner_participant ==
-                    static_cast<int32_t>(config.participant_id))
+                    config))
             {
                 continue;
             }
@@ -5459,7 +5457,19 @@ namespace
                     break;
                 }
             }
-            if (!assigned_locally)
+
+            const auto &active_bank =
+                target_runtime.banks[target_runtime.active_bank];
+            const auto occupancy =
+                llaminar2::moe_rebalance_policy::classifyTransferSlotOccupancy(
+                    /*transfer_backed=*/true,
+                    assigned_locally,
+                    active_bank.resident_participant_mask[prior.expert],
+                    llaminar2::moe_rebalance_policy::participantBit(
+                        config.participant_id),
+                    prior.descriptor.owner_participant,
+                    config.participant_id);
+            if (occupancy.occupied && !occupancy.protected_from_reuse)
             {
                 selected_slot = slot_index;
                 break;

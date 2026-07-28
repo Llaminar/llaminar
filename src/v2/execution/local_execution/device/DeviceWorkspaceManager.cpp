@@ -188,6 +188,38 @@ namespace llaminar2
         return allocateBuffers(all_buffers, total_size);
     }
 
+    bool DeviceWorkspaceManager::zeroAll(void *stream)
+    {
+        if (!allocated_)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] zeroAll called before allocation on "
+                      << device_.to_string());
+            return false;
+        }
+        if (!block_ || block_size_ == 0)
+            return true;
+        if (device_.is_gpu() && !stream)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] zeroAll requires an explicit GPU stream on "
+                      << device_.to_string());
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(device_);
+        if (!backend)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] zeroAll has no backend for "
+                      << device_.to_string());
+            return false;
+        }
+        return backend->memset(
+            block_,
+            0,
+            block_size_,
+            device_.is_cpu() ? 0 : device_.ordinal,
+            stream);
+    }
+
     bool DeviceWorkspaceManager::allocateBuffers(
         const std::vector<const WorkspaceDescriptor *> &buffers,
         size_t total_size)

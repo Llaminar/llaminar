@@ -1452,72 +1452,100 @@ namespace llaminar2
         }
 
         /**
-         * @brief Read one layer's exact expert formats without constructing compute views.
+         * @brief Derive one expert's transfer-slot format from compute-ready GEMMs.
          *
-         * Decode maintenance needs a model-wide allocation profile before its
-         * first graph is finalized. Packed 3-D tensors expose storage-view
-         * dimensions rather than logical per-expert GEMM dimensions, so shape
-         * comes from the declarative model config while codebook characteristics
-         * come from each layer's actual tensor. This preflight does not allocate,
-         * upload, or prepare a kernel.
+         * The ExpertGemmRegistry is the authoritative source consumed by GPU
+         * execution. Reading its exported descriptors keeps transfer storage
+         * sizing tied to the exact codebook and packed representation that the
+         * grouped kernels will execute. Raw model tensors are intentionally not
+         * consulted here: doing so creates two format authorities and fails for
+         * legitimate prepacked or test-provided engines.
+         *
+         * @param gate Prepared gate projection for one logical expert.
+         * @param up Prepared up projection for the same logical expert.
+         * @param down Prepared down projection for the same logical expert.
+         * @param d_model Declarative hidden dimension.
+         * @param expert_intermediate Declarative expert intermediate dimension.
+         * @return Three exact projection specs, or std::nullopt when any engine
+         *         cannot export a valid, geometry-compatible NativeVNNI descriptor.
          */
         std::optional<std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>>
-        transferSlotSpecsFromPackedExpertTensors(
-            TensorBase *gate_exps,
-            TensorBase *up_exps,
-            TensorBase *down_exps,
+        transferSlotSpecsFromPreparedExpertEngines(
+            ITensorGemm *gate,
+            ITensorGemm *up,
+            ITensorGemm *down,
             int d_model,
             int expert_intermediate)
         {
-            if (d_model <= 0 || expert_intermediate <= 0)
+            if (!gate || !up || !down ||
+                d_model <= 0 || expert_intermediate <= 0)
+            {
                 return std::nullopt;
+            }
 
             auto make_spec =
-                [](const char *label, TensorBase *tensor, int n, int k)
+                [](const char *label, ITensorGemm *engine, int n, int k)
                 -> std::optional<DeviceMoETransferSlotDirectory::ProjectionSpec>
             {
-                if (!tensor || n <= 0 || k <= 0)
+                if (!engine || n <= 0 || k <= 0)
                     return std::nullopt;
-                auto *unpackable = dynamic_cast<IINT8Unpackable *>(tensor);
-                const NativeVnniFormatInfo *vnni =
-                    unpackable ? unpackable->vnniFormatInfo() : nullptr;
-                if (!vnni)
+
+                DeviceNativeVNNIMatrixDesc descriptor{};
+                if (!engine->exportNativeVNNIMatrixDesc(descriptor) ||
+                    !descriptor.valid() ||
+                    descriptor.n != n ||
+                    descriptor.k != k)
+                {
                     return std::nullopt;
+                }
+
+                uint8_t payload_bytes_per_block = 0;
+                uint8_t is_asymmetric = 0;
+                uint8_t has_emins = 0;
+                if (!deviceMoEProjectionFormat(
+                        descriptor,
+                        payload_bytes_per_block,
+                        is_asymmetric,
+                        has_emins))
+                {
+                    return std::nullopt;
+                }
 
                 DeviceMoETransferSlotDirectory::ProjectionSpec spec;
                 spec.label = label;
                 spec.N = n;
                 spec.K = k;
-                spec.payload_bytes_per_block = vnni->payload_bytes;
-                spec.is_asymmetric = vnni->is_asymmetric;
-                spec.has_emins = vnni->has_emins;
-                spec.codebook_id = vnni->codebook_id;
+                spec.payload_bytes_per_block =
+                    static_cast<int>(payload_bytes_per_block);
+                spec.is_asymmetric = is_asymmetric != 0;
+                spec.has_emins = has_emins != 0;
+                spec.codebook_id = descriptor.codebook_id;
                 return spec;
             };
 
-            auto gate = make_spec(
+            auto gate_spec = make_spec(
                 "gate",
-                gate_exps,
+                gate,
                 expert_intermediate,
                 d_model);
-            auto up = make_spec(
+            auto up_spec = make_spec(
                 "up",
-                up_exps,
+                up,
                 expert_intermediate,
                 d_model);
-            auto down = make_spec(
+            auto down_spec = make_spec(
                 "down",
-                down_exps,
+                down,
                 d_model,
                 expert_intermediate);
-            if (!gate || !up || !down)
+            if (!gate_spec || !up_spec || !down_spec)
                 return std::nullopt;
 
             std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec> specs;
             specs.reserve(3);
-            specs.push_back(std::move(*gate));
-            specs.push_back(std::move(*up));
-            specs.push_back(std::move(*down));
+            specs.push_back(std::move(*gate_spec));
+            specs.push_back(std::move(*up_spec));
+            specs.push_back(std::move(*down_spec));
             return specs;
         }
 
@@ -2751,32 +2779,137 @@ namespace llaminar2
              * domain. Its slots retain arrivals from different layers, so sizing
              * it from the current layer would either reject a later, wider
              * codebook or force one full directory allocation per layer. Scan
-             * every exact packed tensor before any directory is created and
-             * merge those formats into one immutable capacity profile.
+             * every compute-ready registry descriptor before any directory is
+             * created and merge those formats into one immutable capacity
+             * profile.
              */
             std::vector<std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>>
                 layer_formats;
             layer_formats.reserve(static_cast<size_t>(runtime_table_layers));
+
+            auto weight_mgr =
+                model_ctx_ ? model_ctx_->concreteWeightManager() : nullptr;
+            if (!weight_mgr)
+            {
+                throw std::runtime_error(
+                    "Qwen35 MoE graph requires a prepared ExpertGemmRegistry "
+                    "before sizing transfer slots on " +
+                    device.to_string());
+            }
+            const auto &registry = weight_mgr->expertGemmRegistry();
+
             for (int scan_layer = 0;
                  scan_layer < runtime_table_layers;
                  ++scan_layer)
             {
-                const LayerWeights scan_weights =
-                    layerWeightsForGraph(scan_layer);
-                auto exact_specs =
-                    transferSlotSpecsFromPackedExpertTensors(
-                        scan_weights.moe_gate_exps,
-                        scan_weights.moe_up_exps,
-                        scan_weights.moe_down_exps,
-                        config_.d_model,
-                        config_.moe.intermediate_size);
-                if (!exact_specs.has_value())
+                auto append_registered_formats =
+                    [&](const std::vector<ITensorGemm *> &gate_engines,
+                        const std::vector<ITensorGemm *> &up_engines,
+                        const std::vector<ITensorGemm *> &down_engines,
+                        const std::string &registry_scope) -> bool
+                {
+                    if (gate_engines.size() !=
+                            static_cast<size_t>(config_.moe.num_experts) ||
+                        up_engines.size() !=
+                            static_cast<size_t>(config_.moe.num_experts) ||
+                        down_engines.size() !=
+                            static_cast<size_t>(config_.moe.num_experts))
+                    {
+                        return false;
+                    }
+
+                    bool found_complete_expert = false;
+                    for (int expert = 0;
+                         expert < config_.moe.num_experts;
+                         ++expert)
+                    {
+                        ITensorGemm *gate_engine =
+                            gate_engines[static_cast<size_t>(expert)];
+                        ITensorGemm *up_engine =
+                            up_engines[static_cast<size_t>(expert)];
+                        ITensorGemm *down_engine =
+                            down_engines[static_cast<size_t>(expert)];
+                        if (!gate_engine || !up_engine || !down_engine)
+                            continue;
+
+                        auto exact_specs =
+                            transferSlotSpecsFromPreparedExpertEngines(
+                                gate_engine,
+                                up_engine,
+                                down_engine,
+                                config_.d_model,
+                                config_.moe.intermediate_size);
+                        if (!exact_specs.has_value())
+                        {
+                            throw std::runtime_error(
+                                "Qwen35 MoE graph found an invalid NativeVNNI "
+                                "descriptor triple for model layer " +
+                                std::to_string(scan_layer) + " expert " +
+                                std::to_string(expert) + " in " +
+                                registry_scope + " on " +
+                                device.to_string());
+                        }
+                        layer_formats.push_back(std::move(*exact_specs));
+                        found_complete_expert = true;
+                    }
+                    return found_complete_expert;
+                };
+
+                bool found_layer_format = false;
+                if (overlay_runtime_plan)
+                {
+                    for (const auto &domain : overlay_runtime_plan->domains())
+                    {
+                        if (!domainContainsDevice(domain, device))
+                            continue;
+
+                        std::vector<ITensorGemm *> gate_engines;
+                        std::vector<ITensorGemm *> up_engines;
+                        std::vector<ITensorGemm *> down_engines;
+                        (void)registry.populateExpertEnginesForDomain(
+                            domain.name,
+                            device,
+                            scan_layer,
+                            config_.moe.num_experts,
+                            gate_engines,
+                            up_engines,
+                            down_engines);
+                        found_layer_format =
+                            append_registered_formats(
+                                gate_engines,
+                                up_engines,
+                                down_engines,
+                                "domain '" + domain.name + "'") ||
+                            found_layer_format;
+                    }
+                }
+                else
+                {
+                    std::vector<ITensorGemm *> gate_engines;
+                    std::vector<ITensorGemm *> up_engines;
+                    std::vector<ITensorGemm *> down_engines;
+                    (void)registry.populateExpertEngines(
+                        device,
+                        scan_layer,
+                        config_.moe.num_experts,
+                        gate_engines,
+                        up_engines,
+                        down_engines);
+                    found_layer_format =
+                        append_registered_formats(
+                            gate_engines,
+                            up_engines,
+                            down_engines,
+                            "device registry");
+                }
+
+                if (!found_layer_format)
                 {
                     throw std::runtime_error(
-                        "Qwen35 MoE graph could not derive NativeVNNI transfer-slot specs for model layer " +
+                        "Qwen35 MoE graph could not derive NativeVNNI "
+                        "transfer-slot specs from prepared engines for model layer " +
                         std::to_string(scan_layer) + " on " + device.to_string());
                 }
-                layer_formats.push_back(std::move(*exact_specs));
             }
             return DeviceMoETransferSlotDirectory::profileForLayerFormats(
                 layer_formats);

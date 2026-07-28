@@ -1219,6 +1219,27 @@ namespace llaminar2
         }
 
         /**
+         * @brief Publish a stage output when this stage executes on a GPU.
+         *
+         * CPU kernels write host-authoritative tensor storage directly and
+         * therefore require no device publication. GPU kernels, by contrast,
+         * must publish through the executor-bound stream so downstream
+         * consumers inherit the exact producer event. Keeping that distinction
+         * in this shared helper prevents individual dual-backend stages from
+         * accidentally constructing a GPU execution token on their CPU path.
+         *
+         * This is intentionally not a permissive GPU fallback: a GPU stage
+         * without an executor-bound stream still fails through gpuExecution().
+         *
+         * @param tensor Tensor written by the stage kernel.
+         */
+        void publishStageOutput(ITensor *tensor) const
+        {
+            if (device_id_.is_gpu())
+                gpuExecution().publish(tensor);
+        }
+
+        /**
          * @brief Update dynamic parameters for graph reuse
          *
          * Allows updating position-dependent parameters (like RoPE position offset)

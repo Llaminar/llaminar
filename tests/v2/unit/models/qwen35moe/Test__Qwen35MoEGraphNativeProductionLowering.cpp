@@ -589,7 +589,8 @@ namespace llaminar2::test
         TensorArena activation_arena;
         auto buffers = makeActivationBuffers(activation_arena);
 
-        auto model_ctx = makeTestingModelContextWithHotDomainExperts();
+        auto model_ctx =
+            makeTestingModelContextWithHotDomainExperts(config.n_layers);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
         ComputeGraph graph = graph_builder.buildFFNGraph(layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
 
@@ -725,7 +726,8 @@ namespace llaminar2::test
         TensorArena activation_arena;
         auto buffers = makeActivationBuffers(activation_arena);
 
-        auto model_ctx = makeTestingModelContextWithHotDomainExperts();
+        auto model_ctx =
+            makeTestingModelContextWithHotDomainExperts(config.n_layers);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
         ComputeGraph graph = graph_builder.buildFFNGraph(
             layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
@@ -771,7 +773,8 @@ namespace llaminar2::test
         TensorArena activation_arena;
         auto buffers = makeActivationBuffers(activation_arena);
 
-        auto model_ctx = makeTestingModelContextWithHotDomainExperts();
+        auto model_ctx =
+            makeTestingModelContextWithHotDomainExperts(config.n_layers);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
         ComputeGraph graph = graph_builder.buildFFNGraph(
             layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));

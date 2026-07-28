@@ -193,6 +193,54 @@ namespace llaminar2
                    isRoutedExpertResidencyCategory(binding.identity.residency_category);
         }
 
+        bool isDeclaredGemmRole(WeightRole role)
+        {
+            switch (role)
+            {
+            case WeightRole::LMHead:
+            case WeightRole::AttentionQ:
+            case WeightRole::AttentionK:
+            case WeightRole::AttentionV:
+            case WeightRole::AttentionWO:
+            case WeightRole::FusedQKV:
+            case WeightRole::GDNProjection:
+            case WeightRole::FFNGate:
+            case WeightRole::FFNUp:
+            case WeightRole::FFNDown:
+            case WeightRole::MoEExpertGate:
+            case WeightRole::MoEExpertUp:
+            case WeightRole::MoEExpertDown:
+            case WeightRole::SharedExpertGate:
+            case WeightRole::SharedExpertUp:
+            case WeightRole::SharedExpertDown:
+                return true;
+            case WeightRole::Embedding:
+            case WeightRole::OutputNorm:
+            case WeightRole::GDNSsmParam:
+            case WeightRole::MoERouter:
+            case WeightRole::Norm:
+            case WeightRole::Bias:
+            case WeightRole::Other:
+                return false;
+            }
+            return false;
+        }
+
+        bool preparedKindDeclaresGemm(
+            const std::optional<PreparedWeightRef> &prepared,
+            DeviceId device)
+        {
+            if (!prepared.has_value() || prepared->device != device)
+                return false;
+            if (device.is_cpu())
+                return prepared->kind == PreparedWeightKind::CpuPackedGemm;
+            if (device.is_cuda())
+                return prepared->kind == PreparedWeightKind::CudaInt8PackedGemm;
+            if (device.is_rocm())
+                return prepared->kind == PreparedWeightKind::RocmInt8PackedGemm;
+            return false;
+        }
+
         bool bindingTargetsDevice(const WeightBinding &binding, DeviceId device)
         {
             return binding.residency.home_device == device ||
@@ -223,14 +271,27 @@ namespace llaminar2
             if (!include_expert_jobs && isRoutedExpertBinding(binding))
                 return false;
 
+            /*
+             * Frozen bindings are the declarative graph contract. An explicit
+             * GEMM role or backend-typed prepared reference is sufficient to
+             * classify the binding even when a lightweight unit/model context
+             * does not retain the source schema object. Known non-GEMM roles
+             * were rejected above, so a stale prepared hint cannot reinterpret
+             * a norm, bias, router, or recurrent parameter as GEMM.
+             */
+            if (preparedKindDeclaresGemm(binding.prepared, device) ||
+                (device.is_gpu() &&
+                 isDeclaredGemmRole(binding.identity.role)))
+            {
+                return true;
+            }
+
             try
             {
                 /*
-                 * A prepared-kind hint describes the representation expected
-                 * after preparation; it is not permission to reinterpret a
-                 * schema-declared norm, bias, router, or recurrent parameter as
-                 * GEMM. The model's structural classification remains
-                 * authoritative even when a stale hint is present.
+                 * WeightRole::Other bindings from older graph builders still
+                 * require schema classification. Production model contexts
+                 * always install that schema before materialization.
                  */
                 return manager.isGemmWeight(binding.identity.canonical_name);
             }

@@ -2,7 +2,7 @@
  * @file ROCmGatedDeltaNet.h
  * @brief ROCm/HIP implementation of ITensorGatedDeltaNet
  *
- * Manages GPU-resident recurrence state internally.
+ * Consumes cache-owned, persistently bound GPU recurrence state.
  *
  * Device-pointer design: All input/output pointers passed to chunk_forward()
  * and recurrent_step() are expected to be DEVICE pointers (already on GPU).
@@ -13,7 +13,6 @@
 #pragma once
 
 #include "../../../tensors/TensorKernels.h"
-#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 
@@ -70,8 +69,6 @@ extern "C"
         int device_idx, void *stream);
 
     // GPU memory helpers (implemented in ROCmGatedDeltaNetKernels.hip)
-    bool rocmGDN_gpu_malloc(float **ptr, size_t count, int device_ordinal);
-    void rocmGDN_gpu_free(float *ptr, int device_ordinal);
     void rocmGDN_gpu_memset_zero(float *ptr, size_t count);
     void rocmGDN_gpu_memset_zero_async(float *ptr, size_t count, void *stream);
     void rocmGDN_gpu_memcpy(float *dst, const float *src, size_t count);
@@ -79,7 +76,6 @@ extern "C"
     void rocmGDN_gpu_memcpy_d2h(float *host_dst, const float *device_src, size_t count);
     void rocmGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream);
     void rocmGDN_gpu_set_device(int ordinal);
-    void rocmGDN_stream_synchronize(void *stream);
     bool rocmGDN_gpu_copy_capture_row_from_device_index(
         float *dst,
         const float *capture,
@@ -125,17 +121,30 @@ namespace llaminar2
         explicit ROCmGatedDeltaNet(int device_ordinal)
             : device_ordinal_(device_ordinal) {}
 
-        ~ROCmGatedDeltaNet()
+        ~ROCmGatedDeltaNet() override = default;
+
+        bool bindDeviceState(const GDNDeviceStateBinding &binding) override
         {
-            rocmGDN_gpu_set_device(device_ordinal_);
-            rocmGDN_gpu_free(gpu_state_, device_ordinal_);
-            rocmGDN_gpu_free(secondary_gpu_state_, device_ordinal_);
-            rocmGDN_gpu_free(request_state_bank_, device_ordinal_);
-            rocmGDN_gpu_free(deinterleave_scratch_, device_ordinal_);
+            if (device_state_bound_ || !binding.valid())
+                return false;
+
+            gpu_state_ = binding.primary_state;
+            state_size_ = binding.primary_state_floats;
+            secondary_gpu_state_ = binding.secondary_state;
+            secondary_state_size_ = binding.secondary_state_floats;
+            request_state_bank_ = binding.request_state_bank;
+            request_state_bank_floats_ = binding.request_state_bank_floats;
+            /*
+             * Stable storage is not the same thing as published state. The
+             * request bank has not inherited the primary live state yet.
+             */
+            request_state_bank_state_size_ = 0;
+            request_state_bank_capacity_ = binding.request_capacity;
+            device_state_bound_ = true;
+            return true;
         }
 
-        void allocateGPUState(int state_size) override { allocateState(state_size); }
-        void resetGPUState() override { resetState(); }
+        bool resetGPUState(void *stream) override { return resetState(stream); }
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
         {
             verifier_state_capture_ = workspace;
@@ -173,6 +182,12 @@ namespace llaminar2
             {
                 rocmGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
             }
+            /*
+             * The packed request bank derives from the selected scalar live
+             * bank. Mark it stale after every authoritative import so grouped
+             * execution cannot consume a same-shaped but obsolete snapshot.
+             */
+            invalidateRequestStateBank();
             return true;
         }
 
@@ -201,6 +216,7 @@ namespace llaminar2
                 stream);
             if (!ok)
                 return false;
+            invalidateRequestStateBank();
             return true;
         }
 
@@ -275,7 +291,14 @@ namespace llaminar2
         }
         bool supportsRequestLiveStateBank(int request_count, int state_size) const override
         {
-            return request_count > 0 && state_size > 0;
+            return device_state_bound_ &&
+                   request_count > 0 &&
+                   request_count <= request_state_bank_capacity_ &&
+                   state_size > 0 &&
+                   hasState(state_size) &&
+                   request_state_bank_floats_ >=
+                       static_cast<size_t>(request_count) *
+                           static_cast<size_t>(state_size);
         }
         size_t stateBytes() const override
         {
@@ -288,64 +311,25 @@ namespace llaminar2
             return largest_state_size > 0 ? static_cast<size_t>(largest_state_size) * sizeof(float) : 0;
         }
 
-        void allocateState(int state_size)
+        bool resetState(void *stream)
         {
-            if (selectState(state_size))
-                return;
-            if (isGraphCaptureActive())
-            {
-                LOG_ERROR("[ROCmGatedDeltaNet] GPU state allocation during graph capture "
-                          "(need "
-                          << state_size << " floats, have active=" << state_size_
-                          << " secondary=" << secondary_state_size_ << ")");
-                return;
-            }
-            rocmGDN_gpu_set_device(device_ordinal_);
-            float *new_state = nullptr;
-            if (!rocmGDN_gpu_malloc(&new_state, state_size, device_ordinal_))
-            {
-                LOG_ERROR("[ROCmGatedDeltaNet] GPU malloc failed for state");
-                return;
-            }
-            void *stream = GPUDeviceContextPool::instance().getAMDContext(device_ordinal_).defaultStream();
-            rocmGDN_gpu_memset_zero_async(new_state, state_size, stream);
-            rocmGDN_stream_synchronize(stream);
+            if (!device_state_bound_ || !stream)
+                return false;
 
-            if (gpu_state_)
-            {
-                if (secondary_gpu_state_)
-                    rocmGDN_gpu_free(secondary_gpu_state_, device_ordinal_);
-                secondary_gpu_state_ = gpu_state_;
-                secondary_state_size_ = state_size_;
-            }
-            gpu_state_ = new_state;
-            state_size_ = state_size;
-            LOG_DEBUG("[ROCmGatedDeltaNet] Allocated GPU state: " << state_size << " floats on device " << device_ordinal_);
-        }
-
-        void resetState()
-        {
             rocmGDN_gpu_set_device(device_ordinal_);
-            if (gpu_state_ && state_size_ > 0)
+            rocmGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
+            if (secondary_gpu_state_ && secondary_state_size_ > 0)
+                rocmGDN_gpu_memset_zero_async(
+                    secondary_gpu_state_, secondary_state_size_, stream);
+            if (request_state_bank_ && request_state_bank_floats_ > 0)
             {
-                void *stream = GPUDeviceContextPool::instance().getAMDContext(device_ordinal_).defaultStream();
-                rocmGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
-                if (secondary_gpu_state_ && secondary_state_size_ > 0)
-                    rocmGDN_gpu_memset_zero_async(secondary_gpu_state_, secondary_state_size_, stream);
-                if (request_state_bank_ && request_state_bank_capacity_ > 0)
-                    rocmGDN_gpu_memset_zero_async(
-                        request_state_bank_,
-                        static_cast<size_t>(request_state_bank_capacity_) *
-                            static_cast<size_t>(request_state_bank_state_size_),
-                        stream);
-                rocmGDN_stream_synchronize(stream);
+                rocmGDN_gpu_memset_zero_async(
+                    request_state_bank_,
+                    request_state_bank_floats_,
+                    stream);
             }
-            if (deinterleave_scratch_)
-            {
-                void *stream = GPUDeviceContextPool::instance().getAMDContext(device_ordinal_).defaultStream();
-                rocmGDN_gpu_memset_zero_async(deinterleave_scratch_, deinterleave_scratch_size_, stream);
-                rocmGDN_stream_synchronize(stream);
-            }
+            request_state_bank_state_size_ = state_size_;
+            return true;
         }
 
         bool chunk_forward(
@@ -372,7 +356,7 @@ namespace llaminar2
                 return false;
 
             // All pointers are device pointers — pass directly to HIP kernel.
-            return rocmGDN_chunk_forward(
+            const bool ok = rocmGDN_chunk_forward(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
@@ -380,6 +364,9 @@ namespace llaminar2
                 verifier_state_capture_size_,
                 verifier_state_capture_rows_,
                 device_ordinal_, stream_);
+            if (ok && effective_state == gpu_state_)
+                invalidateRequestStateBank();
+            return ok;
         }
 
         bool chunkForwardWithEffectiveSeqLen(
@@ -407,7 +394,7 @@ namespace llaminar2
             if (!effective_state)
                 return false;
 
-            return rocmGDN_chunk_forward_effective(
+            const bool ok = rocmGDN_chunk_forward_effective(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
@@ -416,6 +403,9 @@ namespace llaminar2
                 verifier_state_capture_size_,
                 verifier_state_capture_rows_,
                 device_ordinal_, stream_);
+            if (ok && effective_state == gpu_state_)
+                invalidateRequestStateBank();
+            return ok;
         }
 
         bool chunkForwardBatchedRequests(
@@ -628,7 +618,7 @@ namespace llaminar2
              * true replay-equivalent handoff rather than a backend-specific
              * approximation.
              */
-            return rocmGDN_chunk_forward(
+            const bool ok = rocmGDN_chunk_forward(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
                 output, effective_state,
                 /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
@@ -636,6 +626,9 @@ namespace llaminar2
                 verifier_state_capture_size_,
                 verifier_state_capture_rows_,
                 device_ordinal_, stream_);
+            if (ok && effective_state == gpu_state_)
+                invalidateRequestStateBank();
+            return ok;
         }
 
         void setGPUStream(void *stream) override { stream_ = stream; }
@@ -745,8 +738,6 @@ namespace llaminar2
                 return false;
 
             if (!gpu_state_)
-                allocateState(state_size_);
-            if (!gpu_state_)
                 return false;
 
             rocmGDN_gpu_set_device(device_ordinal_);
@@ -758,6 +749,7 @@ namespace llaminar2
             {
                 rocmGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
             }
+            invalidateRequestStateBank();
             return true;
         }
 
@@ -783,8 +775,7 @@ namespace llaminar2
              * state, so force the next request-batched prefill to reseed it from
              * the freshly imported active bank.
              */
-            request_state_bank_state_size_ = 0;
-            request_state_bank_capacity_ = 0;
+            invalidateRequestStateBank();
             return true;
         }
 
@@ -854,10 +845,9 @@ namespace llaminar2
         float *secondary_gpu_state_ = nullptr;
         int secondary_state_size_ = 0;
         float *request_state_bank_ = nullptr;
+        size_t request_state_bank_floats_ = 0;
         int request_state_bank_state_size_ = 0;
         int request_state_bank_capacity_ = 0;
-        float *deinterleave_scratch_ = nullptr;
-        size_t deinterleave_scratch_size_ = 0;
         float *bound_deinterleave_scratch_ = nullptr;
         size_t bound_deinterleave_scratch_size_ = 0;
         float *verifier_state_capture_ = nullptr;
@@ -865,6 +855,7 @@ namespace llaminar2
         int verifier_state_capture_size_ = 0;
         float *speculative_state_work_ = nullptr;
         int speculative_state_work_size_ = 0;
+        bool device_state_bound_ = false;
 
         bool hasState(int required_state_size) const
         {
@@ -892,17 +883,12 @@ namespace llaminar2
         {
             if (selectState(required_state_size))
                 return true;
-            if (isGraphCaptureActive())
-            {
-                LOG_ERROR("["
-                          << caller << "] GPU state allocation during graph capture "
-                          << "(need " << required_state_size
-                          << " floats, have active=" << state_size_
-                          << " secondary=" << secondary_state_size_ << ")");
-                return false;
-            }
-            allocateState(required_state_size);
-            return selectState(required_state_size);
+            LOG_ERROR("["
+                      << caller << "] Required cache-owned GPU state was not bound "
+                      << "(need " << required_state_size
+                      << " floats, have active=" << state_size_
+                      << " secondary=" << secondary_state_size_ << ")");
+            return false;
         }
 
         float *prepareEffectiveStateForVerifierForward(int required_state_size, void *stream)
@@ -935,6 +921,18 @@ namespace llaminar2
             return speculative_state_work_;
         }
 
+        /**
+         * @brief Mark the packed request bank stale after a scalar-state write.
+         *
+         * The scalar and grouped representations share storage ownership but
+         * not contents. Keeping this transition in one helper prevents a
+         * matching geometry from being mistaken for coherent state.
+         */
+        void invalidateRequestStateBank() noexcept
+        {
+            request_state_bank_state_size_ = 0;
+        }
+
         bool ensureRequestStateBank(int request_count, int required_state_size)
         {
             if (request_count <= 0 || required_state_size <= 0)
@@ -945,47 +943,41 @@ namespace llaminar2
             if (!gpu_state_)
                 return false;
 
-            if (request_state_bank_ &&
-                request_state_bank_state_size_ == required_state_size &&
-                request_state_bank_capacity_ >= request_count)
+            const size_t required_request_floats =
+                static_cast<size_t>(request_count) *
+                static_cast<size_t>(required_state_size);
+            if (!request_state_bank_ ||
+                request_count > request_state_bank_capacity_ ||
+                required_request_floats > request_state_bank_floats_)
+            {
+                LOG_ERROR("[ROCmGatedDeltaNet] Cache-owned request recurrence-state bank is undersized"
+                          << " requests=" << request_count
+                          << " state_size=" << required_state_size
+                          << " request_capacity=" << request_state_bank_capacity_
+                          << " available_floats=" << request_state_bank_floats_);
+                return false;
+            }
+
+            if (request_state_bank_state_size_ == required_state_size)
             {
                 return true;
             }
 
-            if (isGraphCaptureActive())
+            if (!stream_)
             {
-                LOG_ERROR("[ROCmGatedDeltaNet] request recurrence-state bank allocation during graph capture "
-                          "(requests=" << request_count
-                          << ", state_size=" << required_state_size << ")");
+                LOG_ERROR("[ROCmGatedDeltaNet] request recurrence-state publication requires an explicit stream");
                 return false;
             }
 
             rocmGDN_gpu_set_device(device_ordinal_);
-            if (request_state_bank_)
-                rocmGDN_gpu_free(request_state_bank_, device_ordinal_);
-            request_state_bank_ = nullptr;
-            request_state_bank_state_size_ = required_state_size;
-            request_state_bank_capacity_ = request_count;
-
-            const size_t total_floats =
-                static_cast<size_t>(request_count) *
-                static_cast<size_t>(required_state_size);
-            if (!rocmGDN_gpu_malloc(&request_state_bank_, total_floats, device_ordinal_))
-            {
-                LOG_ERROR("[ROCmGatedDeltaNet] GPU malloc failed for request recurrence-state bank");
-                request_state_bank_state_size_ = 0;
-                request_state_bank_capacity_ = 0;
-                return false;
-            }
-
-            void *stream = GPUDeviceContextPool::instance().getAMDContext(device_ordinal_).defaultStream();
-            rocmGDN_gpu_memset_zero_async(request_state_bank_, total_floats, stream);
+            rocmGDN_gpu_memset_zero_async(
+                request_state_bank_, request_state_bank_floats_, stream_);
             rocmGDN_gpu_memcpy_async(
                 request_state_bank_,
                 gpu_state_,
                 static_cast<size_t>(required_state_size),
-                stream);
-            rocmGDN_stream_synchronize(stream);
+                stream_);
+            request_state_bank_state_size_ = required_state_size;
             return true;
         }
     };

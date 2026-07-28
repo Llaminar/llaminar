@@ -31,7 +31,14 @@ namespace llaminar2
         {
             return request_count > 0 && state_size > 0;
         }
-        void resetGPUState() override;
+        /**
+         * @brief Reset CPU-owned request and speculative state.
+         *
+         * @param stream Unused on CPU; present for the common state-publication
+         *        contract.
+         * @return true after all CPU-owned transient state is cleared.
+         */
+        bool resetGPUState(void *stream) override;
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override;
         void bindSpeculativeStateWorkspace(float *workspace, int state_size) override;
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override;

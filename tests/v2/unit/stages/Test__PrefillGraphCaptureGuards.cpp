@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
@@ -181,8 +182,6 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_ChunkForward_FailsDuringCapture_NoSt
     gdn.setGPUStream(ctx.defaultStream());
 
     const int n_heads = 4, d_k = 64, d_v = 64, seq_len = 8;
-    const int state_size = n_heads * d_k * d_v;
-
     // Allocate dummy device buffers for the call
     float *d_buf = nullptr;
     (void)hipMalloc(&d_buf, static_cast<size_t>(seq_len * n_heads * d_k) * sizeof(float));
@@ -198,22 +197,6 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_ChunkForward_FailsDuringCapture_NoSt
             d_buf, d_buf, d_buf, d_buf, d_buf, d_buf, d_buf,
             d_output, nullptr,
             seq_len, n_heads, d_k, d_v, 0, false));
-    }
-
-    // Allocate state outside capture
-    gdn.allocateGPUState(state_size);
-    EXPECT_TRUE(gdn.isGPUStateReady(state_size));
-
-    // With state ready, chunk_forward under capture should NOT hit the guard
-    // (state is already allocated with correct size)
-    {
-        GraphCaptureGuard guard;
-        // This should succeed (kernel dispatch is capturable)
-        bool result = gdn.chunk_forward(
-            d_buf, d_buf, d_buf, d_buf, d_buf, d_buf, d_buf,
-            d_output, nullptr,
-            seq_len, n_heads, d_k, d_v, 0, false);
-        EXPECT_TRUE(result);
     }
 
     (void)hipFree(d_buf);
@@ -233,8 +216,6 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_RecurrentStep_FailsDuringCapture_NoS
     gdn.setGPUStream(ctx.defaultStream());
 
     const int n_heads = 4, d_k = 64, d_v = 64;
-    const int state_size = n_heads * d_k * d_v;
-
     float *d_buf = nullptr;
     (void)hipMalloc(&d_buf, static_cast<size_t>(n_heads * d_k) * sizeof(float));
     (void)hipMemset(d_buf, 0, static_cast<size_t>(n_heads * d_k) * sizeof(float));
@@ -249,17 +230,6 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_RecurrentStep_FailsDuringCapture_NoS
             d_buf, d_buf, d_buf, d_buf, d_buf, d_buf, d_buf,
             d_output, nullptr,
             n_heads, d_k, d_v, false));
-    }
-
-    // Allocate and retry
-    gdn.allocateGPUState(state_size);
-    {
-        GraphCaptureGuard guard;
-        bool result = gdn.recurrent_step(
-            d_buf, d_buf, d_buf, d_buf, d_buf, d_buf, d_buf,
-            d_output, nullptr,
-            n_heads, d_k, d_v, false);
-        EXPECT_TRUE(result);
     }
 
     (void)hipFree(d_buf);

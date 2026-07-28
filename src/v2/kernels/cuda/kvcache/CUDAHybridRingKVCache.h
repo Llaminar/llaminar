@@ -13,6 +13,7 @@
 #pragma once
 
 #include "CUDARingKVCache.h"
+#include "../../HybridGDNDeviceStateArena.h"
 #include "../../HybridKVCacheConfig.h"
 #include "../../IHybridKVCache.h"
 #include "../../../tensors/TensorKernels.h"
@@ -436,9 +437,12 @@ namespace llaminar2
             // CUDA sidecar/device buffers without dispatching through the hybrid
             // global-layer clear_layer() override.
             Base::clear();
+            void *const state_stream = gdnStateStream();
             for (auto &state : gdn_states_)
             {
-                state.resetGPUKernelState();
+                if (!state.resetGPUKernelState(state_stream))
+                    throw std::runtime_error(
+                        "[CUDAHybridRingKVCache] Failed to reset cache-owned GDN state");
             }
         }
 
@@ -466,7 +470,9 @@ namespace llaminar2
                 int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
                 if (gdn_idx >= 0 && gdn_idx < static_cast<int>(gdn_states_.size()))
                 {
-                    gdn_states_[gdn_idx].resetGPUKernelState();
+                    if (!gdn_states_[gdn_idx].resetGPUKernelState(gdnStateStream()))
+                        throw std::runtime_error(
+                            "[CUDAHybridRingKVCache] Failed to reset layer GDN state");
                 }
             }
         }
@@ -612,9 +618,12 @@ namespace llaminar2
 
         void resetGDNStates() override
         {
+            void *const state_stream = gdnStateStream();
             for (auto &state : gdn_states_)
             {
-                state.resetGPUKernelState();
+                if (!state.resetGPUKernelState(state_stream))
+                    throw std::runtime_error(
+                        "[CUDAHybridRingKVCache] Failed to reset GDN state");
             }
         }
 
@@ -623,10 +632,7 @@ namespace llaminar2
 
         size_t gdnMemoryBytes() const override
         {
-            size_t total = 0;
-            for (const auto &state : gdn_states_)
-                total += state.localStateBytes();
-            return total;
+            return gdn_state_arena_.bytes();
         }
 
         HybridPrefixStateMetadata hybridPrefixStateMetadata() const override
@@ -716,7 +722,24 @@ namespace llaminar2
         int total_layers_;
         int first_layer_index_ = 0;
         HybridLayerMap layer_map_;
+        HybridGDNDeviceStateArena gdn_state_arena_;
         std::vector<HybridGDNLayerState> gdn_states_;
+
+        /**
+         * @brief Resolve the cache's explicit state-management stream.
+         *
+         * Cache construction and request reset enqueue state initialization on
+         * this stream. Kernel stages later use the same worker context, making
+         * ordering visible without a host-side stream synchronization.
+         */
+        void *gdnStateStream() const
+        {
+            if (this->deviceContext())
+                return this->deviceContext()->defaultStream();
+            return GPUDeviceContextPool::instance()
+                .getNvidiaContext(this->device_id())
+                .defaultStream();
+        }
 
         int normalizeLayerIndex(int layer) const
         {
@@ -1052,6 +1075,12 @@ namespace llaminar2
                 state.full_conv_state_size = full_conv_state_size;
                 state.initializeShape(qkv_dim);
             }
+
+            gdn_state_arena_.initialize(
+                DeviceId::cuda(this->device_id()),
+                this->batch_size_,
+                gdn_states_,
+                gdnStateStream());
 
             LOG_DEBUG("[CUDAHybridRingKVCache] Created: " << total_layers_ << " total layers, "
                                                           << layer_map_.kvLayerCount() << " KV (FA), "

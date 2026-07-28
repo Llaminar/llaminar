@@ -20,7 +20,6 @@
  */
 
 #include "../ops/CUDAHelpers.cuh"
-#include "../../../backends/BackendManager.h"
 #include "../../../utils/DebugEnv.h"
 #include <cstdio>
 #include <cstdint>
@@ -1544,33 +1543,11 @@ namespace
 } // anonymous namespace (deinterleave kernel)
 
 // =========================================================================
-// GPU Memory Management Helpers (called from headers via extern "C")
+// GPU transfer helpers (called from headers via extern "C")
 // =========================================================================
 
 extern "C"
 {
-
-    bool cudaGDN_gpu_malloc(float **ptr, size_t count, int device_ordinal)
-    {
-        auto *backend = llaminar2::getCUDABackend();
-        if (!backend)
-            return false;
-        *ptr = static_cast<float *>(
-            backend->allocate(count * sizeof(float), device_ordinal));
-        return *ptr != nullptr;
-    }
-
-    void cudaGDN_gpu_free(float *ptr, int device_ordinal)
-    {
-        if (ptr)
-        {
-            auto *backend = llaminar2::getCUDABackend();
-            if (!backend)
-                throw std::runtime_error(
-                    "[CUDA GDN] CUDA backend unavailable during state teardown");
-            backend->free(ptr, device_ordinal);
-        }
-    }
 
     void cudaGDN_gpu_memset_zero(float *ptr, size_t count)
     {

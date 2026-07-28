@@ -4046,9 +4046,9 @@ namespace llaminar2::test
         const std::string execute_body = contents.substr(execute_start, execute_end - execute_start);
 
         const size_t fused_gate_call = execute_body.find("kernel->sharedExpertGateAddFromTensors(");
-        const size_t fused_publish = execute_body.find("gpuExecution().publish(params_.shared_output)",
+        const size_t fused_publish = execute_body.find("execution.publish(params_.shared_output)",
                                                        fused_gate_call);
-        const size_t fused_combined_publish = execute_body.find("gpuExecution().publish(params_.combined_output)",
+        const size_t fused_combined_publish = execute_body.find("execution.publish(params_.combined_output)",
                                                                fused_gate_call);
         const size_t gate_call = execute_body.find("kernel->sharedExpertGateFromTensors(");
         const size_t publish = execute_body.find("gpuExecution().publish(params_.shared_output)",
@@ -5491,14 +5491,16 @@ namespace llaminar2::test
                  std::pair{"CUDA", &cuda},
                  std::pair{"ROCm", &rocm}})
         {
-            EXPECT_NE(source->find("shared_slot_live_expert_count"),
+            EXPECT_NE(source->find(
+                          "rebalance_transfer_slot_has_active_runtime_claim("),
                       std::string::npos)
                 << backend
-                << " materialization must detect an already-aliased transfer slot";
-            EXPECT_NE(source->find("shared_slot_protected"),
+                << " materialization must prove that a transfer-slot occupant is "
+                   "still claimed by an active runtime bank";
+            EXPECT_NE(source->find("occupancy.protected_from_reuse"),
                       std::string::npos)
                 << backend
-                << " materialization must protect current-row and authoritative slots";
+                << " materialization must protect authoritative and current-row slots";
             EXPECT_NE(source->find(
                           "moe_rebalance_policy::classifyTransferSlotOccupancy("),
                       std::string::npos)

@@ -130,12 +130,14 @@ static inline __m256 avx2_fast_sigmoid(__m256 vx)
 
 namespace llaminar2
 {
-    void CPUGatedDeltaNet::resetGPUState()
+    bool CPUGatedDeltaNet::resetGPUState(void *stream)
     {
+        (void)stream;
         request_state_bank_.clear();
         request_state_size_ = 0;
         request_state_capacity_ = 0;
         owned_speculative_state_work_.clear();
+        return true;
     }
 
     bool CPUGatedDeltaNet::ensureRequestStateBank(

@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 
+#include "GDNDeviceStateBinding.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -97,6 +98,19 @@ namespace llaminar2
         std::shared_ptr<ITensorGatedDeltaNet> rec_kernel;
 
         /**
+         * @brief Cache-owned device slices bound into the short-conv kernel.
+         *
+         * CPU caches leave this empty. CUDA and ROCm caches populate it from
+         * HybridGDNDeviceStateArena before KernelFactory creates the kernel.
+         */
+        GDNDeviceStateBinding conv_device_state;
+
+        /**
+         * @brief Cache-owned device slices bound into the recurrence kernel.
+         */
+        GDNDeviceStateBinding recurrence_device_state;
+
+        /**
          * @brief Initialize the CPU-owned live state vectors.
          *
          * GPU caches must call @ref initializeShape instead and let their
@@ -139,7 +153,7 @@ namespace llaminar2
 
         /// Reset GPU-resident kernel state (call after reset() for GPU backends)
         /// Requires full ITensorShortConvolution/ITensorGatedDeltaNet definitions.
-        void resetGPUKernelState();
+        bool resetGPUKernelState(void *stream = nullptr);
 
         /// Total CPU-owned live-state memory in bytes.
         size_t cpuMemoryBytes() const

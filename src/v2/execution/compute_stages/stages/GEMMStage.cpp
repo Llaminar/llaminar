@@ -394,7 +394,7 @@ namespace llaminar2
                     params_.alpha, params_.beta,
                     getWorkspace()))
             {
-                gpuExecution().publish(C_base);
+                publishStageOutput(C_base);
                 LOG_DEBUG("[GEMMStage] Fused SwiGLU+GEMM completed via ITensorGemm");
                 traceOutput("C", params_.C);
                 return true;
@@ -427,7 +427,7 @@ namespace llaminar2
                 LOG_ERROR("[GEMMStage] SwiGLU fallback activation failed");
                 return false;
             }
-            gpuExecution().publish(swiglu_output);
+            publishStageOutput(swiglu_output);
 
             bool success = gemm->multiply_tensor(
                 swiglu_output, C_base,
@@ -439,7 +439,7 @@ namespace llaminar2
                 getWorkspace());
             if (success)
             {
-                gpuExecution().publish(C_base);
+                publishStageOutput(C_base);
                 traceOutput("C", params_.C);
             }
             return success;
@@ -465,7 +465,7 @@ namespace llaminar2
 
             if (success)
             {
-                gpuExecution().publish(C_base);
+                publishStageOutput(C_base);
                 traceOutput("C", params_.C);
             }
             return success;

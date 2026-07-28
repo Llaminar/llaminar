@@ -32,6 +32,7 @@
 #include <cstring>
 #include <iomanip>
 #include <initializer_list>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -110,6 +111,79 @@ namespace
             }
             return host;
         }
+    };
+
+    /**
+     * @brief Test owner for the persistent device state consumed by GDN kernels.
+     *
+     * Production kernels receive equivalent slices from
+     * HybridGDNDeviceStateArena. Direct integration tests do not construct a
+     * model cache, so this owner supplies the same one-shot binding without
+     * reintroducing a kernel-owned allocator. The request bank covers both test
+     * requests and the larger of the local/full state geometries.
+     */
+    struct CudaGDNStateOwner
+    {
+        template <typename Kernel>
+        CudaGDNStateOwner(
+            Kernel &kernel,
+            int primary_state_floats,
+            int secondary_state_floats = 0,
+            int request_capacity = 2)
+            : primary_(std::make_unique<CudaFloatBuffer>(
+                  static_cast<size_t>(primary_state_floats), 0.0f)),
+              secondary_(
+                  secondary_state_floats > 0 &&
+                          secondary_state_floats != primary_state_floats
+                      ? std::make_unique<CudaFloatBuffer>(
+                            static_cast<size_t>(secondary_state_floats), 0.0f)
+                      : nullptr),
+              requests_(std::make_unique<CudaFloatBuffer>(
+                  static_cast<size_t>(request_capacity) *
+                      static_cast<size_t>(std::max(
+                          primary_state_floats,
+                          secondary_state_floats)),
+                  0.0f))
+        {
+            if (primary_state_floats <= 0 || request_capacity <= 0)
+                throw std::invalid_argument(
+                    "CudaGDNStateOwner requires positive state and request capacity");
+
+            const GDNDeviceStateBinding binding{
+                .primary_state = primary_->ptr,
+                .primary_state_floats = primary_state_floats,
+                .secondary_state = secondary_ ? secondary_->ptr : nullptr,
+                .secondary_state_floats =
+                    secondary_ ? secondary_state_floats : 0,
+                .request_state_bank = requests_->ptr,
+                .request_state_bank_floats = requests_->count,
+                .request_capacity = request_capacity,
+            };
+            if (!kernel.bindDeviceState(binding))
+                throw std::runtime_error(
+                    "CUDA GDN kernel rejected explicit test-owned state");
+        }
+
+        /**
+         * @brief Bind persistent test-owned scratch for in-place short-conv.
+         */
+        template <typename Kernel>
+        void bindScratch(Kernel &kernel, int scratch_floats)
+        {
+            if (scratch_floats <= 0)
+                throw std::invalid_argument(
+                    "CUDA short-conv scratch must be positive");
+            scratch_ = std::make_unique<CudaFloatBuffer>(
+                static_cast<size_t>(scratch_floats), 0.0f);
+            kernel.bindScratchWorkspace(
+                scratch_->ptr, static_cast<int>(scratch_->count));
+        }
+
+    private:
+        std::unique_ptr<CudaFloatBuffer> primary_;
+        std::unique_ptr<CudaFloatBuffer> secondary_;
+        std::unique_ptr<CudaFloatBuffer> requests_;
+        std::unique_ptr<CudaFloatBuffer> scratch_;
     };
 
     /// @brief RAII wrapper for int metadata stored on a CUDA device.
@@ -667,6 +741,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteEx
     CudaFloatBuffer d_conv_weights(conv_weights);
     CudaFloatBuffer d_conv_bias(conv_bias);
     CUDAShortConvolution grouped_conv(cuda_ordinal_);
+    CudaGDNStateOwner grouped_conv_state_owner(
+        grouped_conv, channels * (kernel_size - 1));
     grouped_conv.setGPUStream(stream.stream);
     grouped_conv.bindScratchWorkspace(
         d_conv_scratch.ptr,
@@ -709,6 +785,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteEx
         CudaFloatBuffer d_scalar_decode(scalar_decode_input);
         CudaFloatBuffer d_scalar_decode_output(channels, -77.0f);
         CUDAShortConvolution scalar_conv(cuda_ordinal_);
+        CudaGDNStateOwner scalar_conv_state_owner(
+            scalar_conv, channels * (kernel_size - 1));
         scalar_conv.setGPUStream(stream.stream);
 
         ASSERT_TRUE(scalar_conv.forward(
@@ -863,6 +941,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteEx
     CudaFloatBuffer d_decode_beta(decode_beta);
     CudaFloatBuffer d_gdn_decode_output(static_cast<size_t>(request_count) * v_width, -55.0f);
     CUDAGatedDeltaNet grouped_gdn(cuda_ordinal_);
+    CudaGDNStateOwner grouped_gdn_state_owner(
+        grouped_gdn, gdn_state_floats);
     grouped_gdn.setGPUStream(stream.stream);
 
     ASSERT_TRUE(grouped_gdn.chunkForwardBatchedRequestsWithDeviceSeqLens(
@@ -928,6 +1008,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteEx
         CudaFloatBuffer d_scalar_decode_beta(extract_rows(decode_beta, request, 1, gate_width));
         CudaFloatBuffer d_scalar_decode_output(v_width, -33.0f);
         CUDAGatedDeltaNet scalar_gdn(cuda_ordinal_);
+        CudaGDNStateOwner scalar_gdn_state_owner(
+            scalar_gdn, gdn_state_floats);
         scalar_gdn.setGPUStream(stream.stream);
 
         ASSERT_TRUE(scalar_gdn.chunk_forward(
@@ -973,7 +1055,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteEx
         CudaFloatBuffer d_single_grouped_decode_output(v_width, -31.0f);
         CUDAGatedDeltaNet single_grouped_gdn(cuda_ordinal_);
         single_grouped_gdn.setGPUStream(stream.stream);
-        single_grouped_gdn.allocateGPUState(gdn_state_floats);
+        CudaGDNStateOwner single_grouped_gdn_state_owner(single_grouped_gdn, gdn_state_floats);
         ASSERT_TRUE(single_grouped_gdn.importState(
             scalar_gdn_prefill_state.data(),
             /*src_device=*/nullptr,
@@ -1050,13 +1132,13 @@ TEST_F(Test__CUDAGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCap
 
     CUDAGatedDeltaNet recurrence(cuda_ordinal_);
     recurrence.setGPUStream(stream.stream);
-    recurrence.allocateGPUState(local_recurrence_state);
+    CudaGDNStateOwner recurrence_state_owner(
+        recurrence, local_recurrence_state, full_recurrence_state);
     ASSERT_TRUE(recurrence.isGPUStateReady(local_recurrence_state));
-    recurrence.allocateGPUState(full_recurrence_state);
     ASSERT_TRUE(recurrence.isGPUStateReady(full_recurrence_state));
     ASSERT_TRUE(recurrence.isGPUStateReady(local_recurrence_state))
         << "Full decode-state handoff must not discard the local prefill state slot";
-    ASSERT_EQ(recurrence.stateBytes(), static_cast<size_t>(full_recurrence_state) * sizeof(float));
+    ASSERT_EQ(recurrence.stateBytes(), static_cast<size_t>(local_recurrence_state) * sizeof(float));
 
     CudaFloatBuffer d_q(static_cast<size_t>(seq_len) * full_qk_stride, 0.01f);
     CudaFloatBuffer d_kbuf(static_cast<size_t>(seq_len) * full_qk_stride, 0.02f);
@@ -1097,10 +1179,12 @@ TEST_F(Test__CUDAGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCap
 
     CUDAShortConvolution conv(cuda_ordinal_);
     conv.setGPUStream(stream.stream);
-    conv.allocateGPUState(local_conv_state);
+    CudaGDNStateOwner conv_state_owner(
+        conv, local_conv_state, full_conv_state);
     ASSERT_EQ(conv.stateBytes(), static_cast<size_t>(local_conv_state) * sizeof(float));
-    conv.allocateGPUState(full_conv_state);
-    ASSERT_EQ(conv.stateBytes(), static_cast<size_t>(full_conv_state) * sizeof(float));
+    ASSERT_EQ(
+        conv.largestStateBytes(),
+        static_cast<size_t>(full_conv_state) * sizeof(float));
 
     const auto weights = makeShortConvWeights(full_channels, kernel_size);
     const auto bias = makeBias(full_channels);
@@ -1185,7 +1269,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, LocalStateSurvivesFullStateHandoffBeforeNe
 
     CUDAGatedDeltaNet ref_recurrence(cuda_ordinal_);
     ref_recurrence.setGPUStream(stream.stream);
-    ref_recurrence.allocateGPUState(local_recurrence_state);
+    CudaGDNStateOwner ref_recurrence_state_owner(ref_recurrence, local_recurrence_state);
     ASSERT_TRUE(ref_recurrence.importState(initial_recurrence.data(), nullptr, stream.stream));
     ASSERT_TRUE(ref_recurrence.chunk_forward(
         d_Q_ref.ptr, d_K_ref.ptr, d_V_ref.ptr, d_alpha_ref.ptr, d_beta_ref.ptr,
@@ -1209,7 +1293,10 @@ TEST_F(Test__CUDAGDNPaddedRealLength, LocalStateSurvivesFullStateHandoffBeforeNe
 
     CUDAGatedDeltaNet handoff_recurrence(cuda_ordinal_);
     handoff_recurrence.setGPUStream(stream.stream);
-    handoff_recurrence.allocateGPUState(local_recurrence_state);
+    CudaGDNStateOwner handoff_recurrence_state_owner(
+        handoff_recurrence,
+        local_recurrence_state,
+        full_recurrence_state_floats);
     ASSERT_TRUE(handoff_recurrence.importState(initial_recurrence.data(), nullptr, stream.stream));
     ASSERT_TRUE(handoff_recurrence.chunk_forward(
         d_Q_handoff.ptr, d_K_handoff.ptr, d_V_handoff.ptr, d_alpha_handoff.ptr, d_beta_handoff.ptr,
@@ -1225,8 +1312,11 @@ TEST_F(Test__CUDAGDNPaddedRealLength, LocalStateSurvivesFullStateHandoffBeforeNe
     std::copy(first_segment_recurrence_state.begin(),
               first_segment_recurrence_state.end(),
               imported_full_recurrence_state.begin());
-    handoff_recurrence.allocateGPUState(full_recurrence_state_floats);
-    ASSERT_TRUE(handoff_recurrence.importState(imported_full_recurrence_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(handoff_recurrence.importStateForSize(
+        full_recurrence_state_floats,
+        imported_full_recurrence_state.data(),
+        nullptr,
+        stream.stream));
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(import full recurrence state)");
     ASSERT_EQ(handoff_recurrence.stateBytes(),
               static_cast<size_t>(full_recurrence_state_floats) * sizeof(float));
@@ -1281,7 +1371,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, LocalStateSurvivesFullStateHandoffBeforeNe
 
     CUDAShortConvolution ref_conv(cuda_ordinal_);
     ref_conv.setGPUStream(stream.stream);
-    ref_conv.allocateGPUState(local_conv_state);
+    CudaGDNStateOwner ref_conv_state_owner(ref_conv, local_conv_state);
     ASSERT_TRUE(ref_conv.importState(initial_conv.data(), nullptr, stream.stream));
     ASSERT_TRUE(ref_conv.forward(
         d_conv_input_ref.ptr, d_conv_weight.ptr, d_conv_bias.ptr,
@@ -1301,7 +1391,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, LocalStateSurvivesFullStateHandoffBeforeNe
 
     CUDAShortConvolution handoff_conv(cuda_ordinal_);
     handoff_conv.setGPUStream(stream.stream);
-    handoff_conv.allocateGPUState(local_conv_state);
+    CudaGDNStateOwner handoff_conv_state_owner(
+        handoff_conv, local_conv_state, full_conv_state);
     ASSERT_TRUE(handoff_conv.importState(initial_conv.data(), nullptr, stream.stream));
     ASSERT_TRUE(handoff_conv.forward(
         d_conv_input_handoff.ptr, d_conv_weight.ptr, d_conv_bias.ptr,
@@ -1317,8 +1408,11 @@ TEST_F(Test__CUDAGDNPaddedRealLength, LocalStateSurvivesFullStateHandoffBeforeNe
     std::copy(first_segment_conv_state.begin(),
               first_segment_conv_state.end(),
               imported_full_conv_state.begin());
-    handoff_conv.allocateGPUState(full_conv_state);
-    ASSERT_TRUE(handoff_conv.importState(imported_full_conv_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(handoff_conv.importStateForSize(
+        full_conv_state,
+        imported_full_conv_state.data(),
+        nullptr,
+        stream.stream));
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(import full short-conv state)");
     ASSERT_EQ(handoff_conv.stateBytes(),
               static_cast<size_t>(full_conv_state) * sizeof(float));
@@ -1391,7 +1485,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedD
         CudaIntBuffer d_effective_len(real_len);
 
         CUDAGatedDeltaNet padded_kernel(cuda_ordinal_);
-        padded_kernel.allocateGPUState(n_heads * d_k * d_v);
+        CudaGDNStateOwner padded_kernel_state_owner(padded_kernel, n_heads * d_k * d_v);
         padded_kernel.setGPUStream(stream.stream);
         ASSERT_TRUE(padded_kernel.chunkForwardWithEffectiveSeqLen(
             d_Q_padded.ptr, d_K_padded.ptr, d_V_padded.ptr, d_alpha_padded.ptr, d_beta_padded.ptr, d_A_log.ptr, d_dt_bias.ptr,
@@ -1415,7 +1509,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedD
         checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(padded recurrence decode)");
 
         CUDAGatedDeltaNet ref_kernel(cuda_ordinal_);
-        ref_kernel.allocateGPUState(n_heads * d_k * d_v);
+        CudaGDNStateOwner ref_kernel_state_owner(ref_kernel, n_heads * d_k * d_v);
         ref_kernel.setGPUStream(stream.stream);
         ASSERT_TRUE(ref_kernel.chunk_forward(
             d_Q_ref.ptr, d_K_ref.ptr, d_V_ref.ptr, d_alpha_ref.ptr, d_beta_ref.ptr, d_A_log.ptr, d_dt_bias.ptr,
@@ -1496,7 +1590,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceEffectivePrefillCapturesAndLaunc
     CudaStreamHandle capture_stream;
 
     CUDAGatedDeltaNet captured_kernel(cuda_ordinal_);
-    captured_kernel.allocateGPUState(n_heads * d_k * d_v);
+    CudaGDNStateOwner captured_kernel_state_owner(captured_kernel, n_heads * d_k * d_v);
     captured_kernel.setGPUStream(capture_stream.stream);
     captureAndLaunchOnce(capture_stream.stream, [&] {
         return captured_kernel.chunkForwardWithEffectiveSeqLen(
@@ -1522,7 +1616,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceEffectivePrefillCapturesAndLaunc
     checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(captured recurrence decode)");
 
     CUDAGatedDeltaNet ref_kernel(cuda_ordinal_);
-    ref_kernel.allocateGPUState(n_heads * d_k * d_v);
+    CudaGDNStateOwner ref_kernel_state_owner(ref_kernel, n_heads * d_k * d_v);
     ref_kernel.setGPUStream(capture_stream.stream);
     ASSERT_TRUE(ref_kernel.chunk_forward(
         d_Q_ref.ptr, d_K_ref.ptr, d_V_ref.ptr, d_alpha_ref.ptr, d_beta_ref.ptr, d_A_log.ptr, d_dt_bias.ptr,
@@ -1587,7 +1681,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvEffectivePrefillPreservesDecodeSt
         CudaIntBuffer d_effective_len(real_len);
 
         CUDAShortConvolution padded_kernel(cuda_ordinal_);
-        padded_kernel.allocateGPUState(channels * (kernel_size - 1));
+        CudaGDNStateOwner padded_kernel_state_owner(padded_kernel, channels * (kernel_size - 1));
         ASSERT_TRUE(padded_kernel.forwardWithEffectiveSeqLen(
             d_input.ptr, d_weight.ptr, d_bias.ptr,
             d_padded_out.ptr, nullptr,
@@ -1606,7 +1700,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvEffectivePrefillPreservesDecodeSt
         checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(padded short-conv decode)");
 
         CUDAShortConvolution ref_kernel(cuda_ordinal_);
-        ref_kernel.allocateGPUState(channels * (kernel_size - 1));
+        CudaGDNStateOwner ref_kernel_state_owner(ref_kernel, channels * (kernel_size - 1));
         ASSERT_TRUE(ref_kernel.forward(
             d_input.ptr, d_weight.ptr, d_bias.ptr,
             d_ref_out.ptr, nullptr,
@@ -1666,7 +1760,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvEffectivePrefillCapturesAndLaunch
     CudaStreamHandle capture_stream;
 
     CUDAShortConvolution captured_kernel(cuda_ordinal_);
-    captured_kernel.allocateGPUState(channels * (kernel_size - 1));
+    CudaGDNStateOwner captured_kernel_state_owner(captured_kernel, channels * (kernel_size - 1));
     captured_kernel.setGPUStream(capture_stream.stream);
     captureAndLaunchOnce(capture_stream.stream, [&] {
         return captured_kernel.forwardWithEffectiveSeqLen(
@@ -1688,7 +1782,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvEffectivePrefillCapturesAndLaunch
     checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(captured short-conv decode)");
 
     CUDAShortConvolution ref_kernel(cuda_ordinal_);
-    ref_kernel.allocateGPUState(channels * (kernel_size - 1));
+    CudaGDNStateOwner ref_kernel_state_owner(ref_kernel, channels * (kernel_size - 1));
     ASSERT_TRUE(ref_kernel.forward(
         d_input.ptr, d_weight.ptr, d_bias.ptr,
         d_ref_out.ptr, nullptr,
@@ -1771,7 +1865,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAcc
     CudaStreamHandle stream;
 
     CUDAGatedDeltaNet verifier_kernel(cuda_ordinal_);
-    verifier_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     std::vector<float> initial_live_state(static_cast<size_t>(state_floats));
     ASSERT_TRUE(verifier_kernel.exportState(initial_live_state.data(), nullptr, nullptr));
@@ -1815,7 +1909,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAcc
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(restored recurrence decode)");
 
     CUDAGatedDeltaNet ref_kernel(cuda_ordinal_);
-    ref_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
     ref_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(ref_kernel.chunk_forward(
         d_Q_ref.ptr, d_K_ref.ptr, d_V_ref.ptr, d_alpha_ref.ptr, d_beta_ref.ptr, d_A_log.ptr, d_dt_bias.ptr,
@@ -1888,7 +1982,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseRepla
     CudaFloatBuffer d_step_out(output_elems, 0.0f);
 
     CUDAGatedDeltaNet m4_kernel(cuda_ordinal_);
-    m4_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     m4_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m4_kernel.chunk_forward(
@@ -1901,7 +1995,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseRepla
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, stream.stream));
 
     CUDAGatedDeltaNet step_kernel(cuda_ordinal_);
-    step_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -1991,7 +2085,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay
         0.0f);
 
     CUDAGatedDeltaNet m4_kernel(cuda_ordinal_);
-    m4_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     m4_kernel.setGPUStream(stream.stream);
     m4_kernel.bindDeinterleaveWorkspace(d_m4_scratch.ptr, d_m4_scratch.count);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -2019,7 +2113,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, stream.stream));
 
     CUDAGatedDeltaNet step_kernel(cuda_ordinal_);
-    step_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -2133,7 +2227,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCapture
     CudaStreamHandle stream;
 
     CUDAGatedDeltaNet grouped_kernel(cuda_ordinal_);
-    grouped_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner grouped_kernel_state_owner(grouped_kernel, state_floats);
     grouped_kernel.setGPUStream(stream.stream);
     grouped_kernel.bindDeinterleaveWorkspace(d_grouped_scratch.ptr, d_grouped_scratch.count);
     grouped_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
@@ -2165,7 +2259,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCapture
     ASSERT_TRUE(grouped_kernel.exportState(grouped_live_state.data(), nullptr, stream.stream));
 
     CUDAGatedDeltaNet step_kernel(cuda_ordinal_);
-    step_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -2293,7 +2387,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceM2VerifierSnapshotsMatchStepwise
     CudaStreamHandle stream;
 
     CUDAGatedDeltaNet verifier_kernel(cuda_ordinal_);
-    verifier_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(verifier_kernel.importState(initial_state.data(), nullptr, stream.stream));
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
@@ -2309,7 +2403,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceM2VerifierSnapshotsMatchStepwise
     ASSERT_TRUE(verifier_kernel.exportState(verifier_live_state.data(), nullptr, nullptr));
 
     CUDAGatedDeltaNet one_kernel(cuda_ordinal_);
-    one_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner one_kernel_state_owner(one_kernel, state_floats);
     one_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(one_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(one_kernel.recurrent_step(
@@ -2324,7 +2418,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceM2VerifierSnapshotsMatchStepwise
     ASSERT_TRUE(one_kernel.exportState(one_state.data(), nullptr, nullptr));
 
     CUDAGatedDeltaNet step_kernel(cuda_ordinal_);
-    step_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -2432,7 +2526,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceM4VerifierSnapshotsMatchStepwise
     CudaStreamHandle stream;
 
     CUDAGatedDeltaNet verifier_kernel(cuda_ordinal_);
-    verifier_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(verifier_kernel.importState(initial_state.data(), nullptr, stream.stream));
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
@@ -2448,7 +2542,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceM4VerifierSnapshotsMatchStepwise
     ASSERT_TRUE(verifier_kernel.exportState(verifier_live_state.data(), nullptr, stream.stream));
 
     CUDAGatedDeltaNet step_kernel(cuda_ordinal_);
-    step_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
 
@@ -2559,7 +2653,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceTwoRowVerifierRowZeroRestoreMatc
     CudaStreamHandle stream;
 
     CUDAGatedDeltaNet verifier_kernel(cuda_ordinal_);
-    verifier_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
@@ -2598,7 +2692,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceTwoRowVerifierRowZeroRestoreMatc
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(restored recurrence row0)");
 
     CUDAGatedDeltaNet ref_kernel(cuda_ordinal_);
-    ref_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
     ref_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(ref_kernel.chunk_forward(
         d_Q_ref.ptr, d_K_ref.ptr, d_V_ref.ptr, d_alpha_ref.ptr, d_beta_ref.ptr, d_A_log.ptr, d_dt_bias.ptr,
@@ -2680,7 +2774,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiSt
     CudaStreamHandle stream;
 
     CUDAGatedDeltaNet verifier_kernel(cuda_ordinal_);
-    verifier_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
@@ -2726,7 +2820,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiSt
     ASSERT_TRUE(verifier_kernel.exportState(restored_state.data(), nullptr, stream.stream));
 
     CUDAGatedDeltaNet ref_kernel(cuda_ordinal_);
-    ref_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
     ref_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(ref_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(ref_kernel.chunk_forward(
@@ -2793,7 +2887,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAcce
     CudaStreamHandle stream;
 
     CUDAShortConvolution verifier_kernel(cuda_ordinal_);
-    verifier_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
@@ -2820,7 +2914,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAcce
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(restored short-conv decode)");
 
     CUDAShortConvolution ref_kernel(cuda_ordinal_);
-    ref_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
     ASSERT_TRUE(ref_kernel.forward(
         d_input.ptr,
         d_weight.ptr,
@@ -2870,7 +2964,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvM4FinalStateMatchesStepwiseReplay
     CudaFloatBuffer d_step_out(output_elems, 0.0f);
 
     CUDAShortConvolution m4_kernel(cuda_ordinal_);
-    m4_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, nullptr));
     ASSERT_TRUE(m4_kernel.forward(
         d_input_m4.ptr,
@@ -2885,7 +2979,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvM4FinalStateMatchesStepwiseReplay
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     CUDAShortConvolution step_kernel(cuda_ordinal_);
-    step_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, nullptr));
     for (int row = 0; row < verifier_len; ++row)
     {
@@ -2940,9 +3034,9 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M2InPlaceStateMatchesStepwi
     CudaStreamHandle stream;
 
     CUDAShortConvolution m2_kernel(cuda_ordinal_);
-    m2_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(m2_kernel.allocateGPUScratch(
-        static_cast<int>(output_elems)));
+    CudaGDNStateOwner m2_kernel_state_owner(m2_kernel, state_floats);
+    m2_kernel_state_owner.bindScratch(
+        m2_kernel, static_cast<int>(output_elems));
     m2_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m2_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m2_kernel.forward(
@@ -2958,8 +3052,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M2InPlaceStateMatchesStepwi
     ASSERT_TRUE(m2_kernel.exportState(m2_state.data(), nullptr, stream.stream));
 
     CUDAShortConvolution step_kernel(cuda_ordinal_);
-    step_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    CudaGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
+    step_kernel_state_owner.bindScratch(step_kernel, channels);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -3026,8 +3120,9 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M3InPlaceStateMatchesStepwi
     CudaStreamHandle stream;
 
     CUDAShortConvolution m3_kernel(cuda_ordinal_);
-    m3_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(m3_kernel.allocateGPUScratch(static_cast<int>(output_elems)));
+    CudaGDNStateOwner m3_kernel_state_owner(m3_kernel, state_floats);
+    m3_kernel_state_owner.bindScratch(
+        m3_kernel, static_cast<int>(output_elems));
     m3_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m3_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m3_kernel.forward(
@@ -3043,8 +3138,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M3InPlaceStateMatchesStepwi
     ASSERT_TRUE(m3_kernel.exportState(m3_state.data(), nullptr, stream.stream));
 
     CUDAShortConvolution step_kernel(cuda_ordinal_);
-    step_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    CudaGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
+    step_kernel_state_owner.bindScratch(step_kernel, channels);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -3111,8 +3206,9 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwi
     CudaStreamHandle stream;
 
     CUDAShortConvolution m4_kernel(cuda_ordinal_);
-    m4_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(m4_kernel.allocateGPUScratch(static_cast<int>(output_elems)));
+    CudaGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
+    m4_kernel_state_owner.bindScratch(
+        m4_kernel, static_cast<int>(output_elems));
     m4_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m4_kernel.forward(
@@ -3128,8 +3224,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwi
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, stream.stream));
 
     CUDAShortConvolution step_kernel(cuda_ordinal_);
-    step_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    CudaGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
+    step_kernel_state_owner.bindScratch(step_kernel, channels);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -3192,7 +3288,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvTwoRowVerifierRowZeroRestoreMatch
     CudaStreamHandle stream;
 
     CUDAShortConvolution verifier_kernel(cuda_ordinal_);
-    verifier_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
@@ -3219,7 +3315,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvTwoRowVerifierRowZeroRestoreMatch
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(restored short-conv row0)");
 
     CUDAShortConvolution ref_kernel(cuda_ordinal_);
-    ref_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
     ASSERT_TRUE(ref_kernel.forward(
         d_input.ptr,
         d_weight.ptr,
@@ -3279,7 +3375,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiSte
     CudaStreamHandle stream;
 
     CUDAShortConvolution verifier_kernel(cuda_ordinal_);
-    verifier_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
@@ -3313,7 +3409,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiSte
     ASSERT_TRUE(verifier_kernel.exportState(restored_state.data(), nullptr, stream.stream));
 
     CUDAShortConvolution ref_kernel(cuda_ordinal_);
-    ref_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
     ref_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(ref_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(ref_kernel.forward(
@@ -3424,7 +3520,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeRecurrencePublica
     CudaStreamHandle stream;
 
     CUDAGatedDeltaNet live_kernel(cuda_ordinal_);
-    live_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner live_kernel_state_owner(live_kernel, state_floats);
     live_kernel.setGPUStream(stream.stream);
     live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
     live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
@@ -3450,7 +3546,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeRecurrencePublica
         });
 
     CUDAGatedDeltaNet oracle_kernel(cuda_ordinal_);
-    oracle_kernel.allocateGPUState(state_floats);
+    CudaGDNStateOwner oracle_kernel_state_owner(oracle_kernel, state_floats);
     oracle_kernel.setGPUStream(stream.stream);
 
     for (const int verifier_rows : llaminar2::test::kGroupedVerifierRuntimeRows)
@@ -3622,8 +3718,9 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicat
     CudaStreamHandle stream;
 
     CUDAShortConvolution live_kernel(cuda_ordinal_);
-    live_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(live_kernel.allocateGPUScratch(max_verifier_rows * channels));
+    CudaGDNStateOwner live_kernel_state_owner(live_kernel, state_floats);
+    live_kernel_state_owner.bindScratch(
+        live_kernel, max_verifier_rows * channels);
     live_kernel.setGPUStream(stream.stream);
     live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
     live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
@@ -3645,8 +3742,9 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicat
         });
 
     CUDAShortConvolution oracle_kernel(cuda_ordinal_);
-    oracle_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(oracle_kernel.allocateGPUScratch(max_verifier_rows * channels));
+    CudaGDNStateOwner oracle_kernel_state_owner(oracle_kernel, state_floats);
+    oracle_kernel_state_owner.bindScratch(
+        oracle_kernel, max_verifier_rows * channels);
     oracle_kernel.setGPUStream(stream.stream);
 
     for (const int verifier_rows : llaminar2::test::kGroupedVerifierRuntimeRows)

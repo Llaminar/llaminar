@@ -26,6 +26,7 @@
 #include <cstring>
 #include <iomanip>
 #include <initializer_list>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -110,6 +111,78 @@ namespace
             }
             return host;
         }
+    };
+
+    /**
+     * @brief Test owner for cache-style persistent ROCm GDN device state.
+     *
+     * The real hybrid cache plans these banks before graph construction.
+     * Direct kernel tests use this owner to preserve that exact ownership and
+     * one-shot binding contract while keeping allocations outside production
+     * kernels and outside every captured region.
+     */
+    struct HipGDNStateOwner
+    {
+        template <typename Kernel>
+        HipGDNStateOwner(
+            Kernel &kernel,
+            int primary_state_floats,
+            int secondary_state_floats = 0,
+            int request_capacity = 2)
+            : primary_(std::make_unique<HipFloatBuffer>(
+                  static_cast<size_t>(primary_state_floats), 0.0f)),
+              secondary_(
+                  secondary_state_floats > 0 &&
+                          secondary_state_floats != primary_state_floats
+                      ? std::make_unique<HipFloatBuffer>(
+                            static_cast<size_t>(secondary_state_floats), 0.0f)
+                      : nullptr),
+              requests_(std::make_unique<HipFloatBuffer>(
+                  static_cast<size_t>(request_capacity) *
+                      static_cast<size_t>(std::max(
+                          primary_state_floats,
+                          secondary_state_floats)),
+                  0.0f))
+        {
+            if (primary_state_floats <= 0 || request_capacity <= 0)
+                throw std::invalid_argument(
+                    "HipGDNStateOwner requires positive state and request capacity");
+
+            const GDNDeviceStateBinding binding{
+                .primary_state = primary_->ptr,
+                .primary_state_floats = primary_state_floats,
+                .secondary_state = secondary_ ? secondary_->ptr : nullptr,
+                .secondary_state_floats =
+                    secondary_ ? secondary_state_floats : 0,
+                .request_state_bank = requests_->ptr,
+                .request_state_bank_floats = requests_->count,
+                .request_capacity = request_capacity,
+            };
+            if (!kernel.bindDeviceState(binding))
+                throw std::runtime_error(
+                    "ROCm GDN kernel rejected explicit test-owned state");
+        }
+
+        /**
+         * @brief Bind persistent test-owned scratch for in-place short-conv.
+         */
+        template <typename Kernel>
+        void bindScratch(Kernel &kernel, int scratch_floats)
+        {
+            if (scratch_floats <= 0)
+                throw std::invalid_argument(
+                    "ROCm short-conv scratch must be positive");
+            scratch_ = std::make_unique<HipFloatBuffer>(
+                static_cast<size_t>(scratch_floats), 0.0f);
+            kernel.bindScratchWorkspace(
+                scratch_->ptr, static_cast<int>(scratch_->count));
+        }
+
+    private:
+        std::unique_ptr<HipFloatBuffer> primary_;
+        std::unique_ptr<HipFloatBuffer> secondary_;
+        std::unique_ptr<HipFloatBuffer> requests_;
+        std::unique_ptr<HipFloatBuffer> scratch_;
     };
 
     /// @brief RAII wrapper for int metadata stored on a HIP device.
@@ -624,6 +697,8 @@ TEST(Test__ROCmGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteExac
     HipFloatBuffer d_conv_weights(conv_weights);
     HipFloatBuffer d_conv_bias(conv_bias);
     ROCmShortConvolution grouped_conv(0);
+    HipGDNStateOwner grouped_conv_state_owner(
+        grouped_conv, channels * (kernel_size - 1));
     grouped_conv.setGPUStream(stream.stream);
     grouped_conv.bindScratchWorkspace(
         d_conv_scratch.ptr,
@@ -660,6 +735,8 @@ TEST(Test__ROCmGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteExac
         HipFloatBuffer d_scalar_decode(scalar_decode_input);
         HipFloatBuffer d_scalar_decode_output(channels, -77.0f);
         ROCmShortConvolution scalar_conv(0);
+        HipGDNStateOwner scalar_conv_state_owner(
+            scalar_conv, channels * (kernel_size - 1));
         scalar_conv.setGPUStream(stream.stream);
 
         ASSERT_TRUE(scalar_conv.forward(
@@ -799,6 +876,8 @@ TEST(Test__ROCmGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteExac
     HipFloatBuffer d_decode_beta(decode_beta);
     HipFloatBuffer d_gdn_decode_output(static_cast<size_t>(request_count) * v_width, -55.0f);
     ROCmGatedDeltaNet grouped_gdn(0);
+    HipGDNStateOwner grouped_gdn_state_owner(
+        grouped_gdn, gdn_state_floats);
     grouped_gdn.setGPUStream(stream.stream);
 
     ASSERT_TRUE(grouped_gdn.chunkForwardBatchedRequestsWithDeviceSeqLens(
@@ -857,6 +936,8 @@ TEST(Test__ROCmGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteExac
         HipFloatBuffer d_scalar_decode_beta(extract_rows(decode_beta, request, 1, gate_width));
         HipFloatBuffer d_scalar_decode_output(v_width, -33.0f);
         ROCmGatedDeltaNet scalar_gdn(0);
+        HipGDNStateOwner scalar_gdn_state_owner(
+            scalar_gdn, gdn_state_floats);
         scalar_gdn.setGPUStream(stream.stream);
 
         ASSERT_TRUE(scalar_gdn.chunk_forward(
@@ -904,7 +985,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteExac
         HipFloatBuffer d_single_grouped_decode_output(v_width, -31.0f);
         ROCmGatedDeltaNet single_grouped_gdn(0);
         single_grouped_gdn.setGPUStream(stream.stream);
-        single_grouped_gdn.allocateGPUState(gdn_state_floats);
+        HipGDNStateOwner single_grouped_gdn_state_owner(single_grouped_gdn, gdn_state_floats);
         ASSERT_TRUE(single_grouped_gdn.importState(
             scalar_gdn_prefill_state.data(),
             /*src_device=*/nullptr,
@@ -971,13 +1052,13 @@ TEST(Test__ROCmGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCaptu
 
     ROCmGatedDeltaNet recurrence(0);
     recurrence.setGPUStream(stream.stream);
-    recurrence.allocateGPUState(local_recurrence_state);
+    HipGDNStateOwner recurrence_state_owner(
+        recurrence, local_recurrence_state, full_recurrence_state);
     ASSERT_TRUE(recurrence.isGPUStateReady(local_recurrence_state));
-    recurrence.allocateGPUState(full_recurrence_state);
     ASSERT_TRUE(recurrence.isGPUStateReady(full_recurrence_state));
     ASSERT_TRUE(recurrence.isGPUStateReady(local_recurrence_state))
         << "Full decode-state handoff must not discard the local prefill state slot";
-    ASSERT_EQ(recurrence.stateBytes(), static_cast<size_t>(full_recurrence_state) * sizeof(float));
+    ASSERT_EQ(recurrence.stateBytes(), static_cast<size_t>(local_recurrence_state) * sizeof(float));
 
     HipFloatBuffer d_q(static_cast<size_t>(seq_len) * full_qk_stride, 0.01f);
     HipFloatBuffer d_kbuf(static_cast<size_t>(seq_len) * full_qk_stride, 0.02f);
@@ -1018,10 +1099,12 @@ TEST(Test__ROCmGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCaptu
 
     ROCmShortConvolution conv(0);
     conv.setGPUStream(stream.stream);
-    conv.allocateGPUState(local_conv_state);
+    HipGDNStateOwner conv_state_owner(
+        conv, local_conv_state, full_conv_state);
     ASSERT_EQ(conv.stateBytes(), static_cast<size_t>(local_conv_state) * sizeof(float));
-    conv.allocateGPUState(full_conv_state);
-    ASSERT_EQ(conv.stateBytes(), static_cast<size_t>(full_conv_state) * sizeof(float));
+    ASSERT_EQ(
+        conv.largestStateBytes(),
+        static_cast<size_t>(full_conv_state) * sizeof(float));
 
     const auto weights = makeShortConvWeights(full_channels, kernel_size);
     const auto bias = makeBias(full_channels);
@@ -1092,7 +1175,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedDec
         HipIntBuffer d_effective_len(real_len);
 
         ROCmGatedDeltaNet padded_kernel(0);
-        padded_kernel.allocateGPUState(n_heads * d_k * d_v);
+        HipGDNStateOwner padded_kernel_state_owner(padded_kernel, n_heads * d_k * d_v);
         padded_kernel.setGPUStream(stream.stream);
         ASSERT_TRUE(padded_kernel.chunkForwardWithEffectiveSeqLen(
             d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
@@ -1116,7 +1199,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedDec
         checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(padded recurrence decode)");
 
         ROCmGatedDeltaNet ref_kernel(0);
-        ref_kernel.allocateGPUState(n_heads * d_k * d_v);
+        HipGDNStateOwner ref_kernel_state_owner(ref_kernel, n_heads * d_k * d_v);
         ref_kernel.setGPUStream(stream.stream);
         ASSERT_TRUE(ref_kernel.chunk_forward(
             d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
@@ -1184,7 +1267,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvEffectivePrefillPreservesDecodeStat
         HipIntBuffer d_effective_len(real_len);
 
         ROCmShortConvolution padded_kernel(0);
-        padded_kernel.allocateGPUState(channels * (kernel_size - 1));
+        HipGDNStateOwner padded_kernel_state_owner(padded_kernel, channels * (kernel_size - 1));
         padded_kernel.setGPUStream(stream.stream);
         ASSERT_TRUE(padded_kernel.forwardWithEffectiveSeqLen(
             d_input.ptr, d_weight.ptr, d_bias.ptr,
@@ -1204,7 +1287,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvEffectivePrefillPreservesDecodeStat
         checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(padded short-conv decode)");
 
         ROCmShortConvolution ref_kernel(0);
-        ref_kernel.allocateGPUState(channels * (kernel_size - 1));
+        HipGDNStateOwner ref_kernel_state_owner(ref_kernel, channels * (kernel_size - 1));
         ref_kernel.setGPUStream(stream.stream);
         ASSERT_TRUE(ref_kernel.forward(
             d_input.ptr, d_weight.ptr, d_bias.ptr,
@@ -1290,7 +1373,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAccep
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet verifier_kernel(0);
-    verifier_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     std::vector<float> initial_live_state(static_cast<size_t>(state_floats));
     ASSERT_TRUE(verifier_kernel.exportState(initial_live_state.data(), nullptr, nullptr));
@@ -1334,7 +1417,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAccep
     checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(restored recurrence decode)");
 
     ROCmGatedDeltaNet ref_kernel(0);
-    ref_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
     ref_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(ref_kernel.chunk_forward(
         d_Q_ref.ptr, d_K_ref.ptr, d_V_ref.ptr, d_alpha_ref.ptr, d_beta_ref.ptr, d_A_log.ptr, d_dt_bias.ptr,
@@ -1422,7 +1505,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiStep
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet verifier_kernel(0);
-    verifier_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
@@ -1468,7 +1551,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiStep
     ASSERT_TRUE(verifier_kernel.exportState(restored_state.data(), nullptr, stream.stream));
 
     ROCmGatedDeltaNet ref_kernel(0);
-    ref_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
     ref_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(ref_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(ref_kernel.chunk_forward(
@@ -1547,7 +1630,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseReplay)
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet m4_kernel(0);
-    m4_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     m4_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m4_kernel.chunk_forward(
@@ -1560,7 +1643,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseReplay)
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     ROCmGatedDeltaNet step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -1634,7 +1717,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4DV64FinalStateMatchesStepwiseRep
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet m4_kernel(0);
-    m4_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     m4_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m4_kernel.chunk_forward(
@@ -1647,7 +1730,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4DV64FinalStateMatchesStepwiseRep
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     ROCmGatedDeltaNet step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -1738,7 +1821,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay)
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet m4_kernel(0);
-    m4_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     m4_kernel.setGPUStream(stream.stream);
     m4_kernel.bindDeinterleaveWorkspace(d_m4_scratch.ptr, d_m4_scratch.count);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -1766,7 +1849,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay)
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     ROCmGatedDeltaNet step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -1874,7 +1957,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeVerifierCaptureIs
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet m4_kernel(0);
-    m4_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     m4_kernel.setGPUStream(stream.stream);
     m4_kernel.bindDeinterleaveWorkspace(d_m4_scratch.ptr, d_m4_scratch.count);
     m4_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
@@ -1904,7 +1987,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeVerifierCaptureIs
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     ROCmGatedDeltaNet step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -2028,7 +2111,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM2Qwen36DenseShapeVerifierCaptureMa
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet grouped_kernel(0);
-    grouped_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner grouped_kernel_state_owner(grouped_kernel, state_floats);
     grouped_kernel.setGPUStream(stream.stream);
     grouped_kernel.bindDeinterleaveWorkspace(d_grouped_scratch.ptr, d_grouped_scratch.count);
     grouped_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
@@ -2060,7 +2143,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM2Qwen36DenseShapeVerifierCaptureMa
     ASSERT_TRUE(grouped_kernel.exportState(grouped_live_state.data(), nullptr, nullptr));
 
     ROCmGatedDeltaNet step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -2196,7 +2279,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCaptureMa
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet grouped_kernel(0);
-    grouped_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner grouped_kernel_state_owner(grouped_kernel, state_floats);
     grouped_kernel.setGPUStream(stream.stream);
     grouped_kernel.bindDeinterleaveWorkspace(d_grouped_scratch.ptr, d_grouped_scratch.count);
     grouped_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
@@ -2228,7 +2311,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCaptureMa
     ASSERT_TRUE(grouped_kernel.exportState(grouped_live_state.data(), nullptr, nullptr));
 
     ROCmGatedDeltaNet step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -2335,7 +2418,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAccept
     HipStreamHandle stream;
 
     ROCmShortConvolution verifier_kernel(0);
-    verifier_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
@@ -2373,7 +2456,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAccept
     checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(restored short-conv decode)");
 
     ROCmShortConvolution ref_kernel(0);
-    ref_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
     ref_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(ref_kernel.forward(
         d_input.ptr,
@@ -2426,7 +2509,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvM4FinalStateMatchesStepwiseReplay)
     HipStreamHandle stream;
 
     ROCmShortConvolution m4_kernel(0);
-    m4_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     m4_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m4_kernel.forward(
@@ -2442,7 +2525,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvM4FinalStateMatchesStepwiseReplay)
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     ROCmShortConvolution step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -2505,8 +2588,9 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M2InPlaceStateMatchesStepwise
     HipStreamHandle stream;
 
     ROCmShortConvolution m2_kernel(0);
-    m2_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(m2_kernel.allocateGPUScratch(static_cast<int>(output_elems)));
+    HipGDNStateOwner m2_kernel_state_owner(m2_kernel, state_floats);
+    m2_kernel_state_owner.bindScratch(
+        m2_kernel, static_cast<int>(output_elems));
     m2_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m2_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m2_kernel.forward(
@@ -2522,8 +2606,8 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M2InPlaceStateMatchesStepwise
     ASSERT_TRUE(m2_kernel.exportState(m2_state.data(), nullptr, nullptr));
 
     ROCmShortConvolution step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
+    step_kernel_state_owner.bindScratch(step_kernel, channels);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -2590,8 +2674,9 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M3InPlaceStateMatchesStepwise
     HipStreamHandle stream;
 
     ROCmShortConvolution m3_kernel(0);
-    m3_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(m3_kernel.allocateGPUScratch(static_cast<int>(output_elems)));
+    HipGDNStateOwner m3_kernel_state_owner(m3_kernel, state_floats);
+    m3_kernel_state_owner.bindScratch(
+        m3_kernel, static_cast<int>(output_elems));
     m3_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m3_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m3_kernel.forward(
@@ -2607,8 +2692,8 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M3InPlaceStateMatchesStepwise
     ASSERT_TRUE(m3_kernel.exportState(m3_state.data(), nullptr, nullptr));
 
     ROCmShortConvolution step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
+    step_kernel_state_owner.bindScratch(step_kernel, channels);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -2670,8 +2755,9 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwise
     HipStreamHandle stream;
 
     ROCmShortConvolution m4_kernel(0);
-    m4_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(m4_kernel.allocateGPUScratch(static_cast<int>(output_elems)));
+    HipGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
+    m4_kernel_state_owner.bindScratch(
+        m4_kernel, static_cast<int>(output_elems));
     m4_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m4_kernel.forward(
@@ -2687,8 +2773,8 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwise
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     ROCmShortConvolution step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
+    step_kernel_state_owner.bindScratch(step_kernel, channels);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -2757,7 +2843,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiStepR
     HipStreamHandle stream;
 
     ROCmShortConvolution verifier_kernel(0);
-    verifier_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
@@ -2791,7 +2877,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiStepR
     ASSERT_TRUE(verifier_kernel.exportState(restored_state.data(), nullptr, nullptr));
 
     ROCmShortConvolution ref_kernel(0);
-    ref_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
     ref_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(ref_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(ref_kernel.forward(
@@ -2900,7 +2986,7 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeRecurrencePublicati
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet live_kernel(0);
-    live_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner live_kernel_state_owner(live_kernel, state_floats);
     live_kernel.setGPUStream(stream.stream);
     live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
     live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
@@ -2926,7 +3012,7 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeRecurrencePublicati
         });
 
     ROCmGatedDeltaNet oracle_kernel(0);
-    oracle_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner oracle_kernel_state_owner(oracle_kernel, state_floats);
     oracle_kernel.setGPUStream(stream.stream);
 
     for (const int verifier_rows : llaminar2::test::kGroupedVerifierRuntimeRows)
@@ -3098,8 +3184,9 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicatio
     HipStreamHandle stream;
 
     ROCmShortConvolution live_kernel(0);
-    live_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(live_kernel.allocateGPUScratch(max_verifier_rows * channels));
+    HipGDNStateOwner live_kernel_state_owner(live_kernel, state_floats);
+    live_kernel_state_owner.bindScratch(
+        live_kernel, max_verifier_rows * channels);
     live_kernel.setGPUStream(stream.stream);
     live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
     live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
@@ -3121,8 +3208,9 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicatio
         });
 
     ROCmShortConvolution oracle_kernel(0);
-    oracle_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(oracle_kernel.allocateGPUScratch(max_verifier_rows * channels));
+    HipGDNStateOwner oracle_kernel_state_owner(oracle_kernel, state_floats);
+    oracle_kernel_state_owner.bindScratch(
+        oracle_kernel, max_verifier_rows * channels);
     oracle_kernel.setGPUStream(stream.stream);
 
     for (const int verifier_rows : llaminar2::test::kGroupedVerifierRuntimeRows)

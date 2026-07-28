@@ -9,12 +9,11 @@
 namespace llaminar2
 {
 
-    void HybridGDNLayerState::resetGPUKernelState()
+    bool HybridGDNLayerState::resetGPUKernelState(void *stream)
     {
-        if (conv_kernel)
-            conv_kernel->resetGPUState();
-        if (rec_kernel)
-            rec_kernel->resetGPUState();
+        const bool conv_ok = !conv_kernel || conv_kernel->resetGPUState(stream);
+        const bool recurrence_ok = !rec_kernel || rec_kernel->resetGPUState(stream);
+        return conv_ok && recurrence_ok;
     }
 
 } // namespace llaminar2

@@ -218,6 +218,20 @@ namespace llaminar2
         bool allocate(const WorkspaceRequirements &requirements);
 
         /**
+         * @brief Zero the complete allocated workspace on an explicit stream.
+         *
+         * Persistent cache-owned arenas use this after one-time planning so
+         * every suballocation begins from a deterministic state without
+         * exposing or iterating implementation-specific raw GPU allocations.
+         * GPU callers must provide the producer stream; CPU callers may pass
+         * nullptr because host memset has no stream-ordering contract.
+         *
+         * @param stream CUDA/HIP producer stream, or nullptr for CPU storage.
+         * @return true when the complete allocation was initialized.
+         */
+        bool zeroAll(void *stream);
+
+        /**
          * @brief Check if buffers have been allocated
          */
         bool isAllocated() const { return allocated_; }

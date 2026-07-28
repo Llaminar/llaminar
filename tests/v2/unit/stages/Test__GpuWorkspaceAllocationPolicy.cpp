@@ -617,6 +617,81 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEKernelsDoNotOwnRawGpuAllocations)
         "ROCm MoE kernel");
 }
 
+TEST(
+    Test__GpuWorkspaceAllocationPolicy,
+    GDNKernelsConsumeOnlyCacheOwnedPersistentState)
+{
+    const auto root = repoRoot();
+    const std::array<std::string, 6> kernel_sources = {
+        "src/v2/kernels/cuda/gdn/CUDAGatedDeltaNet.h",
+        "src/v2/kernels/cuda/gdn/CUDAShortConvolution.h",
+        "src/v2/kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu",
+        "src/v2/kernels/rocm/gdn/ROCmGatedDeltaNet.h",
+        "src/v2/kernels/rocm/gdn/ROCmShortConvolution.h",
+        "src/v2/kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip",
+    };
+    const std::array<const char *, 8> forbidden = {
+        "allocateGPUState(",
+        "allocateGPUScratch(",
+        "cudaGDN_gpu_malloc(",
+        "cudaGDN_gpu_free(",
+        "rocmGDN_gpu_malloc(",
+        "rocmGDN_gpu_free(",
+        "backend->allocate(",
+        "backend->free(",
+    };
+
+    for (const auto &relative : kernel_sources)
+    {
+        const auto executable = stripCommentsAndStringLiterals(
+            readFile(root / relative));
+        for (const char *needle : forbidden)
+        {
+            EXPECT_EQ(executable.find(needle), std::string::npos)
+                << relative
+                << " must consume cache-owned persistent state and stage-owned "
+                   "scratch; hidden capacity repair is forbidden: "
+                << needle;
+        }
+    }
+
+    const auto tensor_api = stripCommentsAndStringLiterals(
+        readFile(root / "src/v2/tensors/TensorKernels.h"));
+    EXPECT_EQ(tensor_api.find("allocateGPUState("), std::string::npos);
+    EXPECT_EQ(tensor_api.find("allocateGPUScratch("), std::string::npos);
+    EXPECT_EQ(countOccurrences(tensor_api, "bindDeviceState("), 2u)
+        << "Short-conv and recurrence expose one typed persistent-state "
+           "binding contract each";
+}
+
+TEST(
+    Test__GpuWorkspaceAllocationPolicy,
+    HybridCachePlansGDNStateBeforeKernelConstruction)
+{
+    const auto root = repoRoot();
+    const auto arena = stripCommentsAndStringLiterals(readFile(
+        root / "src/v2/kernels/HybridGDNDeviceStateArena.h"));
+    const auto factory = stripCommentsAndStringLiterals(readFile(
+        root / "src/v2/kernels/KernelFactory.cpp"));
+    const auto handoff = stripCommentsAndStringLiterals(readFile(
+        root /
+        "src/v2/execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp"));
+
+    EXPECT_NE(arena.find("DeviceWorkspaceManager"), std::string::npos);
+    EXPECT_NE(arena.find("zeroAll(initialization_stream)"), std::string::npos);
+    EXPECT_EQ(arena.find("synchronize"), std::string::npos)
+        << "Persistent state initialization is stream ordered, never host blocked";
+
+    EXPECT_EQ(countOccurrences(factory, "bindDeviceState("), 2u)
+        << "KernelFactory must bind both short-conv and recurrence state";
+    EXPECT_EQ(factory.find("allocateGPUState("), std::string::npos);
+
+    EXPECT_EQ(countOccurrences(handoff, "importStateForSize("), 2u)
+        << "LocalTP handoff must select the prebound full-size conv and "
+           "recurrence banks by exact geometry";
+    EXPECT_EQ(handoff.find("allocateGPUState("), std::string::npos);
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MoEWorkspaceActiveExpertIdsCoversAllExperts)
 {
     const int max_seq_len = 9;
