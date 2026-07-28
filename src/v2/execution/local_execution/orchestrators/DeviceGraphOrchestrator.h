@@ -2165,6 +2165,10 @@ namespace llaminar2
             const int32_t *stop_tokens,
             int stop_token_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
+        bool prepareGreedyAllPositionBatchOutcomeGraph(
+            int verifier_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count) override;
         bool verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
             const DeviceGreedyBatchOutcomeRequest *requests,
             int request_count,
@@ -3457,6 +3461,12 @@ namespace llaminar2
             return compute_row_indexed_all_position_logits_
                        ? row_indexed_all_position_logits_row_count_
                        : 0;
+        }
+
+        MTPVerifierOutcomeGraphMode
+        mtpVerifierOutcomeGraphMode() const override
+        {
+            return mtp_verifier_outcome_graph_mode_;
         }
 
         /** Whether the next all-position verifier forward has explicit MTP row metadata. */
@@ -5515,6 +5525,7 @@ namespace llaminar2
         int request_sequence_lengths_capacity_ = 0; ///< Number of request rows reserved in the arena allocation.
         int request_sequence_lengths_active_count_ = 0; ///< Rows populated for the current request-batched prefill.
         void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 stable compact verifier token row/matrix.
+        void *mtp_verifier_stop_tokens_dev_ = nullptr; ///< INT32 fixed-width stop-token controls read inside captured reducers.
         void *stochastic_topk_partial_vals_dev_ = nullptr; ///< FP32 target/verifier top-k partial scratch.
         void *stochastic_topk_partial_idxs_dev_ = nullptr; ///< INT32 target/verifier top-k partial scratch.
         int stochastic_topk_partial_capacity_ = 0;
@@ -6315,6 +6326,36 @@ namespace llaminar2
         bool compute_row_indexed_all_position_logits_ = false;
         int row_indexed_all_position_logits_row_count_ = 0;
         int request_batched_prefill_logits_row_count_ = 0;
+
+        enum class GreedyVerifierOutcomeGraphState
+        {
+            Idle,
+            Armed,
+            Produced,
+        };
+
+        /**
+         * @brief Request controls and lifecycle for one graph-owned greedy result.
+         *
+         * The host array is only a durable source for the tiny pre-replay H2D
+         * control upload.  The graph itself captures the arena address in
+         * `mtp_verifier_stop_tokens_dev_` and never captures these host values.
+         */
+        struct GreedyVerifierOutcomeGraphTransaction
+        {
+            GreedyVerifierOutcomeGraphState state =
+                GreedyVerifierOutcomeGraphState::Idle;
+            int verifier_token_count = 0;
+            int stop_token_count = 0;
+            std::array<int32_t,
+                       sampling_math::kSpeculativeBatchMaxStopTokens>
+                stop_tokens = {-1, -1, -1, -1, -1, -1, -1, -1};
+        };
+
+        MTPVerifierOutcomeGraphMode mtp_verifier_outcome_graph_mode_ =
+            MTPVerifierOutcomeGraphMode::Disabled;
+        GreedyVerifierOutcomeGraphTransaction
+            greedy_verifier_outcome_graph_transaction_;
 
         /// Runner-owned graph metadata workspace for vLLM-style MTP verification.
         MTPSpecDecodeMetadataWorkspaceBinding mtp_spec_decode_metadata_binding_{

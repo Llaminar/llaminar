@@ -800,6 +800,17 @@ namespace llaminar2
         int *out_meta,
         int device_idx,
         void *stream);
+    extern "C" bool
+    rocmOps_summarize_greedy_speculative_verify_batch_device_controls(
+        const int *verify_tokens,
+        const int *draft_tokens,
+        int compare_row_count,
+        const int *stop_tokens,
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta,
+        int device_idx,
+        void *stream);
     extern "C" bool rocmOps_derive_speculative_publication_metadata(
         const int *meta,
         int meta_stride,
@@ -2032,6 +2043,40 @@ namespace llaminar2
             stop_tokens[6],
             stop_tokens[7],
             stop_token_count,
+            static_cast<int *>(out_tokens_device),
+            out_token_capacity,
+            static_cast<int *>(out_meta_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::
+        enqueueSummarizeGreedySpeculativeVerifyBatchDeviceControls(
+            const void *verify_tokens_device,
+            const void *draft_tokens_device,
+            int compare_row_count,
+            const void *stop_tokens_device,
+            int device_id,
+            void *stream,
+            int out_token_capacity,
+            void *out_tokens_device,
+            void *out_meta_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !verify_tokens_device || !draft_tokens_device ||
+            !stop_tokens_device || compare_row_count < 0 ||
+            out_token_capacity < compare_row_count + 1 ||
+            !stream || !out_tokens_device || !out_meta_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_summarize_greedy_speculative_verify_batch_device_controls(
+            static_cast<const int *>(verify_tokens_device),
+            static_cast<const int *>(draft_tokens_device),
+            compare_row_count,
+            static_cast<const int *>(stop_tokens_device),
             static_cast<int *>(out_tokens_device),
             out_token_capacity,
             static_cast<int *>(out_meta_device),

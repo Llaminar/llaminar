@@ -23,6 +23,7 @@
 #include "ICollectiveBackend.h"
 #include "ITPContext.h"
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -270,21 +271,42 @@ namespace llaminar2
         /**
          * @brief Execute compact graph-visible control sidebands on an explicit stream.
          *
-         * This lower-level ABI enqueues sidebands adjacent to an existing graph
-         * collective stage. Production MoE rebalance traffic should prefer
-         * allreduceWithSidebandsOnStream() so the anchor and sidebands enter one
-         * backend group. This method remains for diagnostics and unsupported
-         * fallback probes only. It must not use the legacy default stream or a
-         * host-synchronized fallback.
+         * This lower-level ABI enqueues sidebands on one participant's explicit
+         * graph stream. Production MoE rebalance traffic should prefer
+         * allreduceWithSidebandsOnStream() when a real activation collective
+         * already exists. Compact MTP outcome publication intentionally uses
+         * this anchor-free form because manufacturing a dummy allreduce would
+         * change both its economics and semantics. It must never use the legacy
+         * default stream or a host-synchronized implementation.
          *
          * @param sidebands Compact sideband collectives for this participant.
          * @param device_index Participant index in devices().
          * @param producer_stream Explicit stream that produced the sideband buffers.
-         * @param anchor_stage_name Existing collective stage these sidebands ride with.
+         * @param anchor_stage_name Owning graph stage, whether or not it has an
+         *        activation-collective anchor.
          * @return true on success, false when unsupported or failed.
          */
         virtual bool collectiveSidebandOnStream(
             const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
+            int device_index,
+            void *producer_stream,
+            const std::string &anchor_stage_name)
+        {
+            return collectiveSidebandSpanOnStream(
+                sidebands,
+                device_index,
+                producer_stream,
+                anchor_stage_name);
+        }
+
+        /**
+         * @brief Allocation-free span form for graph-stage sideband bundles.
+         *
+         * Capturable stages own their descriptor storage for graph lifetime and
+         * pass a span here so execute() cannot allocate a temporary vector.
+         */
+        virtual bool collectiveSidebandSpanOnStream(
+            std::span<const LocalTPCollectiveSidebandBuffer> sidebands,
             int device_index,
             void *producer_stream,
             const std::string &anchor_stage_name)

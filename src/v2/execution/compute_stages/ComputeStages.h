@@ -57,6 +57,7 @@
 
 // MTP sidecar stages
 #include "stages/MTPConcatStage.h"
+#include "stages/MTPVerifierOutcomeStage.h"
 
 // Factory
 #include "ComputeStageFactory.h"

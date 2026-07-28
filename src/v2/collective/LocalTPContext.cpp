@@ -2391,6 +2391,19 @@ namespace llaminar2
         void *producer_stream,
         const std::string &anchor_stage_name)
     {
+        return collectiveSidebandSpanOnStream(
+            sidebands,
+            device_index,
+            producer_stream,
+            anchor_stage_name);
+    }
+
+    bool LocalTPContext::collectiveSidebandSpanOnStream(
+        std::span<const LocalTPCollectiveSidebandBuffer> sidebands,
+        int device_index,
+        void *producer_stream,
+        const std::string &anchor_stage_name)
+    {
         if (!producer_stream)
             throw std::invalid_argument("LocalTPContext::collectiveSidebandOnStream requires a non-null GPU stream");
 

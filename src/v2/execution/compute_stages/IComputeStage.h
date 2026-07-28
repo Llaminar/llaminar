@@ -352,6 +352,12 @@ namespace llaminar2
 
         // MTP sidecar
         MTP_CONCAT, ///< Concatenate normalized draft embedding and terminal hidden rows
+
+        /**
+         * Terminal grouped-verifier transaction: device argmax/distribution
+         * reduction plus optional mirrored LocalTP outcome publication.
+         */
+        MTP_VERIFIER_OUTCOME,
     };
 
     /**

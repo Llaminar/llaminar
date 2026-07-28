@@ -22,6 +22,7 @@
 #include "../execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "../execution/config/ExecutionPolicy.h"
 #include "../execution/config/RuntimeConfig.h"
+#include "../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../backends/DeviceId.h"
 #include "../memory/BufferId.h"
 #include "../config/TensorParallelConfig.h"
@@ -186,6 +187,27 @@ namespace llaminar2
          * forwards.
          */
         bool grouped_mtp_verifier = false;
+
+        /**
+         * @brief Graph-owned compact verifier outcome policy for this build.
+         *
+         * `grouped_mtp_verifier` identifies semantic ownership of recurrent
+         * capture slots.  This independent enum identifies the terminal
+         * sampling/reduction topology.  Keeping both explicit prevents a
+         * stochastic verifier from reusing a cached greedy graph merely because
+         * both request all-position logits.
+         */
+        MTPVerifierOutcomeGraphMode mtp_verifier_outcome_graph_mode =
+            MTPVerifierOutcomeGraphMode::Disabled;
+
+        /**
+         * @brief Stable arena addresses used by the terminal outcome stage.
+         *
+         * The orchestrator installs these bindings once during arena
+         * initialization.  Graph builders copy only the addresses into stage
+         * parameters; request values are refreshed on device before replay.
+         */
+        MTPVerifierOutcomeGraphBinding mtp_verifier_outcome_graph_binding;
 
         /**
          * @brief Runtime-only live request-batch condition transaction.

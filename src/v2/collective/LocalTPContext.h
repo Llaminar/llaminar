@@ -140,6 +140,11 @@ namespace llaminar2
             int device_index,
             void *producer_stream,
             const std::string &anchor_stage_name) override;
+        bool collectiveSidebandSpanOnStream(
+            std::span<const LocalTPCollectiveSidebandBuffer> sidebands,
+            int device_index,
+            void *producer_stream,
+            const std::string &anchor_stage_name) override;
         bool collectiveSidebandsMultiOnStreams(
             const std::vector<std::vector<LocalTPCollectiveSidebandBuffer>>
                 &participant_sidebands,

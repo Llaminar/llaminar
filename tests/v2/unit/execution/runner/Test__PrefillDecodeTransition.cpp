@@ -200,6 +200,11 @@ namespace
             if (all_position_logits_enabled_)
             {
                 setupAllPositionLogits(seq_len);
+                if (greedy_outcome_graph_armed_)
+                {
+                    greedy_outcome_graph_armed_ = false;
+                    greedy_outcome_graph_produced_ = true;
+                }
                 return true;
             }
 
@@ -242,6 +247,11 @@ namespace
             if (all_position_logits_enabled_)
             {
                 setupAllPositionLogitsForBatch(token_batches);
+                if (greedy_outcome_graph_armed_)
+                {
+                    greedy_outcome_graph_armed_ = false;
+                    greedy_outcome_graph_produced_ = true;
+                }
                 return !token_batches.empty();
             }
             setupPrefillLogits();
@@ -2101,6 +2111,49 @@ namespace
                 .state = mock_mtp_transaction_};
         }
 
+        /**
+         * @brief Arm one mock graph-owned greedy outcome transaction.
+         *
+         * The production runner appends the compact reducer to the verifier
+         * graph.  This mock models the same lifetime explicitly: preparation
+         * records immutable launch controls, the next all-position forward
+         * publishes the outcome, and the resident consumer must consume that
+         * exact publication once.
+         */
+        bool prepareGreedyAllPositionBatchOutcomeGraph(
+            int verifier_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count) override
+        {
+            using namespace sampling_math;
+            if (!primary_device_.is_gpu() ||
+                !supports_device_resident_mtp_spec_state_publication_ ||
+                !supports_mtp_device_draft_token_input_ ||
+                verifier_token_count <= 0 ||
+                verifier_token_count >
+                    static_cast<int>(device_verifier_input_tokens_.size()) ||
+                stop_token_count < 0 ||
+                stop_token_count > kSpeculativeBatchMaxStopTokens ||
+                (stop_token_count > 0 && !stop_tokens) ||
+                greedy_outcome_graph_armed_ ||
+                greedy_outcome_graph_produced_)
+            {
+                return false;
+            }
+
+            greedy_outcome_graph_verifier_token_count_ =
+                verifier_token_count;
+            greedy_outcome_graph_stop_token_count_ = stop_token_count;
+            greedy_outcome_graph_stop_tokens_.fill(-1);
+            for (int i = 0; i < stop_token_count; ++i)
+            {
+                greedy_outcome_graph_stop_tokens_[static_cast<size_t>(i)] =
+                    stop_tokens[i];
+            }
+            greedy_outcome_graph_armed_ = true;
+            return true;
+        }
+
         bool verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
             const int32_t *draft_tokens,
             int draft_token_count,
@@ -2112,6 +2165,22 @@ namespace
             if (!out_handle)
                 return false;
             *out_handle = DeviceSpeculativeOutcomeHandle{};
+            if (!greedy_outcome_graph_produced_ ||
+                draft_token_count !=
+                    greedy_outcome_graph_verifier_token_count_ ||
+                stop_token_count !=
+                    greedy_outcome_graph_stop_token_count_)
+            {
+                return false;
+            }
+            for (int i = 0; i < stop_token_count; ++i)
+            {
+                if (stop_tokens[i] !=
+                    greedy_outcome_graph_stop_tokens_[static_cast<size_t>(i)])
+                {
+                    return false;
+                }
+            }
 
             DeviceSpeculativeVerifyBatchOutcome outcome;
             if (!verifyGreedyAllPositionBatchOutcomeOnDevice(
@@ -2164,7 +2233,17 @@ namespace
                     [](void *) {});
             out_handle->mtp_transaction =
                 makeMockMTPTransactionLease(/*request_count=*/1);
-            return out_handle->valid();
+            out_handle->mirrored_local_tp_published_in_graph =
+                mirrors_localtp_mtp_head_for_verifier_;
+            const bool valid = out_handle->valid();
+            if (valid)
+            {
+                greedy_outcome_graph_produced_ = false;
+                greedy_outcome_graph_verifier_token_count_ = 0;
+                greedy_outcome_graph_stop_token_count_ = 0;
+                greedy_outcome_graph_stop_tokens_.fill(-1);
+            }
+            return valid;
         }
 
         bool verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
@@ -5850,6 +5929,9 @@ namespace
         std::array<int32_t, kMockVerifierTokenCapacity>
             device_verifier_input_tokens_{};
         std::array<int32_t,
+                   sampling_math::kSpeculativeBatchMaxStopTokens>
+            greedy_outcome_graph_stop_tokens_{};
+        std::array<int32_t,
                    sampling_math::kSpeculativeBatchMaxOutputTokens *
                        kMockResidentOutcomeRequestCapacity>
             resident_output_tokens_{};
@@ -5860,6 +5942,10 @@ namespace
         int resident_stream_token_{0};
         int resident_outcome_response_ready_event_token_{0};
         int resident_ready_event_token_{0};
+        int greedy_outcome_graph_verifier_token_count_{0};
+        int greedy_outcome_graph_stop_token_count_{0};
+        bool greedy_outcome_graph_armed_{false};
+        bool greedy_outcome_graph_produced_{false};
         std::shared_ptr<DeviceResidentMTPTransactionState>
             mock_mtp_transaction_;
         bool resident_logical_state_valid_{false};
@@ -8215,6 +8301,7 @@ namespace
                 /*chained_mtp_support=*/true,
                 /*sidecar_sample_fusion=*/true);
             mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            mock->enableMTPDeviceDraftTokenInput();
             mock->enableDeviceResidentMTPSpecStatePublication();
             mock->setDecodeArgmaxScript({
                 MockInferenceRunner::MTP_ARGMAX_TOKEN,
@@ -8242,9 +8329,21 @@ namespace
             ASSERT_GE(mock->forwardHistory().size(), 2u);
             EXPECT_THAT(mock->forwardHistory()[0], ElementsAre(1, 2, 3, 4, 5));
             EXPECT_THAT(mock->forwardHistory()[1],
-                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                        ElementsAre(
+                            MockInferenceRunner::DEFERRED_DEVICE_FIRST_TOKEN_SHADOW,
+                            MockInferenceRunner::DEFERRED_DEVICE_DRAFT_TOKEN_SHADOW,
+                            MockInferenceRunner::DEFERRED_DEVICE_DRAFT_TOKEN_SHADOW))
+                << "the host row carries sentinels; the verifier consumes the "
+                   "canonical tokens through its device pointer";
+            EXPECT_EQ(mock->lastForwardDeviceTokenIds(),
+                      mock->deviceVerifierInputTokens().data());
+            EXPECT_THAT(
+                std::vector<int32_t>(
+                    mock->deviceVerifierInputTokens().begin(),
+                    mock->deviceVerifierInputTokens().begin() + 3),
+                ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                            MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             const auto probe = runner->prefixStateProbe();
             EXPECT_EQ(probe.mtp_draft_steps, 2u);
@@ -8285,6 +8384,7 @@ namespace
                 /*sidecar_sample_fusion=*/true);
             mock->enableMTPSidecarPreservesMainState();
             mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            mock->enableMTPDeviceDraftTokenInput();
             mock->enableDeviceResidentMTPSpecStatePublication();
             mock->setDecodeArgmaxScript({
                 MockInferenceRunner::MTP_ARGMAX_TOKEN,
@@ -8309,8 +8409,17 @@ namespace
             EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
             EXPECT_EQ(mock->forwardCallCount(), 2);
             EXPECT_THAT(mock->forwardHistory()[1],
-                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                        ElementsAre(
+                            MockInferenceRunner::DEFERRED_DEVICE_FIRST_TOKEN_SHADOW,
+                            MockInferenceRunner::DEFERRED_DEVICE_DRAFT_TOKEN_SHADOW));
+            EXPECT_EQ(mock->lastForwardDeviceTokenIds(),
+                      mock->deviceVerifierInputTokens().data());
+            EXPECT_THAT(
+                std::vector<int32_t>(
+                    mock->deviceVerifierInputTokens().begin(),
+                    mock->deviceVerifierInputTokens().begin() + 2),
+                ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                            MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             EXPECT_EQ(findPerfRecord(records,
@@ -9056,7 +9165,8 @@ namespace
         EXPECT_THAT(mock->publicationEvents(), IsEmpty());
     }
 
-    TEST_F(Test__PrefillDecodeTransition, PenaltyGreedyGPUUsesRowLocalAllPositionVerifier)
+    TEST_F(Test__PrefillDecodeTransition,
+           PenaltyGreedyGPUFailsBeforeUncapturedVerifierTransform)
     {
         const std::filesystem::path export_path =
             std::filesystem::temp_directory_path() /
@@ -9090,31 +9200,31 @@ namespace
             const int forward_count_after_prefill = mock->forwardCallCount();
 
             GenerationResult step = runner->decodeStep();
-            ASSERT_TRUE(step.success()) << step.error;
-            EXPECT_THAT(step.tokens,
-                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
-
+            ASSERT_FALSE(step.success());
+            EXPECT_THAT(
+                step.error,
+                HasSubstr(
+                    "GPU greedy MTP penalties must execute inside the captured "
+                    "verifier graph"));
             EXPECT_EQ(mock->applyMainPenaltiesCount(), 1)
                 << "the first temperature-zero target token is still sampled "
                    "from penalty-mutated logits";
             EXPECT_EQ(mock->applyMTPPenaltiesCount(), 2)
                 << "each greedy MTP sidecar draft should see the sampler "
                    "history built by prior accepted tokens";
-            EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 3)
-                << "two verifier comparison rows plus the bonus-ready row "
-                   "need row-local speculative penalty history";
-            EXPECT_EQ(mock->setAllPositionCount(), 2);
-            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1)
-                << "penalty-greedy should use the compact all-position reducer "
-                   "after row-local penalty application";
-            EXPECT_EQ(mock->verifyGreedyAllPositionBatchOutcomeCount(), 1);
+            EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0)
+                << "uncaptured verifier transforms must fail before launching "
+                   "the grouped verifier graph";
+            EXPECT_EQ(mock->setAllPositionCount(), 1)
+                << "the only all-position transition is fail-path teardown; no "
+                   "verifier graph is enabled or executed";
+            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
+            EXPECT_EQ(mock->verifyGreedyAllPositionBatchOutcomeCount(), 0);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
-            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
-            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
-                << "the promoted penalty-greedy lane must not fall back to "
-                   "stepwise decode-equivalent replay";
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 0);
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill)
+                << "the unsupported graph transform must fail before verifier "
+                   "execution instead of entering a fallback lane";
             EXPECT_EQ(
                 mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount(),
                 1)
@@ -9145,8 +9255,9 @@ namespace
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Counter,
                                "greedy_vllm_penalty_rows_preapplied");
-            ASSERT_NE(row_penalties, nullptr);
-            EXPECT_DOUBLE_EQ(row_penalties->value, 3.0);
+            EXPECT_EQ(row_penalties, nullptr)
+                << "the uncaptured row transform must not run before the hard "
+                   "failure";
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -13330,10 +13441,10 @@ namespace
     }
 
     /**
-     * @brief LocalTP reject publication samples before teardown and publishes resident state.
+     * @brief LocalTP penalty verification fails before an uncaptured transform.
      */
     TEST_F(Test__PrefillDecodeTransition,
-           LocalTPGroupedCompactPublicationSamplesRejectBeforeLogitTeardown)
+           LocalTPPenaltyGreedyFailsBeforeUncapturedVerifierTransform)
     {
         const std::filesystem::path export_path =
             std::filesystem::temp_directory_path() /
@@ -13365,52 +13476,38 @@ namespace
             ASSERT_TRUE(harness.runner->prefill({1, 2, 3, 4, 5}));
 
             GenerationResult step = harness.runner->decodeStep();
-            ASSERT_TRUE(step.success()) << step.error;
-            EXPECT_THAT(step.tokens,
-                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                    MockInferenceRunner::VERIFY_REJECT_TOKEN));
+            ASSERT_FALSE(step.success());
+            EXPECT_THAT(
+                step.error,
+                HasSubstr(
+                    "Grouped-outcome GPU greedy MTP penalties must execute "
+                    "inside the captured verifier graph"));
 
-            EXPECT_EQ(harness.child0->verifyGreedyAllPositionBatchOutcomeCount(), 1);
-            EXPECT_EQ(harness.child1->verifyGreedyAllPositionBatchOutcomeCount(), 1)
-                << "Mirrored LocalTP MTP heads reduce compact greedy outcomes "
-                   "on every child.";
-            EXPECT_EQ(harness.child0->sampleAllPositionLogitsBatchedCount(), 1);
-            EXPECT_EQ(harness.child1->sampleAllPositionLogitsBatchedCount(), 1);
+            EXPECT_EQ(harness.child0->verifyGreedyAllPositionBatchOutcomeCount(), 0);
+            EXPECT_EQ(harness.child1->verifyGreedyAllPositionBatchOutcomeCount(), 0);
+            EXPECT_EQ(harness.child0->sampleAllPositionLogitsBatchedCount(), 0);
+            EXPECT_EQ(harness.child1->sampleAllPositionLogitsBatchedCount(), 0);
             EXPECT_EQ(harness.child0->publishMTPSpecStateCount(), 0);
             EXPECT_EQ(harness.child1->publishMTPSpecStateCount(), 0);
             EXPECT_EQ(harness.child0->publishMTPSpecStateBatchCount(), 0);
             EXPECT_EQ(harness.child1->publishMTPSpecStateBatchCount(), 0);
             EXPECT_EQ(harness.child0->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
             EXPECT_EQ(harness.child1->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
-            EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 1);
-            EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 1);
-            EXPECT_THAT(harness.child0->publicationEvents(),
-                        ElementsAre("device_outcome_publish", "host_outcome_bridge"));
-            EXPECT_THAT(harness.child1->publicationEvents(),
-                        ElementsAre("device_outcome_publish"));
+            EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 0);
+            EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 0);
+            EXPECT_THAT(harness.child0->publicationEvents(), IsEmpty());
+            EXPECT_THAT(harness.child1->publicationEvents(), IsEmpty());
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
-            const PerfStatRecord *pre_cleanup_sample =
-                findPerfRecord(records,
-                               PerfStatRecord::Kind::Counter,
-                               "grouped_outcome_greedy_verifier_rows_sampled_before_all_position_cleanup");
-            ASSERT_NE(pre_cleanup_sample, nullptr);
-            EXPECT_DOUBLE_EQ(pre_cleanup_sample->value, 2.0);
-            const PerfStatRecord *pre_cleanup_penalties =
-                findPerfRecord(records,
-                               PerfStatRecord::Kind::Counter,
-                               "grouped_outcome_greedy_penalty_rows_preapplied");
-            ASSERT_NE(pre_cleanup_penalties, nullptr);
-            EXPECT_DOUBLE_EQ(pre_cleanup_penalties->value, 2.0);
             EXPECT_EQ(findPerfRecord(records,
                                      PerfStatRecord::Kind::Counter,
                                      "grouped_outcome_host_publication_uses"),
                       nullptr);
-            ASSERT_NE(findPerfRecord(records,
+            EXPECT_EQ(findPerfRecord(records,
                                      PerfStatRecord::Kind::Counter,
                                      "rank_mirrored_localtp_greedy_resident_outcomes"),
                       nullptr);
-            ASSERT_NE(findPerfRecord(records,
+            EXPECT_EQ(findPerfRecord(records,
                                      PerfStatRecord::Kind::Counter,
                                      "grouped_outcome_pending_condition_resident_mailboxes"),
                       nullptr);
@@ -13418,17 +13515,9 @@ namespace
                                      PerfStatRecord::Kind::Counter,
                                      "grouped_outcome_pending_condition_host_tokens"),
                       nullptr);
-            ASSERT_NE(findPerfRecordWithTags(
-                          records,
-                          PerfStatRecord::Kind::Counter,
-                          "acceptance_trace",
-                          {{"verifier_path",
-                            "grouped_decode_equivalent_greedy"},
-                           {"catchup_implementation",
-                            "device_batch_outcome_device_resident_publication"},
-                           {"policy_path",
-                            "grouped_outcome_device_resident_publication"},
-                           {"decode_equivalent_replay_required", "false"}}),
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "acceptance_trace"),
                       nullptr);
         }
         std::filesystem::remove(export_path);

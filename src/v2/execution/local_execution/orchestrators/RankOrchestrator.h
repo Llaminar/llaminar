@@ -789,6 +789,10 @@ namespace llaminar2
             const int32_t *stop_tokens,
             int stop_token_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
+        bool prepareGreedyAllPositionBatchOutcomeGraph(
+            int verifier_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count) override;
         bool verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
             const DeviceGreedyBatchOutcomeRequest *requests,
             int request_count,

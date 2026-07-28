@@ -181,6 +181,20 @@ namespace llaminar2
             return true;
         }
 
+        bool setMTPVerifierOutcomeGraphMode(
+            MTPVerifierOutcomeGraphMode mode) override
+        {
+            config_.mtp_verifier_outcome_graph_mode = mode;
+            return true;
+        }
+
+        bool setMTPVerifierOutcomeGraphBinding(
+            const MTPVerifierOutcomeGraphBinding &binding) override
+        {
+            config_.mtp_verifier_outcome_graph_binding = binding;
+            return true;
+        }
+
         bool setLiveMTPRequestBatchCondition(bool enabled) override
         {
             config_.live_mtp_request_batch_condition = enabled;
@@ -680,6 +694,26 @@ namespace llaminar2
             const int32_t *request_sequence_lengths_device = nullptr,
             int request_row_stride = 0,
             BufferId input_buffer_id = BufferId::NORMALIZED) const;
+
+        /**
+         * @brief Append the typed graph-owned MTP verifier transaction.
+         *
+         * @param graph Forward graph whose LM-head output is complete.
+         * @param dependency_node Exact logits-producing terminal node.
+         * @param logits Full-vocabulary verifier logits tensor.
+         * @param verifier_row_count Number of compact verifier rows.
+         * @param device Participant device.
+         * @return New terminal node, or @p dependency_node when the policy is
+         *         Disabled.
+         * @throws std::runtime_error when an enabled policy is malformed or
+         *         cannot be represented by the current topology.
+         */
+        std::string addMTPVerifierOutcomeToGraph(
+            ComputeGraph &graph,
+            const std::string &dependency_node,
+            TensorBase *logits,
+            int verifier_row_count,
+            DeviceId device) const;
 
         [[noreturn]] void failMissingGpuExpertGemmEngines(
             DeviceId device,

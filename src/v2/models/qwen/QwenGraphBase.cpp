@@ -1352,6 +1352,100 @@ namespace llaminar2
     // Model-Level Graph Building
     // =============================================================================
 
+    std::string QwenGraphBase::addMTPVerifierOutcomeToGraph(
+        ComputeGraph &graph,
+        const std::string &dependency_node,
+        TensorBase *logits,
+        int verifier_row_count,
+        DeviceId device) const
+    {
+        const MTPVerifierOutcomeGraphMode mode =
+            config_.mtp_verifier_outcome_graph_mode;
+        if (mode == MTPVerifierOutcomeGraphMode::Disabled)
+            return dependency_node;
+
+        if (!config_.grouped_mtp_verifier ||
+            !config_.compute_all_position_logits ||
+            !config_.compute_row_indexed_logits)
+        {
+            throw std::runtime_error(
+                "MTP verifier outcome graph mode requires the explicit grouped, "
+                "all-position, row-indexed verifier policy");
+        }
+        if (!device.is_gpu())
+        {
+            throw std::runtime_error(
+                "Graph-owned MTP verifier outcomes are GPU-only");
+        }
+        if (mode != MTPVerifierOutcomeGraphMode::Greedy)
+        {
+            throw std::runtime_error(
+                "Requested MTP verifier outcome graph mode is not implemented");
+        }
+        if (!logits || verifier_row_count <= 0 ||
+            verifier_row_count != config_.row_indexed_logits_row_count ||
+            !config_.mtp_verifier_outcome_graph_binding.validForGreedy())
+        {
+            throw std::runtime_error(
+                "Greedy MTP verifier outcome graph has malformed geometry or "
+                "persistent device bindings");
+        }
+
+        ILocalTPContext *local_tp = nullptr;
+        if (config_.tp_ctx && config_.tp_ctx->isLocal())
+        {
+            local_tp = dynamic_cast<ILocalTPContext *>(config_.tp_ctx);
+            if (!local_tp)
+            {
+                throw std::runtime_error(
+                    "Local MTP verifier topology did not expose ILocalTPContext");
+            }
+        }
+        const bool publish_mirrored_local_tp =
+            local_tp && local_tp->degree() > 1;
+        if (publish_mirrored_local_tp &&
+            !config_.mtp.mirror_full_head_for_local_tp)
+        {
+            throw std::runtime_error(
+                "Graph-owned LocalTP MTP outcomes require a mirrored full "
+                "verifier head on every participant");
+        }
+        if (publish_mirrored_local_tp &&
+            !local_tp->supportsCollectiveSidebandOnStreamGraphCapture())
+        {
+            throw std::runtime_error(
+                "Graph-owned LocalTP MTP outcome publication requires "
+                "graph-capturable NCCL/RCCL sidebands");
+        }
+        if (config_.tp_ctx && !config_.tp_ctx->isLocal() &&
+            config_.tp_ctx->degree() > 1)
+        {
+            throw std::runtime_error(
+                "Graph-owned compact MTP outcome publication is not yet "
+                "implemented for multi-rank GlobalTP");
+        }
+
+        MTPVerifierOutcomeStage::Params params{
+            .device_id = device,
+            .logits = logits,
+            .mode = mode,
+            .binding = config_.mtp_verifier_outcome_graph_binding,
+            .verifier_row_count = verifier_row_count,
+            .vocab_size = config_.vocab_size,
+            .local_tp_ctx = local_tp,
+            .local_tp_device_index = config_.tp_device_idx,
+            .local_tp_root_device_index = 0,
+            .publish_mirrored_local_tp = publish_mirrored_local_tp,
+            .stage_name = "mtp_verifier_outcome",
+        };
+        graph.addNode(
+            params.stage_name,
+            ComputeStageFactory::createMTPVerifierOutcome(params),
+            device);
+        graph.addDependency(params.stage_name, dependency_node);
+        return params.stage_name;
+    }
+
     ComputeGraph QwenGraphBase::buildFullForwardGraph(
         const ForwardInput &input,
         ForwardOutput &output)
@@ -1605,7 +1699,15 @@ namespace llaminar2
                           ComputeStageFactory::createAllGather(allgather_params),
                           device);
             graph.addDependency("lm_head_allgather", prev_node);
+            prev_node = "lm_head_allgather";
         }
+
+        prev_node = addMTPVerifierOutcomeToGraph(
+            graph,
+            prev_node,
+            graphLMHeadOutput(use_column_parallel),
+            lm_layout.seq_len,
+            device);
 
         // Set output
         output.logits = graphLMHeadOutput(use_column_parallel);
@@ -1922,7 +2024,15 @@ namespace llaminar2
                               ComputeStageFactory::createAllGather(allgather_params),
                               device);
                 graph.addDependency("lm_head_allgather", prev_node);
+                prev_node = "lm_head_allgather";
             }
+
+            prev_node = addMTPVerifierOutcomeToGraph(
+                graph,
+                prev_node,
+                graphLMHeadOutput(use_column_parallel),
+                lm_layout.seq_len,
+                device);
 
             // Set output logits
             output.logits = graphLMHeadOutput(use_column_parallel);

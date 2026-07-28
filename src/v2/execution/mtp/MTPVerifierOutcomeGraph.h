@@ -1,0 +1,83 @@
+/**
+ * @file MTPVerifierOutcomeGraph.h
+ * @brief Typed policy and stable device bindings for graph-owned MTP outcomes.
+ *
+ * A grouped verifier forward does not end when the LM head writes logits.  The
+ * complete GPU transaction also selects verifier tokens, reduces the accepted
+ * prefix into a compact outcome, and, for mirrored LocalTP execution, publishes
+ * that one canonical outcome to every participant.  This header describes that
+ * transaction without depending on a particular model graph.
+ *
+ * All pointers in MTPVerifierOutcomeGraphBinding refer to persistent arena
+ * storage.  They are installed before any graph is built and remain stable for
+ * the lifetime of every cached graph that captures them.  Request-specific
+ * values are written into those buffers before replay; graph stages must never
+ * capture pointers to temporary host vectors or per-request allocations.
+ */
+
+#pragma once
+
+#include <cstdint>
+
+namespace llaminar2
+{
+    /**
+     * @brief Verifier outcome operation captured at the end of a forward graph.
+     *
+     * The enum is deliberately closed.  A new sampling regime must add a real
+     * graph implementation and a cache-signature value rather than quietly
+     * sharing a topology intended for another verifier.
+     */
+    enum class MTPVerifierOutcomeGraphMode : uint8_t
+    {
+        Disabled = 0,
+        Greedy = 1,
+        StochasticSerialEquivalent = 2,
+        StochasticRejection = 3,
+    };
+
+    /**
+     * @brief Persistent device storage consumed by the verifier outcome stage.
+     *
+     * The binding contains addresses only, never request values.  For example,
+     * @ref stop_tokens_device always addresses an eight-element arena row; the
+     * pre-replay metadata transaction updates that row and fills unused entries
+     * with `-1`.  The captured reducer can consequently inspect all eight slots
+     * without embedding a changing host stop-token count in its kernel node.
+     */
+    struct MTPVerifierOutcomeGraphBinding
+    {
+        const int32_t *verifier_input_tokens_device = nullptr;
+        const int32_t *stop_tokens_device = nullptr;
+
+        int32_t *verifier_tokens_device = nullptr;
+        float *argmax_values_device = nullptr;
+        float *argmax_partial_values_device = nullptr;
+        int32_t *argmax_partial_indices_device = nullptr;
+        int argmax_partial_capacity = 0;
+
+        int32_t *output_tokens_device = nullptr;
+        int32_t *output_meta_device = nullptr;
+        int output_token_capacity = 0;
+        int output_meta_capacity = 0;
+
+        /**
+         * @brief Validate the pointer/capacity contract required by greedy mode.
+         */
+        [[nodiscard]] bool validForGreedy() const noexcept
+        {
+            return verifier_input_tokens_device != nullptr &&
+                   stop_tokens_device != nullptr &&
+                   verifier_tokens_device != nullptr &&
+                   argmax_values_device != nullptr &&
+                   argmax_partial_values_device != nullptr &&
+                   argmax_partial_indices_device != nullptr &&
+                   argmax_partial_capacity > 0 &&
+                   output_tokens_device != nullptr &&
+                   output_meta_device != nullptr &&
+                   output_token_capacity > 0 &&
+                   output_meta_capacity > 0;
+        }
+    };
+
+} // namespace llaminar2

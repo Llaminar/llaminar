@@ -4649,21 +4649,24 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
         runner_source,
         "if (draft_idx == 0)",
         "else\n                {");
-    const auto greedy_summary_body = sliceBetween(
+    const auto greedy_consumer_body = sliceBetween(
         dgo_source,
         "bool DeviceGraphOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDeviceResident(",
-        "const auto *base = static_cast<const float *>(gpu_ptr);");
+        "bool DeviceGraphOrchestrator::verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(");
+    const auto graph_outcome_stage = readFile(
+        repoRoot() /
+        "src/v2/execution/compute_stages/stages/MTPVerifierOutcomeStage.cpp");
     const auto greedy_runner_body = sliceBetween(
         runner_source,
         "const bool use_greedy_device_batch_outcome =",
         "else\n                {");
     const auto cuda_greedy_summary_kernel = sliceBetween(
         cuda_sampling,
-        "__global__ void cuda_summarize_greedy_speculative_verify_batch_kernel(",
+        "cuda_summarize_greedy_speculative_verify_batch_device_controls_kernel(",
         "__global__ void cuda_derive_speculative_publication_metadata_kernel(");
     const auto rocm_greedy_summary_kernel = sliceBetween(
         rocm_sampling,
-        "__global__ void rocm_summarize_greedy_speculative_verify_batch_kernel(",
+        "rocm_summarize_greedy_speculative_verify_batch_device_controls_kernel(",
         "__global__ void rocm_derive_speculative_publication_metadata_kernel(");
 
     const size_t first_token_device_sample =
@@ -4695,28 +4698,52 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
            "fails, the decode step must abort before the legacy sampler can "
            "hide the coherence bug.";
 
-    const size_t expected_gate =
-        greedy_summary_body.find("prepared_device_tokens_expected");
-    const size_t missing_row_counter =
-        greedy_summary_body.find(
-            "\"greedy_verifier_missing_device_token_rows\"");
-    const size_t missing_row_return =
-        greedy_summary_body.find("return false;", missing_row_counter);
-    const size_t legacy_upload_counter =
-        greedy_summary_body.find("\"greedy_verifier_host_token_row_uploads\"");
-    const size_t host_upload =
-        greedy_summary_body.find("hostToDeviceOnStream(");
-    ASSERT_NE(expected_gate, std::string::npos);
-    ASSERT_NE(missing_row_counter, std::string::npos);
-    ASSERT_NE(missing_row_return, std::string::npos);
-    EXPECT_EQ(legacy_upload_counter, std::string::npos)
-        << "Resident greedy verifier outcome must fail without prepared device "
-           "tokens instead of staging a host verifier row.";
-    EXPECT_EQ(host_upload, std::string::npos)
-        << "Resident greedy verifier outcome must not have a hot-path H2D "
-           "token-row upload.";
-    EXPECT_LT(expected_gate, missing_row_counter);
-    EXPECT_LT(missing_row_counter, missing_row_return);
+    const auto compact_greedy_consumer = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(greedy_consumer_body));
+    const auto compact_graph_outcome_stage = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(graph_outcome_stage));
+    EXPECT_NE(
+        compact_greedy_consumer.find(
+            "GreedyVerifierOutcomeGraphState::Produced"),
+        std::string::npos);
+    EXPECT_NE(
+        compact_greedy_consumer.find(
+            "consumePendingLogitsStream("
+            "PendingLogitsStreamRole::AllPositionVerifier"),
+        std::string::npos);
+    EXPECT_NE(
+        compact_greedy_consumer.find(
+            "forward_graph_output_ready_.event"),
+        std::string::npos);
+    EXPECT_EQ(
+        compact_greedy_consumer.find(
+            "enqueueArgmaxF32BatchedRowsDevice("),
+        std::string::npos)
+        << "The resident consumer must not launch a post-graph argmax.";
+    EXPECT_EQ(
+        compact_greedy_consumer.find(
+            "enqueueSummarizeGreedySpeculativeVerifyBatch"),
+        std::string::npos)
+        << "The resident consumer must not launch a post-graph summary.";
+    EXPECT_EQ(
+        compact_greedy_consumer.find("explicitGPUStreamForOperation("),
+        std::string::npos)
+        << "A missing graph stream is fatal, not a fresh-stream fallback.";
+    EXPECT_EQ(
+        compact_greedy_consumer.find("hostToDeviceOnStream("),
+        std::string::npos);
+    EXPECT_NE(
+        compact_graph_outcome_stage.find(
+            "enqueueArgmaxF32BatchedRowsDevice("),
+        std::string::npos);
+    EXPECT_NE(
+        compact_graph_outcome_stage.find(
+            "enqueueSummarizeGreedySpeculativeVerifyBatchDeviceControls("),
+        std::string::npos);
+    EXPECT_NE(
+        compact_graph_outcome_stage.find(
+            "collectiveSidebandSpanOnStream("),
+        std::string::npos);
 
     const auto compact_greedy_runner =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(greedy_runner_body));
@@ -4755,10 +4782,14 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
               std::string::npos);
     ASSERT_NE(rocm_greedy_summary_kernel.find("draft_tokens[0]"),
               std::string::npos);
-    ASSERT_NE(cuda_greedy_summary_kernel.find("sampled_first_token"),
-              std::string::npos);
-    ASSERT_NE(rocm_greedy_summary_kernel.find("sampled_first_token"),
-              std::string::npos);
+    ASSERT_NE(
+        cuda_greedy_summary_kernel.find(
+            "sampling_math::kSpeculativeBatchMaxStopTokens"),
+        std::string::npos);
+    ASSERT_NE(
+        rocm_greedy_summary_kernel.find(
+            "sampling_math::kSpeculativeBatchMaxStopTokens"),
+        std::string::npos);
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, RequestBatchResidentOutcomePublishesBeforeHostBridge)

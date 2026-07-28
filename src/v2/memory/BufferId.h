@@ -149,6 +149,7 @@ namespace llaminar2
         MTP_CONDITION_TOKEN, ///< Arena-owned INT32 condition-token rows for device-resident MTP sidecar input
         MTP_POSITION_IDS, ///< Arena-owned INT32 request positions for device-resident batched MTP sidecar replay
         MTP_VERIFIER_INPUT_TOKENS, ///< Arena-owned INT32 verifier token row fed directly to GPU embedding
+        MTP_VERIFIER_STOP_TOKENS, ///< Arena-owned fixed-width INT32 stop-token controls for captured verifier reduction
         MTP_VERIFIER_POSITION_IDS, ///< Arena-owned INT32 absolute positions expanded from device-owned live KV counts
         MTP_LOGICAL_SEQUENCE_STATE, ///< Arena-owned INT32 published logical-state rows that outlive graph workspace generations
 
@@ -348,6 +349,8 @@ namespace llaminar2
             return "MTP_POSITION_IDS";
         case BufferId::MTP_VERIFIER_INPUT_TOKENS:
             return "MTP_VERIFIER_INPUT_TOKENS";
+        case BufferId::MTP_VERIFIER_STOP_TOKENS:
+            return "MTP_VERIFIER_STOP_TOKENS";
         case BufferId::MTP_VERIFIER_POSITION_IDS:
             return "MTP_VERIFIER_POSITION_IDS";
         case BufferId::MTP_LOGICAL_SEQUENCE_STATE:

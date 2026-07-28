@@ -86,6 +86,8 @@ namespace llaminar2
         bool all_position_logits = false;
         bool live_mtp_request_batch_condition = false; ///< True for one live main-model row per MTP request.
         int all_position_logit_rows = 0; ///< Compact verifier logits row count when all-position logits are row-indexed.
+        MTPVerifierOutcomeGraphMode mtp_verifier_outcome_graph_mode =
+            MTPVerifierOutcomeGraphMode::Disabled; ///< Terminal compact outcome topology captured by this graph.
         bool uses_device_token_ids = false; ///< True when embedding reads token IDs from a stable device buffer.
         bool uses_device_position_ids = false; ///< True when RoPE reads position IDs from a stable device buffer.
         ForwardPositionPolicy position_policy = ForwardPositionPolicy::ExplicitRows; ///< Position geometry captured by this graph.
@@ -112,6 +114,8 @@ namespace llaminar2
                    live_mtp_request_batch_condition ==
                        other.live_mtp_request_batch_condition &&
                    all_position_logit_rows == other.all_position_logit_rows &&
+                   mtp_verifier_outcome_graph_mode ==
+                       other.mtp_verifier_outcome_graph_mode &&
                    uses_device_token_ids == other.uses_device_token_ids &&
                    uses_device_position_ids == other.uses_device_position_ids &&
                    position_policy == other.position_policy &&
@@ -142,6 +146,10 @@ namespace llaminar2
             h ^= (std::hash<bool>{}(sig.all_position_logits) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.live_mtp_request_batch_condition) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.all_position_logit_rows) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint8_t>{}(
+                      static_cast<uint8_t>(
+                          sig.mtp_verifier_outcome_graph_mode)) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_token_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_position_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint8_t>{}(static_cast<uint8_t>(sig.position_policy)) +

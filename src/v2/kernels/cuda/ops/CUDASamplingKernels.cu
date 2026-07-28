@@ -3516,6 +3516,38 @@ __global__ void cuda_summarize_greedy_speculative_verify_batch_kernel(
 }
 
 /**
+ * @brief Graph-replayable greedy reducer with all mutable controls on device.
+ *
+ * The verifier input row owns the first target token and the fixed stop-token
+ * row owns eight entries with `-1` padding.  Reading both in the kernel keeps a
+ * cached CUDA graph valid when request values change between launches.
+ */
+__global__ void
+cuda_summarize_greedy_speculative_verify_batch_device_controls_kernel(
+    const int *__restrict__ verify_tokens,
+    const int *__restrict__ draft_tokens,
+    int compare_row_count,
+    const int *__restrict__ stop_tokens,
+    int *__restrict__ out_tokens,
+    int out_token_capacity,
+    int *__restrict__ out_meta)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    llaminar2::sampling_math::summarize_greedy_speculative_verify_batch(
+        draft_tokens[0],
+        verify_tokens,
+        draft_tokens,
+        compare_row_count,
+        stop_tokens,
+        llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens,
+        out_tokens,
+        out_token_capacity,
+        out_meta);
+}
+
+/**
  * @brief Derive publication rows/counts from compact speculative metadata.
  *
  * Each request is independent, so one CUDA thread maps one compact metadata row
@@ -5536,6 +5568,51 @@ extern "C"
         {
             fprintf(stderr, "CUDA Greedy Speculative Verify Batch Summary kernel launch failed: %s\n",
                     cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_summarize_greedy_speculative_verify_batch_device_controls(
+        const int *verify_tokens,
+        const int *draft_tokens,
+        int compare_row_count,
+        const int *stop_tokens,
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta,
+        int device_idx,
+        void *stream)
+    {
+        if (compare_row_count < 0 ||
+            out_token_capacity < compare_row_count + 1 ||
+            !verify_tokens || !draft_tokens || !stop_tokens ||
+            !out_tokens || !out_meta || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_summarize_greedy_speculative_verify_batch_device_controls_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            verify_tokens,
+            draft_tokens,
+            compare_row_count,
+            stop_tokens,
+            out_tokens,
+            out_token_capacity,
+            out_meta);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA device-control greedy speculative summary launch failed: %s\n",
+                cudaGetErrorString(err));
             return false;
         }
         return true;

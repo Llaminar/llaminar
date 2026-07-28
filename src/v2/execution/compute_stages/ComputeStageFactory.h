@@ -46,6 +46,7 @@
 #include "stages/QGateSplitStage.h"
 #include "stages/FusedAddAllreduceStage.h"
 #include "stages/MTPConcatStage.h"
+#include "stages/MTPVerifierOutcomeStage.h"
 
 namespace llaminar2
 {
@@ -292,6 +293,12 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createMTPConcat(
             const MTPConcatStage::Params &params);
+
+        /**
+         * @brief Create the graph-owned compact MTP verifier outcome stage.
+         */
+        static std::unique_ptr<IComputeStage> createMTPVerifierOutcome(
+            const MTPVerifierOutcomeStage::Params &params);
 
         // =====================================================================
         // MPI Communication Stages

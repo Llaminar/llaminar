@@ -452,6 +452,34 @@ namespace llaminar2
         }
 
         /**
+         * @brief Select the terminal device-owned verifier outcome transaction.
+         *
+         * This policy changes graph topology and therefore participates in the
+         * forward graph cache signature.  Implementations must reject a mode
+         * they cannot build; treating an unsupported mode as Disabled would
+         * silently return to post-graph host orchestration.
+         */
+        virtual bool setMTPVerifierOutcomeGraphMode(
+            MTPVerifierOutcomeGraphMode mode)
+        {
+            return mode == MTPVerifierOutcomeGraphMode::Disabled;
+        }
+
+        /**
+         * @brief Install persistent arena bindings for terminal MTP reduction.
+         *
+         * Bindings are lifetime resources, not request metadata.  They may be
+         * replaced only while graph caches are inactive, normally during arena
+         * initialization.
+         */
+        virtual bool setMTPVerifierOutcomeGraphBinding(
+            const MTPVerifierOutcomeGraphBinding &binding)
+        {
+            (void)binding;
+            return false;
+        }
+
+        /**
          * @brief Select the grouped live MTP condition graph policy.
          *
          * Unlike all-position verification, this mode advances live recurrent

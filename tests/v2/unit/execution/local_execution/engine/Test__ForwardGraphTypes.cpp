@@ -548,6 +548,29 @@ TEST(Test__ForwardGraphSignature, DifferentAllPositionLogitsNotEqual)
     EXPECT_NE(terminal_only, all_positions);
 }
 
+TEST(Test__ForwardGraphSignature, GraphOwnedMTPOutcomeHasDedicatedIdentity)
+{
+    ForwardGraphSignature ordinary_verifier{
+        .seq_len = 4,
+        .batch_size = 1,
+        .device = DeviceId::cuda(0),
+        .decode = true,
+        .all_position_logits = true,
+        .all_position_logit_rows = 4,
+        .mtp_verifier_outcome_graph_mode =
+            MTPVerifierOutcomeGraphMode::Disabled};
+    ForwardGraphSignature graph_owned_greedy = ordinary_verifier;
+    graph_owned_greedy.mtp_verifier_outcome_graph_mode =
+        MTPVerifierOutcomeGraphMode::Greedy;
+
+    EXPECT_NE(ordinary_verifier, graph_owned_greedy);
+    EXPECT_NE(
+        ForwardGraphSignatureHash{}(ordinary_verifier),
+        ForwardGraphSignatureHash{}(graph_owned_greedy))
+        << "A verifier graph with a terminal reducer/collective must never "
+           "reuse an executable captured without that transaction.";
+}
+
 TEST(Test__ForwardGraphSignature, DifferentDeviceTokenSourceNotEqual)
 {
     ForwardGraphSignature host_tokens{.seq_len = 1,

@@ -6918,6 +6918,72 @@ namespace llaminar2
         return true;
     }
 
+    bool RankOrchestrator::prepareGreedyAllPositionBatchOutcomeGraph(
+        int verifier_token_count,
+        const int32_t *stop_tokens,
+        int stop_token_count)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->prepareGreedyAllPositionBatchOutcomeGraph(
+                verifier_token_count,
+                stop_tokens,
+                stop_token_count);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]
+                ->prepareGreedyAllPositionBatchOutcomeGraph(
+                    verifier_token_count,
+                    stop_tokens,
+                    stop_token_count);
+        }
+        if (device_runners_.size() < 2 ||
+            !usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            LOG_ERROR("[RankOrchestrator] Multi-device graph-owned greedy outcomes require a mirrored LocalTP MTP head");
+            return false;
+        }
+
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            const auto &child = device_runners_[i];
+            if (!child ||
+                !child->primaryDeviceId().is_gpu() ||
+                !child->usesMirroredLocalTPMTPHeadForVerifier())
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP graph-owned greedy outcome participant "
+                          << i << " is not eligible");
+                return false;
+            }
+        }
+
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            if (!device_runners_[i]
+                     ->prepareGreedyAllPositionBatchOutcomeGraph(
+                         verifier_token_count,
+                         stop_tokens,
+                         stop_token_count))
+            {
+                if (tp_ctx_)
+                    tp_ctx_->requestAbort();
+                throw std::runtime_error(
+                    "Failed to arm every mirrored LocalTP graph-owned greedy "
+                    "outcome participant");
+            }
+        }
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_graph_owned_greedy_outcome_transactions_armed",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"rows", std::to_string(verifier_token_count)}});
+        return true;
+    }
+
     bool RankOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
         const int32_t *draft_tokens,
         int draft_token_count,
@@ -7127,11 +7193,22 @@ namespace llaminar2
                 return false;
             }
         }
-        if (!broadcastPrimaryMirroredLocalTPDeviceOutcomeToChildren(
-                child_outcomes,
-                "rank_mirrored_localtp_greedy_common_outcome"))
+        const bool every_child_published_in_graph =
+            std::all_of(
+                child_outcomes.begin(),
+                child_outcomes.end(),
+                [](const DeviceSpeculativeOutcomeHandle &outcome)
+                {
+                    return outcome
+                        .mirrored_local_tp_published_in_graph;
+                });
+        if (!every_child_published_in_graph)
         {
-            return false;
+            if (tp_ctx_)
+                tp_ctx_->requestAbort();
+            throw std::runtime_error(
+                "Mirrored LocalTP greedy outcomes were not published by the "
+                "captured verifier graph on every participant");
         }
 
         rank_mirrored_child_outcomes_ = std::move(child_outcomes);
@@ -7152,7 +7229,8 @@ namespace llaminar2
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())},
                  {"compare_rows", std::to_string(compare_rows)},
-                 {"implementation", "primary_child_outcome_device_broadcast"}});
+                 {"implementation",
+                  "graph_captured_primary_outcome_broadcast"}});
         }
         return rank_compact_outcome_valid_;
     }

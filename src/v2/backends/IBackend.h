@@ -1782,6 +1782,52 @@ namespace llaminar2
         }
 
         /**
+         * @brief Reduce greedy verifier rows using device-resident controls.
+         *
+         * This is the reusable GPU-graph form of
+         * enqueueSummarizeGreedySpeculativeVerifyBatch().  Both the first token
+         * and the fixed-width stop-token row are read by the kernel from stable
+         * device addresses.  The stop row always contains
+         * `kSpeculativeBatchMaxStopTokens` entries; unused entries are `-1`, so
+         * no mutable host count or scalar is captured in the graph node.
+         *
+         * @param verify_tokens_device Device argmax token for every verifier row.
+         * @param draft_tokens_device Device verifier input row; entry zero is the
+         *        first target token and later entries are speculative drafts.
+         * @param compare_row_count Number of speculative rows to compare.
+         * @param stop_tokens_device Fixed-width INT32 stop-token row on device.
+         * @param device_id GPU ordinal.
+         * @param stream Exact non-null graph execution stream.
+         * @param out_token_capacity Capacity of the compact output token row.
+         * @param out_tokens_device Compact output token row.
+         * @param out_meta_device Compact SamplingMath metadata row.
+         * @return true when the graph-capturable reducer was enqueued.
+         */
+        virtual bool
+        enqueueSummarizeGreedySpeculativeVerifyBatchDeviceControls(
+            const void *verify_tokens_device,
+            const void *draft_tokens_device,
+            int compare_row_count,
+            const void *stop_tokens_device,
+            int device_id,
+            void *stream,
+            int out_token_capacity,
+            void *out_tokens_device,
+            void *out_meta_device)
+        {
+            (void)verify_tokens_device;
+            (void)draft_tokens_device;
+            (void)compare_row_count;
+            (void)stop_tokens_device;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_capacity;
+            (void)out_tokens_device;
+            (void)out_meta_device;
+            return false;
+        }
+
+        /**
          * @brief Derive device-resident speculative state publication metadata.
          *
          * The compact verifier reducers write one metadata row per request. This

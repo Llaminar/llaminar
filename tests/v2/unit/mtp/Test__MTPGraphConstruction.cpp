@@ -7,6 +7,7 @@
 #include "collective/ITPContext.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/compute_stages/stages/MTPConcatStage.h"
+#include "execution/compute_stages/stages/MTPVerifierOutcomeStage.h"
 #include "execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "execution/compute_stages/stages/TPKVCacheStateAllGatherStage.h"
@@ -1326,6 +1327,83 @@ TEST(Test__MTPGraphConstruction, ConcatStageCopiesEmbeddingThenHidden)
         104, 105, 106, 4, 5, 6};
     for (size_t i = 0; i < expected.size(); ++i)
         EXPECT_FLOAT_EQ(output->data()[i], expected[i]);
+}
+
+TEST(Test__MTPGraphConstruction,
+     GraphOwnedGreedyOutcomeDeclaresPersistentTerminalContract)
+{
+    auto logits = TestTensorFactory::createFP32Random({4, 32});
+    MTPVerifierOutcomeGraphBinding binding{
+        .verifier_input_tokens_device =
+            reinterpret_cast<const int32_t *>(0x1000),
+        .stop_tokens_device =
+            reinterpret_cast<const int32_t *>(0x2000),
+        .verifier_tokens_device =
+            reinterpret_cast<int32_t *>(0x3000),
+        .argmax_values_device =
+            reinterpret_cast<float *>(0x4000),
+        .argmax_partial_values_device =
+            reinterpret_cast<float *>(0x5000),
+        .argmax_partial_indices_device =
+            reinterpret_cast<int32_t *>(0x6000),
+        .argmax_partial_capacity = 32,
+        .output_tokens_device =
+            reinterpret_cast<int32_t *>(0x7000),
+        .output_meta_device =
+            reinterpret_cast<int32_t *>(0x8000),
+        .output_token_capacity = 4,
+        .output_meta_capacity =
+            sampling_math::kSpeculativeBatchMetaCount,
+    };
+    MTPVerifierOutcomeStage stage({
+        .device_id = DeviceId::cuda(0),
+        .logits = logits.get(),
+        .mode = MTPVerifierOutcomeGraphMode::Greedy,
+        .binding = binding,
+        .verifier_row_count = 4,
+        .vocab_size = 32,
+        .local_tp_ctx = nullptr,
+        .local_tp_device_index = 0,
+        .local_tp_root_device_index = 0,
+        .publish_mirrored_local_tp = false,
+        .stage_name = "mtp_verifier_outcome",
+    });
+
+    EXPECT_EQ(stage.type(), ComputeStageType::MTP_VERIFIER_OUTCOME);
+    EXPECT_TRUE(stage.isGraphCapturable());
+    EXPECT_FALSE(stage.isCollectiveStage());
+    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::NONE);
+
+    const StageBufferContract contract = stage.bufferContract();
+    const auto has_input = [&](BufferId id)
+    {
+        return std::any_of(
+            contract.inputs.begin(),
+            contract.inputs.end(),
+            [id](const BufferBinding &binding)
+            {
+                return binding.id == id;
+            });
+    };
+    const auto has_output = [&](BufferId id)
+    {
+        return std::any_of(
+            contract.outputs.begin(),
+            contract.outputs.end(),
+            [id](const BufferBinding &binding)
+            {
+                return binding.id == id;
+            });
+    };
+
+    EXPECT_TRUE(has_input(BufferId::ALL_POSITION_LOGITS));
+    EXPECT_TRUE(has_input(BufferId::MTP_VERIFIER_INPUT_TOKENS));
+    EXPECT_TRUE(has_input(BufferId::MTP_VERIFIER_STOP_TOKENS));
+    EXPECT_TRUE(has_output(BufferId::STOCHASTIC_VERIFY_TOKENS));
+    EXPECT_TRUE(
+        has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS));
+    EXPECT_TRUE(
+        has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_META));
 }
 
 TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)

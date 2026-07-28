@@ -235,6 +235,14 @@ namespace llaminar2
          * same cache owner that produced the child verifier outcome.
          */
         DeviceResidentMTPTransactionLease mtp_transaction;
+        /**
+         * @brief True when mirrored LocalTP publication is already in the graph.
+         *
+         * Rank orchestration must never enqueue a second compact-outcome
+         * broadcast when this flag is set.  Every child handle in the domain
+         * must agree on the value.
+         */
+        bool mirrored_local_tp_published_in_graph = false;
 
         bool valid() const
         {
@@ -2262,6 +2270,26 @@ namespace llaminar2
             (void)stop_tokens;
             (void)stop_token_count;
             (void)out_handle;
+            return false;
+        }
+
+        /**
+         * @brief Arm the terminal greedy outcome stage before verifier replay.
+         *
+         * GPU implementations copy only the small stop-token control row on the
+         * exact pre-replay stream.  Draft tokens already reside in the verifier
+         * input arena row.  Once armed, failure to execute or consume the
+         * matching graph transaction is fatal; implementations must not enqueue
+         * a post-graph reducer as a substitute.
+         */
+        virtual bool prepareGreedyAllPositionBatchOutcomeGraph(
+            int verifier_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count)
+        {
+            (void)verifier_token_count;
+            (void)stop_tokens;
+            (void)stop_token_count;
             return false;
         }
 

@@ -1316,6 +1316,8 @@ public:
             std::shared_ptr<void>(
                 &resident_outcome_ready_event_token_,
                 [](void *) {});
+        out_handle->mirrored_local_tp_published_in_graph =
+            uses_mirrored_localtp_mtp_head_for_verifier_;
         attachMockResidentMTPTransaction(out_handle, /*request_count=*/1);
         return out_handle->valid();
     }
@@ -6131,7 +6133,8 @@ TEST_F(Test__RankOrchestrator, LocalTPCompactGreedyVerifierOutcomeRejectsCrossSh
     EXPECT_FALSE(outcome.sampled_terminal);
 }
 
-TEST_F(Test__RankOrchestrator, LocalTPMirroredGreedyOutcomeBroadcastsCommonResidentOutcome)
+TEST_F(Test__RankOrchestrator,
+       LocalTPMirroredGreedyOutcomeUsesGraphPublishedCommonResidentOutcome)
 {
     auto rendezvous = std::make_shared<MTPPublicationRendezvous>(2);
 
@@ -6192,13 +6195,10 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredGreedyOutcomeBroadcastsCommonResid
         /*stop_token_count=*/0,
         &handle));
     ASSERT_TRUE(handle.valid());
-    EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 1u)
-        << "The compact outcome must enter one rank-level grouped NCCL/RCCL "
-           "publication, not one host-rendezvoused call per participant.";
-    EXPECT_EQ(tp_ctx_ptr->collective_sideband_broadcast_count(), 4u)
-        << "Mirrored LocalTP resident publication must copy one primary "
-           "compact outcome into every child mailbox using device-side "
-           "token/meta broadcasts before publication.";
+    EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 0u)
+        << "The rank consumer must not enqueue a second compact-outcome "
+           "collective after every child reports graph-owned publication.";
+    EXPECT_EQ(tp_ctx_ptr->collective_sideband_broadcast_count(), 0u);
 
     DeviceSpeculativeVerifyBatchOutcome materialized;
     ASSERT_TRUE(orchestrator->materializeDeviceSpeculativeOutcomesForHostResponse(
@@ -6339,6 +6339,38 @@ TEST_F(Test__RankOrchestrator,
     EXPECT_EQ(
         body.find("collectiveSidebandOnStream("),
         std::string::npos);
+}
+
+TEST_F(Test__RankOrchestrator,
+       MirroredGreedyConsumerCannotRebroadcastGraphOwnedOutcome)
+{
+    const std::string source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const size_t begin = source.find(
+        "bool RankOrchestrator::verifyGreedyMirroredLocalTPBatchOutcomeOnDeviceResident(");
+    ASSERT_NE(begin, std::string::npos);
+    const size_t end = source.find(
+        "bool RankOrchestrator::verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(",
+        begin);
+    ASSERT_NE(end, std::string::npos);
+    const std::string body = source.substr(begin, end - begin);
+
+    EXPECT_NE(
+        body.find("mirrored_local_tp_published_in_graph"),
+        std::string::npos);
+    EXPECT_EQ(
+        body.find(
+            "broadcastPrimaryMirroredLocalTPDeviceOutcomeToChildren("),
+        std::string::npos)
+        << "Greedy graph publication is complete before rank consumption; "
+           "a second rank-side collective is forbidden.";
+    EXPECT_NE(
+        body.find("requestAbort()"),
+        std::string::npos)
+        << "A child missing graph-owned publication must abort the TP domain.";
 }
 
 TEST_F(Test__RankOrchestrator, LocalTPResidentCompactGreedyOutcomeResolvesDeferredRankSlots)

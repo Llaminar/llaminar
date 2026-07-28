@@ -4529,6 +4529,12 @@ namespace llaminar2
                                         static_cast<size_t>(stochastic_target_row_capacity_),
                                         "INT32",
                                         state_.device_id) ||
+                !arena_->registerBuffer(
+                    BufferId::MTP_VERIFIER_STOP_TOKENS,
+                    1,
+                    sampling_math::kSpeculativeBatchMaxStopTokens,
+                    "INT32",
+                    state_.device_id) ||
                 !arena_->registerBuffer(BufferId::MTP_VERIFIER_POSITION_IDS,
                                         1,
                                         static_cast<size_t>(stochastic_target_row_capacity_),
@@ -4745,6 +4751,7 @@ namespace llaminar2
             arena_->isRegistered(BufferId::MTP_CONDITION_TOKEN) &&
             arena_->isRegistered(BufferId::MTP_POSITION_IDS) &&
             arena_->isRegistered(BufferId::MTP_VERIFIER_INPUT_TOKENS) &&
+            arena_->isRegistered(BufferId::MTP_VERIFIER_STOP_TOKENS) &&
             arena_->isRegistered(BufferId::MTP_VERIFIER_POSITION_IDS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS) &&
@@ -4769,6 +4776,7 @@ namespace llaminar2
             arena_->allocateDeviceStorage(BufferId::MTP_CONDITION_TOKEN, state_.device_id);
             arena_->allocateDeviceStorage(BufferId::MTP_POSITION_IDS, state_.device_id);
             arena_->allocateDeviceStorage(BufferId::MTP_VERIFIER_INPUT_TOKENS, state_.device_id);
+            arena_->allocateDeviceStorage(BufferId::MTP_VERIFIER_STOP_TOKENS, state_.device_id);
             arena_->allocateDeviceStorage(BufferId::MTP_VERIFIER_POSITION_IDS, state_.device_id);
             arena_->allocateDeviceStorage(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS, state_.device_id);
             arena_->allocateDeviceStorage(BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS, state_.device_id);
@@ -4807,6 +4815,10 @@ namespace llaminar2
                 arena_->getDevicePtr(BufferId::MTP_POSITION_IDS, state_.device_id);
             mtp_verifier_input_tokens_dev_ =
                 arena_->getDevicePtr(BufferId::MTP_VERIFIER_INPUT_TOKENS, state_.device_id);
+            mtp_verifier_stop_tokens_dev_ =
+                arena_->getDevicePtr(
+                    BufferId::MTP_VERIFIER_STOP_TOKENS,
+                    state_.device_id);
             mtp_verifier_position_ids_dev_ =
                 arena_->getDevicePtr(BufferId::MTP_VERIFIER_POSITION_IDS, state_.device_id);
             stochastic_topk_partial_vals_dev_ =
@@ -4836,6 +4848,44 @@ namespace llaminar2
                 arena_->getDevicePtr(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS, state_.device_id);
             stochastic_batch_output_meta_dev_ =
                 arena_->getDevicePtr(BufferId::STOCHASTIC_BATCH_OUTPUT_META, state_.device_id);
+
+            MTPVerifierOutcomeGraphBinding outcome_binding;
+            outcome_binding.verifier_input_tokens_device =
+                static_cast<const int32_t *>(
+                    mtp_verifier_input_tokens_dev_);
+            outcome_binding.stop_tokens_device =
+                static_cast<const int32_t *>(
+                    mtp_verifier_stop_tokens_dev_);
+            outcome_binding.verifier_tokens_device =
+                static_cast<int32_t *>(stochastic_verify_tokens_dev_);
+            outcome_binding.argmax_values_device =
+                static_cast<float *>(stochastic_verify_accept_probs_dev_);
+            outcome_binding.argmax_partial_values_device =
+                static_cast<float *>(argmax_partial_vals_dev_);
+            outcome_binding.argmax_partial_indices_device =
+                static_cast<int32_t *>(argmax_partial_idxs_dev_);
+            outcome_binding.argmax_partial_capacity =
+                argmax_partial_capacity_;
+            outcome_binding.output_tokens_device =
+                static_cast<int32_t *>(
+                    stochastic_batch_output_tokens_dev_);
+            outcome_binding.output_meta_device =
+                static_cast<int32_t *>(
+                    stochastic_batch_output_meta_dev_);
+            outcome_binding.output_token_capacity =
+                stochastic_batch_output_token_stride_;
+            outcome_binding.output_meta_capacity =
+                sampling_math::kSpeculativeBatchMetaCount;
+            if (!outcome_binding.validForGreedy() ||
+                !graph_builder_ ||
+                !graph_builder_->setMTPVerifierOutcomeGraphBinding(
+                    outcome_binding))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to install persistent graph-owned MTP outcome bindings on "
+                          << state_.device_id.toString());
+                return false;
+            }
+
             IBackend *backend = getBackendFor(state_.device_id);
             if (!backend)
             {
@@ -5252,7 +5302,33 @@ namespace llaminar2
         // Delegate to ForwardExecutionEngine
         const bool success = forward_engine_->execute(effective_input, output, *this);
         if (!success)
+        {
+            if (mtp_verifier_outcome_graph_mode_ !=
+                MTPVerifierOutcomeGraphMode::Disabled)
+            {
+                greedy_verifier_outcome_graph_transaction_ = {};
+                mtp_verifier_outcome_graph_mode_ =
+                    MTPVerifierOutcomeGraphMode::Disabled;
+            }
             return false;
+        }
+        if (mtp_verifier_outcome_graph_mode_ !=
+            MTPVerifierOutcomeGraphMode::Disabled)
+        {
+            if (mtp_verifier_outcome_graph_mode_ !=
+                    MTPVerifierOutcomeGraphMode::Greedy ||
+                greedy_verifier_outcome_graph_transaction_.state !=
+                    GreedyVerifierOutcomeGraphState::Armed ||
+                !output.execution.valid ||
+                !output.execution.all_position_logits)
+            {
+                throw std::runtime_error(
+                    "Successful verifier forward did not satisfy its armed "
+                    "graph-owned MTP outcome transaction");
+            }
+            greedy_verifier_outcome_graph_transaction_.state =
+                GreedyVerifierOutcomeGraphState::Produced;
+        }
         if (!publishForwardGraphOutputReady(output.execution))
         {
             throw std::runtime_error(
@@ -9845,6 +9921,56 @@ namespace llaminar2
         if (!grouped_verifier_scope.enabled)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Graph builder rejected grouped MTP verifier policy");
+            return nullptr;
+        }
+
+        struct MTPVerifierOutcomeGraphScope
+        {
+            IGraphBuilder *builder = nullptr;
+            MTPVerifierOutcomeGraphMode mode =
+                MTPVerifierOutcomeGraphMode::Disabled;
+            bool installed = false;
+
+            MTPVerifierOutcomeGraphScope(
+                IGraphBuilder *graph_builder,
+                ForwardExecutionRole role,
+                MTPVerifierOutcomeGraphMode requested_mode)
+                : builder(graph_builder),
+                  mode(requested_mode)
+            {
+                if (mode != MTPVerifierOutcomeGraphMode::Disabled &&
+                    role != ForwardExecutionRole::GroupedMTPVerifier)
+                {
+                    return;
+                }
+                installed =
+                    builder &&
+                    builder->setMTPVerifierOutcomeGraphMode(mode);
+            }
+
+            ~MTPVerifierOutcomeGraphScope()
+            {
+                if (installed && builder)
+                {
+                    (void)builder->setMTPVerifierOutcomeGraphMode(
+                        MTPVerifierOutcomeGraphMode::Disabled);
+                }
+            }
+        } verifier_outcome_scope(
+            graph_builder_.get(),
+            execution_role,
+            mtp_verifier_outcome_graph_mode_);
+        if (!verifier_outcome_scope.installed)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Graph builder rejected the MTP verifier outcome transaction"
+                      << " mode="
+                      << static_cast<int>(
+                             mtp_verifier_outcome_graph_mode_)
+                      << " grouped_role="
+                      << (execution_role ==
+                                  ForwardExecutionRole::GroupedMTPVerifier
+                              ? "true"
+                              : "false"));
             return nullptr;
         }
 
@@ -22180,6 +22306,57 @@ namespace llaminar2
                       << " does not match graph row count " << expected_rows);
             return false;
         }
+        if (mtp_verifier_outcome_graph_mode_ ==
+            MTPVerifierOutcomeGraphMode::Greedy)
+        {
+            const auto &transaction =
+                greedy_verifier_outcome_graph_transaction_;
+            if (transaction.state !=
+                    GreedyVerifierOutcomeGraphState::Armed ||
+                transaction.verifier_token_count != expected_rows ||
+                !mtp_verifier_stop_tokens_dev_)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Greedy verifier graph controls do not match the compact row plan"
+                          << " state="
+                          << static_cast<int>(transaction.state)
+                          << " transaction_rows="
+                          << transaction.verifier_token_count
+                          << " graph_rows=" << expected_rows
+                          << " stop_buffer="
+                          << mtp_verifier_stop_tokens_dev_);
+                return false;
+            }
+            if (!backend->hostToDeviceOnStream(
+                    mtp_verifier_stop_tokens_dev_,
+                    transaction.stop_tokens.data(),
+                    sizeof(int32_t) *
+                        sampling_math::
+                            kSpeculativeBatchMaxStopTokens,
+                    metadata_device.gpu_ordinal(),
+                    execution_stream))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload graph-owned greedy verifier stop controls");
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "graph_owned_greedy_control_uploads",
+                1.0,
+                "decode",
+                metadata_device.toString(),
+                {{"bytes",
+                  std::to_string(
+                      sizeof(int32_t) *
+                      sampling_math::
+                          kSpeculativeBatchMaxStopTokens)},
+                 {"rows", std::to_string(expected_rows)}});
+        }
+        else if (greedy_verifier_outcome_graph_transaction_.state !=
+                 GreedyVerifierOutcomeGraphState::Idle)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Armed greedy verifier controls reached metadata preparation without the greedy graph policy");
+            return false;
+        }
         if (plan.request_count <= 0 ||
             plan.request_count != input.batch_size ||
             input.seq_len <= 0 ||
@@ -23346,6 +23523,66 @@ namespace llaminar2
             start_row, row_count, out_tokens);
     }
 
+    bool DeviceGraphOrchestrator::prepareGreedyAllPositionBatchOutcomeGraph(
+        int verifier_token_count,
+        const int32_t *stop_tokens,
+        int stop_token_count)
+    {
+        using namespace sampling_math;
+
+        if (!state_.device_id.is_gpu() ||
+            verifier_token_count <= 0 ||
+            verifier_token_count > mtp_max_verifier_rows_ ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens ||
+            (stop_token_count > 0 && !stop_tokens) ||
+            !mtp_verifier_stop_tokens_dev_ ||
+            !mtp_verifier_input_tokens_dev_ ||
+            !stochastic_verify_tokens_dev_ ||
+            !stochastic_verify_accept_probs_dev_ ||
+            !stochastic_batch_output_tokens_dev_ ||
+            !stochastic_batch_output_meta_dev_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid graph-owned greedy outcome preparation"
+                      << " device=" << state_.device_id.toString()
+                      << " verifier_tokens=" << verifier_token_count
+                      << " stop_tokens=" << stop_token_count);
+            return false;
+        }
+        if (mtp_verifier_outcome_graph_mode_ !=
+                MTPVerifierOutcomeGraphMode::Disabled ||
+            greedy_verifier_outcome_graph_transaction_.state !=
+                GreedyVerifierOutcomeGraphState::Idle)
+        {
+            throw std::logic_error(
+                "Cannot arm a graph-owned greedy MTP outcome while another "
+                "outcome transaction is active");
+        }
+
+        GreedyVerifierOutcomeGraphTransaction transaction;
+        transaction.state = GreedyVerifierOutcomeGraphState::Armed;
+        transaction.verifier_token_count = verifier_token_count;
+        transaction.stop_token_count = stop_token_count;
+        for (int i = 0; i < stop_token_count; ++i)
+        {
+            transaction.stop_tokens[static_cast<size_t>(i)] =
+                stop_tokens[i];
+        }
+
+        greedy_verifier_outcome_graph_transaction_ = transaction;
+        mtp_verifier_outcome_graph_mode_ =
+            MTPVerifierOutcomeGraphMode::Greedy;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "graph_owned_greedy_outcome_transactions_armed",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"rows", std::to_string(verifier_token_count)},
+             {"stop_tokens", std::to_string(stop_token_count)}});
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
         const int32_t *draft_tokens,
         int draft_token_count,
@@ -23360,248 +23597,61 @@ namespace llaminar2
         if (!out_handle)
             return false;
 
-        const int compare_rows = draft_token_count - 1;
         if (!draft_tokens ||
             draft_token_count <= 0 ||
             draft_token_count > mtp_max_verifier_rows_ ||
-            compare_rows < 0 ||
-            compare_rows > mtp_max_draft_depth_ ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
-            (stop_token_count > 0 && !stop_tokens) ||
-            !state_.all_position_logits)
+            (stop_token_count > 0 && !stop_tokens))
         {
             return false;
         }
 
-        /*
-         * The compact reducer consumes one complete verifier-logit row per
-         * child. Ordinary column-parallel LocalTP writes local vocab shards and
-         * therefore still needs rank-scope candidate coordination. Mirrored
-         * LocalTP MTP heads deliberately suppress the local-logit writer and
-         * store full-vocab rows in state_.all_position_logits, so they are safe
-         * to reduce independently on each participant.
-         */
-        if (activeAllPositionLogitsAreColumnParallel(draft_token_count))
-            return false;
-
-        const IGlobalTPContext *global_ctx = globalTPContextForMTPCoordination();
-        if (global_ctx && global_ctx->degree() > 1)
-            return false;
-
-        TensorBase *tensor = state_.all_position_logits.get();
-        const auto &shape = tensor->shape();
-        if (shape.empty())
-            return false;
-        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
-        const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
-        if (cols == 0 ||
-            static_cast<size_t>(draft_token_count) > rows ||
-            cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+        const auto &transaction =
+            greedy_verifier_outcome_graph_transaction_;
+        if (mtp_verifier_outcome_graph_mode_ !=
+                MTPVerifierOutcomeGraphMode::Greedy ||
+            transaction.state !=
+                GreedyVerifierOutcomeGraphState::Produced ||
+            transaction.verifier_token_count != draft_token_count ||
+            transaction.stop_token_count != stop_token_count)
         {
-            return false;
+            throw std::logic_error(
+                "Greedy resident outcome consumption does not match a "
+                "produced graph-owned transaction");
         }
-
-        std::array<int, kSpeculativeBatchMaxStopTokens> packed_stop_tokens =
-            {-1, -1, -1, -1, -1, -1, -1, -1};
         for (int i = 0; i < stop_token_count; ++i)
-            packed_stop_tokens[static_cast<size_t>(i)] = stop_tokens[i];
-
-        auto device_opt = tensor->current_device();
-        if (!state_.device_id.is_gpu() ||
-            draft_token_count > stochastic_target_row_capacity_ ||
-            compare_rows > stochastic_draft_row_capacity_ ||
-            !state_.all_position_logits->deviceValid() ||
-            !mtp_verifier_input_tokens_dev_ ||
-            !stochastic_verify_tokens_dev_ ||
-            !stochastic_verify_accept_probs_dev_ ||
-            !stochastic_batch_output_tokens_dev_ ||
-            !stochastic_batch_output_meta_dev_ ||
-            !device_opt.has_value() ||
-            !device_opt->is_gpu())
         {
-            return false;
+            if (transaction.stop_tokens[static_cast<size_t>(i)] !=
+                stop_tokens[i])
+            {
+                throw std::logic_error(
+                    "Greedy resident outcome stop controls differ from the "
+                    "controls captured for graph replay");
+            }
         }
 
-        IBackend *backend = getBackendFor(*device_opt);
-        const void *gpu_ptr = tensor->gpu_data_ptr();
-        if (!backend || !gpu_ptr)
-            return false;
-
-        /*
-         * The all-position verifier graph may have replayed launch-only and
-         * handed us its stream. Consume that stream here so row argmax and the
-         * reducer are ordered after verifier logits but before the compact D2H
-         * summary. Falling back to a fresh stream before validation would race.
-         */
         void *stream = consumePendingLogitsStream(
             PendingLogitsStreamRole::AllPositionVerifier,
-            "verifyGreedyAllPositionBatchOutcomeOnDevice");
+            "consumeGraphOwnedGreedyAllPositionBatchOutcome");
         if (!stream)
         {
-            stream = explicitGPUStreamForOperation(
-                "verifyGreedyAllPositionBatchOutcomeOnDevice");
+            throw std::logic_error(
+                "Graph-owned greedy outcome has no verifier stream handoff");
         }
-        if (!stream)
-            return false;
+        if (!forward_graph_output_ready_.valid ||
+            !forward_graph_output_ready_.event ||
+            !forward_graph_output_ready_.all_position_logits)
+        {
+            throw std::logic_error(
+                "Graph-owned greedy outcome has no durable grouped-forward "
+                "completion publication");
+        }
 
-        /*
-         * Prefer the device verifier-token row that the verifier graph already
-         * consumed.  Fixed-depth greedy MTP now samples sidecar drafts into
-         * runner-owned device slots, so rebuilding the same row from host token
-         * shadows would add a pure hot-path H2D dependency.  If the caller
-         * installed a device-token plan, a missing or mismatched materialized
-         * row is a coherence bug, not a compatibility fallback.
-         */
-        const bool prepared_device_tokens_expected =
-            pending_mtp_verifier_device_token_plan_.has_value();
-        const bool use_prepared_device_tokens =
-            materialized_mtp_verifier_device_token_row_.valid &&
-            materialized_mtp_verifier_device_token_row_.total_verifier_input_tokens ==
-                draft_token_count &&
-            materialized_mtp_verifier_device_token_row_.draft_token_count ==
-                compare_rows;
-        if (!use_prepared_device_tokens)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Greedy MTP resident outcome requires a materialized device verifier token row"
-                      << " prepared_plan="
-                      << (prepared_device_tokens_expected ? "true" : "false")
-                      << " expected_tokens=" << draft_token_count
-                      << " expected_drafts=" << compare_rows
-                      << " materialized_valid="
-                      << (materialized_mtp_verifier_device_token_row_.valid ? "true" : "false")
-                      << " materialized_tokens="
-                      << materialized_mtp_verifier_device_token_row_.total_verifier_input_tokens
-                      << " materialized_drafts="
-                      << materialized_mtp_verifier_device_token_row_.draft_token_count);
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "greedy_verifier_missing_device_token_rows",
-                1.0,
-                "decode",
-                state_.device_id.toString(),
-                {{"expected_tokens", std::to_string(draft_token_count)},
-                 {"expected_drafts", std::to_string(compare_rows)}});
-            return false;
-        }
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "greedy_verifier_prepared_device_token_rows",
-            1.0,
-            "decode",
-            state_.device_id.toString(),
-            {{"tokens", std::to_string(draft_token_count)}});
-        const void *summary_draft_tokens_device = mtp_verifier_input_tokens_dev_;
         const bool materialized_first_token_from_device =
             materialized_mtp_verifier_device_token_row_.first_token_from_device;
         const int materialized_first_target_sample_slot =
             materialized_mtp_verifier_device_token_row_.first_target_sample_slot;
-
-        const auto *base = static_cast<const float *>(gpu_ptr);
-        const bool argmax_ok = backend->enqueueArgmaxF32BatchedRowsDevice(
-            base,
-            draft_token_count,
-            static_cast<int>(cols),
-            device_opt->gpu_ordinal(),
-            stream,
-            stochastic_verify_accept_probs_dev_,
-            stochastic_verify_tokens_dev_,
-            argmax_partial_vals_dev_,
-            argmax_partial_idxs_dev_,
-            argmax_partial_capacity_);
-        if (!argmax_ok)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Greedy all-position verifier device argmax failed on "
-                      << device_opt->toString());
-            return false;
-        }
-
-        std::shared_ptr<void> producer_start_timing_event;
-        std::shared_ptr<void> producer_stop_timing_event;
-        const bool collect_producer_gpu_timing =
-            PerfStatsCollector::isEnabled() && state_.device_id.is_gpu();
-        if (collect_producer_gpu_timing)
-        {
-            const int device_ordinal = device_opt->gpu_ordinal();
-            if (!acquirePersistentMTPGpuTimingEvents(
-                    "greedy_compact_outcome_summary",
-                    &producer_start_timing_event,
-                    &producer_stop_timing_event))
-            {
-                return false;
-            }
-            if (!backend->recordEvent(
-                    producer_start_timing_event.get(),
-                    device_ordinal,
-                    stream))
-            {
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "greedy_request_batch_summary_gpu_timing_record_failures",
-                    1.0,
-                    "decode",
-                    state_.device_id.toString(),
-                    {{"event", "start"}});
-                return false;
-            }
-        }
-
-        if (!backend->enqueueSummarizeGreedySpeculativeVerifyBatch(
-                stochastic_verify_tokens_dev_,
-                summary_draft_tokens_device,
-                compare_rows,
-                draft_tokens[0],
-                packed_stop_tokens.data(),
-                stop_token_count,
-                device_opt->gpu_ordinal(),
-                stream,
-                stochastic_batch_output_token_stride_,
-                stochastic_batch_output_tokens_dev_,
-                stochastic_batch_output_meta_dev_))
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Greedy all-position verifier device summary failed on "
-                      << device_opt->toString());
-            return false;
-        }
-
-        if (producer_stop_timing_event)
-        {
-            if (!backend->recordEvent(
-                    producer_stop_timing_event.get(),
-                    device_opt->gpu_ordinal(),
-                    stream))
-            {
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "greedy_request_batch_summary_gpu_timing_record_failures",
-                    1.0,
-                    "decode",
-                    state_.device_id.toString(),
-                    {{"event", "stop"}});
-                return false;
-            }
-        }
-
-        std::shared_ptr<void> response_ready_event =
-            acquirePersistentMTPOutcomeReadyEvent(
-                "greedy_compact_outcome");
-        if (!response_ready_event)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Greedy outcome has no available preallocated response-ready event");
-            return false;
-        }
-        if (!DeviceEventEdge::at(
-                 DeviceTimelinePoint::CompactSpeculativeResponseReady)
-                 .from(DeviceTimelineRole::VerifierSummary)
-                 .publish(
-                     *backend,
-                     state_.device_id,
-                     response_ready_event.get(),
-                     stream))
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to record greedy outcome response-ready event");
-            return false;
-        }
 
         if (materialized_first_token_from_device)
         {
@@ -23615,7 +23665,7 @@ namespace llaminar2
         if (!recordDeviceResidentMTPTransactionMutation(
                 /*request_count=*/1,
                 stream,
-                "greedy_device_outcome"))
+                "graph_owned_greedy_device_outcome"))
         {
             return false;
         }
@@ -23630,13 +23680,19 @@ namespace llaminar2
         out_handle->meta_stride = kSpeculativeBatchMetaCount;
         out_handle->device = state_.device_id;
         out_handle->stream = stream;
-        out_handle->response_ready_event = std::move(response_ready_event);
+        out_handle->response_ready_event =
+            forward_graph_output_ready_.event;
         out_handle->mtp_transaction =
             currentDeviceResidentMTPTransactionLease();
-        out_handle->producer_start_timing_event =
-            std::move(producer_start_timing_event);
-        out_handle->producer_stop_timing_event =
-            std::move(producer_stop_timing_event);
+        out_handle->mirrored_local_tp_published_in_graph =
+            usesMirroredLocalTPMTPHeadForVerifier() &&
+            graph_builder_ &&
+            graph_builder_->config().tp_ctx &&
+            graph_builder_->config().tp_ctx->degree() > 1;
+
+        greedy_verifier_outcome_graph_transaction_ = {};
+        mtp_verifier_outcome_graph_mode_ =
+            MTPVerifierOutcomeGraphMode::Disabled;
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -23644,7 +23700,15 @@ namespace llaminar2
             1.0,
             "decode",
             state_.device_id.toString(),
-            {{"compare_rows", std::to_string(compare_rows)}});
+            {{"compare_rows", std::to_string(draft_token_count - 1)},
+             {"implementation", "graph_owned_outcome"}});
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "graph_owned_greedy_outcome_consumptions",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"rows", std::to_string(draft_token_count)}});
         return out_handle->valid();
     }
 
@@ -34368,6 +34432,9 @@ namespace llaminar2
         pending_mtp_verifier_device_token_batch_plan_.reset();
         materialized_mtp_verifier_device_token_row_ = {};
         materialized_mtp_verifier_device_token_batch_ = {};
+        greedy_verifier_outcome_graph_transaction_ = {};
+        mtp_verifier_outcome_graph_mode_ =
+            MTPVerifierOutcomeGraphMode::Disabled;
 
         for (auto &cache : layer_graph_cache_)
         {

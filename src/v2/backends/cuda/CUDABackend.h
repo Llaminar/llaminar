@@ -423,6 +423,16 @@ namespace llaminar2
             int out_token_capacity,
             void *out_tokens_device,
             void *out_meta_device) override;
+        bool enqueueSummarizeGreedySpeculativeVerifyBatchDeviceControls(
+            const void *verify_tokens_device,
+            const void *draft_tokens_device,
+            int compare_row_count,
+            const void *stop_tokens_device,
+            int device_id,
+            void *stream,
+            int out_token_capacity,
+            void *out_tokens_device,
+            void *out_meta_device) override;
         bool enqueueDeriveSpeculativePublicationMetadata(
             const void *meta_device,
             int meta_stride,

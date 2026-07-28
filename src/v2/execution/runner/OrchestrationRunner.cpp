@@ -8841,6 +8841,14 @@ namespace llaminar2
                         effectiveMTPMaxDraftDepth(mtp) + 1);
             if (!stochastic_verify &&
                 runner_->primaryDeviceId().is_gpu() &&
+                active_sampling_params_.has_penalties())
+            {
+                return fail_after_checkpoint(
+                    "GPU greedy MTP penalties must execute inside the captured "
+                    "verifier graph before graph-owned outcome reduction");
+            }
+            if (!stochastic_verify &&
+                runner_->primaryDeviceId().is_gpu() &&
                 !use_greedy_device_batch_outcome)
             {
                 return fail_after_checkpoint(
@@ -8933,6 +8941,34 @@ namespace llaminar2
                 MTPVerifierForwardExecutionOptions verifier_forward_options;
                 verifier_forward_options.device_token_ids =
                     verifier_input_tokens_device;
+                if (use_greedy_device_batch_outcome)
+                {
+                    if (!verifier_input_tokens_device)
+                    {
+                        runner_->setComputeAllPositionLogits(false);
+                        runner_->setComputeRowIndexedAllPositionLogits(
+                            false,
+                            0);
+                        return fail_after_checkpoint(
+                            "Graph-owned GPU greedy MTP requires a "
+                            "device-resident verifier input row");
+                    }
+                    if (!runner_
+                             ->prepareGreedyAllPositionBatchOutcomeGraph(
+                                 verifier_row_count,
+                                 stop_tokens_.data(),
+                                 static_cast<int>(
+                                     stop_tokens_.size())))
+                    {
+                        runner_->setComputeAllPositionLogits(false);
+                        runner_->setComputeRowIndexedAllPositionLogits(
+                            false,
+                            0);
+                        return fail_after_checkpoint(
+                            "All-position greedy MTP could not arm the "
+                            "graph-owned outcome transaction");
+                    }
+                }
                 const MTPVerifierForwardExecutionResult verifier_forward =
                     executeMTPSpecVerifierForward(
                         *runner_,
@@ -9023,7 +9059,6 @@ namespace llaminar2
             std::optional<DeviceSpeculativeVerifyBatchOutcome>
                 device_batch_outcome_for_transaction;
             bool state_published_from_device_outcome = false;
-            std::vector<int32_t> direct_sampled_verifier_rows_for_replay_check;
             if (stochastic_verify)
             {
                 if (!stochastic_device_verify && !stochastic_host_verify)
@@ -9737,31 +9772,6 @@ namespace llaminar2
             {
                 if (use_greedy_device_batch_outcome)
                 {
-                    if (verify_commit_replay_check)
-                    {
-                        /*
-                         * The compact greedy reducer is the production fast path,
-                         * but replay-check failures need to know whether the
-                         * compact reducer disagreed with ordinary row argmax or
-                         * whether the verifier graph itself produced different
-                         * rows.  This diagnostic intentionally runs only under
-                         * the expensive commit-replay guard; it may consume and
-                         * synchronize the deferred verifier stream before the
-                         * compact reducer, so it is never part of the hot path.
-                         */
-                        direct_sampled_verifier_rows_for_replay_check.assign(
-                            sampled_verifier_rows.size(),
-                            -1);
-                        if (!runner_->sampleGreedyFromAllPositionLogitsOnDeviceRows(
-                                0,
-                                static_cast<int>(
-                                    direct_sampled_verifier_rows_for_replay_check.size()),
-                                direct_sampled_verifier_rows_for_replay_check.data()))
-                        {
-                            direct_sampled_verifier_rows_for_replay_check.clear();
-                        }
-                    }
-
                     PerfStatsCollector::ScopedTimer sample_timer(
                         "mtp",
                         "all_position_verifier_greedy_device_summary",
@@ -10597,12 +10607,6 @@ namespace llaminar2
                     << (all_speculative_accepted ? "true" : "false")
                     << " accepted_speculative_prefix="
                     << accepted_speculative_prefix;
-                if (!direct_sampled_verifier_rows_for_replay_check.empty())
-                {
-                    replay_context
-                        << " direct_all_position_rows="
-                        << join_tokens(direct_sampled_verifier_rows_for_replay_check);
-                }
                 if (auto mismatch = verify_committed_prefix_replay(
                         verifier_replay_check_path,
                         accepted_tokens,
@@ -12045,6 +12049,14 @@ namespace llaminar2
                     return fail_after_checkpoint(
                         "Grouped-outcome greedy MTP cannot apply row-local penalties to deferred token shadows");
                 }
+                if (runner_->primaryDeviceId().is_gpu() &&
+                    use_sampling_penalties)
+                {
+                    return fail_after_checkpoint(
+                        "Grouped-outcome GPU greedy MTP penalties must "
+                        "execute inside the captured verifier graph before "
+                        "graph-owned outcome reduction");
+                }
                 if (!runner_->supportsMTPDeviceDraftTokenInput())
                 {
                     return fail_after_checkpoint(
@@ -12169,6 +12181,22 @@ namespace llaminar2
                     MTPVerifierForwardExecutionOptions verifier_forward_options;
                     verifier_forward_options.device_token_ids =
                         verifier_input_tokens_device;
+                    if (runner_->primaryDeviceId().is_gpu() &&
+                        !runner_
+                             ->prepareGreedyAllPositionBatchOutcomeGraph(
+                                 verifier_row_count,
+                                 stop_tokens_.data(),
+                                 static_cast<int>(
+                                     stop_tokens_.size())))
+                    {
+                        runner_->setComputeAllPositionLogits(false);
+                        runner_->setComputeRowIndexedAllPositionLogits(
+                            false,
+                            0);
+                        return fail_after_checkpoint(
+                            "Grouped-outcome greedy MTP could not arm the "
+                            "graph-owned outcome transaction");
+                    }
                     const MTPVerifierForwardExecutionResult verifier_forward =
                         executeMTPSpecVerifierForward(
                             *runner_,

@@ -1218,6 +1218,8 @@ namespace llaminar2
                     all_position_logits
                         ? std::max(0, host.allPositionLogitRows())
                         : 0,
+                .mtp_verifier_outcome_graph_mode =
+                    host.mtpVerifierOutcomeGraphMode(),
                 .uses_device_token_ids = input.token_ids_device != nullptr,
                 .uses_device_position_ids = input.position_ids_device != nullptr,
                 .position_policy = effective_input.position_policy,

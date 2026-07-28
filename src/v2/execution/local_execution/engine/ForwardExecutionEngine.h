@@ -282,6 +282,15 @@ namespace llaminar2
         virtual int allPositionLogitRows() const { return 0; }
 
         /**
+         * @brief Terminal MTP outcome topology owned by the current graph.
+         */
+        virtual MTPVerifierOutcomeGraphMode
+        mtpVerifierOutcomeGraphMode() const
+        {
+            return MTPVerifierOutcomeGraphMode::Disabled;
+        }
+
+        /**
          * @brief True while a vLLM-style MTP verifier row plan is installed.
          *
          * Batched verifier forwards have `batch_size > 1` and `seq_len > 1`,
