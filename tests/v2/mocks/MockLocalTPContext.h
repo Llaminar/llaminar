@@ -316,6 +316,83 @@ namespace llaminar2::test
             return completed && sideband_generation_result_;
         }
 
+        /**
+         * @brief Execute one participant-major mock sideband collective.
+         *
+         * Production NCCL/RCCL code submits every participant and its exact
+         * producer stream through one grouped host call.  The mock mirrors that
+         * rank-level API directly: it validates the complete matrix, records
+         * one logical collective call, and copies broadcast payloads only
+         * through the shared descriptor interpreter.  No worker rendezvous is
+         * needed because every participant is already present in this call.
+         *
+         * @param participant_sidebands Sidebands indexed by LocalTP participant.
+         * @param producer_streams Exact producer stream for each participant.
+         * @param publication_name Human-readable collective identity.
+         * @return true when the complete matrix is valid and was applied.
+         */
+        bool collectiveSidebandsMultiOnStreams(
+            const std::vector<std::vector<LocalTPCollectiveSidebandBuffer>>
+                &participant_sidebands,
+            const std::vector<void *> &producer_streams,
+            const std::string &publication_name) override
+        {
+            int participant_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                participant_count = static_cast<int>(devices_.size());
+                if (participant_sidebands.size() !=
+                        static_cast<size_t>(participant_count) ||
+                    producer_streams.size() !=
+                        static_cast<size_t>(participant_count))
+                {
+                    ++sideband_call_count_;
+                    return false;
+                }
+
+                for (int participant = 0;
+                     participant < participant_count;
+                     ++participant)
+                {
+                    void *stream =
+                        producer_streams[static_cast<size_t>(participant)];
+                    if (!stream)
+                    {
+                        throw std::invalid_argument(
+                            "MockLocalTPContext::collectiveSidebandsMultiOnStreams "
+                            "requires a non-null stream for every participant");
+                    }
+                    sideband_calls_.push_back(
+                        SidebandCall{
+                            participant,
+                            stream,
+                            publication_name,
+                            participant_sidebands[
+                                static_cast<size_t>(participant)]
+                                .size()});
+                }
+            }
+
+            ++sideband_call_count_;
+            if (sideband_should_fail_)
+                return false;
+
+            std::lock_guard<std::mutex> collective_lock(
+                sideband_collective_mutex_);
+            if (sideband_arrivals_ != 0 ||
+                !sideband_generation_requests_.empty())
+            {
+                return false;
+            }
+
+            sideband_generation_requests_ = participant_sidebands;
+            const bool result = completeSidebandGenerationLocked();
+            sideband_generation_requests_.clear();
+            sideband_generation_result_ = result;
+            ++sideband_generation_;
+            return result;
+        }
+
         void synchronize() override
         {
             ++synchronize_call_count_;

@@ -210,8 +210,9 @@ namespace llaminar2::test::parity::qwen36
                 test_case.topology == DensePrefixParityTopology::LocalTP);
     }
 
-    inline bool denseHasMTPPerfCounter(
+    inline bool denseHasPerfCounter(
         const std::vector<PerfStatRecord> &records,
+        const char *domain,
         const char *name)
     {
         return std::any_of(
@@ -220,13 +221,15 @@ namespace llaminar2::test::parity::qwen36
             [&](const PerfStatRecord &record)
             {
                 return record.kind == PerfStatRecord::Kind::Counter &&
-                       record.domain == "mtp" &&
-                       record.name == name;
+                       record.domain == domain &&
+                       record.name == name &&
+                       record.value > 0.0;
             });
     }
 
-    inline bool denseHasMTPPerfRecordTag(
+    inline bool denseHasPerfRecordTag(
         const std::vector<PerfStatRecord> &records,
+        const char *domain,
         const char *name,
         const char *tag_key,
         const char *tag_value)
@@ -236,11 +239,128 @@ namespace llaminar2::test::parity::qwen36
             records.end(),
             [&](const PerfStatRecord &record)
             {
-                if (record.domain != "mtp" || record.name != name)
+                if (record.domain != domain || record.name != name)
                     return false;
                 const auto it = record.tags.find(tag_key);
                 return it != record.tags.end() && it->second == tag_value;
             });
+    }
+
+    /**
+     * @brief Return whether a positive counter carries an exact metadata tag.
+     *
+     * Graph-capture assertions must distinguish evidence emitted by the main
+     * decode graph from evidence emitted by the MTP sidecar graph. Merely
+     * finding a tagged zero-valued planning record would not prove execution,
+     * so this helper requires both the matching tag and positive counter value.
+     */
+    inline bool denseHasPositivePerfCounterTag(
+        const std::vector<PerfStatRecord> &records,
+        const char *domain,
+        const char *name,
+        const char *tag_key,
+        const char *tag_value)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                if (record.kind != PerfStatRecord::Kind::Counter ||
+                    record.domain != domain ||
+                    record.name != name ||
+                    record.value <= 0.0)
+                {
+                    return false;
+                }
+                const auto it = record.tags.find(tag_key);
+                return it != record.tags.end() && it->second == tag_value;
+            });
+    }
+
+    /**
+     * @brief Return whether a positive counter tag starts with a stable prefix.
+     *
+     * MTP sidecar graph contexts include resident-input policy suffixes in
+     * their cache identity. Tests care that the sidecar graph family replayed,
+     * while preserving those suffixes as useful diagnostics.
+     */
+    inline bool denseHasPositivePerfCounterTagPrefix(
+        const std::vector<PerfStatRecord> &records,
+        const char *domain,
+        const char *name,
+        const char *tag_key,
+        const char *tag_prefix)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                if (record.kind != PerfStatRecord::Kind::Counter ||
+                    record.domain != domain ||
+                    record.name != name ||
+                    record.value <= 0.0)
+                {
+                    return false;
+                }
+                const auto it = record.tags.find(tag_key);
+                return it != record.tags.end() &&
+                       it->second.rfind(tag_prefix, 0) == 0;
+            });
+    }
+
+    inline bool denseHasMTPPerfCounter(
+        const std::vector<PerfStatRecord> &records,
+        const char *name)
+    {
+        return denseHasPerfCounter(records, "mtp", name);
+    }
+
+    inline bool denseHasMTPPerfRecordTag(
+        const std::vector<PerfStatRecord> &records,
+        const char *name,
+        const char *tag_key,
+        const char *tag_value)
+    {
+        return denseHasPerfRecordTag(
+            records,
+            "mtp",
+            name,
+            tag_key,
+            tag_value);
+    }
+
+    /**
+     * @brief Return whether every participant uses one homogeneous GPU backend.
+     *
+     * CUDA-only and ROCm-only graphs can capture their backend-native
+     * collectives. A mixed CUDA/ROCm topology is intentionally excluded because
+     * its cross-backend handoff may require explicit execution segments.
+     */
+    inline bool denseCaseUsesHomogeneousGPU(
+        const DensePrefixRestoreParityCase &test_case)
+    {
+        if (test_case.devices.empty())
+        {
+            return false;
+        }
+
+        const bool all_cuda = std::all_of(
+            test_case.devices.begin(),
+            test_case.devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.isCUDA();
+            });
+        const bool all_rocm = std::all_of(
+            test_case.devices.begin(),
+            test_case.devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.isROCm();
+            });
+        return all_cuda || all_rocm;
     }
 
     /**
@@ -289,6 +409,11 @@ namespace llaminar2::test::parity::qwen36
             denseHasMTPPerfCounter(
                 records,
                 "grouped_decode_equivalent_greedy_verifier_runs");
+        const bool used_rank_grouped_multi_stream_publication =
+            denseHasPerfCounter(
+                records,
+                "tp_collective_runtime",
+                "sideband_only_multi_stream_groups");
 
         if (denseCaseExpectsGroupedDevicePublication(test_case))
         {
@@ -307,6 +432,30 @@ namespace llaminar2::test::parity::qwen36
                 << context << " must not promote dense direct all-position "
                    "publication without a continuation proof.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
+            if (test_case.topology == DensePrefixParityTopology::LocalTP)
+            {
+                EXPECT_TRUE(used_rank_grouped_multi_stream_publication)
+                    << context << " must publish the compact mirrored outcome "
+                       "through one rank-level NCCL/RCCL multi-stream group.\n"
+                    << PerfStatsCollector::summaryString(
+                           {"mtp", "tp_collective_runtime"});
+                EXPECT_TRUE(denseHasPerfRecordTag(
+                    records,
+                    "tp_collective_runtime",
+                    "sideband_only_multi_stream_groups",
+                    "host_rendezvous",
+                    "false"))
+                    << context << " must not rendezvous host workers for compact "
+                       "outcome publication.";
+                EXPECT_TRUE(denseHasPerfRecordTag(
+                    records,
+                    "tp_collective_runtime",
+                    "sideband_only_multi_stream_groups",
+                    "device_completion_wait",
+                    "false"))
+                    << context << " must leave collective completion ordered by "
+                       "the participant device streams.";
+            }
             return;
         }
 
@@ -322,8 +471,91 @@ namespace llaminar2::test::parity::qwen36
             << PerfStatsCollector::summaryString({"mtp"});
         EXPECT_FALSE(used_direct_all_position_publication)
             << context << " must not use unproven dense direct all-position "
-               "publication.\n"
-            << PerfStatsCollector::summaryString({"mtp"});
+                   "publication.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+    }
+
+    /**
+     * @brief Prove homogeneous GPU MTP executed whole captured graphs.
+     *
+     * CUDA-only and ROCm-only serving cells have graph-capturable collectives,
+     * so both the ordinary decode graph and the MTP sidecar graph must replay as
+     * one native graph each. Segmented plans, segmented capture executables, and
+     * segmented replay are all architectural failures for these topologies.
+     *
+     * Heterogeneous device mixes are intentionally outside this assertion:
+     * crossing backend boundaries can require explicit collective segments.
+     *
+     * @param test_case Dense parity fixture under test.
+     * @param records Request-local PerfStats evidence.
+     * @param context Human-readable request label for assertion failures.
+     */
+    inline void expectDenseHomogeneousGPUFullGraphReplay(
+        const DensePrefixRestoreParityCase &test_case,
+        const std::vector<PerfStatRecord> &records,
+        const std::string &context)
+    {
+        if (!denseCaseUsesHomogeneousGPU(test_case))
+        {
+            return;
+        }
+
+        EXPECT_TRUE(denseHasPositivePerfCounterTag(
+            records,
+            "forward_graph",
+            "full_graph_plan_graphs",
+            "type",
+            "capturable"))
+            << context << " did not produce a whole-graph capture plan.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+        const bool captured_full_graph = denseHasPerfCounter(
+            records,
+            "forward_graph",
+            "full_graph_capture_executable_nodes");
+        const bool replayed_full_graph = denseHasPerfCounter(
+            records,
+            "forward_graph",
+            "full_graph_replay_calls");
+        EXPECT_TRUE(captured_full_graph || replayed_full_graph)
+            << context << " neither instantiated nor replayed a whole native graph.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+        const bool captured_full_sidecar =
+            denseHasPositivePerfCounterTagPrefix(
+                records,
+                "forward_graph",
+                "full_graph_capture_executable_nodes",
+                "context",
+                "mtp_decode_sidecar");
+        const bool replayed_full_sidecar =
+            denseHasPositivePerfCounterTagPrefix(
+                records,
+                "forward_graph",
+                "full_graph_replay_calls",
+                "context",
+                "mtp_decode_sidecar");
+        EXPECT_TRUE(captured_full_sidecar || replayed_full_sidecar)
+            << context << " neither captured nor replayed the MTP sidecar as "
+                          "one native graph.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+
+        EXPECT_FALSE(denseHasPerfCounter(
+            records,
+            "forward_graph",
+            "segmented_plan_segments"))
+            << context << " produced a segmented graph plan on homogeneous GPUs.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+        EXPECT_FALSE(denseHasPerfCounter(
+            records,
+            "forward_graph",
+            "segmented_graph_capture_executable_nodes"))
+            << context << " instantiated a segmented graph on homogeneous GPUs.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+        EXPECT_FALSE(denseHasPerfCounter(
+            records,
+            "forward_graph",
+            "segmented_replay_segments"))
+            << context << " executed segmented replay on homogeneous GPUs.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
     }
 
     inline void expectPhase138TransactionUsed(
@@ -2608,14 +2840,27 @@ namespace llaminar2::test::parity::qwen36
     }
 
     inline void runDenseMTPParity(
-        const DensePrefixRestoreParityCase &test_case,
+        DensePrefixRestoreParityCase test_case,
         bool enable_prefix_cache,
         int mtp_draft_tokens = 1,
         MTPDepthPolicyConfig depth_policy = {})
     {
         ScopedDenseParityProductionMode production_mode(
             shouldForceDenseParityProductionMode(test_case));
-        ScopedEnvironmentValues perf_stats_enabled({
+        if (denseCaseUsesHomogeneousGPU(test_case))
+        {
+            // Short requests can finish before a repeated verifier geometry
+            // crosses graph warmup. Use the established continuation fixture so
+            // every homogeneous-GPU MTP cell proves an executable full graph,
+            // rather than stopping at the weaker "capturable plan" assertion.
+            test_case.decode_steps = std::max(test_case.decode_steps, 8);
+            test_case.max_seq_len = std::max(test_case.max_seq_len, 128);
+            test_case.default_metadata_path =
+                "pytorch_qwen36_dense_phase138_continuation_snapshots/metadata.txt";
+        }
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
             {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
         });
         ASSERT_GE(mtp_draft_tokens, 1);
@@ -2648,7 +2893,9 @@ namespace llaminar2::test::parity::qwen36
         PerfStatsCollector::reset();
         auto first = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
         const auto after_first = mtp->prefixStateProbe();
-        const auto first_records = PerfStatsCollector::snapshot({"mtp"});
+        const auto first_records =
+            PerfStatsCollector::snapshot(
+                {"mtp", "tp_collective_runtime", "forward_graph"});
         ASSERT_TRUE(first.error.empty()) << first.error;
         ASSERT_EQ(first.tokens.size(), expected_tokens.size());
         EXPECT_EQ(first.tokens, expected_tokens);
@@ -2669,6 +2916,10 @@ namespace llaminar2::test::parity::qwen36
             test_case,
             first_records,
             test_case.name + " first request");
+        expectDenseHomogeneousGPUFullGraphReplay(
+            test_case,
+            first_records,
+            test_case.name + " first request");
 
         if (!enable_prefix_cache)
         {
@@ -2684,7 +2935,9 @@ namespace llaminar2::test::parity::qwen36
         PerfStatsCollector::reset();
         auto second = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
         const auto after_second = mtp->prefixStateProbe();
-        const auto second_records = PerfStatsCollector::snapshot({"mtp"});
+        const auto second_records =
+            PerfStatsCollector::snapshot(
+                {"mtp", "tp_collective_runtime", "forward_graph"});
         mtp->shutdown();
 
         ASSERT_TRUE(second.error.empty()) << second.error;
@@ -2712,6 +2965,10 @@ namespace llaminar2::test::parity::qwen36
             after_second,
             test_case.name + " restored request");
         expectDenseGreedyMTPPublicationPath(
+            test_case,
+            second_records,
+            test_case.name + " restored request");
+        expectDenseHomogeneousGPUFullGraphReplay(
             test_case,
             second_records,
             test_case.name + " restored request");
@@ -3190,6 +3447,19 @@ namespace llaminar2::test::parity::qwen36
     {
         ScopedDenseParityProductionMode production_mode(
             shouldForceDenseParityProductionMode(test_case));
+        // A single longer request is required here. It exercises repeated
+        // dynamic-depth verifier shapes after graph warmup without resetting
+        // runner state between requests and accidentally testing lifecycle
+        // behavior instead of the production dynamic-depth path.
+        test_case.decode_steps = std::max(test_case.decode_steps, 8);
+        test_case.max_seq_len = std::max(test_case.max_seq_len, 128);
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_phase138_continuation_snapshots/metadata.txt";
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
         const int adaptive_max_depth = enable_prefix_cache ? 1 : 2;
         MTPDepthPolicyConfig depth_policy;
         depth_policy.mode = MTPDepthPolicyMode::Dynamic;
@@ -3224,8 +3494,13 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_NE(mtp, nullptr);
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
 
+        PerfStatsCollector::reset();
         auto first = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
         const auto after_first = mtp->prefixStateProbe();
+        const auto first_records =
+            PerfStatsCollector::snapshot(
+                {"mtp", "tp_collective_runtime", "forward_graph"});
+        mtp->shutdown();
         ASSERT_TRUE(first.error.empty()) << first.error;
         ASSERT_EQ(first.tokens.size(), expected_tokens.size());
         EXPECT_EQ(first.tokens, expected_tokens);
@@ -3237,24 +3512,15 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_EQ(after_first.mtp_max_depth, adaptive_max_depth);
         EXPECT_GE(after_first.mtp_current_depth, 1);
         EXPECT_LE(after_first.mtp_current_depth, adaptive_max_depth);
-
-        if (!enable_prefix_cache)
-        {
-            mtp->shutdown();
-            return;
-        }
-
-        auto second = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
-        const auto after_second = mtp->prefixStateProbe();
-        mtp->shutdown();
-
-        ASSERT_TRUE(second.error.empty()) << second.error;
-        ASSERT_EQ(second.tokens.size(), expected_tokens.size());
-        EXPECT_EQ(second.tokens, expected_tokens);
-        EXPECT_TRUE(after_second.prefix_request.hit);
-        EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
-        EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
-        EXPECT_GE(after_second.mtp_depth_policy_windows, 1u);
+        expectDenseGreedyMTPPublicationPath(
+            test_case,
+            first_records,
+            test_case.name + " dynamic-depth first request");
+        expectDenseHomogeneousGPUFullGraphReplay(
+            test_case,
+            first_records,
+            test_case.name + " dynamic-depth long request");
+        PerfStatsCollector::reset();
     }
 
     inline void runDenseNoMTPBenchmarkStyleFreshRunnerDeterminism(
@@ -5131,7 +5397,9 @@ namespace llaminar2::test::parity::qwen36
         PerfStatsCollector::reset();
         auto reused_mtp_result = mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
         const auto after_reused_mtp = mtp->prefixStateProbe();
-        const auto phase138_records = PerfStatsCollector::snapshot({"mtp"});
+        const auto phase138_records =
+            PerfStatsCollector::snapshot(
+                {"mtp", "tp_collective_runtime", "forward_graph"});
         mtp->shutdown();
 
         ASSERT_TRUE(reused_mtp_result.error.empty()) << reused_mtp_result.error;
@@ -5238,6 +5506,27 @@ namespace llaminar2::test::parity::qwen36
                 << "GPU LocalTP Qwen3.6 stochastic MTP must not promote to a "
                    "single-owner all-position publication path\n"
                 << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_TRUE(denseHasPerfCounter(
+                phase138_records,
+                "tp_collective_runtime",
+                "sideband_only_multi_stream_groups"))
+                << "GPU LocalTP stochastic MTP must publish each compact "
+                   "mirrored outcome through the rank-level NCCL/RCCL "
+                   "multi-stream primitive\n"
+                << PerfStatsCollector::summaryString(
+                       {"mtp", "tp_collective_runtime"});
+            EXPECT_TRUE(denseHasPerfRecordTag(
+                phase138_records,
+                "tp_collective_runtime",
+                "sideband_only_multi_stream_groups",
+                "host_rendezvous",
+                "false"));
+            EXPECT_TRUE(denseHasPerfRecordTag(
+                phase138_records,
+                "tp_collective_runtime",
+                "sideband_only_multi_stream_groups",
+                "device_completion_wait",
+                "false"));
         }
         else
         {
@@ -5260,6 +5549,11 @@ namespace llaminar2::test::parity::qwen36
             << "Stateful Qwen3.6 stochastic MTP must not use the retired "
                "accepted-count publication candidate\n"
             << PerfStatsCollector::summaryString({"mtp"});
+        expectDenseHomogeneousGPUFullGraphReplay(
+            test_case,
+            phase138_records,
+            test_case.name + " stochastic MTP after clearCache");
+        PerfStatsCollector::reset();
     }
 
 } // namespace llaminar2::test::parity::qwen36

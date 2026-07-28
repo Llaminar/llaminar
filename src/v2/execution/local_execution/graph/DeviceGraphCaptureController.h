@@ -78,7 +78,16 @@ namespace llaminar2
          */
         struct ReplayHooks
         {
-            /// Ensures replay inputs/weights/outputs are coherent before launch.
+            /**
+             * @brief Joins every external producer event to the exact graph stream.
+             *
+             * This hook is mandatory for native capture and diagnostic
+             * recapture. It runs after stage-owned launch metadata has been
+             * prepared and before `beginCapture()`, because metadata preparation
+             * may itself publish a new device-write event. A capture transaction
+             * must never discover or import that external event from inside its
+             * recorded body.
+             */
             std::function<bool(const DeviceGraphExecutor::GraphSegment &)> cohere_inputs;
             /// Executes one stage through executor's canonical node path.
             std::function<bool(ComputeNode &)> execute_node;
@@ -277,6 +286,7 @@ namespace llaminar2
             int segment_index,
             uint64_t current_step,
             const std::string &perf_context,
+            const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
             const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);

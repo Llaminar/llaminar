@@ -1275,6 +1275,187 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLCoordinator::collectiveSidebandsMultiOnStreams(
+        const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+        if (sidebands.empty())
+        {
+            last_error_ =
+                "collectiveSidebandsMultiOnStreams requires at least one sideband";
+            return false;
+        }
+        if (streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Stream count does not match device count";
+            return false;
+        }
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!streams[static_cast<size_t>(i)])
+            {
+                last_error_ = "Null grouped sideband stream for device " +
+                              std::to_string(i);
+                return false;
+            }
+        }
+
+        /*
+         * Reject malformed publication contracts before opening the RCCL group.
+         * A participant mismatch discovered after the first launch would leave a
+         * partial collective sequence resident in the communicator.
+         */
+        for (size_t sideband_index = 0;
+             sideband_index < sidebands.size();
+             ++sideband_index)
+        {
+            const auto &sideband = sidebands[sideband_index];
+            if (sideband.count == 0 ||
+                sideband.recv_buffers.size() !=
+                    static_cast<size_t>(num_devices_))
+            {
+                last_error_ =
+                    "Invalid grouped sideband descriptor at index " +
+                    std::to_string(sideband_index);
+                return false;
+            }
+            if (sideband.kind == CollectiveSidebandOp::Broadcast &&
+                (sideband.root < 0 || sideband.root >= num_devices_))
+            {
+                last_error_ = "Invalid grouped sideband broadcast root " +
+                              std::to_string(sideband.root);
+                return false;
+            }
+            const bool requires_send_buffers =
+                sideband.kind == CollectiveSidebandOp::Allgather ||
+                sideband.kind == CollectiveSidebandOp::Broadcast;
+            if (requires_send_buffers &&
+                sideband.send_buffers.size() !=
+                    static_cast<size_t>(num_devices_))
+            {
+                last_error_ =
+                    "Grouped sideband send buffer count mismatch at index " +
+                    std::to_string(sideband_index);
+                return false;
+            }
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                if (!sideband.recv_buffers[static_cast<size_t>(i)] ||
+                    (requires_send_buffers &&
+                     !sideband.send_buffers[static_cast<size_t>(i)]))
+                {
+                    last_error_ =
+                        "Null grouped sideband buffer at sideband " +
+                        std::to_string(sideband_index) + " device " +
+                        std::to_string(i);
+                    return false;
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+        rccl::ncclResult_t result = rccl::ncclGroupStart();
+        if (result != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupStart failed: ") +
+                          rccl::ncclGetErrorString(result);
+            return false;
+        }
+
+        for (size_t sideband_index = 0;
+             sideband_index < sidebands.size();
+             ++sideband_index)
+        {
+            const auto &sideband = sidebands[sideband_index];
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                const hipError_t set_device =
+                    trackedHipSetDevice(
+                        device_ordinals_[static_cast<size_t>(i)]);
+                if (set_device != hipSuccess)
+                {
+                    last_error_ = std::string("hipSetDevice failed: ") +
+                                  hipGetErrorString(set_device);
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+
+                const auto comm =
+                    static_cast<rccl::ncclComm_t>(
+                        comms_[static_cast<size_t>(i)]);
+                const auto stream =
+                    static_cast<hipStream_t>(
+                        streams[static_cast<size_t>(i)]);
+                const auto dtype =
+                    toRcclDataTypeInt(toDataTypeInt(sideband.dtype));
+                switch (sideband.kind)
+                {
+                case CollectiveSidebandOp::AllreduceSum:
+                    result = rccl::ncclAllReduce(
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        dtype,
+                        rccl::ncclSum,
+                        comm,
+                        stream);
+                    break;
+                case CollectiveSidebandOp::Allgather:
+                    result = rccl::ncclAllGather(
+                        sideband.send_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        dtype,
+                        comm,
+                        stream);
+                    break;
+                case CollectiveSidebandOp::Broadcast:
+                    result = rccl::ncclBroadcast(
+                        sideband.send_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        dtype,
+                        sideband.root,
+                        comm,
+                        stream);
+                    break;
+                }
+                if (result != rccl::ncclSuccess)
+                {
+                    last_error_ =
+                        "RCCL grouped sideband publication failed at sideband " +
+                        std::to_string(sideband_index) + " device " +
+                        std::to_string(device_ordinals_[static_cast<size_t>(i)]) +
+                        ": " + rccl::ncclGetErrorString(result);
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+            }
+        }
+
+        result = rccl::ncclGroupEnd();
+        if (result != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupEnd failed: ") +
+                          rccl::ncclGetErrorString(result);
+            return false;
+        }
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)sidebands;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLCoordinator::allreduceSingleDeviceAsync(void *buffer, size_t count,
                                                      CollectiveDataType dtype, CollectiveOp op,
                                                      int device_idx)

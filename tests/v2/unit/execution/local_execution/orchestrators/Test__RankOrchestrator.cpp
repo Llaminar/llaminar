@@ -3000,6 +3000,35 @@ public:
         return completed && sideband_generation_result_;
     }
 
+    bool collectiveSidebandsMultiOnStreams(
+        const std::vector<std::vector<LocalTPCollectiveSidebandBuffer>>
+            &participant_sidebands,
+        const std::vector<void *> &producer_streams,
+        const std::string & /*publication_name*/) override
+    {
+        collective_sideband_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (config_.sideband_should_fail ||
+            participant_sidebands.size() != static_cast<size_t>(degree()) ||
+            producer_streams.size() != static_cast<size_t>(degree()))
+        {
+            return false;
+        }
+        for (void *stream : producer_streams)
+        {
+            if (!stream)
+            {
+                throw std::invalid_argument(
+                    "MockLocalTPContext::collectiveSidebandsMultiOnStreams requires non-null streams");
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(sideband_mutex_);
+        sideband_generation_sidebands_ = participant_sidebands;
+        const bool result = completeMockSidebandGenerationLocked();
+        sideband_generation_sidebands_.clear();
+        return result;
+    }
+
     void requestAbort() override {}
     bool isAbortRequested() const override { return false; }
 
@@ -6163,7 +6192,9 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredGreedyOutcomeBroadcastsCommonResid
         /*stop_token_count=*/0,
         &handle));
     ASSERT_TRUE(handle.valid());
-    EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 2u);
+    EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 1u)
+        << "The compact outcome must enter one rank-level grouped NCCL/RCCL "
+           "publication, not one host-rendezvoused call per participant.";
     EXPECT_EQ(tp_ctx_ptr->collective_sideband_broadcast_count(), 4u)
         << "Mirrored LocalTP resident publication must copy one primary "
            "compact outcome into every child mailbox using device-side "
@@ -6276,6 +6307,38 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredGreedyOutcomeBroadcastsCommonResid
             /*request_index=*/0))
         << "A rank mailbox issued before prefix restore must fail closed after "
            "the aggregate epoch advances.";
+}
+
+TEST_F(Test__RankOrchestrator,
+       MirroredLocalTPOutcomePublicationHasNoHostWorkerRendezvous)
+{
+    const std::string source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const size_t begin = source.find(
+        "bool RankOrchestrator::broadcastPrimaryMirroredLocalTPDeviceOutcomeToChildren(");
+    ASSERT_NE(begin, std::string::npos);
+    const size_t end = source.find(
+        "bool RankOrchestrator::buildRankStochasticDistributionFromLocalTP(",
+        begin);
+    ASSERT_NE(end, std::string::npos);
+    const std::string body = source.substr(begin, end - begin);
+
+    EXPECT_NE(
+        body.find("collectiveSidebandsMultiOnStreams("),
+        std::string::npos);
+    EXPECT_EQ(body.find("tp_worker_pool_"), std::string::npos);
+    EXPECT_EQ(body.find("TPWorkerPool"), std::string::npos);
+    EXPECT_EQ(body.find("dispatch("), std::string::npos);
+    EXPECT_EQ(body.find("collectAll("), std::string::npos);
+    EXPECT_EQ(
+        body.find("effectiveTPWorkerJoinTimeoutMs"),
+        std::string::npos);
+    EXPECT_EQ(
+        body.find("collectiveSidebandOnStream("),
+        std::string::npos);
 }
 
 TEST_F(Test__RankOrchestrator, LocalTPResidentCompactGreedyOutcomeResolvesDeferredRankSlots)
@@ -6523,7 +6586,10 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomeSamplesOnceAndSta
         /*inverse_sample_first_logical_position=*/64,
         /*use_vllm_probability_rejection=*/true));
     ASSERT_TRUE(handle.valid());
-    EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 4u);
+    EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 3u)
+        << "The first target, draft proposal, and compact verifier outcome "
+           "must each enter one rank-level grouped collective, independent of "
+           "the LocalTP participant count.";
     EXPECT_EQ(tp_ctx_ptr->collective_sideband_broadcast_count(), 6u)
         << "The primary stochastic compact outcome must be broadcast into "
            "every child mailbox after the first target slot was likewise "

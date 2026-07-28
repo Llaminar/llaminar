@@ -2626,6 +2626,204 @@ namespace llaminar2
         return true;
     }
 
+    bool LocalTPContext::collectiveSidebandsMultiOnStreams(
+        const std::vector<std::vector<LocalTPCollectiveSidebandBuffer>>
+            &participant_sidebands,
+        const std::vector<void *> &producer_streams,
+        const std::string &publication_name)
+    {
+        auto fail = [&](const std::string &reason) -> bool
+        {
+            LOG_ERROR("LocalTPContext::collectiveSidebandsMultiOnStreams: "
+                      << reason
+                      << " publication="
+                      << (publication_name.empty() ? "(none)"
+                                                   : publication_name));
+            requestAbort();
+            return false;
+        };
+
+        if (degree() <= 1)
+            return participant_sidebands.empty() ||
+                   participant_sidebands.front().empty();
+        if (!backend_initialized_ || !backend_impl_)
+            return fail("backend is not initialized");
+        if (backend_ != CollectiveBackendType::NCCL &&
+            backend_ != CollectiveBackendType::RCCL)
+        {
+            return fail(
+                std::string("requires a homogeneous NCCL/RCCL backend, got ") +
+                collectiveBackendTypeToString(backend_));
+        }
+        if (!backend_impl_->isMultiGpuSingleProcess() ||
+            !backend_impl_->supportsCollectiveSidebandsMultiOnStreams())
+        {
+            return fail(
+                "backend lacks required anchor-free grouped sideband support");
+        }
+        if (participant_sidebands.size() != static_cast<size_t>(degree()) ||
+            producer_streams.size() != static_cast<size_t>(degree()))
+        {
+            return fail(
+                "participant descriptor/stream count does not match LocalTP degree");
+        }
+
+        const size_t sideband_count = participant_sidebands.front().size();
+        if (sideband_count == 0)
+            return fail("publication bundle is empty");
+        for (int participant_index = 0;
+             participant_index < degree();
+             ++participant_index)
+        {
+            const size_t slot = static_cast<size_t>(participant_index);
+            if (!producer_streams[slot])
+            {
+                throw std::invalid_argument(
+                    "LocalTPContext::collectiveSidebandsMultiOnStreams requires non-null GPU streams");
+            }
+            if (participant_sidebands[slot].size() != sideband_count)
+            {
+                return fail(
+                    "sideband count mismatch for participant " +
+                    std::to_string(participant_index));
+            }
+        }
+
+        /*
+         * Lower the participant-major semantic matrix into the sideband-major
+         * backend matrix consumed by NCCL/RCCL. Every descriptor is checked
+         * against participant zero before any backend operation is submitted.
+         * This prevents a malformed rank transaction from entering only a
+         * prefix of the collective sequence.
+         */
+        std::vector<CollectiveSidebandMultiOnStreamsOp> backend_sidebands;
+        backend_sidebands.reserve(sideband_count);
+        for (size_t sideband_index = 0;
+             sideband_index < sideband_count;
+             ++sideband_index)
+        {
+            const LocalTPCollectiveSidebandBuffer &reference =
+                participant_sidebands.front()[sideband_index];
+            if (reference.element_count == 0 ||
+                reference.root_device_index < 0 ||
+                reference.root_device_index >= degree())
+            {
+                return fail(
+                    "invalid reference descriptor at sideband " +
+                    std::to_string(sideband_index));
+            }
+
+            CollectiveSidebandMultiOnStreamsOp backend_sideband;
+            backend_sideband.kind = toBackendSidebandOp(reference.kind);
+            backend_sideband.count = reference.element_count;
+            backend_sideband.dtype = reference.dtype;
+            backend_sideband.root = reference.root_device_index;
+            backend_sideband.recv_buffers.assign(
+                static_cast<size_t>(degree()), nullptr);
+            if (reference.kind == LocalTPCollectiveSidebandKind::Allgather ||
+                reference.kind == LocalTPCollectiveSidebandKind::Broadcast)
+            {
+                backend_sideband.send_buffers.assign(
+                    static_cast<size_t>(degree()), nullptr);
+            }
+
+            for (int participant_index = 0;
+                 participant_index < degree();
+                 ++participant_index)
+            {
+                const size_t slot = static_cast<size_t>(participant_index);
+                const LocalTPCollectiveSidebandBuffer &participant =
+                    participant_sidebands[slot][sideband_index];
+                if (participant.kind != reference.kind ||
+                    participant.element_count != reference.element_count ||
+                    participant.dtype != reference.dtype ||
+                    participant.root_device_index !=
+                        reference.root_device_index ||
+                    participant.name != reference.name)
+                {
+                    return fail(
+                        "sideband descriptor mismatch at participant " +
+                        std::to_string(participant_index) + " sideband " +
+                        std::to_string(sideband_index));
+                }
+                if (!participant.recv_buffer)
+                {
+                    return fail(
+                        "missing receive buffer at participant " +
+                        std::to_string(participant_index) + " sideband " +
+                        std::to_string(sideband_index));
+                }
+
+                backend_sideband.recv_buffers[slot] =
+                    participant.recv_buffer;
+                switch (participant.kind)
+                {
+                case LocalTPCollectiveSidebandKind::AllreduceSum:
+                    if (participant.send_buffer &&
+                        participant.send_buffer != participant.recv_buffer)
+                    {
+                        return fail(
+                            "AllreduceSum sideband must be in-place");
+                    }
+                    break;
+                case LocalTPCollectiveSidebandKind::Allgather:
+                    if (!participant.send_buffer)
+                    {
+                        return fail(
+                            "Allgather sideband is missing a send buffer");
+                    }
+                    backend_sideband.send_buffers[slot] =
+                        participant.send_buffer;
+                    break;
+                case LocalTPCollectiveSidebandKind::Broadcast:
+                    backend_sideband.send_buffers[slot] =
+                        participant.send_buffer
+                            ? participant.send_buffer
+                            : participant.recv_buffer;
+                    break;
+                }
+            }
+            backend_sidebands.push_back(std::move(backend_sideband));
+        }
+
+        if (!backend_impl_->collectiveSidebandsMultiOnStreams(
+                backend_sidebands, producer_streams))
+        {
+            return fail(
+                std::string("grouped backend launch failed: ") +
+                backend_impl_->lastError());
+        }
+
+        for (int participant_index = 0;
+             participant_index < degree();
+             ++participant_index)
+        {
+            recordLocalTPRuntimeGroupedSidebands(
+                device_group_,
+                backend_,
+                devices_[static_cast<size_t>(participant_index)]
+                    .toLocalDeviceId(),
+                publication_name,
+                static_cast<size_t>(degree()),
+                participant_index,
+                participant_sidebands[static_cast<size_t>(participant_index)]);
+        }
+        PerfStatsCollector::addCounter(
+            "tp_collective_runtime",
+            "sideband_only_multi_stream_groups",
+            1.0,
+            {},
+            "localtp",
+            {{"publication",
+              publication_name.empty() ? "unnamed" : publication_name},
+             {"backend", collectiveBackendTypeToString(backend_)},
+             {"degree", std::to_string(degree())},
+             {"sideband_count", std::to_string(sideband_count)},
+             {"host_rendezvous", "false"},
+             {"device_completion_wait", "false"}});
+        return true;
+    }
+
     bool LocalTPContext::allgatherRawOnStream(
         const void *local_send,
         void *full_recv,

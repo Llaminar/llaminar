@@ -1462,6 +1462,63 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLBackend::collectiveSidebandsMultiOnStreams(
+        const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ =
+                "collectiveSidebandsMultiOnStreams requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (streams.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Stream count does not match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (!coordinator_->collectiveSidebandsMultiOnStreams(
+                sidebands, streams))
+        {
+            last_error_ =
+                "RCCLCoordinator collectiveSidebandsMultiOnStreams failed: " +
+                coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
+#else
+        (void)sidebands;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsCollectiveSidebandsMultiOnStreams() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
     bool RCCLBackend::allreduceSingleDeviceAsync(
         void *buffer, size_t count,
         CollectiveDataType dtype, CollectiveOp op,

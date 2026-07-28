@@ -472,6 +472,22 @@ namespace llaminar2
             }
         }
 
+        /*
+         * Stage-owned launch preparation may publish metadata on an eager
+         * stream. Import every resulting arena-read event onto the exact
+         * capture stream before beginCapture(); stage execution inside the
+         * transaction is validation-only and must never add an external wait.
+         */
+        if (!prepareInputsForGraphCapture(
+                graph,
+                ctx,
+                gpu_stream,
+                "single_graph_capture"))
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Single-graph capture input preflight failed");
+            return false;
+        }
+
         // Step 1: Begin one structurally owned capture transaction.
         ScopedBackendGraphCapture capture_transaction(
             *capture,

@@ -1565,6 +1565,63 @@ namespace llaminar2
 #endif
     }
 
+    bool NCCLBackend::collectiveSidebandsMultiOnStreams(
+        const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ =
+                "collectiveSidebandsMultiOnStreams requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (streams.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Stream count does not match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (!coordinator_)
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (!coordinator_->collectiveSidebandsMultiOnStreams(
+                sidebands, streams))
+        {
+            last_error_ =
+                "NCCLCoordinator collectiveSidebandsMultiOnStreams failed: " +
+                coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
+#else
+        (void)sidebands;
+        (void)streams;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::supportsCollectiveSidebandsMultiOnStreams() const
+    {
+#ifdef HAVE_NCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
     bool NCCLBackend::allreduceSingleDeviceAsync(
         void *buffer, size_t count,
         CollectiveDataType dtype, CollectiveOp op,

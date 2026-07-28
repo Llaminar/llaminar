@@ -298,6 +298,47 @@ namespace llaminar2
         }
 
         /**
+         * @brief Publish one complete sideband bundle across every LocalTP stream.
+         *
+         * This rank-level form makes participant ownership explicit: index @c i
+         * in @p participant_sidebands and @p producer_streams always belongs to
+         * devices()[i]. Implementations lower the participant-local descriptors
+         * into one NCCL/RCCL group launch. The call is enqueue-only; completion
+         * remains ordered by each supplied stream and is never observed through a
+         * host rendezvous.
+         *
+         * This is the required production contract for compact MTP outcome
+         * publication when there is no real activation allreduce to serve as an
+         * anchor. Supplying a dummy allreduce, invoking one host worker per
+         * participant, or falling back to host copies would all change the
+         * operation's economics and ordering and are therefore forbidden.
+         *
+         * @param participant_sidebands Sideband descriptors grouped by LocalTP
+         *        participant in devices() order.
+         * @param producer_streams Exact non-null stream for every participant.
+         * @param publication_name Stable diagnostic/PerfStats operation name.
+         * @return true only when the complete multi-device group was enqueued.
+         */
+        virtual bool collectiveSidebandsMultiOnStreams(
+            const std::vector<std::vector<LocalTPCollectiveSidebandBuffer>>
+                &participant_sidebands,
+            const std::vector<void *> &producer_streams,
+            const std::string &publication_name)
+        {
+            (void)participant_sidebands;
+            (void)publication_name;
+            for (void *stream : producer_streams)
+            {
+                if (!stream)
+                {
+                    throw std::invalid_argument(
+                        "ILocalTPContext::collectiveSidebandsMultiOnStreams requires non-null GPU streams");
+                }
+            }
+            return false;
+        }
+
+        /**
          * @brief Execute an anchor allreduce and compact control sidebands as
          *        one grouped backend launch on an explicit stream.
          *

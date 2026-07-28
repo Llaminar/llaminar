@@ -140,6 +140,11 @@ namespace llaminar2
             int device_index,
             void *producer_stream,
             const std::string &anchor_stage_name) override;
+        bool collectiveSidebandsMultiOnStreams(
+            const std::vector<std::vector<LocalTPCollectiveSidebandBuffer>>
+                &participant_sidebands,
+            const std::vector<void *> &producer_streams,
+            const std::string &publication_name) override;
         bool allreduceWithSidebandsOnStream(
             TensorBase *tensor,
             const std::string &stage_name,

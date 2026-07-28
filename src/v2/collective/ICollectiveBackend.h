@@ -860,6 +860,36 @@ namespace llaminar2
         virtual bool supportsAllreduceWithSidebandsMultiOnStreams() const { return false; }
 
         /**
+         * @brief Group compact sideband collectives across explicit device streams.
+         *
+         * Unlike allreduceWithSidebandsMultiOnStreams(), this operation has no
+         * synthetic activation allreduce anchor. It is intended for compact
+         * device-resident publication edges, such as publishing one mirrored MTP
+         * verifier outcome to every LocalTP participant. Implementations must
+         * enqueue every sideband and every participant inside one NCCL/RCCL group
+         * and return immediately after launch. They must not synchronize a stream,
+         * wait for device completion on the host, or allocate temporary storage.
+         *
+         * @param sidebands Backend-ready operations containing one buffer address
+         *        per participant.
+         * @param streams Exact producer/consumer stream for each participant.
+         * @return true only when the complete grouped bundle was enqueued.
+         */
+        virtual bool collectiveSidebandsMultiOnStreams(
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams)
+        {
+            (void)sidebands;
+            (void)streams;
+            return false;
+        }
+
+        /**
+         * @brief Whether anchor-free grouped sideband publication is available.
+         */
+        virtual bool supportsCollectiveSidebandsMultiOnStreams() const { return false; }
+
+        /**
          * @brief Per-device non-blocking allreduce (barrier-free)
          *
          * Called independently by each device thread. RCCL/NCCL internally

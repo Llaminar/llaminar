@@ -8796,6 +8796,51 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefillCapturePrejoinsArenaInputsBefore
         "beginCapture().");
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, EveryNativeCapturePathPrejoinsInputsBeforeBeginCapture)
+{
+    const auto controller_source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/graph/DeviceGraphCaptureController.cpp");
+    const auto executor_source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp");
+    const auto phase_two_capture = sliceBetween(
+        controller_source,
+        "DeviceGraphCaptureController::CapturePhaseResult DeviceGraphCaptureController::executeCapturePhase(",
+        "DeviceGraphCaptureController::ReplayPhaseResult DeviceGraphCaptureController::executeReplayPhase(");
+    const auto diagnostic_recapture = sliceBetween(
+        controller_source,
+        "bool DeviceGraphCaptureController::executeCapturedReplaySegmentRecapture(",
+        "DeviceGraphCaptureController::VerifyReplayResult DeviceGraphCaptureController::executeCapturedReplaySegmentVerify(");
+    const auto direct_capture = sliceBetween(
+        executor_source,
+        "bool DeviceGraphExecutor::executeWithGraphCapture(",
+        "bool DeviceGraphExecutor::executeWithCachedGraphReplay(");
+
+    expectNeedleBefore(
+        phase_two_capture,
+        "if (!hooks.cohere_inputs(seg))",
+        "ScopedBackendGraphCapture capture_transaction(",
+        "Phase-2 decode/sidecar capture must join every segment input before "
+        "the backend capture transaction begins.");
+    expectNeedleBefore(
+        phase_two_capture,
+        "if (!hooks.cohere_inputs(seg))",
+        "hooks.capture_boundary(boundary_name, capture_stream)",
+        "Input event joins must precede the LocalTP capture rendezvous so all "
+        "participants enter capture with complete dependencies.");
+    expectNeedleBefore(
+        diagnostic_recapture,
+        "if (!cohere_inputs_cb(segment))",
+        "ScopedBackendGraphCapture capture_transaction(",
+        "Diagnostic recapture is not allowed to bypass exact-stream input "
+        "preparation.");
+    expectNeedleBefore(
+        direct_capture,
+        "prepareInputsForGraphCapture(",
+        "ScopedBackendGraphCapture capture_transaction(",
+        "The direct single-graph API must enforce the same pre-capture event "
+        "contract as cached decode capture.");
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MoERuntimeDecodeUsesFusedWorkspaceBeforeLegacyScratch)
 {
     const auto source =

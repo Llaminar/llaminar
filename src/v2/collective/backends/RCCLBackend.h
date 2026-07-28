@@ -271,6 +271,11 @@ namespace llaminar2
             const std::vector<void *> &streams) override;
         bool supportsAllreduceWithSidebandsMultiOnStreams() const override;
 
+        bool collectiveSidebandsMultiOnStreams(
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams) override;
+        bool supportsCollectiveSidebandsMultiOnStreams() const override;
+
         bool allreduceSingleDeviceAsync(
             void *buffer, size_t count,
             CollectiveDataType dtype, CollectiveOp op,

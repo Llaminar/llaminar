@@ -349,6 +349,41 @@ TEST_F(Test__LocalTPContext, AllreduceWithSidebandsUsesOneGroupedBackendBundle)
         << "Graph-native MoE rebalance should require grouped sideband bundles, not merely standalone sideband primitives.";
 }
 
+TEST_F(Test__LocalTPContext,
+       AnchorFreeSidebandPublicationUsesOneMultiStreamBackendGroup)
+{
+    const std::string source = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    const size_t begin = source.find(
+        "bool LocalTPContext::collectiveSidebandsMultiOnStreams(");
+    ASSERT_NE(begin, std::string::npos);
+    const size_t end = source.find(
+        "bool LocalTPContext::allgatherRawOnStream(",
+        begin);
+    ASSERT_NE(end, std::string::npos);
+    const std::string body = source.substr(begin, end - begin);
+
+    EXPECT_NE(
+        body.find("supportsCollectiveSidebandsMultiOnStreams"),
+        std::string::npos);
+    EXPECT_NE(
+        body.find("backend_impl_->collectiveSidebandsMultiOnStreams("),
+        std::string::npos);
+    EXPECT_NE(
+        body.find("sideband descriptor mismatch"),
+        std::string::npos);
+    EXPECT_NE(
+        body.find("\"host_rendezvous\", \"false\""),
+        std::string::npos);
+    EXPECT_NE(
+        body.find("\"device_completion_wait\", \"false\""),
+        std::string::npos);
+    EXPECT_EQ(body.find("collectiveSidebandOnStream("), std::string::npos);
+    EXPECT_EQ(body.find("allreduceWithSidebandsOnStream("), std::string::npos);
+    EXPECT_EQ(body.find("synchronize("), std::string::npos);
+}
+
 TEST_F(Test__LocalTPContext, BackendCoordinatorsGroupAnchorAndSidebandsInOneRegion)
 {
     const std::string backend = readTextFile(LLAMINAR_COLLECTIVE_BACKEND_HEADER);
@@ -407,6 +442,60 @@ TEST_F(Test__LocalTPContext, BackendCoordinatorsGroupAnchorAndSidebandsInOneRegi
         "rccl::ncclAllReduce(",
         "rccl::ncclAllGather(",
         "rccl::ncclBroadcast(");
+
+    auto expectAnchorFreeBundle = [](
+                                      const std::string &source,
+                                      const char *signature,
+                                      const char *group_start,
+                                      const char *group_end,
+                                      const char *allgather_call,
+                                      const char *broadcast_call,
+                                      const char *allreduce_call)
+    {
+        const size_t fn = source.find(signature);
+        ASSERT_NE(fn, std::string::npos) << signature;
+        const size_t next = source.find("\n    bool ", fn + 1);
+        const std::string body =
+            source.substr(
+                fn,
+                next == std::string::npos ? std::string::npos : next - fn);
+        const size_t start = body.find(group_start);
+        const size_t sideband_loop =
+            body.find("for (size_t sideband_index", start);
+        const size_t end = body.rfind(group_end);
+        ASSERT_NE(start, std::string::npos) << signature;
+        ASSERT_NE(sideband_loop, std::string::npos) << signature;
+        ASSERT_NE(end, std::string::npos) << signature;
+        EXPECT_NE(body.find(allgather_call, sideband_loop), std::string::npos)
+            << signature;
+        EXPECT_NE(body.find(broadcast_call, sideband_loop), std::string::npos)
+            << signature;
+        EXPECT_NE(body.find(allreduce_call, sideband_loop), std::string::npos)
+            << signature;
+        EXPECT_LT(start, sideband_loop) << signature;
+        EXPECT_LT(sideband_loop, end) << signature;
+        EXPECT_EQ(
+            body.find("grouped bundle anchor"),
+            std::string::npos)
+            << "Anchor-free publication must not submit a synthetic activation allreduce.";
+    };
+
+    expectAnchorFreeBundle(
+        nccl,
+        "bool NCCLCoordinator::collectiveSidebandsMultiOnStreams(",
+        "nccl::ncclGroupStart()",
+        "nccl::ncclGroupEnd()",
+        "nccl::ncclAllGather(",
+        "nccl::ncclBroadcast(",
+        "nccl::ncclAllReduce(");
+    expectAnchorFreeBundle(
+        rccl,
+        "bool RCCLCoordinator::collectiveSidebandsMultiOnStreams(",
+        "rccl::ncclGroupStart()",
+        "rccl::ncclGroupEnd()",
+        "rccl::ncclAllGather(",
+        "rccl::ncclBroadcast(",
+        "rccl::ncclAllReduce(");
 }
 
 TEST_F(Test__LocalTPContext, OnStreamGpuCollectivesStayGroupedDuringGraphCapture)

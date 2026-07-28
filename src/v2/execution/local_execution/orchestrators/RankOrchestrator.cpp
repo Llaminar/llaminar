@@ -7417,112 +7417,56 @@ namespace llaminar2
             }
         }
 
-        if (!tp_worker_pool_)
+        /*
+         * Describe the whole rank publication before entering NCCL/RCCL. The
+         * LocalTP context lowers this participant-major matrix into one backend
+         * group over the exact streams that produced each compact mailbox.
+         * There is deliberately no host worker dispatch or completion fence:
+         * group submission is a non-blocking host call, while producer and
+         * consumer ordering remains encoded by the device streams themselves.
+         */
+        std::vector<std::vector<LocalTPCollectiveSidebandBuffer>>
+            participant_sidebands(device_runners_.size());
+        std::vector<void *> producer_streams(device_runners_.size(), nullptr);
+        for (size_t i = 0; i < child_outcomes.size(); ++i)
         {
-            tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
-            if (tp_ctx_)
-            {
-                tp_worker_pool_->setFailureCallback([this]()
-                                                    {
-                    LOG_WARN("[TPWorkerPool] mirrored LocalTP common-outcome broadcast failure detected - aborting collective backend");
-                    tp_ctx_->requestAbort(); });
-            }
+            const DeviceSpeculativeOutcomeHandle &child = child_outcomes[i];
+            const bool is_root = i == 0;
+
+            LocalTPCollectiveSidebandBuffer output_tokens;
+            output_tokens.kind =
+                LocalTPCollectiveSidebandKind::Broadcast;
+            output_tokens.send_buffer =
+                is_root ? primary.output_tokens_device : nullptr;
+            output_tokens.recv_buffer =
+                const_cast<int32_t *>(child.output_tokens_device);
+            output_tokens.element_count = token_elements;
+            output_tokens.dtype = CollectiveDataType::INT32;
+            output_tokens.root_device_index = 0;
+            output_tokens.name = "mtp_common_outcome_tokens";
+
+            LocalTPCollectiveSidebandBuffer meta;
+            meta.kind = LocalTPCollectiveSidebandKind::Broadcast;
+            meta.send_buffer = is_root ? primary.meta_device : nullptr;
+            meta.recv_buffer = const_cast<int *>(child.meta_device);
+            meta.element_count = meta_elements;
+            meta.dtype = CollectiveDataType::INT32;
+            meta.root_device_index = 0;
+            meta.name = "mtp_common_outcome_meta";
+
+            auto &sidebands = participant_sidebands[i];
+            sidebands.reserve(2);
+            sidebands.push_back(std::move(output_tokens));
+            sidebands.push_back(std::move(meta));
+            producer_streams[i] = child.stream;
         }
-
-        auto kernel_phase = KernelProfiler::getCurrentPhase();
-        auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
-        auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
-        auto kv_phase = KVCacheProfiler::getCurrentPhase();
-        auto executor_phase = GraphExecutorStats::currentPhase();
-
-        tp_worker_pool_->dispatch(
-            [this,
-             &child_outcomes,
-             stage_name,
-             token_elements,
-             meta_elements,
-             kernel_phase,
-             rocm_phase,
-             cuda_phase,
-             kv_phase,
-             executor_phase](size_t i) -> bool
-            {
-                KernelProfiler::setCurrentPhase(kernel_phase);
-                ROCmKernelProfiler::setCurrentPhase(rocm_phase);
-                CUDAKernelProfiler::setCurrentPhase(cuda_phase);
-                KVCacheProfiler::setCurrentPhase(kv_phase);
-                GraphExecutorStats::setCurrentPhase(executor_phase);
-
-                const DeviceSpeculativeOutcomeHandle &primary =
-                    child_outcomes.front();
-                const DeviceSpeculativeOutcomeHandle &child =
-                    child_outcomes[i];
-                const bool is_root = i == 0;
-                auto device_id = device_runners_[i]->primaryDeviceId();
-                ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
-                CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
-
-                LocalTPCollectiveSidebandBuffer output_tokens;
-                output_tokens.kind =
-                    LocalTPCollectiveSidebandKind::Broadcast;
-                output_tokens.send_buffer =
-                    is_root ? primary.output_tokens_device : nullptr;
-                output_tokens.recv_buffer =
-                    const_cast<int32_t *>(child.output_tokens_device);
-                output_tokens.element_count = token_elements;
-                output_tokens.dtype = CollectiveDataType::INT32;
-                output_tokens.root_device_index = 0;
-                output_tokens.name = "mtp_common_outcome_tokens";
-
-                LocalTPCollectiveSidebandBuffer meta;
-                meta.kind = LocalTPCollectiveSidebandKind::Broadcast;
-                meta.send_buffer = is_root ? primary.meta_device : nullptr;
-                meta.recv_buffer = const_cast<int *>(child.meta_device);
-                meta.element_count = meta_elements;
-                meta.dtype = CollectiveDataType::INT32;
-                meta.root_device_index = 0;
-                meta.name = "mtp_common_outcome_meta";
-
-                std::vector<LocalTPCollectiveSidebandBuffer> sidebands;
-                sidebands.reserve(2);
-                sidebands.push_back(output_tokens);
-                sidebands.push_back(meta);
-                return tp_ctx_->collectiveSidebandOnStream(
-                    sidebands,
-                    static_cast<int>(i),
-                    child.stream,
-                    stage_name);
-            });
-
-        bool all_success = true;
-        std::exception_ptr first_exception = nullptr;
-        size_t first_exception_device = 0;
-        auto results =
-            tp_worker_pool_->collectAll(effectiveTPWorkerJoinTimeoutMs());
-        for (auto &r : results)
-        {
-            if (!r.completed || !r.success)
-                all_success = false;
-            if (r.exception && !first_exception)
-            {
-                first_exception = r.exception;
-                first_exception_device = r.worker_index;
-                all_success = false;
-            }
-        }
-        if (!all_success && tp_ctx_)
-            tp_ctx_->requestAbort();
-        if (first_exception)
-        {
-            LOG_ERROR("[RankOrchestrator] Mirrored LocalTP common-outcome broadcast rethrowing exception from participant "
-                      << first_exception_device);
-            std::rethrow_exception(first_exception);
-        }
-        if (!all_success)
+        if (!tp_ctx_->collectiveSidebandsMultiOnStreams(
+                participant_sidebands,
+                producer_streams,
+                stage_name))
         {
             return fail(
-                "device-side common outcome broadcast failed or timed out");
+                "device-side common outcome grouped publication failed");
         }
 
         PerfStatsCollector::addCounter(
@@ -7535,7 +7479,8 @@ namespace llaminar2
              {"request_count", std::to_string(primary.request_count)},
              {"output_token_elements", std::to_string(token_elements)},
              {"meta_elements", std::to_string(meta_elements)},
-             {"implementation", "localtp_broadcast_sidebands"},
+             {"implementation", "localtp_grouped_multi_stream_broadcast"},
+             {"host_worker_rendezvous", "false"},
              {"context", stage_name}});
         return true;
     }

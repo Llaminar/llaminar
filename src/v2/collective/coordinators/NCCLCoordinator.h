@@ -198,6 +198,13 @@ namespace llaminar2
             const std::vector<void *> &streams);
 
         /**
+         * @brief Enqueue an anchor-free sideband bundle as one NCCL group.
+         */
+        bool collectiveSidebandsMultiOnStreams(
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams);
+
+        /**
          * @brief Per-device non-blocking allreduce (barrier-free)
          *
          * Each device thread calls this independently. NCCL internally matches

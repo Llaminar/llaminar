@@ -1319,6 +1319,7 @@ namespace llaminar2
         int segment_index,
         uint64_t current_step,
         const std::string &perf_context,
+        const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
         const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
@@ -1346,6 +1347,25 @@ namespace llaminar2
         if (!prepareGraphLaunchMetadata(graph, segment, ctx, capture_stream))
         {
             LOG_ERROR("[DeviceGraphCaptureController] Re-capture metadata preparation failed, seg "
+                      << segment_index);
+            return false;
+        }
+        /*
+         * Launch metadata preparation can publish new device writes. Join those
+         * exact event generations to the capture stream only after preparation,
+         * but before the domain rendezvous and beginCapture(). Stage-level
+         * requirePreparedInput() calls inside capture then prove this prejoin
+         * instead of attempting an illegal external-event import.
+         */
+        if (!cohere_inputs_cb)
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Re-capture requires a pre-capture input coherence hook, seg "
+                      << segment_index);
+            return false;
+        }
+        if (!cohere_inputs_cb(segment))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Re-capture input preflight failed, seg "
                       << segment_index);
             return false;
         }
@@ -2013,11 +2033,13 @@ namespace llaminar2
         // dynamic_cast + virtual getDumpInfo) is pure CPU overhead.
         //
         // Coherence IS needed for verify/recapture modes since they may re-execute
-        // stages in a different order or on different streams.
-        const bool skip_coherence = !recapture_mode && !verify_mode;
+        // stages in a different order or on different streams. Recapture owns
+        // the preflight internally so it runs after launch-metadata preparation.
+        const bool prepare_verify_inputs = verify_mode && !recapture_mode;
         const std::string device_name = ctx->deviceId().toString();
 
-        if (!skip_coherence && !cohere_inputs_cb(segment))
+        if (prepare_verify_inputs &&
+            (!cohere_inputs_cb || !cohere_inputs_cb(segment)))
         {
             return result;
         }
@@ -2038,6 +2060,7 @@ namespace llaminar2
                 segment_index,
                 current_step,
                 perf_context,
+                cohere_inputs_cb,
                 capture_boundary_cb,
                 record_snapshot_copies_cb,
                 post_launch_cb);
@@ -2277,6 +2300,35 @@ namespace llaminar2
                             return result;
                         }
                     }
+                }
+
+                /*
+                 * This is the mandatory external-event import boundary for
+                 * Phase-2 native capture. It deliberately follows every
+                 * stage-owned metadata/snapshot preparation call: either may
+                 * publish a fresh completion event on an eager stream. The
+                 * complete segment is prejoined before the LocalTP rendezvous,
+                 * making late capture-time event discovery impossible.
+                 */
+                if (!hooks.cohere_inputs)
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Native graph capture requires a pre-capture input coherence hook for segment starting at "
+                              << (seg.stage_names.empty()
+                                      ? std::string("<empty>")
+                                      : seg.stage_names.front()));
+                    result.reset_cache = true;
+                    result.success = false;
+                    return result;
+                }
+                if (!hooks.cohere_inputs(seg))
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Native graph capture input preflight failed for segment starting at "
+                              << (seg.stage_names.empty()
+                                      ? std::string("<empty>")
+                                      : seg.stage_names.front()));
+                    result.reset_cache = true;
+                    result.success = false;
+                    return result;
                 }
 
                 // Native capture requires an idle stream. Fence exactly the
