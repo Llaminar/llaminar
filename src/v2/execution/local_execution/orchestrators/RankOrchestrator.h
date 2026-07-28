@@ -1772,6 +1772,22 @@ namespace llaminar2
             int32_t *out_token);
 
         /**
+         * @brief Close non-primary replicated main-logits producer handoffs.
+         *
+         * Replicated dense decode and mirrored MTP-head execution intentionally
+         * sample only participant zero. Participants one through N still produced
+         * the same full-vocabulary row and therefore own one-shot graph-stream
+         * publications. This helper retires those unused publications after the
+         * primary decision without launching duplicate samplers or synchronizing
+         * any stream.
+         *
+         * @param boundary Stable diagnostic label for the rank-level consumer.
+         * @return true when every non-primary publication is closed.
+         */
+        bool consumeUnusedReplicatedMainLogitsPublications(
+            const char *boundary);
+
+        /**
          * @brief Install one rank-resolved target token into every child slot.
          *
          * The LocalTP rank reducer owns the compact full-vocab sample decision,

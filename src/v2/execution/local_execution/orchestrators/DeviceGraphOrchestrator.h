@@ -2046,6 +2046,7 @@ namespace llaminar2
         bool flushPendingMTPWork() override;
         void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override;
         void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override;
+        bool consumeUnusedReplicatedMainLogitsPublication() override;
         bool supportsMTPSpecStatePublication() const override;
         bool supportsDeviceResidentMTPSpecStatePublication() const override;
         bool supportsLogicalMTPVerifierBaseCheckpoint() const override;
@@ -3519,6 +3520,29 @@ namespace llaminar2
         bool materializePendingMTPVerifierInputTokensOnDevice(
             void *execution_stream,
             DeviceId execution_device);
+
+        /**
+         * @brief Publish one raw-written arena buffer as a graph input.
+         *
+         * Verifier control rows are filled through backend copy/kernel APIs
+         * because their device addresses are captured permanently.  A raw
+         * launch alone cannot update the arena's coherence state.  This
+         * boundary proves that the raw destination is still the exact arena
+         * binding and records the producer stream before the graph may read it.
+         *
+         * @param id Arena buffer whose device bytes were just produced.
+         * @param expected_device_ptr Raw destination passed to the backend.
+         * @param producer_stream Exact stream carrying the write.
+         * @param device Device that owns both storage and stream.
+         * @param producer Stable diagnostic name for the write transaction.
+         * @return true only when identity and event publication both succeed.
+         */
+        bool publishPreparedArenaGraphInput(
+            BufferId id,
+            const void *expected_device_ptr,
+            void *producer_stream,
+            DeviceId device,
+            const char *producer);
 
         /**
          * @brief Clear the device-side "sample token is ready" marker for one draft slot.

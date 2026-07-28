@@ -154,6 +154,11 @@ namespace llaminar2
         b.cols = tensor->cols();
         b.dtype = nullptr;
         b.coherence = {};
+        if (auto *base = dynamic_cast<TensorBase *>(tensor);
+            base && base->debugName().empty())
+        {
+            base->setDebugName(bufferIdName(id));
+        }
         return true;
     }
 
@@ -522,6 +527,8 @@ namespace llaminar2
 
             b.owned_tensor = tensor;
             b.coherence.authority = CoherenceState::UNINITIALIZED;
+            if (b.owned_tensor->debugName().empty())
+                b.owned_tensor->setDebugName(bufferIdName(bid));
         }
 
         allocated_ = true;

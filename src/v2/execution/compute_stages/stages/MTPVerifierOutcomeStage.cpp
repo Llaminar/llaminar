@@ -122,36 +122,6 @@ namespace llaminar2
             return false;
         }
 
-        auto logits_device = params_.logits->current_device();
-        auto *logits = static_cast<const float *>(
-            params_.logits->gpu_data_ptr());
-        const auto &shape = params_.logits->shape();
-        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
-        const size_t cols =
-            shape.size() >= 2 ? shape[1] : (shape.empty() ? 0 : shape[0]);
-        if (!params_.logits->deviceValid() ||
-            !logits_device.has_value() ||
-            *logits_device != params_.device_id ||
-            !logits ||
-            rows < static_cast<size_t>(params_.verifier_row_count) ||
-            cols != static_cast<size_t>(params_.vocab_size))
-        {
-            LOG_ERROR("[MTPVerifierOutcomeStage] Verifier logits do not match the captured full-vocabulary contract"
-                      << " rows=" << rows
-                      << " cols=" << cols
-                      << " expected_rows=" << params_.verifier_row_count
-                      << " expected_cols=" << params_.vocab_size);
-            return false;
-        }
-
-        IBackend *backend = getBackendFor(params_.device_id);
-        if (!backend)
-        {
-            LOG_ERROR("[MTPVerifierOutcomeStage] No backend for "
-                      << params_.device_id.toString());
-            return false;
-        }
-
         /*
          * Only the root performs the expensive vocabulary reduction.  Every
          * participant still enters the same two collectives below, so CUDA/HIP
@@ -159,6 +129,51 @@ namespace llaminar2
          */
         if (isRootParticipant())
         {
+            /*
+             * Non-root participants never read their duplicate verifier logits:
+             * their only semantic outputs are the persistent token/meta receive
+             * buffers written by the collective below. Keeping tensor coherence
+             * access inside this branch makes receiver-side logits ownership
+             * irrelevant and prevents a host-authoritative duplicate row from
+             * creating a false H2D requirement.
+             */
+            const auto logits_device = params_.logits->current_device();
+            const auto &shape = params_.logits->shape();
+            const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+            const size_t cols =
+                shape.size() >= 2 ? shape[1]
+                                  : (shape.empty() ? 0 : shape[0]);
+            if (!params_.logits->deviceValid() ||
+                !logits_device.has_value() ||
+                *logits_device != params_.device_id ||
+                rows < static_cast<size_t>(params_.verifier_row_count) ||
+                cols != static_cast<size_t>(params_.vocab_size))
+            {
+                LOG_ERROR("[MTPVerifierOutcomeStage] Root verifier logits do not "
+                          "match the captured full-vocabulary contract"
+                          << " rows=" << rows
+                          << " cols=" << cols
+                          << " expected_rows=" << params_.verifier_row_count
+                          << " expected_cols=" << params_.vocab_size);
+                return false;
+            }
+            auto *logits = static_cast<const float *>(
+                params_.logits->gpu_data_ptr());
+            if (!logits)
+            {
+                LOG_ERROR("[MTPVerifierOutcomeStage] Root verifier logits have "
+                          "no prepared device storage");
+                return false;
+            }
+
+            IBackend *backend = getBackendFor(params_.device_id);
+            if (!backend)
+            {
+                LOG_ERROR("[MTPVerifierOutcomeStage] No backend for "
+                          << params_.device_id.toString());
+                return false;
+            }
+
             if (!backend->enqueueArgmaxF32BatchedRowsDevice(
                     logits,
                     params_.verifier_row_count,
@@ -254,11 +269,22 @@ namespace llaminar2
     StageBufferContract MTPVerifierOutcomeStage::bufferContract() const
     {
         StageBufferContract contract;
-        contract.addInput(BufferId::ALL_POSITION_LOGITS);
-        contract.addInput(BufferId::MTP_VERIFIER_INPUT_TOKENS);
-        contract.addInput(BufferId::MTP_VERIFIER_STOP_TOKENS);
-        contract.addOutput(BufferId::STOCHASTIC_VERIFY_TOKENS);
-        contract.addOutput(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS);
+
+        /*
+         * The contract must describe what this participant actually touches,
+         * not the union of the root and receiver algorithms. DeviceGraphExecutor
+         * establishes coherence from this declaration before execute() runs.
+         * Advertising root-only logits on a receiver would therefore demand a
+         * needless H2D transfer before the receiver enters the collective.
+         */
+        if (isRootParticipant())
+        {
+            contract.addInput(BufferId::ALL_POSITION_LOGITS);
+            contract.addInput(BufferId::MTP_VERIFIER_INPUT_TOKENS);
+            contract.addInput(BufferId::MTP_VERIFIER_STOP_TOKENS);
+            contract.addOutput(BufferId::STOCHASTIC_VERIFY_TOKENS);
+            contract.addOutput(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS);
+        }
         contract.addOutput(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS);
         contract.addOutput(BufferId::STOCHASTIC_BATCH_OUTPUT_META);
         return contract;

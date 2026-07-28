@@ -1404,6 +1404,43 @@ TEST(Test__MTPGraphConstruction,
         has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS));
     EXPECT_TRUE(
         has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_META));
+
+    MTPVerifierOutcomeStage non_root_stage({
+        .device_id = DeviceId::cuda(1),
+        .logits = logits.get(),
+        .mode = MTPVerifierOutcomeGraphMode::Greedy,
+        .binding = binding,
+        .verifier_row_count = 4,
+        .vocab_size = 32,
+        .local_tp_ctx = nullptr,
+        .local_tp_device_index = 1,
+        .local_tp_root_device_index = 0,
+        .publish_mirrored_local_tp = true,
+        .stage_name = "mtp_verifier_outcome",
+    });
+    const StageBufferContract non_root_contract =
+        non_root_stage.bufferContract();
+    const auto non_root_has_output = [&](BufferId id)
+    {
+        return std::any_of(
+            non_root_contract.outputs.begin(),
+            non_root_contract.outputs.end(),
+            [id](const BufferBinding &output_binding)
+            {
+                return output_binding.id == id;
+            });
+    };
+
+    EXPECT_TRUE(non_root_contract.inputs.empty())
+        << "A compact-outcome receiver must not request coherence for root-only "
+           "verifier logits or controls.";
+    EXPECT_FALSE(non_root_has_output(BufferId::STOCHASTIC_VERIFY_TOKENS));
+    EXPECT_FALSE(
+        non_root_has_output(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS));
+    EXPECT_TRUE(
+        non_root_has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS));
+    EXPECT_TRUE(
+        non_root_has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_META));
 }
 
 TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)

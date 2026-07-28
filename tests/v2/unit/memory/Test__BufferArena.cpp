@@ -84,6 +84,32 @@ TEST(Test__BufferArena, BindExternalBufferCanReplaceDynamicScratch)
               CoherenceState::UNINITIALIZED);
 }
 
+TEST(Test__BufferArena, ArenaBindingsInstallStableBufferDebugNames)
+{
+    auto external = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{2, 128},
+        DeviceId::cpu());
+    ASSERT_TRUE(external->debugName().empty());
+
+    BufferArena arena;
+    ASSERT_TRUE(arena.bindExternalBuffer(
+        BufferId::ALL_POSITION_LOGITS,
+        external.get()));
+    ASSERT_TRUE(arena.registerBuffer(
+        BufferId::MTP_VERIFIER_INPUT_TOKENS,
+        1,
+        16,
+        "INT32",
+        DeviceId::cpu()));
+    ASSERT_TRUE(arena.allocate());
+
+    EXPECT_EQ(external->debugName(), "ALL_POSITION_LOGITS");
+    auto *owned = dynamic_cast<TensorBase *>(
+        arena.getTensor(BufferId::MTP_VERIFIER_INPUT_TOKENS));
+    ASSERT_NE(owned, nullptr);
+    EXPECT_EQ(owned->debugName(), "MTP_VERIFIER_INPUT_TOKENS");
+}
+
 TEST(Test__BufferArena, BindExternalBufferRejectsArenaOwnedSlot)
 {
     BufferArena arena;

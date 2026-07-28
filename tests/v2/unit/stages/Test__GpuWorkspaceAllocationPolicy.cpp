@@ -4656,6 +4656,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
     const auto graph_outcome_stage = readFile(
         repoRoot() /
         "src/v2/execution/compute_stages/stages/MTPVerifierOutcomeStage.cpp");
+    const auto verifier_metadata_body = sliceBetween(
+        dgo_source,
+        "bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(",
+        "bool DeviceGraphOrchestrator::prepareLiveStateForForwardGraphExecution(");
     const auto greedy_runner_body = sliceBetween(
         runner_source,
         "const bool use_greedy_device_batch_outcome =",
@@ -4702,6 +4706,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
         stripCommentsAndStringLiterals(greedy_consumer_body));
     const auto compact_graph_outcome_stage = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(graph_outcome_stage));
+    const auto compact_verifier_metadata = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(verifier_metadata_body));
     EXPECT_NE(
         compact_greedy_consumer.find(
             "GreedyVerifierOutcomeGraphState::Produced"),
@@ -4744,6 +4750,52 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
         compact_graph_outcome_stage.find(
             "collectiveSidebandSpanOnStream("),
         std::string::npos);
+    const size_t root_outcome_branch =
+        compact_graph_outcome_stage.find("if(isRootParticipant()){");
+    const size_t root_logits_read =
+        compact_graph_outcome_stage.find(
+            "params_.logits->gpu_data_ptr()",
+            root_outcome_branch);
+    const size_t mirrored_outcome_collective =
+        compact_graph_outcome_stage.find(
+            "if(params_.publish_mirrored_local_tp)",
+            root_logits_read);
+    ASSERT_NE(root_outcome_branch, std::string::npos);
+    ASSERT_NE(root_logits_read, std::string::npos);
+    ASSERT_NE(mirrored_outcome_collective, std::string::npos);
+    EXPECT_LT(root_outcome_branch, root_logits_read);
+    EXPECT_LT(root_logits_read, mirrored_outcome_collective)
+        << "Only the collective root may inspect verifier logits. Non-root "
+           "participants receive compact token/meta buffers without touching a "
+           "duplicate logits tensor or triggering coherence transfer.";
+
+    const size_t stop_control_write =
+        compact_verifier_metadata.find(
+            "backend->hostToDeviceOnStream("
+            "mtp_verifier_stop_tokens_dev_");
+    const size_t stop_control_publication =
+        compact_verifier_metadata.find(
+            "publishPreparedArenaGraphInput("
+            "BufferId::MTP_VERIFIER_STOP_TOKENS",
+            stop_control_write);
+    const size_t verifier_token_materialization =
+        compact_verifier_metadata.find(
+            "materializePendingMTPVerifierInputTokensOnDevice(");
+    const size_t verifier_token_publication =
+        compact_verifier_metadata.find(
+            "publishPreparedArenaGraphInput("
+            "BufferId::MTP_VERIFIER_INPUT_TOKENS",
+            verifier_token_materialization);
+    ASSERT_NE(stop_control_write, std::string::npos);
+    ASSERT_NE(stop_control_publication, std::string::npos);
+    ASSERT_NE(verifier_token_materialization, std::string::npos);
+    ASSERT_NE(verifier_token_publication, std::string::npos);
+    EXPECT_LT(stop_control_write, stop_control_publication);
+    EXPECT_LT(
+        verifier_token_materialization,
+        verifier_token_publication)
+        << "Every raw pre-graph verifier control write must publish its exact "
+           "arena binding and producer stream before the captured stage reads it.";
 
     const auto compact_greedy_runner =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(greedy_runner_body));

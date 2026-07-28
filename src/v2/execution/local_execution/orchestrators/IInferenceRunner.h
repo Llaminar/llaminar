@@ -1728,6 +1728,29 @@ namespace llaminar2
         }
 
         /**
+         * @brief Consume a replicated main-logits publication without sampling it.
+         *
+         * A replicated LocalTP decode graph produces the same full-vocabulary
+         * logits row on every participant. Rank-level sampling economically runs
+         * the argmax or stochastic sampler only on the primary participant.
+         * Every non-primary participant must still close its one-shot producer
+         * handoff before the next graph replay; otherwise a later producer could
+         * silently replace the stream that owned the previous row.
+         *
+         * This operation does not synchronize, copy, or launch a replacement
+         * sampler. The durable forward-output event remains the ordering owner for
+         * later graph/state mutation. Implementations return false unless they
+         * explicitly support this replicated-output lifecycle.
+         *
+         * @return true when no deferred stream exists or the pending replicated
+         *         publication was consumed successfully.
+         */
+        virtual bool consumeUnusedReplicatedMainLogitsPublication()
+        {
+            return false;
+        }
+
+        /**
          * @brief Commit shifted MTP KV rows from the most recent main forward.
          *
          * MTP decode calls forwardMTP() before verifier/replay; that sidecar

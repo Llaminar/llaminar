@@ -34,13 +34,13 @@ Dynamic PhaseSplit and focused graph/ROCm all-format proofs are green.
 captured policy, closing M3/M4 one-ULP drift. All-format, real GDN-weight, and
 Dense/MoE M1-M4 operation-equivalence gates pass.
 
-2026-07-28: resident-MTP timeline, transaction, compact-response, and PerfStats
-timing events are setup-owned; source policy forbids event create/destroy in 11
-hot paths. CUDA/ROCm sampling and Qwen3.6 stochastic full-graph smokes pass;
-unit gate `582/582`. Tests now distinguish compact grouped device publication
-from legacy catch-up replay. Architecture estimate: LocalTP 92%,
-ExpertParallel 88%; graph-native LocalTP outcome broadcast and the full
-E2E/economy matrix remain.
+2026-07-28: resident MTP timeline/transaction/response/PerfStats events are
+setup-owned; policy forbids event create/destroy in 11 hot paths. CUDA/ROCm
+sampling and Qwen3.6 stochastic full-graph smokes pass; unit gate `582/582`.
+Greedy verifier reduction and NCCL/RCCL compact broadcast are graph-owned;
+strict counters prove both.
+CUDA2/ROCm2 Dynamic and LLEP+RAM-prefix cells pass. Architecture estimate:
+LocalTP 96%, ExpertParallel 93%; stochastic/economy matrix refresh remains.
 
 ## Device And Topology Matrix
 
@@ -55,7 +55,7 @@ E2E/economy matrix remain.
 | LocalPP | CUDA stages | A | R | R | R | Correctness/bench refresh pending |
 | LocalPP | ROCm stages | R | R | R | R | Prior dense run speed-negative |
 | NodeLocalTP | CPU sockets | A | A | R | R | Dense E2E green; perf pending |
-| ExpertOverlay | GPU hot + CPU cold | A | R | A | R | CUDA2 Dynamic prefix+MTP green; broader refresh pending |
+| ExpertOverlay | GPU hot + CPU cold | A | R | G | R | Dynamic/LLEP greedy+prefix green; stochastic/perf pending |
 
 ## SingleDevice Speeds
 
@@ -93,10 +93,10 @@ MoE depth sweep:
   reduction for shared verifier or independent request banks. Attention params
   are device-written on CUDA/ROCm; source policy forbids host mirrors/H2D.
   CUDA/ROCm attention and request-batch gates are green.
-- Long-context CUDA2/ROCm2 Dynamic/LLEP is green. The split-prefill stale-input
-  race is closed by preallocated admission/reuse events: the next H2D waits for
-  the main+shifted-MTP reader chain. No sync/D2H/allocation; PerfStats proves
-  both edges. CUDA LLEP passed `20/20`; ROCm canonical plus `3/3` repeats passed.
+- Long-context CUDA2/ROCm2 Dynamic/LLEP is green. Preallocated admission events
+  close split-prefill reuse; replicated logits publications are explicitly
+  retired. Verifier control writes publish exact-stream arena ownership, and
+  captured compact broadcasts cover root/receiver without sync or D2H.
 - Token equality alone is not an accepted verifier parity proof.
 
 ## Next Phase 10 Moves

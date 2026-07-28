@@ -715,6 +715,12 @@ public:
                           std::max_element(logits_.begin(), logits_.end())));
     }
 
+    bool consumeUnusedReplicatedMainLogitsPublication() override
+    {
+        ++consume_unused_replicated_main_logits_publication_calls_;
+        return consume_unused_replicated_main_logits_publication_ok_;
+    }
+
     bool sampleGreedyFromMainLogitsToDeviceTargetSlot(
         int target_sample_slot,
         int32_t *out_token) override
@@ -2120,6 +2126,10 @@ public:
     void set_supports_mtp_shifted_row_reuse_from_sidecar(bool supported) { supports_mtp_shifted_row_reuse_from_sidecar_ = supported; }
     void set_supports_device_stochastic_mtp_verification(bool supported) { supports_device_stochastic_mtp_verification_ = supported; }
     void set_stochastic_sample_token(int token) { stochastic_sample_token_ = token; }
+    void set_consume_unused_replicated_main_logits_publication_ok(bool ok)
+    {
+        consume_unused_replicated_main_logits_publication_ok_ = ok;
+    }
     void set_prefix_live_capture_ok(bool ok) { prefix_live_capture_ok_ = ok; }
     void set_prefix_live_restore_ok(bool ok) { prefix_live_restore_ok_ = ok; }
     void set_prefix_live_truncate_ok(bool ok) { prefix_live_truncate_ok_ = ok; }
@@ -2163,6 +2173,10 @@ public:
         return sample_greedy_main_target_slot_calls_;
     }
     size_t sample_on_device_call_count() const { return sample_on_device_calls_; }
+    size_t consume_unused_replicated_main_logits_publication_call_count() const
+    {
+        return consume_unused_replicated_main_logits_publication_calls_;
+    }
     size_t get_logits_local_info_call_count() const { return get_logits_local_info_calls_.load(std::memory_order_relaxed); }
     size_t consume_logits_local_info_call_count() const { return consume_logits_local_info_calls_.load(std::memory_order_relaxed); }
     size_t get_mtp_logits_local_info_call_count() const { return get_mtp_logits_local_info_calls_.load(std::memory_order_relaxed); }
@@ -2567,6 +2581,7 @@ private:
     bool skip_logits_gather_prefill_ = false;
     bool all_position_sync_deferral_enabled_ = false;
     bool main_decode_sync_deferral_enabled_ = false;
+    bool consume_unused_replicated_main_logits_publication_ok_ = true;
     bool resident_logical_state_valid_ = false;
     int resident_logical_state_request_count_ = 0;
     mutable int resident_stream_token_ = 0;
@@ -2603,6 +2618,7 @@ private:
     size_t sample_greedy_on_device_calls_ = 0;
     size_t sample_greedy_main_target_slot_calls_ = 0;
     size_t sample_on_device_calls_ = 0;
+    size_t consume_unused_replicated_main_logits_publication_calls_ = 0;
     size_t commit_mtp_shifted_rows_calls_ = 0;
     size_t commit_mtp_checkpoint_terminal_hidden_calls_ = 0;
     size_t commit_mtp_initial_device_outcome_calls_ = 0;
@@ -7256,10 +7272,12 @@ TEST_F(Test__RankOrchestrator, MultiChildMainSamplingDelegatesToPrimaryReplicate
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_primary_device_id(DeviceId::cuda(0));
     runner0->set_mock_logits({0.0f, 1.0f, 9.0f, 2.0f});
 
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_primary_device_id(DeviceId::cuda(1));
     runner1->set_mock_logits({0.0f, 8.0f, 1.0f, 3.0f});
 
     std::vector<std::unique_ptr<IInferenceRunner>> runners;
@@ -7276,6 +7294,56 @@ TEST_F(Test__RankOrchestrator, MultiChildMainSamplingDelegatesToPrimaryReplicate
         << "Phase-split decode uses replicated full logits, not LOGITS_LOCAL shards.";
     EXPECT_EQ(runner0_ptr->sample_greedy_on_device_call_count(), 1u);
     EXPECT_EQ(runner1_ptr->sample_greedy_on_device_call_count(), 0u);
+    EXPECT_EQ(
+        runner0_ptr
+            ->consume_unused_replicated_main_logits_publication_call_count(),
+        0u);
+    EXPECT_EQ(
+        runner1_ptr
+            ->consume_unused_replicated_main_logits_publication_call_count(),
+        1u)
+        << "The non-primary replicated graph output must close its one-shot "
+           "stream publication without launching a duplicate argmax.";
+}
+
+/**
+ * @brief Replicated sampling fails closed when a non-primary publication leaks.
+ *
+ * This is the model-free regression for the CUDA2 Dynamic phase-split failure:
+ * a second decode graph replay must never replace participant one's still-live
+ * main-logits stream handoff. Rank sampling therefore treats inability to close
+ * that unused replica as a fatal sampling failure.
+ */
+TEST_F(Test__RankOrchestrator,
+       ReplicatedMainSamplingFailsWhenNonPrimaryPublicationCannotBeConsumed)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_primary_device_id(DeviceId::cuda(0));
+    runner0_ptr->set_mock_logits({0.0f, 1.0f, 9.0f, 2.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_primary_device_id(DeviceId::cuda(1));
+    runner1_ptr->set_mock_logits({0.0f, 8.0f, 1.0f, 3.0f});
+    runner1_ptr->set_consume_unused_replicated_main_logits_publication_ok(false);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_EQ(orchestrator->sampleGreedyOnDevice(), -1);
+    EXPECT_EQ(runner0_ptr->sample_greedy_on_device_call_count(), 1u);
+    EXPECT_EQ(
+        runner1_ptr
+            ->consume_unused_replicated_main_logits_publication_call_count(),
+        1u);
 }
 
 /**
@@ -7328,6 +7396,10 @@ TEST_F(Test__RankOrchestrator,
     EXPECT_EQ(runner0_ptr->sample_greedy_main_target_slot_call_count(), 1u);
     EXPECT_EQ(runner1_ptr->sample_greedy_main_target_slot_call_count(), 0u)
         << "Only the primary mirrored head performs the argmax.";
+    EXPECT_EQ(
+        runner1_ptr
+            ->consume_unused_replicated_main_logits_publication_call_count(),
+        1u);
     EXPECT_EQ(runner0_ptr->consume_logits_local_info_call_count(), 0u);
     EXPECT_EQ(runner1_ptr->consume_logits_local_info_call_count(), 0u);
     EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 2u);
@@ -7390,10 +7462,12 @@ TEST_F(Test__RankOrchestrator, MultiChildMainStochasticSamplingDelegatesToPrimar
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_primary_device_id(DeviceId::cuda(0));
     runner0->set_stochastic_sample_token(23);
 
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_primary_device_id(DeviceId::cuda(1));
     runner1->set_stochastic_sample_token(42);
 
     std::vector<std::unique_ptr<IInferenceRunner>> runners;
@@ -7414,6 +7488,10 @@ TEST_F(Test__RankOrchestrator, MultiChildMainStochasticSamplingDelegatesToPrimar
     EXPECT_EQ(orchestrator->sampleOnDevice(params), 23);
     EXPECT_EQ(runner0_ptr->sample_on_device_call_count(), 1u);
     EXPECT_EQ(runner1_ptr->sample_on_device_call_count(), 0u);
+    EXPECT_EQ(
+        runner1_ptr
+            ->consume_unused_replicated_main_logits_publication_call_count(),
+        1u);
 }
 
 TEST_F(Test__RankOrchestrator, MultiChildMTPLogitsRequireMatchingReplicas)

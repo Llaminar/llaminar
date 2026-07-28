@@ -3005,6 +3005,69 @@ namespace llaminar2
         stats_dirty_ = true;
     }
 
+    bool RankOrchestrator::consumeUnusedReplicatedMainLogitsPublications(
+        const char *boundary)
+    {
+        if (device_runners_.size() < 2)
+            return true;
+
+        size_t consumed_participants = 0;
+        for (size_t participant = 1;
+             participant < device_runners_.size();
+             ++participant)
+        {
+            IInferenceRunner *runner = device_runners_[participant].get();
+            if (!runner)
+            {
+                LOG_ERROR("[RankOrchestrator] Replicated main-logits publication "
+                          "has no participant " << participant
+                          << " at boundary="
+                          << (boundary ? boundary : "unknown"));
+                return false;
+            }
+
+            /*
+             * CPU execution is synchronous and owns no graph-stream token.
+             * A GPU participant must explicitly implement the retirement API;
+             * the interface default fails so an unrecognized nested runner
+             * cannot silently leak or discard an ordering edge.
+             */
+            if (!runner->primaryDeviceId().is_gpu())
+                continue;
+            if (runner->hasLogitsLocal())
+            {
+                LOG_ERROR("[RankOrchestrator] Cannot retire a sharded main-logits "
+                          "publication as an unused replica participant="
+                          << participant << " boundary="
+                          << (boundary ? boundary : "unknown"));
+                return false;
+            }
+            if (!runner->consumeUnusedReplicatedMainLogitsPublication())
+            {
+                LOG_ERROR("[RankOrchestrator] Failed to retire unused replicated "
+                          "main-logits publication participant="
+                          << participant << " boundary="
+                          << (boundary ? boundary : "unknown"));
+                return false;
+            }
+            ++consumed_participants;
+        }
+
+        if (consumed_participants > 0)
+        {
+            PerfStatsCollector::addCounter(
+                "sampling",
+                "rank_unused_replicated_main_logits_publications_consumed",
+                static_cast<double>(consumed_participants),
+                "decode",
+                "rank",
+                {{"boundary", boundary ? boundary : "unknown"},
+                 {"participants", std::to_string(device_runners_.size())},
+                 {"sampler_participant", "0"}});
+        }
+        return true;
+    }
+
     int RankOrchestrator::sampleGreedyOnDevice()
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
@@ -3061,7 +3124,16 @@ namespace llaminar2
             return DeviceSampler::sampleGreedy(device_runners_);
         }
         if (!any_local_logits && !device_runners_.empty() && device_runners_[0])
-            return device_runners_[0]->sampleGreedyOnDevice();
+        {
+            const int token = device_runners_[0]->sampleGreedyOnDevice();
+            if (token < 0 ||
+                !consumeUnusedReplicatedMainLogitsPublications(
+                    "sampleGreedyOnDevice"))
+            {
+                return -1;
+            }
+            return token;
+        }
         return -1;
     }
 
@@ -3109,9 +3181,17 @@ namespace llaminar2
         }
         if (!any_local_logits && !device_runners_.empty() && device_runners_[0])
         {
-            return device_runners_[0]->sampleOnDeviceAtLogicalPosition(
-                params,
-                logical_position);
+            const int token =
+                device_runners_[0]->sampleOnDeviceAtLogicalPosition(
+                    params,
+                    logical_position);
+            if (token < 0 ||
+                !consumeUnusedReplicatedMainLogitsPublications(
+                    "sampleOnDeviceAtLogicalPosition"))
+            {
+                return -1;
+            }
+            return token;
         }
         return -1;
     }
@@ -6517,6 +6597,36 @@ namespace llaminar2
                 out_token);
         }
 
+        /*
+         * The main LM head and the MTP verifier head have independent
+         * distribution policies.  In particular, LocalTP may shard the main
+         * LM head while mirroring the much smaller MTP head.  Never infer the
+         * former from usesMirroredLocalTPMTPHeadForVerifier(): doing so would
+         * sample only participant zero's main-logits shard and then incorrectly
+         * retire participant one as though it owned a redundant full-vocabulary
+         * row.
+         */
+        bool any_local_main_logits = false;
+        bool all_local_main_logits = true;
+        for (const auto &runner : device_runners_)
+        {
+            const bool has_local = runner && runner->hasLogitsLocal();
+            any_local_main_logits = any_local_main_logits || has_local;
+            all_local_main_logits = all_local_main_logits && has_local;
+        }
+        if (any_local_main_logits != all_local_main_logits)
+        {
+            LOG_ERROR("[RankOrchestrator] LocalTP main-target argmax has mixed "
+                      "sharded and replicated main-logits declarations");
+            return false;
+        }
+        if (all_local_main_logits)
+        {
+            return sampleRankGreedyMainLogitsToLocalTPTargetSlot(
+                target_sample_slot,
+                out_token);
+        }
+
         if (usesMirroredLocalTPMTPHeadForVerifier())
         {
             if (target_sample_slot < 0 ||
@@ -6552,6 +6662,11 @@ namespace llaminar2
                          out_token ? &primary_shadow : nullptr))
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP main-target argmax failed on primary participant");
+                return false;
+            }
+            if (!consumeUnusedReplicatedMainLogitsPublications(
+                    "sampleGreedyFromMainLogitsToDeviceTargetSlot"))
+            {
                 return false;
             }
             if (!broadcastPrimaryMirroredLocalTPSampleSlotToChildren(

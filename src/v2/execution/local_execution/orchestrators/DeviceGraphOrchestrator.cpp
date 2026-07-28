@@ -16004,6 +16004,43 @@ namespace llaminar2
         }
     }
 
+    bool DeviceGraphOrchestrator::consumeUnusedReplicatedMainLogitsPublication()
+    {
+        if (!state_.device_id.is_gpu() ||
+            activeMainLogitsAreColumnParallel() ||
+            !state_.logits ||
+            !state_.logits->deviceValid() ||
+            !state_.logits->gpu_data_ptr())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Only a GPU runner with replicated "
+                      "full main logits may retire an unused main-decode publication");
+            return false;
+        }
+
+        /*
+         * A synchronized cache miss has no stream token to retire. A deferred
+         * graph replay does, and consuming that token is the complete semantic
+         * boundary because no kernel will read this participant's duplicate row.
+         * The durable ForwardGraphOutputReady event still orders the next graph
+         * or state mutation; there is deliberately no host wait or no-op kernel.
+         */
+        void *producer_stream = consumePendingLogitsStream(
+            PendingLogitsStreamRole::MainDecode,
+            "consumeUnusedReplicatedMainLogitsPublication");
+        if (producer_stream)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "unused_replicated_main_logits_publication_consumptions",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"ordering_owner", "forward_graph_output_ready"},
+                 {"consumer", "non_primary_rank_participant"}});
+        }
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::shouldDeferAllPositionVerifierFinalSync() const
     {
         return defer_all_position_verifier_sync_ &&
@@ -19649,6 +19686,58 @@ namespace llaminar2
             graph_builder_->setRowIndexedAllPositionLogitRows({});
     }
 
+    bool DeviceGraphOrchestrator::publishPreparedArenaGraphInput(
+        BufferId id,
+        const void *expected_device_ptr,
+        void *producer_stream,
+        DeviceId device,
+        const char *producer)
+    {
+        if (!arena_ ||
+            !arena_->isRegistered(id) ||
+            !device.is_gpu() ||
+            !producer_stream ||
+            !expected_device_ptr)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot publish prepared arena graph input"
+                      << " buffer=" << bufferIdName(id)
+                      << " producer=" << (producer ? producer : "unknown")
+                      << " device=" << device.toString()
+                      << " stream=" << producer_stream
+                      << " expected_ptr=" << expected_device_ptr);
+            return false;
+        }
+
+        const void *const arena_device_ptr =
+            arena_->getDevicePtr(id, device);
+        if (!arena_device_ptr ||
+            arena_device_ptr != expected_device_ptr)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Raw graph-input producer no longer targets its arena binding"
+                      << " buffer=" << bufferIdName(id)
+                      << " producer=" << (producer ? producer : "unknown")
+                      << " device=" << device.toString()
+                      << " expected_ptr=" << expected_device_ptr
+                      << " arena_ptr=" << arena_device_ptr);
+            return false;
+        }
+
+        try
+        {
+            arena_->markWritten(id, device, producer_stream);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to publish prepared arena graph input"
+                      << " buffer=" << bufferIdName(id)
+                      << " producer=" << (producer ? producer : "unknown")
+                      << " device=" << device.toString()
+                      << " error=" << e.what());
+            return false;
+        }
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::materializePendingMTPVerifierInputTokensOnDevice(
         void *execution_stream,
         DeviceId execution_device)
@@ -22338,6 +22427,15 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload graph-owned greedy verifier stop controls");
                 return false;
             }
+            if (!publishPreparedArenaGraphInput(
+                    BufferId::MTP_VERIFIER_STOP_TOKENS,
+                    mtp_verifier_stop_tokens_dev_,
+                    execution_stream,
+                    metadata_device,
+                    "greedy_verifier_stop_controls"))
+            {
+                return false;
+            }
             PerfStatsCollector::addCounter(
                 "mtp",
                 "graph_owned_greedy_control_uploads",
@@ -22481,6 +22579,15 @@ namespace llaminar2
         if (!materializePendingMTPVerifierInputTokensOnDevice(
                 execution_stream,
                 metadata_device))
+        {
+            return false;
+        }
+        if (!publishPreparedArenaGraphInput(
+                BufferId::MTP_VERIFIER_INPUT_TOKENS,
+                mtp_verifier_input_tokens_dev_,
+                execution_stream,
+                metadata_device,
+                "mtp_verifier_input_tokens"))
         {
             return false;
         }

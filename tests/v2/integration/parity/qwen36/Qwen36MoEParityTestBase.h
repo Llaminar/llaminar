@@ -1670,6 +1670,30 @@ namespace llaminar2::test::parity::qwen36
                    MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly;
     }
 
+    /**
+     * @brief Return true when the verifier outcome must be reduced and published
+     *        by one fully captured homogeneous GPU collective graph.
+     *
+     * ExpertOverlay Dynamic and LLEP alter sparse-expert ownership, but their
+     * dense continuation domain is still the homogeneous two-GPU LocalTP domain
+     * represented by these hot-only topologies. Every participant owns the
+     * mirrored full MTP head, the root reduces the verifier rows into compact
+     * token/meta buffers, and NCCL/RCCL broadcasts those buffers inside the same
+     * graph replay. Treating this as a topology invariant keeps token parity from
+     * concealing a post-graph publication path.
+     *
+     * @param test_case MoE integration fixture whose runtime topology is tested.
+     * @return True only for homogeneous CUDA2 or ROCm2 ExpertOverlay execution.
+     */
+    inline bool moECaseExpectsGraphCapturedMirroredOutcomePublication(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        return test_case.topology ==
+                   MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly ||
+               test_case.topology ==
+                   MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly;
+    }
+
     inline bool moEPrefixCaseUsesGPU(const MoEPrefixRestoreParityCase &test_case)
     {
         return std::any_of(
@@ -2081,6 +2105,18 @@ namespace llaminar2::test::parity::qwen36
             hasMTPPerfCounter(
                 records,
                 "verifier_device_position_expansions");
+        const bool used_graph_owned_outcome_stage =
+            hasMTPPerfCounter(
+                records,
+                "graph_owned_greedy_outcome_stage_enqueues");
+        const bool armed_graph_owned_outcome =
+            hasMTPPerfCounter(
+                records,
+                "graph_owned_greedy_outcome_transactions_armed");
+        const bool consumed_graph_owned_outcome =
+            hasMTPPerfCounter(
+                records,
+                "graph_owned_greedy_outcome_consumptions");
 
         if (moECaseExpectsGroupedOutcomeDevicePublication(test_case))
         {
@@ -2103,6 +2139,60 @@ namespace llaminar2::test::parity::qwen36
                 << context << " must not promote direct all-position MoE "
                    "publication outside the proven lane.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
+
+            EXPECT_TRUE(used_graph_owned_outcome_stage)
+                << context << " must execute the greedy outcome reducer inside "
+                   "the captured verifier graph.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_TRUE(armed_graph_owned_outcome)
+                << context << " must arm graph-owned outcome controls before "
+                   "verifier replay.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_TRUE(consumed_graph_owned_outcome)
+                << context << " must consume the outcome produced by that exact "
+                   "captured transaction.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+
+            if (moECaseExpectsGraphCapturedMirroredOutcomePublication(test_case))
+            {
+                EXPECT_TRUE(hasMTPPerfCounter(
+                    records,
+                    "rank_graph_owned_greedy_outcome_transactions_armed"))
+                    << context << " must arm every mirrored continuation-domain "
+                       "participant as one rank transaction.\n"
+                    << PerfStatsCollector::summaryString({"mtp"});
+                EXPECT_TRUE(hasMTPPerfRecordTag(
+                    records,
+                    "graph_owned_greedy_outcome_stage_enqueues",
+                    "mirrored_local_tp",
+                    "true"))
+                    << context << " must enter the captured NCCL/RCCL outcome "
+                       "broadcast on every mirrored participant.\n"
+                    << PerfStatsCollector::summaryString({"mtp"});
+                EXPECT_TRUE(hasMTPPerfRecordTag(
+                    records,
+                    "graph_owned_greedy_outcome_stage_enqueues",
+                    "root",
+                    "true"))
+                    << context << " must execute one captured root reducer.\n"
+                    << PerfStatsCollector::summaryString({"mtp"});
+                EXPECT_TRUE(hasMTPPerfRecordTag(
+                    records,
+                    "graph_owned_greedy_outcome_stage_enqueues",
+                    "root",
+                    "false"))
+                    << context << " must execute captured non-root collective "
+                       "participation instead of a host-side handoff.\n"
+                    << PerfStatsCollector::summaryString({"mtp"});
+                EXPECT_TRUE(hasMTPPerfRecordTag(
+                    records,
+                    "rank_mirrored_localtp_greedy_resident_outcomes",
+                    "implementation",
+                    "graph_captured_primary_outcome_broadcast"))
+                    << context << " must expose the captured primary compact "
+                       "outcome directly; a second rank-side broadcast is forbidden.\n"
+                    << PerfStatsCollector::summaryString({"mtp"});
+            }
             return;
         }
 
