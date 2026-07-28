@@ -186,6 +186,24 @@ namespace llaminar2
             DeviceId device,
             const int32_t *sequence_lengths_device) const;
 
+        /**
+         * @brief Retain one GDN intermediate row in the mirrored checkpoint bank.
+         *
+         * This hook is called by Qwen35Graph only when constructing the GDN
+         * subgraph. It uses the same graph-regime identity and resident row
+         * ownership contract as the outer MoE layer checkpoints.
+         */
+        std::string maybeAddGDNDiagnosticCheckpoint(
+            ComputeGraph &graph,
+            const std::string &boundary,
+            const ITensor *source,
+            const std::string &dependency,
+            int layer_idx,
+            int total_tokens,
+            int feature_dim,
+            DeviceId device,
+            const int32_t *sequence_lengths_device) override;
+
     private:
         struct ScopedMTPGraphContext
         {

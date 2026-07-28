@@ -43,28 +43,6 @@ namespace llaminar2
                                       << " bytes=" << bytes);
         }
 
-        bool synchronizeBeforeWorkspaceRelease(DeviceId device)
-        {
-            if (!device.is_gpu())
-                return true;
-
-            IBackend *backend = getBackendFor(device);
-            if (!backend)
-            {
-                LOG_ERROR("[WorkspaceAllocator] Cannot synchronize " << device.toString()
-                                                                      << " before workspace release: backend unavailable");
-                return false;
-            }
-
-            const int device_idx = device.gpu_ordinal();
-            if (!backend->synchronize(device_idx))
-            {
-                LOG_ERROR("[WorkspaceAllocator] Failed to synchronize " << device.toString()
-                                                                        << " before workspace release");
-                return false;
-            }
-            return true;
-        }
     }
 
     // =========================================================================
@@ -409,103 +387,54 @@ namespace llaminar2
                     continue;
                 }
 
-                // Reconstruct existing requirements from current workspace
-                WorkspaceRequirements existing_reqs;
-                for (const auto &name : existing->second->bufferNames())
-                {
-                    size_t sz = existing->second->getBufferSize(name);
-                    existing_reqs.buffers.push_back({name, sz, 256, true});
-                }
-
-                // Release old workspace so we can reallocate with merged requirements
-                size_t old_budget = existing->second->budget();
-
-                // Unbind consumers BEFORE destroying old workspace to prevent
-                // ABA pointer aliasing: if the new DeviceWorkspaceManager host
-                // object is allocated at the same heap address as the old one,
-                // kernels' `if (workspace_ != workspace)` guard would falsely
-                // evaluate to false and skip re-initialization of GPU buffers
-                // (e.g., RoPE inv_freq). Nulling first ensures the subsequent
-                // bindWorkspace(new_ptr) always triggers state invalidation.
-                for (const auto &consumer_binding : consumers)
-                {
-                    consumer_binding.consumer->bindWorkspace(nullptr);
-                }
-
-                if (!synchronizeBeforeWorkspaceRelease(device))
-                {
-                    return false;
-                }
-
-                existing->second->release();
-                existing->second.reset();
-                device_workspaces_.erase(device);
-                device_workspace_budgets_.erase(device);
-
-                // Merge existing + new requirements
-                WorkspaceRequirements combined = existing_reqs;
+                WorkspaceRequirements combined;
                 for (const auto &consumer_binding : consumers)
                 {
                     combined.merge(requirementsForGraphBinding(consumer_binding));
                 }
-
-                size_t budget = device.is_gpu()
-                                    ? std::max(old_budget, model_floor_budget)
-                                    : old_budget;
                 const size_t needed = combined.total_bytes_with_alignment();
-                if (needed > budget)
-                {
-                    const size_t available = queryAvailableMemory(device);
-                    const size_t max_expandable = (available > config.headroom)
-                                                      ? available - config.headroom
-                                                      : 0;
-                    if (needed <= max_expandable)
-                    {
-                        budget = needed;
-                    }
-                }
-
-                LOG_TRACE("[WorkspaceAllocator] Reallocating workspace on "
-                          << device.toString() << " with "
-                          << combined.buffers.size() << " buffers ("
-                          << (needed / (1024 * 1024)) << "MB needed, budget="
-                          << (budget / (1024 * 1024)) << "MB)");
+                LOG_TRACE("[WorkspaceAllocator] Extending workspace append-only on "
+                          << device.toString() << " for "
+                          << combined.buffers.size() << " current requirements ("
+                          << (needed / (1024 * 1024)) << "MB logical, remaining="
+                          << (existing->second->remaining() / (1024 * 1024))
+                          << "MB)");
                 logVramBomLine(
                     "workspace_plan",
-                    "phase=reallocate device=" + device.toString() +
+                    "phase=append_only_extend device=" + device.toString() +
                         " consumers=" + std::to_string(consumers.size()) +
                         " buffers=" + std::to_string(combined.buffers.size()) +
                         " needed_bytes=" + std::to_string(needed) +
                         " needed_mib=" + vramBomMiB(needed) +
-                        " budget_bytes=" + std::to_string(budget) +
-                        " budget_mib=" + vramBomMiB(budget) +
+                        " budget_bytes=" + std::to_string(existing->second->budget()) +
+                        " budget_mib=" + vramBomMiB(existing->second->budget()) +
                         " model_floor_bytes=" + std::to_string(model_floor_budget) +
                         " model_floor_mib=" + vramBomMiB(model_floor_budget));
-                logWorkspaceVramTrace(device, "workspace.before_reallocate", needed);
-
-                auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
-                if (!manager->allocate(combined))
+                logWorkspaceVramTrace(device, "workspace.before_append_only_extend", needed);
+                if (!existing->second->extend(combined))
                 {
-                    LOG_ERROR("[WorkspaceAllocator] Failed to reallocate workspace on "
-                              << device.toString()
-                              << " (needed=" << needed
-                              << ", budget=" << budget << ")");
+                    LOG_ERROR("[WorkspaceAllocator] Failed to extend workspace append-only on "
+                              << device.toString() << " (logical_needed="
+                              << needed << ", budget="
+                              << existing->second->budget() << ", used="
+                              << existing->second->used() << ")");
                     return false;
                 }
 
                 for (const auto &consumer_binding : consumers)
                 {
-                    consumer_binding.consumer->bindWorkspace(manager.get());
+                    consumer_binding.consumer->bindWorkspace(existing->second.get());
                 }
 
-                LOG_TRACE("[WorkspaceAllocator] Reallocated " << (manager->used() / (1024 * 1024))
-                                                              << "MB workspace on " << device.toString()
-                                                              << " (" << manager->bufferCount() << " buffers)");
-                logWorkspaceVramTrace(device, "workspace.after_reallocate", manager->used());
-
-                device_workspace_budgets_[device] = budget;
-                bumpDeviceGeneration(device);
-                device_workspaces_[device] = std::move(manager);
+                LOG_TRACE("[WorkspaceAllocator] Append-only workspace now owns "
+                          << (existing->second->used() / (1024 * 1024))
+                          << "MB on " << device.toString()
+                          << " (" << existing->second->bufferCount()
+                          << " current names)");
+                logWorkspaceVramTrace(
+                    device,
+                    "workspace.after_append_only_extend",
+                    existing->second->used());
                 continue;
             }
 

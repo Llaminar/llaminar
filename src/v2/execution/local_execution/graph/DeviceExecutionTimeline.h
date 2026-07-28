@@ -41,6 +41,7 @@ namespace llaminar2
      */
     enum class DeviceTimelinePoint : uint8_t
     {
+        RequestStateResetReady,
         RequestInputAdmission,
         RequestInputReuseReady,
         StochasticDraftSampleReady,
@@ -57,6 +58,7 @@ namespace llaminar2
         MoERebalanceMaintenanceReady,
         ForwardGraphOutputReady,
         CompactSpeculativeResponseReady,
+        RankCompactSpeculativeResponseReady,
         Count,
     };
 
@@ -69,6 +71,7 @@ namespace llaminar2
      */
     enum class DeviceTimelineRole : uint8_t
     {
+        RequestStateReset,
         RequestAdmissionTransfer,
         MainForwardGraph,
         MTPSidecarGraph,

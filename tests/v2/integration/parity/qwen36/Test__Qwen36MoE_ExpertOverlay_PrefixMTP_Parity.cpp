@@ -24,6 +24,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <string_view>
 #include <stdexcept>
 #include <sys/file.h>
 #include <unistd.h>
@@ -133,11 +134,12 @@ namespace
     }
 
     /**
-     * @brief Serializes this process with other large Qwen3.6 expert-overlay parity cases.
+     * @brief Serializes this process with same-backend expert-overlay parity cases.
      *
      * The fixture materializes multi-GPU runners and large pinned logits buffers.
-     * Taking an interprocess lock keeps unrelated CTest shards from trying to
-     * consume the same GPU memory and collective resources concurrently.
+     * CUDA and ROCm use disjoint devices and collective libraries, so each owns
+     * a separate lock domain. Running the unfiltered suite retains a global lock
+     * because it traverses both domains in one process.
      */
     class ScopedParityProcessLock
     {
@@ -177,6 +179,43 @@ namespace
     private:
         int fd_ = -1;
     };
+
+    /**
+     * @brief Select the narrowest safe interprocess lock for this test command.
+     *
+     * Individual CUDA and ROCm filters may execute concurrently because their
+     * GPU memory and collectives do not overlap. A filter mentioning both
+     * backends, an unfiltered invocation, or an unfamiliar command retains the
+     * conservative suite-wide lock.
+     *
+     * @param argc Number of command-line arguments.
+     * @param argv Command-line arguments passed to GoogleTest.
+     * @return Stable lock-file path for the selected backend domain.
+     */
+    const char *parityProcessLockPath(
+        int argc,
+        char *const argv[])
+    {
+        bool mentions_cuda = false;
+        bool mentions_rocm = false;
+        for (int index = 1; index < argc; ++index)
+        {
+            const std::string_view argument =
+                argv[index] ? std::string_view(argv[index]) : std::string_view{};
+            mentions_cuda =
+                mentions_cuda ||
+                argument.find("CUDA") != std::string_view::npos;
+            mentions_rocm =
+                mentions_rocm ||
+                argument.find("ROCm") != std::string_view::npos;
+        }
+
+        if (mentions_cuda && !mentions_rocm)
+            return "/tmp/llaminar_qwen36_moe_expert_overlay_cuda.lock";
+        if (mentions_rocm && !mentions_cuda)
+            return "/tmp/llaminar_qwen36_moe_expert_overlay_rocm.lock";
+        return "/tmp/llaminar_qwen36_moe_expert_overlay_parity.lock";
+    }
 
     /**
      * @brief Builds a rebalance policy that deliberately encourages expert movement.
@@ -257,6 +296,17 @@ namespace
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
         };
+
+        /*
+         * Runtime rebalance defaults to Dynamic in production configuration.
+         * A missing optional test override is therefore not static placement.
+         * Declare Off explicitly so this fixture is a genuine long-position
+         * control; configurePhaseSplitMigrationProbe() replaces this policy
+         * with its movement-friendly Dynamic or LLEP configuration.
+         */
+        MoERebalanceRuntimeConfig static_placement;
+        static_placement.mode = MoERebalanceRuntimeMode::Off;
+        test_case.moe_rebalance = static_placement;
     }
 
     /**
@@ -971,10 +1021,49 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMat
         qwen36MoEStochasticDynamicDepthPolicy(3));
 }
 
+/**
+ * @brief Isolates long-position CUDA stochastic MTP from prefix archival.
+ *
+ * The prefix-enabled long-context control below fails only after its explicit
+ * clearCache() boundary. This companion retains the identical prompt, static
+ * expert placement, dynamic-depth verifier, graph replay, and reused-runner
+ * lifecycle while omitting prefix lookup/harvest/restore. A failure here names
+ * generic request reset or captured replay; a pass names prefix-state lifetime.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterClearCache_CUDA2TPLongContextHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(
+        cudaOnlyLongContextCase(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        false,
+        20);
+}
+
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_CUDA2TPHotOnly)
 {
     runMoEStochasticMTPVerifierParity(
         cudaOnlyStochasticBenchmarkCase(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        true);
+}
+
+/**
+ * @brief Proves CUDA stochastic grouped MTP at long absolute positions without
+ *        runtime expert movement.
+ *
+ * This control uses the same long production-tokenized ledger and exact prefix
+ * restore as the Dynamic/LLEP cells while retaining static expert placement.
+ * It distinguishes a long-position stochastic verifier defect from a runtime
+ * placement handoff defect.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_CUDA2TPLongContextHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(
+        cudaOnlyLongContextCase(),
         3,
         false,
         qwen36MoEStochasticDynamicDepthPolicy(3),
@@ -1028,6 +1117,37 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, DeviceResidentRejectPublicationMatch
     PerfStatsCollector::reset();
 }
 
+/**
+ * @brief Proves CUDA resident publication handles an all-accepted verifier row.
+ *
+ * Rejected-correction publication commits only the first target state and
+ * therefore cannot prove the terminal-row path. This companion regression
+ * accepts the speculative row, publishes every grouped verifier state from the
+ * captured graph, and requires the resulting KV/GDN/short-conv state plus the
+ * next eight decode tokens to remain byte-equivalent to serial decode.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, DeviceResidentAcceptedPublicationMatchesSerial_CUDA2TPHotOnly)
+{
+    ScopedEnvironmentValues perf_stats_enabled({
+        {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+    });
+    PerfStatsCollector::reset();
+    runMoEMainVerifierAllPositionRowsMatchSerialDecode(
+        cudaOnlyExpertOverlayCase(),
+        /*use_row_indexed_logits=*/true,
+        /*use_skip_gather=*/true,
+        /*verify_compact_device_outcome=*/true,
+        /*use_deferred_verifier_sync=*/true,
+        /*verify_published_state_continuation=*/true,
+        /*verifier_row_count=*/2,
+        /*verify_device_resident_publication=*/true,
+        /*expect_grouped_moe_verifier_prefill=*/false,
+        /*force_first_speculative_rejection=*/false);
+    PerfStatsCollector::reset();
+}
+
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_CUDA2TPHotOnly)
 {
     runMoEPrefixRestoreParity(
@@ -1071,6 +1191,26 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPDynamic
 }
 
 /**
+ * @brief Proves stochastic grouped MTP remains serial-equivalent while CUDA
+ *        Dynamic expert movement and exact prefix restore are active.
+ *
+ * This cell combines the device-owned speculative sampler, adaptive MTP depth,
+ * runtime Dynamic placement, full NCCL graph capture, and restored recurrent
+ * state in one production request sequence.  Separate stochastic and rebalance
+ * tests cannot expose ordering defects between those independently asynchronous
+ * paths.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_CUDA2TPDynamicPhaseSplit)
+{
+    runMoEStochasticMTPVerifierParity(
+        cudaOnlyDynamicPhaseSplitCase(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        true);
+}
+
+/**
  * @brief Reproduces asynchronous CUDA Dynamic publication races across requests.
  *
  * Dynamic and LLEP share the captured maintenance and prefix-cache ownership
@@ -1093,6 +1233,24 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_CUDA2TPLLEPP
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPLLEPPhaseSplit)
 {
     runMoEMTPParity(cudaOnlyLLEPPhaseSplitCase(), true);
+}
+
+/**
+ * @brief Proves stochastic grouped MTP remains serial-equivalent while CUDA
+ *        LLEP assignment and exact prefix restore are active.
+ *
+ * LLEP owns a distinct device planner and transfer-backed assignment path from
+ * Dynamic rebalance.  This regression requires that path to coexist with the
+ * adaptive stochastic verifier and its fully captured NCCL publication graph.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_CUDA2TPLLEPPhaseSplit)
+{
+    runMoEStochasticMTPVerifierParity(
+        cudaOnlyLLEPPhaseSplitCase(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        true);
 }
 
 /**
@@ -1176,10 +1334,46 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMat
         qwen36MoEStochasticDynamicDepthPolicy(3));
 }
 
+/**
+ * @brief Mirrors the long-position request-reset isolation control on ROCm.
+ *
+ * Keeping this matrix symmetric makes a shared lifecycle defect distinguishable
+ * from CUDA graph replay or ROCm graph replay behavior without weakening the
+ * production path or forcing deterministic diagnostic kernels.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterClearCache_ROCm2TPLongContextHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(
+        rocmOnlyLongContextCase(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        false,
+        20);
+}
+
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_ROCm2TPHotOnly)
 {
     runMoEStochasticMTPVerifierParity(
         rocmOnlyStochasticBenchmarkCase(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        true);
+}
+
+/**
+ * @brief Mirrors the static-placement long-context stochastic control on ROCm.
+ *
+ * The fixture holds expert placement fixed while preserving the exact prompt,
+ * MTP depth controller, RCCL grouped publication, and prefix restore used by
+ * the movement cells. A failure here belongs to long-position stochastic MTP;
+ * a pass isolates the defect to Dynamic/LLEP placement ordering.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_ROCm2TPLongContextHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(
+        rocmOnlyLongContextCase(),
         3,
         false,
         qwen36MoEStochasticDynamicDepthPolicy(3),
@@ -1233,6 +1427,35 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, DeviceResidentRejectPublicationMatch
     PerfStatsCollector::reset();
 }
 
+/**
+ * @brief Proves ROCm resident publication handles an all-accepted verifier row.
+ *
+ * This exercises the terminal accepted-row publication owner on both mirrored
+ * RCCL participants. The published recurrent and cache state must be bytewise
+ * equal to serial decode before an eight-token continuation is compared.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, DeviceResidentAcceptedPublicationMatchesSerial_ROCm2TPHotOnly)
+{
+    ScopedEnvironmentValues perf_stats_enabled({
+        {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+    });
+    PerfStatsCollector::reset();
+    runMoEMainVerifierAllPositionRowsMatchSerialDecode(
+        rocmOnlyExpertOverlayCase(),
+        /*use_row_indexed_logits=*/true,
+        /*use_skip_gather=*/true,
+        /*verify_compact_device_outcome=*/true,
+        /*use_deferred_verifier_sync=*/true,
+        /*verify_published_state_continuation=*/true,
+        /*verifier_row_count=*/2,
+        /*verify_device_resident_publication=*/true,
+        /*expect_grouped_moe_verifier_prefill=*/false,
+        /*force_first_speculative_rejection=*/false);
+    PerfStatsCollector::reset();
+}
+
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_ROCm2TPHotOnly)
 {
     runMoEPrefixRestoreParity(
@@ -1272,6 +1495,24 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPDynamic
 }
 
 /**
+ * @brief Mirrors the stochastic Dynamic movement and prefix-restore proof on
+ *        the ROCm/RCCL implementation.
+ *
+ * CUDA and ROCm use different grouped kernels, graph APIs, and collective
+ * runtimes.  Keeping this cell symmetric prevents a device-owned mailbox or
+ * adaptive-depth fix from becoming accidentally CUDA-specific.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_ROCm2TPDynamicPhaseSplit)
+{
+    runMoEStochasticMTPVerifierParity(
+        rocmOnlyDynamicPhaseSplitCase(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        true);
+}
+
+/**
  * @brief Mirrors the multi-request Dynamic lifecycle regression on ROCm.
  *
  * The full-tier server failure first appears after many successful MTP samples
@@ -1294,6 +1535,24 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_ROCm2TPLLEPP
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPLLEPPhaseSplit)
 {
     runMoEMTPParity(rocmOnlyLLEPPhaseSplitCase(), true);
+}
+
+/**
+ * @brief Mirrors the stochastic LLEP movement and prefix-restore proof on
+ *        the ROCm/RCCL implementation.
+ *
+ * The test requires real LLEP transfer evidence, adaptive stochastic verifier
+ * activity, exact same-seed token replay, and whole-graph RCCL execution in a
+ * single long-context fixture.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_ROCm2TPLLEPPhaseSplit)
+{
+    runMoEStochasticMTPVerifierParity(
+        rocmOnlyLLEPPhaseSplitCase(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        true);
 }
 
 /**
@@ -1383,13 +1642,42 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MixedHotColdMTPUsesPhaseSplitDenseDe
               "qwen36_moe_rocm_hot");
 }
 
+/**
+ * @brief Keep disjoint CUDA and ROCm parity processes in separate lock domains.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProcessLockSeparatesGpuBackends)
+{
+    char program[] = "qwen36_moe_expert_overlay";
+    char cuda_filter[] = "--gtest_filter=*CUDA2TPHotOnly";
+    char rocm_filter[] = "--gtest_filter=*ROCm2TPHotOnly";
+    char mixed_filter[] = "--gtest_filter=*CUDA2TPHotOnly:*ROCm2TPHotOnly";
+
+    char *cuda_args[] = {program, cuda_filter};
+    char *rocm_args[] = {program, rocm_filter};
+    char *mixed_args[] = {program, mixed_filter};
+    char *unfiltered_args[] = {program};
+
+    EXPECT_STREQ(
+        parityProcessLockPath(2, cuda_args),
+        "/tmp/llaminar_qwen36_moe_expert_overlay_cuda.lock");
+    EXPECT_STREQ(
+        parityProcessLockPath(2, rocm_args),
+        "/tmp/llaminar_qwen36_moe_expert_overlay_rocm.lock");
+    EXPECT_STREQ(
+        parityProcessLockPath(2, mixed_args),
+        "/tmp/llaminar_qwen36_moe_expert_overlay_parity.lock");
+    EXPECT_STREQ(
+        parityProcessLockPath(1, unfiltered_args),
+        "/tmp/llaminar_qwen36_moe_expert_overlay_parity.lock");
+}
+
 int main(int argc, char **argv)
 {
     std::unique_ptr<ScopedParityProcessLock> parity_lock;
     try
     {
         parity_lock = std::make_unique<ScopedParityProcessLock>(
-            "/tmp/llaminar_qwen36_moe_expert_overlay_parity.lock");
+            parityProcessLockPath(argc, argv));
     }
     catch (const std::exception &e)
     {

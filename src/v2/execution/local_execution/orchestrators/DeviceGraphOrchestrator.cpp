@@ -112,6 +112,250 @@ namespace llaminar2
         }
 
         /**
+         * @brief Describe one device-resident byte range at an MTP graph boundary.
+         *
+         * These records are consumed only by the opt-in graph-reuse diagnostic
+         * below.  The production sidecar remains fully device owned; no host
+         * shadow is retained by the orchestrator.
+         */
+        struct MTPGraphReuseDiagnosticSource
+        {
+            std::string name;
+            const void *device_data = nullptr;
+            size_t byte_count = 0;
+        };
+
+        /**
+         * @brief Return the byte width of the first logical tensor row.
+         *
+         * Sidecar decode operates on one row.  Hashing only that row excludes
+         * unused arena capacity and stale tail rows from the diagnostic while
+         * still observing the exact bytes consumed or produced by the graph.
+         */
+        size_t mtpDiagnosticTensorRowBytes(const TensorBase *tensor)
+        {
+            if (!tensor)
+                return 0;
+            const size_t rows = std::max<size_t>(1, tensor->rows());
+            const size_t bytes = tensor->size_bytes();
+            return bytes > 0 && bytes % rows == 0 ? bytes / rows : 0;
+        }
+
+        /**
+         * @brief Build a deterministic FNV-1a digest for diagnostic bytes.
+         */
+        uint64_t mtpDiagnosticHashBytes(
+            const uint8_t *bytes,
+            size_t byte_count)
+        {
+            constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ULL;
+            constexpr uint64_t kFnvPrime = 1099511628211ULL;
+            uint64_t hash = kFnvOffsetBasis;
+            for (size_t i = 0; i < byte_count; ++i)
+            {
+                hash ^= static_cast<uint64_t>(bytes[i]);
+                hash *= kFnvPrime;
+            }
+            return hash;
+        }
+
+        /**
+         * @brief Check whether graph-reuse diagnostics apply to one sidecar context.
+         *
+         * `LLAMINAR_MTP_GRAPH_REUSE_DIAGNOSTICS_CONTEXT` can name one context,
+         * or end in `*` to select a context prefix such as
+         * `mtp_decode_sidecar*`.  A long parity run can therefore compare the
+         * first and chained decode sidecars without copying unrelated prefill
+         * or catch-up buffers.
+         */
+        bool mtpGraphReuseDiagnosticsEnabledForContext(
+            const std::string &context)
+        {
+            if (!DebugEnv::isTruthyEnv(
+                    "LLAMINAR_MTP_GRAPH_REUSE_DIAGNOSTICS"))
+            {
+                return false;
+            }
+            const char *filter = DebugEnv::envValue(
+                "LLAMINAR_MTP_GRAPH_REUSE_DIAGNOSTICS_CONTEXT");
+            if (!filter)
+                return true;
+            const std::string_view filter_view(filter);
+            if (!filter_view.empty() && filter_view.back() == '*')
+            {
+                const std::string_view prefix =
+                    filter_view.substr(0, filter_view.size() - 1);
+                return std::string_view(context).starts_with(prefix);
+            }
+            return context == filter_view;
+        }
+
+        /**
+         * @brief Select one GDN layer for request-reset state diagnostics.
+         *
+         * The state-bank observation can copy several megabytes, so graph
+         * reuse diagnostics do not inspect every recurrent layer implicitly.
+         * A developer investigating a localized layer boundary names that
+         * layer explicitly with
+         * `LLAMINAR_MTP_GRAPH_REUSE_DIAGNOSTICS_GDN_LAYER`.
+         */
+        std::optional<int> mtpGraphReuseDiagnosticGDNLayer()
+        {
+            const char *value = DebugEnv::envValue(
+                "LLAMINAR_MTP_GRAPH_REUSE_DIAGNOSTICS_GDN_LAYER");
+            if (!value || value[0] == '\0')
+                return std::nullopt;
+
+            char *end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (!end || end == value || *end != '\0' ||
+                parsed < 0 ||
+                parsed > static_cast<long>(std::numeric_limits<int>::max()))
+            {
+                throw std::invalid_argument(
+                    "LLAMINAR_MTP_GRAPH_REUSE_DIAGNOSTICS_GDN_LAYER must "
+                    "name one non-negative layer index");
+            }
+            return static_cast<int>(parsed);
+        }
+
+        /**
+         * @brief Hash device truth at one MTP sidecar graph boundary.
+         *
+         * Every D2H copy is enqueued on the exact sidecar producer stream, then
+         * that stream is synchronized once after all copies have been queued.
+         * This makes the diagnostic a faithful observation of the graph's
+         * ordered inputs or outputs rather than an observation from an
+         * unrelated default stream.  It is deliberately opt-in because the
+         * final synchronization perturbs latency and may help distinguish a
+         * missing event edge from a stale stable-pointer binding.
+         *
+         * @return `true` when every requested byte range was captured.
+         */
+        bool logMTPGraphReuseBoundaryDiagnostics(
+            const char *boundary,
+            const std::string &context,
+            uint64_t session_epoch,
+            bool graph_rebuilt,
+            bool graph_replayed,
+            IBackend &backend,
+            const DeviceId &device,
+            void *stream,
+            const std::vector<MTPGraphReuseDiagnosticSource> &sources)
+        {
+            if (!mtpGraphReuseDiagnosticsEnabledForContext(context))
+                return true;
+            if (!device.is_gpu() || !stream)
+            {
+                LOG_ERROR("[MTPGraphReuseDiagnostics] requested without an exact GPU stream"
+                          << " context=" << context
+                          << " boundary=" << (boundary ? boundary : "<unknown>"));
+                return false;
+            }
+
+            std::vector<std::vector<uint8_t>> host_bytes(sources.size());
+            for (size_t i = 0; i < sources.size(); ++i)
+            {
+                const auto &source = sources[i];
+                if (!source.device_data || source.byte_count == 0)
+                {
+                    LOG_ERROR("[MTPGraphReuseDiagnostics] missing device bytes"
+                              << " context=" << context
+                              << " boundary=" << (boundary ? boundary : "<unknown>")
+                              << " source=" << (source.name.empty() ? "<unnamed>" : source.name)
+                              << " bytes=" << source.byte_count);
+                    return false;
+                }
+                host_bytes[i].resize(source.byte_count);
+            }
+
+            for (size_t i = 0; i < sources.size(); ++i)
+            {
+                const auto &source = sources[i];
+                if (!backend.deviceToHostOnStream(
+                        host_bytes[i].data(),
+                        source.device_data,
+                        source.byte_count,
+                        device.gpu_ordinal(),
+                        stream))
+                {
+                    LOG_ERROR("[MTPGraphReuseDiagnostics] failed to enqueue device observation"
+                              << " context=" << context
+                              << " boundary=" << (boundary ? boundary : "<unknown>")
+                              << " source=" << (source.name.empty() ? "<unnamed>" : source.name)
+                              << " bytes=" << source.byte_count);
+                    return false;
+                }
+            }
+            void *completion_event =
+                backend.createEvent(device.gpu_ordinal());
+            if (!completion_event)
+            {
+                LOG_ERROR("[MTPGraphReuseDiagnostics] failed to allocate the diagnostic completion event"
+                          << " context=" << context
+                          << " boundary=" << (boundary ? boundary : "<unknown>"));
+                return false;
+            }
+            const bool published =
+                backend.recordEvent(
+                    completion_event,
+                    device.gpu_ordinal(),
+                    stream);
+            const bool completed =
+                published &&
+                backend.waitForEvent(
+                    completion_event,
+                    device.gpu_ordinal());
+            backend.destroyEvent(
+                completion_event,
+                device.gpu_ordinal());
+            if (!completed)
+            {
+                LOG_ERROR("[MTPGraphReuseDiagnostics] failed to complete the exact diagnostic event"
+                          << " context=" << context
+                          << " boundary=" << (boundary ? boundary : "<unknown>")
+                          << " published=" << published);
+                return false;
+            }
+
+            std::ostringstream message;
+            message << "[MTPGraphReuseDiagnostics]"
+                    << " epoch=" << session_epoch
+                    << " device=" << device.toString()
+                    << " context=" << context
+                    << " boundary=" << (boundary ? boundary : "<unknown>")
+                    << " rebuilt=" << (graph_rebuilt ? "true" : "false")
+                    << " replayed=" << (graph_replayed ? "true" : "false");
+            for (size_t i = 0; i < sources.size(); ++i)
+            {
+                const auto &source = sources[i];
+                message << ' '
+                        << (source.name.empty() ? "unnamed" : source.name)
+                        << "_bytes=" << source.byte_count
+                        << ' '
+                        << (source.name.empty() ? "unnamed" : source.name)
+                        << "_hash=0x" << std::hex
+                        << mtpDiagnosticHashBytes(
+                               host_bytes[i].data(),
+                               host_bytes[i].size())
+                        << std::dec;
+                if (source.byte_count == sizeof(int32_t))
+                {
+                    int32_t value = 0;
+                    std::memcpy(
+                        &value,
+                        host_bytes[i].data(),
+                        sizeof(value));
+                    message << ' '
+                            << (source.name.empty() ? "unnamed" : source.name)
+                            << "_value=" << value;
+                }
+            }
+            LOG_INFO(message.str());
+            return true;
+        }
+
+        /**
          * @brief Format a compact INT32 vector for single-line publication logs.
          */
         std::string formatMTPDiagnosticIntVector(
@@ -3143,6 +3387,9 @@ namespace llaminar2
         append("mtp_prefill_terminal_archive",
                mtp_prefill_terminal_archive_ready_.event,
                mtp_prefill_terminal_archive_ready_.valid);
+        append("request_state_reset",
+               request_state_reset_ready_.event,
+               request_state_reset_ready_.valid);
         append("request_input_admission",
                request_input_admission_ready_.event,
                request_input_admission_ready_.valid);
@@ -4185,6 +4432,7 @@ namespace llaminar2
         request_sequence_lengths_dev_ = nullptr;
         request_sequence_lengths_capacity_ = 0;
         request_sequence_lengths_active_count_ = 0;
+        request_state_reset_ready_ = {};
         request_input_admission_ready_ = {};
         request_input_reuse_ready_ = {};
 
@@ -4684,10 +4932,13 @@ namespace llaminar2
                 make_request_input_event();
             request_input_reuse_ready_.event =
                 make_request_input_event();
+            request_state_reset_ready_.event =
+                make_request_input_event();
             if (!request_input_admission_ready_.event ||
-                !request_input_reuse_ready_.event)
+                !request_input_reuse_ready_.event ||
+                !request_state_reset_ready_.event)
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to preallocate the request-input admission/reuse event pair");
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to preallocate request-boundary reset/admission/reuse events");
                 return false;
             }
         }
@@ -10428,10 +10679,19 @@ namespace llaminar2
                       : batch_size * seq_len == 1
                             ? "serial_decode"
                             : "prefill";
+        if (output.execution.graph_seq_len <= 0 ||
+            output.execution.graph_batch_size <= 0)
+        {
+            throw std::runtime_error(
+                "Successful forward omitted its captured graph geometry from "
+                "execution provenance");
+        }
         last_mirrored_layer_checkpoint_prefix_ =
             std::string(graph_regime) +
             "_m" +
-            std::to_string(std::max(1, batch_size * seq_len)) +
+            std::to_string(
+                output.execution.graph_batch_size *
+                output.execution.graph_seq_len) +
             "_";
 
         // Update positions
@@ -12913,6 +13173,161 @@ namespace llaminar2
                 use_device_position_ids ? 0 : position_id;
             stage->updateDynamicParams(scalar_position_for_dynamic_params, token_count);
         }
+
+        if (mtpGraphReuseDiagnosticsEnabledForContext(sidecar_context))
+        {
+            IBackend *backend = getBackendFor(state_.device_id);
+            const void *terminal_hidden_device =
+                terminal_hidden && terminal_hidden->deviceValid()
+                    ? terminal_hidden->gpu_data_ptr()
+                    : nullptr;
+            const size_t terminal_hidden_row_bytes =
+                mtpDiagnosticTensorRowBytes(terminal_hidden);
+            const void *mtp_live_position =
+                !state_.mtp_kv_caches.empty() && state_.mtp_kv_caches[0]
+                    ? state_.mtp_kv_caches[0]
+                          ->deviceSequenceCachedTokenCountPtr(first_seq_idx)
+                    : nullptr;
+            std::vector<MTPGraphReuseDiagnosticSource> diagnostic_sources{
+                {"condition_token",
+                 condition_token_device,
+                 sizeof(int32_t) * static_cast<size_t>(total_rows)},
+                {"position_id",
+                 effective_position_ids_device,
+                 sizeof(int32_t) * static_cast<size_t>(total_rows)},
+                {"terminal_hidden",
+                 terminal_hidden_device,
+                 terminal_hidden_row_bytes},
+                {"mtp_live_position",
+                 mtp_live_position,
+                 sizeof(int32_t)},
+            };
+
+            /*
+             * Main-model checkpoints are inserted into the captured graph only
+             * when mirrored-layer diagnostics were armed before construction.
+             * Append the bank produced by the latest successful main forward
+             * to this same stream observation.  Comparing attention-residual
+             * and FFN-delta rows per layer identifies the first producer that
+             * changes before the MTP sidecar sees its terminal hidden input.
+             */
+            if (terminal_hidden_buffer_id != BufferId::MTP_HIDDEN)
+            {
+                if (const auto *qwen_moe =
+                        dynamic_cast<const Qwen35MoEGraph *>(
+                            graph_builder_.get()))
+                {
+                    const auto checkpoints =
+                        qwen_moe->mirroredLayerCheckpoints();
+                    diagnostic_sources.reserve(
+                        diagnostic_sources.size() + checkpoints.size());
+                    for (const auto &checkpoint : checkpoints)
+                    {
+                        if (!checkpoint.tensor ||
+                            last_mirrored_layer_checkpoint_prefix_.empty() ||
+                            !checkpoint.name.starts_with(
+                                last_mirrored_layer_checkpoint_prefix_))
+                        {
+                            continue;
+                        }
+                        diagnostic_sources.push_back({
+                            checkpoint.name,
+                            checkpoint.tensor->deviceValid()
+                                ? checkpoint.tensor->gpu_data_ptr()
+                                : nullptr,
+                            mtpDiagnosticTensorRowBytes(checkpoint.tensor),
+                        });
+                    }
+                }
+            }
+
+            /*
+             * The sidecar stream has already inherited the main-forward
+             * completion event at this boundary.  When a recurrent layer is
+             * selected for graph-reuse diagnostics, observe its complete live
+             * banks here as well.  This places the measurement after main
+             * prefill but before the first MTP sidecar launch, which separates
+             * a divergent prefill producer from a later speculative-state
+             * publication error without introducing an unordered host probe.
+             */
+            if (const auto diagnostic_gdn_layer =
+                    mtpGraphReuseDiagnosticGDNLayer())
+            {
+                auto *hybrid_cache =
+                    dynamic_cast<IHybridKVCache *>(state_.kv_cache.get());
+                const HybridGDNLayerState *gdn_state =
+                    hybrid_cache
+                        ? hybrid_cache->getGDNState(*diagnostic_gdn_layer)
+                        : nullptr;
+                if (!gdn_state)
+                {
+                    LOG_ERROR("[MTPGraphReuseDiagnostics] selected pre-sidecar diagnostic layer is not GDN"
+                              << " layer=" << *diagnostic_gdn_layer
+                              << " device=" << state_.device_id.toString());
+                    return false;
+                }
+
+                const auto append_binding =
+                    [&](const char *owner,
+                        const GDNDeviceStateBinding &binding)
+                {
+                    const std::string prefix =
+                        std::string{"layer"} +
+                        std::to_string(*diagnostic_gdn_layer) +
+                        "_" + owner;
+                    if (binding.primary_state &&
+                        binding.primary_state_floats > 0)
+                    {
+                        diagnostic_sources.push_back({
+                            prefix + "_primary",
+                            binding.primary_state,
+                            static_cast<size_t>(
+                                binding.primary_state_floats) *
+                                sizeof(float),
+                        });
+                    }
+                    if (binding.secondary_state &&
+                        binding.secondary_state_floats > 0)
+                    {
+                        diagnostic_sources.push_back({
+                            prefix + "_secondary",
+                            binding.secondary_state,
+                            static_cast<size_t>(
+                                binding.secondary_state_floats) *
+                                sizeof(float),
+                        });
+                    }
+                    if (binding.request_state_bank &&
+                        binding.request_state_bank_floats > 0)
+                    {
+                        diagnostic_sources.push_back({
+                            prefix + "_requests",
+                            binding.request_state_bank,
+                            binding.request_state_bank_floats *
+                                sizeof(float),
+                        });
+                    }
+                };
+                append_binding("conv", gdn_state->conv_device_state);
+                append_binding(
+                    "recurrence",
+                    gdn_state->recurrence_device_state);
+            }
+            if (!backend ||
+                !logMTPGraphReuseBoundaryDiagnostics(
+                    "before_execute",
+                    sidecar_context,
+                    session_epoch_,
+                    rebuilt_graph,
+                    /*graph_replayed=*/false,
+                    *backend,
+                    state_.device_id,
+                    sidecar_dynamic_stream,
+                    diagnostic_sources))
+            {
+                return false;
+            }
+        }
         sidecar_cache.graph->reset();
 
         const bool has_sidecar_collectives = !sidecar_cache.collective_nodes.empty();
@@ -13070,13 +13485,104 @@ namespace llaminar2
                     }
                 }
             }
-            else
-            {
-                ok = execute(*sidecar_cache.graph, ctx);
-            }
+                else
+                {
+                    ok = execute(*sidecar_cache.graph, ctx);
+                }
 
-            PerfStatsCollector::addCounter(
-                "mtp",
+                if (ok &&
+                    mtpGraphReuseDiagnosticsEnabledForContext(sidecar_context))
+                {
+                    auto extension =
+                        [&](BufferId id) -> const TensorBase *
+                    {
+                        const auto it = state_.extension_buffers.find(id);
+                        return it == state_.extension_buffers.end()
+                                   ? nullptr
+                                   : it->second.get();
+                    };
+                    std::vector<MTPGraphReuseDiagnosticSource>
+                        diagnostic_sources;
+                    auto append_tensor =
+                        [&](const char *name,
+                            const TensorBase *tensor)
+                    {
+                        const MTPGraphReuseDiagnosticSource source{
+                            name,
+                            tensor && tensor->deviceValid()
+                                ? tensor->gpu_data_ptr()
+                                : nullptr,
+                            mtpDiagnosticTensorRowBytes(tensor)};
+                        /*
+                         * Sidecar roles deliberately bind different subsets of
+                         * the extension arena. An absent tensor is not a missing
+                         * publication; it is outside this graph's contract.
+                         * Observe every bound range, while the mandatory
+                         * shifted-KV position below remains fail-closed.
+                         */
+                        if (source.device_data && source.byte_count > 0)
+                            diagnostic_sources.push_back(source);
+                    };
+                    append_tensor(
+                        "mtp_embedding",
+                        extension(BufferId::MTP_EMBEDDING));
+                    append_tensor(
+                        "mtp_norm_hidden",
+                        extension(BufferId::MTP_NORM_HIDDEN));
+                    append_tensor(
+                        "mtp_concat",
+                        extension(BufferId::MTP_CONCAT));
+                    append_tensor(
+                        "mtp_projected",
+                        extension(BufferId::MTP_PROJECTED));
+                    append_tensor(
+                        "mtp_q",
+                        extension(BufferId::MTP_Q_PROJ));
+                    append_tensor(
+                        "mtp_k",
+                        extension(BufferId::MTP_K_PROJ));
+                    append_tensor(
+                        "mtp_v",
+                        extension(BufferId::MTP_V_PROJ));
+                    append_tensor(
+                        "mtp_attention_output",
+                        extension(BufferId::MTP_ATTN_OUTPUT));
+                    append_tensor(
+                        "mtp_hidden",
+                        extension(BufferId::MTP_HIDDEN));
+                    append_tensor(
+                        "mtp_logits",
+                        extension(BufferId::MTP_LOGITS));
+                    const void *mtp_live_position =
+                        !state_.mtp_kv_caches.empty() &&
+                                state_.mtp_kv_caches[0]
+                            ? state_.mtp_kv_caches[0]
+                                  ->deviceSequenceCachedTokenCountPtr(first_seq_idx)
+                            : nullptr;
+                    diagnostic_sources.push_back({
+                        "mtp_live_position",
+                        mtp_live_position,
+                        sizeof(int32_t),
+                    });
+                    IBackend *backend = getBackendFor(state_.device_id);
+                    if (!backend ||
+                        !logMTPGraphReuseBoundaryDiagnostics(
+                            "after_execute",
+                            sidecar_context,
+                            session_epoch_,
+                            rebuilt_graph,
+                            used_graph_replay,
+                            *backend,
+                            state_.device_id,
+                            sidecar_dynamic_stream,
+                            diagnostic_sources))
+                    {
+                        return false;
+                    }
+                }
+
+                PerfStatsCollector::addCounter(
+                    "mtp",
                 "sidecar_graph_capture_path",
                 1.0,
                 phase,
@@ -17046,75 +17552,6 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation(
-        const DeviceResidentLogicalSequenceStateHandle &handle,
-        void *producer_stream,
-        const char *producer_name)
-    {
-        auto &mailbox = device_resident_logical_sequence_state_mailbox_;
-        if (!state_.device_id.is_gpu() || !mailbox.valid())
-            return true;
-        if (!producer_stream)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox retarget requires an explicit producer stream");
-            return false;
-        }
-
-        /*
-         * This helper is deliberately stricter than deviceResidentLogicalSequenceState():
-         * it only refreshes a mailbox that the just-finished shifted-KV commit used
-         * before recordShiftedMTPKVReplayStateMutation() advanced the live epoch.
-         * Pointer identity plus the previous epoch prevents an unrelated mutation
-         * from laundering a stale handle into the next sidecar.
-         */
-        const uint64_t previous_epoch =
-            live_replay_state_epoch_ > 0 ? live_replay_state_epoch_ - 1 : 0;
-        if (!mailbox.ownsHandle(handle, previous_epoch))
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox retarget received a non-owned pre-mutation handle");
-            return false;
-        }
-
-        IBackend *backend = getBackendFor(state_.device_id);
-        if (!backend)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox retarget could not resolve backend");
-            return false;
-        }
-
-        if (!device_resident_logical_sequence_state_ready_event_)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox retarget has no preallocated readiness event");
-            return false;
-        }
-        if (!backend->recordEvent(
-                device_resident_logical_sequence_state_ready_event_.get(),
-                state_.device_id.gpu_ordinal(),
-                producer_stream))
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox retarget could not record readiness event");
-            return false;
-        }
-
-        mailbox.producer_stream = producer_stream;
-        mailbox.ready_event =
-            device_resident_logical_sequence_state_ready_event_;
-        mailbox.live_state_epoch = live_replay_state_epoch_;
-
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "device_resident_logical_state_mailbox_retargets",
-            1.0,
-            perfPhaseName(),
-            state_.device_id.toString(),
-            {{"producer", producer_name && producer_name[0] != '\0'
-                              ? producer_name
-                              : "unknown"},
-             {"previous_live_state_epoch", std::to_string(previous_epoch)},
-             {"live_state_epoch", std::to_string(mailbox.live_state_epoch)}});
-        return true;
-    }
-
     bool DeviceGraphOrchestrator::supportsDeviceResidentMTPSpecStatePublication() const
     {
         /*
@@ -19102,13 +19539,23 @@ namespace llaminar2
         {
             recordShiftedMTPKVReplayStateMutation(
                 "mtp_shifted_row_resident_logical_state_commit");
-            if (!retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation(
-                    logical_state,
-                    stream,
-                    "mtp_shifted_row_resident_logical_state_commit"))
-            {
-                return false;
-            }
+            /*
+             * This commit consumes a one-shot logical-state handle. The caller
+             * has already preserved the emitted token in a persistent target
+             * slot, and the immediately following main graph establishes the
+             * next live-state epoch. Carrying the old compact values across
+             * this mutation would create a stale mailbox with a fresh epoch.
+             */
+            clearDeviceResidentLogicalSequenceStateMailbox();
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "device_resident_logical_state_mailbox_consumptions",
+                1.0,
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"consumer",
+                  "mtp_shifted_row_resident_logical_state_commit"},
+                 {"next_owner", "persistent_target_slot_then_main_graph"}});
         }
         return true;
     }
@@ -20468,6 +20915,117 @@ namespace llaminar2
         }
     }
 
+    bool
+    DeviceGraphOrchestrator::reclaimCompletedGpuTimingMeasurementsNonblocking(
+        IBackend *backend)
+    {
+        if (pending_gpu_timing_measurements_.empty())
+            return true;
+        if (!backend || !state_.device_id.is_gpu())
+            return false;
+
+        IWorkerGPUContext *gpu_context = nullptr;
+        try
+        {
+            gpu_context =
+                &GPUDeviceContextPool::instance().getContext(
+                    state_.device_id);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Could not acquire the GPU context "
+                "needed for nonblocking MTP timing-event reclamation on "
+                << state_.device_id.toString() << ": " << error.what());
+            return false;
+        }
+
+        /*
+         * Compact in place so profiling cannot introduce allocator work into
+         * decode. A completed entry releases its shared event owners when the
+         * vector is resized, making the fixed pool pair immediately reusable.
+         */
+        size_t retained_count = 0;
+        size_t reclaimed_count = 0;
+        const int device_ordinal = state_.device_id.gpu_ordinal();
+        for (size_t index = 0;
+             index < pending_gpu_timing_measurements_.size();
+             ++index)
+        {
+            auto &measurement =
+                pending_gpu_timing_measurements_[index];
+            bool ready = false;
+            if (!gpu_context->queryEventChecked(
+                    measurement.stop_event.get(),
+                    ready))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Failed to query pending MTP "
+                    "GPU timing event name="
+                    << measurement.name << " device="
+                    << state_.device_id.toString());
+                return false;
+            }
+
+            if (!ready)
+            {
+                if (retained_count != index)
+                {
+                    pending_gpu_timing_measurements_[retained_count] =
+                        std::move(measurement);
+                }
+                ++retained_count;
+                continue;
+            }
+
+            float elapsed_ms = 0.0f;
+            if (!backend->eventElapsedTimeMs(
+                    measurement.start_event.get(),
+                    measurement.stop_event.get(),
+                    device_ordinal,
+                    &elapsed_ms))
+            {
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "pending_gpu_timing_read_failures",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"name", measurement.name},
+                     {"reclaim", "nonblocking"}});
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Failed to read completed MTP "
+                    "GPU timing events name="
+                    << measurement.name << " device="
+                    << state_.device_id.toString());
+                return false;
+            }
+
+            const double clamped_ms =
+                std::max(0.0, static_cast<double>(elapsed_ms));
+            PerfStatsCollector::recordTimingNs(
+                "mtp",
+                measurement.name,
+                static_cast<uint64_t>(clamped_ms * 1000000.0),
+                "decode",
+                state_.device_id.toString(),
+                measurement.tags);
+            ++reclaimed_count;
+        }
+
+        pending_gpu_timing_measurements_.resize(retained_count);
+        if (reclaimed_count > 0)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "pending_gpu_timing_nonblocking_reclaims",
+                static_cast<double>(reclaimed_count),
+                "decode",
+                state_.device_id.toString());
+        }
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::waitForStochasticDraftSampleReadyRange(
         int first_slot,
         int slot_count,
@@ -20866,6 +21424,18 @@ namespace llaminar2
             return true;
         if (!out_start_event || !out_stop_event)
             return false;
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!reclaimCompletedGpuTimingMeasurementsNonblocking(backend))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Could not reclaim completed MTP "
+                "GPU timing events before measurement="
+                << (measurement_name && measurement_name[0] != '\0'
+                        ? measurement_name
+                        : "unknown"));
+            return false;
+        }
 
         for (const auto &pair : mtp_gpu_timing_event_pool_)
         {
@@ -22602,6 +23172,13 @@ namespace llaminar2
         if (!state_.device_id.is_gpu())
             return true;
         (void)input;
+        if (!waitForPendingRequestStateReset(
+                execution_stream,
+                DeviceTimelineRole::MainForwardGraph,
+                "forward_graph_request_state_reset"))
+        {
+            return false;
+        }
         if (!waitForPendingRequestInputAdmission(
                 execution_stream,
                 "forward_graph_request_input"))
@@ -24342,17 +24919,76 @@ namespace llaminar2
             graph_builder_ && graph_builder_->config().mtp.enabled;
         snapshot.positions = state_.positions;
         snapshot.sequence_lengths = state_.sequence_lengths;
-        if (auto resident_tokens =
-                deviceResidentLogicalTokenCountForObservation(
-                    /*request_index=*/0,
-                    probe_stream,
-                    "prefix_state_probe_logical_tokens"))
+        const DeviceResidentLogicalSequenceStateHandle logical_state =
+            deviceResidentLogicalSequenceState();
+        if (logical_state.valid())
         {
-            snapshot.current_position = *resident_tokens;
-            if (!snapshot.positions.empty())
-                snapshot.positions[0] = *resident_tokens;
-            if (!snapshot.sequence_lengths.empty())
-                snapshot.sequence_lengths[0] = *resident_tokens;
+            /*
+             * A diagnostic snapshot is a host-visible result boundary, so it
+             * may materialize the small logical metadata row.  Read the entire
+             * row from the authoritative mailbox in one operation rather than
+             * mixing request zero with stale host vectors for later requests.
+             * Any failed observation is fatal: returning the host mirror would
+             * make a coherence defect look like a valid runtime state.
+             */
+            if (!waitForDeviceResidentLogicalSequenceStateMailboxForObservation(
+                    probe_stream,
+                    "prefix_state_probe_logical_state"))
+            {
+                throw std::runtime_error(
+                    "Prefix-state diagnostics could not wait for the "
+                    "device-resident logical-state mailbox");
+            }
+            IBackend *backend = getBackendFor(state_.device_id);
+            if (!backend)
+            {
+                throw std::runtime_error(
+                    "Prefix-state diagnostics could not resolve the GPU backend");
+            }
+
+            const size_t request_count =
+                static_cast<size_t>(logical_state.request_count);
+            std::vector<int32_t> resident_positions(request_count, -1);
+            std::vector<int32_t> resident_sequence_lengths(request_count, -1);
+            const size_t row_bytes = sizeof(int32_t) * request_count;
+            if (!backend->deviceToHostFast(
+                    resident_positions.data(),
+                    logical_state.target_positions_device,
+                    row_bytes,
+                    state_.device_id.gpu_ordinal(),
+                    probe_stream) ||
+                !backend->deviceToHostFast(
+                    resident_sequence_lengths.data(),
+                    logical_state.target_sequence_lengths_device,
+                    row_bytes,
+                    state_.device_id.gpu_ordinal(),
+                    probe_stream))
+            {
+                throw std::runtime_error(
+                    "Prefix-state diagnostics could not materialize the "
+                    "device-resident logical-state row");
+            }
+            if (std::any_of(
+                    resident_positions.begin(),
+                    resident_positions.end(),
+                    [](int32_t value) { return value < 0; }) ||
+                std::any_of(
+                    resident_sequence_lengths.begin(),
+                    resident_sequence_lengths.end(),
+                    [](int32_t value) { return value < 0; }))
+            {
+                throw std::runtime_error(
+                    "Prefix-state diagnostics observed invalid negative "
+                    "device-resident logical metadata");
+            }
+
+            snapshot.current_position = resident_positions.front();
+            snapshot.positions.assign(
+                resident_positions.begin(),
+                resident_positions.end());
+            snapshot.sequence_lengths.assign(
+                resident_sequence_lengths.begin(),
+                resident_sequence_lengths.end());
         }
 
         const int sequence_count = state_.batch_size > 0 ? state_.batch_size : 1;
@@ -26033,6 +26669,13 @@ namespace llaminar2
         if (state_.device_id.is_gpu() && !stream)
         {
             return fail("missing explicit GPU stream after prefix restore reset");
+        }
+        if (!waitForPendingRequestStateReset(
+                stream,
+                DeviceTimelineRole::PrefixRestoreMutation,
+                "populate_prefix_request_state_reset"))
+        {
+            return fail("prefix restore could not consume request-state reset");
         }
         IBackend *prefix_backend =
             state_.device_id.is_gpu() ? getBackendFor(state_.device_id) : nullptr;
@@ -28809,6 +29452,13 @@ namespace llaminar2
         {
             return fail("missing explicit GPU stream");
         }
+        if (!waitForPendingRequestStateReset(
+                stream,
+                DeviceTimelineRole::PrefixRestoreMutation,
+                "restore_live_prefix_request_state_reset"))
+        {
+            return fail("request-state reset wait failed");
+        }
         if (!waitForPendingLivePrefixCheckpointReady(
                 stream,
                 "restore_live_prefix_state_source"))
@@ -29497,6 +30147,13 @@ namespace llaminar2
         {
             return false;
         }
+        if (!waitForPendingRequestStateReset(
+                stream,
+                DeviceTimelineRole::PrefixRestoreMutation,
+                "truncate_live_prefix_request_state_reset"))
+        {
+            return false;
+        }
         if (!waitForPendingLivePrefixCheckpointReady(
                 stream,
                 "truncate_live_prefix_source"))
@@ -29775,6 +30432,240 @@ namespace llaminar2
         }
         IGlobalTPContext *global_ctx = globalTPContextForMTPCoordination();
         return global_ctx && global_ctx->degree() > 1;
+    }
+
+    bool DeviceGraphOrchestrator::joinPriorDeviceWorkForRequestStateReset(
+        const char *consumer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+
+        void *reset_stream =
+            explicitGPUStreamForOperation(
+                "joinPriorDeviceWorkForRequestStateReset");
+        if (!reset_stream ||
+            !waitForLiveInferenceStateReadyForObservation(
+                reset_stream,
+                consumer_name,
+                DeviceTimelineRole::RequestStateReset))
+        {
+            return false;
+        }
+        PerfStatsCollector::addCounter(
+            "request_reset",
+            "device_prior_work_joins",
+            1.0,
+            "request_reset",
+            state_.device_id.toString(),
+            {{"consumer",
+              consumer_name && consumer_name[0] != '\0'
+                  ? consumer_name
+                  : "unknown"},
+             {"ordering", "event_wait"}});
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::publishRequestStateResetReady(
+        const char *producer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return;
+
+        auto &ready = request_state_reset_ready_;
+        if (!ready.event || ready.valid)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Request-state reset publication has invalid lifecycle ownership"
+                      << " producer="
+                      << (producer_name && producer_name[0] != '\0'
+                              ? producer_name
+                              : "unknown")
+                      << " event=" << static_cast<bool>(ready.event)
+                      << " already_valid=" << ready.valid);
+            std::terminate();
+        }
+
+        void *stream =
+            explicitGPUStreamForOperation("publishRequestStateResetReady");
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!stream || !backend ||
+            !DeviceEventEdge::at(DeviceTimelinePoint::RequestStateResetReady)
+                 .from(DeviceTimelineRole::RequestStateReset)
+                 .publish(
+                     *backend,
+                     state_.device_id,
+                     ready.event.get(),
+                     stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to publish request-state reset readiness");
+            std::terminate();
+        }
+
+        ready.producer_stream = stream;
+        ready.valid = true;
+        PerfStatsCollector::addCounter(
+            "request_reset",
+            "device_state_ready_events",
+            1.0,
+            "request_reset",
+            state_.device_id.toString(),
+            {{"producer",
+              producer_name && producer_name[0] != '\0'
+                  ? producer_name
+                  : "unknown"},
+             {"ordering", "event_wait"}});
+    }
+
+    bool DeviceGraphOrchestrator::waitForPendingRequestStateReset(
+        void *consumer_stream,
+        DeviceTimelineRole consumer_role,
+        const char *consumer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+
+        auto &ready = request_state_reset_ready_;
+        if (!ready.valid)
+            return true;
+        if (!consumer_stream ||
+            !ready.event ||
+            !ready.producer_stream ||
+            (consumer_role != DeviceTimelineRole::MainForwardGraph &&
+             consumer_role != DeviceTimelineRole::MTPSidecarGraph &&
+             consumer_role != DeviceTimelineRole::PrefixRestoreMutation))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Request-state reset dependency has incomplete or invalid ownership"
+                      << " consumer="
+                      << (consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"));
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend ||
+            !DeviceEventEdge::at(DeviceTimelinePoint::RequestStateResetReady)
+                 .from(DeviceTimelineRole::RequestStateReset)
+                 .to(consumer_role)
+                 .enqueueWait(
+                     *backend,
+                     state_.device_id,
+                     ready.event.get(),
+                     ready.producer_stream,
+                     consumer_stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to order graph execution after request-state reset"
+                      << " consumer="
+                      << (consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"));
+            return false;
+        }
+
+        /*
+         * Observe cache-owned recurrent banks only after the consumer stream
+         * has inherited RequestStateResetReady. This diagnostic distinguishes
+         * an incomplete reset from a captured graph that later addresses the
+         * wrong persistent bank. It is opt-in and synchronizes only this
+         * consumer stream; production request reset remains event-only.
+         */
+        const auto diagnostic_gdn_layer =
+            mtpGraphReuseDiagnosticGDNLayer();
+        if (consumer_role == DeviceTimelineRole::MainForwardGraph &&
+            diagnostic_gdn_layer &&
+            mtpGraphReuseDiagnosticsEnabledForContext(
+                "request_state_reset_gdn"))
+        {
+            auto *hybrid_cache =
+                dynamic_cast<IHybridKVCache *>(state_.kv_cache.get());
+            const HybridGDNLayerState *gdn_state =
+                hybrid_cache
+                    ? hybrid_cache->getGDNState(*diagnostic_gdn_layer)
+                    : nullptr;
+            if (!gdn_state)
+            {
+                LOG_ERROR("[MTPGraphReuseDiagnostics] selected reset diagnostic layer is not GDN"
+                          << " layer=" << *diagnostic_gdn_layer
+                          << " device=" << state_.device_id.toString());
+                return false;
+            }
+
+            std::vector<MTPGraphReuseDiagnosticSource> sources;
+            const auto append_binding =
+                [&](const char *owner,
+                    const GDNDeviceStateBinding &binding)
+            {
+                const std::string prefix =
+                    std::string{"layer"} +
+                    std::to_string(*diagnostic_gdn_layer) +
+                    "_" + owner;
+                if (binding.primary_state &&
+                    binding.primary_state_floats > 0)
+                {
+                    sources.push_back({
+                        prefix + "_primary",
+                        binding.primary_state,
+                        static_cast<size_t>(
+                            binding.primary_state_floats) *
+                            sizeof(float),
+                    });
+                }
+                if (binding.secondary_state &&
+                    binding.secondary_state_floats > 0)
+                {
+                    sources.push_back({
+                        prefix + "_secondary",
+                        binding.secondary_state,
+                        static_cast<size_t>(
+                            binding.secondary_state_floats) *
+                            sizeof(float),
+                    });
+                }
+                if (binding.request_state_bank &&
+                    binding.request_state_bank_floats > 0)
+                {
+                    sources.push_back({
+                        prefix + "_requests",
+                        binding.request_state_bank,
+                        binding.request_state_bank_floats *
+                            sizeof(float),
+                    });
+                }
+            };
+            append_binding("conv", gdn_state->conv_device_state);
+            append_binding(
+                "recurrence",
+                gdn_state->recurrence_device_state);
+            if (sources.empty() ||
+                !logMTPGraphReuseBoundaryDiagnostics(
+                    "after_reset_wait",
+                    "request_state_reset_gdn",
+                    session_epoch_,
+                    /*graph_rebuilt=*/false,
+                    /*graph_replayed=*/false,
+                    *backend,
+                    state_.device_id,
+                    consumer_stream,
+                    sources))
+            {
+                return false;
+            }
+        }
+
+        PerfStatsCollector::addCounter(
+            "request_reset",
+            "device_state_ready_waits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"consumer",
+              consumer_name && consumer_name[0] != '\0'
+                  ? consumer_name
+                  : "unknown"},
+             {"same_stream",
+              boolTag(consumer_stream == ready.producer_stream)}});
+        ready.valid = false;
+        ready.producer_stream = nullptr;
+        return true;
     }
 
     bool DeviceGraphOrchestrator::admitRequestInputsOnDevice(
@@ -32945,6 +33836,39 @@ namespace llaminar2
         return out_handle->valid();
     }
 
+    bool DeviceGraphOrchestrator::publishRankCompactSpeculativeResponseReady(
+        DeviceSpeculativeOutcomeHandle *handle)
+    {
+        if (!handle ||
+            !handle->valid() ||
+            handle->device != state_.device_id ||
+            handle->stream == nullptr ||
+            handle->response_ready_event == nullptr ||
+            handle->response_ready_after_rank_collective)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid compact outcome ownership while publishing rank readiness");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend ||
+            !DeviceEventEdge::at(
+                 DeviceTimelinePoint::RankCompactSpeculativeResponseReady)
+                 .from(DeviceTimelineRole::RankCollective)
+                 .publish(
+                     *backend,
+                     state_.device_id,
+                     handle->response_ready_event.get(),
+                     handle->stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to publish rank compact-outcome readiness");
+            return false;
+        }
+
+        handle->response_ready_after_rank_collective = true;
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost(
         const DeviceSpeculativeOutcomeHandle &handle,
         DeviceSpeculativeVerifyBatchOutcome *outcomes)
@@ -33072,10 +33996,18 @@ namespace llaminar2
                      * submission and then make the final D2H stream wait below
                      * pay for the same work a second time.
                      */
-                    if (!DeviceEventEdge::at(
-                             DeviceTimelinePoint::
-                                 CompactSpeculativeResponseReady)
-                             .from(DeviceTimelineRole::VerifierSummary)
+                    const DeviceTimelinePoint response_point =
+                        handle.response_ready_after_rank_collective
+                            ? DeviceTimelinePoint::
+                                  RankCompactSpeculativeResponseReady
+                            : DeviceTimelinePoint::
+                                  CompactSpeculativeResponseReady;
+                    const DeviceTimelineRole response_producer =
+                        handle.response_ready_after_rank_collective
+                            ? DeviceTimelineRole::RankCollective
+                            : DeviceTimelineRole::VerifierSummary;
+                    if (!DeviceEventEdge::at(response_point)
+                             .from(response_producer)
                              .to(DeviceTimelineRole::HostResultBridge)
                              .enqueueWait(
                                  *backend,

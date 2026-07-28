@@ -2683,6 +2683,130 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
         << "CUDA verifier GDN graphs must snapshot recurrence state rows for cheap MTP rollback";
 }
 
+/**
+ * @brief Prove independently replayable GDN graph roles cannot alias mutable scratch.
+ *
+ * Long prefill and grouped verifier graphs may be queued on different streams.
+ * Both deinterleave merged QKV and preserve in-place short-convolution input,
+ * so a device-wide literal scratch key lets one graph overwrite rows while the
+ * other graph is still consuming them. The graph builder owns the role policy:
+ * main inference keeps the legacy key, grouped verification receives a distinct
+ * role key, and layers within either role continue to share one allocation.
+ */
+TEST(Test__MTPGraphConstruction, CUDAGDNMutableScratchIsGraphRoleOwned)
+{
+    auto mpi = std::make_shared<MockMPIContext>(0, 1);
+    GraphConfig main_config = tinyQwen35GDNConfig(DeviceId::cuda(0));
+    main_config.mtp.draft_tokens = 2;
+    main_config.compute_all_position_logits = false;
+
+    GraphConfig verifier_config = main_config;
+    verifier_config.grouped_mtp_verifier = true;
+    verifier_config.compute_all_position_logits = true;
+
+    CPUHybridRingKVCacheFP32 cache(
+        tinyGDNHybridConfig(),
+        *mpi,
+        main_config.n_layers,
+        /*batch_size=*/1,
+        main_config.max_seq_len,
+        main_config.n_kv_heads,
+        main_config.head_dim,
+        DeviceId::cpu());
+
+    LayerWeights layer = tinyQwen35GDNLayerWeights(main_config);
+    ActivationBuffers main_buffers =
+        tinyQwen35GDNActivationBuffers(main_config, /*total_tokens=*/4);
+    ActivationBuffers verifier_buffers =
+        tinyQwen35GDNActivationBuffers(verifier_config, /*total_tokens=*/4);
+
+    Qwen35Graph main_builder(main_config, mpi);
+    ComputeGraph main_graph = main_builder.buildAttentionGraph(
+        layer,
+        main_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/4,
+        /*batch_size=*/1,
+        &cache,
+        /*position_ids=*/nullptr,
+        DeviceId::cuda(0),
+        /*sequence_lengths=*/nullptr);
+
+    Qwen35Graph verifier_builder(verifier_config, mpi);
+    ComputeGraph verifier_graph = verifier_builder.buildAttentionGraph(
+        layer,
+        verifier_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/4,
+        /*batch_size=*/1,
+        &cache,
+        /*position_ids=*/nullptr,
+        DeviceId::cuda(0),
+        /*sequence_lengths=*/nullptr);
+
+    const auto *main_conv = dynamic_cast<const ShortConv1dStage *>(
+        main_graph.getNode("layer0_short_conv")->stage.get());
+    const auto *verifier_conv = dynamic_cast<const ShortConv1dStage *>(
+        verifier_graph.getNode("layer0_short_conv")->stage.get());
+    const auto *main_recurrence = dynamic_cast<const GDNRecurrenceStage *>(
+        main_graph.getNode("layer0_gdn_recurrence")->stage.get());
+    const auto *verifier_recurrence = dynamic_cast<const GDNRecurrenceStage *>(
+        verifier_graph.getNode("layer0_gdn_recurrence")->stage.get());
+    ASSERT_NE(main_conv, nullptr);
+    ASSERT_NE(verifier_conv, nullptr);
+    ASSERT_NE(main_recurrence, nullptr);
+    ASSERT_NE(verifier_recurrence, nullptr);
+
+    const WorkspaceRequirements main_conv_reqs =
+        main_conv->getWorkspaceRequirements(/*m=*/4);
+    const WorkspaceRequirements verifier_conv_reqs =
+        verifier_conv->getWorkspaceRequirements(/*m=*/4);
+    EXPECT_NE(
+        main_conv_reqs.find(ShortConv1dStage::WS_INPLACE_PREFILL_SCRATCH),
+        nullptr);
+    EXPECT_EQ(
+        verifier_conv_reqs.find(ShortConv1dStage::WS_INPLACE_PREFILL_SCRATCH),
+        nullptr);
+    EXPECT_NE(
+        verifier_conv_reqs.find(
+            "gdn_shortconv_inplace_scratch_grouped_mtp_verifier"),
+        nullptr);
+
+    const WorkspaceRequirements main_recurrence_reqs =
+        main_recurrence->getWorkspaceRequirements(/*m=*/4);
+    const WorkspaceRequirements verifier_recurrence_reqs =
+        verifier_recurrence->getWorkspaceRequirements(/*m=*/4);
+    EXPECT_NE(
+        main_recurrence_reqs.find(GDNRecurrenceStage::WS_DEINTERLEAVE_SCRATCH),
+        nullptr);
+    EXPECT_EQ(
+        verifier_recurrence_reqs.find(GDNRecurrenceStage::WS_DEINTERLEAVE_SCRATCH),
+        nullptr);
+    EXPECT_NE(
+        verifier_recurrence_reqs.find(
+            "gdn_deinterleave_scratch_grouped_mtp_verifier"),
+        nullptr);
+
+    ShortConv1dStage::Params second_conv_params = verifier_conv->getParams();
+    second_conv_params.layer_idx = 1;
+    ShortConv1dStage second_conv(std::move(second_conv_params));
+    EXPECT_NE(
+        second_conv.getWorkspaceRequirements(/*m=*/4).find(
+            "gdn_shortconv_inplace_scratch_grouped_mtp_verifier"),
+        nullptr)
+        << "Serialized layers in one graph role must reuse one economical scratch allocation.";
+
+    GDNRecurrenceStage::Params second_recurrence_params =
+        verifier_recurrence->getParams();
+    second_recurrence_params.layer_idx = 1;
+    GDNRecurrenceStage second_recurrence(std::move(second_recurrence_params));
+    EXPECT_NE(
+        second_recurrence.getWorkspaceRequirements(/*m=*/4).find(
+            "gdn_deinterleave_scratch_grouped_mtp_verifier"),
+        nullptr)
+        << "Serialized layers in one graph role must reuse one economical scratch allocation.";
+}
+
 TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresRequestBatchedStateCaptureWorkspace)
 {
     auto mpi = std::make_shared<MockMPIContext>(0, 1);

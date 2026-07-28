@@ -118,6 +118,57 @@ namespace llaminar2
                 const GraphConfig &config,
                 const IMPIContext *mpi_ctx);
 
+    protected:
+        /**
+         * @brief Optionally insert one terminal-row checkpoint into a GDN graph.
+         *
+         * The dense graph has no diagnostic storage and returns @p dependency
+         * unchanged. Derived graph families can override this hook to make
+         * projection, short-convolution, recurrence, and output-projection
+         * boundaries observable without teaching the GDN graph builder about
+         * a particular logging or tensor-retention policy.
+         *
+         * Implementations that add a node must return that node's name. The
+         * caller makes the next mutating GDN stage depend on it, so an in-place
+         * short-convolution cannot overwrite the projection row before the
+         * checkpoint has captured it.
+         *
+         * @param graph GDN subgraph being assembled.
+         * @param boundary Stable backend-neutral boundary name.
+         * @param source Tensor whose final real row is retained.
+         * @param dependency Producer that must complete before row selection.
+         * @param layer_idx Global transformer layer index.
+         * @param total_tokens Flattened captured graph row count.
+         * @param feature_dim Number of FP32 values in one source row.
+         * @param device Device that owns both source and checkpoint.
+         * @param sequence_lengths_device Resident real-length owner for padded
+         *        prefill, or null for exact-row graph regimes.
+         * @return @p dependency when disabled, otherwise the inserted node.
+         */
+        virtual std::string maybeAddGDNDiagnosticCheckpoint(
+            ComputeGraph &graph,
+            const std::string &boundary,
+            const ITensor *source,
+            const std::string &dependency,
+            int layer_idx,
+            int total_tokens,
+            int feature_dim,
+            DeviceId device,
+            const int32_t *sequence_lengths_device);
+
+        /**
+         * @brief Resolve the independently executable GDN graph-role namespace.
+         *
+         * Mutable long-context scratch is shared by all serialized GDN layers
+         * in one graph role, but it must never alias another role that may
+         * replay on a different stream. Keeping this policy in the declarative
+         * graph builder makes the ownership distinction explicit and prevents
+         * individual stages from inventing ad hoc workspace identities.
+         *
+         * @return Empty for main inference, otherwise a stable role name.
+         */
+        std::string gdnWorkspaceRoleNamespace() const;
+
     private:
         // =====================================================================
         // FA (Full Attention) Sub-Graph Building

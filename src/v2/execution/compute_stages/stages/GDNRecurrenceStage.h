@@ -57,7 +57,6 @@ namespace llaminar2
     {
     public:
         static constexpr const char *WS_DEINTERLEAVE_SCRATCH = "gdn_deinterleave_scratch";
-        static constexpr const char *WS_EFFECTIVE_SEQ_LEN_SCALAR = "gdn_effective_seq_len_scalar";
         static constexpr const char *WS_SPECULATIVE_STATE_SLOTS = "gdn_speculative_state_slots";
         static constexpr const char *WS_SPECULATIVE_STATE_WORK = "gdn_speculative_state_work";
 
@@ -130,10 +129,15 @@ namespace llaminar2
             /**
              * @brief Stable graph/workspace namespace for capture-sensitive buffers.
              *
-             * Main verifier graphs and MTP sidecar graphs can both contain a GDN
-             * recurrence stage for the same logical layer.  Their verifier-row
-             * snapshot slots must not alias, so graph builders pass a role prefix
-             * such as `layer12` or `MTP0` here.
+             * Main inference, grouped verifier, and live request-batch graphs can
+             * execute independently on different streams. Their verifier-row
+             * snapshots and mutable prefill scratch must therefore not alias.
+             * Graph builders pass a graph-role prefix such as
+             * `grouped_mtp_verifier`; the stage appends the logical layer only
+             * for buffers whose contents are layer-persistent.
+             *
+             * An empty namespace denotes the main inference role and preserves
+             * its historical workspace keys.
              */
             std::string workspace_namespace;
             int verifier_state_capture_rows = 0; ///< Compatibility spelling for speculative state slots.
@@ -152,7 +156,7 @@ namespace llaminar2
         static_assert(StageParamsRequired<Params>);
 
         explicit GDNRecurrenceStage(Params params);
-        ~GDNRecurrenceStage() override;
+        ~GDNRecurrenceStage() override = default;
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::GDN_RECURRENCE; }
@@ -204,9 +208,9 @@ namespace llaminar2
         /**
          * @brief Reset request-local GDN metadata while preserving capture slots.
          *
-         * Prefill graphs capture recurrent-state snapshot buffers and the
-         * effective-length scalar by address. The replay prelude refreshes the
-         * scalar before launch, and onGraphReplayed() rebinds the kernel for
+         * Prefill graphs capture recurrent-state snapshot buffers by address
+         * and read each request's real length from the stable device request
+         * metadata allocation. onGraphReplayed() rebinds the kernel for
          * publication. Do not clear the verifier workspace binding while a
          * Ready prefill executable is being preserved.
          */
@@ -293,13 +297,10 @@ namespace llaminar2
         const Params &getParams() const { return params_; }
 
     private:
-        struct GpuEffectiveSeqLenState;
-
         Params params_;
         int prefill_effective_seq_len_ = 0;
         int prefill_bucket_seq_len_ = 0;
         bool prefill_replay_params_set_ = false;
-        std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
         uint32_t workspace_slice_id_ = 0;
         bool verifier_capture_workspace_bound_ = false;
@@ -317,16 +318,12 @@ namespace llaminar2
         int effectivePrefillSeqLen() const;
         bool shouldUseRealLengthContract() const;
         std::string workspaceStableId() const;
-        std::string effectiveSeqLenScalarBufferName() const;
+        std::string deinterleaveScratchBufferName() const;
         std::string speculativeStateSlotsBufferName() const;
         std::string speculativeStateWorkBufferName() const;
         int requestedSpeculativeStateSlotRows() const;
         bool verifierStateCaptureWorkspaceRequired() const;
         bool ensureVerifierStateCaptureWorkspaceBound() const;
-        bool ensureGpuEffectiveSeqLenStateInitialized();
-        bool uploadGpuEffectiveSeqLen();
-        void refreshPinnedEffectiveSeqLen();
-        void releaseGpuEffectiveSeqLenState();
         void bindKernelWorkspace();
         void clearKernelVerifierStateWorkspace();
         const float *cpuVerifierStateCaptureSource() const;

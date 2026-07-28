@@ -1824,6 +1824,24 @@ public:
         return out_handle->valid();
     }
 
+    bool publishRankCompactSpeculativeResponseReady(
+        DeviceSpeculativeOutcomeHandle *handle) override
+    {
+        ++publish_rank_compact_response_ready_calls_;
+        if (!handle ||
+            !handle->valid() ||
+            handle->device != device_id_ ||
+            handle->stream != &resident_stream_token_ ||
+            handle->response_ready_event.get() !=
+                &resident_outcome_ready_event_token_ ||
+            handle->response_ready_after_rank_collective)
+        {
+            return false;
+        }
+        handle->response_ready_after_rank_collective = true;
+        return true;
+    }
+
     void clear_cache() override
     {
         clear_cache_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -2337,6 +2355,10 @@ public:
     }
     size_t verify_stochastic_batch_outcome_call_count() const { return verify_stochastic_batch_outcome_calls_; }
     size_t verify_stochastic_request_batch_outcome_call_count() const { return verify_stochastic_request_batch_outcome_calls_; }
+    size_t publish_rank_compact_response_ready_call_count() const
+    {
+        return publish_rank_compact_response_ready_calls_;
+    }
     size_t verify_greedy_all_position_batch_outcome_call_count() const { return verify_greedy_all_position_batch_outcome_calls_; }
     size_t forward_mtp_from_resident_logical_state_call_count() const
     {
@@ -2641,6 +2663,7 @@ private:
     size_t stage_stochastic_target_token_calls_ = 0;
     size_t verify_stochastic_batch_outcome_calls_ = 0;
     size_t verify_stochastic_request_batch_outcome_calls_ = 0;
+    size_t publish_rank_compact_response_ready_calls_ = 0;
     size_t verify_greedy_all_position_batch_outcome_calls_ = 0;
     size_t forward_mtp_from_resident_logical_state_calls_ = 0;
     size_t last_penalty_count_ = 0;
@@ -6634,6 +6657,9 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomeSamplesOnceAndSta
         /*inverse_sample_first_logical_position=*/64,
         /*use_vllm_probability_rejection=*/true));
     ASSERT_TRUE(handle.valid());
+    EXPECT_EQ(runner0_ptr->publish_rank_compact_response_ready_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->publish_rank_compact_response_ready_call_count(), 1u);
+    EXPECT_TRUE(handle.response_ready_after_rank_collective);
     EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 3u)
         << "The first target, draft proposal, and compact verifier outcome "
            "must each enter one rank-level grouped collective, independent of "

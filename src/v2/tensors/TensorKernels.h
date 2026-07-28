@@ -3437,15 +3437,15 @@ namespace llaminar2
             return true;
         }
 
-        /// Size of the currently selected persistent recurrent-state bank.
+        /// Size of the immutable primary persistent conv-state bank.
         virtual size_t stateBytes() const { return 0; }
 
         /// Largest resident conv-state bank, if multiple live banks are held.
         virtual size_t largestStateBytes() const { return stateBytes(); }
 
-        /// Export the selected persistent state. When stream is non-null, GPU
-        /// implementations may enqueue async copies; callers must synchronize
-        /// the stream before consuming the exported payload.
+        /// Export the immutable primary persistent state. Multi-geometry GPU
+        /// callers must use exportStateForSize() so graph construction never
+        /// depends on mutable selected-bank host state.
         virtual bool exportState(void *dst_host, void *dst_device, void *stream) const
         {
             (void)dst_host;
@@ -3463,9 +3463,8 @@ namespace llaminar2
             return exportState(dst_host, dst_device, stream);
         }
 
-        /// Import implementation-owned state. When stream is non-null, GPU
-        /// implementations may enqueue async copies; callers must synchronize
-        /// the stream before using the imported state.
+        /// Import the immutable primary implementation-owned state.
+        /// Multi-geometry GPU callers must use importStateForSize().
         virtual bool importState(const void *src_host, const void *src_device, void *stream)
         {
             (void)src_host;
@@ -3723,15 +3722,15 @@ namespace llaminar2
             return true;
         }
 
-        /// Size of the currently selected persistent recurrent-state bank.
+        /// Size of the immutable primary persistent recurrence-state bank.
         virtual size_t stateBytes() const { return 0; }
 
         /// Largest resident recurrence-state bank, if multiple live banks are held.
         virtual size_t largestStateBytes() const { return stateBytes(); }
 
-        /// Export the selected persistent state. When stream is non-null, GPU
-        /// implementations may enqueue async copies; callers must synchronize
-        /// the stream before consuming the exported payload.
+        /// Export the immutable primary persistent state. Multi-geometry GPU
+        /// callers must use exportStateForSize() so graph construction never
+        /// depends on mutable selected-bank host state.
         virtual bool exportState(void *dst_host, void *dst_device, void *stream) const
         {
             (void)dst_host;
@@ -3749,9 +3748,8 @@ namespace llaminar2
             return exportState(dst_host, dst_device, stream);
         }
 
-        /// Import implementation-owned state. When stream is non-null, GPU
-        /// implementations may enqueue async copies; callers must synchronize
-        /// the stream before using the imported state.
+        /// Import the immutable primary implementation-owned state.
+        /// Multi-geometry GPU callers must use importStateForSize().
         virtual bool importState(const void *src_host, const void *src_device, void *stream)
         {
             (void)src_host;

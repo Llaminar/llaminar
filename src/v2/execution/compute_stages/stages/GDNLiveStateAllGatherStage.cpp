@@ -183,14 +183,6 @@ namespace llaminar2
                  * degree * local floats into a full buffer that is only local
                  * floats wide.
                  */
-                if (params_.conv_kernel->stateBytes() !=
-                    static_cast<size_t>(params_.full_conv_state_floats) * sizeof(float))
-                {
-                    LOG_ERROR("[GDNLiveStateAllGatherStage] Short-conv kernel is not full-sized for no-op handoff"
-                              << " expected_bytes=" << (static_cast<size_t>(params_.full_conv_state_floats) * sizeof(float))
-                              << " actual_bytes=" << params_.conv_kernel->stateBytes());
-                    return false;
-                }
                 return true;
             }
             if (!params_.modular_conv_state &&
@@ -246,15 +238,6 @@ namespace llaminar2
                 LOG_ERROR("[GDNLiveStateAllGatherStage] Uniform conv state must not carry modular layout fields");
                 return false;
             }
-            if (params_.conv_kernel->stateBytes() !=
-                static_cast<size_t>(params_.local_conv_state_floats) * sizeof(float))
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Short-conv kernel state is not local-sized before handoff"
-                          << " expected_bytes=" << (static_cast<size_t>(params_.local_conv_state_floats) * sizeof(float))
-                          << " actual_bytes=" << params_.conv_kernel->stateBytes());
-                return false;
-            }
-
             const std::string local_name = localConvBufferName();
             const std::string full_name = fullConvBufferName();
             const std::string gathered_name = gatheredConvBufferName();
@@ -273,7 +256,11 @@ namespace llaminar2
                 LOG_ERROR("[GDNLiveStateAllGatherStage] Missing gathered modular conv workspace buffer");
                 return false;
             }
-            if (!params_.conv_kernel->exportState(nullptr, local, stream))
+            if (!params_.conv_kernel->exportStateForSize(
+                    params_.local_conv_state_floats,
+                    nullptr,
+                    local,
+                    stream))
             {
                 LOG_ERROR("[GDNLiveStateAllGatherStage] Failed to export short-conv state");
                 return false;
@@ -368,14 +355,6 @@ namespace llaminar2
                  * recurrence bank to gather, so preserve the current kernel
                  * state and let downstream replicated decode consume it.
                  */
-                if (params_.recurrence_kernel->stateBytes() !=
-                    static_cast<size_t>(params_.full_recurrence_state_floats) * sizeof(float))
-                {
-                    LOG_ERROR("[GDNLiveStateAllGatherStage] Recurrence kernel is not full-sized for no-op handoff"
-                              << " expected_bytes=" << (static_cast<size_t>(params_.full_recurrence_state_floats) * sizeof(float))
-                              << " actual_bytes=" << params_.recurrence_kernel->stateBytes());
-                    return false;
-                }
                 return true;
             }
             if (params_.local_recurrence_state_floats <= 0 ||
@@ -389,15 +368,6 @@ namespace llaminar2
                           << " degree=" << params_.tp_ctx->degree());
                 return false;
             }
-            if (params_.recurrence_kernel->stateBytes() !=
-                static_cast<size_t>(params_.local_recurrence_state_floats) * sizeof(float))
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Recurrence kernel state is not local-sized before handoff"
-                          << " expected_bytes=" << (static_cast<size_t>(params_.local_recurrence_state_floats) * sizeof(float))
-                          << " actual_bytes=" << params_.recurrence_kernel->stateBytes());
-                return false;
-            }
-
             const std::string local_name = localRecurrenceBufferName();
             const std::string full_name = fullRecurrenceBufferName();
             auto *local = static_cast<float *>(bound_workspace_->getBuffer(local_name));
@@ -407,7 +377,11 @@ namespace llaminar2
                 LOG_ERROR("[GDNLiveStateAllGatherStage] Missing recurrence workspace buffers");
                 return false;
             }
-            if (!params_.recurrence_kernel->exportState(nullptr, local, stream))
+            if (!params_.recurrence_kernel->exportStateForSize(
+                    params_.local_recurrence_state_floats,
+                    nullptr,
+                    local,
+                    stream))
             {
                 LOG_ERROR("[GDNLiveStateAllGatherStage] Failed to export recurrence state");
                 return false;

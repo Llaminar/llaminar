@@ -1758,6 +1758,85 @@ namespace llaminar2::test::parity::qwen36
             });
     }
 
+    /**
+     * @brief Return whether a positive counter carries one exact metadata tag.
+     *
+     * Graph-capture diagnostics publish records for the main decode graph and
+     * the MTP sidecar graph under the same counter names.  Requiring a positive
+     * value and an exact tag prevents a zero-valued planning record from being
+     * mistaken for proof that a native graph was instantiated or replayed.
+     *
+     * @param records Request-local PerfStats records.
+     * @param domain PerfStats domain to inspect.
+     * @param name Counter name to inspect.
+     * @param tag_key Metadata key that must be present.
+     * @param tag_value Exact metadata value required by the caller.
+     * @return True when at least one positive matching counter exists.
+     */
+    inline bool hasPositivePerfCounterTag(
+        const std::vector<PerfStatRecord> &records,
+        const char *domain,
+        const char *name,
+        const char *tag_key,
+        const char *tag_value)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                if (record.kind != PerfStatRecord::Kind::Counter ||
+                    record.domain != domain ||
+                    record.name != name ||
+                    record.value <= 0.0)
+                {
+                    return false;
+                }
+                const auto it = record.tags.find(tag_key);
+                return it != record.tags.end() && it->second == tag_value;
+            });
+    }
+
+    /**
+     * @brief Return whether a positive counter tag begins with a stable prefix.
+     *
+     * MTP sidecar graph contexts append resident-input and graph-bucket policy
+     * fields to their cache identity.  Tests need to prove that the sidecar
+     * family executed without coupling themselves to those useful diagnostic
+     * suffixes.
+     *
+     * @param records Request-local PerfStats records.
+     * @param domain PerfStats domain to inspect.
+     * @param name Counter name to inspect.
+     * @param tag_key Metadata key that must be present.
+     * @param tag_prefix Prefix required at the beginning of the metadata value.
+     * @return True when at least one positive matching counter exists.
+     */
+    inline bool hasPositivePerfCounterTagPrefix(
+        const std::vector<PerfStatRecord> &records,
+        const char *domain,
+        const char *name,
+        const char *tag_key,
+        const char *tag_prefix)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                if (record.kind != PerfStatRecord::Kind::Counter ||
+                    record.domain != domain ||
+                    record.name != name ||
+                    record.value <= 0.0)
+                {
+                    return false;
+                }
+                const auto it = record.tags.find(tag_key);
+                return it != record.tags.end() &&
+                       it->second.rfind(tag_prefix, 0) == 0;
+            });
+    }
+
     inline double perfCounterSum(
         const std::vector<PerfStatRecord> &records,
         const std::string &domain,
@@ -1774,6 +1853,95 @@ namespace llaminar2::test::parity::qwen36
             }
         }
         return total;
+    }
+
+    /**
+     * @brief Format every stochastic MTP transaction recorded by one request.
+     *
+     * Aggregate counters can remain identical while a replayed graph consumes
+     * one stale token, position, or sampling input.  The acceptance trace names
+     * those device-owned transaction inputs and outputs.  Rendering it only in
+     * assertion diagnostics keeps successful integration runs compact while
+     * making a failed long-context request actionable without another run.
+     *
+     * @param records Request-local PerfStats records.
+     * @return One stable, line-oriented record per stochastic transaction.
+     */
+    inline std::string formatMTPAcceptanceTrace(
+        const std::vector<PerfStatRecord> &records)
+    {
+        std::ostringstream trace;
+        bool found = false;
+        for (const auto &record : records)
+        {
+            if (record.kind != PerfStatRecord::Kind::Counter ||
+                record.domain != "mtp" ||
+                record.name != "acceptance_trace")
+            {
+                continue;
+            }
+
+            found = true;
+            trace << "  count=" << record.value;
+            for (const auto &[key, value] : record.tags)
+            {
+                trace << ' ' << key << '=' << value;
+            }
+            trace << '\n';
+        }
+        if (!found)
+        {
+            trace << "  <no mtp.acceptance_trace records>\n";
+        }
+        return trace.str();
+    }
+
+    /**
+     * @brief Canonicalize stochastic transaction semantics across request epochs.
+     *
+     * Request epochs intentionally advance after clearCache(), but every other
+     * acceptance-trace field must be reproducible for the same prompt, model,
+     * sampling seed, and depth policy.  Sorting also makes this comparison
+     * independent of PerfStats' aggregate-map iteration order.
+     */
+    inline std::vector<std::string> canonicalMTPAcceptanceTrace(
+        const std::vector<PerfStatRecord> &records)
+    {
+        std::vector<std::string> canonical;
+        for (const auto &record : records)
+        {
+            if (record.kind != PerfStatRecord::Kind::Counter ||
+                record.domain != "mtp" ||
+                record.name != "acceptance_trace")
+            {
+                continue;
+            }
+
+            std::ostringstream row;
+            row << "count=" << record.value;
+            for (const auto &[key, value] : record.tags)
+            {
+                if (key != "request_epoch")
+                    row << ' ' << key << '=' << value;
+            }
+            canonical.push_back(row.str());
+        }
+        std::sort(canonical.begin(), canonical.end());
+        return canonical;
+    }
+
+    inline std::string formatTokenIds(const std::vector<int32_t> &tokens)
+    {
+        std::ostringstream formatted;
+        formatted << '{';
+        for (size_t i = 0; i < tokens.size(); ++i)
+        {
+            if (i > 0)
+                formatted << ',';
+            formatted << tokens[i];
+        }
+        formatted << '}';
+        return formatted.str();
     }
 
     inline void expectPerfCounterPositive(
@@ -2034,6 +2202,110 @@ namespace llaminar2::test::parity::qwen36
         }
 
         expectPerfCounterZero(records, "mtp", counter_name, context);
+    }
+
+    /**
+     * @brief Prove homogeneous GPU MoE MTP used whole native graph replay.
+     *
+     * A CUDA-only or ROCm-only graph has a backend-native NCCL/RCCL collective
+     * domain.  Both the main decode graph and the grouped MTP sidecar therefore
+     * have to execute as one captured graph each.  Segmented planning, capture,
+     * or replay is an architectural failure for these topologies, even when
+     * the emitted token stream remains numerically correct.
+     *
+     * Heterogeneous device mixes are intentionally excluded because a
+     * cross-backend collective boundary is the one topology where explicit
+     * graph segments may be required.
+     *
+     * @param test_case MoE integration fixture whose topology is under test.
+     * @param records Request-local PerfStats evidence.
+     * @param context Human-readable request label for assertion failures.
+     */
+    inline void expectMoEHomogeneousGPUFullGraphReplay(
+        const MoEPrefixRestoreParityCase &test_case,
+        const std::vector<PerfStatRecord> &records,
+        const std::string &context)
+    {
+        if (test_case.devices.empty())
+        {
+            return;
+        }
+
+        const bool all_cuda = std::all_of(
+            test_case.devices.begin(),
+            test_case.devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.isCUDA();
+            });
+        const bool all_rocm = std::all_of(
+            test_case.devices.begin(),
+            test_case.devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.isROCm();
+            });
+        if (!all_cuda && !all_rocm)
+        {
+            return;
+        }
+
+        EXPECT_TRUE(hasPositivePerfCounterTag(
+            records,
+            "forward_graph",
+            "full_graph_plan_graphs",
+            "type",
+            "capturable"))
+            << context << " did not produce a whole-graph capture plan.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+
+        const bool captured_full_graph = hasPerfCounter(
+            records,
+            "forward_graph",
+            "full_graph_capture_executable_nodes");
+        const bool replayed_full_graph = hasPerfCounter(
+            records,
+            "forward_graph",
+            "full_graph_replay_calls");
+        EXPECT_TRUE(captured_full_graph || replayed_full_graph)
+            << context << " neither instantiated nor replayed a whole native graph.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+
+        const bool captured_full_sidecar = hasPositivePerfCounterTagPrefix(
+            records,
+            "forward_graph",
+            "full_graph_capture_executable_nodes",
+            "context",
+            "mtp_decode_sidecar");
+        const bool replayed_full_sidecar = hasPositivePerfCounterTagPrefix(
+            records,
+            "forward_graph",
+            "full_graph_replay_calls",
+            "context",
+            "mtp_decode_sidecar");
+        EXPECT_TRUE(captured_full_sidecar || replayed_full_sidecar)
+            << context << " neither captured nor replayed the grouped MTP "
+                          "sidecar as one native graph.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+
+        EXPECT_FALSE(hasPerfCounter(
+            records,
+            "forward_graph",
+            "segmented_plan_segments"))
+            << context << " produced a segmented plan on homogeneous GPUs.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+        EXPECT_FALSE(hasPerfCounter(
+            records,
+            "forward_graph",
+            "segmented_graph_capture_executable_nodes"))
+            << context << " instantiated a segmented graph on homogeneous GPUs.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+        EXPECT_FALSE(hasPerfCounter(
+            records,
+            "forward_graph",
+            "segmented_replay_segments"))
+            << context << " executed segmented replay on homogeneous GPUs.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
     }
 
     inline bool hasMTPPerfRecordTag(
@@ -3168,7 +3440,7 @@ namespace llaminar2::test::parity::qwen36
         mtp->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
         const auto after_first = mtp->prefixStateProbe();
         const auto first_records = PerfStatsCollector::snapshot(
-            {"mtp", "prefix_cache", "moe_rebalance", "kernel"});
+            {"mtp", "prefix_cache", "moe_rebalance", "kernel", "forward_graph"});
         ASSERT_TRUE(first.error.empty()) << first.error;
         ASSERT_EQ(first.tokens.size(), reference_tokens.size());
         EXPECT_EQ(first.tokens, reference_tokens);
@@ -3184,6 +3456,10 @@ namespace llaminar2::test::parity::qwen36
             first_records,
             test_case.name + " first request");
         expectMoERebalancePerfPath(
+            test_case,
+            first_records,
+            test_case.name + " first request");
+        expectMoEHomogeneousGPUFullGraphReplay(
             test_case,
             first_records,
             test_case.name + " first request");
@@ -3206,7 +3482,7 @@ namespace llaminar2::test::parity::qwen36
         mtp->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
         const auto after_second = mtp->prefixStateProbe();
         const auto second_records = PerfStatsCollector::snapshot(
-            {"mtp", "prefix_cache", "moe_rebalance", "kernel"});
+            {"mtp", "prefix_cache", "moe_rebalance", "kernel", "forward_graph"});
         mtp->shutdown();
 
         ASSERT_TRUE(second.error.empty()) << second.error;
@@ -3244,6 +3520,10 @@ namespace llaminar2::test::parity::qwen36
             test_case.name + " restored request",
             /*require_fresh_movement=*/false);
         expectMoEBackendKernelPerfPath(
+            test_case,
+            second_records,
+            test_case.name + " restored request");
+        expectMoEHomogeneousGPUFullGraphReplay(
             test_case,
             second_records,
             test_case.name + " restored request");
@@ -3385,7 +3665,8 @@ namespace llaminar2::test::parity::qwen36
         int draft_depth = 1,
         bool require_stochastic_outcome_after_reuse = false,
         MTPDepthPolicyConfig mtp_depth_policy = {},
-        bool enable_prefix_cache = false)
+        bool enable_prefix_cache = false,
+        int clear_cache_repetitions = 1)
     {
         ScopedMoEParityProductionMode production_mode(
             shouldForceMoEParityProductionMode(test_case));
@@ -3422,6 +3703,9 @@ namespace llaminar2::test::parity::qwen36
         const int requested_draft_depth = std::max(1, draft_depth);
         const bool dynamic_depth =
             mtp_depth_policy.mode == MTPDepthPolicyMode::Dynamic;
+        ASSERT_GE(clear_cache_repetitions, 1)
+            << "A stochastic request-reset regression must exercise at least "
+               "one clearCache() boundary";
         /*
          * Reserve one output slot for the first sampled token plus the full
          * requested draft.  Without this lower bound, depth-3 and dynamic-depth
@@ -3481,13 +3765,17 @@ namespace llaminar2::test::parity::qwen36
         mtp->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
         const auto after_first_mtp = mtp->prefixStateProbe();
         const auto first_mtp_records = PerfStatsCollector::snapshot(
-            {"mtp", "prefix_cache", "moe_rebalance", "kernel"});
+            {"mtp", "prefix_cache", "moe_rebalance", "kernel", "forward_graph"});
         ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
         ASSERT_EQ(mtp_result.tokens.size(), static_cast<size_t>(stochastic_decode_steps));
         EXPECT_EQ(mtp_result.tokens, baseline_result.tokens)
             << "MoE stochastic MTP must match serial stochastic decode for "
                "the same seed on the first request";
         expectMoERebalancePerfPath(
+            test_case,
+            first_mtp_records,
+            test_case.name + " stochastic first request");
+        expectMoEHomogeneousGPUFullGraphReplay(
             test_case,
             first_mtp_records,
             test_case.name + " stochastic first request");
@@ -3508,7 +3796,7 @@ namespace llaminar2::test::parity::qwen36
             mtp->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
             const auto after_restored_mtp = mtp->prefixStateProbe();
             const auto restored_records = PerfStatsCollector::snapshot(
-                {"mtp", "prefix_cache", "moe_rebalance", "kernel"});
+                {"mtp", "prefix_cache", "moe_rebalance", "kernel", "forward_graph"});
 
             ASSERT_TRUE(restored_mtp_result.error.empty())
                 << restored_mtp_result.error;
@@ -3556,6 +3844,10 @@ namespace llaminar2::test::parity::qwen36
                 test_case,
                 restored_records,
                 test_case.name + " stochastic restored-prefix request");
+            expectMoEHomogeneousGPUFullGraphReplay(
+                test_case,
+                restored_records,
+                test_case.name + " stochastic restored-prefix request");
             if (test_case.topology ==
                     MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly ||
                 test_case.topology ==
@@ -3594,8 +3886,8 @@ namespace llaminar2::test::parity::qwen36
             }
         }
 
-        mtp->clearCache();
         PerfStatsCollector::reset();
+        mtp->clearCache();
         phase_start = parityPhaseStart();
         auto reused_mtp_result =
             mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
@@ -3604,20 +3896,71 @@ namespace llaminar2::test::parity::qwen36
         const auto after_reused_mtp = mtp->prefixStateProbe();
         const auto phase138_records =
             PerfStatsCollector::snapshot(
-                {"mtp", "prefix_cache", "moe_rebalance", "kernel"});
-        mtp->shutdown();
+                {"mtp",
+                 "prefix_cache",
+                 "moe_rebalance",
+                 "kernel",
+                 "forward_graph",
+                 "request_reset"});
 
         ASSERT_TRUE(reused_mtp_result.error.empty()) << reused_mtp_result.error;
         ASSERT_EQ(reused_mtp_result.tokens.size(), mtp_result.tokens.size());
         EXPECT_EQ(reused_mtp_result.tokens, baseline_result.tokens)
             << "MoE stochastic MTP after clearCache() must match serial "
-               "stochastic decode for the same seed";
+               "stochastic decode for the same seed.\n"
+            << "First-request MTP acceptance trace:\n"
+            << formatMTPAcceptanceTrace(first_mtp_records)
+            << "Post-clearCache MTP acceptance trace:\n"
+            << formatMTPAcceptanceTrace(phase138_records);
+        EXPECT_EQ(
+            canonicalMTPAcceptanceTrace(phase138_records),
+            canonicalMTPAcceptanceTrace(first_mtp_records))
+            << "MoE stochastic MTP transaction semantics changed after "
+               "clearCache(); request_epoch is the only intentionally "
+               "different trace field.\n"
+            << "First-request MTP acceptance trace:\n"
+            << formatMTPAcceptanceTrace(first_mtp_records)
+            << "Post-clearCache MTP acceptance trace:\n"
+            << formatMTPAcceptanceTrace(phase138_records);
+        if (reused_mtp_result.tokens != baseline_result.tokens ||
+            reused_mtp_result.tokens != mtp_result.tokens)
+        {
+            mtp->shutdown();
+            return;
+        }
         EXPECT_EQ(reused_mtp_result.tokens, mtp_result.tokens)
-            << "MoE stochastic MTP with the same seed must be reproducible after clearCache()";
+            << "MoE stochastic MTP with the same seed must be reproducible "
+               "after clearCache().\n"
+            << "First-request MTP acceptance trace:\n"
+            << formatMTPAcceptanceTrace(first_mtp_records)
+            << "Post-clearCache MTP acceptance trace:\n"
+            << formatMTPAcceptanceTrace(phase138_records);
         expectMoEMTPHeadOwnershipPerfPath(
             test_case,
             phase138_records,
             test_case.name + " stochastic post-clearCache request");
+        expectMoEHomogeneousGPUFullGraphReplay(
+            test_case,
+            phase138_records,
+            test_case.name + " stochastic post-clearCache request");
+        if (moEPrefixCaseUsesGPU(test_case))
+        {
+            expectPerfCounterPositive(
+                phase138_records,
+                "request_reset",
+                "device_prior_work_joins",
+                test_case.name + " stochastic post-clearCache request");
+            expectPerfCounterPositive(
+                phase138_records,
+                "request_reset",
+                "device_state_ready_events",
+                test_case.name + " stochastic post-clearCache request");
+            expectPerfCounterPositive(
+                phase138_records,
+                "request_reset",
+                "device_state_ready_waits",
+                test_case.name + " stochastic post-clearCache request");
+        }
         if (enable_prefix_cache &&
             test_case.topology == MoEPrefixParityTopology::NodeLocalTP &&
             !moEPrefixCaseUsesGPU(test_case))
@@ -3812,6 +4155,104 @@ namespace llaminar2::test::parity::qwen36
             << "Stateful Qwen3.6 MoE stochastic MTP must not use the retired "
                "accepted-count publication candidate\n"
             << PerfStatsCollector::summaryString({"mtp"});
+
+        /*
+         * Reuse one initialized runner so this lifecycle stress costs only
+         * repeated request execution, not twenty 35B model loads.  Stop on the
+         * first mismatch and print the exact transaction pair that crossed the
+         * bad reset boundary.
+         */
+        for (int repetition = 1;
+             repetition < clear_cache_repetitions;
+             ++repetition)
+        {
+            PerfStatsCollector::reset();
+            mtp->clearCache();
+            const auto repetition_start = parityPhaseStart();
+            const auto stress_result =
+                mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
+            const std::string stress_phase =
+                "stochastic-mtp.clear-cache-stress-" +
+                std::to_string(repetition + 1);
+            logMoEParityPhase(
+                test_case,
+                stress_phase.c_str(),
+                repetition_start);
+            mtp->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
+            const auto stress_snapshot = mtp->prefixStateProbe();
+            const auto stress_records = PerfStatsCollector::snapshot(
+                {"mtp",
+                 "prefix_cache",
+                 "moe_rebalance",
+                 "kernel",
+                 "forward_graph",
+                 "request_reset"});
+
+            if (!stress_result.error.empty() ||
+                stress_result.tokens.size() != mtp_result.tokens.size() ||
+                stress_result.tokens != baseline_result.tokens ||
+                stress_result.tokens != mtp_result.tokens ||
+                canonicalMTPAcceptanceTrace(stress_records) !=
+                    canonicalMTPAcceptanceTrace(first_mtp_records))
+            {
+                ADD_FAILURE()
+                    << test_case.name
+                    << " stochastic MTP diverged after clearCache() repetition "
+                    << (repetition + 1)
+                    << " error=" << stress_result.error << "\n"
+                    << "baseline=" << formatTokenIds(baseline_result.tokens)
+                    << "\nfirst=" << formatTokenIds(mtp_result.tokens)
+                    << "\nreused=" << formatTokenIds(stress_result.tokens)
+                    << "\nFirst-request MTP acceptance trace:\n"
+                    << formatMTPAcceptanceTrace(first_mtp_records)
+                    << "Divergent MTP acceptance trace:\n"
+                    << formatMTPAcceptanceTrace(stress_records);
+                mtp->shutdown();
+                return;
+            }
+
+            EXPECT_EQ(stress_snapshot.mtp_transaction_validation_failures, 0u)
+                << test_case.name << " repetition=" << (repetition + 1);
+            EXPECT_FALSE(stress_snapshot.mtp_bypassed)
+                << test_case.name << " repetition=" << (repetition + 1)
+                << " reason=" << stress_snapshot.mtp_bypass_reason;
+            expectMoEMTPHeadOwnershipPerfPath(
+                test_case,
+                stress_records,
+                test_case.name + " stochastic clearCache stress repetition " +
+                    std::to_string(repetition + 1));
+            expectMoEHomogeneousGPUFullGraphReplay(
+                test_case,
+                stress_records,
+                test_case.name + " stochastic clearCache stress repetition " +
+                    std::to_string(repetition + 1));
+            if (moEPrefixCaseUsesGPU(test_case))
+            {
+                expectPerfCounterPositive(
+                    stress_records,
+                    "request_reset",
+                    "device_prior_work_joins",
+                    test_case.name +
+                        " stochastic clearCache stress repetition " +
+                        std::to_string(repetition + 1));
+                expectPerfCounterPositive(
+                    stress_records,
+                    "request_reset",
+                    "device_state_ready_events",
+                    test_case.name +
+                        " stochastic clearCache stress repetition " +
+                        std::to_string(repetition + 1));
+                expectPerfCounterPositive(
+                    stress_records,
+                    "request_reset",
+                    "device_state_ready_waits",
+                    test_case.name +
+                        " stochastic clearCache stress repetition " +
+                        std::to_string(repetition + 1));
+            }
+        }
+
+        mtp->shutdown();
     }
 
     inline void runMoEGreedyFreshRunnerDeterminism(
@@ -6278,6 +6719,32 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_GE(token_after_setup, 0)
             << "serial setup must produce the first verifier input token";
 
+        const auto commit_shifted_row =
+            [&](int32_t token,
+                int already_appended_tokens,
+                bool allow_speculative_discard,
+                int position_offset) -> bool
+        {
+            if (!device.is_gpu())
+            {
+                return runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+                    token,
+                    already_appended_tokens,
+                    allow_speculative_discard,
+                    position_offset);
+            }
+
+            constexpr int kTestTargetSampleSlot = 0;
+            return runner->stageStochasticTargetTokenForDeviceSampling(
+                       token,
+                       kTestTargetSampleSlot) &&
+                   runner->commitMTPShiftedRowFromDeviceTargetSample(
+                       kTestTargetSampleSlot,
+                       already_appended_tokens,
+                       allow_speculative_discard,
+                       position_offset);
+        };
+
         if (verify_published_state_continuation)
         {
             /*
@@ -6287,15 +6754,15 @@ namespace llaminar2::test::parity::qwen36
              * need sidecar maintenance, and keeping that state out of the base
              * snapshot makes the M=1..4 numeric checks isolate target-model
              * logits/KV/GDN equivalence rather than shifted-cache coherence.
-             */
+            */
             const int production_sidecar_position = runner->get_position();
-            ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+            ASSERT_TRUE(commit_shifted_row(
                 expected_tokens[0],
                 /*already_appended_tokens=*/0,
                 /*allow_speculative_discard=*/true,
                 production_sidecar_position - 2))
                 << "failed to advance shifted MTP cache for first setup token";
-            ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+            ASSERT_TRUE(commit_shifted_row(
                 expected_tokens[1],
                 /*already_appended_tokens=*/0,
                 /*allow_speculative_discard=*/true,
@@ -6358,7 +6825,7 @@ namespace llaminar2::test::parity::qwen36
         const int base_sidecar_position = runner->get_position();
         if (verify_published_state_continuation)
         {
-            ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+            ASSERT_TRUE(commit_shifted_row(
                 verifier_tokens[0],
                 /*already_appended_tokens=*/0,
                 /*allow_speculative_discard=*/true,
@@ -6411,6 +6878,7 @@ namespace llaminar2::test::parity::qwen36
             runner->setMTPAllPositionVerifierSyncDeferralEnabled(true);
         }
         ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        const void *verifier_tokens_device = nullptr;
         if (verify_compact_device_outcome)
         {
             ASSERT_GE(verifier_tokens.size(), 2u)
@@ -6421,13 +6889,20 @@ namespace llaminar2::test::parity::qwen36
                    "verifier rows M=2..4";
             if (runner->supportsGreedyAllPositionBatchOutcomeOnDevice())
             {
-                ASSERT_NE(nullptr,
-                          runner->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
-                              verifier_tokens.data(),
-                              static_cast<int>(verifier_tokens.size()),
-                              static_cast<int>(verifier_tokens.size() - 1)))
+                verifier_tokens_device =
+                    runner->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+                        verifier_tokens.data(),
+                        static_cast<int>(verifier_tokens.size()),
+                        static_cast<int>(verifier_tokens.size() - 1));
+                ASSERT_NE(nullptr, verifier_tokens_device)
                     << "compact greedy verifier regression requires a materialized "
                        "device verifier-token row";
+                ASSERT_TRUE(runner->prepareGreedyAllPositionBatchOutcomeGraph(
+                    static_cast<int>(verifier_tokens.size()),
+                    /*stop_tokens=*/nullptr,
+                    /*stop_token_count=*/0))
+                    << "compact greedy verifier regression must arm the same "
+                       "terminal graph-owned outcome transaction as production";
             }
             else
             {
@@ -6445,9 +6920,16 @@ namespace llaminar2::test::parity::qwen36
                    "their own strict continuation gates exist.";
             PerfStatsCollector::reset();
         }
-        ASSERT_TRUE(runner->forward(
-            verifier_tokens.data(),
-            static_cast<int>(verifier_tokens.size())))
+        const bool verifier_forward_ok =
+            verifier_tokens_device
+                ? runner->forwardWithDeviceTokenIds(
+                      verifier_tokens.data(),
+                      verifier_tokens_device,
+                      static_cast<int>(verifier_tokens.size()))
+                : runner->forward(
+                      verifier_tokens.data(),
+                      static_cast<int>(verifier_tokens.size()));
+        ASSERT_TRUE(verifier_forward_ok)
             << "all-position verifier forward failed";
         if (expect_grouped_moe_verifier_prefill)
         {

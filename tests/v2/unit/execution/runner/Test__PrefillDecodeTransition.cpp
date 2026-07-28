@@ -14286,7 +14286,7 @@ namespace
      * token through the resident logical-state mailbox. The second transaction
      * has room for that bonus token but no speculative rows. It must snapshot
      * the resident token D2D into the target arena before shifted-cache commit
-     * retargets the mailbox, then use that same target slot for the main graph.
+     * consumes the mailbox, then use that same target slot for the main graph.
      */
     TEST_F(Test__PrefillDecodeTransition,
            MTPGpuBudgetClampPublishesResidentReadyTokenD2D)
@@ -14341,7 +14341,7 @@ namespace
             << "Shifted publication must consume the mailbox-owned token and position.";
         EXPECT_EQ(mock->deviceTargetShiftedCommitCount(),
                   device_target_commits_before)
-            << "The target slot preserves the token across mailbox retargeting; "
+            << "The target slot preserves the token across mailbox consumption; "
                "it must not replace the resident position authority.";
         EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(),
                   device_first_prepares_before + 1);

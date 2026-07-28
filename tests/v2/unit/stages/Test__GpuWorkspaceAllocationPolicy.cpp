@@ -664,6 +664,84 @@ TEST(
            "binding contract each";
 }
 
+/**
+ * @brief Prevent host-side request-bank validity from re-entering GPU GDN state.
+ *
+ * CUDA/HIP graph replay executes the recorded device operations without
+ * re-running the C++ wrapper that originally submitted them. A host field that
+ * claims a request-state bank is current therefore cannot describe graph-replay
+ * state. Likewise, swapping a kernel's primary state pointer while constructing
+ * local/full LocalTP graphs makes graph build order alter later bindings.
+ *
+ * Request-bank publication must remain an explicit device copy on the producer
+ * stream, and LocalTP handoff stages must name the state geometry they consume.
+ */
+TEST(
+    Test__GpuWorkspaceAllocationPolicy,
+    GDNRequestBanksHaveImmutableBindingsAndDevicePublishedValidity)
+{
+    const auto root = repoRoot();
+    const std::array<std::string, 4> kernel_headers = {
+        "src/v2/kernels/cuda/gdn/CUDAGatedDeltaNet.h",
+        "src/v2/kernels/cuda/gdn/CUDAShortConvolution.h",
+        "src/v2/kernels/rocm/gdn/ROCmGatedDeltaNet.h",
+        "src/v2/kernels/rocm/gdn/ROCmShortConvolution.h",
+    };
+    const std::array<const char *, 5> forbidden = {
+        "request_state_bank_state_size_",
+        "selectState(",
+        "ensureActiveState(",
+        "effective_state == gpu_state_",
+        "active_state_size_",
+    };
+
+    for (const auto &relative : kernel_headers)
+    {
+        const auto executable = stripCommentsAndStringLiterals(
+            readFile(root / relative));
+        for (const char *needle : forbidden)
+        {
+            EXPECT_EQ(executable.find(needle), std::string::npos)
+                << relative
+                << " must not mirror device-state validity or mutate primary "
+                   "state bindings on the host: "
+                << needle;
+        }
+        EXPECT_NE(
+            executable.find("publishLiveStateToRequestZero("),
+            std::string::npos)
+            << relative
+            << " must publish the authoritative live row into request slot "
+               "zero through an explicit stream-ordered device operation";
+        EXPECT_NE(executable.find("stateForSize("), std::string::npos)
+            << relative
+            << " must resolve local/full state geometry without mutating the "
+               "kernel's stable primary and secondary bindings";
+    }
+
+    const std::array<std::string, 2> handoff_sources = {
+        "src/v2/execution/compute_stages/stages/GDNLiveStateLocalizeStage.cpp",
+        "src/v2/execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp",
+    };
+    for (const auto &relative : handoff_sources)
+    {
+        const auto executable = stripCommentsAndStringLiterals(
+            readFile(root / relative));
+        EXPECT_EQ(executable.find("exportState("), std::string::npos)
+            << relative
+            << " must export the declared local/full geometry explicitly";
+        EXPECT_EQ(executable.find("importState("), std::string::npos)
+            << relative
+            << " must import the declared local/full geometry explicitly";
+        EXPECT_NE(executable.find("exportStateForSize("), std::string::npos)
+            << relative
+            << " must use the size-explicit state export contract";
+        EXPECT_NE(executable.find("importStateForSize("), std::string::npos)
+            << relative
+            << " must use the size-explicit state import contract";
+    }
+}
+
 TEST(
     Test__GpuWorkspaceAllocationPolicy,
     HybridCachePlansGDNStateBeforeKernelConstruction)
@@ -1879,13 +1957,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
     expectNeedleBefore(
         resident_logical_executable,
         "recordShiftedMTPKVReplayStateMutation",
-        "retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation",
-        "Resident correction shifted commits must make the mailbox current after the shifted-KV epoch advances.");
+        "clearDeviceResidentLogicalSequenceStateMailbox",
+        "Resident correction shifted commits must consume the mailbox after the shifted-KV epoch advances.");
     EXPECT_NE(resident_logical_body.find(
-                  "retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation"),
+                  "device_resident_logical_state_mailbox_consumptions"),
               std::string::npos)
-        << "Resident correction shifted commits must keep the device mailbox usable "
-           "for the next pending condition without a host-token fallback.";
+        << "Resident correction mailbox consumption must remain visible in perfstats.";
 
     /*
      * The mandatory LocalTP publication route has two shifted-cache entry
@@ -1925,18 +2002,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
         << "The checkpoint supplies terminal hidden state, not the authoritative GPU position.";
     EXPECT_EQ(device_outcome_executable.find("state_.positions"), std::string::npos)
         << "The suffix must not derive positions from a host-owned sequence mirror.";
-    for (const auto *executable_body : {&initial_device_outcome_executable,
-                                        &device_outcome_executable})
-    {
-        EXPECT_EQ(
-            executable_body->find(
-                "retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation"),
-            std::string::npos)
-            << "Device-outcome shifted-row commits feed an immediate accepted-state "
-               "publication. They must leave logical mailbox creation to that "
-               "publication instead of retargeting a pre-publication handle.";
-    }
-
     const auto initial_interface = sliceBetween(
         runner_interface,
         "virtual bool commitMTPInitialShiftedRowFromDeviceOutcome(",
@@ -3381,7 +3446,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LiveStateObservationsWaitForGraphProduc
     const auto mailbox_observation_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::waitForDeviceResidentLogicalSequenceStateMailboxForObservation(",
-        "bool DeviceGraphOrchestrator::retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation(");
+        "bool DeviceGraphOrchestrator::supportsDeviceResidentMTPSpecStatePublication() const");
     const auto harvest_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::harvestPrefix(",
@@ -4160,10 +4225,22 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GDNVerifierCaptureWorkspacesAreGraphRol
                              std::string(stage.find("GDNRecurrenceStage") != std::string::npos
                                              ? "GDNRecurrenceStage"
                                              : "ShortConv1dStage") +
-                             "::effectiveSeqLenScalarBufferName() const")));
+                             "::speculativeStateSlotsBufferName() const")));
         EXPECT_NE(stable_id.find("params_.workspace_namespace"), std::string::npos);
         EXPECT_NE(stable_id.find("role_prefix+"), std::string::npos)
             << "Capture workspace ids must include the graph-role namespace.";
+    }
+
+    for (const auto &stage : {gdn_stage, conv_stage})
+    {
+        EXPECT_EQ(stage.find("device_value_uploaded"), std::string::npos);
+        EXPECT_EQ(stage.find("host_effective_seq_len"), std::string::npos);
+        EXPECT_EQ(stage.find("effective_seq_len_scalar"), std::string::npos)
+            << "Padded GPU GDN replay must read request lengths from the "
+               "persistent device request metadata allocation";
+        EXPECT_NE(
+            stage.find("request_seq_lens_device"),
+            std::string::npos);
     }
 
     EXPECT_NE(qwen35.find("conv_params.workspace_namespace = workspace_namespace"),
@@ -4461,6 +4538,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, StochasticOutcomeHostBridgeWaitsOnRespo
     EXPECT_NE(compact_handle.find("std::shared_ptr<void>response_ready_event"),
               std::string::npos)
         << "Resident stochastic outcome handles must carry a response-ready event.";
+    EXPECT_NE(compact_handle.find(
+                  "boolresponse_ready_after_rank_collective=false"),
+              std::string::npos)
+        << "The compact outcome handle must identify whether readiness belongs "
+           "to the child verifier or the completed rank collective.";
     EXPECT_NE(compact_handle.find("response_ready_event!=nullptr"),
               std::string::npos)
         << "A handle without a response-ready event must not be considered valid.";
@@ -4516,7 +4598,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, StochasticOutcomeHostBridgeWaitsOnRespo
         << "Bridge accounting must identify the nonblocking event dependency "
            "separately from final host result materialization.";
     EXPECT_NE(compact_bridge.find(
-                  "DeviceEventEdge::at(DeviceTimelinePoint::CompactSpeculativeResponseReady).from(DeviceTimelineRole::VerifierSummary).to(DeviceTimelineRole::HostResultBridge).enqueueWait(*backend,state_.device_id,handle.response_ready_event.get(),handle.stream,copy_stream)"),
+                  "handle.response_ready_after_rank_collective?DeviceTimelinePoint::RankCompactSpeculativeResponseReady:DeviceTimelinePoint::CompactSpeculativeResponseReady"),
+              std::string::npos)
+        << "The bridge must select the exact ownership edge carried by the handle.";
+    EXPECT_NE(compact_bridge.find(
+                  "DeviceEventEdge::at(response_point).from(response_producer).to(DeviceTimelineRole::HostResultBridge).enqueueWait(*backend,state_.device_id,handle.response_ready_event.get(),handle.stream,copy_stream)"),
               std::string::npos)
         << "The explicit D2H bridge stream must consume the named response "
            "timeline point as a device-side event dependency.";
@@ -4554,7 +4640,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ResidentMTPHotPathsUseOnlyPreallocatedE
               std::string::npos)
         << "Persistent MTP PerfStats events must be allocated at setup.";
 
-    const std::array<std::tuple<const char *, const char *, const char *>, 11>
+    const std::array<std::tuple<const char *, const char *, const char *>, 10>
         hot_paths = {{
             {
                 "bool DeviceGraphOrchestrator::recordDeviceResidentMTPTransactionMutation(",
@@ -4565,11 +4651,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ResidentMTPHotPathsUseOnlyPreallocatedE
                 "bool DeviceGraphOrchestrator::recordDeviceResidentLogicalSequenceStateMailbox(",
                 "bool DeviceGraphOrchestrator::waitForDeviceResidentLogicalSequenceStateMailbox(",
                 "resident logical-state publication",
-            },
-            {
-                "bool DeviceGraphOrchestrator::retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation(",
-                "bool DeviceGraphOrchestrator::supportsDeviceResidentMTPSpecStatePublication() const",
-                "resident logical-state retarget",
             },
             {
                 "bool DeviceGraphOrchestrator::recordStochasticDraftSampleReady(",
@@ -4625,6 +4706,65 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ResidentMTPHotPathsUseOnlyPreallocatedE
         EXPECT_EQ(body.find("destroyEvent("), std::string::npos)
             << label << " must not retire backend event resources";
     }
+}
+
+/**
+ * @brief Locks in bounded, nonblocking profiler-event reuse for mirrored MTP.
+ *
+ * Non-root LocalTP participants do not own the final compact result D2H. Their
+ * per-kernel timing events must therefore be queried and reclaimed without a
+ * stream/device synchronization before the fixed pool can be reused. The rank
+ * result event must also be republished after the NCCL/RCCL collective, making
+ * that nonblocking reclamation ordering explicit rather than timing-dependent.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy, MirroredMTPTimingEventsReclaimAfterRankCollective)
+{
+    const auto dgo_source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto rank_source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
+    const auto reclaim_body = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            dgo_source,
+            "DeviceGraphOrchestrator::reclaimCompletedGpuTimingMeasurementsNonblocking(",
+            "bool DeviceGraphOrchestrator::waitForStochasticDraftSampleReadyRange(")));
+    const auto acquire_body = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            dgo_source,
+            "bool DeviceGraphOrchestrator::acquirePersistentMTPGpuTimingEvents(",
+            "bool DeviceGraphOrchestrator::recordShiftedMTPKVReady(")));
+    const auto broadcast_body = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            rank_source,
+            "bool RankOrchestrator::broadcastPrimaryMirroredLocalTPDeviceOutcomeToChildren(",
+            "bool RankOrchestrator::buildRankStochasticDistributionFromLocalTP(")));
+
+    EXPECT_NE(reclaim_body.find("queryEventChecked("), std::string::npos)
+        << "Timing reuse must be gated by a nonblocking completion query.";
+    EXPECT_NE(reclaim_body.find("eventElapsedTimeMs("), std::string::npos)
+        << "Completed kernel timings must still become training/perf evidence.";
+    EXPECT_EQ(reclaim_body.find("synchronizeStream("), std::string::npos);
+    EXPECT_EQ(reclaim_body.find("synchronizeDevice("), std::string::npos);
+    EXPECT_EQ(reclaim_body.find("waitForEvent("), std::string::npos);
+    EXPECT_NE(acquire_body.find(
+                  "reclaimCompletedGpuTimingMeasurementsNonblocking(backend)"),
+              std::string::npos)
+        << "Every fixed-pool borrow must first retire completed measurements.";
+
+    expectNeedleBefore(
+        broadcast_body,
+        "tp_ctx_->collectiveSidebandsMultiOnStreams(",
+        "publishRankCompactSpeculativeResponseReady(",
+        "Rank response readiness must be published after NCCL/RCCL submission.");
+    EXPECT_NE(broadcast_body.find(
+                  "runner->publishRankCompactSpeculativeResponseReady(&child)"),
+              std::string::npos)
+        << "Rank orchestration must ask the child that owns the event, stream, "
+           "and backend to strengthen the response-ready edge.";
+    EXPECT_EQ(broadcast_body.find("getBackendFor("), std::string::npos)
+        << "Rank orchestration must not manipulate child-owned event resources.";
+    EXPECT_EQ(broadcast_body.find("synchronizeStream("), std::string::npos);
+    EXPECT_EQ(broadcast_body.find("synchronizeDevice("), std::string::npos);
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuietlyFallback)
@@ -5414,11 +5554,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
     const auto wait_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::waitForDeviceResidentLogicalSequenceStateMailbox(",
-        "bool DeviceGraphOrchestrator::retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation(");
-    const auto retarget_body = sliceBetween(
-        source,
-        "bool DeviceGraphOrchestrator::retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation(",
         "bool DeviceGraphOrchestrator::supportsDeviceResidentMTPSpecStatePublication() const");
+    const auto resident_shifted_commit_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::commitMTPShiftedRowFromDeviceResidentLogicalState(",
+        "bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromDeviceOutcome(");
     const auto sidecar_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
@@ -5453,8 +5593,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
         removeAsciiWhitespace(stripCommentsAndStringLiterals(record_body));
     const auto compact_wait =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(wait_body));
-    const auto compact_retarget =
-        removeAsciiWhitespace(stripCommentsAndStringLiterals(retarget_body));
+    const auto compact_resident_shifted_commit =
+        removeAsciiWhitespace(
+            stripCommentsAndStringLiterals(resident_shifted_commit_body));
     const auto compact_sidecar =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(sidecar_body));
     const auto compact_resident_sidecar =
@@ -5633,10 +5774,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
     EXPECT_NE(compact_header.find("boolownsHandle(constDeviceResidentLogicalSequenceStateHandle&handle,uint64_tcurrent_live_state_epoch)const"),
               std::string::npos)
         << "Mailbox ownership must be checked structurally, not open-coded by each consumer.";
-    EXPECT_NE(compact_header.find("retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation("),
+    EXPECT_EQ(compact_header.find(
+                  "retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation("),
               std::string::npos)
-        << "Resident shifted-KV commits need a typed way to keep mailbox ownership "
-           "current after the live epoch advances.";
+        << "Resident shifted-KV commits consume one-shot mailboxes instead of "
+           "laundering old values into a fresh live-state epoch.";
     EXPECT_NE(compact_header.find("DeviceResidentLogicalSequenceStateHandledeviceResidentLogicalSequenceState()constoverride"),
               std::string::npos);
     EXPECT_NE(compact_header.find("forwardMTPFromDeviceResidentLogicalStateForDeviceSampling("),
@@ -5783,24 +5925,19 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
               std::string::npos)
         << "Mailbox waits should be visible in perf counters.";
 
-    EXPECT_NE(compact_retarget.find("mailbox.ownsHandle(handle,previous_epoch)"),
+    EXPECT_EQ(source.find(
+                  "retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation"),
               std::string::npos)
-        << "Mailbox retarget must only accept the pre-mutation current mailbox.";
-    EXPECT_NE(compact_retarget.find("backend->recordEvent("),
+        << "A shifted-KV mutation must not launder a consumed logical mailbox "
+           "into the next live-state epoch.";
+    EXPECT_NE(compact_resident_shifted_commit.find(
+                  "clearDeviceResidentLogicalSequenceStateMailbox()"),
               std::string::npos)
-        << "Retargeting must publish a new stream-ordered readiness event.";
-    EXPECT_NE(compact_retarget.find("mailbox.producer_stream=producer_stream"),
+        << "The resident shifted-row committer must consume its one-shot mailbox.";
+    EXPECT_NE(resident_shifted_commit_body.find(
+                  "device_resident_logical_state_mailbox_consumptions"),
               std::string::npos)
-        << "Retargeting must hand ownership to the shifted-KV commit stream.";
-    EXPECT_NE(compact_retarget.find("mailbox.live_state_epoch=live_replay_state_epoch_"),
-              std::string::npos)
-        << "Retargeting must refresh the mailbox epoch instead of weakening stale-handle checks.";
-    EXPECT_EQ(compact_retarget.find("device_resident_logical_sequence_host_mirror_epoch_"),
-              std::string::npos)
-        << "Shifted-KV retargets must carry only the resident ownership contract.";
-    EXPECT_NE(retarget_body.find("device_resident_logical_state_mailbox_retargets"),
-              std::string::npos)
-        << "Retargets should be visible in perf counters.";
+        << "Mailbox consumption must remain visible to integration perfstats.";
 
     EXPECT_NE(compact_sidecar.find("constvoid*position_ids_device_override"),
               std::string::npos)

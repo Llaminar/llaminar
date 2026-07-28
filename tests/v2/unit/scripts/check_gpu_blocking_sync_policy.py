@@ -276,6 +276,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/local_execution/graph/DeviceGraphExecutor.cpp", "DeviceGraphExecutor::runStages", "backend_device", 1),
         ("src/v2/execution/local_execution/graph/StageTimeline.h", "collect", "worker_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::exportCompletedDeviceMoERebalanceMaintenanceStats", "worker_stream", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "logMTPGraphReuseBoundaryDiagnostics", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "logMTPPublicationMetadataDiagnostics", "worker_stream", 1),
         ("src/v2/collective/LocalTPContext.cpp", "validateRocmAllreducePointerForSlot", "backend_sync_copy", 1),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp", "CUDAQuantisedGemmKernel::multiply_fused_tensor_impl", "raw_stream", 2),
@@ -351,7 +352,6 @@ ALLOWANCES: tuple[Allowance, ...] = (
     ),
     *reviewed(
         "lifecycle",
-        ("src/v2/execution/local_execution/device/WorkspaceAllocator.cpp", "synchronizeBeforeWorkspaceRelease", "backend_device", 1),
         ("src/v2/execution/local_execution/engine/ForwardGraphTypes.h", "reset", "worker_stream", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::retirePublishedDeviceWorkBeforeArenaRelease", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::retirePendingPrefixPayloadUses", "backend_event", 1),

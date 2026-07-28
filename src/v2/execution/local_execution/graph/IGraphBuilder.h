@@ -220,6 +220,8 @@ namespace llaminar2
         void *stream = nullptr;                ///< Exact GPU producer stream; null for CPU.
         bool is_decode = false;                ///< Whether decode semantics selected this graph.
         bool all_position_logits = false;      ///< Whether this was a grouped verifier graph.
+        int graph_seq_len = 0;                 ///< Captured graph rows per request, including prefill bucketing.
+        int graph_batch_size = 0;              ///< Captured graph request count.
     };
 
     /**

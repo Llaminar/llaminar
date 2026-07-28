@@ -6434,8 +6434,8 @@ namespace llaminar2
                          * Ready and rejection-correction tokens are owned by the
                          * resident publication mailbox, not by their host response
                          * shadows. Preserve the token in the persistent target
-                         * arena before shifted-cache publication retargets that
-                         * mailbox's transaction epoch. This is an event-ordered
+                         * arena before shifted-cache publication consumes that
+                         * one-shot mailbox. This is an event-ordered
                          * D2D handoff; the host scalar is never uploaded.
                          */
                         if (first_token_resident_state.has_value())

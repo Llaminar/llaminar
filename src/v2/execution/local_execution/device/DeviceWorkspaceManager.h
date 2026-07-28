@@ -10,9 +10,10 @@
  *
  * Design:
  * - One manager per device (DeviceId)
- * - Allocates contiguous block up front
- * - Suballocates named buffers from the block
- * - No reallocation during inference (hot path is zero-alloc)
+ * - Allocates each declared workspace generation as one contiguous block
+ * - Extends append-only while graph families are materialized
+ * - Never frees or moves an address observed by a captured graph
+ * - Performs no allocation during graph replay (hot path is zero-alloc)
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -218,6 +219,30 @@ namespace llaminar2
         bool allocate(const WorkspaceRequirements &requirements);
 
         /**
+         * @brief Add missing or larger named buffers without moving old storage.
+         *
+         * CUDA and HIP graph executables retain raw workspace addresses.
+         * Replacing the manager's original allocation when a sidecar or
+         * verifier graph declares more workspace leaves every earlier graph
+         * executable pointing at freed memory. Extension therefore allocates
+         * one additional block, updates the current name map, and retains all
+         * superseded blocks until @ref release.
+         *
+         * Existing names that are already large enough keep exactly the same
+         * address. A name that grows receives a new current address, while its
+         * old address remains allocated for graph executables captured against
+         * the earlier geometry.
+         *
+         * This is a graph-materialization operation, not an inference replay
+         * operation. The caller must complete graph-family planning before the
+         * serving hot path begins.
+         *
+         * @param requirements Complete requirements known to the caller.
+         * @return true when every required addition fits the manager budget.
+         */
+        bool extend(const WorkspaceRequirements &requirements);
+
+        /**
          * @brief Zero the complete allocated workspace on an explicit stream.
          *
          * Persistent cache-owned arenas use this after one-time planning so
@@ -376,7 +401,12 @@ namespace llaminar2
         /**
          * @brief Get the remaining budget in bytes
          */
-        size_t remaining() const { return budget_bytes_ - used_bytes_; }
+        size_t remaining() const
+        {
+            return used_bytes_ < budget_bytes_
+                       ? budget_bytes_ - used_bytes_
+                       : 0;
+        }
 
         /**
          * @brief Get the number of allocated buffers
@@ -397,10 +427,21 @@ namespace llaminar2
         // Named buffer offsets within block
         struct BufferInfo
         {
-            size_t offset;
-            size_t size;
+            void *base = nullptr;
+            size_t offset = 0;
+            size_t size = 0;
         };
         std::unordered_map<std::string, BufferInfo> buffers_;
+
+        /**
+         * @brief Additional append-only allocation retained for graph lifetime.
+         */
+        struct ExtensionBlock
+        {
+            void *base = nullptr;
+            size_t size = 0;
+        };
+        std::vector<ExtensionBlock> extension_blocks_;
 
         /**
          * @brief Host-only ownership registry for immutable graph metadata.
@@ -429,6 +470,13 @@ namespace llaminar2
          * @return true on success
          */
         bool allocateBuffers(
+            const std::vector<const WorkspaceDescriptor *> &buffers,
+            size_t total_size);
+
+        /**
+         * @brief Allocate one append-only extension block and publish its names.
+         */
+        bool allocateExtensionBuffers(
             const std::vector<const WorkspaceDescriptor *> &buffers,
             size_t total_size);
     };

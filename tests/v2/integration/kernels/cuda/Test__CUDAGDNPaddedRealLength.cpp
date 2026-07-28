@@ -1113,7 +1113,9 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteEx
     }
 }
 
-TEST_F(Test__CUDAGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCaptureGuard)
+TEST_F(
+    Test__CUDAGDNPaddedRealLength,
+    StateBankGeometryLookupDoesNotMutateStableBindingsUnderCaptureGuard)
 {
     SKIP_IF_NO_CUDA();
     checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
@@ -1169,7 +1171,12 @@ TEST_F(Test__CUDAGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCap
             /*use_qk_l2norm=*/false));
     }
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(full recurrence slot)");
-    EXPECT_EQ(recurrence.stateBytes(), static_cast<size_t>(full_recurrence_state) * sizeof(float));
+    EXPECT_EQ(
+        recurrence.stateBytes(),
+        static_cast<size_t>(local_recurrence_state) * sizeof(float));
+    EXPECT_EQ(
+        recurrence.largestStateBytes(),
+        static_cast<size_t>(full_recurrence_state) * sizeof(float));
 
     constexpr int local_channels = 64;
     constexpr int full_channels = 128;
@@ -1213,7 +1220,200 @@ TEST_F(Test__CUDAGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCap
             /*apply_silu=*/true));
     }
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(full short-conv slot)");
-    EXPECT_EQ(conv.stateBytes(), static_cast<size_t>(full_conv_state) * sizeof(float));
+    EXPECT_EQ(
+        conv.stateBytes(),
+        static_cast<size_t>(local_conv_state) * sizeof(float));
+    EXPECT_EQ(
+        conv.largestStateBytes(),
+        static_cast<size_t>(full_conv_state) * sizeof(float));
+}
+
+/**
+ * @brief Proves captured local-to-full handoffs publish request state on replay.
+ *
+ * CUDA graph replay executes recorded device work without re-entering the C++
+ * kernel wrappers. Request-bank coherence therefore cannot depend on a host
+ * boolean or selected-size field changed while the graph was captured. This
+ * regression records the same sequence used by LocalTP prefill: local stateful
+ * work followed by publication into the mirrored full-state bank. It then
+ * resets every bank and replays the original executable. Request zero must be
+ * an exact device-side publication of the resulting full live state for both
+ * recurrent GDN and short-convolution state.
+ */
+TEST_F(
+    Test__CUDAGDNPaddedRealLength,
+    CapturedLocalToFullHandoffPublishesRequestBanksOnEveryReplay)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    CudaStreamHandle stream;
+
+    constexpr int local_heads = 1;
+    constexpr int full_heads = 2;
+    constexpr int d_k = 64;
+    constexpr int d_v = 64;
+    constexpr int seq_len = 2;
+    constexpr int local_qk_stride = local_heads * d_k;
+    constexpr int local_v_stride = local_heads * d_v;
+    constexpr int local_recurrence_state = local_heads * d_k * d_v;
+    constexpr int full_recurrence_state = full_heads * d_k * d_v;
+
+    CUDAGatedDeltaNet recurrence(cuda_ordinal_);
+    recurrence.setGPUStream(stream.stream);
+    CudaGDNStateOwner recurrence_state_owner(
+        recurrence,
+        local_recurrence_state,
+        full_recurrence_state);
+
+    CudaFloatBuffer d_q(
+        static_cast<size_t>(seq_len) * local_qk_stride,
+        0.01f);
+    CudaFloatBuffer d_kbuf(
+        static_cast<size_t>(seq_len) * local_qk_stride,
+        0.02f);
+    CudaFloatBuffer d_vbuf(
+        static_cast<size_t>(seq_len) * local_v_stride,
+        0.03f);
+    CudaFloatBuffer d_alpha(
+        static_cast<size_t>(seq_len) * local_heads,
+        0.2f);
+    CudaFloatBuffer d_beta(
+        static_cast<size_t>(seq_len) * local_heads,
+        -0.1f);
+    CudaFloatBuffer d_A_log(static_cast<size_t>(local_heads), -0.5f);
+    CudaFloatBuffer d_dt_bias(static_cast<size_t>(local_heads), 0.1f);
+    CudaFloatBuffer d_recurrence_out(
+        static_cast<size_t>(seq_len) * local_v_stride,
+        0.0f);
+    const auto full_recurrence_payload =
+        makeInitialState(static_cast<size_t>(full_recurrence_state), 0.00031f);
+    CudaFloatBuffer d_full_recurrence(full_recurrence_payload);
+
+    CudaCapturedGraph recurrence_graph(
+        stream.stream,
+        [&]()
+        {
+            return recurrence.chunk_forward(
+                       d_q.ptr,
+                       d_kbuf.ptr,
+                       d_vbuf.ptr,
+                       d_alpha.ptr,
+                       d_beta.ptr,
+                       d_A_log.ptr,
+                       d_dt_bias.ptr,
+                       d_recurrence_out.ptr,
+                       nullptr,
+                       seq_len,
+                       local_heads,
+                       d_k,
+                       d_v,
+                       /*chunk_size=*/64,
+                       /*use_qk_l2norm=*/false) &&
+                   recurrence.importStateForSize(
+                       full_recurrence_state,
+                       /*src_host=*/nullptr,
+                       d_full_recurrence.ptr,
+                       stream.stream);
+        });
+
+    ASSERT_TRUE(recurrence.resetGPUState(stream.stream));
+    recurrence_graph.launch(stream.stream);
+    std::vector<float> recurrence_live(
+        static_cast<size_t>(full_recurrence_state));
+    std::vector<float> recurrence_request(
+        static_cast<size_t>(full_recurrence_state));
+    ASSERT_TRUE(recurrence.exportStateForSize(
+        full_recurrence_state,
+        recurrence_live.data(),
+        /*dst_device=*/nullptr,
+        stream.stream));
+    ASSERT_TRUE(recurrence.exportRequestStateBank(
+        recurrence_request.data(),
+        /*request_count=*/1,
+        full_recurrence_state,
+        stream.stream));
+    checkCuda(
+        cudaStreamSynchronize(stream.stream),
+        "cudaStreamSynchronize(replayed recurrence publication)");
+    expectByteExactEquivalent(
+        "captured recurrence request-state publication",
+        recurrence_request,
+        recurrence_live,
+        /*offset=*/0,
+        recurrence_live.size());
+
+    constexpr int local_channels = 64;
+    constexpr int full_channels = 128;
+    constexpr int kernel_size = 4;
+    constexpr int local_conv_state = local_channels * (kernel_size - 1);
+    constexpr int full_conv_state = full_channels * (kernel_size - 1);
+
+    CUDAShortConvolution conv(cuda_ordinal_);
+    conv.setGPUStream(stream.stream);
+    CudaGDNStateOwner conv_state_owner(
+        conv,
+        local_conv_state,
+        full_conv_state);
+    const auto conv_weights =
+        makeShortConvWeights(local_channels, kernel_size);
+    const auto conv_bias = makeBias(local_channels);
+    CudaFloatBuffer d_conv_input(
+        static_cast<size_t>(seq_len) * local_channels,
+        0.04f);
+    CudaFloatBuffer d_conv_weight(conv_weights);
+    CudaFloatBuffer d_conv_bias(conv_bias);
+    CudaFloatBuffer d_conv_out(
+        static_cast<size_t>(seq_len) * local_channels,
+        0.0f);
+    const auto full_conv_payload =
+        makeInitialState(static_cast<size_t>(full_conv_state), 0.0061f);
+    CudaFloatBuffer d_full_conv(full_conv_payload);
+
+    CudaCapturedGraph conv_graph(
+        stream.stream,
+        [&]()
+        {
+            return conv.forward(
+                       d_conv_input.ptr,
+                       d_conv_weight.ptr,
+                       d_conv_bias.ptr,
+                       d_conv_out.ptr,
+                       nullptr,
+                       seq_len,
+                       local_channels,
+                       kernel_size,
+                       /*apply_silu=*/true) &&
+                   conv.importStateForSize(
+                       full_conv_state,
+                       /*src_host=*/nullptr,
+                       d_full_conv.ptr,
+                       stream.stream);
+        });
+
+    ASSERT_TRUE(conv.resetGPUState(stream.stream));
+    conv_graph.launch(stream.stream);
+    std::vector<float> conv_live(static_cast<size_t>(full_conv_state));
+    std::vector<float> conv_request(static_cast<size_t>(full_conv_state));
+    ASSERT_TRUE(conv.exportStateForSize(
+        full_conv_state,
+        conv_live.data(),
+        /*dst_device=*/nullptr,
+        stream.stream));
+    ASSERT_TRUE(conv.exportRequestStateBank(
+        conv_request.data(),
+        /*request_count=*/1,
+        full_conv_state,
+        stream.stream));
+    checkCuda(
+        cudaStreamSynchronize(stream.stream),
+        "cudaStreamSynchronize(replayed short-conv publication)");
+    expectByteExactEquivalent(
+        "captured short-conv request-state publication",
+        conv_request,
+        conv_live,
+        /*offset=*/0,
+        conv_live.size());
 }
 
 TEST_F(Test__CUDAGDNPaddedRealLength, LocalStateSurvivesFullStateHandoffBeforeNextPrefillSegment)
@@ -1318,8 +1518,12 @@ TEST_F(Test__CUDAGDNPaddedRealLength, LocalStateSurvivesFullStateHandoffBeforeNe
         nullptr,
         stream.stream));
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(import full recurrence state)");
-    ASSERT_EQ(handoff_recurrence.stateBytes(),
-              static_cast<size_t>(full_recurrence_state_floats) * sizeof(float));
+    ASSERT_EQ(
+        handoff_recurrence.stateBytes(),
+        static_cast<size_t>(local_recurrence_state) * sizeof(float));
+    ASSERT_EQ(
+        handoff_recurrence.largestStateBytes(),
+        static_cast<size_t>(full_recurrence_state_floats) * sizeof(float));
 
     ASSERT_TRUE(handoff_recurrence.chunk_forward(
         d_Q_handoff.ptr + static_cast<size_t>(first_len) * local_qk_stride,
@@ -1414,8 +1618,12 @@ TEST_F(Test__CUDAGDNPaddedRealLength, LocalStateSurvivesFullStateHandoffBeforeNe
         nullptr,
         stream.stream));
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(import full short-conv state)");
-    ASSERT_EQ(handoff_conv.stateBytes(),
-              static_cast<size_t>(full_conv_state) * sizeof(float));
+    ASSERT_EQ(
+        handoff_conv.stateBytes(),
+        static_cast<size_t>(local_conv_state) * sizeof(float));
+    ASSERT_EQ(
+        handoff_conv.largestStateBytes(),
+        static_cast<size_t>(full_conv_state) * sizeof(float));
 
     ASSERT_TRUE(handoff_conv.forward(
         d_conv_input_handoff.ptr + static_cast<size_t>(first_len) * local_channels,
@@ -1545,6 +1753,326 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedD
         EXPECT_LT(decode.first, 2e-4f) << "real_len=" << real_len;
         EXPECT_LT(decode.second, 1e-4) << "real_len=" << real_len;
         EXPECT_EQ(tail_abs, 0.0f) << "CUDA recurrence padding rows must be inert for real_len=" << real_len;
+    }
+}
+
+/**
+ * @brief Prove reset-and-repeat determinism at the Qwen3.6 LocalTP prefill shape.
+ *
+ * The serving graph uses eight participant-local value heads, a 2560-row
+ * capture bucket, and a resident effective length for a 2383-token prompt.
+ * Smaller recurrence tests do not exercise the same row-split grid or sustain
+ * enough sequential timesteps to expose stale scratch and incomplete state
+ * initialization. This regression restores every mutable input because the
+ * optimized prefill route normalizes Q/K and transforms alpha/beta in place.
+ */
+TEST_F(
+    Test__CUDAGDNPaddedRealLength,
+    Qwen36LocalTPPrefillResetAndRepeatIsByteExact)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+    CudaStreamHandle stream;
+
+    /*
+     * Qwen3.6-35B MoE LocalTP keeps eight local value heads with d_v=256.
+     * The previous 16x128 geometry happened to have the same total state and
+     * output byte counts, but it exercised a different recurrence tiling:
+     * four column blocks per head instead of the production eight. Matching
+     * byte counts is not a substitute for matching launch geometry.
+     */
+    constexpr int n_heads = 8;
+    constexpr int d_k = 128;
+    constexpr int d_v = 256;
+    constexpr int bucket_len = 2560;
+    constexpr int real_len = 2383;
+    constexpr int qk_stride = n_heads * d_k;
+    constexpr int v_stride = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr size_t output_elems =
+        static_cast<size_t>(bucket_len) * static_cast<size_t>(v_stride);
+
+    const auto Q = makeSequenceRows(
+        bucket_len, qk_stride, real_len, bucket_len,
+        0.0021f, 0.19f, 0.0035f);
+    const auto K = makeSequenceRows(
+        bucket_len, qk_stride, real_len, bucket_len,
+        -0.0019f, 0.17f, -0.0027f);
+    const auto V = makeSequenceRows(
+        bucket_len, v_stride, real_len, bucket_len,
+        0.0025f, 0.23f, 0.0041f);
+    const auto alpha = makeSequenceRows(
+        bucket_len, n_heads, real_len, bucket_len,
+        0.025f, 0.8f, 0.031f);
+    const auto beta = makeSequenceRows(
+        bucket_len, n_heads, real_len, bucket_len,
+        -0.021f, 0.7f, -0.029f);
+    const std::vector<float> A_log(static_cast<size_t>(n_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+    CudaFloatBuffer d_Q(Q.size());
+    CudaFloatBuffer d_K(K.size());
+    CudaFloatBuffer d_V(V.size());
+    CudaFloatBuffer d_alpha(alpha.size());
+    CudaFloatBuffer d_beta(beta.size());
+    CudaFloatBuffer d_A_log(A_log);
+    CudaFloatBuffer d_dt_bias(dt_bias);
+    CudaFloatBuffer d_output(output_elems, 0.0f);
+    CudaIntBuffer d_effective_len(real_len);
+
+    CUDAGatedDeltaNet kernel(cuda_ordinal_);
+    CudaGDNStateOwner state_owner(kernel, state_floats);
+    kernel.setGPUStream(stream.stream);
+
+    std::vector<float> reference_output;
+    std::vector<float> reference_state;
+    for (int iteration = 0; iteration < 3; ++iteration)
+    {
+        /*
+         * The production prefill kernel deliberately preprocesses these arrays
+         * in place. Re-uploading all five mutable inputs makes each invocation
+         * start from the exact same byte image instead of accidentally testing
+         * repeated preprocessing.
+         */
+        d_Q.copyFrom(Q);
+        d_K.copyFrom(K);
+        d_V.copyFrom(V);
+        d_alpha.copyFrom(alpha);
+        d_beta.copyFrom(beta);
+        ASSERT_TRUE(kernel.resetGPUState(stream.stream));
+        ASSERT_TRUE(kernel.chunkForwardWithEffectiveSeqLen(
+            d_Q.ptr, d_K.ptr, d_V.ptr,
+            d_alpha.ptr, d_beta.ptr,
+            d_A_log.ptr, d_dt_bias.ptr,
+            d_output.ptr, nullptr,
+            bucket_len, n_heads, d_k, d_v,
+            /*chunk_size=*/64,
+            /*use_qk_l2norm=*/true,
+            d_effective_len.ptr));
+        checkCuda(
+            cudaStreamSynchronize(stream.stream),
+            "cudaStreamSynchronize(Qwen3.6 recurrence repeat)");
+
+        const auto output = d_output.toHost();
+        std::vector<float> state(static_cast<size_t>(state_floats));
+        ASSERT_TRUE(kernel.exportState(state.data(), nullptr, nullptr));
+        if (iteration == 0)
+        {
+            reference_output = output;
+            reference_state = state;
+            continue;
+        }
+
+        EXPECT_EQ(
+            std::memcmp(
+                output.data(),
+                reference_output.data(),
+                output.size() * sizeof(float)),
+            0)
+            << "long-prefill output changed after an identical device-state reset"
+            << " iteration=" << iteration;
+        EXPECT_EQ(
+            std::memcmp(
+                state.data(),
+                reference_state.data(),
+                state.size() * sizeof(float)),
+            0)
+            << "long-prefill terminal recurrence state changed after an identical "
+               "device-state reset iteration="
+            << iteration;
+    }
+}
+
+/**
+ * @brief Prove one captured production-shape merged-QKV prefill is reusable.
+ *
+ * The model graph does not hand separate Q, K, and V arrays to the recurrence
+ * kernel. It first deinterleaves the merged post-convolution tensor into graph
+ * workspace, then launches recurrence from those workspace slices. This test
+ * deliberately captures both operations so it covers the raw addresses and
+ * ordering that the serving graph records.
+ *
+ * Every replay starts from identical resident inputs and zeroed live state.
+ * The graph executable is instantiated once and never recaptured. Byte-equal
+ * output and terminal recurrence state therefore prove that CUDA graph replay,
+ * merged-QKV deinterleave, and the row-split recurrence kernel are deterministic
+ * when their storage ownership remains stable.
+ */
+TEST_F(
+    Test__CUDAGDNPaddedRealLength,
+    Qwen36LocalTPMergedPrefillCapturedReplayIsByteExact)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+    CudaStreamHandle stream;
+
+    constexpr int n_heads = 8;
+    constexpr int d_k = 128;
+    constexpr int d_v = 256;
+    constexpr int bucket_len = 2560;
+    constexpr int real_len = 2383;
+    constexpr int q_width = n_heads * d_k;
+    constexpr int k_width = n_heads * d_k;
+    constexpr int v_width = n_heads * d_v;
+    constexpr int merged_width = q_width + k_width + v_width;
+    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr size_t output_elems =
+        static_cast<size_t>(bucket_len) * static_cast<size_t>(v_width);
+    constexpr size_t scratch_elems =
+        static_cast<size_t>(bucket_len) *
+        static_cast<size_t>(q_width + k_width + v_width);
+
+    const auto Q = makeSequenceRows(
+        bucket_len, q_width, real_len, bucket_len,
+        0.0021f, 0.19f, 0.0035f);
+    const auto K = makeSequenceRows(
+        bucket_len, k_width, real_len, bucket_len,
+        -0.0019f, 0.17f, -0.0027f);
+    const auto V = makeSequenceRows(
+        bucket_len, v_width, real_len, bucket_len,
+        0.0025f, 0.23f, 0.0041f);
+    std::vector<float> merged(
+        static_cast<size_t>(bucket_len) *
+        static_cast<size_t>(merged_width));
+    for (int row = 0; row < bucket_len; ++row)
+    {
+        float *dst =
+            merged.data() +
+            static_cast<size_t>(row) * static_cast<size_t>(merged_width);
+        std::copy_n(
+            Q.data() + static_cast<size_t>(row) * q_width,
+            q_width,
+            dst);
+        std::copy_n(
+            K.data() + static_cast<size_t>(row) * k_width,
+            k_width,
+            dst + q_width);
+        std::copy_n(
+            V.data() + static_cast<size_t>(row) * v_width,
+            v_width,
+            dst + q_width + k_width);
+    }
+
+    const auto alpha = makeSequenceRows(
+        bucket_len, n_heads, real_len, bucket_len,
+        0.025f, 0.8f, 0.031f);
+    const auto beta = makeSequenceRows(
+        bucket_len, n_heads, real_len, bucket_len,
+        -0.021f, 0.7f, -0.029f);
+    const std::vector<float> A_log(static_cast<size_t>(n_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+    CudaFloatBuffer d_merged(merged.size());
+    CudaFloatBuffer d_alpha(alpha.size());
+    CudaFloatBuffer d_beta(beta.size());
+    CudaFloatBuffer d_A_log(A_log);
+    CudaFloatBuffer d_dt_bias(dt_bias);
+    CudaFloatBuffer d_output(output_elems, 0.0f);
+    CudaFloatBuffer d_scratch(scratch_elems, 0.0f);
+    CudaIntBuffer d_effective_len(real_len);
+
+    CUDAGatedDeltaNet kernel(cuda_ordinal_);
+    CudaGDNStateOwner state_owner(kernel, state_floats);
+    kernel.setGPUStream(stream.stream);
+    kernel.bindDeinterleaveWorkspace(d_scratch.ptr, d_scratch.count);
+
+    const auto run_production_body = [&]() -> bool
+    {
+        float *d_q_ptr = nullptr;
+        float *d_k_ptr = nullptr;
+        float *d_v_ptr = nullptr;
+        if (!kernel.deinterleave_qkv_device(
+                d_merged.ptr,
+                d_q_ptr,
+                d_k_ptr,
+                d_v_ptr,
+                bucket_len,
+                n_heads,
+                n_heads,
+                d_k,
+                d_v,
+                /*global_v_head_offset=*/0))
+        {
+            return false;
+        }
+        return kernel.chunkForwardWithEffectiveSeqLen(
+            d_q_ptr, d_k_ptr, d_v_ptr,
+            d_alpha.ptr, d_beta.ptr,
+            d_A_log.ptr, d_dt_bias.ptr,
+            d_output.ptr, nullptr,
+            bucket_len, n_heads, d_k, d_v,
+            /*chunk_size=*/64,
+            /*use_qk_l2norm=*/true,
+            d_effective_len.ptr);
+    };
+
+    /*
+     * Capture and replay must be byte-identical to ordinary eager execution,
+     * not merely self-consistent with another replay of the same potentially
+     * incorrect graph. The serving request-reset regression crosses exactly
+     * this Warmup -> Capture transition.
+     */
+    d_merged.copyFrom(merged);
+    d_alpha.copyFrom(alpha);
+    d_beta.copyFrom(beta);
+    ASSERT_TRUE(kernel.resetGPUState(stream.stream));
+    ASSERT_TRUE(run_production_body());
+    checkCuda(
+        cudaStreamSynchronize(stream.stream),
+        "cudaStreamSynchronize(Qwen3.6 eager recurrence oracle)");
+    const std::vector<float> eager_output = d_output.toHost();
+    std::vector<float> eager_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(kernel.exportState(
+        eager_state.data(),
+        /*dst_device=*/nullptr,
+        stream.stream));
+    checkCuda(
+        cudaStreamSynchronize(stream.stream),
+        "cudaStreamSynchronize(Qwen3.6 eager recurrence state)");
+
+    CudaCapturedGraph graph(stream.stream, run_production_body);
+
+    for (int iteration = 0; iteration < 3; ++iteration)
+    {
+        /*
+         * Recurrence preprocessing mutates deinterleaved Q/K and gate arrays.
+         * The graph regenerates Q/K/V from merged input, while the gate inputs
+         * are refreshed explicitly before each replay.
+         */
+        d_merged.copyFrom(merged);
+        d_alpha.copyFrom(alpha);
+        d_beta.copyFrom(beta);
+        ASSERT_TRUE(kernel.resetGPUState(stream.stream));
+        graph.launch(stream.stream);
+
+        std::vector<float> state(static_cast<size_t>(state_floats));
+        ASSERT_TRUE(kernel.exportState(
+            state.data(),
+            /*dst_device=*/nullptr,
+            stream.stream));
+        checkCuda(
+            cudaStreamSynchronize(stream.stream),
+            "cudaStreamSynchronize(Qwen3.6 captured recurrence replay)");
+        const auto output = d_output.toHost();
+
+        EXPECT_EQ(
+            std::memcmp(
+                output.data(),
+                eager_output.data(),
+                output.size() * sizeof(float)),
+            0)
+            << "captured merged-QKV prefill output differs from eager execution "
+               "after an identical device-state reset iteration="
+            << iteration;
+        EXPECT_EQ(
+            std::memcmp(
+                state.data(),
+                eager_state.data(),
+                state.size() * sizeof(float)),
+            0)
+            << "captured merged-QKV prefill state differs from eager execution "
+               "after an identical device-state reset iteration="
+            << iteration;
     }
 }
 
@@ -3591,8 +4119,27 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeRecurrencePublica
             captured_verifier.launch(stream.stream);
 
             CudaIntBuffer d_accepted_row(accepted_row);
-            ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
-                nullptr, d_accepted_row.ptr, stream.stream));
+            if (accepted_row == verifier_rows - 1)
+            {
+                /*
+                 * The production grouped publisher uses the plural API even
+                 * for one active request. It must update both the packed
+                 * request bank and scalar request-zero owner before this
+                 * already-captured decode executable consumes the state.
+                 */
+                ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowsFromDeviceIndices(
+                    nullptr,
+                    state_floats,
+                    d_accepted_row.ptr,
+                    /*request_count=*/1,
+                    /*row_index_stride=*/1,
+                    stream.stream));
+            }
+            else
+            {
+                ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
+                    nullptr, d_accepted_row.ptr, stream.stream));
+            }
             live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
             live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
 
@@ -3785,8 +4332,21 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicat
             captured_verifier.launch(stream.stream);
 
             CudaIntBuffer d_accepted_row(accepted_row);
-            ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
-                nullptr, d_accepted_row.ptr, stream.stream));
+            if (accepted_row == verifier_rows - 1)
+            {
+                ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowsFromDeviceIndices(
+                    nullptr,
+                    state_floats,
+                    d_accepted_row.ptr,
+                    /*request_count=*/1,
+                    /*row_index_stride=*/1,
+                    stream.stream));
+            }
+            else
+            {
+                ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
+                    nullptr, d_accepted_row.ptr, stream.stream));
+            }
             live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
             live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
             captured_decode.launch(stream.stream);

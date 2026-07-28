@@ -30,14 +30,6 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
 
-#ifdef HAVE_CUDA
-#include "../../../kernels/cuda/ops/CUDARowSelectKernels.h"
-#endif
-
-#ifdef HAVE_ROCM
-#include "../../../kernels/rocm/ops/ROCmRowSelectKernels.h"
-#endif
-
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -154,24 +146,11 @@ namespace llaminar2
         }
     } // namespace
 
-    struct GDNRecurrenceStage::GpuEffectiveSeqLenState
-    {
-        DeviceId device = DeviceId::invalid();   ///< Device that owns device_effective_seq_len.
-        int *host_effective_seq_len = nullptr;   ///< Pinned host scalar uploaded before capture/replay.
-        int *device_effective_seq_len = nullptr; ///< Device scalar read by the recurrence kernel.
-        bool device_value_uploaded = false;       ///< True once the current host scalar is resident.
-    };
-
     GDNRecurrenceStage::GDNRecurrenceStage(Params params)
         : IComputeStage(params.device_id),
           params_(std::move(params)),
           workspace_slice_id_(g_gdn_recurrence_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed))
     {
-    }
-
-    GDNRecurrenceStage::~GDNRecurrenceStage()
-    {
-        releaseGpuEffectiveSeqLenState();
     }
 
     WorkspaceRequirements GDNRecurrenceStage::getWorkspaceRequirements(int m, int n, int k) const
@@ -217,9 +196,6 @@ namespace llaminar2
         if (!params_.device_id.is_gpu())
             return reqs;
 
-        if (max_seq_len > 1)
-            reqs.buffers.push_back({effectiveSeqLenScalarBufferName(), sizeof(int), alignof(int), true});
-
         const bool merged_qkv = params_.Q == params_.K && params_.K == params_.V;
         if (!merged_qkv)
             return reqs;
@@ -232,18 +208,13 @@ namespace llaminar2
             return reqs;
 
         const size_t bytes = deinterleaveScratchFloats(max_seq_len) * sizeof(float);
-        reqs.buffers.push_back({WS_DEINTERLEAVE_SCRATCH, bytes, 256, true});
+        reqs.buffers.push_back({deinterleaveScratchBufferName(), bytes, 256, true});
         return reqs;
     }
 
     void GDNRecurrenceStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
         bound_workspace_ = workspace;
-        if (gpu_effective_seq_len_state_)
-        {
-            gpu_effective_seq_len_state_->device_effective_seq_len = nullptr;
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
-        }
         bindKernelWorkspace();
     }
 
@@ -260,10 +231,11 @@ namespace llaminar2
 
         float *scratch = nullptr;
         size_t scratch_floats = 0;
-        if (bound_workspace_ && bound_workspace_->hasBuffer(WS_DEINTERLEAVE_SCRATCH))
+        const std::string scratch_name = deinterleaveScratchBufferName();
+        if (bound_workspace_ && bound_workspace_->hasBuffer(scratch_name))
         {
-            scratch = static_cast<float *>(bound_workspace_->getBuffer(WS_DEINTERLEAVE_SCRATCH));
-            scratch_floats = bound_workspace_->getBufferSize(WS_DEINTERLEAVE_SCRATCH) / sizeof(float);
+            scratch = static_cast<float *>(bound_workspace_->getBuffer(scratch_name));
+            scratch_floats = bound_workspace_->getBufferSize(scratch_name) / sizeof(float);
         }
 
         params_.kernel->bindDeinterleaveWorkspace(scratch, scratch_floats);
@@ -380,13 +352,20 @@ namespace llaminar2
 
     bool GDNRecurrenceStage::shouldUseRealLengthContract() const
     {
+        const int state_size =
+            params_.n_heads * params_.d_k * params_.d_v;
         return params_.seq_len > 1 &&
                prefill_replay_params_set_ &&
                prefill_bucket_seq_len_ == params_.seq_len &&
                prefill_effective_seq_len_ > 0 &&
                prefill_effective_seq_len_ < params_.seq_len &&
+               params_.request_count == 1 &&
+               params_.request_seq_len == params_.seq_len &&
+               params_.request_seq_lens_device != nullptr &&
                params_.kernel &&
-               params_.kernel->supportsPaddedPrefillRealLength();
+               params_.kernel->supportsRequestLiveStateBank(
+                   /*request_count=*/1,
+                   state_size);
     }
 
     std::string GDNRecurrenceStage::workspaceStableId() const
@@ -411,9 +390,20 @@ namespace llaminar2
         return role_prefix + "slice" + std::to_string(workspace_slice_id_);
     }
 
-    std::string GDNRecurrenceStage::effectiveSeqLenScalarBufferName() const
+    std::string GDNRecurrenceStage::deinterleaveScratchBufferName() const
     {
-        return std::string(WS_EFFECTIVE_SEQ_LEN_SCALAR) + "_" + workspaceStableId();
+        /*
+         * Every GDN layer in one graph role executes in dependency order and
+         * can economically reuse one large deinterleave allocation. Different
+         * graph roles may replay on independent streams, so their mutable Q/K/V
+         * scratch must have distinct keys. Including the layer here would avoid
+         * the race but multiply long-context scratch by the number of GDN
+         * layers, which is unnecessary and prohibitively expensive.
+         */
+        if (params_.workspace_namespace.empty())
+            return WS_DEINTERLEAVE_SCRATCH;
+        return std::string(WS_DEINTERLEAVE_SCRATCH) + "_" +
+               params_.workspace_namespace;
     }
 
     std::string GDNRecurrenceStage::speculativeStateSlotsBufferName() const
@@ -726,6 +716,7 @@ namespace llaminar2
     bool GDNRecurrenceStage::ensureGpuDeinterleaveWorkspaceBound(int seq_len) const
     {
         const size_t required_bytes = deinterleaveScratchFloats(seq_len) * sizeof(float);
+        const std::string scratch_name = deinterleaveScratchBufferName();
         if (required_bytes == 0)
         {
             LOG_ERROR("[GDNRecurrenceStage] Invalid merged-QKV deinterleave scratch shape"
@@ -737,15 +728,15 @@ namespace llaminar2
         }
 
         if (!bound_workspace_ ||
-            !bound_workspace_->hasBuffer(WS_DEINTERLEAVE_SCRATCH) ||
-            bound_workspace_->getBufferSize(WS_DEINTERLEAVE_SCRATCH) < required_bytes)
+            !bound_workspace_->hasBuffer(scratch_name) ||
+            bound_workspace_->getBufferSize(scratch_name) < required_bytes)
         {
             LOG_ERROR("[GDNRecurrenceStage] Missing required graph workspace buffer '"
-                      << WS_DEINTERLEAVE_SCRATCH << "' for merged-QKV GPU deinterleave"
+                      << scratch_name << "' for merged-QKV GPU deinterleave"
                       << " (requested=" << required_bytes << " bytes"
                       << ", available="
-                      << (bound_workspace_ && bound_workspace_->hasBuffer(WS_DEINTERLEAVE_SCRATCH)
-                              ? bound_workspace_->getBufferSize(WS_DEINTERLEAVE_SCRATCH)
+                      << (bound_workspace_ && bound_workspace_->hasBuffer(scratch_name)
+                              ? bound_workspace_->getBufferSize(scratch_name)
                               : 0)
                       << " bytes, seq_len=" << seq_len
                       << ", n_heads=" << params_.n_heads
@@ -764,22 +755,19 @@ namespace llaminar2
         prefill_bucket_seq_len_ = replay.bucket_seq_len > 0 ? replay.bucket_seq_len : params_.seq_len;
         const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
         prefill_effective_seq_len_ = std::clamp(real_seq_len, 1, std::max(1, params_.seq_len));
-        refreshPinnedEffectiveSeqLen();
-        if (gpu_effective_seq_len_state_)
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
-        if (params_.device_id.is_gpu() && hasGPUStream() && bound_workspace_)
-            (void)(ensureGpuEffectiveSeqLenStateInitialized() && uploadGpuEffectiveSeqLen());
     }
 
     bool GDNRecurrenceStage::supportsPaddedPrefillRealLengthContract() const
     {
-        if (params_.request_count > 1)
+        if (params_.device_id.is_gpu())
         {
+            const int state_size =
+                params_.n_heads * params_.d_k * params_.d_v;
             return params_.kernel &&
                    params_.request_seq_lens_device != nullptr &&
                    params_.kernel->supportsRequestLiveStateBank(
                        params_.request_count,
-                       params_.n_heads * params_.d_k * params_.d_v);
+                       state_size);
         }
         return params_.kernel && params_.kernel->supportsPaddedPrefillRealLength();
     }
@@ -816,143 +804,7 @@ namespace llaminar2
     bool GDNRecurrenceStage::supportsPaddedPrefillGraphCapturePreflight() const
     {
         return supportsLazyPrefillGraphCapturePreflight() &&
-               params_.kernel &&
-               params_.kernel->supportsPaddedPrefillRealLength();
-    }
-
-    bool GDNRecurrenceStage::ensureGpuEffectiveSeqLenStateInitialized()
-    {
-        const std::string scalar_buffer = effectiveSeqLenScalarBufferName();
-        if (!bound_workspace_ ||
-            !bound_workspace_->hasBuffer(scalar_buffer) ||
-            bound_workspace_->getBufferSize(scalar_buffer) < sizeof(int))
-        {
-            LOG_ERROR("[GDNRecurrenceStage] Missing required graph workspace buffer '"
-                      << scalar_buffer << "' for effective sequence length on "
-                      << params_.device_id.toString());
-            return false;
-        }
-
-        auto *device_effective_seq_len =
-            static_cast<int *>(bound_workspace_->getBuffer(scalar_buffer));
-        if (!device_effective_seq_len)
-        {
-            LOG_ERROR("[GDNRecurrenceStage] Graph workspace buffer '"
-                      << scalar_buffer << "' resolved to null on "
-                      << params_.device_id.toString());
-            return false;
-        }
-
-        if (gpu_effective_seq_len_state_)
-        {
-            gpu_effective_seq_len_state_->device_effective_seq_len = device_effective_seq_len;
-            if (!device_effective_seq_len)
-                gpu_effective_seq_len_state_->device_value_uploaded = false;
-            return true;
-        }
-
-        auto state = std::make_unique<GpuEffectiveSeqLenState>();
-        state->device = params_.device_id;
-        state->device_effective_seq_len = device_effective_seq_len;
-
-        bool allocated = false;
-        if (params_.device_id.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            allocated = cuda::allocateRowSelectHostParam(
-                params_.device_id.cuda_ordinal(),
-                &state->host_effective_seq_len);
-#endif
-        }
-        else if (params_.device_id.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            allocated = rocm::allocateRowSelectHostParam(
-                params_.device_id.rocm_ordinal(),
-                &state->host_effective_seq_len);
-#endif
-        }
-
-        if (!allocated || !state->host_effective_seq_len || !state->device_effective_seq_len)
-        {
-            LOG_ERROR("[GDNRecurrenceStage] Failed to allocate pinned effective length replay scalar on "
-                      << params_.device_id.toString());
-            return false;
-        }
-
-        gpu_effective_seq_len_state_ = std::move(state);
-        refreshPinnedEffectiveSeqLen();
-        return true;
-    }
-
-    void GDNRecurrenceStage::refreshPinnedEffectiveSeqLen()
-    {
-        if (gpu_effective_seq_len_state_ && gpu_effective_seq_len_state_->host_effective_seq_len)
-            *gpu_effective_seq_len_state_->host_effective_seq_len = effectivePrefillSeqLen();
-    }
-
-    bool GDNRecurrenceStage::uploadGpuEffectiveSeqLen()
-    {
-        if (!gpu_effective_seq_len_state_)
-            return false;
-        refreshPinnedEffectiveSeqLen();
-
-        if (isGraphCaptureActive())
-        {
-            if (!gpu_effective_seq_len_state_->device_value_uploaded)
-            {
-                LOG_ERROR("[GDNRecurrenceStage] Effective sequence length scalar was not uploaded before graph capture");
-                return false;
-            }
-            return true;
-        }
-
-        bool uploaded = false;
-        if (params_.device_id.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            uploaded = cuda::uploadRowSelectParam(
-                gpu_effective_seq_len_state_->device_effective_seq_len,
-                gpu_effective_seq_len_state_->host_effective_seq_len,
-                gpuStream());
-#endif
-        }
-        else if (params_.device_id.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            uploaded = rocm::uploadRowSelectParam(
-                gpu_effective_seq_len_state_->device_effective_seq_len,
-                gpu_effective_seq_len_state_->host_effective_seq_len,
-                gpuStream());
-#endif
-        }
-        gpu_effective_seq_len_state_->device_value_uploaded = uploaded;
-        return uploaded;
-    }
-
-    void GDNRecurrenceStage::releaseGpuEffectiveSeqLenState()
-    {
-        if (!gpu_effective_seq_len_state_)
-            return;
-
-        if (gpu_effective_seq_len_state_->device.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            cuda::freeRowSelectHostParam(
-                gpu_effective_seq_len_state_->device.cuda_ordinal(),
-                gpu_effective_seq_len_state_->host_effective_seq_len);
-#endif
-        }
-        else if (gpu_effective_seq_len_state_->device.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            rocm::freeRowSelectHostParam(
-                gpu_effective_seq_len_state_->device.rocm_ordinal(),
-                gpu_effective_seq_len_state_->host_effective_seq_len);
-#endif
-        }
-
-        gpu_effective_seq_len_state_.reset();
+               supportsPaddedPrefillRealLengthContract();
     }
 
     // =========================================================================
@@ -1173,17 +1025,17 @@ namespace llaminar2
                                                                             << " d_v=" << params_.d_v
                                                                             << " seq=" << params_.seq_len
                                                                             << " effective_seq=" << effective_seq_len);
-                if (request_batched)
+                if (request_batched || use_real_length_contract)
                 {
                     if (!params_.request_seq_lens_device)
                     {
-                        LOG_ERROR("[GDNRecurrenceStage] Request-batched GPU recurrence requires device-owned request lengths");
+                        LOG_ERROR("[GDNRecurrenceStage] GPU recurrence with dynamic real lengths requires device-owned request lengths");
                         return false;
                     }
                     const int state_size = params_.n_heads * params_.d_k * params_.d_v;
                     if (!params_.kernel->supportsRequestLiveStateBank(params_.request_count, state_size))
                     {
-                        LOG_ERROR("[GDNRecurrenceStage] Backend lacks request-owned live recurrence-state bank for "
+                        LOG_ERROR("[GDNRecurrenceStage] Backend lacks device-owned live recurrence-state bank for "
                                   << params_.request_count << " requests");
                         return false;
                     }
@@ -1196,22 +1048,6 @@ namespace llaminar2
                         params_.n_heads, params_.d_k, params_.d_v,
                         params_.chunk_size, params_.use_qk_l2norm,
                         params_.request_seq_lens_device);
-                }
-                else if (use_real_length_contract)
-                {
-                    if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
-                    {
-                        LOG_ERROR("[GDNRecurrenceStage] Failed to update GPU effective length scalar");
-                        return false;
-                    }
-                    ok = params_.kernel->chunkForwardWithEffectiveSeqLen(
-                        d_q, d_k, d_v,
-                        d_alpha, d_beta,
-                        d_alog, d_dtbias,
-                        d_output, params_.recurrence_state,
-                        params_.seq_len, params_.n_heads, params_.d_k, params_.d_v,
-                        params_.chunk_size, params_.use_qk_l2norm,
-                        gpu_effective_seq_len_state_->device_effective_seq_len);
                 }
                 else
                 {

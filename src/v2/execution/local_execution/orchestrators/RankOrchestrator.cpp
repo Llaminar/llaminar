@@ -5489,6 +5489,10 @@ namespace llaminar2
             }
             if (all_success)
             {
+                invalidateRankResidentLogicalStateAggregate(
+                    "shifted_row_commit",
+                    "child_mailboxes_consumed",
+                    /*participant=*/-1);
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "rank_resident_logical_state_shifted_commits",
@@ -7662,6 +7666,29 @@ namespace llaminar2
                 "device-side common outcome grouped publication failed");
         }
 
+        /*
+         * The child-local event initially names verifier-summary completion.
+         * Once NCCL/RCCL is queued, the compact bytes are rank-authoritative
+         * only after that collective on each exact participant stream. Re-record
+         * the preallocated event at this stronger named timeline point. The
+         * final host bridge waits on the primary participant's post-collective
+         * edge, which also guarantees that every non-root timing stop event
+         * ordered before collective entry can be reclaimed without a sync.
+         */
+        for (size_t i = 0; i < child_outcomes.size(); ++i)
+        {
+            DeviceSpeculativeOutcomeHandle &child = child_outcomes[i];
+            IInferenceRunner *runner = device_runners_[i].get();
+            if (!runner ||
+                !runner->publishRankCompactSpeculativeResponseReady(&child))
+            {
+                return fail(
+                    "could not publish post-collective compact outcome for "
+                    "participant " +
+                    std::to_string(i));
+            }
+        }
+
         PerfStatsCollector::addCounter(
             "mtp",
             "rank_mirrored_localtp_common_outcome_broadcasts",
@@ -7675,6 +7702,15 @@ namespace llaminar2
              {"implementation", "localtp_grouped_multi_stream_broadcast"},
              {"host_worker_rendezvous", "false"},
              {"context", stage_name}});
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_mirrored_localtp_post_collective_response_publications",
+            static_cast<double>(child_outcomes.size()),
+            "decode",
+            "rank",
+            {{"participants", std::to_string(child_outcomes.size())},
+             {"timeline_point",
+              "rank_compact_speculative_response_ready"}});
         return true;
     }
 
@@ -13214,6 +13250,34 @@ namespace llaminar2
         snapshot.positions = {snapshot.current_position};
         snapshot.sequence_lengths = current_sequence_lengths_;
 
+        const bool use_resident_child_logical_state =
+            pp_stage_runners_.empty() &&
+            deviceResidentLogicalSequenceState().valid();
+        std::optional<int> resident_child_position;
+        std::vector<int> resident_child_positions;
+        std::vector<int> resident_child_sequence_lengths;
+        auto adopt_resident_child_logical_state =
+            [&](const PrefixRuntimeStateSnapshot &child)
+        {
+            if (!use_resident_child_logical_state)
+                return;
+            if (!resident_child_position.has_value())
+            {
+                resident_child_position = child.current_position;
+                resident_child_positions = child.positions;
+                resident_child_sequence_lengths = child.sequence_lengths;
+                return;
+            }
+            if (*resident_child_position != child.current_position ||
+                resident_child_positions != child.positions ||
+                resident_child_sequence_lengths != child.sequence_lengths)
+            {
+                throw std::runtime_error(
+                    "Rank prefix-state diagnostics observed divergent "
+                    "device-resident logical metadata across LocalTP participants");
+            }
+        };
+
         auto merge_child = [&snapshot](const PrefixRuntimeStateSnapshot &child)
         {
             snapshot.initialized = snapshot.initialized && child.initialized;
@@ -13334,7 +13398,10 @@ namespace llaminar2
         {
             if (runner)
             {
-                merge_child(runner->prefixStateProbe());
+                const PrefixRuntimeStateSnapshot child =
+                    runner->prefixStateProbe();
+                adopt_resident_child_logical_state(child);
+                merge_child(child);
                 saw_child = true;
             }
         }
@@ -13350,6 +13417,20 @@ namespace llaminar2
         if (!saw_child)
         {
             snapshot.initialized = false;
+        }
+        if (resident_child_position.has_value())
+        {
+            /*
+             * The rank host cursor is only a scheduler/response shadow.  Once
+             * LocalTP children publish a resident logical-state mailbox,
+             * diagnostics must report that mailbox and must never let the
+             * verifier graph's temporary padded row count masquerade as live
+             * sequence state.
+             */
+            snapshot.current_position = *resident_child_position;
+            snapshot.positions = std::move(resident_child_positions);
+            snapshot.sequence_lengths =
+                std::move(resident_child_sequence_lengths);
         }
         if (snapshot.prefix_cache_bypassed)
         {

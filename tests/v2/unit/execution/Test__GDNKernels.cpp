@@ -688,18 +688,14 @@ TEST(Test__GDNKernels, ShortConv_WorkspaceRequirementUsesActiveSeqLen)
               static_cast<size_t>(1536) * static_cast<size_t>(8192) * sizeof(float));
     EXPECT_TRUE(scratch->required);
 
-    const WorkspaceDescriptor *effective_len = nullptr;
     for (const auto &buffer : reqs.buffers)
     {
-        if (buffer.name.find(ShortConv1dStage::WS_EFFECTIVE_SEQ_LEN_SCALAR) != std::string::npos)
-        {
-            effective_len = &buffer;
-            break;
-        }
+        EXPECT_EQ(
+            buffer.name.find("effective_seq_len_scalar"),
+            std::string::npos)
+            << "GPU GDN prefill must consume the arena-owned device request "
+               "length directly, not allocate a host-fed replay scalar";
     }
-    ASSERT_NE(effective_len, nullptr);
-    EXPECT_GE(effective_len->size_bytes, sizeof(int));
-    EXPECT_TRUE(effective_len->required);
 }
 
 TEST(Test__GDNKernels, Recurrence_WorkspaceRequirementSharesMergedQKVScratch)
@@ -752,9 +748,8 @@ TEST(Test__GDNKernels, ShortConv_WorkspaceNamesUseStableLayerIdAcrossRebuilds)
     merged.merge(first.getWorkspaceRequirements(/*m=*/2));
     merged.merge(rebuilt.getWorkspaceRequirements(/*m=*/2));
 
-    EXPECT_NE(merged.find("gdn_shortconv_effective_seq_len_scalar_layer17"), nullptr);
+    EXPECT_EQ(merged.find("gdn_shortconv_effective_seq_len_scalar_layer17"), nullptr);
     EXPECT_NE(merged.find("gdn_shortconv_speculative_state_slots_layer17"), nullptr);
-    EXPECT_EQ(countPrefixed(merged, ShortConv1dStage::WS_EFFECTIVE_SEQ_LEN_SCALAR), 1);
     EXPECT_EQ(countPrefixed(merged, ShortConv1dStage::WS_SPECULATIVE_STATE_SLOTS), 1);
 }
 
@@ -788,9 +783,8 @@ TEST(Test__GDNKernels, Recurrence_WorkspaceNamesUseStableLayerIdAcrossRebuilds)
     merged.merge(first.getWorkspaceRequirements(/*m=*/2));
     merged.merge(rebuilt.getWorkspaceRequirements(/*m=*/2));
 
-    EXPECT_NE(merged.find("gdn_effective_seq_len_scalar_layer17"), nullptr);
+    EXPECT_EQ(merged.find("gdn_effective_seq_len_scalar_layer17"), nullptr);
     EXPECT_NE(merged.find("gdn_speculative_state_slots_layer17"), nullptr);
-    EXPECT_EQ(countPrefixed(merged, GDNRecurrenceStage::WS_EFFECTIVE_SEQ_LEN_SCALAR), 1);
     EXPECT_EQ(countPrefixed(merged, GDNRecurrenceStage::WS_SPECULATIVE_STATE_SLOTS), 1);
 }
 

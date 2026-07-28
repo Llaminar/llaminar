@@ -28,6 +28,16 @@ namespace llaminar2
             static_cast<size_t>(DeviceTimelinePoint::Count)>
             kDeviceExecutionTimeline = {{
                 {
+                    .point = DeviceTimelinePoint::RequestStateResetReady,
+                    .name = "request_state_reset_ready",
+                    .producer = DeviceTimelineRole::RequestStateReset,
+                    .consumers = roles({
+                        DeviceTimelineRole::MainForwardGraph,
+                        DeviceTimelineRole::MTPSidecarGraph,
+                        DeviceTimelineRole::PrefixRestoreMutation,
+                    }),
+                },
+                {
                     .point = DeviceTimelinePoint::RequestInputAdmission,
                     .name = "request_input_admission",
                     .producer = DeviceTimelineRole::RequestAdmissionTransfer,
@@ -70,6 +80,7 @@ namespace llaminar2
                         DeviceTimelineRole::AllPositionVerifier,
                         DeviceTimelineRole::AcceptedStatePublication,
                         DeviceTimelineRole::PrefixCheckpointArchive,
+                        DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::Diagnostics,
                     }),
                 },
@@ -80,6 +91,7 @@ namespace llaminar2
                     .consumers = roles({
                         DeviceTimelineRole::VerifierSummary,
                         DeviceTimelineRole::AcceptedStatePublication,
+                        DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::Diagnostics,
                     }),
                 },
@@ -91,6 +103,7 @@ namespace llaminar2
                         DeviceTimelineRole::MainForwardGraph,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::PrefixCheckpointArchive,
+                        DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::Diagnostics,
                     }),
                 },
@@ -102,6 +115,7 @@ namespace llaminar2
                         DeviceTimelineRole::MainForwardGraph,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::RankCollective,
+                        DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::Diagnostics,
                     }),
                 },
@@ -113,6 +127,7 @@ namespace llaminar2
                         DeviceTimelineRole::MainForwardGraph,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::RankCollective,
+                        DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::Diagnostics,
                     }),
                 },
@@ -122,6 +137,7 @@ namespace llaminar2
                     .producer = DeviceTimelineRole::MainForwardGraph,
                     .consumers = roles({
                         DeviceTimelineRole::MTPSidecarGraph,
+                        DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::Diagnostics,
                     }),
                 },
@@ -132,6 +148,7 @@ namespace llaminar2
                     .consumers = roles({
                         DeviceTimelineRole::PrefixRestoreMutation,
                         DeviceTimelineRole::HostArchiveBoundary,
+                        DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::Diagnostics,
                     }),
                 },
@@ -143,6 +160,7 @@ namespace llaminar2
                         DeviceTimelineRole::MainForwardGraph,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::PrefixCheckpointArchive,
+                        DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::Diagnostics,
                     }),
                 },
@@ -178,6 +196,7 @@ namespace llaminar2
                         DeviceTimelineRole::RankCollective,
                         DeviceTimelineRole::HostResultBridge,
                         DeviceTimelineRole::HostArchiveBoundary,
+                        DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::Diagnostics,
                     }),
                 },
@@ -189,6 +208,17 @@ namespace llaminar2
                     .consumers = roles({
                         DeviceTimelineRole::RankCollective,
                         DeviceTimelineRole::HostResultBridge,
+                        DeviceTimelineRole::Diagnostics,
+                    }),
+                },
+                {
+                    .point =
+                        DeviceTimelinePoint::RankCompactSpeculativeResponseReady,
+                    .name = "rank_compact_speculative_response_ready",
+                    .producer = DeviceTimelineRole::RankCollective,
+                    .consumers = roles({
+                        DeviceTimelineRole::HostResultBridge,
+                        DeviceTimelineRole::AcceptedStatePublication,
                         DeviceTimelineRole::Diagnostics,
                     }),
                 },
@@ -235,6 +265,8 @@ namespace llaminar2
     {
         switch (role)
         {
+        case DeviceTimelineRole::RequestStateReset:
+            return "request_state_reset";
         case DeviceTimelineRole::RequestAdmissionTransfer:
             return "request_admission_transfer";
         case DeviceTimelineRole::MainForwardGraph:

@@ -576,6 +576,59 @@ TEST_F(Test__DeviceWorkspaceManager, DoubleAllocateWithoutReleaseFails)
     EXPECT_FALSE(mgr.hasBuffer("second"));
 }
 
+/**
+ * @brief Append-only growth preserves every address a captured graph can own.
+ */
+TEST_F(Test__DeviceWorkspaceManager, ExtendRetainsOldStorageAndStableNames)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+
+    WorkspaceRequirements initial;
+    initial.buffers.push_back({"growing", 1024, 64, true});
+    initial.buffers.push_back({"stable", 1024, 64, true});
+    ASSERT_TRUE(mgr.allocate(initial));
+
+    auto *old_growing =
+        static_cast<unsigned char *>(mgr.getBuffer("growing"));
+    auto *old_stable =
+        static_cast<unsigned char *>(mgr.getBuffer("stable"));
+    ASSERT_NE(old_growing, nullptr);
+    ASSERT_NE(old_stable, nullptr);
+    old_growing[0] = 0x5a;
+    old_stable[0] = 0xa5;
+
+    WorkspaceRequirements extension;
+    extension.buffers.push_back({"growing", 4096, 64, true});
+    extension.buffers.push_back({"stable", 1024, 64, true});
+    extension.buffers.push_back({"new_name", 2048, 64, true});
+    ASSERT_TRUE(mgr.extend(extension));
+
+    EXPECT_NE(mgr.getBuffer("growing"), old_growing);
+    EXPECT_EQ(mgr.getBufferSize("growing"), 4096u);
+    EXPECT_EQ(mgr.getBuffer("stable"), old_stable);
+    EXPECT_EQ(mgr.getBufferSize("stable"), 1024u);
+    EXPECT_NE(mgr.getBuffer("new_name"), nullptr);
+    EXPECT_EQ(old_growing[0], 0x5a)
+        << "Superseded storage must remain live for captured graph executables";
+    EXPECT_EQ(old_stable[0], 0xa5);
+}
+
+TEST_F(Test__DeviceWorkspaceManager, ExtendFailsClosedWhenRequiredGrowthExceedsBudget)
+{
+    DeviceWorkspaceManager mgr(device, 4096);
+
+    WorkspaceRequirements initial;
+    initial.buffers.push_back({"initial", 3072, 64, true});
+    ASSERT_TRUE(mgr.allocate(initial));
+    void *initial_address = mgr.getBuffer("initial");
+
+    WorkspaceRequirements extension;
+    extension.buffers.push_back({"required_growth", 2048, 64, true});
+    EXPECT_FALSE(mgr.extend(extension));
+    EXPECT_EQ(mgr.getBuffer("initial"), initial_address);
+    EXPECT_FALSE(mgr.hasBuffer("required_growth"));
+}
+
 // ============================================================================
 // Buffer Content Tests
 // ============================================================================

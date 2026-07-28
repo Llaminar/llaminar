@@ -840,6 +840,45 @@ namespace llaminar2
     // GDN Attention Sub-Graph
     // =========================================================================
 
+    std::string Qwen35Graph::maybeAddGDNDiagnosticCheckpoint(
+        ComputeGraph &graph,
+        const std::string &boundary,
+        const ITensor *source,
+        const std::string &dependency,
+        int layer_idx,
+        int total_tokens,
+        int feature_dim,
+        DeviceId device,
+        const int32_t *sequence_lengths_device)
+    {
+        (void)graph;
+        (void)boundary;
+        (void)source;
+        (void)layer_idx;
+        (void)total_tokens;
+        (void)feature_dim;
+        (void)device;
+        (void)sequence_lengths_device;
+        return dependency;
+    }
+
+    std::string Qwen35Graph::gdnWorkspaceRoleNamespace() const
+    {
+        /*
+         * `compute_all_position_logits` is deliberately absent: it is an output
+         * policy shared by ordinary MTP prompt prefill and grouped verification,
+         * not an execution owner. DeviceGraphOrchestrator scopes the two typed
+         * role flags below around exactly one graph build, so mutable workspace
+         * identity follows semantic ownership rather than tensor shape or
+         * requested outputs.
+         */
+        if (config_.grouped_mtp_verifier)
+            return "grouped_mtp_verifier";
+        if (config_.live_mtp_request_batch_condition)
+            return "live_mtp_request_batch";
+        return {};
+    }
+
     ComputeGraph Qwen35Graph::buildGDNAttentionGraph(
         const LayerWeights &layer,
         ActivationBuffers &buffers,
@@ -853,10 +892,7 @@ namespace llaminar2
     {
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
-        const std::string workspace_namespace =
-            prefix.empty() || prefix.back() != '_'
-                ? prefix
-                : prefix.substr(0, prefix.size() - 1);
+        const std::string workspace_namespace = gdnWorkspaceRoleNamespace();
         int total_tokens = batch_size * seq_len;
         const bool live_state_allgather_available =
             gdnLiveStateAllGatherAvailable(total_tokens, device);
@@ -1044,6 +1080,62 @@ namespace llaminar2
                       ComputeStageFactory::createGDNProjection(proj_params),
                       device);
         graph.addDependency(prefix + "gdn_proj", prefix + "attn_norm");
+        std::string gdn_projection_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_projection",
+                buffers.get(BufferId::GDN_QKV),
+                prefix + "gdn_proj",
+                layer_idx,
+                total_tokens,
+                qkv_dim,
+                device,
+                sequence_lengths_device);
+        /*
+         * The recurrence consumes alpha and beta in addition to the merged QKV
+         * projection, while gated normalization consumes Z later in the same
+         * subgraph. Retain all four projection products when diagnostics are
+         * enabled so a recurrence mismatch cannot be misattributed to its
+         * kernel merely because the QKV branch happened to remain identical.
+         *
+         * Each checkpoint is chained through `gdn_projection_ready`. Besides
+         * making the diagnostic order obvious, this prevents a later layer from
+         * reusing these arena buffers before every terminal row has been copied
+         * into its graph-owned device checkpoint.
+         */
+        gdn_projection_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_z",
+                buffers.get(BufferId::GDN_Z),
+                gdn_projection_ready,
+                layer_idx,
+                total_tokens,
+                value_dim,
+                device,
+                sequence_lengths_device);
+        gdn_projection_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_alpha",
+                buffers.get(BufferId::GDN_ALPHA),
+                gdn_projection_ready,
+                layer_idx,
+                total_tokens,
+                n_v_heads,
+                device,
+                sequence_lengths_device);
+        gdn_projection_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_beta",
+                buffers.get(BufferId::GDN_BETA),
+                gdn_projection_ready,
+                layer_idx,
+                total_tokens,
+                n_v_heads,
+                device,
+                sequence_lengths_device);
 
         std::string gdn_state_localize_node;
         if (needs_gdn_live_state_localize)
@@ -1117,9 +1209,20 @@ namespace llaminar2
         graph.addNode(prefix + "short_conv",
                       ComputeStageFactory::createShortConv1d(conv_params),
                       device);
-        graph.addDependency(prefix + "short_conv", prefix + "gdn_proj");
+        graph.addDependency(prefix + "short_conv", gdn_projection_ready);
         if (!gdn_state_localize_node.empty())
             graph.addDependency(prefix + "short_conv", gdn_state_localize_node);
+        const std::string short_conv_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "short_conv",
+                buffers.get(BufferId::GDN_QKV),
+                prefix + "short_conv",
+                layer_idx,
+                total_tokens,
+                qkv_dim,
+                device,
+                sequence_lengths_device);
 
         // =====================================================================
         // Stage 4: GDN Recurrence (delta rule linear attention)
@@ -1194,7 +1297,7 @@ namespace llaminar2
         graph.addNode(prefix + "gdn_recurrence",
                       ComputeStageFactory::createGDNRecurrence(rec_params),
                       device);
-        graph.addDependency(prefix + "gdn_recurrence", prefix + "short_conv");
+        graph.addDependency(prefix + "gdn_recurrence", short_conv_ready);
 
         std::string gdn_state_ready_node = prefix + "gdn_recurrence";
         if (gdn_live_state_handoff_candidate)
@@ -1243,6 +1346,61 @@ namespace llaminar2
             }
         }
 
+        /*
+         * GPU prefill recurrence preprocesses Q/K and alpha/beta in place.
+         * Capturing only their raw projection values before recurrence cannot
+         * distinguish an upstream input mismatch from repeated or stale
+         * preprocessing during graph capture.  Diagnostic graphs therefore
+         * retain the terminal row of the exact transformed inputs after the
+         * recurrence has consumed them.  Chaining through the live-state
+         * handoff also prevents arena reuse before these tiny device copies.
+         */
+        gdn_state_ready_node =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_preprocessed_qkv",
+                buffers.get(BufferId::GDN_QKV),
+                gdn_state_ready_node,
+                layer_idx,
+                total_tokens,
+                qkv_dim,
+                device,
+                sequence_lengths_device);
+        gdn_state_ready_node =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_preprocessed_alpha",
+                buffers.get(BufferId::GDN_ALPHA),
+                gdn_state_ready_node,
+                layer_idx,
+                total_tokens,
+                n_v_heads,
+                device,
+                sequence_lengths_device);
+        gdn_state_ready_node =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_preprocessed_beta",
+                buffers.get(BufferId::GDN_BETA),
+                gdn_state_ready_node,
+                layer_idx,
+                total_tokens,
+                n_v_heads,
+                device,
+                sequence_lengths_device);
+
+        gdn_state_ready_node =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_recurrence",
+                buffers.attn_output,
+                gdn_state_ready_node,
+                layer_idx,
+                total_tokens,
+                value_dim,
+                device,
+                sequence_lengths_device);
+
         // =====================================================================
         // Stage 5: Gated RMSNorm — RMSNorm(output) * SiLU(Z)
         // =====================================================================
@@ -1267,6 +1425,17 @@ namespace llaminar2
                       ComputeStageFactory::createGatedRMSNorm(gnorm_params),
                       device);
         graph.addDependency(prefix + "gated_norm", gdn_state_ready_node);
+        const std::string gated_norm_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_gated_norm",
+                buffers.attn_output,
+                prefix + "gated_norm",
+                layer_idx,
+                total_tokens,
+                value_dim,
+                device,
+                sequence_lengths_device);
 
         // =====================================================================
         // Stage 6: Output Projection (Wo GEMM) + optional TP AllReduce
@@ -1274,8 +1443,19 @@ namespace llaminar2
         std::string terminal_node = addWoProjectionAndAllreduce(
             graph, prefix, buffers, gdn_layer->ssm_out, layer_bindings.ssm_out,
             total_tokens, layer_idx, device,
-            prefix + "gated_norm",
+            gated_norm_ready,
             "gdn_out_proj", "gdn_wo_allreduce");
+        terminal_node =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_output_projection",
+                buffers.attn_proj,
+                terminal_node,
+                layer_idx,
+                total_tokens,
+                config_.d_model,
+                device,
+                sequence_lengths_device);
         replicated_attention_state_graph_active_ =
             saved_replicated_attention_state_graph_active;
 

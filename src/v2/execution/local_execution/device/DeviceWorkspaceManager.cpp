@@ -188,6 +188,66 @@ namespace llaminar2
         return allocateBuffers(all_buffers, total_size);
     }
 
+    bool DeviceWorkspaceManager::extend(
+        const WorkspaceRequirements &requirements)
+    {
+        if (!allocated_)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] extend called before initial allocation on "
+                      << device_.to_string());
+            return false;
+        }
+
+        std::vector<const WorkspaceDescriptor *> additions;
+        additions.reserve(requirements.buffers.size());
+        for (const auto &buffer : requirements.buffers)
+        {
+            const auto existing = buffers_.find(buffer.name);
+            if (existing == buffers_.end() ||
+                existing->second.size < buffer.size_bytes)
+            {
+                additions.push_back(&buffer);
+            }
+        }
+        if (additions.empty())
+            return true;
+
+        size_t extension_size = 0;
+        std::vector<const WorkspaceDescriptor *> fitting;
+        fitting.reserve(additions.size());
+        for (const WorkspaceDescriptor *buffer : additions)
+        {
+            const size_t aligned_offset =
+                alignUp(extension_size, buffer->alignment);
+            const bool fits =
+                aligned_offset <= budget_bytes_ &&
+                buffer->size_bytes <= budget_bytes_ - aligned_offset &&
+                used_bytes_ <= budget_bytes_ -
+                                   (aligned_offset + buffer->size_bytes);
+            if (!fits)
+            {
+                if (buffer->required)
+                {
+                    LOG_ERROR("[DeviceWorkspaceManager] Append-only workspace extension for required buffer '"
+                              << buffer->name << "' (" << buffer->size_bytes
+                              << " bytes) exceeds remaining budget "
+                              << remaining() << " on " << device_.to_string());
+                    return false;
+                }
+                LOG_TRACE("[DeviceWorkspaceManager] Skipping optional append-only buffer '"
+                          << buffer->name << "' because it exceeds remaining budget");
+                continue;
+            }
+
+            fitting.push_back(buffer);
+            extension_size = aligned_offset + buffer->size_bytes;
+        }
+
+        if (fitting.empty())
+            return true;
+        return allocateExtensionBuffers(fitting, extension_size);
+    }
+
     bool DeviceWorkspaceManager::zeroAll(void *stream)
     {
         if (!allocated_)
@@ -196,8 +256,6 @@ namespace llaminar2
                       << device_.to_string());
             return false;
         }
-        if (!block_ || block_size_ == 0)
-            return true;
         if (device_.is_gpu() && !stream)
         {
             LOG_ERROR("[DeviceWorkspaceManager] zeroAll requires an explicit GPU stream on "
@@ -212,12 +270,31 @@ namespace llaminar2
                       << device_.to_string());
             return false;
         }
-        return backend->memset(
-            block_,
-            0,
-            block_size_,
-            device_.is_cpu() ? 0 : device_.ordinal,
-            stream);
+        const int device_ordinal = device_.is_cpu() ? 0 : device_.ordinal;
+        if (block_ && block_size_ > 0 &&
+            !backend->memset(
+                block_,
+                0,
+                block_size_,
+                device_ordinal,
+                stream))
+        {
+            return false;
+        }
+        for (const ExtensionBlock &extension : extension_blocks_)
+        {
+            if (extension.base && extension.size > 0 &&
+                !backend->memset(
+                    extension.base,
+                    0,
+                    extension.size,
+                    device_ordinal,
+                    stream))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     bool DeviceWorkspaceManager::allocateBuffers(
@@ -291,6 +368,7 @@ namespace llaminar2
             current_offset = alignUp(current_offset, buf->alignment);
 
             BufferInfo info;
+            info.base = block_;
             info.offset = current_offset;
             info.size = buf->size_bytes;
             buffers_[buf->name] = info;
@@ -351,6 +429,102 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceWorkspaceManager::allocateExtensionBuffers(
+        const std::vector<const WorkspaceDescriptor *> &buffers,
+        size_t total_size)
+    {
+        IBackend *backend = getBackendFor(device_);
+        if (!backend)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Cannot extend workspace without backend for "
+                      << device_.to_string());
+            return false;
+        }
+        if (total_size == 0 || used_bytes_ > budget_bytes_ - total_size)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Invalid append-only extension size "
+                      << total_size << " with " << remaining()
+                      << " bytes remaining on " << device_.to_string());
+            return false;
+        }
+
+        const int device_ordinal = device_.is_cpu() ? 0 : device_.ordinal;
+        void *extension_base = backend->allocate(total_size, device_ordinal);
+        if (!extension_base)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Failed to allocate append-only workspace extension of "
+                      << total_size << " bytes on " << device_.to_string());
+            return false;
+        }
+
+        size_t max_alignment = 1;
+        for (const WorkspaceDescriptor *buffer : buffers)
+            max_alignment = std::max(max_alignment, buffer->alignment);
+        if (!device_.is_cpu() &&
+            (reinterpret_cast<std::uintptr_t>(extension_base) &
+             (max_alignment - 1)) != 0)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Append-only workspace extension on "
+                      << device_.to_string() << " is not aligned to "
+                      << max_alignment << " bytes");
+            backend->free(extension_base, device_ordinal);
+            return false;
+        }
+
+        size_t current_offset = 0;
+        for (const WorkspaceDescriptor *buffer : buffers)
+        {
+            current_offset = alignUp(current_offset, buffer->alignment);
+            void *buffer_ptr =
+                static_cast<char *>(extension_base) + current_offset;
+            if (!device_.is_cpu() &&
+                (reinterpret_cast<std::uintptr_t>(buffer_ptr) &
+                 (buffer->alignment - 1)) != 0)
+            {
+                LOG_ERROR("[DeviceWorkspaceManager] Append-only buffer '"
+                          << buffer->name << "' on " << device_.to_string()
+                          << " is not aligned to " << buffer->alignment
+                          << " bytes");
+                backend->free(extension_base, device_ordinal);
+                return false;
+            }
+
+            buffers_[buffer->name] = BufferInfo{
+                .base = extension_base,
+                .offset = current_offset,
+                .size = buffer->size_bytes,
+            };
+            LOG_TRACE("[WORKSPACE_APPEND_ONLY_SUBALLOC] '" << buffer->name
+                                                           << "' ptr=" << buffer_ptr
+                                                           << " offset=" << current_offset
+                                                           << " size=" << buffer->size_bytes
+                                                           << " device=" << device_.to_string());
+            PerfStatsCollector::addCounter(
+                "memory",
+                "workspace_append_only_suballoc_bytes",
+                static_cast<double>(buffer->size_bytes),
+                "materialize",
+                device_.to_string(),
+                {{"name", buffer->name},
+                 {"required", buffer->required ? "true" : "false"},
+                 {"alignment", std::to_string(buffer->alignment)},
+                 {"bytes", std::to_string(buffer->size_bytes)}});
+            current_offset += buffer->size_bytes;
+        }
+
+        extension_blocks_.push_back({extension_base, total_size});
+        used_bytes_ += total_size;
+        PerfStatsCollector::addCounter(
+            "memory",
+            "workspace_append_only_extension_bytes",
+            static_cast<double>(total_size),
+            "materialize",
+            device_.to_string(),
+            {{"buffer_count", std::to_string(buffers.size())},
+             {"bytes", std::to_string(total_size)}});
+        return true;
+    }
+
     void DeviceWorkspaceManager::release()
     {
         /*
@@ -389,6 +563,21 @@ namespace llaminar2
             block_ = nullptr;
             block_size_ = 0;
         }
+        if (!extension_blocks_.empty())
+        {
+            IBackend *backend = getBackendFor(device_);
+            if (backend)
+            {
+                const int device_ordinal =
+                    device_.is_cpu() ? 0 : device_.ordinal;
+                for (const ExtensionBlock &extension : extension_blocks_)
+                {
+                    if (extension.base)
+                        backend->free(extension.base, device_ordinal);
+                }
+            }
+            extension_blocks_.clear();
+        }
 
         buffers_.clear();
         used_bytes_ = 0;
@@ -407,8 +596,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Return block_ + offset
-        return static_cast<char *>(block_) + it->second.offset;
+        return static_cast<char *>(it->second.base) + it->second.offset;
     }
 
     size_t DeviceWorkspaceManager::getBufferSize(const std::string &name) const

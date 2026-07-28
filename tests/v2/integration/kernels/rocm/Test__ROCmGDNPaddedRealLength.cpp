@@ -1032,7 +1032,9 @@ TEST(Test__ROCmGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteExac
     }
 }
 
-TEST(Test__ROCmGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCaptureGuard)
+TEST(
+    Test__ROCmGDNPaddedRealLength,
+    StateBankGeometryLookupDoesNotMutateStableBindingsUnderCaptureGuard)
 {
     if (!hasROCm())
         GTEST_SKIP() << "No ROCm device available";
@@ -1089,7 +1091,12 @@ TEST(Test__ROCmGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCaptu
             /*use_qk_l2norm=*/false));
     }
     checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(full recurrence slot)");
-    EXPECT_EQ(recurrence.stateBytes(), static_cast<size_t>(full_recurrence_state) * sizeof(float));
+    EXPECT_EQ(
+        recurrence.stateBytes(),
+        static_cast<size_t>(local_recurrence_state) * sizeof(float));
+    EXPECT_EQ(
+        recurrence.largestStateBytes(),
+        static_cast<size_t>(full_recurrence_state) * sizeof(float));
 
     constexpr int local_channels = 64;
     constexpr int full_channels = 128;
@@ -1133,7 +1140,197 @@ TEST(Test__ROCmGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCaptu
             /*apply_silu=*/true));
     }
     checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(full short-conv slot)");
-    EXPECT_EQ(conv.stateBytes(), static_cast<size_t>(full_conv_state) * sizeof(float));
+    EXPECT_EQ(
+        conv.stateBytes(),
+        static_cast<size_t>(local_conv_state) * sizeof(float));
+    EXPECT_EQ(
+        conv.largestStateBytes(),
+        static_cast<size_t>(full_conv_state) * sizeof(float));
+}
+
+/**
+ * @brief Proves HIP replay republishes LocalTP full state to request zero.
+ *
+ * The captured executable performs local stateful work followed by a
+ * local-to-full handoff. Resetting all banks and replaying that executable must
+ * rebuild both the full live bank and the packed request view without a host
+ * validity field being updated by the C++ wrappers.
+ */
+TEST(
+    Test__ROCmGDNPaddedRealLength,
+    CapturedLocalToFullHandoffPublishesRequestBanksOnEveryReplay)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    HipStreamHandle stream;
+
+    constexpr int local_heads = 1;
+    constexpr int full_heads = 2;
+    constexpr int d_k = 64;
+    constexpr int d_v = 64;
+    constexpr int seq_len = 2;
+    constexpr int local_qk_stride = local_heads * d_k;
+    constexpr int local_v_stride = local_heads * d_v;
+    constexpr int local_recurrence_state = local_heads * d_k * d_v;
+    constexpr int full_recurrence_state = full_heads * d_k * d_v;
+
+    ROCmGatedDeltaNet recurrence(0);
+    recurrence.setGPUStream(stream.stream);
+    HipGDNStateOwner recurrence_state_owner(
+        recurrence,
+        local_recurrence_state,
+        full_recurrence_state);
+
+    HipFloatBuffer d_q(
+        static_cast<size_t>(seq_len) * local_qk_stride,
+        0.01f);
+    HipFloatBuffer d_kbuf(
+        static_cast<size_t>(seq_len) * local_qk_stride,
+        0.02f);
+    HipFloatBuffer d_vbuf(
+        static_cast<size_t>(seq_len) * local_v_stride,
+        0.03f);
+    HipFloatBuffer d_alpha(
+        static_cast<size_t>(seq_len) * local_heads,
+        0.2f);
+    HipFloatBuffer d_beta(
+        static_cast<size_t>(seq_len) * local_heads,
+        -0.1f);
+    HipFloatBuffer d_A_log(static_cast<size_t>(local_heads), -0.5f);
+    HipFloatBuffer d_dt_bias(static_cast<size_t>(local_heads), 0.1f);
+    HipFloatBuffer d_recurrence_out(
+        static_cast<size_t>(seq_len) * local_v_stride,
+        0.0f);
+    const auto full_recurrence_payload =
+        makeInitialState(static_cast<size_t>(full_recurrence_state), 0.00031f);
+    HipFloatBuffer d_full_recurrence(full_recurrence_payload);
+
+    HipCapturedGraph recurrence_graph(
+        stream.stream,
+        [&]()
+        {
+            return recurrence.chunk_forward(
+                       d_q.ptr,
+                       d_kbuf.ptr,
+                       d_vbuf.ptr,
+                       d_alpha.ptr,
+                       d_beta.ptr,
+                       d_A_log.ptr,
+                       d_dt_bias.ptr,
+                       d_recurrence_out.ptr,
+                       nullptr,
+                       seq_len,
+                       local_heads,
+                       d_k,
+                       d_v,
+                       /*chunk_size=*/64,
+                       /*use_qk_l2norm=*/false) &&
+                   recurrence.importStateForSize(
+                       full_recurrence_state,
+                       /*src_host=*/nullptr,
+                       d_full_recurrence.ptr,
+                       stream.stream);
+        });
+
+    ASSERT_TRUE(recurrence.resetGPUState(stream.stream));
+    recurrence_graph.launch(stream.stream);
+    std::vector<float> recurrence_live(
+        static_cast<size_t>(full_recurrence_state));
+    std::vector<float> recurrence_request(
+        static_cast<size_t>(full_recurrence_state));
+    ASSERT_TRUE(recurrence.exportStateForSize(
+        full_recurrence_state,
+        recurrence_live.data(),
+        /*dst_device=*/nullptr,
+        stream.stream));
+    ASSERT_TRUE(recurrence.exportRequestStateBank(
+        recurrence_request.data(),
+        /*request_count=*/1,
+        full_recurrence_state,
+        stream.stream));
+    checkHip(
+        hipStreamSynchronize(stream.stream),
+        "hipStreamSynchronize(replayed recurrence publication)");
+    expectByteExactEquivalent(
+        "captured ROCm recurrence request-state publication",
+        recurrence_request,
+        recurrence_live,
+        /*offset=*/0,
+        recurrence_live.size());
+
+    constexpr int local_channels = 64;
+    constexpr int full_channels = 128;
+    constexpr int kernel_size = 4;
+    constexpr int local_conv_state = local_channels * (kernel_size - 1);
+    constexpr int full_conv_state = full_channels * (kernel_size - 1);
+
+    ROCmShortConvolution conv(0);
+    conv.setGPUStream(stream.stream);
+    HipGDNStateOwner conv_state_owner(
+        conv,
+        local_conv_state,
+        full_conv_state);
+    const auto conv_weights =
+        makeShortConvWeights(local_channels, kernel_size);
+    const auto conv_bias = makeBias(local_channels);
+    HipFloatBuffer d_conv_input(
+        static_cast<size_t>(seq_len) * local_channels,
+        0.04f);
+    HipFloatBuffer d_conv_weight(conv_weights);
+    HipFloatBuffer d_conv_bias(conv_bias);
+    HipFloatBuffer d_conv_out(
+        static_cast<size_t>(seq_len) * local_channels,
+        0.0f);
+    const auto full_conv_payload =
+        makeInitialState(static_cast<size_t>(full_conv_state), 0.0061f);
+    HipFloatBuffer d_full_conv(full_conv_payload);
+
+    HipCapturedGraph conv_graph(
+        stream.stream,
+        [&]()
+        {
+            return conv.forward(
+                       d_conv_input.ptr,
+                       d_conv_weight.ptr,
+                       d_conv_bias.ptr,
+                       d_conv_out.ptr,
+                       nullptr,
+                       seq_len,
+                       local_channels,
+                       kernel_size,
+                       /*apply_silu=*/true) &&
+                   conv.importStateForSize(
+                       full_conv_state,
+                       /*src_host=*/nullptr,
+                       d_full_conv.ptr,
+                       stream.stream);
+        });
+
+    ASSERT_TRUE(conv.resetGPUState(stream.stream));
+    conv_graph.launch(stream.stream);
+    std::vector<float> conv_live(static_cast<size_t>(full_conv_state));
+    std::vector<float> conv_request(static_cast<size_t>(full_conv_state));
+    ASSERT_TRUE(conv.exportStateForSize(
+        full_conv_state,
+        conv_live.data(),
+        /*dst_device=*/nullptr,
+        stream.stream));
+    ASSERT_TRUE(conv.exportRequestStateBank(
+        conv_request.data(),
+        /*request_count=*/1,
+        full_conv_state,
+        stream.stream));
+    checkHip(
+        hipStreamSynchronize(stream.stream),
+        "hipStreamSynchronize(replayed short-conv publication)");
+    expectByteExactEquivalent(
+        "captured ROCm short-conv request-state publication",
+        conv_request,
+        conv_live,
+        /*offset=*/0,
+        conv_live.size());
 }
 
 TEST(Test__ROCmGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedDecode)
@@ -3057,8 +3254,26 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeRecurrencePublicati
             captured_verifier.launch(stream.stream);
 
             HipIntBuffer d_accepted_row(accepted_row);
-            ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
-                nullptr, d_accepted_row.ptr, stream.stream));
+            if (accepted_row == verifier_rows - 1)
+            {
+                /*
+                 * Exercise the production grouped publication contract: the
+                 * packed request-zero row and scalar live owner must be
+                 * published together before captured decode replay.
+                 */
+                ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowsFromDeviceIndices(
+                    nullptr,
+                    state_floats,
+                    d_accepted_row.ptr,
+                    /*request_count=*/1,
+                    /*row_index_stride=*/1,
+                    stream.stream));
+            }
+            else
+            {
+                ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
+                    nullptr, d_accepted_row.ptr, stream.stream));
+            }
             live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
             live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
 
@@ -3251,8 +3466,21 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicatio
             captured_verifier.launch(stream.stream);
 
             HipIntBuffer d_accepted_row(accepted_row);
-            ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
-                nullptr, d_accepted_row.ptr, stream.stream));
+            if (accepted_row == verifier_rows - 1)
+            {
+                ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowsFromDeviceIndices(
+                    nullptr,
+                    state_floats,
+                    d_accepted_row.ptr,
+                    /*request_count=*/1,
+                    /*row_index_stride=*/1,
+                    stream.stream));
+            }
+            else
+            {
+                ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
+                    nullptr, d_accepted_row.ptr, stream.stream));
+            }
             live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
             live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
             captured_decode.launch(stream.stream);

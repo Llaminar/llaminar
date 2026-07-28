@@ -68,6 +68,38 @@ namespace llaminar2
                 "LLAMINAR_MTP_MIRROR_LAYER_DIAGNOSTICS");
         }
 
+        /**
+         * @brief Resolve the one GDN layer whose fixed prefill rows are retained.
+         *
+         * Terminal-row checkpoints are useful for finding the first divergent
+         * layer, but a recurrent operator consumes every preceding row. Once a
+         * layer has been selected, retaining a logarithmic row sample at each
+         * boundary distinguishes an upstream row mismatch from a state-lifetime
+         * defect without copying a full activation tensor to the host.
+         *
+         * The environment value is read only while graph topology is built.
+         * Invalid and absent values disable fixed-row sampling; they never
+         * silently select another layer.
+         */
+        std::optional<int> mirroredGDNDiagnosticLayer()
+        {
+            const char *value =
+                DebugEnv::envValue(
+                    "LLAMINAR_MTP_GRAPH_REUSE_DIAGNOSTICS_GDN_LAYER");
+            if (!value || value[0] == '\0')
+                return std::nullopt;
+
+            char *end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (!end || *end != '\0' ||
+                parsed < 0 ||
+                parsed > std::numeric_limits<int>::max())
+            {
+                return std::nullopt;
+            }
+            return static_cast<int>(parsed);
+        }
+
         void appendU32(std::vector<uint8_t> &out, uint32_t value)
         {
             for (int i = 0; i < 4; ++i)
@@ -5733,6 +5765,21 @@ namespace llaminar2
                             1u,
                             static_cast<size_t>(config_.d_model)},
                         device);
+                    /*
+                     * Diagnostic checkpoints are graph outputs, not host
+                     * tensors awaiting upload. Prepare their model-lifetime
+                     * device storage before the executor validates output
+                     * placement. This allocation exists only when the
+                     * opt-in mirrored-layer diagnostic changes graph topology;
+                     * normal inference never creates these tensors.
+                     */
+                    if (!checkpoint->allocateOnDevice(device))
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE could not allocate mirrored-layer "
+                            "diagnostic checkpoint " +
+                            checkpoint_name + " on " + device.to_string());
+                    }
                 }
 
                 const std::string node_name =
@@ -5800,6 +5847,134 @@ namespace llaminar2
         return checkpoints;
     }
 
+    std::string Qwen35MoEGraph::maybeAddGDNDiagnosticCheckpoint(
+        ComputeGraph &graph,
+        const std::string &boundary,
+        const ITensor *source,
+        const std::string &dependency,
+        int layer_idx,
+        int total_tokens,
+        int feature_dim,
+        DeviceId device,
+        const int32_t *sequence_lengths_device)
+    {
+        if (mtp_graph_context_active_ ||
+            !device.is_gpu() ||
+            !mirroredLayerDiagnosticsEnabled())
+        {
+            return dependency;
+        }
+        if (!source || layer_idx < 0 ||
+            total_tokens <= 0 || feature_dim <= 0)
+        {
+            throw std::runtime_error(
+                "Qwen35 MoE GDN diagnostics require a source tensor and "
+                "positive layer, row, and feature geometry");
+        }
+
+        const std::string graph_regime =
+            config_.grouped_mtp_verifier
+                ? "grouped_verifier"
+                : config_.live_mtp_request_batch_condition
+                ? "request_batch_decode"
+                : total_tokens == 1
+                      ? "serial_decode"
+                      : "prefill";
+        const std::string graph_shape =
+            graph_regime + "_m" + std::to_string(total_tokens);
+        const auto add_checkpoint =
+            [&](const std::string &checkpoint_suffix,
+                int selected_row,
+                HiddenStateRowSelectStage::SelectionPolicy selection_policy,
+                const int32_t *request_lengths,
+                const std::string &input_dependency) -> std::string
+        {
+            const std::string checkpoint_name =
+                graph_shape + "_layer" + std::to_string(layer_idx) +
+                "_" + boundary + checkpoint_suffix;
+            auto &checkpoint =
+                mirrored_layer_checkpoints_[checkpoint_name];
+            if (!checkpoint)
+            {
+                checkpoint = std::make_unique<FP32Tensor>(
+                    std::vector<size_t>{
+                        1u,
+                        static_cast<size_t>(feature_dim)},
+                    device);
+                if (!checkpoint->allocateOnDevice(device))
+                {
+                    throw std::runtime_error(
+                        "Qwen35 MoE could not allocate GDN diagnostic checkpoint " +
+                        checkpoint_name + " on " + device.to_string());
+                }
+            }
+
+            const std::string node_name =
+                "layer" + std::to_string(layer_idx) +
+                "_mirror_checkpoint_" + graph_shape + "_" + boundary +
+                checkpoint_suffix;
+            HiddenStateRowSelectStage::Params params;
+            params.device_id = device;
+            params.input = source;
+            params.output = checkpoint.get();
+            params.seq_len = total_tokens;
+            params.d_model = feature_dim;
+            params.selected_row_idx = selected_row;
+            params.selection_policy = selection_policy;
+            params.request_sequence_length_device = request_lengths;
+
+            graph.addNode(
+                node_name,
+                ComputeStageFactory::createHiddenStateRowSelect(params),
+                device);
+            graph.addDependency(node_name, input_dependency);
+            return node_name;
+        };
+
+        HiddenStateRowSelectStage::Params terminal_policy;
+        terminal_policy.selected_row_idx = total_tokens - 1;
+        configureMirroredCheckpointRowOwnership(
+            terminal_policy,
+            total_tokens,
+            device,
+            sequence_lengths_device);
+        std::string checkpoint_dependency = add_checkpoint(
+            "",
+            terminal_policy.selected_row_idx,
+            terminal_policy.selection_policy,
+            terminal_policy.request_sequence_length_device,
+            dependency);
+
+        /*
+         * Fixed rows are diagnostic observations of immutable graph geometry.
+         * They deliberately do not consume mutable request-length metadata.
+         * Keep the terminal checkpoint above device-owned so padded prefill
+         * still identifies the exact logical final row.
+         */
+        const auto selected_layer = mirroredGDNDiagnosticLayer();
+        if (graph_regime == "prefill" &&
+            selected_layer &&
+            *selected_layer == layer_idx)
+        {
+            static constexpr int kSampleRows[] = {
+                0, 1, 2, 7, 31, 127, 511,
+                575, 639, 703, 767, 831, 895, 959, 1023,
+                2047};
+            for (const int row : kSampleRows)
+            {
+                if (row >= total_tokens)
+                    continue;
+                checkpoint_dependency = add_checkpoint(
+                    "_row" + std::to_string(row),
+                    row,
+                    HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow,
+                    nullptr,
+                    checkpoint_dependency);
+            }
+        }
+        return checkpoint_dependency;
+    }
+
     std::string Qwen35MoEGraph::maybeAddFinalNormDiagnosticCheckpoint(
         ComputeGraph &graph,
         const std::string &boundary,
@@ -5843,6 +6018,18 @@ namespace llaminar2
                     1u,
                     static_cast<size_t>(config_.d_model)},
                 device);
+            /*
+             * See the per-layer checkpoint allocation above. Final-norm
+             * diagnostics are graph outputs as well and therefore require
+             * prepared device storage before execution begins.
+             */
+            if (!checkpoint->allocateOnDevice(device))
+            {
+                throw std::runtime_error(
+                    "Qwen35 MoE could not allocate final-norm diagnostic "
+                    "checkpoint " +
+                    checkpoint_name + " on " + device.to_string());
+            }
         }
 
         const std::string node_name =

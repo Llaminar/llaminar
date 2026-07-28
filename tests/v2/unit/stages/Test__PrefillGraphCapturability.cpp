@@ -283,6 +283,15 @@ namespace
             return supports_padded_real_length_;
         }
 
+        bool supportsRequestLiveStateBank(
+            int request_count,
+            int state_size) const override
+        {
+            return supports_padded_real_length_ &&
+                   request_count > 0 &&
+                   state_size > 0;
+        }
+
         bool chunk_forward(
             const float *, const float *, const float *,
             const float *, const float *,
@@ -2055,6 +2064,7 @@ protected:
     std::unique_ptr<FP32Tensor> dt_bias_;
     std::unique_ptr<FP32Tensor> output_;
     std::vector<float> state_;
+    int32_t request_seq_len_device_ = SEQ_LEN;
 
     void SetUp() override
     {
@@ -2074,6 +2084,9 @@ protected:
         GDNRecurrenceStage::Params p;
         p.device_id = DeviceId::rocm(0);
         p.seq_len = SEQ_LEN;
+        p.request_count = 1;
+        p.request_seq_len = SEQ_LEN;
+        p.request_seq_lens_device = &request_seq_len_device_;
         p.n_heads = N_HEADS;
         p.d_k = D_K;
         p.d_v = D_V;

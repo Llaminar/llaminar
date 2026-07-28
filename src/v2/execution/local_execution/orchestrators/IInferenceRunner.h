@@ -216,6 +216,17 @@ namespace llaminar2
          */
         std::shared_ptr<void> response_ready_event;
         /**
+         * @brief Whether @ref response_ready_event was republished after a rank collective.
+         *
+         * Single-device outcomes are ready at the verifier-summary edge.
+         * Mirrored LocalTP outcomes become rank-authoritative only after the
+         * NCCL/RCCL compact-outcome collective queued on every child stream.
+         * Consumers use this flag to select the corresponding declarative
+         * timeline edge; they never guess ownership from topology or pointer
+         * identity.
+         */
+        bool response_ready_after_rank_collective = false;
+        /**
          * @brief Optional timing event recorded before compact outcome reduction.
          *
          * These events exist only when structured perfstats are enabled.  They
@@ -1962,6 +1973,12 @@ namespace llaminar2
          * host position override or derive one from get_position() /
          * sequence_lengths(); doing so would split one resident transaction
          * across two independently advancing owners.
+         *
+         * This is a consuming operation. A successful shifted-KV mutation
+         * advances the live-state epoch and must retire the supplied logical
+         * mailbox rather than retargeting its old values into the new epoch.
+         * Callers that need the condition token for the subsequent main graph
+         * must first publish it D2D into a persistent target slot.
          */
         virtual bool commitMTPShiftedRowFromDeviceResidentLogicalState(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
@@ -3657,6 +3674,27 @@ namespace llaminar2
             (void)requests;
             (void)request_count;
             (void)out_handle;
+            return false;
+        }
+
+        /**
+         * @brief Strengthen compact-outcome readiness after a rank collective.
+         *
+         * The runner owns the backend event, producer stream, and device
+         * context carried by @p handle. Rank orchestration must therefore ask
+         * the owning runner to republish the event after NCCL/RCCL submission;
+         * it may not recover a backend independently and manipulate the
+         * runner's event resource from the outside.
+         *
+         * Implementations must fail unless the handle belongs to this runner,
+         * publish `RankCompactSpeculativeResponseReady` on the exact producer
+         * stream, and set `response_ready_after_rank_collective` only after the
+         * publication succeeds.
+         */
+        virtual bool publishRankCompactSpeculativeResponseReady(
+            DeviceSpeculativeOutcomeHandle *handle)
+        {
+            (void)handle;
             return false;
         }
 

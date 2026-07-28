@@ -45,7 +45,6 @@ namespace llaminar2
     {
     public:
         static constexpr const char *WS_INPLACE_PREFILL_SCRATCH = "gdn_shortconv_inplace_scratch";
-        static constexpr const char *WS_EFFECTIVE_SEQ_LEN_SCALAR = "gdn_shortconv_effective_seq_len_scalar";
         static constexpr const char *WS_SPECULATIVE_STATE_SLOTS = "gdn_shortconv_speculative_state_slots";
         static constexpr const char *WS_SPECULATIVE_STATE_WORK = "gdn_shortconv_speculative_state_work";
 
@@ -85,9 +84,11 @@ namespace llaminar2
             /**
              * @brief Stable graph/workspace namespace for capture-sensitive buffers.
              *
-             * All-position verifier rows and MTP sidecar rows may be built for the
-             * same logical layer.  The namespace keeps short-conv verifier-state
-             * snapshots graph-role local instead of sharing one layer-only key.
+             * Main inference, grouped verifier, and live request-batch graphs
+             * may execute independently for the same logical layer. The
+             * namespace keeps both short-conv verifier-state snapshots and
+             * mutable prefill scratch graph-role local. An empty namespace is
+             * reserved for the main inference graph.
              */
             std::string workspace_namespace;
             int verifier_state_capture_rows = 0; ///< Compatibility spelling for speculative state slots.
@@ -104,7 +105,7 @@ namespace llaminar2
         static_assert(StageParamsRequired<Params>);
 
         explicit ShortConv1dStage(Params params);
-        ~ShortConv1dStage() override;
+        ~ShortConv1dStage() override = default;
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::SHORT_CONV1D; }
@@ -160,9 +161,9 @@ namespace llaminar2
          * @brief Reset request-local short-conv metadata while preserving capture slots.
          *
          * Preserved prefill graphs replay over the same verifier-state capture
-         * workspace and effective-length scalar addresses. The scalar is
-         * restamped before launch, so request reset only clears host mirrors and
-         * stream ownership here.
+         * workspace and stable device request-length allocation. Request reset
+         * therefore clears stream ownership without introducing a host scalar
+         * mirror into graph replay.
          */
         void resetSessionStatePreservingCapturedReplay() override
         {
@@ -243,13 +244,10 @@ namespace llaminar2
         const Params &getParams() const { return params_; }
 
     private:
-        struct GpuEffectiveSeqLenState;
-
         Params params_;
         int prefill_effective_seq_len_ = 0;
         int prefill_bucket_seq_len_ = 0;
         bool prefill_replay_params_set_ = false;
-        std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
         uint32_t workspace_slice_id_ = 0;
         bool verifier_capture_workspace_bound_ = false;
@@ -261,16 +259,12 @@ namespace llaminar2
         int effectivePrefillSeqLen() const;
         bool shouldUseRealLengthContract() const;
         std::string workspaceStableId() const;
-        std::string effectiveSeqLenScalarBufferName() const;
+        std::string inplacePrefillScratchBufferName() const;
         std::string speculativeStateSlotsBufferName() const;
         std::string speculativeStateWorkBufferName() const;
         int requestedSpeculativeStateSlotRows() const;
         bool verifierStateCaptureWorkspaceRequired() const;
         bool ensureVerifierStateCaptureWorkspaceBound() const;
-        bool ensureGpuEffectiveSeqLenStateInitialized();
-        bool uploadGpuEffectiveSeqLen();
-        void refreshPinnedEffectiveSeqLen();
-        void releaseGpuEffectiveSeqLenState();
         void bindKernelWorkspace();
         void clearKernelVerifierStateWorkspace();
         const float *cpuVerifierStateCaptureSource() const;

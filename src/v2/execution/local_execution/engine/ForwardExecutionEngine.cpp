@@ -79,7 +79,9 @@ namespace llaminar2
             DeviceId device,
             void *stream,
             bool is_decode,
-            bool all_position_logits)
+            bool all_position_logits,
+            int graph_seq_len,
+            int graph_batch_size)
         {
             output.execution = {
                 .valid = !device.is_gpu() || stream != nullptr,
@@ -87,6 +89,8 @@ namespace llaminar2
                 .stream = stream,
                 .is_decode = is_decode,
                 .all_position_logits = all_position_logits,
+                .graph_seq_len = graph_seq_len,
+                .graph_batch_size = graph_batch_size,
             };
         }
 
@@ -2221,7 +2225,9 @@ namespace llaminar2
                     is_decode,
                     used_graph_replay),
                 is_decode,
-                host.computeAllPositionLogitsEnabled());
+                host.computeAllPositionLogitsEnabled(),
+                input.seq_len,
+                input.batch_size);
             if (input.device.is_gpu() && !output.execution.valid)
             {
                 LOG_ERROR("[ForwardExecutionEngine] Successful cached GPU forward has no exact output producer stream"
@@ -3431,7 +3437,9 @@ namespace llaminar2
                 producer_device,
                 execution_stream_used,
                 is_decode,
-                host.computeAllPositionLogitsEnabled());
+                host.computeAllPositionLogitsEnabled(),
+                effective_input.seq_len,
+                effective_input.batch_size);
 
             if (is_decode && producer_device.is_gpu())
             {

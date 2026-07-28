@@ -75,6 +75,31 @@ namespace llaminar2::test
             << "The forward graph cannot impersonate the verifier summary.";
     }
 
+    TEST(Test__DeviceExecutionTimeline, RankCompactResponseOwnsPostCollectiveFlow)
+    {
+        const auto publication =
+            DeviceEventEdge::at(
+                DeviceTimelinePoint::RankCompactSpeculativeResponseReady)
+                .from(DeviceTimelineRole::RankCollective);
+        EXPECT_TRUE(publication.validForPublication());
+        EXPECT_TRUE(
+            publication.to(DeviceTimelineRole::HostResultBridge)
+                .validForConsumption());
+        EXPECT_TRUE(
+            publication.to(DeviceTimelineRole::AcceptedStatePublication)
+                .validForConsumption());
+        EXPECT_FALSE(
+            publication.to(DeviceTimelineRole::MainForwardGraph)
+                .validForConsumption());
+        EXPECT_FALSE(
+            DeviceEventEdge::at(
+                DeviceTimelinePoint::RankCompactSpeculativeResponseReady)
+                .from(DeviceTimelineRole::VerifierSummary)
+                .validForPublication())
+            << "A child-local verifier summary cannot impersonate completed "
+               "rank publication.";
+    }
+
     TEST(Test__DeviceExecutionTimeline, RequestInputBankDeclaresBidirectionalLifetime)
     {
         const auto admission =
@@ -100,6 +125,36 @@ namespace llaminar2::test
                 .validForConsumption())
             << "Sidecars release the bank through the main transaction stream; "
                "they never consume the bank-reuse publication.";
+    }
+
+    TEST(Test__DeviceExecutionTimeline, RequestResetMustPrecedeEveryGpuGraphFamily)
+    {
+        const auto reset =
+            DeviceEventEdge::at(DeviceTimelinePoint::RequestStateResetReady)
+                .from(DeviceTimelineRole::RequestStateReset);
+        EXPECT_TRUE(reset.validForPublication());
+        EXPECT_TRUE(
+            reset.to(DeviceTimelineRole::MainForwardGraph)
+                .validForConsumption());
+        EXPECT_TRUE(
+            reset.to(DeviceTimelineRole::MTPSidecarGraph)
+                .validForConsumption());
+        EXPECT_TRUE(
+            reset.to(DeviceTimelineRole::PrefixRestoreMutation)
+                .validForConsumption());
+        EXPECT_FALSE(
+            reset.to(DeviceTimelineRole::RequestAdmissionTransfer)
+                .validForConsumption())
+            << "Request input admission owns independent buffers and may overlap "
+               "device-state reset; graph execution joins both events.";
+
+        const auto prior_forward =
+            DeviceEventEdge::at(DeviceTimelinePoint::ForwardGraphOutputReady)
+                .from(DeviceTimelineRole::MainForwardGraph)
+                .to(DeviceTimelineRole::RequestStateReset);
+        EXPECT_TRUE(prior_forward.validForConsumption())
+            << "Reset zeroing must first join the previous request's final "
+               "forward publication.";
     }
 
     TEST(Test__DeviceExecutionTimeline, DurableForwardPublicationNeedsNoProducerStream)

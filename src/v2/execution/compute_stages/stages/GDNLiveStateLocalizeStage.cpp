@@ -192,14 +192,6 @@ namespace llaminar2
                  * check keeps manually constructed tests and future graph
                  * variants honest.
                  */
-                if (params_.conv_kernel->stateBytes() !=
-                    static_cast<size_t>(params_.full_conv_state_floats) * sizeof(float))
-                {
-                    LOG_ERROR("[GDNLiveStateLocalizeStage] Short-conv no-op localization expected full state"
-                              << " expected_bytes=" << (static_cast<size_t>(params_.full_conv_state_floats) * sizeof(float))
-                              << " actual_bytes=" << params_.conv_kernel->stateBytes());
-                    return false;
-                }
                 return true;
             }
             if (params_.modular_conv_state)
@@ -252,21 +244,6 @@ namespace llaminar2
                 }
             }
 
-            /*
-             * This stage exists only when the verifier graph starts from the
-             * replicated decode state bank.  If a local-sized state reaches this
-             * point, the lifecycle is wrong; returning success would make graph
-             * capture bake in a no-op and then replay stale local state.
-             */
-            if (params_.conv_kernel->stateBytes() !=
-                static_cast<size_t>(params_.full_conv_state_floats) * sizeof(float))
-            {
-                LOG_ERROR("[GDNLiveStateLocalizeStage] Short-conv kernel state is not full-sized before localization"
-                          << " expected_bytes=" << (static_cast<size_t>(params_.full_conv_state_floats) * sizeof(float))
-                          << " actual_bytes=" << params_.conv_kernel->stateBytes());
-                return false;
-            }
-
             auto *full = static_cast<float *>(bound_workspace_->getBuffer(fullConvBufferName()));
             auto *local = static_cast<float *>(bound_workspace_->getBuffer(localConvBufferName()));
             if (!full || !local)
@@ -274,7 +251,11 @@ namespace llaminar2
                 LOG_ERROR("[GDNLiveStateLocalizeStage] Missing conv workspace buffers");
                 return false;
             }
-            if (!params_.conv_kernel->exportState(nullptr, full, stream))
+            if (!params_.conv_kernel->exportStateForSize(
+                    params_.full_conv_state_floats,
+                    nullptr,
+                    full,
+                    stream))
             {
                 LOG_ERROR("[GDNLiveStateLocalizeStage] Failed to export full short-conv state");
                 return false;
@@ -363,14 +344,6 @@ namespace llaminar2
             if (params_.local_recurrence_state_floats ==
                 params_.full_recurrence_state_floats)
             {
-                if (params_.recurrence_kernel->stateBytes() !=
-                    static_cast<size_t>(params_.full_recurrence_state_floats) * sizeof(float))
-                {
-                    LOG_ERROR("[GDNLiveStateLocalizeStage] Recurrence no-op localization expected full state"
-                              << " expected_bytes=" << (static_cast<size_t>(params_.full_recurrence_state_floats) * sizeof(float))
-                              << " actual_bytes=" << params_.recurrence_kernel->stateBytes());
-                    return false;
-                }
                 return true;
             }
             if (params_.full_recurrence_state_floats !=
@@ -382,15 +355,6 @@ namespace llaminar2
                           << " degree=" << degree);
                 return false;
             }
-            if (params_.recurrence_kernel->stateBytes() !=
-                static_cast<size_t>(params_.full_recurrence_state_floats) * sizeof(float))
-            {
-                LOG_ERROR("[GDNLiveStateLocalizeStage] Recurrence kernel state is not full-sized before localization"
-                          << " expected_bytes=" << (static_cast<size_t>(params_.full_recurrence_state_floats) * sizeof(float))
-                          << " actual_bytes=" << params_.recurrence_kernel->stateBytes());
-                return false;
-            }
-
             auto *full = static_cast<float *>(bound_workspace_->getBuffer(fullRecurrenceBufferName()));
             auto *local = static_cast<float *>(bound_workspace_->getBuffer(localRecurrenceBufferName()));
             if (!full || !local)
@@ -398,7 +362,11 @@ namespace llaminar2
                 LOG_ERROR("[GDNLiveStateLocalizeStage] Missing recurrence workspace buffers");
                 return false;
             }
-            if (!params_.recurrence_kernel->exportState(nullptr, full, stream))
+            if (!params_.recurrence_kernel->exportStateForSize(
+                    params_.full_recurrence_state_floats,
+                    nullptr,
+                    full,
+                    stream))
             {
                 LOG_ERROR("[GDNLiveStateLocalizeStage] Failed to export full recurrence state");
                 return false;

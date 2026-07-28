@@ -2708,6 +2708,14 @@ namespace llaminar2
             int request_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
         /**
+         * @brief Republish this runner's compact outcome after rank collection.
+         *
+         * This is deliberately runner-owned because only the per-device runner
+         * owns the backend event and exact stream stored in the handle.
+         */
+        bool publishRankCompactSpeculativeResponseReady(
+            DeviceSpeculativeOutcomeHandle *handle) override;
+        /**
          * @brief Legacy host bridge for a device-resident stochastic outcome.
          */
         bool copyDeviceSpeculativeOutcomesToHost(
@@ -2820,6 +2828,26 @@ namespace llaminar2
                     "request_reset",
                     reset_reason);
             }
+            if (state_.device_id.is_gpu())
+            {
+                /*
+                 * A surfaced token result does not transfer ownership of every
+                 * live-state producer to the host. Accepted-state publication,
+                 * verifier replay, terminal archival, and ordinary forward
+                 * graphs may still have device work queued. Join all named
+                 * publications onto the reset stream before cache-owned
+                 * zeroing starts; the reset-ready event published below then
+                 * forms one transitive edge from the old request to the first
+                 * graph of the new request.
+                 */
+                if (!joinPriorDeviceWorkForRequestStateReset(reset_reason))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Request-state reset could not join all prior GPU producers"
+                              << " reason=" << reset_reason
+                              << " device=" << state_.device_id.toString());
+                    std::terminate();
+                }
+            }
             for (auto &entry : layer_graph_cache_)
             {
                 entry.resetSessionState();
@@ -2930,6 +2958,8 @@ namespace llaminar2
                 state_.clearMTPSidecarState();
             if (request.reset_logical_sequence)
                 state_.clearLogicalSequenceState();
+            if (state_.device_id.is_gpu())
+                publishRequestStateResetReady(reset_reason);
             // NOTE: Do NOT reset arena_ here. Buffer registrations and allocations
             // are expensive and model-specific (e.g., GDN buffers for Qwen3.5).
             // The arena is created once in initializeBuffers() and persists for
@@ -4168,6 +4198,19 @@ namespace llaminar2
 
         /** Convert completed pending GPU timing events into structured perfstats. */
         void drainPendingGpuTimingMeasurements(IBackend *backend);
+
+        /**
+         * @brief Reclaim only timing measurements whose stop events are complete.
+         *
+         * Mirrored non-root participants do not own the final compact D2H, so
+         * they cannot rely on that host boundary to drain profiler events. This
+         * method queries stop events without blocking, emits timing records for
+         * completed work, and leaves unfinished measurements in place. It
+         * performs no allocation and is safe to call before borrowing another
+         * persistent timing-event pair.
+         */
+        bool reclaimCompletedGpuTimingMeasurementsNonblocking(
+            IBackend *backend);
 
         /** Monotonic live-state epoch used by versioned decode replay. */
         uint64_t liveReplayStateEpoch() const override { return live_replay_state_epoch_; }
@@ -5738,6 +5781,21 @@ namespace llaminar2
         };
 
         /**
+         * @brief Event-backed completion of request-owned GPU state reset.
+         *
+         * GPU ring metadata, GDN recurrence, and short-conv state are reset on
+         * the worker context's explicit state stream. Captured prefill/decode
+         * graphs may replay on a different stream, so request reset publishes
+         * one durable dependency after the final cache-owned reset launch.
+         */
+        struct PendingRequestStateResetReadyState
+        {
+            std::shared_ptr<void> event;
+            void *producer_stream = nullptr;
+            bool valid = false;
+        };
+
+        /**
          * @brief Event-backed ownership of one external GPU request admission.
          *
          * The event allocation is created during runner initialization, before
@@ -5819,6 +5877,7 @@ namespace llaminar2
             pending_prefix_payload_uses_;
         mutable PendingMTPPrefillTerminalArchiveReadyState
             mtp_prefill_terminal_archive_ready_;
+        PendingRequestStateResetReadyState request_state_reset_ready_;
         PendingRequestInputAdmissionReadyState
             request_input_admission_ready_;
         PendingRequestInputReuseReadyState
@@ -6688,6 +6747,28 @@ namespace llaminar2
             const char *consumer_name);
 
         /**
+         * @brief Publish completion of every request-owned GPU state reset.
+         *
+         * Failure is fatal because replaying a graph without this dependency
+         * can race GDN/short-conv zeroing and corrupt the new request.
+         */
+        void publishRequestStateResetReady(const char *producer_name);
+
+        /**
+         * @brief Join every old-request producer onto the cache reset stream.
+         */
+        bool joinPriorDeviceWorkForRequestStateReset(
+            const char *consumer_name);
+
+        /**
+         * @brief Queue the first graph behind request-state reset completion.
+         */
+        bool waitForPendingRequestStateReset(
+            void *consumer_stream,
+            DeviceTimelineRole consumer_role,
+            const char *consumer_name);
+
+        /**
          * @brief Publish completion of every reader of the request-input bank.
          *
          * The caller supplies the exact main-transaction stream. If shifted-MTP
@@ -6714,22 +6795,6 @@ namespace llaminar2
         bool initializeDeviceResidentLogicalSequenceStateFromMainBatchSamples(
             int request_count,
             void *producer_stream);
-
-        /**
-         * @brief Retarget the current resident mailbox after a shifted-MTP KV append.
-         *
-         * Resident correction commits consume the next-condition token from the
-         * publication mailbox, then append one shifted-MTP KV row on their own
-         * stream.  That append advances the live replay epoch so old handles must
-         * not remain valid by accident.  When the append was driven by the current
-         * mailbox, the logical rows themselves are still the right device-owned
-         * source for the next pending condition; this helper advances only the
-         * mailbox epoch and readiness event to the commit stream.
-         */
-        bool retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation(
-            const DeviceResidentLogicalSequenceStateHandle &handle,
-            void *producer_stream,
-            const char *producer_name);
 
         /// Queue a stream wait for resident logical-state metadata, if present.
         bool waitForDeviceResidentLogicalSequenceStateMailbox(
