@@ -332,7 +332,8 @@ namespace llaminar2::test
         state->conv_state[0] = 99.0f;
 
         // Clear should reset
-        cache->clear();
+        ASSERT_TRUE(cache->resetRequestState(
+            IKVCache::StateResetContext::testReinitialization(nullptr)));
 
         EXPECT_EQ(state->recurrence_state[0], 0.0f);
         EXPECT_EQ(state->conv_state[0], 0.0f);
@@ -346,7 +347,9 @@ namespace llaminar2::test
         ASSERT_NE(state, nullptr);
         state->recurrence_state[0] = 42.0f;
 
-        cache->clear_layer(0);
+        ASSERT_TRUE(cache->resetLayerState(
+            0,
+            IKVCache::StateResetContext::testReinitialization(nullptr)));
 
         EXPECT_EQ(state->recurrence_state[0], 0.0f);
     }
@@ -657,7 +660,8 @@ namespace llaminar2::test
         EXPECT_FLOAT_EQ(payload_floats[layer4_offset], 41.0f);
         EXPECT_FLOAT_EQ(payload_floats[layer4_offset + layer4->recurrence_state.size()], 43.0f);
 
-        cache->clear();
+        ASSERT_TRUE(cache->resetRequestState(
+            IKVCache::StateResetContext::testReinitialization(nullptr)));
         EXPECT_FLOAT_EQ(layer0->recurrence_state[0], 0.0f);
         EXPECT_FLOAT_EQ(layer0->conv_state[0], 0.0f);
         EXPECT_FLOAT_EQ(layer4->recurrence_state[0], 0.0f);
@@ -871,7 +875,8 @@ namespace llaminar2::test
         desc.logical_token_count = 5;
         ASSERT_TRUE(hybrid->exportHybridPrefixState(desc, payload.data(), nullptr));
 
-        cache->clear();
+        ASSERT_TRUE(cache->resetRequestState(
+            IKVCache::StateResetContext::testReinitialization(nullptr)));
         EXPECT_EQ(hybrid->getConvKernel(0), conv0);
         EXPECT_EQ(hybrid->getRecurrenceKernel(0), rec0);
         EXPECT_FLOAT_EQ(layer0->recurrence_state[0], 0.0f);

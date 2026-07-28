@@ -2781,20 +2781,24 @@ namespace llaminar2
                 device_payload);
         }
 
-        void resetHybridPrefixPayloadState(IKVCache &cache)
+        bool resetHybridPrefixPayloadState(
+            IKVCache &cache,
+            const IKVCache::StateResetContext &context)
         {
             auto *hybrid = dynamic_cast<IHybridKVCache *>(&cache);
             if (!hybrid)
             {
-                return;
+                return true;
             }
             for (int layer = 0; layer < cache.n_layers(); ++layer)
             {
-                if (hybrid->isGDNLayer(layer))
+                if (hybrid->isGDNLayer(layer) &&
+                    !cache.resetLayerState(layer, context))
                 {
-                    cache.clear_layer(layer);
+                    return false;
                 }
             }
+            return true;
         }
 
         bool liveCheckpointHasHybridState(const IKVCache &cache,
@@ -5258,6 +5262,10 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to create MTP KV cache depth " << depth);
                 return false;
             }
+            cache->bindStateOwnership({
+                .role = IKVCache::StateRole::MTPShiftedSidecar,
+                .mtp_depth = depth,
+            });
             logKVCacheBom(("mtp_depth_" + std::to_string(depth)).c_str(),
                           device,
                           cache.get(),
@@ -9330,6 +9338,9 @@ namespace llaminar2
                               << stage_device.to_string());
                     return false;
                 }
+                state_.pp_kv_caches[stage_device]->bindStateOwnership({
+                    .role = IKVCache::StateRole::PipelineShard,
+                });
                 logKVCacheBom("pp", stage_device, state_.pp_kv_caches[stage_device].get(), batch_size);
             }
 
@@ -9443,6 +9454,11 @@ namespace llaminar2
                           << device.to_string());
                 return false;
             }
+            state_.kv_cache->bindStateOwnership({
+                .role = pp_stage_config_.has_value()
+                            ? IKVCache::StateRole::PipelineShard
+                            : IKVCache::StateRole::CommittedMain,
+            });
             logKVCacheBom("main", device, state_.kv_cache.get(), batch_size);
         }
 
@@ -16401,6 +16417,9 @@ namespace llaminar2
         mtp_publication_base_cache_snapshot_ready_ = false;
         mtp_publication_base_cache_snapshot_request_count_ = 0;
         request_batched_prefill_logits_row_count_ = 0;
+        greedy_verifier_outcome_graph_transaction_ = {};
+        mtp_verifier_outcome_graph_mode_ =
+            MTPVerifierOutcomeGraphMode::Disabled;
 
         if (graph_builder_)
         {
@@ -29743,7 +29762,18 @@ namespace llaminar2
             }
             if (snapshot.cached_tokens == 0)
             {
-                resetHybridPrefixPayloadState(*state_.kv_cache);
+                if (!resetHybridPrefixPayloadState(
+                        *state_.kv_cache,
+                        IKVCache::StateResetContext{
+                            .boundary =
+                                IKVCache::StateResetBoundary::PrefixReplacement,
+                            .execution_stream = stream,
+                            .reason = "restore-logical-checkpoint-zero",
+                        }))
+                {
+                    return fail(
+                        "zero-token logical checkpoint GDN reset failed");
+                }
             }
             else if (hybrid_handle)
             {
@@ -29951,7 +29981,17 @@ namespace llaminar2
             {
                 return fail("zero-token hybrid payload checkpoint restore requires streamful GDN reset");
             }
-            resetHybridPrefixPayloadState(*state_.kv_cache);
+            if (!resetHybridPrefixPayloadState(
+                    *state_.kv_cache,
+                    IKVCache::StateResetContext{
+                        .boundary =
+                            IKVCache::StateResetBoundary::PrefixReplacement,
+                        .execution_stream = stream,
+                        .reason = "restore-payload-checkpoint-zero",
+                    }))
+            {
+                return fail("zero-token payload checkpoint GDN reset failed");
+            }
             state_.positions[seq_idx] = 0;
             state_.sequence_lengths[seq_idx] = 0;
             handleLivePrefixReplayStateAfterMutation(
@@ -30435,14 +30475,12 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::joinPriorDeviceWorkForRequestStateReset(
+        void *reset_stream,
         const char *consumer_name)
     {
         if (!state_.device_id.is_gpu())
             return true;
 
-        void *reset_stream =
-            explicitGPUStreamForOperation(
-                "joinPriorDeviceWorkForRequestStateReset");
         if (!reset_stream ||
             !waitForLiveInferenceStateReadyForObservation(
                 reset_stream,
@@ -30466,6 +30504,7 @@ namespace llaminar2
     }
 
     void DeviceGraphOrchestrator::publishRequestStateResetReady(
+        void *producer_stream,
         const char *producer_name)
     {
         if (!state_.device_id.is_gpu())
@@ -30484,23 +30523,21 @@ namespace llaminar2
             std::terminate();
         }
 
-        void *stream =
-            explicitGPUStreamForOperation("publishRequestStateResetReady");
         IBackend *backend = getBackendFor(state_.device_id);
-        if (!stream || !backend ||
+        if (!producer_stream || !backend ||
             !DeviceEventEdge::at(DeviceTimelinePoint::RequestStateResetReady)
                  .from(DeviceTimelineRole::RequestStateReset)
                  .publish(
                      *backend,
                      state_.device_id,
                      ready.event.get(),
-                     stream))
+                     producer_stream))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to publish request-state reset readiness");
             std::terminate();
         }
 
-        ready.producer_stream = stream;
+        ready.producer_stream = producer_stream;
         ready.valid = true;
         PerfStatsCollector::addCounter(
             "request_reset",
@@ -35419,71 +35456,6 @@ namespace llaminar2
             return 0;
         }
         return state_.positions[seq_idx];
-    }
-
-    void DeviceGraphOrchestrator::clearInferenceState()
-    {
-        request_batched_prefill_logits_row_count_ = 0;
-        clearDeviceResidentLogicalSequenceStateMailbox();
-        retireDeviceResidentMTPTransaction();
-        state_.clear();
-
-        if (forward_engine_)
-            forward_engine_->resetSessionReplayState();
-        mtp_sidecar_depth0_cache_.resetSessionState();
-        mtp_sidecar_depth0_device_token_cache_.resetSessionState();
-        mtp_sidecar_depth0_chained_cache_.resetSessionState();
-        mtp_sidecar_depth0_chained_device_token_cache_.resetSessionState();
-        mtp_sidecar_depth0_kv_only_cache_.resetSessionState();
-        mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionState();
-        for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
-            cache->resetSessionState();
-        mtp_terminal_hidden_row_select_cache_.invalidate();
-        mtp_terminal_hidden_rows_select_cache_.invalidate();
-        device_moe_rebalance_maintenance_graph_.reset(
-            DeviceMoERebalanceMaintenanceGraphCache::ResetBoundary::
-                BindingIdentityChanged);
-        device_moe_rebalance_decode_tokens_seen_ = 0;
-        defer_next_mtp_main_decode_sync_ = false;
-        defer_all_position_verifier_sync_ = false;
-        clearAllPendingLogitsStreams("clearInferenceState");
-        std::fill(stochastic_target_distribution_streams_.begin(),
-                  stochastic_target_distribution_streams_.end(),
-                  nullptr);
-        std::fill(stochastic_draft_distribution_streams_.begin(),
-                  stochastic_draft_distribution_streams_.end(),
-                  nullptr);
-        std::fill(stochastic_target_row_formats_.begin(),
-                  stochastic_target_row_formats_.end(),
-                  StochasticRowFormat::Empty);
-        std::fill(stochastic_draft_row_formats_.begin(),
-                  stochastic_draft_row_formats_.end(),
-                  StochasticRowFormat::Empty);
-        std::fill(stochastic_target_top_k_.begin(),
-                  stochastic_target_top_k_.end(),
-                  0);
-        std::fill(stochastic_draft_top_k_.begin(),
-                  stochastic_draft_top_k_.end(),
-                  0);
-        clearStochasticTargetSampleReadySlots(StochasticSampleReadyClearMode::Force);
-        clearStochasticDraftSampleReadySlots(StochasticSampleReadyClearMode::Force);
-        pending_mtp_verifier_device_token_plan_.reset();
-        pending_mtp_verifier_device_token_batch_plan_.reset();
-        materialized_mtp_verifier_device_token_row_ = {};
-        materialized_mtp_verifier_device_token_batch_ = {};
-        greedy_verifier_outcome_graph_transaction_ = {};
-        mtp_verifier_outcome_graph_mode_ =
-            MTPVerifierOutcomeGraphMode::Disabled;
-
-        for (auto &cache : layer_graph_cache_)
-        {
-            cache.resetSessionState();
-        }
-
-        resetKernelDynamicState();
-        recordLivePrefixSessionReset("clearInferenceState");
-
-        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared (cached graph topology preserved)");
     }
 
     // =========================================================================

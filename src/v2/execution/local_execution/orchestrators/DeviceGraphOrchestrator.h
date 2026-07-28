@@ -367,38 +367,43 @@ namespace llaminar2
         }
 
         /**
-         * @brief Clear main-model KV plus hybrid GDN/short-conv payloads.
+         * @brief Reset committed KV plus hybrid GDN/short-conv state.
          *
-         * The IKVCache owner is the first-class live-sequence state holder for
-         * attention history. Hybrid cache implementations also own GDN and
-         * short-conv GPU state, so clearing the main and PP KV owners is the
-         * correct boundary for recurrent model state as well.
+         * Every cache consumes the same explicit reset context.  On GPU this
+         * means PP shards, main KV metadata, GDN recurrence, and short-conv
+         * history all enqueue on one caller-owned stream.  The orchestrator can
+         * therefore publish one transitive completion event after this method
+         * and the shifted-MTP reset below have both succeeded.
          */
-        void clearMainKVAndGDNState()
+        bool resetCommittedKVAndRecurrentState(
+            const IKVCache::StateResetContext &context)
         {
-            if (kv_cache)
-                kv_cache->clear();
+            if (kv_cache && !kv_cache->resetRequestState(context))
+                return false;
             for (auto &[device, cache] : pp_kv_caches)
             {
                 (void)device;
-                if (cache)
-                    cache->clear();
+                if (cache && !cache->resetRequestState(context))
+                    return false;
             }
+            return true;
         }
 
         /**
-         * @brief Clear request-local MTP sidecar KV payloads.
+         * @brief Reset request-local shifted-MTP sidecar state.
          *
          * MTP sidecars are shifted relative to the main cache and are owned by
          * the active speculative transaction, not by the main decode stream.
          */
-        void clearMTPSidecarState()
+        bool resetMTPShiftedSidecarState(
+            const IKVCache::StateResetContext &context)
         {
             for (auto &cache : mtp_kv_caches)
             {
-                if (cache)
-                    cache->clear();
+                if (cache && !cache->resetRequestState(context))
+                    return false;
             }
+            return true;
         }
 
         /**
@@ -416,16 +421,6 @@ namespace llaminar2
             last_forward_batch_size = 0;
             last_forward_request_lengths.clear();
             mtp_terminal_hidden_current = false;
-        }
-
-        /**
-         * @brief Compatibility helper for older hard-reset paths.
-         */
-        void clear()
-        {
-            clearMainKVAndGDNState();
-            clearMTPSidecarState();
-            clearLogicalSequenceState();
         }
 
         /**
@@ -2183,17 +2178,6 @@ namespace llaminar2
          */
         int getPosition(int seq_idx = 0) const;
 
-        /**
-         * @brief Internal request-state reset that preserves graph topology.
-         *
-         * This helper is used by DGO paths that need the same live-state cleanup
-         * as clear_cache() without invalidating reusable graphs or workspaces.
-         * It clears request-local handoffs, mailbox pointers, KV/recurrent state,
-         * positions, and dynamic kernel metadata.  It must not free the arena,
-         * prepared weights, device contexts, or cached graph topology.
-         */
-        void clearInferenceState();
-
         // =========================================================================
         // Fluent Graph Building API
         // =========================================================================
@@ -2747,6 +2731,79 @@ namespace llaminar2
         };
 
         /**
+         * @brief Scope guard for one request-state reset publication.
+         *
+         * The transaction captures exactly one execution stream and exposes it
+         * through the IKVCache reset context.  The same stream first consumes
+         * every old-request producer, then owns KV/GDN/MTP mutation, and finally
+         * records RequestStateResetReady.  Destroying an armed transaction
+         * without that publication is fatal because the next captured graph
+         * would otherwise have no valid dependency to consume.
+         */
+        class RequestStateResetTransaction final
+        {
+        public:
+            RequestStateResetTransaction(
+                IKVCache::StateResetBoundary boundary,
+                void *execution_stream,
+                const char *reason,
+                bool publication_required)
+                : context_{
+                      .boundary = boundary,
+                      .execution_stream = execution_stream,
+                      .reason = reason,
+                  },
+                  publication_required_(publication_required)
+            {
+                if (!context_.permitsRequestReset() ||
+                    !context_.hasReason() ||
+                    (publication_required_ && !context_.execution_stream))
+                {
+                    throw std::invalid_argument(
+                        "RequestStateResetTransaction requires a named boundary "
+                        "and an explicit GPU stream");
+                }
+            }
+
+            ~RequestStateResetTransaction()
+            {
+                if (publication_required_ && !published_)
+                    std::terminate();
+            }
+
+            RequestStateResetTransaction(
+                const RequestStateResetTransaction &) = delete;
+            RequestStateResetTransaction &operator=(
+                const RequestStateResetTransaction &) = delete;
+            RequestStateResetTransaction(
+                RequestStateResetTransaction &&) = delete;
+            RequestStateResetTransaction &operator=(
+                RequestStateResetTransaction &&) = delete;
+
+            const IKVCache::StateResetContext &cacheContext() const
+            {
+                return context_;
+            }
+
+            void *executionStream() const
+            {
+                return context_.execution_stream;
+            }
+
+            void markPublished()
+            {
+                if (!publication_required_ || published_)
+                    std::terminate();
+                published_ = true;
+            }
+
+        private:
+            IKVCache::StateResetContext context_;
+            bool publication_required_ = false;
+            bool published_ = false;
+        };
+
+        /**
          * @brief IInferenceRunner request-boundary reset.
          *
          * Resets live sequence state (KV cache, positions, model recurrence,
@@ -2803,6 +2860,18 @@ namespace llaminar2
             const bool preserve_replay_safe_graphs = request.preserve_replay_safe_graphs;
             const bool prefix_restore_resets_model_runtime_owner =
                 prefix_restore_boundary && request.reset_model_runtime;
+            void *const reset_stream =
+                state_.device_id.is_gpu()
+                    ? explicitGPUStreamForOperation(
+                          "requestStateResetTransaction")
+                    : nullptr;
+            RequestStateResetTransaction reset_transaction(
+                prefix_restore_boundary
+                    ? IKVCache::StateResetBoundary::PrefixReplacement
+                    : IKVCache::StateResetBoundary::RequestBoundary,
+                reset_stream,
+                reset_reason,
+                state_.device_id.is_gpu());
             {
                 /*
                  * Request reset is not a whole-device ownership boundary.
@@ -2840,7 +2909,9 @@ namespace llaminar2
                  * forms one transitive edge from the old request to the first
                  * graph of the new request.
                  */
-                if (!joinPriorDeviceWorkForRequestStateReset(reset_reason))
+                if (!joinPriorDeviceWorkForRequestStateReset(
+                        reset_transaction.executionStream(),
+                        reset_reason))
                 {
                     LOG_ERROR("[DeviceGraphOrchestrator] Request-state reset could not join all prior GPU producers"
                               << " reason=" << reset_reason
@@ -2952,14 +3023,31 @@ namespace llaminar2
             clearDeviceResidentLogicalSequenceStateMailbox();
             retireDeviceResidentMTPTransaction();
             cache_stats_ = CacheStats{};
-            if (request.reset_kv || request.reset_gdn)
-                state_.clearMainKVAndGDNState();
-            if (request.reset_mtp)
-                state_.clearMTPSidecarState();
+            if ((request.reset_kv || request.reset_gdn) &&
+                !state_.resetCommittedKVAndRecurrentState(
+                    reset_transaction.cacheContext()))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Committed KV/GDN request reset failed"
+                          << " reason=" << reset_reason);
+                std::terminate();
+            }
+            if (request.reset_mtp &&
+                !state_.resetMTPShiftedSidecarState(
+                    reset_transaction.cacheContext()))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Shifted-MTP request reset failed"
+                          << " reason=" << reset_reason);
+                std::terminate();
+            }
             if (request.reset_logical_sequence)
                 state_.clearLogicalSequenceState();
             if (state_.device_id.is_gpu())
-                publishRequestStateResetReady(reset_reason);
+            {
+                publishRequestStateResetReady(
+                    reset_transaction.executionStream(),
+                    reset_reason);
+                reset_transaction.markPublished();
+            }
             // NOTE: Do NOT reset arena_ here. Buffer registrations and allocations
             // are expensive and model-specific (e.g., GDN buffers for Qwen3.5).
             // The arena is created once in initializeBuffers() and persists for
@@ -4607,13 +4695,11 @@ namespace llaminar2
         /**
          * @brief Record a request/session state reset in live-state telemetry.
          *
-         * `clear_cache()` is a request-boundary reset: it clears live KV/GDN
-         * and request-local metadata, but deliberately preserves replay-safe
-         * CUDA/HIP graph executables and their captured dynamic pointer tables.
-         * `clearInferenceState()` is a hard reset and must continue to report
-         * replay/kernel teardown.  Keeping the distinction explicit avoids
-         * misleading Phase 10 perf counters and makes the ownership contract
-         * visible to future reset call sites.
+         * A typed request-boundary reset clears live KV/GDN and request-local
+         * metadata while deliberately preserving replay-safe CUDA/HIP graph
+         * executables and their captured dynamic pointer tables. Keeping that
+         * boundary explicit avoids misleading Phase 10 perf counters and
+         * makes the ownership contract visible to future reset call sites.
          */
         void recordLivePrefixSessionReset(
             const char *operation,
@@ -6752,12 +6838,15 @@ namespace llaminar2
          * Failure is fatal because replaying a graph without this dependency
          * can race GDN/short-conv zeroing and corrupt the new request.
          */
-        void publishRequestStateResetReady(const char *producer_name);
+        void publishRequestStateResetReady(
+            void *producer_stream,
+            const char *producer_name);
 
         /**
          * @brief Join every old-request producer onto the cache reset stream.
          */
         bool joinPriorDeviceWorkForRequestStateReset(
+            void *reset_stream,
             const char *consumer_name);
 
         /**

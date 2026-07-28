@@ -2,7 +2,7 @@
  * @file Test__ROCmHybridKVCacheReset.cpp
  * @brief Regression tests for ROCm hybrid KV/GDN cache reset semantics.
  *
- * Exercises the standard clear()/clear_layer() APIs on ROCm hybrid caches that
+ * Exercises explicit request/layer reset transactions on ROCm hybrid caches that
  * compress full-attention layers and keep GDN recurrence/short-conv GPU state
  * in cache-owned kernels. The tests compare a reset cache against a freshly
  * constructed cache while asserting that reset does not recreate kernel objects.
@@ -675,7 +675,10 @@ TEST(Test__ROCmHybridKVCacheReset, ClearPreservesCacheAndGDNKernelObjectsButMatc
     EXPECT_EQ(cache.owner->get_cached_tokens(1, 0), 2);
     mutateGDNState(cache.hybrid, /*layer=*/0);
 
-    cache.owner->clear();
+    HipStream reset_stream;
+    ASSERT_TRUE(cache.owner->resetRequestState(
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
 
     EXPECT_EQ(cache.owner->get_cached_tokens(1, 0), 0);
     EXPECT_EQ(cache.hybrid->getGDNState(0)->conv_kernel.get(), conv_ptr)
@@ -685,11 +688,11 @@ TEST(Test__ROCmHybridKVCacheReset, ClearPreservesCacheAndGDNKernelObjectsButMatc
 
     auto actual_conv = runConvDecode(cache.hybrid, /*layer=*/0, 3.0f);
     auto fresh_conv = runConvDecode(fresh.hybrid, /*layer=*/0, 3.0f);
-    expectNearVector(actual_conv, fresh_conv, 1e-5f, "conv output after clear vs fresh");
+    expectNearVector(actual_conv, fresh_conv, 1e-5f, "conv output after request reset vs fresh");
 
     auto actual_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 3.5f);
     auto fresh_rec = runRecurrenceDecode(fresh.hybrid, /*layer=*/0, 3.5f);
-    expectNearVector(actual_rec, fresh_rec, 1e-4f, "recurrence output after clear vs fresh");
+    expectNearVector(actual_rec, fresh_rec, 1e-4f, "recurrence output after request reset vs fresh");
 }
 
 TEST(Test__ROCmHybridKVCacheReset, ClearLayerResetsGDNGPUKernelState)
@@ -701,15 +704,19 @@ TEST(Test__ROCmHybridKVCacheReset, ClearLayerResetsGDNGPUKernelState)
     auto fresh = createHybridCache();
 
     mutateGDNState(cache.hybrid, /*layer=*/0);
-    cache.owner->clear_layer(/*layer=*/0);
+    HipStream reset_stream;
+    ASSERT_TRUE(cache.owner->resetLayerState(
+        /*layer=*/0,
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
 
     auto actual_conv = runConvDecode(cache.hybrid, /*layer=*/0, 4.0f);
     auto fresh_conv = runConvDecode(fresh.hybrid, /*layer=*/0, 4.0f);
-    expectNearVector(actual_conv, fresh_conv, 1e-5f, "conv output after clear_layer vs fresh");
+    expectNearVector(actual_conv, fresh_conv, 1e-5f, "conv output after layer reset vs fresh");
 
     auto actual_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 4.5f);
     auto fresh_rec = runRecurrenceDecode(fresh.hybrid, /*layer=*/0, 4.5f);
-    expectNearVector(actual_rec, fresh_rec, 1e-4f, "recurrence output after clear_layer vs fresh");
+    expectNearVector(actual_rec, fresh_rec, 1e-4f, "recurrence output after layer reset vs fresh");
 }
 
 TEST(Test__ROCmHybridKVCacheReset, InPlaceShortConvDecodeStoresRawProjectionInGPUState)
@@ -781,7 +788,9 @@ TEST(Test__ROCmHybridKVCacheReset, DevicePointerStateExportRoundTripRestoresGPUK
     ASSERT_TRUE(state->rec_kernel->exportState(nullptr, d_rec_snapshot.ptr, stream));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    cache.owner->clear_layer(/*layer=*/0);
+    ASSERT_TRUE(cache.owner->resetLayerState(
+        /*layer=*/0,
+        llaminar2::IKVCache::StateResetContext::testReinitialization(stream)));
     ASSERT_TRUE(state->conv_kernel->importState(nullptr, d_conv_snapshot.ptr, stream));
     ASSERT_TRUE(state->rec_kernel->importState(nullptr, d_rec_snapshot.ptr, stream));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
@@ -840,7 +849,9 @@ TEST(Test__ROCmHybridKVCacheReset, HybridPrefixStateRoundTripRestoresDeviceState
     const auto expected_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
     const auto expected_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
 
-    cache.owner->clear();
+    ASSERT_TRUE(cache.owner->resetRequestState(
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            stream.opaque())));
     EXPECT_EQ(cache.hybrid->getGDNState(0)->conv_kernel.get(), conv_ptr);
     EXPECT_EQ(cache.hybrid->getGDNState(0)->rec_kernel.get(), rec_ptr);
     ASSERT_TRUE(cache.hybrid->importHybridPrefixState(desc, payload.data(), nullptr));
@@ -896,7 +907,9 @@ TEST(Test__ROCmHybridKVCacheReset, HostStagedHybridPrefixStateSerializesOnlyDevi
         staged_payload.end(),
         [](uint8_t value) { return value == 0xCD; }));
 
-    cache.owner->clear();
+    ASSERT_TRUE(cache.owner->resetRequestState(
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            stream.opaque())));
     ASSERT_TRUE(cache.hybrid->importHybridPrefixState(
         desc,
         staged_payload.data(),
@@ -952,7 +965,8 @@ TEST(Test__ROCmHybridKVCacheReset, AsyncDeviceOnlyHybridPrefixStateRoundTripRest
     const auto expected_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
     const auto expected_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
 
-    cache.owner->clear();
+    ASSERT_TRUE(cache.owner->resetRequestState(
+        llaminar2::IKVCache::StateResetContext::testReinitialization(stream)));
     ASSERT_TRUE(cache.hybrid->importHybridPrefixState(
         desc,
         nullptr,
@@ -1009,7 +1023,9 @@ TEST(Test__ROCmHybridKVCacheReset, HostStagedDeviceOnlyHybridPrefixStateRoundTri
     const auto expected_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
     const auto expected_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
 
-    cache.owner->clear();
+    ASSERT_TRUE(cache.owner->resetRequestState(
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            stream.opaque())));
     ASSERT_TRUE(cache.hybrid->importHybridPrefixState(
         desc,
         payload.data(),
@@ -1155,10 +1171,14 @@ TEST(Test__ROCmHybridKVCacheReset, ClearLayerResetsCompressedFullAttentionEntry)
     appendFullAttentionToken(cache.owner.get(), /*layer=*/1);
     ASSERT_EQ(cache.owner->get_cached_tokens(1, 0), 2);
 
-    cache.owner->clear_layer(/*layer=*/1);
+    HipStream reset_stream;
+    ASSERT_TRUE(cache.owner->resetLayerState(
+        /*layer=*/1,
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
 
     EXPECT_EQ(cache.owner->get_cached_tokens(1, 0), 0)
-        << "clear_layer(global FA layer) must reset the compressed parent-cache entry";
+        << "resetLayerState(global FA layer) must reset the compressed parent-cache entry";
 }
 
 TEST(Test__ROCmHybridKVCacheReset, DeviceSequenceMetadataPointersUseCompressedFullAttentionSlot)
@@ -1480,7 +1500,9 @@ TEST(Test__ROCmHybridKVCacheReset, PrefixPayloadSlabRoundTripPreservesLateFullAt
             source_v.size());
     }
 
-    target.owner->clear();
+    ASSERT_TRUE(target.owner->resetRequestState(
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            stream.opaque())));
     for (size_t i = 0; i < fa_layers.size(); ++i)
     {
         const int layer = fa_layers[i];

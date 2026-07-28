@@ -157,9 +157,29 @@ namespace
             return false;
         }
 
-        void clear() override { cached_tokens = 0; }
-        void clear_sequence(int, int) override { cached_tokens = 0; }
-        void clear_layer(int) override { cached_tokens = 0; }
+        bool resetRequestState(const StateResetContext &) override
+        {
+            cached_tokens = 0;
+            return true;
+        }
+        bool resetSequenceState(int, const StateResetContext &) override
+        {
+            cached_tokens = 0;
+            return true;
+        }
+        bool resetLayerSequenceState(
+            int,
+            int,
+            const StateResetContext &) override
+        {
+            cached_tokens = 0;
+            return true;
+        }
+        bool resetLayerState(int, const StateResetContext &) override
+        {
+            cached_tokens = 0;
+            return true;
+        }
     };
 
     /**

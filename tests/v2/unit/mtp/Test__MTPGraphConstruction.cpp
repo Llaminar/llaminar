@@ -5215,11 +5215,15 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsMatchFullRowsOnCPU)
         full_logits + static_cast<size_t>(selected_rows) * vocab);
     ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
 
-    orchestrator.clearInferenceState();
-    const auto after_clear_state = orchestrator.prefixStateProbe();
-    EXPECT_EQ(after_clear_state.live_state_session_resets, 1u);
-    EXPECT_EQ(after_clear_state.last_live_state_mutation_reason, "session_reset");
-    EXPECT_EQ(after_clear_state.last_live_state_mutation_operation, "clearInferenceState");
+    orchestrator.resetInferenceState(
+        InferenceStateResetRequest::requestBoundary(
+            "row-indexed-all-position-logits"));
+    const auto after_reset_state = orchestrator.prefixStateProbe();
+    EXPECT_EQ(after_reset_state.live_state_session_resets, 1u);
+    EXPECT_EQ(after_reset_state.last_live_state_mutation_reason, "session_reset");
+    EXPECT_EQ(
+        after_reset_state.last_live_state_mutation_operation,
+        "row-indexed-all-position-logits");
 
     // The compact verifier mode keeps the forward sequence length at three
     // tokens, but asks the graph to run LM-head GEMM over only rows 0 and 1.
@@ -5287,7 +5291,9 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsRespectExplicitVerif
     }
     ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
 
-    orchestrator.clearInferenceState();
+    orchestrator.resetInferenceState(
+        InferenceStateResetRequest::requestBoundary(
+            "explicit-verifier-row-reset"));
 
     MTPSpecDecodeVerifierInputPlan row_plan;
     row_plan.ok = true;
@@ -5396,7 +5402,9 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsRespectPaddedVerifie
     }
     ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
 
-    orchestrator.clearInferenceState();
+    orchestrator.resetInferenceState(
+        InferenceStateResetRequest::requestBoundary(
+            "padded-verifier-row-reset"));
 
     ASSERT_TRUE(orchestrator.setMTPSpecVerifierInputPlan(logical_plan));
     ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(
@@ -5767,7 +5775,9 @@ TEST(Test__MTPGraphConstruction, RowIndexedVerifierRowsScaleWithMTPRequestBatchC
         full_logits + static_cast<size_t>(selected_rows) * vocab);
     ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
 
-    orchestrator.clearInferenceState();
+    orchestrator.resetInferenceState(
+        InferenceStateResetRequest::requestBoundary(
+            "batched-verifier-row-reset"));
 
     /*
      * Request-batched MTP flattens target rows across requests.  This test does

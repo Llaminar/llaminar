@@ -15,6 +15,7 @@
 #include "../utils/Logger.h"
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,178 @@ namespace llaminar2
     {
     public:
         virtual ~IKVCache() = default;
+
+        /**
+         * @brief Semantic owner of one cache instance's mutable sequence state.
+         *
+         * A main-model cache and an MTP sidecar can have identical tensor
+         * geometry while living at different sequence offsets and crossing
+         * different lifecycle boundaries.  Recording this role on the cache
+         * makes that distinction inspectable and prevents orchestration code
+         * from treating every IKVCache as interchangeable request storage.
+         */
+        enum class StateRole : uint8_t
+        {
+            Standalone,       ///< Directly constructed cache used outside an orchestrator.
+            CommittedMain,    ///< Canonical committed KV/GDN state for the live request.
+            PipelineShard,    ///< Committed state owned by one pipeline stage/device.
+            MTPShiftedSidecar ///< Speculative cache shifted by one MTP depth.
+        };
+
+        /**
+         * @brief Immutable lifecycle identity assigned after cache construction.
+         */
+        struct StateOwnership
+        {
+            StateRole role = StateRole::Standalone;
+            int mtp_depth = -1;
+
+            bool valid() const
+            {
+                return role == StateRole::MTPShiftedSidecar
+                           ? mtp_depth >= 0
+                           : mtp_depth == -1;
+            }
+
+            bool operator==(const StateOwnership &other) const
+            {
+                return role == other.role && mtp_depth == other.mtp_depth;
+            }
+        };
+
+        /**
+         * @brief Semantic boundary that makes previously cached rows unreachable.
+         *
+         * This is deliberately more precise than the historical word "clear".
+         * Payload allocations remain alive at every boundary.  Only logical
+         * visibility, graph append bindings, and cache-owned recurrent state
+         * cross the boundary.
+         */
+        enum class StateResetBoundary : uint8_t
+        {
+            RequestBoundary,   ///< Start a new independent prompt/session.
+            PrefixReplacement, ///< Replace live state with a promoted prefix snapshot.
+            SequenceRetirement, ///< Retire one request slot while siblings remain live.
+            TestReinitialization ///< Explicit test-fixture reuse; never a serving fallback.
+        };
+
+        /**
+         * @brief Caller-owned ordering context for a cache-state reset.
+         *
+         * GPU implementations require @ref execution_stream and enqueue every
+         * metadata/GDN/short-conv mutation on exactly that stream.  They must
+         * never select a default stream or synchronize internally.  The caller
+         * publishes one event after all participating state owners have reset.
+         *
+         * CPU implementations require a null stream because their mutations
+         * complete synchronously on the calling thread.
+         */
+        struct StateResetContext
+        {
+            StateResetBoundary boundary = StateResetBoundary::RequestBoundary;
+            void *execution_stream = nullptr;
+            const char *reason = nullptr;
+
+            bool hasReason() const
+            {
+                return reason != nullptr && reason[0] != '\0';
+            }
+
+            /**
+             * @brief Whether this boundary may retire every live cache row.
+             */
+            bool permitsRequestReset() const
+            {
+                return boundary == StateResetBoundary::RequestBoundary ||
+                       boundary == StateResetBoundary::PrefixReplacement ||
+                       boundary == StateResetBoundary::TestReinitialization;
+            }
+
+            /**
+             * @brief Whether this boundary may retire one request slot.
+             */
+            bool permitsSequenceReset() const
+            {
+                return boundary == StateResetBoundary::SequenceRetirement ||
+                       boundary == StateResetBoundary::TestReinitialization;
+            }
+
+            /**
+             * @brief Whether this boundary may reset one layer/request pair.
+             */
+            bool permitsLayerSequenceReset() const
+            {
+                return boundary == StateResetBoundary::PrefixReplacement ||
+                       boundary == StateResetBoundary::SequenceRetirement ||
+                       boundary == StateResetBoundary::TestReinitialization;
+            }
+
+            /**
+             * @brief Whether this boundary may reset one complete layer.
+             */
+            bool permitsLayerReset() const
+            {
+                return boundary == StateResetBoundary::PrefixReplacement ||
+                       boundary == StateResetBoundary::TestReinitialization;
+            }
+
+            /**
+             * @brief Build the explicit fixture-reuse boundary used by tests.
+             *
+             * GPU integration tests pass their exact test stream. CPU unit
+             * tests pass nullptr. This factory keeps test intent readable
+             * without weakening production stream requirements.
+             */
+            static StateResetContext testReinitialization(
+                void *execution_stream,
+                const char *reason = "test-reinitialization")
+            {
+                return {
+                    .boundary = StateResetBoundary::TestReinitialization,
+                    .execution_stream = execution_stream,
+                    .reason = reason,
+                };
+            }
+        };
+
+        /**
+         * @brief Bind this cache to one immutable orchestration lifetime.
+         *
+         * Binding is idempotent only for the exact same identity.  Conflicting
+         * rebinding is a construction bug and throws rather than silently
+         * changing whether a cache represents committed or speculative state.
+         *
+         * @param ownership Immutable role and optional MTP depth.
+         * @throws std::invalid_argument for an internally inconsistent identity.
+         * @throws std::logic_error when an already-bound cache is rebound.
+         */
+        void bindStateOwnership(const StateOwnership &ownership)
+        {
+            if (!ownership.valid())
+            {
+                throw std::invalid_argument(
+                    "IKVCache state ownership has inconsistent role/depth");
+            }
+            if (state_ownership_bound_ && !(state_ownership_ == ownership))
+            {
+                throw std::logic_error(
+                    "IKVCache state ownership cannot change after binding");
+            }
+            state_ownership_ = ownership;
+            state_ownership_bound_ = true;
+        }
+
+        /**
+         * @brief Return the cache's lifecycle identity.
+         *
+         * Direct factory users remain Standalone until an orchestrator binds a
+         * stronger role.  Production orchestrators bind every owned cache
+         * immediately after successful construction.
+         */
+        const StateOwnership &stateOwnership() const
+        {
+            return state_ownership_;
+        }
 
         /**
          * @brief Descriptor for copying a logical KV block in oldest-to-newest order.
@@ -784,43 +957,54 @@ namespace llaminar2
         }
 
         // =================================================================
-        // Clear Operations
+        // Explicit State-Lifetime Reset Operations
         // =================================================================
 
         /**
-         * @brief Clear all cached tokens across all layers and sequences
-         */
-        virtual void clear() = 0;
-
-        /**
-         * @brief Clear a specific sequence across all layers
-         * @param seq_idx Sequence index to clear
+         * @brief Reset all layers and request slots at a named lifecycle boundary.
          *
-         * Default implementation clears sequence in each layer.
-         * Subclasses may override for more efficient implementation.
-         */
-        virtual void clear_sequence(int seq_idx)
-        {
-            for (int layer = 0; layer < n_layers(); ++layer)
-            {
-                clear_sequence(layer, seq_idx);
-            }
-        }
-
-        /**
-         * @brief Clear a specific sequence in a specific layer
-         * @param layer Layer index
-         * @param seq_idx Sequence index to clear
+         * Implementations make every previous row unreachable while retaining
+         * model-lifetime payload allocations, graph bindings whose addresses
+         * remain stable, and pre-bound workspace.  GPU implementations enqueue
+         * work on @p context.execution_stream and return without waiting.
          *
-         * This is the primitive operation that subclasses should implement.
+         * @return true after every required mutation has been accepted.
          */
-        virtual void clear_sequence(int layer, int seq_idx) = 0;
+        virtual bool resetRequestState(const StateResetContext &context) = 0;
 
         /**
-         * @brief Clear all sequences in a specific layer
-         * @param layer Layer index
+         * @brief Retire one request slot across every cache layer.
+         *
+         * @param seq_idx Request slot whose rows become unreachable.
+         * @param context Explicit semantic and stream-ordering context.
+         * @return true after the reset has been accepted.
          */
-        virtual void clear_layer(int layer) = 0;
+        virtual bool resetSequenceState(
+            int seq_idx,
+            const StateResetContext &context) = 0;
+
+        /**
+         * @brief Reset one request slot in one model/cache layer.
+         *
+         * Hybrid caches interpret @p layer as a global model layer and reset
+         * the corresponding KV or recurrent owner.  Invalid indices are
+         * contract violations and must fail rather than become silent no-ops.
+         */
+        virtual bool resetLayerSequenceState(
+            int layer,
+            int seq_idx,
+            const StateResetContext &context) = 0;
+
+        /**
+         * @brief Reset every request slot, or recurrent state, in one layer.
+         *
+         * @param layer Global or cache-local layer accepted by the implementation.
+         * @param context Explicit semantic and stream-ordering context.
+         * @return true after the reset has been accepted.
+         */
+        virtual bool resetLayerState(
+            int layer,
+            const StateResetContext &context) = 0;
 
         // =================================================================
         // Batched Operations
@@ -1084,6 +1268,10 @@ namespace llaminar2
         {
             return get_kv_converted(layer, 0, Target, out_k, out_v, out_kv_len, rope);
         }
+
+    private:
+        StateOwnership state_ownership_{};
+        bool state_ownership_bound_ = false;
     };
 
 } // namespace llaminar2

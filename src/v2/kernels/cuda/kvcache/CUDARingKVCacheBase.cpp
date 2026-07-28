@@ -286,7 +286,7 @@ namespace llaminar2
         }
         for (int layer = 0; layer < n_layers_; ++layer)
         {
-            onClearSequence(layer, seq_idx);
+            onResetLayerSequenceState(layer, seq_idx);
         }
         return true;
     }
@@ -353,39 +353,133 @@ namespace llaminar2
         return true;
     }
 
-    void CUDARingKVCacheBase::clear()
+    bool CUDARingKVCacheBase::resetRequestState(
+        const StateResetContext &context)
     {
+        if (!context.permitsRequestReset() ||
+            !context.execution_stream || !context.hasReason() ||
+            !d_head_params_ || !d_count_params_ ||
+            !activateOwningDevice("request-state reset"))
+        {
+            LOG_ERROR("[CUDARingKVCacheBase] Request-state reset requires an explicit stream, reason, and device metadata");
+            return false;
+        }
+
+        const size_t entry_count =
+            static_cast<size_t>(n_layers_) * static_cast<size_t>(batch_size_);
+        const size_t metadata_bytes = entry_count * sizeof(int);
+        auto stream = static_cast<cudaStream_t>(context.execution_stream);
+        if (cudaMemsetAsync(d_head_params_, 0, metadata_bytes, stream) != cudaSuccess ||
+            cudaMemsetAsync(d_count_params_, 0, metadata_bytes, stream) != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARingKVCacheBase] Failed to enqueue request-state metadata reset"
+                      << " reason=" << context.reason);
+            return false;
+        }
+
+        std::fill(append_count_sources_.begin(), append_count_sources_.end(), nullptr);
         for (int layer = 0; layer < n_layers_; ++layer)
-            clear_layer(layer);
+        {
+            for (int seq_idx = 0; seq_idx < batch_size_; ++seq_idx)
+                onResetLayerSequenceState(layer, seq_idx);
+        }
         wrap_warned_ = false;
+        return true;
     }
 
-    void CUDARingKVCacheBase::clear_sequence(int layer, int seq_idx)
+    bool CUDARingKVCacheBase::resetSequenceState(
+        int seq_idx,
+        const StateResetContext &context)
     {
-        if (!validLayerSeq(layer, seq_idx))
-            return;
-        append_count_sources_[static_cast<size_t>(
-            layer * batch_size_ + seq_idx)] = nullptr;
-        cudaStream_t stream = static_cast<cudaStream_t>(
-            GPUDeviceContextPool::instance()
-                .getNvidiaContext(device_id_)
-                .defaultStream());
-        if (!setDeviceSequenceState(layer, seq_idx, 0, 0, stream) ||
-            cudaStreamSynchronize(stream) != cudaSuccess)
+        if (!context.permitsSequenceReset() ||
+            !context.execution_stream || !context.hasReason() ||
+            seq_idx < 0 || seq_idx >= batch_size_)
         {
-            LOG_ERROR("[CUDARingKVCacheBase] Failed to reset canonical device sequence state"
+            LOG_ERROR("[CUDARingKVCacheBase] Sequence-state reset has invalid ownership"
+                      << " seq_idx=" << seq_idx);
+            return false;
+        }
+        if (!truncateSequence(seq_idx, 0, context.execution_stream))
+            return false;
+
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            append_count_sources_[static_cast<size_t>(
+                layer * batch_size_ + seq_idx)] = nullptr;
+        }
+        return true;
+    }
+
+    bool CUDARingKVCacheBase::resetLayerSequenceState(
+        int layer,
+        int seq_idx,
+        const StateResetContext &context)
+    {
+        if (!context.permitsLayerSequenceReset() ||
+            !context.execution_stream || !context.hasReason() ||
+            !validLayerSeq(layer, seq_idx))
+        {
+            LOG_ERROR("[CUDARingKVCacheBase] Layer/sequence reset has invalid ownership"
                       << " layer=" << layer
                       << " seq_idx=" << seq_idx);
+            return false;
         }
-        onClearSequence(layer, seq_idx);
+        append_count_sources_[static_cast<size_t>(
+            layer * batch_size_ + seq_idx)] = nullptr;
+        if (!setDeviceSequenceState(
+                layer,
+                seq_idx,
+                0,
+                0,
+                context.execution_stream))
+        {
+            return false;
+        }
+        onResetLayerSequenceState(layer, seq_idx);
+        return true;
     }
 
-    void CUDARingKVCacheBase::clear_layer(int layer)
+    bool CUDARingKVCacheBase::resetLayerState(
+        int layer,
+        const StateResetContext &context)
     {
-        if (layer < 0 || layer >= n_layers_)
-            return;
-        for (int seq = 0; seq < batch_size_; ++seq)
-            clear_sequence(layer, seq);
+        if (!context.permitsLayerReset() ||
+            !context.execution_stream || !context.hasReason() ||
+            layer < 0 || layer >= n_layers_ ||
+            !d_head_params_ || !d_count_params_ ||
+            !activateOwningDevice("layer-state reset"))
+        {
+            LOG_ERROR("[CUDARingKVCacheBase] Layer-state reset has invalid ownership"
+                      << " layer=" << layer);
+            return false;
+        }
+
+        const size_t first_entry =
+            static_cast<size_t>(layer) * static_cast<size_t>(batch_size_);
+        const size_t metadata_bytes =
+            static_cast<size_t>(batch_size_) * sizeof(int);
+        auto stream = static_cast<cudaStream_t>(context.execution_stream);
+        if (cudaMemsetAsync(
+                d_head_params_ + first_entry,
+                0,
+                metadata_bytes,
+                stream) != cudaSuccess ||
+            cudaMemsetAsync(
+                d_count_params_ + first_entry,
+                0,
+                metadata_bytes,
+                stream) != cudaSuccess)
+        {
+            return false;
+        }
+
+        for (int seq_idx = 0; seq_idx < batch_size_; ++seq_idx)
+        {
+            append_count_sources_[first_entry + static_cast<size_t>(seq_idx)] =
+                nullptr;
+            onResetLayerSequenceState(layer, seq_idx);
+        }
+        return true;
     }
 
     // =========================================================================
@@ -536,7 +630,7 @@ namespace llaminar2
 
         for (int layer = 0; layer < n_layers_; ++layer)
         {
-            onClearSequence(layer, seq_idx);
+            onResetLayerSequenceState(layer, seq_idx);
         }
         return true;
     }

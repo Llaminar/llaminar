@@ -113,7 +113,8 @@ TEST(Test__PrefixCacheStateProbe, CapturesClearedCPURingKVInventory)
     std::fill(in_v->mutable_data(), in_v->mutable_data() + 4, 2.0f);
 
     ASSERT_TRUE(cache.append_kv(0, 0, in_k.get(), in_v.get(), 2));
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
 
     PrefixRuntimeStateSnapshot snapshot;
     snapshot.kv_caches.push_back(inspectKVCacheForPrefixProbe(cache, "unit", DeviceId::cpu()));

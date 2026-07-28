@@ -431,50 +431,71 @@ namespace llaminar2
                 read);
         }
 
-        void clear() override
+        bool resetRequestState(
+            const typename IKVCache::StateResetContext &context) override
         {
-            // Base::clear() resets compressed FA entries directly and scrubs
-            // CUDA sidecar/device buffers without dispatching through the hybrid
-            // global-layer clear_layer() override.
-            Base::clear();
-            void *const state_stream = gdnStateStream();
+            if (!Base::resetRequestState(context))
+                return false;
             for (auto &state : gdn_states_)
             {
-                if (!state.resetGPUKernelState(state_stream))
-                    throw std::runtime_error(
-                        "[CUDAHybridRingKVCache] Failed to reset cache-owned GDN state");
+                if (!state.resetGPUKernelState(context.execution_stream))
+                {
+                    LOG_ERROR("[CUDAHybridRingKVCache] Failed to enqueue cache-owned GDN request reset"
+                              << " reason=" << context.reason);
+                    return false;
+                }
             }
+            return true;
         }
 
-        void clear_sequence(int layer, int seq_idx) override
+        bool resetLayerSequenceState(
+            int layer,
+            int seq_idx,
+            const typename IKVCache::StateResetContext &context) override
         {
+            if (!context.permitsLayerSequenceReset() ||
+                !context.execution_stream || !context.hasReason() ||
+                seq_idx < 0 || seq_idx >= this->batch_size_)
+                return false;
             int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
-                return;
-            // Qualify fully to avoid name hiding from 'using IKVCache::clear_sequence' in Base
-            CUDARingKVCacheBase::clear_sequence(kv_idx, seq_idx);
+            {
+                const int gdn_idx =
+                    layer_map_.toGDNIndex(normalizeLayerIndex(layer));
+                return gdn_idx >= 0 &&
+                       gdn_idx < static_cast<int>(gdn_states_.size());
+            }
+            return CUDARingKVCacheBase::resetLayerSequenceState(
+                kv_idx,
+                seq_idx,
+                context);
         }
 
-        void clear_layer(int layer) override
+        bool resetLayerState(
+            int layer,
+            const typename IKVCache::StateResetContext &context) override
         {
+            if (!context.permitsLayerReset() ||
+                !context.execution_stream || !context.hasReason())
+            {
+                return false;
+            }
             int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx >= 0)
             {
-                for (int seq = 0; seq < this->batch_size_; ++seq)
-                {
-                    CUDARingKVCacheBase::clear_sequence(kv_idx, seq);
-                }
+                return CUDARingKVCacheBase::resetLayerState(kv_idx, context);
             }
-            else
+            int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
+            if (gdn_idx < 0 || gdn_idx >= static_cast<int>(gdn_states_.size()))
+                return false;
+            if (!gdn_states_[gdn_idx].resetGPUKernelState(
+                    context.execution_stream))
             {
-                int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
-                if (gdn_idx >= 0 && gdn_idx < static_cast<int>(gdn_states_.size()))
-                {
-                    if (!gdn_states_[gdn_idx].resetGPUKernelState(gdnStateStream()))
-                        throw std::runtime_error(
-                            "[CUDAHybridRingKVCache] Failed to reset layer GDN state");
-                }
+                LOG_ERROR("[CUDAHybridRingKVCache] Failed to enqueue layer GDN reset"
+                          << " layer=" << layer);
+                return false;
             }
+            return true;
         }
 
         typename IKVCache::KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override

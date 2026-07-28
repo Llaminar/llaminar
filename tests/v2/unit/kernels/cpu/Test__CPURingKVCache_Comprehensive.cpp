@@ -4,7 +4,7 @@
  *
  * - Shadow buffer wrap-around edge cases and stress tests
  * - get_kv() / get_v() accessors
- * - clear_sequence() / clear_layer() / clear() and their effect on shadows
+ * - request, sequence, and layer reset boundaries and their effect on shadows
  * - evict_oldest() / get_total_evicted() / reset_eviction_counter()
  * - Multi-sequence (batch_size > 1) gather and shadow behavior
  * - Multi-layer shadow correctness
@@ -358,7 +358,10 @@ TEST_F(Test__CPURingKVCache_Comprehensive, ClearSequence_ResetsOneEntry)
     ASSERT_TRUE(cache.append_kv(1, 0, k.get(), v.get(), 3));
     ASSERT_TRUE(cache.append_kv(1, 1, k.get(), v.get(), 3));
 
-    cache.clear_sequence(0, 0);
+    ASSERT_TRUE(cache.resetLayerSequenceState(
+        0,
+        0,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     EXPECT_EQ(cache.ring_size(0, 0), 0);
     EXPECT_EQ(cache.ring_head(0, 0), 0);
     // Other entries untouched
@@ -374,9 +377,18 @@ TEST_F(Test__CPURingKVCache_Comprehensive, ClearSequence_OutOfBounds_NoOp)
     auto v = taggedFP32(2, 2.0f);
     ASSERT_TRUE(cache.append_kv(0, 0, k.get(), v.get(), 2));
 
-    cache.clear_sequence(-1, 0);         // OOB
-    cache.clear_sequence(0, -1);         // OOB
-    cache.clear_sequence(1, 0);          // OOB
+    EXPECT_FALSE(cache.resetLayerSequenceState(
+        -1,
+        0,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
+    EXPECT_FALSE(cache.resetLayerSequenceState(
+        0,
+        -1,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
+    EXPECT_FALSE(cache.resetLayerSequenceState(
+        1,
+        0,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     EXPECT_EQ(cache.ring_size(0, 0), 2); // Unchanged
 }
 
@@ -390,7 +402,9 @@ TEST_F(Test__CPURingKVCache_Comprehensive, ClearLayer_ResetsAllSeqsInLayer)
         for (int s = 0; s < 2; ++s)
             ASSERT_TRUE(cache.append_kv(l, s, k.get(), v.get(), 3));
 
-    cache.clear_layer(0);
+    ASSERT_TRUE(cache.resetLayerState(
+        0,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     EXPECT_EQ(cache.ring_size(0, 0), 0);
     EXPECT_EQ(cache.ring_size(0, 1), 0);
     // Layer 1 untouched
@@ -405,18 +419,23 @@ TEST_F(Test__CPURingKVCache_Comprehensive, ClearLayer_OutOfBounds_NoOp)
     auto v = taggedFP32(2, 2.0f);
     ASSERT_TRUE(cache.append_kv(0, 0, k.get(), v.get(), 2));
 
-    cache.clear_layer(-1);
-    cache.clear_layer(1);
+    EXPECT_FALSE(cache.resetLayerState(
+        -1,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
+    EXPECT_FALSE(cache.resetLayerState(
+        1,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     EXPECT_EQ(cache.ring_size(0, 0), 2);
 }
 
 // =========================================================================
-// 6. SHADOW INVALIDATION: clear() / clear_sequence() / clear_layer()
+// 6. SHADOW INVALIDATION AT EXPLICIT RESET BOUNDARIES
 // =========================================================================
 
 TEST_F(Test__CPURingKVCache_Comprehensive, FP16Shadow_Clear_ThenReappend_ConvertsCorrectly)
 {
-    // Bug check: clear() doesn't reset fp32_shadows_, but the "kv_len < shadow.converted_rows"
+    // Bug check: request reset must invalidate fp32_shadows_; otherwise the
+    // "kv_len < shadow.converted_rows"
     // check in get_kv_converted should detect the reset.
     constexpr int MAX_SEQ = 4;
     CPURingKVCacheFP16 cache(testMPI(), 1, 1, MAX_SEQ, NKV, HD, DeviceId::cpu());
@@ -435,7 +454,8 @@ TEST_F(Test__CPURingKVCache_Comprehensive, FP16Shadow_Clear_ThenReappend_Convert
     EXPECT_TRUE(rowNear(out_k->data(), 10.0f));
 
     // Clear the cache
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     EXPECT_EQ(cache.ring_size(0, 0), 0);
 
     // Re-append 2 tokens with different values
@@ -455,7 +475,7 @@ TEST_F(Test__CPURingKVCache_Comprehensive, FP16Shadow_Clear_ThenReappend_Convert
 
 TEST_F(Test__CPURingKVCache_Comprehensive, FP32Shadow_ClearSequence_ThenWrap_ConvertsCorrectly)
 {
-    // Tests that after clear_sequence the shadow is properly invalidated for FP32 wrapping path.
+    // Sequence retirement must invalidate the FP32 wrapping-path shadow.
     constexpr int MAX_SEQ = 4;
     CPURingKVCacheFP32 cache(testMPI(), 1, 1, MAX_SEQ, NKV, HD, DeviceId::cpu());
 
@@ -475,7 +495,10 @@ TEST_F(Test__CPURingKVCache_Comprehensive, FP32Shadow_ClearSequence_ThenWrap_Con
     EXPECT_EQ(len, 4);
 
     // Clear and re-fill
-    cache.clear_sequence(0, 0);
+    ASSERT_TRUE(cache.resetLayerSequenceState(
+        0,
+        0,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     EXPECT_EQ(cache.ring_size(0, 0), 0);
     EXPECT_EQ(cache.ring_head(0, 0), 0);
 
@@ -488,7 +511,7 @@ TEST_F(Test__CPURingKVCache_Comprehensive, FP32Shadow_ClearSequence_ThenWrap_Con
     EXPECT_EQ(len, 3);
     // Head is 0 now so it should passthrough directly
     EXPECT_TRUE(rowNear(out_k->data() + 0 * KV_DIM, 200.0f))
-        << "After clear_sequence+re-append: got " << out_k->data()[0];
+        << "After sequence reset and re-append: got " << out_k->data()[0];
 }
 
 TEST_F(Test__CPURingKVCache_Comprehensive, FP16Shadow_ClearLayer_InvalidatesShadow)
@@ -509,7 +532,9 @@ TEST_F(Test__CPURingKVCache_Comprehensive, FP16Shadow_ClearLayer_InvalidatesShad
                                        &out_k, &out_v, &len));
 
     // Clear only layer 0
-    cache.clear_layer(0);
+    ASSERT_TRUE(cache.resetLayerState(
+        0,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
 
     // Re-append different data to layer 0
     auto k2 = taggedFP16(2, 70.0f);
@@ -520,7 +545,7 @@ TEST_F(Test__CPURingKVCache_Comprehensive, FP16Shadow_ClearLayer_InvalidatesShad
                                        &out_k, &out_v, &len));
     EXPECT_EQ(len, 2);
     EXPECT_TRUE(rowNear(out_k->data(), 70.0f))
-        << "Layer 0 after clear_layer: got " << out_k->data()[0];
+        << "Layer 0 after layer reset: got " << out_k->data()[0];
 
     // Layer 1 still has old data
     ASSERT_TRUE(cache.get_kv_converted(1, 0, ActivationPrecision::FP32,
@@ -549,7 +574,8 @@ TEST_F(Test__CPURingKVCache_Comprehensive, FP16Shadow_Clear_ThenSameLengthReappe
     ASSERT_TRUE(rowNear(out_k->data() + 0 * KV_DIM, 10.0f));
     ASSERT_TRUE(rowNear(out_v->data() + 0 * KV_DIM, 20.0f));
 
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     ASSERT_EQ(cache.ring_size(0, 0), 0);
     ASSERT_EQ(cache.ring_head(0, 0), 0);
 
@@ -561,13 +587,13 @@ TEST_F(Test__CPURingKVCache_Comprehensive, FP16Shadow_Clear_ThenSameLengthReappe
                                        &out_k, &out_v, &len));
     EXPECT_EQ(len, 2);
     EXPECT_TRUE(rowNear(out_k->data() + 0 * KV_DIM, 50.0f))
-        << "clear() left stale K shadow row, got " << out_k->data()[0];
+        << "Request reset left stale K shadow row, got " << out_k->data()[0];
     EXPECT_TRUE(rowNear(out_k->data() + 1 * KV_DIM, 51.0f))
-        << "clear() left stale K shadow row, got " << out_k->data()[KV_DIM];
+        << "Request reset left stale K shadow row, got " << out_k->data()[KV_DIM];
     EXPECT_TRUE(rowNear(out_v->data() + 0 * KV_DIM, 60.0f))
-        << "clear() left stale V shadow row, got " << out_v->data()[0];
+        << "Request reset left stale V shadow row, got " << out_v->data()[0];
     EXPECT_TRUE(rowNear(out_v->data() + 1 * KV_DIM, 61.0f))
-        << "clear() left stale V shadow row, got " << out_v->data()[KV_DIM];
+        << "Request reset left stale V shadow row, got " << out_v->data()[KV_DIM];
 }
 
 TEST_F(Test__CPURingKVCache_Comprehensive, BF16Shadow_ClearSequence_ThenSameLengthReappend_DoesNotReuseStaleRows)
@@ -593,7 +619,10 @@ TEST_F(Test__CPURingKVCache_Comprehensive, BF16Shadow_ClearSequence_ThenSameLeng
                                        &out_k, &out_v, &len));
     ASSERT_EQ(len, 2);
 
-    cache.clear_sequence(0, 0);
+    ASSERT_TRUE(cache.resetLayerSequenceState(
+        0,
+        0,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     ASSERT_EQ(cache.ring_size(0, 0), 0);
     ASSERT_EQ(cache.ring_size(0, 1), 2);
 
@@ -605,15 +634,15 @@ TEST_F(Test__CPURingKVCache_Comprehensive, BF16Shadow_ClearSequence_ThenSameLeng
                                        &out_k, &out_v, &len));
     EXPECT_EQ(len, 2);
     EXPECT_TRUE(rowNear(out_k->data() + 0 * KV_DIM, 50.0f, 0.1f))
-        << "clear_sequence() left stale K shadow row, got " << out_k->data()[0];
+        << "Sequence reset left stale K shadow row, got " << out_k->data()[0];
     EXPECT_TRUE(rowNear(out_v->data() + 1 * KV_DIM, 61.0f, 0.1f))
-        << "clear_sequence() left stale V shadow row, got " << out_v->data()[KV_DIM];
+        << "Sequence reset left stale V shadow row, got " << out_v->data()[KV_DIM];
 
     ASSERT_TRUE(cache.get_kv_converted(0, 1, ActivationPrecision::FP32,
                                        &out_k, &out_v, &len));
     EXPECT_EQ(len, 2);
     EXPECT_TRUE(rowNear(out_k->data() + 0 * KV_DIM, 100.0f, 0.1f))
-        << "clear_sequence() should not disturb sibling sequence";
+        << "Sequence reset should not disturb sibling sequence";
 }
 
 TEST_F(Test__CPURingKVCache_Comprehensive, Q8_1Shadow_ClearLayer_ThenSameLengthReappend_DoesNotReuseStaleRows)
@@ -640,7 +669,9 @@ TEST_F(Test__CPURingKVCache_Comprehensive, Q8_1Shadow_ClearLayer_ThenSameLengthR
                                        &out_k, &out_v, &len));
     ASSERT_EQ(len, 2);
 
-    cache.clear_layer(0);
+    ASSERT_TRUE(cache.resetLayerState(
+        0,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     ASSERT_EQ(cache.ring_size(0, 0), 0);
     ASSERT_EQ(cache.ring_size(1, 0), 2);
 
@@ -652,17 +683,17 @@ TEST_F(Test__CPURingKVCache_Comprehensive, Q8_1Shadow_ClearLayer_ThenSameLengthR
                                        &out_k, &out_v, &len));
     EXPECT_EQ(len, 2);
     EXPECT_TRUE(rowNearCols(out_k->data() + 0 * Q8_DIM, Q8_DIM, 40.0f))
-        << "clear_layer() left stale Q8_1 K shadow row, got " << out_k->data()[0];
+        << "Layer reset left stale Q8_1 K shadow row, got " << out_k->data()[0];
     EXPECT_TRUE(rowNearCols(out_k->data() + 1 * Q8_DIM, Q8_DIM, 41.0f))
-        << "clear_layer() left stale Q8_1 K shadow row, got " << out_k->data()[Q8_DIM];
+        << "Layer reset left stale Q8_1 K shadow row, got " << out_k->data()[Q8_DIM];
     EXPECT_TRUE(rowNearCols(out_v->data() + 0 * Q8_DIM, Q8_DIM, 50.0f))
-        << "clear_layer() left stale Q8_1 V shadow row, got " << out_v->data()[0];
+        << "Layer reset left stale Q8_1 V shadow row, got " << out_v->data()[0];
 
     ASSERT_TRUE(cache.get_kv_converted(1, 0, ActivationPrecision::FP32,
                                        &out_k, &out_v, &len));
     EXPECT_EQ(len, 2);
     EXPECT_TRUE(rowNearCols(out_k->data() + 0 * Q8_DIM, Q8_DIM, 80.0f))
-        << "clear_layer() should not disturb sibling layer";
+        << "Layer reset should not disturb sibling layer";
 }
 
 // =========================================================================
@@ -1699,7 +1730,10 @@ TEST_F(Test__CPURingKVCache_Comprehensive, MultiSeq_ClearOne_OtherUnaffected)
                                        &out_k, &out_v, &len));
 
     // Clear seq 0 only
-    cache.clear_sequence(0, 0);
+    ASSERT_TRUE(cache.resetLayerSequenceState(
+        0,
+        0,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     EXPECT_EQ(cache.ring_size(0, 0), 0);
     EXPECT_EQ(cache.ring_size(0, 1), 2); // Untouched
 

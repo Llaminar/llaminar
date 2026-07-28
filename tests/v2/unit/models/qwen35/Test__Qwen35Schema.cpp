@@ -270,9 +270,16 @@ namespace
         ITensor *get_v(int, int) override { return nullptr; }
         const ITensor *get_v(int, int) const override { return nullptr; }
         bool append(int, int, const ITensor *, const ITensor *, int) override { return false; }
-        void clear() override {}
-        void clear_sequence(int, int) override {}
-        void clear_layer(int) override {}
+        bool resetRequestState(const StateResetContext &) override { return true; }
+        bool resetSequenceState(int, const StateResetContext &) override { return true; }
+        bool resetLayerSequenceState(
+            int,
+            int,
+            const StateResetContext &) override
+        {
+            return true;
+        }
+        bool resetLayerState(int, const StateResetContext &) override { return true; }
 
         mutable std::vector<int> queried_cache_layers;
 

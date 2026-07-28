@@ -439,7 +439,7 @@ TEST(Test__IKVCacheLogicalBlockIO, PositionMajorExportsWrappedLogicalOrder)
     expectFP32Rows(out_v, 4, KV_DIM, {220.0f, 230.0f, 240.0f, 250.0f});
 }
 
-TEST(Test__IKVCacheLogicalBlockIO, ImportsIntoEmptyAndAfterClear)
+TEST(Test__IKVCacheLogicalBlockIO, ImportsIntoEmptyAndAfterRequestReset)
 {
     constexpr int KV_DIM = 2;
     CPURingKVCacheFP32 cache(testMPI(), 1, 1, 4, 1, KV_DIM, DeviceId::cpu());
@@ -456,7 +456,8 @@ TEST(Test__IKVCacheLogicalBlockIO, ImportsIntoEmptyAndAfterClear)
     EXPECT_EQ(out_k, k_payload);
     EXPECT_EQ(out_v, v_payload);
 
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     std::vector<float> k_payload_2 = {5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f};
     std::vector<float> v_payload_2 = {50.0f, 60.0f, 70.0f, 80.0f, 90.0f, 100.0f};
     const IKVCache::KVCacheLogicalBlockDescriptor three_tokens{0, 0, 0, 3, nullptr};

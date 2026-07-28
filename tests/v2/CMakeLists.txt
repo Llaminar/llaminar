@@ -1991,6 +1991,25 @@ set_tests_properties(V2_Unit_GPUBlockingSynchronizationPolicy PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_KVStateLifecyclePolicySelfTest
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_kv_state_lifecycle_policy.py
+)
+set_tests_properties(V2_Unit_KVStateLifecyclePolicySelfTest PROPERTIES
+    LABELS "V2;Unit;GPU;CUDA;ROCm;KVCache;MTP;Synchronization;SourcePolicy;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_KVStateLifecyclePolicy
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/check_kv_state_lifecycle_policy.py
+            --repo-root ${CMAKE_SOURCE_DIR}/../..
+)
+set_tests_properties(V2_Unit_KVStateLifecyclePolicy PROPERTIES
+    LABELS "V2;Unit;GPU;CUDA;ROCm;KVCache;MTP;Synchronization;SourcePolicy;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_GPUEventlessPublicationPolicySelfTest
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_eventless_publication_policy.py
@@ -6110,7 +6129,7 @@ message(STATUS "V2 Tests: Added CUDA Ring KV Cache logical block IO integration 
 
 # Integration Test: CUDA Hybrid KV Cache Reset
 # Verifies GDN GPU kernel state and compressed FA metadata resets through
-# standard clear()/clear_layer() semantics without recreating cache kernels.
+# explicit request/layer reset semantics without recreating cache kernels.
 add_executable(v2_integration_cuda_hybrid_kv_cache_reset integration/kernels/cuda/Test__CUDAHybridKVCacheReset.cpp)
 target_link_libraries(v2_integration_cuda_hybrid_kv_cache_reset llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CUDAHybridKVCacheReset
@@ -11578,7 +11597,7 @@ if(HAVE_ROCM)
     message(STATUS "V2 Tests: Added ROCm Ring KV Cache logical block IO integration tests")
 
     # Integration Test: ROCm Hybrid KV Cache Reset
-    # Verifies GDN GPU kernel state resets through standard clear()/clear_layer()
+    # Verifies GDN GPU kernel state resets through explicit request/layer
     # semantics without destroying/recreating the hybrid cache object.
     add_executable(v2_integration_rocm_hybrid_kv_cache_reset
         integration/kernels/rocm/Test__ROCmHybridKVCacheReset.cpp

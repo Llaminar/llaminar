@@ -500,12 +500,16 @@ TEST(Test__CUDARingKVCacheTQ, Clear_ResetsAllLayers)
     stream.synchronize();
 
     // Clear single sequence
-    cache.clear_sequence(0, 0);
+    ASSERT_TRUE(cache.resetLayerSequenceState(
+        0,
+        0,
+        IKVCache::StateResetContext::testReinitialization(stream.opaque())));
     EXPECT_EQ(cache.get_cached_tokens(0, 0), 0);
     EXPECT_EQ(cache.get_cached_tokens(1, 0), 5); // Other layer unaffected
 
     // Clear all
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(stream.opaque())));
     for (int l = 0; l < n_layers; ++l)
         EXPECT_EQ(cache.get_cached_tokens(l, 0), 0);
 
@@ -590,18 +594,24 @@ TEST(Test__CUDARingKVCacheTQ, ClearSequenceLayerAndAllInvalidateConvertedScratch
     ASSERT_EQ(kv_len, num_tokens);
     ASSERT_NE(out_k, nullptr);
 
-    cache.clear_sequence(0, 1);
+    ASSERT_TRUE(cache.resetLayerSequenceState(
+        0,
+        1,
+        IKVCache::StateResetContext::testReinitialization(stream.opaque())));
     expectConvertedEmpty(cache, 0, 1);
     EXPECT_EQ(cache.get_cached_tokens(0, 0), num_tokens);
     EXPECT_EQ(cache.get_cached_tokens(1, 0), num_tokens);
     EXPECT_EQ(cache.get_cached_tokens(1, 1), num_tokens);
 
-    cache.clear_layer(1);
+    ASSERT_TRUE(cache.resetLayerState(
+        1,
+        IKVCache::StateResetContext::testReinitialization(stream.opaque())));
     expectConvertedEmpty(cache, 1, 0);
     expectConvertedEmpty(cache, 1, 1);
     EXPECT_EQ(cache.get_cached_tokens(0, 0), num_tokens);
 
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(stream.opaque())));
     expectConvertedEmpty(cache, 0, 0);
     expectConvertedEmpty(cache, 0, 1);
 }
@@ -647,7 +657,8 @@ TEST(Test__CUDARingKVCacheTQ, ClearThenReappendConvertedScratchUsesNewRows)
     ASSERT_EQ(kv_len, num_tokens);
     auto k_a = downloadFP16ToFP32(out_k_a->gpu_data_ptr(), num_tokens * kv_dim);
 
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(stream.opaque())));
     expectConvertedEmpty(cache, 0, 0);
 
     append_host(h_K_b, h_V_b);

@@ -157,13 +157,27 @@ namespace llaminar2
                 cached_tokens_[layer] += num_tokens;
                 return true;
             }
-            void clear() override
+            bool resetRequestState(const StateResetContext &) override
             {
                 for (auto &c : cached_tokens_)
                     c = 0;
+                return true;
             }
-            void clear_sequence(int, int) override {}
-            void clear_layer(int) override {}
+            bool resetSequenceState(int, const StateResetContext &) override
+            {
+                return true;
+            }
+            bool resetLayerSequenceState(
+                int,
+                int,
+                const StateResetContext &) override
+            {
+                return true;
+            }
+            bool resetLayerState(int, const StateResetContext &) override
+            {
+                return true;
+            }
             void evict_oldest(int) override {}
             void evict_oldest_from_sequence(int, int) override {}
             int get_total_evicted() const override { return 0; }

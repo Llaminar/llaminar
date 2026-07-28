@@ -814,15 +814,22 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Cache Management (clear operations)
+    // Explicit State-Lifetime Reset Operations
     // =========================================================================
     // These reset the ring buffer bookkeeping (head and size) WITHOUT freeing
     // the underlying tensor memory. This allows the cache to be reused across
     // inference sessions without reallocation.
 
     template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    void CPURingKVCache<KPrecision, VPrecision>::clear()
+    bool CPURingKVCache<KPrecision, VPrecision>::resetRequestState(
+        const StateResetContext &context)
     {
+        if (!context.permitsRequestReset() ||
+            context.execution_stream || !context.hasReason())
+        {
+            LOG_ERROR("[CPURingKVCache] Request-state reset requires a named CPU boundary with no GPU stream");
+            return false;
+        }
         for (int layer = 0; layer < n_layers_; ++layer)
         {
             for (int seq_idx = 0; seq_idx < batch_size_; ++seq_idx)
@@ -840,26 +847,65 @@ namespace llaminar2
             }
         }
         wrap_warned_ = false;
+        return true;
     }
 
     template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    void CPURingKVCache<KPrecision, VPrecision>::clear_sequence(int layer, int seq_idx)
+    bool CPURingKVCache<KPrecision, VPrecision>::resetLayerSequenceState(
+        int layer,
+        int seq_idx,
+        const StateResetContext &context)
     {
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        if (!context.permitsLayerSequenceReset() ||
+            context.execution_stream || !context.hasReason() ||
+            layer < 0 || layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_)
         {
-            return;
+            LOG_ERROR("[CPURingKVCache] Layer/sequence reset has invalid ownership"
+                      << " layer=" << layer
+                      << " seq_idx=" << seq_idx);
+            return false;
         }
         entries_[layer][seq_idx].head = 0;
         entries_[layer][seq_idx].size = 0;
         invalidateFP32Shadow(layer, seq_idx);
+        return true;
     }
 
     template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    void CPURingKVCache<KPrecision, VPrecision>::clear_layer(int layer)
+    bool CPURingKVCache<KPrecision, VPrecision>::resetSequenceState(
+        int seq_idx,
+        const StateResetContext &context)
     {
-        if (layer < 0 || layer >= n_layers_)
+        if (!context.permitsSequenceReset() ||
+            context.execution_stream || !context.hasReason() ||
+            seq_idx < 0 || seq_idx >= batch_size_)
         {
-            return;
+            LOG_ERROR("[CPURingKVCache] Sequence-state reset has invalid ownership"
+                      << " seq_idx=" << seq_idx);
+            return false;
+        }
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            entries_[layer][seq_idx].head = 0;
+            entries_[layer][seq_idx].size = 0;
+            invalidateFP32Shadow(layer, seq_idx);
+        }
+        return true;
+    }
+
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
+    bool CPURingKVCache<KPrecision, VPrecision>::resetLayerState(
+        int layer,
+        const StateResetContext &context)
+    {
+        if (!context.permitsLayerReset() ||
+            context.execution_stream || !context.hasReason() ||
+            layer < 0 || layer >= n_layers_)
+        {
+            LOG_ERROR("[CPURingKVCache] Layer-state reset has invalid ownership"
+                      << " layer=" << layer);
+            return false;
         }
         for (int seq_idx = 0; seq_idx < batch_size_; ++seq_idx)
         {
@@ -867,6 +913,7 @@ namespace llaminar2
             entries_[layer][seq_idx].size = 0;
             invalidateFP32Shadow(layer, seq_idx);
         }
+        return true;
     }
 
     // =========================================================================

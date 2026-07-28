@@ -361,8 +361,14 @@ TEST(Test__CUDARingKVCache_Comprehensive, MultiSeq_ClearOne_OtherUnaffected)
         for (int seq = 0; seq < batch_size; ++seq)
             cache->append(layer, seq, d_K.ptr, d_V.ptr, 10, 0);
 
-    // Clear sequence 1 in layer 0
-    cache->clear_sequence(0, 1);
+    ScopedCudaStream reset_stream;
+
+    // Reset sequence 1 in layer 0.
+    ASSERT_TRUE(cache->resetLayerSequenceState(
+        0,
+        1,
+        IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(0, 1), 0);
 
     // Other sequences in same layer unaffected
@@ -520,8 +526,9 @@ TEST(Test__CUDARingKVCache_Comprehensive, IKVCache_PolymorphismCompliance)
     ASSERT_EQ(cudaStreamSynchronize(stream.stream), cudaSuccess);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 5);
 
-    // Clear via IKVCache
-    cache->clear();
+    // Reset via IKVCache on the same explicit stream as the append.
+    ASSERT_TRUE(cache->resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 }
 
@@ -665,7 +672,9 @@ TEST(Test__CUDARingKVCache_Comprehensive, Clear_ResetsCanonicalRingState)
     int len;
     cache->get_kv_for_attention(0, 0, &dk, &dv, &len, 0);
 
-    // Clear should reset
-    cache->clear();
+    ScopedCudaStream reset_stream;
+    ASSERT_TRUE(cache->resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 }

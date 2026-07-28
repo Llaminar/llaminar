@@ -928,18 +928,29 @@ TEST(Test__CUDARingKVCache, ClearOperations)
         }
     }
 
-    // Clear single sequence
-    cache->clear_sequence(1, 0);
+    ScopedCudaStream reset_stream;
+
+    // Reset one layer/sequence entry.
+    ASSERT_TRUE(cache->resetLayerSequenceState(
+        1,
+        0,
+        IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(1, 0), 0);
     EXPECT_EQ(cache->get_cached_tokens(1, 1), 10); // Other sequence unchanged
 
     // Clear entire layer
-    cache->clear_layer(2);
+    ASSERT_TRUE(cache->resetLayerState(
+        2,
+        IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(2, 0), 0);
     EXPECT_EQ(cache->get_cached_tokens(2, 1), 0);
 
     // Clear all
-    cache->clear();
+    ASSERT_TRUE(cache->resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
     for (int layer = 0; layer < n_layers; ++layer)
     {
         for (int seq = 0; seq < batch_size; ++seq)
@@ -1287,6 +1298,25 @@ TEST(Test__CUDARingKVCache, VerifierRowsFP32ToFP16AppendMatchesSerialDecodeForPo
         ASSERT_NE(serial, nullptr);
         ASSERT_NE(grouped, nullptr);
 
+        auto *serial_workspace_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(serial.get());
+        auto *grouped_workspace_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(grouped.get());
+        ASSERT_NE(serial_workspace_consumer, nullptr);
+        ASSERT_NE(grouped_workspace_consumer, nullptr);
+        auto serial_workspace = bindRequiredWorkspace(
+            serial_workspace_consumer,
+            verifier_rows,
+            batch_size,
+            head_dim);
+        auto grouped_workspace = bindRequiredWorkspace(
+            grouped_workspace_consumer,
+            verifier_rows,
+            batch_size,
+            head_dim);
+        ASSERT_NE(serial_workspace, nullptr);
+        ASSERT_NE(grouped_workspace, nullptr);
+
         append_history(serial.get());
         append_history(grouped.get());
 
@@ -1331,6 +1361,14 @@ TEST(Test__CUDARingKVCache, VerifierRowsFP32ToFP16AppendMatchesSerialDecodeForPo
             << case_name << " grouped K cache bytes diverged from serial decode";
         EXPECT_EQ(grouped_v_bytes, serial_v)
             << case_name << " grouped V cache bytes diverged from serial decode";
+
+        /*
+         * The workspace manager must outlive every bound consumer. Explicitly
+         * sever the non-owning cache references before the local managers are
+         * destroyed at the end of this case.
+         */
+        serial_workspace_consumer->unbindWorkspace();
+        grouped_workspace_consumer->unbindWorkspace();
     };
 
     run_case("position-major", verifier_k_position.get(), verifier_v_position.get());
@@ -1570,7 +1608,8 @@ TEST(Test__CUDARingKVCache, GraphCapturedFP32ToFP16FusedAppendReplaysAfterClear)
     ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
     ASSERT_NE(graph_exec, nullptr);
 
-    cache->clear();
+    ASSERT_TRUE(cache->resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
     ASSERT_TRUE(cache->bindGraphAppendCountSource(
         0, 0, nullptr, num_tokens, stream.opaque()));
@@ -1814,10 +1853,10 @@ TEST(Test__CUDARingKVCache, WorkspaceBinding)
 }
 
 // =============================================================================
-// Test: BatchedGather fails without workspace
+// Test: Diagnostic batched gather uses caller-owned output without workspace
 // =============================================================================
 
-TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
+TEST(Test__CUDARingKVCache, BatchedGatherToCallerOwnedBuffersDoesNotRequireWorkspace)
 {
     if (!hasCUDA())
     {
@@ -1859,8 +1898,12 @@ TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
     }
     stream.synchronize();
 
-    // Gather without workspace should hard-fail instead of allocating hidden
-    // scratch with cudaMalloc.
+    /*
+     * This diagnostic API receives complete output buffers from its caller and
+     * therefore needs no cache-owned scratch. Production graph attention uses
+     * get_kv_batched_device_view(), which keeps lengths device-resident and
+     * requires graph-stable workspace.
+     */
     int max_kv_len = 10;
     float *d_K_gathered, *d_V_gathered;
     cudaMalloc(&d_K_gathered, batch_size * max_kv_len * kv_dim * sizeof(float));
@@ -1871,14 +1914,17 @@ TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
                                               d_K_gathered, d_V_gathered,
                                               kv_lens.data(), max_kv_len, stream.stream());
 
-    EXPECT_EQ(actual_max, -1);
+    EXPECT_EQ(actual_max, 8);
+    ASSERT_EQ(kv_lens.size(), static_cast<size_t>(batch_size));
+    EXPECT_EQ(kv_lens[0], 5);
+    EXPECT_EQ(kv_lens[1], 8);
 
     cudaFree(d_K);
     cudaFree(d_V);
     cudaFree(d_K_gathered);
     cudaFree(d_V_gathered);
 
-    LOG_INFO("[BatchedGatherWithoutWorkspace] PASSED - hard failure verified");
+    LOG_INFO("[BatchedGatherToCallerOwnedBuffersDoesNotRequireWorkspace] PASSED");
 }
 
 /**

@@ -238,20 +238,34 @@ namespace llaminar2
                 return true;
             }
 
-            void clear() override
+            bool resetRequestState(const StateResetContext &) override
             {
                 for (auto &count : cached_tokens_)
                 {
                     count = 0;
                 }
+                return true;
             }
 
-            void clear_sequence(int layer, int seq_idx) override
+            bool resetSequenceState(int seq_idx, const StateResetContext &) override
+            {
+                (void)seq_idx;
+                return true;
+            }
+            bool resetLayerSequenceState(
+                int layer,
+                int seq_idx,
+                const StateResetContext &) override
             {
                 (void)layer;
                 (void)seq_idx;
+                return true;
             }
-            void clear_layer(int layer) override { (void)layer; }
+            bool resetLayerState(int layer, const StateResetContext &) override
+            {
+                (void)layer;
+                return true;
+            }
             void evict_oldest(int tokens_to_evict) override { (void)tokens_to_evict; }
             void evict_oldest_from_sequence(int seq_idx, int tokens_to_evict) override
             {

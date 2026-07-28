@@ -338,7 +338,8 @@ TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_Clear_ResetsAllLayers)
     EXPECT_EQ(cache.ring_size(0, 0), 3);
     EXPECT_EQ(cache.ring_size(1, 0), 3);
 
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
 
     EXPECT_EQ(cache.ring_size(0, 0), 0);
     EXPECT_EQ(cache.ring_size(1, 0), 0);

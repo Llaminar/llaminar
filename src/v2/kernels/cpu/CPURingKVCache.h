@@ -310,23 +310,30 @@ namespace llaminar2
         // Cache Management
         // =====================================================================
 
-        /** @brief Reset all entries across all layers and sequences (head=0, size=0). */
-        void clear() override;
+        /** @brief Reset all entries without releasing persistent cache storage. */
+        bool resetRequestState(const StateResetContext &context) override;
 
         /**
          * @brief Reset a single (layer, sequence) entry.
          *
          * The underlying tensor memory is not freed — only the ring pointers are reset.
          */
-        void clear_sequence(int layer, int seq_idx) override;
+        bool resetLayerSequenceState(
+            int layer,
+            int seq_idx,
+            const StateResetContext &context) override;
 
-        /** @brief Reset all sequences for a given layer. */
-        void clear_layer(int layer) override;
+        /** @brief Reset one request slot across all cache layers. */
+        bool resetSequenceState(
+            int seq_idx,
+            const StateResetContext &context) override;
+
+        /** @brief Reset all request slots for a given layer. */
+        bool resetLayerState(
+            int layer,
+            const StateResetContext &context) override;
 
         /** @brief Advance ring metadata after an externally managed append/replay. */
-
-        /// Bring in ICPUKVCache::clear_sequence(seq_idx) which clears across all layers.
-        using ICPUKVCache::clear_sequence;
 
         // =====================================================================
         // Sharding (Tensor Parallelism) Accessors

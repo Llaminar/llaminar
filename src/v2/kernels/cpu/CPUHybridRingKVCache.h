@@ -221,41 +221,65 @@ namespace llaminar2
                 kv_idx, seq_idx, K, V, verifier_rows, nullptr);
         }
 
-        void clear() override
+        bool resetRequestState(
+            const typename IKVCache::StateResetContext &context) override
         {
-            Base::clear();
+            if (!Base::resetRequestState(context))
+                return false;
             for (auto &state : gdn_states_)
             {
                 state.reset();
-                state.resetGPUKernelState();
+                if (!state.resetGPUKernelState(nullptr))
+                    return false;
             }
+            return true;
         }
 
-        void clear_sequence(int layer, int seq_idx) override
+        bool resetLayerSequenceState(
+            int layer,
+            int seq_idx,
+            const typename IKVCache::StateResetContext &context) override
         {
+            if (!context.permitsLayerSequenceReset() ||
+                context.execution_stream || !context.hasReason() ||
+                seq_idx < 0 || seq_idx >= this->batch_size())
+            {
+                return false;
+            }
             int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
-                return; // GDN — no per-sequence clear needed (state is global)
-            Base::clear_sequence(kv_idx, seq_idx);
+            {
+                const int gdn_idx =
+                    layer_map_.toGDNIndex(normalizeLayerIndex(layer));
+                return gdn_idx >= 0 &&
+                       gdn_idx < static_cast<int>(gdn_states_.size());
+            }
+            return Base::resetLayerSequenceState(kv_idx, seq_idx, context);
         }
 
-        void clear_layer(int layer) override
+        bool resetLayerState(
+            int layer,
+            const typename IKVCache::StateResetContext &context) override
         {
+            if (!context.permitsLayerReset() ||
+                context.execution_stream || !context.hasReason())
+            {
+                return false;
+            }
             int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx >= 0)
             {
-                Base::clear_layer(kv_idx);
+                return Base::resetLayerState(kv_idx, context);
             }
-            else
+            int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
+            if (gdn_idx < 0 || gdn_idx >= static_cast<int>(gdn_states_.size()))
+                return false;
+            gdn_states_[gdn_idx].reset();
+            if (!gdn_states_[gdn_idx].resetGPUKernelState(nullptr))
             {
-                // Reset GDN state for this layer
-                int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
-                if (gdn_idx >= 0 && gdn_idx < static_cast<int>(gdn_states_.size()))
-                {
-                    gdn_states_[gdn_idx].reset();
-                    gdn_states_[gdn_idx].resetGPUKernelState();
-                }
+                return false;
             }
+            return true;
         }
 
         typename IKVCache::KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override

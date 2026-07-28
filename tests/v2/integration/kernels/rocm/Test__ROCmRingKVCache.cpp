@@ -938,21 +938,32 @@ TEST(Test__ROCmRingKVCache, Clear_FP32)
         }
     }
 
-    // Clear specific sequence
-    cache->clear_sequence(0, 1);                           // Layer 0, Seq 1
+    ScopedHipStream reset_stream;
+
+    // Reset one layer/sequence entry.
+    ASSERT_TRUE(cache->resetLayerSequenceState(
+        0,
+        1,
+        IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens); // Unchanged
     EXPECT_EQ(cache->get_cached_tokens(0, 1), 0);          // Cleared
     EXPECT_EQ(cache->get_cached_tokens(1, 0), num_tokens); // Unchanged
     EXPECT_EQ(cache->get_cached_tokens(1, 1), num_tokens); // Unchanged
 
     // Clear specific layer
-    cache->clear_layer(1);
+    ASSERT_TRUE(cache->resetLayerState(
+        1,
+        IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens); // Unchanged
     EXPECT_EQ(cache->get_cached_tokens(1, 0), 0);          // Cleared
     EXPECT_EQ(cache->get_cached_tokens(1, 1), 0);          // Cleared
 
     // Clear all
-    cache->clear();
+    ASSERT_TRUE(cache->resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
     for (int layer = 0; layer < n_layers; ++layer)
     {
         for (int seq = 0; seq < batch_size; ++seq)
@@ -1198,7 +1209,8 @@ TEST(Test__ROCmRingKVCache, GraphCapturedFP32ToFP16FusedAppendReplaysAfterClear)
     ASSERT_EQ(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), hipSuccess);
     ASSERT_NE(graph_exec, nullptr);
 
-    cache->clear();
+    ASSERT_TRUE(cache->resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
     ASSERT_TRUE(cache->bindGraphAppendCountSource(
         0, 0, nullptr, num_tokens, stream.opaque()));

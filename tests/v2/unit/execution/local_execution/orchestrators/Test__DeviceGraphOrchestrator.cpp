@@ -1478,7 +1478,7 @@ TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateAllocatesBuffers)
     EXPECT_NE(orchestrator->logits(), nullptr);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, ClearInferenceStateResetsPositions)
+TEST_F(Test__DeviceGraphOrchestrator, RequestBoundaryResetResetsPositions)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
@@ -1488,8 +1488,9 @@ TEST_F(Test__DeviceGraphOrchestrator, ClearInferenceStateResetsPositions)
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
-    // Clear state
-    orchestrator->clearInferenceState();
+    orchestrator->resetInferenceState(
+        InferenceStateResetRequest::requestBoundary(
+            "request-boundary-position-reset"));
 
     // Positions should be reset to 0
     EXPECT_EQ(orchestrator->getPosition(0), 0);
@@ -1701,7 +1702,7 @@ TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixRestoresHybridStateBanksForS
 
     const auto import_pos = source.find("bool importHybridPrefixPayload(");
     ASSERT_NE(import_pos, std::string::npos);
-    const auto reset_pos = source.find("void resetHybridPrefixPayloadState", import_pos);
+    const auto reset_pos = source.find("bool resetHybridPrefixPayloadState", import_pos);
     ASSERT_NE(reset_pos, std::string::npos);
     const std::string import_body = source.substr(import_pos, reset_pos - import_pos);
 
@@ -2107,7 +2108,7 @@ TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixPublishesLiveStateMutationBo
         populate_body.find("resetInferenceState(");
     const auto prefix_restore_boundary_pos =
         populate_body.find("prefixRestoreBoundary", typed_reset_pos);
-    const auto legacy_hard_reset_pos =
+    const auto obsolete_reset_alias_pos =
         populate_body.find("clearInferenceState();");
     const auto import_hybrid_pos =
         populate_body.find("importHybridPrefixPayload");
@@ -2130,8 +2131,8 @@ TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixPublishesLiveStateMutationBo
         << "Prefix restore without model-runtime bytes needs a dedicated graph-builder "
            "reset hook; resetState() is the request-boundary owner and may preserve "
            "graph-replay baseline state.";
-    EXPECT_EQ(legacy_hard_reset_pos, std::string::npos)
-        << "Prefix restore must not call the legacy clearInferenceState() junk-drawer reset.";
+    EXPECT_EQ(obsolete_reset_alias_pos, std::string::npos)
+        << "Prefix restore must not call an obsolete untyped reset alias.";
     ASSERT_NE(import_hybrid_pos, std::string::npos);
     ASSERT_NE(update_position_pos, std::string::npos);
     ASSERT_NE(mutation_boundary_pos, std::string::npos);

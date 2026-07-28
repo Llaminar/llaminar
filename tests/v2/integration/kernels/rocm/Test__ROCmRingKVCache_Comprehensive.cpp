@@ -30,6 +30,9 @@
 #include "kernels/rocm/kvcache/ROCmRingKVCache.h"
 #include "kernels/rocm/kvcache/ROCmRingKVCacheFactory.h"
 #include "kernels/IKVCache.h"
+#include "interfaces/IWorkspaceConsumer.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
 #include "utils/Logger.h"
@@ -103,6 +106,61 @@ namespace
         }
 
         void *opaque() const { return static_cast<void *>(stream); }
+    };
+
+    /**
+     * @brief Owns one setup-time ROCm workspace binding for a cache test.
+     *
+     * Wrapped ring reads linearize into graph-stable scratch. Production binds
+     * that scratch while constructing the graph, so tests which exercise the
+     * same path must establish the identical lifetime contract instead of
+     * relying on a hot-path allocation. The destructor unbinds the consumer
+     * before releasing the manager that owns the referenced device buffers.
+     */
+    class ScopedROCmWorkspaceBinding
+    {
+    public:
+        ScopedROCmWorkspaceBinding(
+            IWorkspaceConsumer &consumer,
+            int max_rows,
+            int batch_size,
+            int feature_size)
+            : consumer_(consumer)
+        {
+            const WorkspaceRequirements requirements =
+                consumer_.getWorkspaceRequirements(
+                    max_rows,
+                    batch_size,
+                    feature_size);
+            workspace_ = std::make_unique<DeviceWorkspaceManager>(
+                DeviceId::rocm(0),
+                requirements.total_bytes_with_alignment() + 4096);
+            if (!workspace_->allocate(requirements))
+            {
+                throw std::runtime_error(
+                    "Failed to allocate the ROCm KV cache test workspace");
+            }
+            consumer_.bindWorkspace(workspace_.get());
+            if (!consumer_.hasWorkspace())
+            {
+                throw std::runtime_error(
+                    "ROCm KV cache rejected its declared test workspace");
+            }
+        }
+
+        ~ScopedROCmWorkspaceBinding()
+        {
+            consumer_.unbindWorkspace();
+        }
+
+        ScopedROCmWorkspaceBinding(
+            const ScopedROCmWorkspaceBinding &) = delete;
+        ScopedROCmWorkspaceBinding &operator=(
+            const ScopedROCmWorkspaceBinding &) = delete;
+
+    private:
+        IWorkspaceConsumer &consumer_;
+        std::unique_ptr<DeviceWorkspaceManager> workspace_;
     };
 
 } // namespace
@@ -359,8 +417,14 @@ TEST(Test__ROCmRingKVCache_Comprehensive, MultiSeq_ClearOne_OtherUnaffected)
         for (int seq = 0; seq < batch_size; ++seq)
             cache->append(layer, seq, d_K.ptr, d_V.ptr, 10, 0);
 
-    // Clear sequence 1 in layer 0
-    cache->clear_sequence(0, 1);
+    ScopedHipStream reset_stream;
+
+    // Reset sequence 1 in layer 0.
+    ASSERT_TRUE(cache->resetLayerSequenceState(
+        0,
+        1,
+        IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(0, 1), 0);
 
     // Other sequences in same layer unaffected
@@ -430,6 +494,11 @@ TEST(Test__ROCmRingKVCache_Comprehensive, MultiWrap_StressTest)
     const int kv_dim = 2 * 16;
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         1, 1, max_seq, 2, 16, 0);
+    ScopedROCmWorkspaceBinding workspace(
+        *cache,
+        max_seq,
+        /*batch_size=*/1,
+        kv_dim);
 
     // Wrap around 5 complete times (40 tokens through an 8-slot buffer)
     std::vector<float> last_batch_K;
@@ -518,8 +587,9 @@ TEST(Test__ROCmRingKVCache_Comprehensive, IKVCache_PolymorphismCompliance)
     ASSERT_EQ(hipStreamSynchronize(stream.stream), hipSuccess);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 5);
 
-    // Clear via IKVCache
-    cache->clear();
+    // Reset via IKVCache on the same explicit stream as the append.
+    ASSERT_TRUE(cache->resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 }
 
@@ -579,6 +649,11 @@ TEST(Test__ROCmRingKVCache_Comprehensive, LinearizationCounter_TracksWraps)
     const int kv_dim = 2 * 16;
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         1, 1, max_seq, 2, 16, 0);
+    ScopedROCmWorkspaceBinding workspace(
+        *cache,
+        max_seq,
+        /*batch_size=*/1,
+        kv_dim);
 
     // Fill partially (not wrapped)
     auto h_data = generateRandomFP32((max_seq - 1) * kv_dim);
@@ -618,6 +693,11 @@ TEST(Test__ROCmRingKVCache_Comprehensive, Append_ExactCapacity_WrapsHeadPointer)
     const int kv_dim = 2 * 16;
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         1, 1, max_seq, 2, 16, 0);
+    ScopedROCmWorkspaceBinding workspace(
+        *cache,
+        max_seq,
+        /*batch_size=*/1,
+        kv_dim);
 
     auto h_K = generateRandomFP32(max_seq * kv_dim, 42);
     auto h_V = generateRandomFP32(max_seq * kv_dim, 43);

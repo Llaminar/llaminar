@@ -2386,17 +2386,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenRowSelectCachesTrackWo
               std::string::npos)
         << "clear_cache() must not preserve tiny terminal-hidden helper graphs after request-state teardown.";
 
-    const auto clear_inference_body = sliceBetween(
-        source,
-        "void DeviceGraphOrchestrator::clearInferenceState()",
-        "// =========================================================================\n"
-        "    // Private Helpers");
-    const auto clear_inference_executable =
-        stripCommentsAndStringLiterals(clear_inference_body);
-    EXPECT_NE(clear_inference_executable.find("mtp_terminal_hidden_row_select_cache_.invalidate()"),
-              std::string::npos);
-    EXPECT_NE(clear_inference_executable.find("mtp_terminal_hidden_rows_select_cache_.invalidate()"),
-              std::string::npos);
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPVerifierGDNStateSnapshotsUseDecodeEquivalentRows)
@@ -3017,15 +3006,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ClearCachePreservesReplaySafeMTPGraphCa
               std::string::npos);
     EXPECT_NE(record_reset_body.find("tags[\"kernel_dynamic_state\"]=\"reset\";"),
               std::string::npos)
-        << "Hard inference-state clears still need reset telemetry.";
-
-    const auto clear_inference_body = removeAsciiWhitespace(sliceBetween(
-        source,
-        "void DeviceGraphOrchestrator::clearInferenceState()",
-        "// ========================================================================="));
-    EXPECT_NE(clear_inference_body.find("recordLivePrefixSessionReset(\"clearInferenceState\")"),
-              std::string::npos)
-        << "clearInferenceState() is still a hard state reset.";
+        << "Typed non-preserving reset boundaries still need reset telemetry.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, PrefixRestoreWithoutModelRuntimeInvalidatesMTPSidecarGraphs)
@@ -3831,10 +3812,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         source,
         "bool DeviceGraphOrchestrator::prepareDeviceResidentMTPSpecPublicationMetadata(",
         "DeviceGraphOrchestrator::forwardReplayCacheObservations() const");
-    const auto clear_inference_body = sliceBetween(
-        source,
-        "void DeviceGraphOrchestrator::clearInferenceState()",
-        "} // namespace llaminar2");
+    const auto reset_inference_body = sliceBetween(
+        header,
+        "void resetInferenceState(const InferenceStateResetRequest &request) override",
+        "void clear_cache() override");
 
     const auto compact_restore = removeAsciiWhitespace(stripCommentsAndStringLiterals(restore_body));
     const auto compact_restore_with_labels = removeAsciiWhitespace(restore_body);
@@ -3865,8 +3846,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
     const auto compact_prepare_publication_metadata =
         removeAsciiWhitespace(
             stripCommentsAndStringLiterals(prepare_publication_metadata_body));
-    const auto compact_clear_inference =
-        removeAsciiWhitespace(stripCommentsAndStringLiterals(clear_inference_body));
+    const auto compact_reset_inference =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(reset_inference_body));
 
     EXPECT_NE(compact_header.find("PendingLivePrefixMutationReadyState"), std::string::npos);
     EXPECT_NE(compact_header.find("mutablePendingLivePrefixMutationReadyStatelive_prefix_mutation_ready_;"),
@@ -3931,10 +3912,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
                   "retireDeviceResidentMTPTransaction"),
               std::string::npos)
         << "Metadata preparation must preserve shifted-cache ownership through initial/suffix commits.";
-    EXPECT_NE(compact_clear_inference.find(
+    EXPECT_NE(compact_reset_inference.find(
                   "clearDeviceResidentLogicalSequenceStateMailbox()"),
               std::string::npos);
-    EXPECT_NE(compact_clear_inference.find(
+    EXPECT_NE(compact_reset_inference.find(
                   "retireDeviceResidentMTPTransaction()"),
               std::string::npos)
         << "Session teardown must retire the request-scoped transaction.";
@@ -6090,10 +6071,22 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
         header,
         "void resetInferenceState(const InferenceStateResetRequest &request) override",
         "void clear_cache() override");
+    const auto verifier_boundary_body = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "void DeviceGraphOrchestrator::clearMTPVerifierTransactionStateForBoundary(",
+            "void DeviceGraphOrchestrator::clearLivePrefixRestoreTransientHandoffs(")));
     EXPECT_NE(removeAsciiWhitespace(stripCommentsAndStringLiterals(reset_body))
                   .find("clearDeviceResidentLogicalSequenceStateMailbox();"),
               std::string::npos)
         << "Session resets must retire the event-fenced mailbox view.";
+    EXPECT_NE(
+        verifier_boundary_body.find(
+            "greedy_verifier_outcome_graph_transaction_={};"
+            "mtp_verifier_outcome_graph_mode_="
+            "MTPVerifierOutcomeGraphMode::Disabled;"),
+        std::string::npos)
+        << "The centralized verifier boundary must retire any armed graph-owned outcome transaction.";
 
     EXPECT_NE(source.find("device_resident_logical_state_workspace_rebind_survivals"),
               std::string::npos)
@@ -6107,15 +6100,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
     EXPECT_EQ(compact_workspace.find("logical_mailbox_before"),
               std::string::npos)
         << "A clearable mailbox view cannot be the publication-lifetime oracle.";
-
-    const auto clear_state_body = sliceBetween(
-        source,
-        "void DeviceGraphOrchestrator::clearInferenceState()",
-        "// =========================================================================");
-    EXPECT_NE(removeAsciiWhitespace(stripCommentsAndStringLiterals(clear_state_body))
-                  .find("clearDeviceResidentLogicalSequenceStateMailbox();"),
-              std::string::npos)
-        << "Inference-state resets must invalidate mailbox pointers into workspace buffers.";
 
     EXPECT_NE(compact_orchestration_header.find("currentDecodeTransactionPositionForPlanning("),
               std::string::npos)

@@ -17,7 +17,7 @@
  *  - Incremental decode (append-one, convert, repeat)
  *  - Multi-layer independence
  *  - Multi-sequence (batch) support
- *  - Shadow invalidation after clear / clear_sequence / clear_layer
+ *  - Shadow invalidation at request, sequence, and layer reset boundaries
  *  - Multiple complete ring wraps (stress)
  *  - Eviction + dequant correctness
  *  - Quantization error bounds (MSE, cosine similarity)
@@ -655,7 +655,8 @@ TEST_F(Test__CPURingKVCache_Q16_1, Clear_ThenReappend_ShadowReflectsNewData)
     EXPECT_EQ(len, 4);
 
     // Clear
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     EXPECT_EQ(cache.ring_size(0, 0), 0);
 
     // Re-append different data
@@ -696,7 +697,10 @@ TEST_F(Test__CPURingKVCache_Q16_1, ClearSequence_ShadowReflectsNewData)
     ASSERT_TRUE(cache.get_kv_converted(0, 1, ActivationPrecision::FP32, &k1, &v1, &len1));
 
     // Clear only seq 0
-    cache.clear_sequence(0, 0);
+    ASSERT_TRUE(cache.resetLayerSequenceState(
+        0,
+        0,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     EXPECT_EQ(cache.ring_size(0, 0), 0);
     EXPECT_EQ(cache.ring_size(0, 1), 3); // Untouched
 
@@ -742,7 +746,9 @@ TEST_F(Test__CPURingKVCache_Q16_1, ClearLayer_ShadowReflectsNewData)
     ASSERT_TRUE(cache.get_kv_converted(1, 0, ActivationPrecision::FP32, &k1, &v1, &len1));
 
     // Clear layer 0
-    cache.clear_layer(0);
+    ASSERT_TRUE(cache.resetLayerState(
+        0,
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
     EXPECT_EQ(cache.ring_size(0, 0), 0);
     EXPECT_EQ(cache.ring_size(1, 0), 3);
 

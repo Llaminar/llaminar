@@ -124,24 +124,6 @@ namespace llaminar2
         bool importLogicalBlock(const KVCacheLogicalBlockDescriptor &desc,
                                 const void *src_k, const void *src_v) override;
 
-        /**
-         * @brief Clear all TQ ring entries, scratch views, and device storage.
-         *
-         * The common ROCm base resets host ring metadata, but TQ owns compressed
-         * ring buffers and FP16 dequant scratch that can otherwise retain rows
-         * across request boundaries.
-         */
-        void clear() override;
-
-        /// @brief Clear one layer's TQ ring entries and per-layer scratch storage.
-        void clear_layer(int layer) override;
-
-        /// @brief Clear one sequence across all TQ cache layers.
-        void clear_sequence(int seq_idx) override;
-
-        /// @brief Clear one sequence entry and invalidate this layer's shared scratch.
-        void clear_sequence(int layer, int seq_idx) override;
-
         // Converted read (dequant + optional RoPE)
         bool get_kv_converted(int layer, int seq_idx,
                               ActivationPrecision target,
@@ -169,7 +151,7 @@ namespace llaminar2
         }
 
     protected:
-        void onClearSequence(int layer, int seq_idx) override
+        void onResetLayerSequenceState(int layer, int seq_idx) override
         {
             (void)seq_idx;
             layer_scratch_[layer].invalidate();
@@ -201,17 +183,8 @@ namespace llaminar2
             int layer, int seq_idx, float rope_theta, int position_start,
             int rope_dim, hipStream_t stream, int *out_count) const;
 
-        /// @brief Return the stream used for clear-time memset operations.
+        /// @brief Resolve the last explicit stream for diagnostic-only reads.
         hipStream_t clearStream() const;
-
-        /// @brief Zero the compressed TQ ring storage for one layer/sequence entry.
-        void clearEntryStorage(int layer, int seq_idx, hipStream_t stream);
-
-        /// @brief Zero and invalidate the FP16 dequant scratch owned by one layer.
-        void clearScratchStorage(int layer, hipStream_t stream);
-
-        /// @brief Reset graph-capture sidecar params for one layer/sequence entry.
-        void clearDynamicParams(int layer, int seq_idx, hipStream_t stream);
 
         size_t tq8_block_size_;
         size_t tq4_block_size_;

@@ -2,7 +2,7 @@
  * @file Test__CUDAHybridKVCacheReset.cpp
  * @brief Regression tests for CUDA hybrid KV/GDN cache reset semantics.
  *
- * Exercises clear() and clear_layer() on CUDA hybrid caches that compress
+ * Exercises explicit request/layer reset transactions on CUDA hybrid caches that compress
  * full-attention layers and keep GDN recurrence/short-conv GPU state in
  * cache-owned kernels. The tests compare reset cache outputs against a fresh
  * cache while asserting that reset preserves the kernel object identities.
@@ -536,7 +536,10 @@ TEST(Test__CUDAHybridKVCacheReset, ClearPreservesCacheAndGDNKernelObjectsButMatc
     EXPECT_EQ(cache.owner->get_cached_tokens(1, 0), 2);
     mutateGDNState(cache.hybrid, /*layer=*/0);
 
-    cache.owner->clear();
+    CudaStream reset_stream;
+    ASSERT_TRUE(cache.owner->resetRequestState(
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
 
     EXPECT_EQ(cache.owner->get_cached_tokens(1, 0), 0);
     EXPECT_EQ(cache.hybrid->getGDNState(0)->conv_kernel.get(), conv_ptr)
@@ -546,11 +549,11 @@ TEST(Test__CUDAHybridKVCacheReset, ClearPreservesCacheAndGDNKernelObjectsButMatc
 
     auto actual_conv = runConvDecode(cache.hybrid, /*layer=*/0, 3.0f);
     auto fresh_conv = runConvDecode(fresh.hybrid, /*layer=*/0, 3.0f);
-    expectNearVector(actual_conv, fresh_conv, 1e-5f, "conv output after clear vs fresh");
+    expectNearVector(actual_conv, fresh_conv, 1e-5f, "conv output after request reset vs fresh");
 
     auto actual_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 3.5f);
     auto fresh_rec = runRecurrenceDecode(fresh.hybrid, /*layer=*/0, 3.5f);
-    expectNearVector(actual_rec, fresh_rec, 1e-4f, "recurrence output after clear vs fresh");
+    expectNearVector(actual_rec, fresh_rec, 1e-4f, "recurrence output after request reset vs fresh");
 }
 
 TEST(Test__CUDAHybridKVCacheReset, ClearLayerResetsGDNGPUKernelState)
@@ -562,15 +565,19 @@ TEST(Test__CUDAHybridKVCacheReset, ClearLayerResetsGDNGPUKernelState)
     auto fresh = createHybridCache();
 
     mutateGDNState(cache.hybrid, /*layer=*/0);
-    cache.owner->clear_layer(/*layer=*/0);
+    CudaStream reset_stream;
+    ASSERT_TRUE(cache.owner->resetLayerState(
+        /*layer=*/0,
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
 
     auto actual_conv = runConvDecode(cache.hybrid, /*layer=*/0, 4.0f);
     auto fresh_conv = runConvDecode(fresh.hybrid, /*layer=*/0, 4.0f);
-    expectNearVector(actual_conv, fresh_conv, 1e-5f, "conv output after clear_layer vs fresh");
+    expectNearVector(actual_conv, fresh_conv, 1e-5f, "conv output after layer reset vs fresh");
 
     auto actual_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 4.5f);
     auto fresh_rec = runRecurrenceDecode(fresh.hybrid, /*layer=*/0, 4.5f);
-    expectNearVector(actual_rec, fresh_rec, 1e-4f, "recurrence output after clear_layer vs fresh");
+    expectNearVector(actual_rec, fresh_rec, 1e-4f, "recurrence output after layer reset vs fresh");
 }
 
 TEST(Test__CUDAHybridKVCacheReset, DevicePointerStateExportRoundTripRestoresGPUKernelState)
@@ -606,7 +613,9 @@ TEST(Test__CUDAHybridKVCacheReset, DevicePointerStateExportRoundTripRestoresGPUK
     ASSERT_TRUE(state->rec_kernel->exportState(nullptr, d_rec_snapshot.ptr, stream));
     checkCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize after device state export");
 
-    cache.owner->clear_layer(/*layer=*/0);
+    ASSERT_TRUE(cache.owner->resetLayerState(
+        /*layer=*/0,
+        llaminar2::IKVCache::StateResetContext::testReinitialization(stream)));
     ASSERT_TRUE(state->conv_kernel->importState(nullptr, d_conv_snapshot.ptr, stream));
     ASSERT_TRUE(state->rec_kernel->importState(nullptr, d_rec_snapshot.ptr, stream));
     checkCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize after device state import");
@@ -665,7 +674,9 @@ TEST(Test__CUDAHybridKVCacheReset, HybridPrefixStateRoundTripRestoresDeviceState
     const auto expected_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
     const auto expected_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
 
-    cache.owner->clear();
+    ASSERT_TRUE(cache.owner->resetRequestState(
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            stream.opaque())));
     EXPECT_EQ(cache.hybrid->getGDNState(0)->conv_kernel.get(), conv_ptr);
     EXPECT_EQ(cache.hybrid->getGDNState(0)->rec_kernel.get(), rec_ptr);
 
@@ -722,7 +733,9 @@ TEST(Test__CUDAHybridKVCacheReset, HostStagedHybridPrefixStateSerializesOnlyDevi
         staged_payload.end(),
         [](uint8_t value) { return value == 0xCD; }));
 
-    cache.owner->clear();
+    ASSERT_TRUE(cache.owner->resetRequestState(
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            stream.opaque())));
     ASSERT_TRUE(cache.hybrid->importHybridPrefixState(
         desc,
         staged_payload.data(),
@@ -778,7 +791,8 @@ TEST(Test__CUDAHybridKVCacheReset, AsyncDeviceOnlyHybridPrefixStateRoundTripRest
     const auto expected_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
     const auto expected_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
 
-    cache.owner->clear();
+    ASSERT_TRUE(cache.owner->resetRequestState(
+        llaminar2::IKVCache::StateResetContext::testReinitialization(stream)));
     ASSERT_TRUE(cache.hybrid->importHybridPrefixState(
         desc,
         nullptr,
@@ -835,7 +849,9 @@ TEST(Test__CUDAHybridKVCacheReset, HostStagedDeviceOnlyHybridPrefixStateRoundTri
     const auto expected_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
     const auto expected_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
 
-    cache.owner->clear();
+    ASSERT_TRUE(cache.owner->resetRequestState(
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            stream.opaque())));
     ASSERT_TRUE(cache.hybrid->importHybridPrefixState(
         desc,
         payload.data(),
@@ -981,10 +997,14 @@ TEST(Test__CUDAHybridKVCacheReset, ClearLayerResetsCompressedFullAttentionEntry)
     appendFullAttentionToken(cache.owner.get(), /*layer=*/1);
     ASSERT_EQ(cache.owner->get_cached_tokens(1, 0), 2);
 
-    cache.owner->clear_layer(/*layer=*/1);
+    CudaStream reset_stream;
+    ASSERT_TRUE(cache.owner->resetLayerState(
+        /*layer=*/1,
+        llaminar2::IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
 
     EXPECT_EQ(cache.owner->get_cached_tokens(1, 0), 0)
-        << "clear_layer(global FA layer) must reset the compressed parent-cache entry";
+        << "resetLayerState(global FA layer) must reset the compressed parent-cache entry";
 }
 
 TEST(Test__CUDAHybridKVCacheReset, DeviceSequenceMetadataPointersUseCompressedFullAttentionSlot)

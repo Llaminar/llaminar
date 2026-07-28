@@ -53,9 +53,17 @@ namespace llaminar2
             int cached_tokens,
             void *stream = nullptr) override;
 
-        void clear() override;
-        void clear_sequence(int layer, int seq_idx) override;
-        void clear_layer(int layer) override;
+        bool resetRequestState(const StateResetContext &context) override;
+        bool resetSequenceState(
+            int seq_idx,
+            const StateResetContext &context) override;
+        bool resetLayerSequenceState(
+            int layer,
+            int seq_idx,
+            const StateResetContext &context) override;
+        bool resetLayerState(
+            int layer,
+            const StateResetContext &context) override;
 
         // =====================================================================
         // Graph Capture Support (IKVCache overrides)
@@ -199,8 +207,8 @@ namespace llaminar2
         // Hooks for derived class behaviors
         // =====================================================================
 
-        /// Called after an entry is cleared (for scratch/shadow invalidation)
-        virtual void onClearSequence(int layer, int seq_idx) {}
+        /// Called after one entry becomes logically unreachable.
+        virtual void onResetLayerSequenceState(int layer, int seq_idx) {}
 
     };
 

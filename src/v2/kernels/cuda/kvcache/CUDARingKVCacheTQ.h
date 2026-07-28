@@ -177,24 +177,6 @@ namespace llaminar2
         bool importLogicalBlock(const KVCacheLogicalBlockDescriptor &desc,
                                 const void *src_k, const void *src_v) override;
 
-        /**
-         * @brief Clear all TQ ring entries, scratch views, and device storage.
-         *
-         * The common CUDA base resets host ring metadata, but TQ also owns
-         * compressed ring buffers and FP16 dequant scratch that must not carry
-         * request-local rows across prompt boundaries.
-         */
-        void clear() override;
-
-        /// @brief Clear one layer's TQ ring entries and per-layer scratch storage.
-        void clear_layer(int layer) override;
-
-        /// @brief Clear one sequence across all TQ cache layers.
-        void clear_sequence(int seq_idx) override;
-
-        /// @brief Clear one sequence entry and invalidate this layer's shared scratch.
-        void clear_sequence(int layer, int seq_idx) override;
-
         // Converted read (dequant + optional RoPE)
         bool get_kv_converted(int layer, int seq_idx,
                               ActivationPrecision target,
@@ -318,9 +300,11 @@ namespace llaminar2
 
         mutable cudaStream_t cached_stream_; ///< Last explicit stream used by append/read operations.
 
-        void onClearSequence(int layer, int seq_idx) override
+        void onResetLayerSequenceState(int layer, int seq_idx) override
         {
+            (void)seq_idx;
             layer_scratch_[layer].invalidate();
+            cached_stream_ = nullptr;
         }
 
         // Helpers
@@ -344,17 +328,8 @@ namespace llaminar2
          */
         bool publishBatchedEntryTables(cudaStream_t stream);
 
-        /// @brief Return the stream used for clear-time memset operations.
+        /// @brief Resolve the last explicit stream for diagnostic-only reads.
         cudaStream_t clearStream() const;
-
-        /// @brief Zero the compressed TQ ring storage for one layer/sequence entry.
-        void clearEntryStorage(int layer, int seq_idx, cudaStream_t stream);
-
-        /// @brief Zero and invalidate the FP16 dequant scratch owned by one layer.
-        void clearScratchStorage(int layer, cudaStream_t stream);
-
-        /// @brief Reset graph-capture sidecar params for one layer/sequence entry.
-        void clearDynamicParams(int layer, int seq_idx, cudaStream_t stream);
 
         /**
          * @brief Materialize one scalar diagnostic view from canonical device state.

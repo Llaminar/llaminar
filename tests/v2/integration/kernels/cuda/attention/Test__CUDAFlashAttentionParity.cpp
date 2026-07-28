@@ -380,19 +380,31 @@ namespace
                 read);
         }
 
-        void clear() override
+        bool resetRequestState(const StateResetContext &context) override
         {
-            delegate_.clear();
+            return delegate_.resetRequestState(context);
         }
 
-        void clear_sequence(int layer, int seq_idx) override
+        bool resetSequenceState(
+            int seq_idx,
+            const StateResetContext &context) override
         {
-            delegate_.clear_sequence(layer, seq_idx);
+            return delegate_.resetSequenceState(seq_idx, context);
         }
 
-        void clear_layer(int layer) override
+        bool resetLayerSequenceState(
+            int layer,
+            int seq_idx,
+            const StateResetContext &context) override
         {
-            delegate_.clear_layer(layer);
+            return delegate_.resetLayerSequenceState(layer, seq_idx, context);
+        }
+
+        bool resetLayerState(
+            int layer,
+            const StateResetContext &context) override
+        {
+            return delegate_.resetLayerState(layer, context);
         }
 
         bool is_sharded() const override
@@ -4043,7 +4055,8 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedGrowingRequestBatchFP16CacheMatch
      * metadata, graph nodes that retain a pre-reset sequence head, and gathers
      * that accidentally publish only the current append block.
      */
-    kv_cache->clear();
+    ASSERT_TRUE(kv_cache->resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(stream)));
     EXPECT_EQ(kv_cache->get_cached_tokens(0, 0), 0);
     EXPECT_EQ(kv_cache->get_cached_tokens(0, 1), 0);
     ASSERT_TRUE(upload_graph_block(q_host, k_fp16, v_fp16));

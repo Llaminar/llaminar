@@ -140,7 +140,6 @@ namespace llaminar2
         // Bring in convenience overloads from IKVCache
         using IKVCache::append;
         using IKVCache::appendWithStream;
-        using IKVCache::clear_sequence;
         using IKVCache::get_kv;
 
         // =====================================================================
@@ -434,15 +433,6 @@ namespace llaminar2
 
         ActivationPrecision k_precision() const override { return Precision; }
 
-        /**
-         * @brief Reset ring metadata and scrub persistent device buffers.
-         *
-         * ROCm decode graph reuse keeps the KV cache object alive across chat
-         * requests. The cache clears canonical device metadata together with
-         * persistent K/V and scratch storage at request boundaries.
-         */
-        void clear() override;
-
         // ITensor Access (IKVCache interface via get_k/get_v)
         ITensor *get_k(int layer, int seq_idx = 0) override;
         const ITensor *get_k(int layer, int seq_idx = 0) const override;
@@ -514,7 +504,6 @@ namespace llaminar2
 
         // Bring in IROCmRingKVCache overloads to avoid hiding
         using IROCmRingKVCache::append;
-        using IROCmRingKVCache::clear_sequence;
         using IROCmRingKVCache::gather_kv_batched;
 
         // =====================================================================
@@ -638,7 +627,7 @@ namespace llaminar2
         IWorkerGPUContext *deviceContext() const { return device_ctx_; }
 
     protected:
-        void onClearSequence(int layer, int seq_idx) override
+        void onResetLayerSequenceState(int layer, int seq_idx) override
         {
             invalidateRoPEShadow(layer, seq_idx);
         }

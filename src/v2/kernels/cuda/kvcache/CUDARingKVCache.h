@@ -141,7 +141,6 @@ namespace llaminar2
         // Bring in convenience overloads from IKVCache
         using IKVCache::append;
         using IKVCache::appendWithStream;
-        using IKVCache::clear_sequence;
         using IKVCache::get_kv;
 
         // =====================================================================
@@ -429,16 +428,6 @@ namespace llaminar2
 
         ActivationPrecision k_precision() const override { return Precision; }
 
-        /**
-         * @brief Reset ring metadata and request-scoped CUDA sidecar buffers.
-         *
-         * Clears canonical device head/count rows, conversion scratch, RoPE
-         * shadow views, tensor wrappers, and persistent K/V storage. This preserves the
-         * same empty-cache invariant as reconstructing the cache while keeping
-         * stable device pointers for cached compute graphs.
-         */
-        void clear() override;
-
         // ITensor Access (IKVCache interface via get_k/get_v)
         ITensor *get_k(int layer, int seq_idx = 0) override;
         const ITensor *get_k(int layer, int seq_idx = 0) const override;
@@ -504,7 +493,6 @@ namespace llaminar2
 
         // Bring in IKVCache overloads to avoid hiding
         using ICUDARingKVCache::append;
-        using ICUDARingKVCache::clear_sequence;
         using ICUDARingKVCache::gather_kv_batched;
 
         // =====================================================================
@@ -729,7 +717,7 @@ namespace llaminar2
             DataT *d_v_out,
             cudaStream_t stream);
 
-        void onClearSequence(int layer, int seq_idx) override
+        void onResetLayerSequenceState(int layer, int seq_idx) override
         {
             invalidateRoPEShadow(layer, seq_idx);
         }
