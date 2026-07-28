@@ -3633,6 +3633,45 @@ namespace llaminar2
             const char *consumer_name);
 
         /**
+         * @brief Preallocate every event used by the resident GPU MTP timeline.
+         *
+         * The resident verifier transaction records readiness many times per
+         * generated token. Creating CUDA/HIP events at those publication sites
+         * is both an allocation in the decode hot path and an ambiguous lifetime
+         * boundary. This initializer runs after the fixed MTP row capacities are
+         * known and creates all sample, verifier, publication, transaction,
+         * logical-state, response, and profiling events up front.
+         *
+         * @return true when CPU execution needs no events or every GPU event
+         *         required by the configured MTP capacity was created.
+         */
+        bool initializePersistentMTPDeviceEvents();
+
+        /**
+         * @brief Borrow one preallocated response-ready event for an outcome handle.
+         *
+         * Outcome handles may overlap the next transaction fence while the host
+         * response bridge drains the previous compact row. The fixed pool makes
+         * that overlap explicit. Exhaustion is a fatal lifecycle error for the
+         * current operation; the caller must never allocate a replacement.
+         */
+        std::shared_ptr<void> acquirePersistentMTPOutcomeReadyEvent(
+            const char *consumer_name);
+
+        /**
+         * @brief Borrow one preallocated start/stop timing pair.
+         *
+         * Timing events are optional when perfstats are disabled. When perfstats
+         * are enabled, pool exhaustion means the configured transaction has more
+         * concurrent measurements than its declared row capacity and must fail
+         * loudly instead of allocating or silently dropping evidence.
+         */
+        bool acquirePersistentMTPGpuTimingEvents(
+            const char *measurement_name,
+            std::shared_ptr<void> *out_start_event,
+            std::shared_ptr<void> *out_stop_event);
+
+        /**
          * @brief Allocate the reusable shifted-MTP-KV completion event.
          *
          * KV-only sidecars publish this event on both first-use execution and
@@ -5720,6 +5759,20 @@ namespace llaminar2
             bool all_position_logits = false;
         };
 
+        /**
+         * @brief One fixed profiler-event pair owned for the runner lifetime.
+         *
+         * A pair is available when both owners have a reference count of one;
+         * borrowers receive ordinary shared owners that travel with pending
+         * measurements or compact outcome handles. No mutex is required because
+         * one DeviceGraphOrchestrator is scheduled by one rank-control thread.
+         */
+        struct PersistentGpuTimingEventPair
+        {
+            std::shared_ptr<void> start_event;
+            std::shared_ptr<void> stop_event;
+        };
+
         std::vector<StochasticSampleReadyState> stochastic_target_sample_ready_;
         std::vector<StochasticSampleReadyState> stochastic_draft_sample_ready_;
         PendingShiftedMTPKVReadyState shifted_mtp_kv_ready_;
@@ -5736,6 +5789,14 @@ namespace llaminar2
         PendingRequestInputReuseReadyState
             request_input_reuse_ready_;
         ForwardGraphOutputReadyState forward_graph_output_ready_;
+        std::shared_ptr<void>
+            device_resident_mtp_transaction_ready_event_;
+        std::shared_ptr<void>
+            device_resident_logical_sequence_state_ready_event_;
+        std::vector<std::shared_ptr<void>>
+            mtp_outcome_response_ready_event_pool_;
+        std::vector<PersistentGpuTimingEventPair>
+            mtp_gpu_timing_event_pool_;
 
         /**
          * @brief Retire cache payload owners whose restore event has completed.
@@ -6474,14 +6535,12 @@ namespace llaminar2
          * @param request_count Number of active request entries in each count row.
          * @param producer_stream Explicit stream that completed all cache publications.
          * @param producer_name Stable diagnostic label for perfstats.
-         * @param ready_event Optional already-recorded event on @p producer_stream.
          * @return true after the transaction fence has been advanced.
          */
         bool recordDeviceResidentMTPTransactionMutation(
             int request_count,
             void *producer_stream,
-            const char *producer_name,
-            std::shared_ptr<void> ready_event = {});
+            const char *producer_name);
 
         /**
          * @brief Advance the persistent transaction after GPU state restore.

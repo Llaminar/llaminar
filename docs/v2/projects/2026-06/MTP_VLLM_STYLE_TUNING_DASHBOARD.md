@@ -33,7 +33,14 @@ Dynamic PhaseSplit and focused graph/ROCm all-format proofs are green.
 2026-07-27: CUDA decode dispatch is phase-invariant: eager graph warmup uses the
 captured policy, closing M3/M4 one-ULP drift. All-format, real GDN-weight, and
 Dense/MoE M1-M4 operation-equivalence gates pass.
-Architecture estimate: LocalTP 98%, ExpertParallel 80%.
+
+2026-07-28: resident-MTP timeline, transaction, compact-response, and PerfStats
+timing events are setup-owned; source policy forbids event create/destroy in 11
+hot paths. CUDA/ROCm sampling and Qwen3.6 stochastic full-graph smokes pass;
+unit gate `582/582`. Tests now distinguish compact grouped device publication
+from legacy catch-up replay. Architecture estimate: LocalTP 92%,
+ExpertParallel 88%; graph-native LocalTP outcome broadcast and the full
+E2E/economy matrix remain.
 
 ## Device And Topology Matrix
 
@@ -102,10 +109,3 @@ MoE depth sweep:
 5. Prefer grouped/concurrent decode-equivalent kernels over serial row replay.
 6. After each concrete win: run strict parity, refresh tok/s, update
    this dashboard, and make a WiP commit.
-
-## Related DFlash Proposer
-
-2026-07-18: Qwen 3.6 DFlash is research-complete and implementation-pending
-(`R`); see
-[`QWEN36_DFLASH_ACCELERATION_PROJECT_PLAN.md`](../2026-07/QWEN36_DFLASH_ACCELERATION_PROJECT_PLAN.md).
-It reuses the grouped `M<=16` and accepted-only state-publication proofs.

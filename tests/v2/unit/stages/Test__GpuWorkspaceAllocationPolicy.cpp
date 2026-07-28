@@ -4474,7 +4474,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, StochasticOutcomeHostBridgeWaitsOnRespo
               std::string::npos)
         << "The response-only materializer should delegate directly to the "
            "low-level compact D2H hook, not through a host-plan adapter.";
-    EXPECT_NE(compact_verify.find("backend->createEvent("),
+    EXPECT_NE(compact_verify.find(
+                  "acquirePersistentMTPOutcomeReadyEvent("),
+              std::string::npos)
+        << "The verifier must borrow a setup-owned response event instead of "
+           "allocating backend resources during decode.";
+    EXPECT_EQ(compact_verify.find("backend->createEvent("),
+              std::string::npos);
+    EXPECT_EQ(compact_verify.find("backend->createTimingEvent("),
+              std::string::npos);
+    EXPECT_EQ(compact_verify.find("backend->destroyEvent("),
               std::string::npos);
     EXPECT_NE(compact_verify.find(
                   "DeviceEventEdge::at(DeviceTimelinePoint::CompactSpeculativeResponseReady).from(DeviceTimelineRole::VerifierSummary).publish(*backend,state_.device_id,response_ready_event.get(),stream)"),
@@ -4517,6 +4526,105 @@ TEST(Test__GpuWorkspaceAllocationPolicy, StochasticOutcomeHostBridgeWaitsOnRespo
     EXPECT_EQ(compact_bridge.find("backend->synchronizeStream(handle.stream"),
               std::string::npos)
         << "Synchronizing the producer stream reintroduces a publication D2H barrier.";
+}
+
+/**
+ * @brief Forbids backend event allocation from every resident-MTP hot path.
+ *
+ * Events are durable execution-graph edges, not per-token scratch objects.
+ * Setup preallocates fixed readiness events and bounded response/timing pools;
+ * decode may only record or wait on those owners. Keeping the complete method
+ * list here makes a newly introduced event allocation fail the source policy
+ * gate before it can become an intermittent graph-capture or latency defect.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy, ResidentMTPHotPathsUseOnlyPreallocatedEvents)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto initialization_body = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "bool DeviceGraphOrchestrator::initializePersistentMTPDeviceEvents()",
+            "DeviceGraphOrchestrator::acquirePersistentMTPOutcomeReadyEvent(")));
+
+    EXPECT_NE(initialization_body.find("allocatePersistentDeviceEvent("),
+              std::string::npos)
+        << "Persistent MTP readiness and response events must be allocated at setup.";
+    EXPECT_NE(initialization_body.find("allocatePersistentDeviceTimingEvent("),
+              std::string::npos)
+        << "Persistent MTP PerfStats events must be allocated at setup.";
+
+    const std::array<std::tuple<const char *, const char *, const char *>, 11>
+        hot_paths = {{
+            {
+                "bool DeviceGraphOrchestrator::recordDeviceResidentMTPTransactionMutation(",
+                "bool DeviceGraphOrchestrator::recordRestoredDeviceResidentMTPTransaction(",
+                "resident MTP transaction publication",
+            },
+            {
+                "bool DeviceGraphOrchestrator::recordDeviceResidentLogicalSequenceStateMailbox(",
+                "bool DeviceGraphOrchestrator::waitForDeviceResidentLogicalSequenceStateMailbox(",
+                "resident logical-state publication",
+            },
+            {
+                "bool DeviceGraphOrchestrator::retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation(",
+                "bool DeviceGraphOrchestrator::supportsDeviceResidentMTPSpecStatePublication() const",
+                "resident logical-state retarget",
+            },
+            {
+                "bool DeviceGraphOrchestrator::recordStochasticDraftSampleReady(",
+                "bool DeviceGraphOrchestrator::recordStochasticTargetSampleReady(",
+                "draft sample publication",
+            },
+            {
+                "bool DeviceGraphOrchestrator::recordStochasticTargetSampleReady(",
+                "bool DeviceGraphOrchestrator::beginPendingGpuTimingMeasurement(",
+                "target sample publication",
+            },
+            {
+                "bool DeviceGraphOrchestrator::beginPendingGpuTimingMeasurement(",
+                "void DeviceGraphOrchestrator::finishPendingGpuTimingMeasurement(",
+                "deferred GPU timing publication",
+            },
+            {
+                "bool DeviceGraphOrchestrator::recordAllPositionVerifierStateReady(",
+                "bool DeviceGraphOrchestrator::waitForPendingAllPositionVerifierStateReady(",
+                "all-position verifier publication",
+            },
+            {
+                "bool DeviceGraphOrchestrator::recordAcceptedSpecPublicationReady(",
+                "bool DeviceGraphOrchestrator::waitForPendingAcceptedSpecPublicationReady(",
+                "accepted-state publication",
+            },
+            {
+                "bool DeviceGraphOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDeviceResident(",
+                "bool DeviceGraphOrchestrator::verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(",
+                "single-request greedy compact outcome",
+            },
+            {
+                "bool DeviceGraphOrchestrator::verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(",
+                "bool DeviceGraphOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDevice(",
+                "request-batch greedy compact outcome",
+            },
+            {
+                "bool DeviceGraphOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(",
+                "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost(",
+                "request-batch stochastic compact outcome",
+            },
+        }};
+
+    for (const auto &[begin_marker, end_marker, label] : hot_paths)
+    {
+        const auto body = removeAsciiWhitespace(
+            stripCommentsAndStringLiterals(
+                sliceBetween(source, begin_marker, end_marker)));
+        EXPECT_EQ(body.find("createEvent("), std::string::npos)
+            << label << " must not allocate an event";
+        EXPECT_EQ(body.find("createTimingEvent("), std::string::npos)
+            << label << " must not allocate a timing event";
+        EXPECT_EQ(body.find("destroyEvent("), std::string::npos)
+            << label << " must not retire backend event resources";
+    }
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuietlyFallback)
@@ -5516,7 +5624,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
 
     EXPECT_NE(compact_record.find("!producer_stream"), std::string::npos)
         << "The mailbox must preserve explicit stream ownership.";
-    EXPECT_NE(compact_record.find("backend->createEvent("),
+    EXPECT_EQ(compact_record.find("backend->createEvent("),
+              std::string::npos)
+        << "Logical-state publication is a decode hot path and must use its "
+           "setup-owned readiness event.";
+    EXPECT_NE(compact_record.find(
+                  "device_resident_logical_sequence_state_ready_event_"),
               std::string::npos);
     EXPECT_NE(compact_record.find("backend->recordEvent("),
               std::string::npos)
@@ -5545,7 +5658,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
               std::string::npos);
     EXPECT_EQ(compact_record.find("ptrs."), std::string::npos)
         << "Mailbox publication must be incapable of retaining a reallocatable workspace pointer.";
-    EXPECT_NE(compact_record.find("mailbox.ready_event=std::move(ready_event)"),
+    EXPECT_NE(compact_record.find(
+                  "mailbox.ready_event=device_resident_logical_sequence_state_ready_event_"),
               std::string::npos);
     EXPECT_NE(compact_record.find("mailbox.live_state_epoch=live_replay_state_epoch_"),
               std::string::npos);

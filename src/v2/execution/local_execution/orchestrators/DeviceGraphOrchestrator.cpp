@@ -2168,6 +2168,35 @@ namespace llaminar2
                 });
         }
 
+        /**
+         * @brief Create one reusable backend timing event during initialization.
+         *
+         * Timing-capable events are deliberately separate from ordinary timeline
+         * events because CUDA and HIP may allocate different backend resources
+         * for elapsed-time recording. Callers retain the shared owner for the
+         * complete runner lifetime and only borrow additional references while a
+         * measurement is pending.
+         */
+        std::shared_ptr<void> allocatePersistentDeviceTimingEvent(DeviceId device)
+        {
+            if (!device.is_gpu())
+                return nullptr;
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
+                return nullptr;
+            const int ordinal = device.gpu_ordinal();
+            void *event = backend->createTimingEvent(ordinal);
+            if (!event)
+                return nullptr;
+            return std::shared_ptr<void>(
+                event,
+                [backend, ordinal](void *value)
+                {
+                    if (value)
+                        backend->destroyEvent(value, ordinal);
+                });
+        }
+
         bool exportMTPPrefixPayload(const IKVCache &mtp_cache,
                                     int seq_idx,
                                     const PrefixCacheKey &key,
@@ -4855,7 +4884,7 @@ namespace llaminar2
         if (state_.device_id.is_gpu() &&
             config.mtp.enabled &&
             (!initializeMTPPrefillTerminalArchiveReadyEvent() ||
-             !initializeShiftedMTPKVReadyEvent()))
+             !initializePersistentMTPDeviceEvents()))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize persistent MTP stream-handoff events");
             return false;
@@ -16046,8 +16075,7 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::recordDeviceResidentMTPTransactionMutation(
         int request_count,
         void *producer_stream,
-        const char *producer_name,
-        std::shared_ptr<void> ready_event)
+        const char *producer_name)
     {
         if (!state_.device_id.is_gpu())
             return true;
@@ -16095,31 +16123,21 @@ namespace llaminar2
         if (!backend)
             return false;
 
-        if (!ready_event)
+        if (!device_resident_mtp_transaction_ready_event_)
         {
-            void *raw_event =
-                backend->createEvent(state_.device_id.gpu_ordinal());
-            if (!raw_event)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create device MTP transaction event");
-                return false;
-            }
-            const int device_ordinal = state_.device_id.gpu_ordinal();
-            ready_event.reset(
-                raw_event,
-                [backend, device_ordinal](void *event)
-                {
-                    if (event)
-                        backend->destroyEvent(event, device_ordinal);
-                });
-            if (!backend->recordEvent(
-                    ready_event.get(),
-                    device_ordinal,
-                    producer_stream))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to record device MTP transaction event");
-                return false;
-            }
+            LOG_ERROR("[DeviceGraphOrchestrator] Device MTP transaction event was not preallocated"
+                      << " producer=" << owner_name);
+            return false;
+        }
+        const int device_ordinal = state_.device_id.gpu_ordinal();
+        if (!backend->recordEvent(
+                device_resident_mtp_transaction_ready_event_.get(),
+                device_ordinal,
+                producer_stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to record device MTP transaction event"
+                      << " producer=" << owner_name);
+            return false;
         }
 
         const bool owns_current_session =
@@ -16143,7 +16161,8 @@ namespace llaminar2
 
         auto &transaction = *device_resident_mtp_transaction_;
         transaction.producer_stream = producer_stream;
-        transaction.ready_event = std::move(ready_event);
+        transaction.ready_event =
+            device_resident_mtp_transaction_ready_event_;
         ++transaction.mutation_generation;
 
         PerfStatsCollector::addCounter(
@@ -16659,23 +16678,18 @@ namespace llaminar2
             return false;
         }
 
-        void *raw_event = backend->createEvent(state_.device_id.gpu_ordinal());
-        if (!raw_event)
+        if (!device_resident_logical_sequence_state_ready_event_)
         {
             if (error)
-                *error = "device logical-state mailbox could not create readiness event";
+            {
+                *error =
+                    "device logical-state mailbox readiness event was not "
+                    "preallocated";
+            }
             return false;
         }
-        const int device_ordinal = state_.device_id.gpu_ordinal();
-        std::shared_ptr<void> ready_event(
-            raw_event,
-            [backend, device_ordinal](void *event)
-            {
-                if (event)
-                    backend->destroyEvent(event, device_ordinal);
-            });
         if (!backend->recordEvent(
-                ready_event.get(),
+                device_resident_logical_sequence_state_ready_event_.get(),
                 state_.device_id.gpu_ordinal(),
                 producer_stream))
         {
@@ -16708,7 +16722,8 @@ namespace llaminar2
             device_resident_logical_sequence_state_storage_
                 .publication_ok_flags_device;
         mailbox.producer_stream = producer_stream;
-        mailbox.ready_event = std::move(ready_event);
+        mailbox.ready_event =
+            device_resident_logical_sequence_state_ready_event_;
         mailbox.live_state_epoch = live_replay_state_epoch_;
         if (!mailbox.valid())
         {
@@ -16904,22 +16919,13 @@ namespace llaminar2
             return false;
         }
 
-        void *raw_event = backend->createEvent(state_.device_id.gpu_ordinal());
-        if (!raw_event)
+        if (!device_resident_logical_sequence_state_ready_event_)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox retarget could not create readiness event");
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox retarget has no preallocated readiness event");
             return false;
         }
-        const int device_ordinal = state_.device_id.gpu_ordinal();
-        std::shared_ptr<void> ready_event(
-            raw_event,
-            [backend, device_ordinal](void *event)
-            {
-                if (event)
-                    backend->destroyEvent(event, device_ordinal);
-            });
         if (!backend->recordEvent(
-                ready_event.get(),
+                device_resident_logical_sequence_state_ready_event_.get(),
                 state_.device_id.gpu_ordinal(),
                 producer_stream))
         {
@@ -16928,7 +16934,8 @@ namespace llaminar2
         }
 
         mailbox.producer_stream = producer_stream;
-        mailbox.ready_event = std::move(ready_event);
+        mailbox.ready_event =
+            device_resident_logical_sequence_state_ready_event_;
         mailbox.live_state_epoch = live_replay_state_epoch_;
 
         PerfStatsCollector::addCounter(
@@ -20026,20 +20033,9 @@ namespace llaminar2
         auto &ready = stochastic_draft_sample_ready_[static_cast<size_t>(slot)];
         if (!ready.event)
         {
-            void *raw_event = backend->createEvent(state_.device_id.gpu_ordinal());
-            if (!raw_event)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create deferred draft sample event");
-                return false;
-            }
-            const int device_ordinal = state_.device_id.gpu_ordinal();
-            ready.event = std::shared_ptr<void>(
-                raw_event,
-                [backend, device_ordinal](void *event)
-                {
-                    if (event)
-                        backend->destroyEvent(event, device_ordinal);
-                });
+            LOG_ERROR("[DeviceGraphOrchestrator] Deferred draft sample event was not preallocated for slot="
+                      << slot);
+            return false;
         }
 
         if (!backend->recordEvent(
@@ -20093,20 +20089,9 @@ namespace llaminar2
         auto &ready = stochastic_target_sample_ready_[static_cast<size_t>(slot)];
         if (!ready.event)
         {
-            void *raw_event = backend->createEvent(state_.device_id.gpu_ordinal());
-            if (!raw_event)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create deferred target sample event");
-                return false;
-            }
-            const int device_ordinal = state_.device_id.gpu_ordinal();
-            ready.event = std::shared_ptr<void>(
-                raw_event,
-                [backend, device_ordinal](void *event)
-                {
-                    if (event)
-                        backend->destroyEvent(event, device_ordinal);
-                });
+            LOG_ERROR("[DeviceGraphOrchestrator] Deferred target sample event was not preallocated for slot="
+                      << slot);
+            return false;
         }
 
         if (!backend->recordEvent(
@@ -20153,15 +20138,11 @@ namespace llaminar2
         if (!backend)
             return false;
 
-        const int device_ordinal = state_.device_id.gpu_ordinal();
-        void *raw_start = backend->createTimingEvent(device_ordinal);
-        void *raw_stop = backend->createTimingEvent(device_ordinal);
-        if (!raw_start || !raw_stop)
+        if (!acquirePersistentMTPGpuTimingEvents(
+                name.c_str(),
+                out_start_event,
+                out_stop_event))
         {
-            if (raw_start)
-                backend->destroyEvent(raw_start, device_ordinal);
-            if (raw_stop)
-                backend->destroyEvent(raw_stop, device_ordinal);
             PerfStatsCollector::addCounter(
                 "mtp",
                 "pending_gpu_timing_event_failures",
@@ -20169,18 +20150,14 @@ namespace llaminar2
                 "decode",
                 state_.device_id.toString(),
                 {{"name", name}});
-            return true;
+            return false;
         }
 
-        auto event_deleter =
-            [backend, device_ordinal](void *event)
-        {
-            if (event)
-                backend->destroyEvent(event, device_ordinal);
-        };
-        std::shared_ptr<void> start(raw_start, event_deleter);
-        std::shared_ptr<void> stop(raw_stop, event_deleter);
-        if (!backend->recordEvent(start.get(), device_ordinal, stream))
+        const int device_ordinal = state_.device_id.gpu_ordinal();
+        if (!backend->recordEvent(
+                out_start_event->get(),
+                device_ordinal,
+                stream))
         {
             PerfStatsCollector::addCounter(
                 "mtp",
@@ -20189,11 +20166,11 @@ namespace llaminar2
                 "decode",
                 state_.device_id.toString(),
                 {{"name", name}, {"event", "start"}});
-            return true;
+            out_start_event->reset();
+            out_stop_event->reset();
+            return false;
         }
 
-        *out_start_event = std::move(start);
-        *out_stop_event = std::move(stop);
         return true;
     }
 
@@ -20509,6 +20486,197 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::initializePersistentMTPDeviceEvents()
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+
+        auto fail = [&](const std::string &event_name) -> bool
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to preallocate persistent MTP event '"
+                      << event_name << "' for "
+                      << state_.device_id.toString());
+            return false;
+        };
+        auto ensure_event =
+            [&](std::shared_ptr<void> &event,
+                const std::string &event_name) -> bool
+        {
+            if (!event)
+                event = allocatePersistentDeviceEvent(state_.device_id);
+            return event ? true : fail(event_name);
+        };
+
+        /*
+         * Sample slots are addressed directly by the verifier graph plan. Give
+         * every slot a fixed event now so deferred draft/target publication can
+         * never acquire backend resources while decode is active.
+         */
+        for (size_t slot = 0;
+             slot < stochastic_target_sample_ready_.size();
+             ++slot)
+        {
+            if (!ensure_event(
+                    stochastic_target_sample_ready_[slot].event,
+                    "stochastic_target_sample_" + std::to_string(slot)))
+            {
+                return false;
+            }
+        }
+        for (size_t slot = 0;
+             slot < stochastic_draft_sample_ready_.size();
+             ++slot)
+        {
+            if (!ensure_event(
+                    stochastic_draft_sample_ready_[slot].event,
+                    "stochastic_draft_sample_" + std::to_string(slot)))
+            {
+                return false;
+            }
+        }
+
+        if (!initializeShiftedMTPKVReadyEvent() ||
+            !ensure_event(
+                all_position_verifier_state_ready_.event,
+                "all_position_verifier_state") ||
+            !ensure_event(
+                accepted_spec_publication_ready_.event,
+                "accepted_spec_publication") ||
+            !ensure_event(
+                device_resident_mtp_transaction_ready_event_,
+                "device_resident_transaction") ||
+            !ensure_event(
+                device_resident_logical_sequence_state_ready_event_,
+                "device_resident_logical_state"))
+        {
+            return false;
+        }
+
+        /*
+         * The response bridge can still hold the previous compact outcome while
+         * the next transaction begins. Three fixed slots cover that overlap and
+         * leave one diagnostic observer without making the steady-state path
+         * depend on event allocation.
+         */
+        constexpr size_t kOutcomeReadyEventPoolSize = 3;
+        if (mtp_outcome_response_ready_event_pool_.empty())
+        {
+            mtp_outcome_response_ready_event_pool_.reserve(
+                kOutcomeReadyEventPoolSize);
+            for (size_t slot = 0;
+                 slot < kOutcomeReadyEventPoolSize;
+                 ++slot)
+            {
+                auto event =
+                    allocatePersistentDeviceEvent(state_.device_id);
+                if (!event)
+                    return fail(
+                        "compact_outcome_response_" +
+                        std::to_string(slot));
+                mtp_outcome_response_ready_event_pool_.push_back(
+                    std::move(event));
+            }
+        }
+
+        /*
+         * At most one measurement can be pending for each target/draft row
+         * producer before the compact response boundary drains perfstats.
+         * Extra pairs cover the verifier summary, publication, and diagnostics.
+         * The capacity derives from the configured graph shape rather than an
+         * arbitrary runtime growth policy.
+         */
+        if (PerfStatsCollector::isEnabled() &&
+            mtp_gpu_timing_event_pool_.empty())
+        {
+            const size_t timing_pair_capacity =
+                std::max<size_t>(
+                    8,
+                    stochastic_target_sample_ready_.size() +
+                        stochastic_draft_sample_ready_.size() +
+                        4);
+            mtp_gpu_timing_event_pool_.reserve(timing_pair_capacity);
+            for (size_t slot = 0;
+                 slot < timing_pair_capacity;
+                 ++slot)
+            {
+                PersistentGpuTimingEventPair pair;
+                pair.start_event =
+                    allocatePersistentDeviceTimingEvent(state_.device_id);
+                pair.stop_event =
+                    allocatePersistentDeviceTimingEvent(state_.device_id);
+                if (!pair.start_event || !pair.stop_event)
+                {
+                    return fail(
+                        "gpu_timing_pair_" + std::to_string(slot));
+                }
+                mtp_gpu_timing_event_pool_.push_back(std::move(pair));
+            }
+            pending_gpu_timing_measurements_.reserve(
+                timing_pair_capacity);
+        }
+
+        return true;
+    }
+
+    std::shared_ptr<void>
+    DeviceGraphOrchestrator::acquirePersistentMTPOutcomeReadyEvent(
+        const char *consumer_name)
+    {
+        for (const auto &event : mtp_outcome_response_ready_event_pool_)
+        {
+            if (event && event.use_count() == 1)
+                return event;
+        }
+
+        LOG_ERROR("[DeviceGraphOrchestrator] Persistent MTP compact-outcome event pool exhausted"
+                  << " consumer="
+                  << (consumer_name && consumer_name[0] != '\0'
+                          ? consumer_name
+                          : "unknown")
+                  << " capacity="
+                  << mtp_outcome_response_ready_event_pool_.size());
+        return {};
+    }
+
+    bool DeviceGraphOrchestrator::acquirePersistentMTPGpuTimingEvents(
+        const char *measurement_name,
+        std::shared_ptr<void> *out_start_event,
+        std::shared_ptr<void> *out_stop_event)
+    {
+        if (out_start_event)
+            out_start_event->reset();
+        if (out_stop_event)
+            out_stop_event->reset();
+        if (!PerfStatsCollector::isEnabled() || !state_.device_id.is_gpu())
+            return true;
+        if (!out_start_event || !out_stop_event)
+            return false;
+
+        for (const auto &pair : mtp_gpu_timing_event_pool_)
+        {
+            if (pair.start_event &&
+                pair.stop_event &&
+                pair.start_event.use_count() == 1 &&
+                pair.stop_event.use_count() == 1)
+            {
+                *out_start_event = pair.start_event;
+                *out_stop_event = pair.stop_event;
+                return true;
+            }
+        }
+
+        LOG_ERROR("[DeviceGraphOrchestrator] Persistent MTP GPU timing-event pool exhausted"
+                  << " measurement="
+                  << (measurement_name && measurement_name[0] != '\0'
+                          ? measurement_name
+                          : "unknown")
+                  << " capacity="
+                  << mtp_gpu_timing_event_pool_.size()
+                  << " pending="
+                  << pending_gpu_timing_measurements_.size());
+        return false;
+    }
+
     bool DeviceGraphOrchestrator::recordShiftedMTPKVReady(
         void *producer_stream,
         const char *producer_name)
@@ -20685,20 +20853,8 @@ namespace llaminar2
         auto &ready = all_position_verifier_state_ready_;
         if (!ready.event)
         {
-            void *raw_event = backend->createEvent(state_.device_id.gpu_ordinal());
-            if (!raw_event)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create all-position verifier state readiness event");
-                return false;
-            }
-            const int device_ordinal = state_.device_id.gpu_ordinal();
-            ready.event = std::shared_ptr<void>(
-                raw_event,
-                [backend, device_ordinal](void *event)
-                {
-                    if (event)
-                        backend->destroyEvent(event, device_ordinal);
-                });
+            LOG_ERROR("[DeviceGraphOrchestrator] All-position verifier state readiness event was not preallocated");
+            return false;
         }
 
         if (!backend->recordEvent(
@@ -20861,20 +21017,8 @@ namespace llaminar2
         }
         if (!ready.event)
         {
-            void *raw_event = backend->createEvent(state_.device_id.gpu_ordinal());
-            if (!raw_event)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create accepted spec-state publication readiness event");
-                return false;
-            }
-            const int device_ordinal = state_.device_id.gpu_ordinal();
-            ready.event = std::shared_ptr<void>(
-                raw_event,
-                [backend, device_ordinal](void *event)
-                {
-                    if (event)
-                        backend->destroyEvent(event, device_ordinal);
-                });
+            LOG_ERROR("[DeviceGraphOrchestrator] Accepted spec-state publication readiness event was not preallocated");
+            return false;
         }
 
         if (!backend->recordEvent(
@@ -23379,52 +23523,26 @@ namespace llaminar2
         if (collect_producer_gpu_timing)
         {
             const int device_ordinal = device_opt->gpu_ordinal();
-            void *raw_start_event = backend->createTimingEvent(device_ordinal);
-            void *raw_stop_event = backend->createTimingEvent(device_ordinal);
-            if (raw_start_event && raw_stop_event)
+            if (!acquirePersistentMTPGpuTimingEvents(
+                    "greedy_compact_outcome_summary",
+                    &producer_start_timing_event,
+                    &producer_stop_timing_event))
             {
-                producer_start_timing_event.reset(
-                    raw_start_event,
-                    [backend, device_ordinal](void *event)
-                    {
-                        if (event)
-                            backend->destroyEvent(event, device_ordinal);
-                    });
-                producer_stop_timing_event.reset(
-                    raw_stop_event,
-                    [backend, device_ordinal](void *event)
-                    {
-                        if (event)
-                            backend->destroyEvent(event, device_ordinal);
-                    });
-                if (!backend->recordEvent(
-                        producer_start_timing_event.get(),
-                        device_ordinal,
-                        stream))
-                {
-                    producer_start_timing_event.reset();
-                    producer_stop_timing_event.reset();
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "greedy_request_batch_summary_gpu_timing_record_failures",
-                        1.0,
-                        "decode",
-                        state_.device_id.toString(),
-                        {{"event", "start"}});
-                }
+                return false;
             }
-            else
+            if (!backend->recordEvent(
+                    producer_start_timing_event.get(),
+                    device_ordinal,
+                    stream))
             {
-                if (raw_start_event)
-                    backend->destroyEvent(raw_start_event, device_ordinal);
-                if (raw_stop_event)
-                    backend->destroyEvent(raw_stop_event, device_ordinal);
                 PerfStatsCollector::addCounter(
                     "mtp",
-                    "greedy_request_batch_summary_gpu_timing_event_failures",
+                    "greedy_request_batch_summary_gpu_timing_record_failures",
                     1.0,
                     "decode",
-                    state_.device_id.toString());
+                    state_.device_id.toString(),
+                    {{"event", "start"}});
+                return false;
             }
         }
 
@@ -23453,8 +23571,6 @@ namespace llaminar2
                     device_opt->gpu_ordinal(),
                     stream))
             {
-                producer_start_timing_event.reset();
-                producer_stop_timing_event.reset();
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "greedy_request_batch_summary_gpu_timing_record_failures",
@@ -23462,24 +23578,18 @@ namespace llaminar2
                     "decode",
                     state_.device_id.toString(),
                     {{"event", "stop"}});
+                return false;
             }
         }
 
-        void *raw_response_ready_event =
-            backend->createEvent(device_opt->gpu_ordinal());
-        if (!raw_response_ready_event)
+        std::shared_ptr<void> response_ready_event =
+            acquirePersistentMTPOutcomeReadyEvent(
+                "greedy_compact_outcome");
+        if (!response_ready_event)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to create greedy outcome response-ready event");
+            LOG_ERROR("[DeviceGraphOrchestrator] Greedy outcome has no available preallocated response-ready event");
             return false;
         }
-        const int device_ordinal = device_opt->gpu_ordinal();
-        std::shared_ptr<void> response_ready_event(
-            raw_response_ready_event,
-            [backend, device_ordinal](void *event)
-            {
-                if (event)
-                    backend->destroyEvent(event, device_ordinal);
-            });
         if (!DeviceEventEdge::at(
                  DeviceTimelinePoint::CompactSpeculativeResponseReady)
                  .from(DeviceTimelineRole::VerifierSummary)
@@ -23505,8 +23615,7 @@ namespace llaminar2
         if (!recordDeviceResidentMTPTransactionMutation(
                 /*request_count=*/1,
                 stream,
-                "greedy_device_outcome",
-                response_ready_event))
+                "greedy_device_outcome"))
         {
             return false;
         }
@@ -23643,52 +23752,26 @@ namespace llaminar2
         if (collect_producer_gpu_timing)
         {
             const int device_ordinal = device_opt->gpu_ordinal();
-            void *raw_start_event = backend->createTimingEvent(device_ordinal);
-            void *raw_stop_event = backend->createTimingEvent(device_ordinal);
-            if (raw_start_event && raw_stop_event)
+            if (!acquirePersistentMTPGpuTimingEvents(
+                    "greedy_request_batch_compact_outcome_summary",
+                    &producer_start_timing_event,
+                    &producer_stop_timing_event))
             {
-                producer_start_timing_event.reset(
-                    raw_start_event,
-                    [backend, device_ordinal](void *event)
-                    {
-                        if (event)
-                            backend->destroyEvent(event, device_ordinal);
-                    });
-                producer_stop_timing_event.reset(
-                    raw_stop_event,
-                    [backend, device_ordinal](void *event)
-                    {
-                        if (event)
-                            backend->destroyEvent(event, device_ordinal);
-                    });
-                if (!backend->recordEvent(
-                        producer_start_timing_event.get(),
-                        device_ordinal,
-                        stream))
-                {
-                    producer_start_timing_event.reset();
-                    producer_stop_timing_event.reset();
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "greedy_request_batch_summary_gpu_timing_record_failures",
-                        1.0,
-                        "decode",
-                        state_.device_id.toString(),
-                        {{"event", "start"}});
-                }
+                return false;
             }
-            else
+            if (!backend->recordEvent(
+                    producer_start_timing_event.get(),
+                    device_ordinal,
+                    stream))
             {
-                if (raw_start_event)
-                    backend->destroyEvent(raw_start_event, device_ordinal);
-                if (raw_stop_event)
-                    backend->destroyEvent(raw_stop_event, device_ordinal);
                 PerfStatsCollector::addCounter(
                     "mtp",
-                    "greedy_request_batch_summary_gpu_timing_event_failures",
+                    "greedy_request_batch_summary_gpu_timing_record_failures",
                     1.0,
                     "decode",
-                    state_.device_id.toString());
+                    state_.device_id.toString(),
+                    {{"event", "start"}});
+                return false;
             }
         }
 
@@ -23766,8 +23849,6 @@ namespace llaminar2
                     device_opt->gpu_ordinal(),
                     stream))
             {
-                producer_start_timing_event.reset();
-                producer_stop_timing_event.reset();
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "greedy_request_batch_summary_gpu_timing_record_failures",
@@ -23775,24 +23856,18 @@ namespace llaminar2
                     "decode",
                     state_.device_id.toString(),
                     {{"event", "stop"}});
+                return false;
             }
         }
 
-        void *raw_response_ready_event =
-            backend->createEvent(device_opt->gpu_ordinal());
-        if (!raw_response_ready_event)
+        std::shared_ptr<void> response_ready_event =
+            acquirePersistentMTPOutcomeReadyEvent(
+                "greedy_request_batch_compact_outcome");
+        if (!response_ready_event)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to create greedy request-batch outcome response-ready event");
+            LOG_ERROR("[DeviceGraphOrchestrator] Greedy request-batch outcome has no available preallocated response-ready event");
             return false;
         }
-        const int device_ordinal = device_opt->gpu_ordinal();
-        std::shared_ptr<void> response_ready_event(
-            raw_response_ready_event,
-            [backend, device_ordinal](void *event)
-            {
-                if (event)
-                    backend->destroyEvent(event, device_ordinal);
-            });
         if (!DeviceEventEdge::at(
                  DeviceTimelinePoint::CompactSpeculativeResponseReady)
                  .from(DeviceTimelineRole::VerifierSummary)
@@ -23810,8 +23885,7 @@ namespace llaminar2
         if (!recordDeviceResidentMTPTransactionMutation(
                 request_count,
                 stream,
-                "greedy_request_batch_device_outcome",
-                response_ready_event))
+                "greedy_request_batch_device_outcome"))
         {
             return false;
         }
@@ -32463,53 +32537,27 @@ namespace llaminar2
             PerfStatsCollector::isEnabled() && state_.device_id.is_gpu();
         if (collect_producer_gpu_timing)
         {
-            const int device_ordinal = state_.device_id.gpu_ordinal();
-            void *raw_start_event = backend->createTimingEvent(device_ordinal);
-            void *raw_stop_event = backend->createTimingEvent(device_ordinal);
-            if (raw_start_event && raw_stop_event)
+            if (!acquirePersistentMTPGpuTimingEvents(
+                    "stochastic_request_batch_compact_outcome_summary",
+                    &producer_start_timing_event,
+                    &producer_stop_timing_event))
             {
-                producer_start_timing_event.reset(
-                    raw_start_event,
-                    [backend, device_ordinal](void *event)
-                    {
-                        if (event)
-                            backend->destroyEvent(event, device_ordinal);
-                    });
-                producer_stop_timing_event.reset(
-                    raw_stop_event,
-                    [backend, device_ordinal](void *event)
-                    {
-                        if (event)
-                            backend->destroyEvent(event, device_ordinal);
-                    });
-                if (!backend->recordEvent(
-                        producer_start_timing_event.get(),
-                        device_ordinal,
-                        stream))
-                {
-                    producer_start_timing_event.reset();
-                    producer_stop_timing_event.reset();
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "stochastic_request_batch_summary_gpu_timing_record_failures",
-                        1.0,
-                        "decode",
-                        state_.device_id.toString(),
-                        {{"event", "start"}});
-                }
+                return false;
             }
-            else
+            if (!backend->recordEvent(
+                    producer_start_timing_event.get(),
+                    state_.device_id.gpu_ordinal(),
+                    stream))
             {
-                if (raw_start_event)
-                    backend->destroyEvent(raw_start_event, device_ordinal);
-                if (raw_stop_event)
-                    backend->destroyEvent(raw_stop_event, device_ordinal);
                 PerfStatsCollector::addCounter(
                     "mtp",
-                    "stochastic_request_batch_summary_gpu_timing_event_failures",
+                    "stochastic_request_batch_summary_gpu_timing_record_failures",
                     1.0,
                     "decode",
-                    state_.device_id.toString());
+                    state_.device_id.toString(),
+                    {{"event", "start"}});
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to record the preallocated stochastic outcome timing start event");
+                return false;
             }
         }
 
@@ -32660,8 +32708,6 @@ namespace llaminar2
                     state_.device_id.gpu_ordinal(),
                     stream))
             {
-                producer_start_timing_event.reset();
-                producer_stop_timing_event.reset();
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "stochastic_request_batch_summary_gpu_timing_record_failures",
@@ -32669,24 +32715,18 @@ namespace llaminar2
                     "decode",
                     state_.device_id.toString(),
                     {{"event", "stop"}});
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to record the preallocated stochastic outcome timing stop event");
+                return false;
             }
         }
 
-        void *raw_response_ready_event =
-            backend->createEvent(state_.device_id.gpu_ordinal());
-        if (!raw_response_ready_event)
+        std::shared_ptr<void> response_ready_event =
+            acquirePersistentMTPOutcomeReadyEvent(
+                "stochastic_request_batch_compact_outcome");
+        if (!response_ready_event)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to create stochastic outcome response-ready event");
             return false;
         }
-        const int device_ordinal = state_.device_id.gpu_ordinal();
-        std::shared_ptr<void> response_ready_event(
-            raw_response_ready_event,
-            [backend, device_ordinal](void *event)
-            {
-                if (event)
-                    backend->destroyEvent(event, device_ordinal);
-            });
         /*
          * Record before any caller enqueues state publication on this producer
          * stream.  The compact outcome rows are immutable after the verifier
@@ -32710,8 +32750,7 @@ namespace llaminar2
         if (!recordDeviceResidentMTPTransactionMutation(
                 request_count,
                 stream,
-                "stochastic_request_batch_device_outcome",
-                response_ready_event))
+                "stochastic_request_batch_device_outcome"))
         {
             return false;
         }

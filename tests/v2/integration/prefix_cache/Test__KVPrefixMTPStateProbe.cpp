@@ -1437,27 +1437,30 @@ namespace
     {
         None,
         AllPositionStatePublication,
+        GroupedDeviceResidentPublication,
         DecodeEquivalent,
     };
 
     /**
      * @brief Identify which verifier contract executed for the current MTP run.
      *
-     * Direct all-position state publication stays fail-closed until a
-     * backend/model lane proves the stronger continuation contract.  The
-     * baseline production lane is grouped decode-equivalent verification, for
-     * both greedy and stochastic sampling.  That lane must still use graph-
-     * captured main decode and catch-up contexts. This helper lets probes assert
-     * the active contract instead of baking in an all-position-only expectation.
+     * Direct all-position publication and grouped decode-equivalent
+     * verification both execute the all-position `main_verifier` graph. They
+     * differ in the strength of their state-publication proof: the former
+     * adopts verifier rows directly, while the latter reduces compact outcomes
+     * and publishes through the device-resident grouped transaction. Older
+     * host-planned decode-equivalent lanes use main-decode/catch-up replay.
+     * This helper keeps those graph and publication contracts distinct.
      */
     MTPVerifierGraphPath mtpVerifierGraphPath(
         const std::vector<PerfStatRecord> &records)
     {
         if (mtpCounterValue(records, "all_position_state_publication_verifier_runs") >= 1.0)
             return MTPVerifierGraphPath::AllPositionStatePublication;
+        if (mtpCounterValue(records, "grouped_outcome_device_resident_publication_uses") >= 1.0)
+            return MTPVerifierGraphPath::GroupedDeviceResidentPublication;
         if (mtpCounterValue(records, "grouped_decode_equivalent_greedy_verifier_runs") >= 1.0 ||
             mtpCounterValue(records, "grouped_decode_equivalent_stochastic_verifier_runs") >= 1.0 ||
-            mtpCounterValue(records, "grouped_outcome_device_resident_publication_uses") >= 1.0 ||
             mtpCounterValue(records, "grouped_outcome_host_publication_uses") >= 1.0)
             return MTPVerifierGraphPath::DecodeEquivalent;
         return MTPVerifierGraphPath::None;
@@ -1491,10 +1494,11 @@ namespace
     /**
      * @brief Assert graph replay for the active MTP verifier path.
      *
-     * Direct all-position publication replays the `main_verifier` graph.  The
-     * Phase 9.7-supported decode-equivalent lane replays ordinary `main_decode`
-     * plus `mtp_decode_catchup` graphs while preserving the same verifier math
-     * and accepted-state contract.
+     * Direct all-position publication and compact grouped device publication
+     * replay the `main_verifier` graph. A remaining host-planned
+     * decode-equivalent lane replays ordinary `main_decode` plus
+     * `mtp_decode_catchup`; it is deliberately classified separately so a
+     * device-resident lane cannot satisfy the gate with legacy graph evidence.
      */
     void expectMTPVerifierGraphLifecycle(
         const std::vector<PerfStatRecord> &records,
@@ -1506,7 +1510,8 @@ namespace
         ASSERT_NE(path, MTPVerifierGraphPath::None)
             << backend_name << " MTP must execute a supported verifier path";
 
-        if (path == MTPVerifierGraphPath::AllPositionStatePublication)
+        if (path == MTPVerifierGraphPath::AllPositionStatePublication ||
+            path == MTPVerifierGraphPath::GroupedDeviceResidentPublication)
         {
             expectSegmentedGraphLifecycle(
                 records,
@@ -1534,11 +1539,12 @@ namespace
     /**
      * @brief Assert that accepted MTP state was published through a fast path.
      *
-     * Greedy and older host-planned paths may materialize accepted shifted rows
-     * by replaying the `mtp_decode_catchup` graph. The vLLM-style stochastic
-     * path can skip that graph entirely by publishing KV/GDN/hidden state from
-     * compact device-resident verifier metadata. Both are valid fast paths; a
-     * test failure here means the run fell back to neither.
+     * Older host-planned paths may materialize accepted shifted rows by
+     * replaying the `mtp_decode_catchup` graph. Device-resident direct and
+     * grouped paths skip that graph by publishing KV/GDN/hidden and logical
+     * state from verifier-owned metadata. Both are observable production
+     * contracts; a test failure here means the run completed without either
+     * accepted-state publication proof.
      */
     void expectMTPAcceptedStateFastPublication(
         const std::vector<PerfStatRecord> &records,
@@ -1546,8 +1552,13 @@ namespace
     {
         const bool catchup_replayed =
             decodeGraphPhaseCount(records, "mtp_decode_catchup", "replay") >= 1.0;
+        const bool logical_state_published =
+            mtpCounterValue(records, "device_resident_state_publications") >= 1.0 ||
+            mtpCounterValue(
+                records,
+                "grouped_outcome_device_resident_state_publications") >= 1.0;
         const bool resident_published =
-            mtpCounterValue(records, "device_resident_state_publications") >= 1.0 &&
+            logical_state_published &&
             mtpCounterValue(records, "device_resident_kv_sequence_state_publications") >= 1.0 &&
             mtpCounterValue(records, "spec_state_publications") >= 1.0;
         EXPECT_TRUE(catchup_replayed || resident_published)
@@ -2703,6 +2714,31 @@ namespace
                 << backend_name << " all-position stochastic MTP must not also "
                 << "run the grouped decode-equivalent verifier";
         }
+        else if (verifier_path ==
+                 MTPVerifierGraphPath::GroupedDeviceResidentPublication)
+        {
+            EXPECT_GE(
+                counter("grouped_decode_equivalent_stochastic_verifier_runs"),
+                1.0)
+                << backend_name << " grouped device-resident MTP must prove "
+                << "decode-equivalent verifier math";
+            EXPECT_GE(
+                counter("grouped_outcome_device_resident_publication_uses"),
+                1.0)
+                << backend_name << " grouped verifier outcomes must remain "
+                << "device-resident through accepted-state publication";
+            EXPECT_GE(
+                counter("grouped_outcome_device_resident_state_publications"),
+                1.0)
+                << backend_name << " compact grouped outcomes must publish "
+                << "logical state without a host plan";
+            EXPECT_EQ(counter("all_position_state_publication_verifier_runs"), 0.0)
+                << backend_name << " grouped decode-equivalent verification "
+                << "must not claim the stronger direct all-position contract";
+            EXPECT_EQ(counter("grouped_outcome_host_publication_uses"), 0.0)
+                << backend_name << " grouped device-resident publication must "
+                << "never materialize a host publication plan";
+        }
         else
         {
             EXPECT_GE(counter("grouped_decode_equivalent_stochastic_verifier_runs"), 1.0)
@@ -2721,7 +2757,12 @@ namespace
             EXPECT_GE(counter("stochastic_topk_smallk_scratch_distribution_builds"), 1.0)
                 << backend_name << " stochastic MTP target sampling must use the "
                 << "arena-declared small-k top-k scratch path";
-            if (verifier_path == MTPVerifierGraphPath::AllPositionStatePublication &&
+            const bool device_resident_verifier =
+                verifier_path ==
+                    MTPVerifierGraphPath::AllPositionStatePublication ||
+                verifier_path ==
+                    MTPVerifierGraphPath::GroupedDeviceResidentPublication;
+            if (device_resident_verifier &&
                 !use_presence_penalty)
             {
                 EXPECT_GE(counter("first_token_stochastic_deferred_host_reads"), 1.0)
@@ -2740,14 +2781,39 @@ namespace
                     << backend_name << " sidecar/verifier consumers must wait on deferred draft samples";
                 EXPECT_GE(counter("verifier_device_token_input_prepares"), 1.0)
                     << backend_name << " verifier input tokens should be staged from device draft slots";
-                EXPECT_GE(counter("stochastic_batch_summary_device_first_tokens"), 1.0)
-                    << backend_name << " verifier summary should read the first token from device scratch";
-                EXPECT_GE(counter("all_position_stochastic_device_batched_rows"), 1.0)
-                    << backend_name << " penalty-free stochastic verification should use the batched device outcome";
+                if (verifier_path ==
+                    MTPVerifierGraphPath::AllPositionStatePublication)
+                {
+                    EXPECT_GE(counter("stochastic_batch_summary_device_first_tokens"), 1.0)
+                        << backend_name << " direct all-position summary should "
+                        << "read the first token from device scratch";
+                    EXPECT_GE(counter("all_position_stochastic_device_batched_rows"), 1.0)
+                        << backend_name << " direct all-position stochastic "
+                        << "verification should use the batched device outcome";
+                }
+                else
+                {
+                    EXPECT_GE(
+                        counter(
+                            "stochastic_serial_equivalent_verify_batch_device_token_rows"),
+                        1.0)
+                        << backend_name << " grouped resident verification must "
+                        << "reduce serial-equivalent rows from device token slots";
+                    EXPECT_GE(
+                        counter("stochastic_verify_request_batch_outcomes"),
+                        1.0)
+                        << backend_name << " grouped resident verification must "
+                        << "produce compact request-batched outcomes";
+                    EXPECT_GE(
+                        counter("grouped_outcome_verifier_device_token_inputs"),
+                        1.0)
+                        << backend_name << " grouped resident verification must "
+                        << "consume its staged verifier token batch on device";
+                }
                 EXPECT_EQ(counter("mtp_token_stochastic_device_samples"), 0.0)
                     << backend_name << " deferred draft samples should not force a host-visible token sample";
             }
-            else if (verifier_path == MTPVerifierGraphPath::AllPositionStatePublication)
+            else if (device_resident_verifier)
             {
                 EXPECT_GE(counter("mtp_token_stochastic_device_samples"), 1.0)
                     << backend_name << " penalty paths still need a host-visible sampled token for sampler history";
