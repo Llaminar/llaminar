@@ -762,22 +762,6 @@ extern "C"
         float weight, int count,
         int device_idx, void *stream);
 
-    // Phase 2: Histogram + Expert Mask bridges
-    bool hipMoE_histogram_record(
-        const int *routing_indices, unsigned long long *histogram,
-        int seq_len, int num_experts, int top_k, int layer_idx,
-        int device_idx, void *stream);
-
-    bool hipMoE_apply_expert_mask(
-        float *routing_weights, const int *routing_indices,
-        const bool *expert_mask,
-        int seq_len, int top_k,
-        int device_idx, void *stream);
-
-    bool hipMoE_histogram_reset(
-        unsigned long long *histogram, int layer_idx, int num_experts,
-        int device_idx, void *stream);
-
     // Phase 3: Token grouping bridges
     bool hipMoE_count_per_expert(
         const int *routing_indices, int *expert_counts,
@@ -1566,8 +1550,6 @@ namespace llaminar2
 
     void ROCmMoEKernel::clearWorkspaceScratchBindings() noexcept
     {
-        d_histogram_ = nullptr;
-        d_expert_mask_ = nullptr;
         d_write_heads_ = nullptr;
         d_staging_indices_ = nullptr;
         d_staging_weights_ = nullptr;
@@ -1610,8 +1592,6 @@ namespace llaminar2
         d_prefill_gate_ = nullptr;
         d_prefill_up_ = nullptr;
 
-        max_experts_ = 0;
-        max_layers_ = 0;
         max_write_heads_experts_ = 0;
         staging_capacity_ = 0;
         grouped_decode_active_cap_ = 0;
@@ -2758,228 +2738,7 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Phase 2: Device-resident histogram + expert mask
-    // =========================================================================
-
-    void ROCmMoEKernel::allocateHistogramBuffers(int num_layers, int num_experts)
-    {
-        if (num_layers <= 0 || num_experts <= 0)
-            return;
-
-        // Already allocated with sufficient dimensions?
-        if (d_histogram_ && max_layers_ >= num_layers && max_experts_ >= num_experts)
-            return;
-
-        if (!setMoEDevice(device_ordinal_, "allocateHistogramBuffers"))
-            return;
-        hipStream_t stream = static_cast<hipStream_t>(getStream());
-        if (!stream)
-        {
-            LOG_ERROR("[ROCmMoEKernel::allocateHistogramBuffers] explicit HIP stream is required");
-            return;
-        }
-
-        if (num_layers > MoEWorkspaceBuffers::kHistogramLayerSlots)
-        {
-            LOG_ERROR("[ROCmMoEKernel::allocateHistogramBuffers] requested histogram layer count "
-                      << num_layers << " exceeds workspace capacity "
-                      << MoEWorkspaceBuffers::kHistogramLayerSlots);
-            return;
-        }
-
-        void *histogram = nullptr;
-        const size_t total = static_cast<size_t>(MoEWorkspaceBuffers::kHistogramLayerSlots) *
-                             static_cast<size_t>(num_experts);
-        if (!bindWorkspaceBuffer(&histogram,
-                                 MoEWorkspaceBuffers::ROCM_HISTOGRAM_COUNTS,
-                                 total * sizeof(uint64_t),
-                                 "ROCm MoE histogram counts"))
-        {
-            d_histogram_ = nullptr;
-            max_layers_ = 0;
-            max_experts_ = 0;
-            return;
-        }
-
-        d_histogram_ = static_cast<uint64_t *>(histogram);
-        max_layers_ = num_layers;
-        max_experts_ = num_experts;
-
-        hipError_t err = hipMemsetAsync(d_histogram_, 0, total * sizeof(uint64_t),
-                                        stream);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::allocateHistogramBuffers] hipMemset failed: "
-                      << hipGetErrorString(err));
-        }
-
-        LOG_DEBUG("[ROCmMoEKernel] Allocated histogram buffer: "
-                  << max_layers_ << " layers × " << max_experts_ << " experts");
-    }
-
-    void ROCmMoEKernel::recordHistogramDevice(
-        const int *d_routing_indices, int seq_len, int top_k, int layer_idx)
-    {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
-        if (seq_len <= 0 || top_k <= 0)
-            return;
-
-        // Lazy allocate — assume at least layer_idx+1 layers, 256 experts as initial guess
-        const int min_experts = 256;
-        if (!d_histogram_ || layer_idx >= max_layers_)
-        {
-            allocateHistogramBuffers(layer_idx + 1, (max_experts_ > 0) ? max_experts_ : min_experts);
-        }
-        if (!d_histogram_)
-            return;
-
-        if (!hipMoE_histogram_record(
-                d_routing_indices,
-                reinterpret_cast<unsigned long long *>(d_histogram_),
-                seq_len, max_experts_, top_k, layer_idx,
-                device_ordinal_, getStream()))
-        {
-            LOG_ERROR("[ROCmMoEKernel::recordHistogramDevice] kernel launch failed");
-        }
-    }
-
-    void ROCmMoEKernel::syncHistogramToHost(
-        uint64_t *host_counts, int layer_idx, int num_experts)
-    {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
-        if (!d_histogram_)
-        {
-            LOG_WARN("[ROCmMoEKernel::syncHistogramToHost] No histogram allocated");
-            return;
-        }
-        if (layer_idx >= max_layers_ || num_experts > max_experts_)
-        {
-            LOG_ERROR("[ROCmMoEKernel::syncHistogramToHost] layer_idx=" << layer_idx
-                                                                        << " or num_experts=" << num_experts << " out of range");
-            return;
-        }
-
-        if (!setMoEDevice(device_ordinal_, "syncHistogramToHost"))
-            return;
-
-        hipStream_t stream = static_cast<hipStream_t>(getStream());
-        const size_t offset = static_cast<size_t>(layer_idx) * max_experts_;
-
-        hipError_t err = hipMemcpyAsync(
-            host_counts,
-            d_histogram_ + offset,
-            num_experts * sizeof(uint64_t),
-            hipMemcpyDeviceToHost, stream);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::syncHistogramToHost] D2H copy failed: "
-                      << hipGetErrorString(err));
-            return;
-        }
-
-        (void)hipStreamSynchronize(stream);
-    }
-
-    void ROCmMoEKernel::resetHistogramDevice(int layer_idx, int num_experts)
-    {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
-        if (!d_histogram_)
-        {
-            LOG_WARN("[ROCmMoEKernel::resetHistogramDevice] No histogram allocated");
-            return;
-        }
-        if (layer_idx >= max_layers_)
-        {
-            LOG_ERROR("[ROCmMoEKernel::resetHistogramDevice] layer_idx=" << layer_idx << " out of range");
-            return;
-        }
-
-        if (!setMoEDevice(device_ordinal_, "resetHistogramDevice"))
-            return;
-
-        if (!hipMoE_histogram_reset(
-                reinterpret_cast<unsigned long long *>(d_histogram_),
-                layer_idx, num_experts,
-                device_ordinal_, getStream()))
-        {
-            LOG_ERROR("[ROCmMoEKernel::resetHistogramDevice] kernel launch failed");
-        }
-    }
-
-    void ROCmMoEKernel::updateExpertMaskDevice(const bool *mask, int num_experts)
-    {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
-        if (num_experts <= 0)
-            return;
-
-        if (!setMoEDevice(device_ordinal_, "updateExpertMaskDevice"))
-            return;
-        hipStream_t stream = static_cast<hipStream_t>(getStream());
-        if (!stream)
-        {
-            LOG_ERROR("[ROCmMoEKernel::updateExpertMaskDevice] explicit HIP stream is required");
-            return;
-        }
-
-        if (!d_expert_mask_ || num_experts > max_experts_)
-        {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_expert_mask_),
-                                     MoEWorkspaceBuffers::ROCM_EXPERT_MASK,
-                                     static_cast<size_t>(num_experts) * sizeof(bool),
-                                     "ROCm MoE expert mask"))
-            {
-                d_expert_mask_ = nullptr;
-                return;
-            }
-            if (num_experts > max_experts_)
-                max_experts_ = num_experts;
-        }
-
-        hipError_t err = hipMemcpyAsync(
-            d_expert_mask_, mask,
-            num_experts * sizeof(bool),
-            hipMemcpyHostToDevice, stream);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::updateExpertMaskDevice] H2D copy failed: "
-                      << hipGetErrorString(err));
-        }
-    }
-
-    void ROCmMoEKernel::applyExpertMaskDevice(
-        float *d_routing_weights, const int *d_routing_indices,
-        int seq_len, int top_k)
-    {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
-        if (seq_len <= 0 || top_k <= 0)
-            return;
-
-        if (!setMoEDevice(device_ordinal_, "applyExpertMaskDevice"))
-            return;
-
-        if (!d_expert_mask_)
-        {
-            LOG_WARN("[ROCmMoEKernel::applyExpertMaskDevice] No expert mask uploaded");
-            return;
-        }
-
-        if (!hipMoE_apply_expert_mask(
-                d_routing_weights, d_routing_indices,
-                d_expert_mask_,
-                seq_len, top_k,
-                device_ordinal_, getStream()))
-        {
-            LOG_ERROR("[ROCmMoEKernel::applyExpertMaskDevice] kernel launch failed");
-        }
-    }
-
-    // =========================================================================
-    // Phase 3: Device-side token grouping
+    // Device-side token grouping
     // =========================================================================
 
     bool ROCmMoEKernel::groupTokensByExpertDevice(

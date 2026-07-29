@@ -3867,10 +3867,6 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::usesDeviceSideMoERebalanceController() const
     {
-        const auto &env = debugEnv();
-        if (!env.moe_rebalance.device_rebalance_graph_controller)
-            return false;
-
         if (!usesGraphStableGpuMoERebalance() || !graph_builder_)
             return false;
 
@@ -3879,37 +3875,58 @@ namespace llaminar2
         if (!config.isMoE() ||
             config.moe.rebalance_mode != MoERebalanceMode::DYNAMIC)
         {
-            return false;
+            throw std::runtime_error(
+                "Graph-stable GPU MoE rebalance reached a non-dynamic graph on " +
+                primary_device.to_string() +
+                "; host publish/apply fallback is refused");
         }
 
         const auto *local_tp = dynamic_cast<const ILocalTPContext *>(config.tp_ctx);
         if (!local_tp ||
             local_tp->degree() <= 1 ||
             config.tp_device_idx < 0 ||
-            config.tp_device_idx >= local_tp->degree() ||
-            !local_tp->supportsRawAllgatherOnStreamGraphCapture())
+            config.tp_device_idx >= local_tp->degree())
         {
-            return false;
+            throw std::runtime_error(
+                "Graph-stable GPU MoE rebalance requires a valid multi-device LocalTP binding on " +
+                primary_device.to_string() +
+                "; host publish/apply fallback is refused");
+        }
+        if (!local_tp->supportsRawAllgatherOnStreamGraphCapture())
+        {
+            throw std::runtime_error(
+                "Graph-stable GPU MoE rebalance requires graph-capturable raw NCCL/RCCL allgather on " +
+                primary_device.to_string() +
+                "; host publish/apply fallback is refused");
         }
 
         const CollectiveBackendType backend = local_tp->backend();
         if ((primary_device.is_cuda() && backend != CollectiveBackendType::NCCL) ||
             (primary_device.is_rocm() && backend != CollectiveBackendType::RCCL))
         {
-            return false;
+            throw std::runtime_error(
+                "Graph-stable GPU MoE rebalance requires NCCL for CUDA or RCCL for ROCm on " +
+                primary_device.to_string() +
+                "; host publish/apply fallback is refused");
         }
 
         const auto &devices = local_tp->devices();
         if (static_cast<int>(devices.size()) != local_tp->degree())
         {
-            return false;
+            throw std::runtime_error(
+                "Graph-stable GPU MoE rebalance LocalTP degree/device-list mismatch on " +
+                primary_device.to_string() +
+                "; host publish/apply fallback is refused");
         }
 
         const auto &local_participant = devices[static_cast<size_t>(config.tp_device_idx)];
         if (!local_participant.isLocal() ||
             local_participant.toLocalDeviceId() != primary_device)
         {
-            return false;
+            throw std::runtime_error(
+                "Graph-stable GPU MoE rebalance participant binding does not name its owning device " +
+                primary_device.to_string() +
+                "; host publish/apply fallback is refused");
         }
 
         const DeviceType expected_type =
@@ -3920,7 +3937,10 @@ namespace llaminar2
                 !participant.isGPU() ||
                 participant.device_type != expected_type)
             {
-                return false;
+                throw std::runtime_error(
+                    "Graph-stable GPU MoE rebalance requires a homogeneous local GPU participant set on " +
+                    primary_device.to_string() +
+                    "; host publish/apply fallback is refused");
             }
         }
 

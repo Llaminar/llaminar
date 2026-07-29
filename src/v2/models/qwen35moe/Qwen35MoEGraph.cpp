@@ -2715,7 +2715,6 @@ namespace llaminar2
             hot_replica_cap = std::max(0, env.moe_rebalance.max_replicas);
         const bool device_side_graph_rebalance_candidate =
             device_rebalance_decode_layer &&
-            env.moe_rebalance.device_rebalance_graph_controller &&
             config_.moe.rebalance_mode == MoERebalanceMode::DYNAMIC &&
             local_tp_ctx &&
             isHomogeneousGpuLocalTPRebalanceDomain(

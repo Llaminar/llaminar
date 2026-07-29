@@ -2695,9 +2695,9 @@ TEST(Test__Qwen35MoEGraph, RuntimeHistogramRegistrationIsDecodeOnly)
     EXPECT_NE(source.find("device_side_graph_rebalance_candidate"), std::string::npos)
         << "Device-side graph rebalance must not register host histogram sync callbacks";
     EXPECT_NE(source.find("!device_side_graph_rebalance_candidate"), std::string::npos);
-    EXPECT_NE(source.find("env.moe_rebalance.device_rebalance_graph_controller &&"),
+    EXPECT_EQ(source.find("env.moe_rebalance.device_rebalance_graph_controller"),
               std::string::npos)
-        << "Host-window rebalance should keep decode histogram registration unless the graph-native controller is enabled.";
+        << "Homogeneous graph-stable GPU rebalance is topology-selected and cannot be redirected to host maintenance.";
     const size_t prefill_call = source.find("moeRuntimeTableForDevice(", prefill_branch);
     ASSERT_NE(prefill_call, std::string::npos);
     const size_t prefill_call_end = source.find(");", prefill_call);

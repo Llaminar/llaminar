@@ -1390,69 +1390,6 @@ namespace llaminar2
         }
 
         // =================================================================
-        // Device-resident histogram + expert mask (Phase 2)
-        //
-        // Default no-op implementations so CPU kernels compile unchanged.
-        // GPU kernels override for on-device execution.
-        // =================================================================
-
-        /**
-         * @brief Record routing decisions into device-resident histogram
-         *
-         * Atomically increments per-expert counters based on routing indices.
-         *
-         * @param d_routing_indices Device pointer: [seq_len * top_k] expert indices
-         * @param seq_len           Number of tokens
-         * @param top_k             Number of experts per token
-         * @param layer_idx         Layer index (for per-layer histograms)
-         */
-        virtual void recordHistogramDevice(
-            const int *d_routing_indices, int seq_len, int top_k, int layer_idx) {}
-
-        /**
-         * @brief Sync device histogram to host (async D2H copy + stream sync)
-         *
-         * @param host_counts Host buffer to receive counts: [num_experts] uint64_t
-         * @param layer_idx   Which layer's histogram to sync
-         * @param num_experts  Number of experts
-         */
-        virtual void syncHistogramToHost(
-            uint64_t *host_counts, int layer_idx, int num_experts) {}
-
-        /**
-         * @brief Reset device histogram counters for a specific layer to zero
-         *
-         * @param layer_idx   Layer index
-         * @param num_experts  Number of experts
-         */
-        virtual void resetHistogramDevice(int layer_idx, int num_experts) {}
-
-        /**
-         * @brief Upload expert mask to device (H2D)
-         *
-         * mask[e] = true means expert e is active (local to this device).
-         *
-         * @param mask        Host pointer: [num_experts] booleans
-         * @param num_experts Number of experts
-         */
-        virtual void updateExpertMaskDevice(const bool *mask, int num_experts) {}
-
-        /**
-         * @brief Apply expert mask: zero out routing weights for masked-off experts
-         *
-         * For each token/expert slot, if the expert is masked off,
-         * set its routing weight to 0.
-         *
-         * @param d_routing_weights  Device pointer: [seq_len * top_k] weights (modified in-place)
-         * @param d_routing_indices  Device pointer: [seq_len * top_k] expert indices
-         * @param seq_len            Number of tokens
-         * @param top_k              Number of experts per token
-         */
-        virtual void applyExpertMaskDevice(
-            float *d_routing_weights, const int *d_routing_indices,
-            int seq_len, int top_k) {}
-
-        // =================================================================
         // Device-side token grouping (Phase 3 — prefill optimization)
         //
         // Default no-op returning false so CPU kernels compile unchanged.

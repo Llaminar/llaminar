@@ -513,24 +513,6 @@ namespace llaminar2
             int target_layer = -1) override;
 
         // =================================================================
-        // Phase 2: Device-resident histogram + expert mask
-        // =================================================================
-
-        void recordHistogramDevice(
-            const int *d_routing_indices, int seq_len, int top_k, int layer_idx) override;
-
-        void syncHistogramToHost(
-            uint64_t *host_counts, int layer_idx, int num_experts) override;
-
-        void resetHistogramDevice(int layer_idx, int num_experts) override;
-
-        void updateExpertMaskDevice(const bool *mask, int num_experts) override;
-
-        void applyExpertMaskDevice(
-            float *d_routing_weights, const int *d_routing_indices,
-            int seq_len, int top_k) override;
-
-        // =================================================================
         // Phase 3: Device-side token grouping (prefill optimization)
         // =================================================================
 
@@ -720,7 +702,6 @@ namespace llaminar2
         };
 
         void syncBlasStream();
-        void allocateHistogramBuffers(int num_layers, int num_experts);
         bool ensureStagingCapacity(int count);
         bool ensureGroupedDecodeCapacity(int num_active, int intermediate);
         bool ensureGroupedGateUpCapacity(int num_active, int d_model);
@@ -944,13 +925,9 @@ namespace llaminar2
         int device_ordinal_;
         std::unique_ptr<rocm::HipBLASGemmKernel> blas_gemm_;
 
-        // Phase 2: device-resident histogram and expert mask
-        uint64_t *d_histogram_ = nullptr; ///< [max_layers_ * max_experts_] on device
-        bool *d_expert_mask_ = nullptr;   ///< [max_experts_] on device
+        // Device-resident expert mask used by asynchronous grouped routing.
         uint8_t *d_group_expert_mask_ = nullptr; ///< [max_experts_] for masked async grouping
         std::shared_ptr<PersistentWorkspaceSlotLease> group_expert_mask_workspace_lease_;
-        int max_experts_ = 0;
-        int max_layers_ = 0;
         int group_expert_mask_cap_ = 0;
         uint64_t group_expert_mask_hash_ = 0;
         int group_expert_mask_num_experts_ = 0;

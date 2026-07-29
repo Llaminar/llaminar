@@ -20449,8 +20449,16 @@ TEST(Test__CUDAMoERequestReset,
     EXPECT_THROW(directory->resetRequestPublications(nullptr),
                  std::invalid_argument);
 
-    cudaStream_t stream = nullptr;
-    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+    cudaStream_t reset_stream = nullptr;
+    cudaStream_t consumer_stream = nullptr;
+    cudaEvent_t reset_ready = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&reset_stream, cudaStreamNonBlocking),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&consumer_stream, cudaStreamNonBlocking),
+              cudaSuccess);
+    ASSERT_EQ(cudaEventCreateWithFlags(
+                  &reset_ready,
+                  cudaEventDisableTiming),
               cudaSuccess);
     const auto baseline = directory->hostEntriesForTest();
     const size_t bytes =
@@ -20492,23 +20500,39 @@ TEST(Test__CUDAMoERequestReset,
                       published.data(),
                       bytes,
                       cudaMemcpyHostToDevice,
-                      stream),
+                      reset_stream),
                   cudaSuccess);
         ASSERT_NO_THROW(
-            directory->resetRequestPublications(stream));
+            directory->resetRequestPublications(reset_stream));
+
+        /*
+         * Production does not synchronize the reset stream. The orchestrator
+         * publishes one reset-ready event and every graph consumer waits on
+         * that event before reading request-owned placement. Reuse the same
+         * event for all epochs to prove both the asynchronous D2D reset and
+         * the explicit cross-stream handoff remain valid under churn.
+         */
+        ASSERT_EQ(cudaEventRecord(reset_ready, reset_stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamWaitEvent(
+                      consumer_stream,
+                      reset_ready,
+                      /*flags=*/0),
+                  cudaSuccess);
         ASSERT_EQ(cudaMemcpyAsync(
                       restored.data(),
                       directory->deviceEntries(),
                       bytes,
                       cudaMemcpyDeviceToHost,
-                      stream),
+                      consumer_stream),
                   cudaSuccess);
-        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(consumer_stream), cudaSuccess);
         EXPECT_EQ(std::memcmp(restored.data(), baseline.data(), bytes), 0)
             << "CUDA request reset leaked a transfer-slot occupant at epoch "
             << request_epoch;
     }
 
-    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    EXPECT_EQ(cudaEventDestroy(reset_ready), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(consumer_stream), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(reset_stream), cudaSuccess);
 #endif
 }

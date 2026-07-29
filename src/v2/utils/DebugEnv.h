@@ -3509,12 +3509,6 @@ namespace llaminar2
             /// Number of transfer staging waves to reserve. 2 enables double buffering.
             /// (env: LLAMINAR_MOE_GPU_DIRECT_TRANSFER_BUFFERS)
             int gpu_direct_transfer_buffers = 2;
-            /// Insert the graph-native device-side rebalance controller into
-            /// homogeneous GPU decode graphs. Enabled by default so homogeneous
-            /// same-backend dynamic rebalance avoids host publish/apply; set the
-            /// env var to 0 to force the older host-window diagnostic path. (env:
-            /// LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER)
-            bool device_rebalance_graph_controller = true;
             /// Run graph-stable GPU rebalance planning/copy as a captured
             /// maintenance graph instead of embedding the producer in decode.
             /// Enabled by default with the device-side controller so histogram
@@ -3926,9 +3920,6 @@ namespace llaminar2
                 moe_rebalance.gpu_direct_transfer_wave_experts = std::max(1, std::atoi(moe_wave));
             if (const char *moe_buffers = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_BUFFERS"))
                 moe_rebalance.gpu_direct_transfer_buffers = std::max(1, std::atoi(moe_buffers));
-            if (const char *moe_graph_controller = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER"))
-                moe_rebalance.device_rebalance_graph_controller =
-                    (std::atoi(moe_graph_controller) != 0);
             if (const char *moe_maintenance_graph = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH"))
                 moe_rebalance.device_rebalance_maintenance_graph =
                     (std::atoi(moe_maintenance_graph) != 0);
@@ -4127,10 +4118,6 @@ namespace llaminar2
             moe_rebalance.gpu_direct_transfer_buffers = 2;
             if (const char *moe_buffers = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_BUFFERS"))
                 moe_rebalance.gpu_direct_transfer_buffers = std::max(1, std::atoi(moe_buffers));
-            moe_rebalance.device_rebalance_graph_controller = true;
-            if (const char *moe_graph_controller = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER"))
-                moe_rebalance.device_rebalance_graph_controller =
-                    (std::atoi(moe_graph_controller) != 0);
             moe_rebalance.device_rebalance_maintenance_graph = true;
             if (const char *moe_maintenance_graph = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH"))
                 moe_rebalance.device_rebalance_maintenance_graph =

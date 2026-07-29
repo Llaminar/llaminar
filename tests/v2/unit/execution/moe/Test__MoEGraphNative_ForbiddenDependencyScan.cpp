@@ -1627,7 +1627,7 @@ namespace llaminar2::test
             {"void ROCmMoEKernel::scatterAddWeighted", "void ROCmMoEKernel::sharedExpertGate"},
             {"void ROCmMoEKernel::sharedExpertGate", "void ROCmMoEKernel::swiGLU"},
             {"void ROCmMoEKernel::swiGLU", "void ROCmMoEKernel::weightedAdd"},
-            {"void ROCmMoEKernel::weightedAdd", "void ROCmMoEKernel::allocateHistogramBuffers"},
+            {"void ROCmMoEKernel::weightedAdd", "bool ROCmMoEKernel::groupTokensByExpertDevice"},
             {"bool ROCmMoEKernel::groupTokensByExpertDevice", "bool ROCmMoEKernel::ensureStagingCapacity"},
             {"void ROCmMoEKernel::zeroBuffer", "void ROCmMoEKernel::gatherTokenBatchFromTensors"},
             {"void ROCmMoEKernel::gatherTokenBatchFromTensors", "void ROCmMoEKernel::scatterAddWeightedFromTensors"},
@@ -1978,9 +1978,9 @@ namespace llaminar2::test
         EXPECT_NE(ffn_body.find("device_side_graph_rebalance_candidate ="), std::string::npos);
         EXPECT_NE(ffn_body.find("device_rebalance_decode_layer &&"), std::string::npos)
             << "Device-side graph rebalance must own both serial and grouped decode layers so MTP does not depend on constructing an M=1 graph.";
-        EXPECT_NE(ffn_body.find("env.moe_rebalance.device_rebalance_graph_controller &&"),
+        EXPECT_EQ(ffn_body.find("device_rebalance_graph_controller"),
                   std::string::npos)
-            << "Graph-stable placement and the graph-native controller must be separate policy gates.";
+            << "Homogeneous graph-stable GPU rebalance must not expose a host-controller selection toggle.";
         EXPECT_NE(ffn_body.find("env.moe_rebalance.device_rebalance_collect_load_stats"),
                   std::string::npos)
             << "Projected load-spread diagnostics must be opt-in from DebugEnv.";
@@ -3035,8 +3035,8 @@ namespace llaminar2::test
             << "Device-side mode must never move known-empty fixed payload slot capacity.";
         EXPECT_NE(dgo.find("host publish/apply fallback is refused"), std::string::npos)
             << "Homogeneous GPU device-side rebalance must fail closed when graph-captured sideband collectives are unavailable.";
-        EXPECT_NE(dgo.find("env.moe_rebalance.device_rebalance_graph_controller"), std::string::npos)
-            << "The runner must bypass host publish/apply only when the graph-native controller is enabled.";
+        EXPECT_EQ(dgo.find("device_rebalance_graph_controller"), std::string::npos)
+            << "Topology, not a debug toggle, must select homogeneous GPU device-side rebalance.";
         EXPECT_NE(graph_builder.find("buildDeviceMoERebalanceMaintenanceGraph("),
                   std::string::npos)
             << "Graph builders expose first-class rolling maintenance replay for device-side rebalance.";
@@ -3512,7 +3512,23 @@ namespace llaminar2::test
             dgo.substr(device_controller_start, device_controller_end - device_controller_start);
         EXPECT_NE(device_controller_predicate.find("config.moe.rebalance_mode != MoERebalanceMode::DYNAMIC"),
                   std::string::npos)
-            << "The device-side controller opt-in env must not override a static rebalance config.";
+            << "Static/off rebalance must never enter the device-side dynamic controller.";
+        const size_t graph_stable_gate =
+            device_controller_predicate.find("usesGraphStableGpuMoERebalance()");
+        const size_t graph_stable_gate_end =
+            device_controller_predicate.find("const DeviceId primary_device", graph_stable_gate);
+        ASSERT_NE(graph_stable_gate, std::string::npos);
+        ASSERT_NE(graph_stable_gate_end, std::string::npos);
+        const std::string recognized_graph_stable_body =
+            device_controller_predicate.substr(graph_stable_gate_end);
+        EXPECT_EQ(recognized_graph_stable_body.find("return false;"), std::string::npos)
+            << "Once a homogeneous graph-stable GPU domain is recognized, every invalid binding must fail hard instead of selecting host maintenance.";
+        EXPECT_GE(
+            countOccurrences(
+                recognized_graph_stable_body,
+                "host publish/apply fallback is refused"),
+            6u)
+            << "Every post-recognition topology/capability rejection must name the forbidden fallback.";
         EXPECT_EQ(device_controller_predicate.find("hot_replica_cap <= 0"),
                   std::string::npos)
             << "Homogeneous GPU dynamic rebalance must stay device-owned when --moe-hot-expert-cache is off.";
@@ -3553,10 +3569,10 @@ namespace llaminar2::test
             << "Static/off rebalance must not pay GPU-state or position checks when maintenance env is set.";
         EXPECT_LT(maintenance_dynamic_gate, maintenance_controller_gate)
             << "Static/off rebalance must not walk controller/overlay state when maintenance env is set.";
-        EXPECT_NE(debug_env.find("bool device_rebalance_graph_controller = true"),
+        EXPECT_EQ(debug_env.find("device_rebalance_graph_controller"),
                   std::string::npos)
-            << "The graph-native controller should be the default homogeneous GPU rebalance path.";
-        EXPECT_NE(debug_env.find("LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER"),
+            << "The retired host-controller selection knob must not return.";
+        EXPECT_EQ(debug_env.find("LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER"),
                   std::string::npos);
         EXPECT_NE(debug_env.find("bool device_rebalance_maintenance_graph = true"),
                   std::string::npos)

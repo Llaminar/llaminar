@@ -1265,7 +1265,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CachedGraphReplayFailureCannotRetryThro
         << "Eager execution is an explicit policy, not an error fallback";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, ROCmMoEWorkspaceOwnsRoutingStateAndMetadataCaches)
+TEST(Test__GpuWorkspaceAllocationPolicy, ROCmMoEWorkspaceOwnsLiveRoutingStateAndMetadataCaches)
 {
     const int max_seq_len = 9;
     const int d_model = 2048;
@@ -1275,14 +1275,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ROCmMoEWorkspaceOwnsRoutingStateAndMeta
 
     const auto reqs = llaminar2::MoEWorkspaceBuffers::rocmMoE(
         max_seq_len, d_model, intermediate, num_experts, top_k);
-    const auto *histogram = reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_HISTOGRAM_COUNTS);
-    ASSERT_NE(histogram, nullptr);
-    EXPECT_GE(histogram->size_bytes,
-              static_cast<size_t>(llaminar2::MoEWorkspaceBuffers::kHistogramLayerSlots) *
-                  static_cast<size_t>(num_experts) * sizeof(uint64_t));
-    const auto *expert_mask = reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_EXPERT_MASK);
-    ASSERT_NE(expert_mask, nullptr);
-    EXPECT_GE(expert_mask->size_bytes, static_cast<size_t>(num_experts) * sizeof(bool));
     EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES), nullptr);
     EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES), nullptr);
     EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES), nullptr);

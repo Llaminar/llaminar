@@ -16259,8 +16259,16 @@ TEST(Test__ROCmMoEKernel,
     EXPECT_THROW(directory->resetRequestPublications(nullptr),
                  std::invalid_argument);
 
-    hipStream_t stream = nullptr;
-    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+    hipStream_t reset_stream = nullptr;
+    hipStream_t consumer_stream = nullptr;
+    hipEvent_t reset_ready = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&reset_stream, hipStreamNonBlocking),
+              hipSuccess);
+    ASSERT_EQ(hipStreamCreateWithFlags(&consumer_stream, hipStreamNonBlocking),
+              hipSuccess);
+    ASSERT_EQ(hipEventCreateWithFlags(
+                  &reset_ready,
+                  hipEventDisableTiming),
               hipSuccess);
     const auto baseline = directory->hostEntriesForTest();
     const size_t bytes =
@@ -16300,24 +16308,39 @@ TEST(Test__ROCmMoEKernel,
                       published.data(),
                       bytes,
                       hipMemcpyHostToDevice,
-                      stream),
+                      reset_stream),
                   hipSuccess);
         ASSERT_NO_THROW(
-            directory->resetRequestPublications(stream));
+            directory->resetRequestPublications(reset_stream));
+
+        /*
+         * Match the production reset transaction: publication stays
+         * asynchronous on its producer stream, then the next graph consumer
+         * waits on one reusable event. No host or full-device synchronization
+         * is permitted to manufacture coherence between these streams.
+         */
+        ASSERT_EQ(hipEventRecord(reset_ready, reset_stream), hipSuccess);
+        ASSERT_EQ(hipStreamWaitEvent(
+                      consumer_stream,
+                      reset_ready,
+                      /*flags=*/0),
+                  hipSuccess);
         ASSERT_EQ(hipMemcpyAsync(
                       restored.data(),
                       directory->deviceEntries(),
                       bytes,
                       hipMemcpyDeviceToHost,
-                      stream),
+                      consumer_stream),
                   hipSuccess);
-        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(consumer_stream), hipSuccess);
         EXPECT_EQ(std::memcmp(restored.data(), baseline.data(), bytes), 0)
             << "ROCm request reset leaked a transfer-slot occupant at epoch "
             << request_epoch;
     }
 
-    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+    EXPECT_EQ(hipEventDestroy(reset_ready), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(consumer_stream), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(reset_stream), hipSuccess);
 }
 
 TEST(Test__ROCmMoEKernel, GroupedPrefill_Q4KGateUp_Q5KDownMatchesSequentialGemm)
@@ -17448,290 +17471,6 @@ TEST(Test__ROCmMoEKernel, KernelFactoryDispatch)
     EXPECT_FALSE(kernel->supports_device(-1))
         << "ROCm MoE kernel should NOT support CPU device index";
 }
-
-// ============================================================================
-// Phase 2 Tests: Device-Resident Histogram + Expert Mask
-// ============================================================================
-
-// ============================================================================
-// Test: recordHistogramDevice() + syncHistogramToHost()
-// ============================================================================
-
-TEST(Test__ROCmMoEKernel, Histogram_RecordAndSync)
-{
-    SKIP_IF_NO_ROCM();
-
-    const int seq_len = 8;
-    const int top_k = 2;
-    const int num_experts = 8;
-    const int layer_idx = 0;
-
-    // Known routing indices: each token picks 2 experts
-    // Token 0: experts 0, 1
-    // Token 1: experts 2, 3
-    // Token 2: experts 0, 2
-    // Token 3: experts 1, 3
-    // Token 4: experts 4, 5
-    // Token 5: experts 6, 7
-    // Token 6: experts 0, 7
-    // Token 7: experts 3, 5
-    std::vector<int> routing_indices = {
-        0, 1, 2, 3, 0, 2, 1, 3, 4, 5, 6, 7, 0, 7, 3, 5};
-
-    // Expected histogram: count occurrences of each expert
-    // Expert 0: 3 (tokens 0, 2, 6)
-    // Expert 1: 2 (tokens 0, 3)
-    // Expert 2: 2 (tokens 1, 2)
-    // Expert 3: 3 (tokens 1, 3, 7)
-    // Expert 4: 1 (token 4)
-    // Expert 5: 2 (tokens 4, 7)
-    // Expert 6: 1 (token 5)
-    // Expert 7: 2 (tokens 5, 6)
-    std::vector<uint64_t> expected_counts = {3, 2, 2, 3, 1, 2, 1, 2};
-
-    // Upload routing indices to device
-    int *d_indices = nullptr;
-    (void)hipMalloc(&d_indices, routing_indices.size() * sizeof(int));
-    (void)hipMemcpy(d_indices, routing_indices.data(),
-              routing_indices.size() * sizeof(int), hipMemcpyHostToDevice);
-
-    ROCmMoEKernel gpu_kernel(0);
-    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
-    gpu_kernel.recordHistogramDevice(d_indices, seq_len, top_k, layer_idx);
-
-    // Sync histogram to host
-    std::vector<uint64_t> host_counts(num_experts, 0);
-    gpu_kernel.syncHistogramToHost(host_counts.data(), layer_idx, num_experts);
-
-    (void)hipFree(d_indices);
-
-    // Verify counts
-    uint64_t total_count = 0;
-    for (int e = 0; e < num_experts; ++e)
-    {
-        total_count += host_counts[e];
-        EXPECT_EQ(host_counts[e], expected_counts[e])
-            << "Expert " << e << " count mismatch: got " << host_counts[e]
-            << " expected " << expected_counts[e];
-    }
-
-    uint64_t expected_total = static_cast<uint64_t>(seq_len) * top_k;
-    EXPECT_EQ(total_count, expected_total)
-        << "Total histogram count mismatch";
-
-    std::cout << "[Histogram_RecordAndSync] total_count=" << total_count
-              << " expected=" << expected_total << std::endl;
-}
-
-// ============================================================================
-// Test: resetHistogramDevice()
-// ============================================================================
-
-TEST(Test__ROCmMoEKernel, Histogram_Reset)
-{
-    SKIP_IF_NO_ROCM();
-
-    const int seq_len = 4;
-    const int top_k = 2;
-    const int num_experts = 8;
-    const int layer_idx = 0;
-
-    // Record some histogram data
-    std::vector<int> routing_indices = {0, 1, 2, 3, 4, 5, 6, 7};
-    int *d_indices = nullptr;
-    (void)hipMalloc(&d_indices, routing_indices.size() * sizeof(int));
-    (void)hipMemcpy(d_indices, routing_indices.data(),
-              routing_indices.size() * sizeof(int), hipMemcpyHostToDevice);
-
-    ROCmMoEKernel gpu_kernel(0);
-    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
-    gpu_kernel.recordHistogramDevice(d_indices, seq_len, top_k, layer_idx);
-
-    // Verify something was recorded
-    std::vector<uint64_t> counts_before(num_experts, 0);
-    gpu_kernel.syncHistogramToHost(counts_before.data(), layer_idx, num_experts);
-    uint64_t sum_before = 0;
-    for (auto c : counts_before)
-        sum_before += c;
-    ASSERT_GT(sum_before, 0u) << "Histogram should have non-zero counts before reset";
-
-    // Reset
-    gpu_kernel.resetHistogramDevice(layer_idx, num_experts);
-
-    // Sync and verify all zero
-    std::vector<uint64_t> counts_after(num_experts, 99);
-    gpu_kernel.syncHistogramToHost(counts_after.data(), layer_idx, num_experts);
-
-    for (int e = 0; e < num_experts; ++e)
-    {
-        EXPECT_EQ(counts_after[e], 0u)
-            << "Expert " << e << " should be 0 after reset, got " << counts_after[e];
-    }
-
-    (void)hipFree(d_indices);
-
-    std::cout << "[Histogram_Reset] sum_before=" << sum_before
-              << " sum_after=0 (all zeroed)" << std::endl;
-}
-
-// ============================================================================
-// Test: Expert mask zeros out weights for inactive experts
-// ============================================================================
-
-TEST(Test__ROCmMoEKernel, ExpertMask_ApplyZerosWeights)
-{
-    SKIP_IF_NO_ROCM();
-
-    const int seq_len = 8;
-    const int top_k = 4;
-    const int num_experts = 8;
-    const int total_slots = seq_len * top_k;
-
-    // Create routing indices — each token picks 4 experts
-    std::vector<int> routing_indices(total_slots);
-    std::vector<float> routing_weights(total_slots);
-    std::mt19937 gen(42);
-    std::uniform_int_distribution<int> expert_dist(0, num_experts - 1);
-    std::uniform_real_distribution<float> weight_dist(0.05f, 0.5f);
-    for (int i = 0; i < total_slots; ++i)
-    {
-        routing_indices[i] = expert_dist(gen);
-        routing_weights[i] = weight_dist(gen);
-    }
-
-    // Save original weights for comparison
-    std::vector<float> original_weights = routing_weights;
-
-    // Expert mask: experts 0,1 active, experts 2-7 inactive
-    std::vector<bool> mask(num_experts, false);
-    mask[0] = true;
-    mask[1] = true;
-
-    // Upload to device
-    int *d_indices = nullptr;
-    float *d_weights = nullptr;
-    (void)hipMalloc(&d_indices, total_slots * sizeof(int));
-    (void)hipMalloc(&d_weights, total_slots * sizeof(float));
-    (void)hipMemcpy(d_indices, routing_indices.data(), total_slots * sizeof(int), hipMemcpyHostToDevice);
-    (void)hipMemcpy(d_weights, routing_weights.data(), total_slots * sizeof(float), hipMemcpyHostToDevice);
-
-    ROCmMoEKernel gpu_kernel(0);
-    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
-    // Need to convert std::vector<bool> to a contiguous bool array
-    std::vector<char> mask_bytes(num_experts);
-    for (int i = 0; i < num_experts; ++i)
-        mask_bytes[i] = mask[i] ? 1 : 0;
-    gpu_kernel.updateExpertMaskDevice(reinterpret_cast<const bool *>(mask_bytes.data()), num_experts);
-    gpu_kernel.applyExpertMaskDevice(d_weights, d_indices, seq_len, top_k);
-    (void)hipDeviceSynchronize();
-
-    // Read back weights
-    std::vector<float> result_weights(total_slots);
-    (void)hipMemcpy(result_weights.data(), d_weights, total_slots * sizeof(float), hipMemcpyDeviceToHost);
-
-    (void)hipFree(d_indices);
-    (void)hipFree(d_weights);
-
-    // Verify
-    int zeroed_count = 0;
-    int unchanged_count = 0;
-    for (int i = 0; i < total_slots; ++i)
-    {
-        int expert = routing_indices[i];
-        if (expert == 0 || expert == 1)
-        {
-            EXPECT_FLOAT_EQ(result_weights[i], original_weights[i])
-                << "Active expert " << expert << " weight at slot " << i
-                << " should be unchanged";
-            if (result_weights[i] == original_weights[i])
-                ++unchanged_count;
-        }
-        else
-        {
-            EXPECT_FLOAT_EQ(result_weights[i], 0.0f)
-                << "Inactive expert " << expert << " weight at slot " << i
-                << " should be zeroed";
-            if (result_weights[i] == 0.0f)
-                ++zeroed_count;
-        }
-    }
-
-    std::cout << "[ExpertMask_ApplyZerosWeights] zeroed=" << zeroed_count
-              << " unchanged=" << unchanged_count
-              << " total=" << total_slots << std::endl;
-}
-
-// ============================================================================
-// Test: All-active expert mask leaves weights unchanged
-// ============================================================================
-
-TEST(Test__ROCmMoEKernel, ExpertMask_AllActiveNoChange)
-{
-    SKIP_IF_NO_ROCM();
-
-    const int seq_len = 8;
-    const int top_k = 2;
-    const int num_experts = 8;
-    const int total_slots = seq_len * top_k;
-
-    // Create routing indices and weights
-    std::vector<int> routing_indices(total_slots);
-    std::vector<float> routing_weights(total_slots);
-    std::mt19937 gen(123);
-    std::uniform_int_distribution<int> expert_dist(0, num_experts - 1);
-    std::uniform_real_distribution<float> weight_dist(0.05f, 0.5f);
-    for (int i = 0; i < total_slots; ++i)
-    {
-        routing_indices[i] = expert_dist(gen);
-        routing_weights[i] = weight_dist(gen);
-    }
-    std::vector<float> original_weights = routing_weights;
-
-    // All experts active
-    std::vector<char> mask_bytes(num_experts, 1);
-
-    // Upload to device
-    int *d_indices = nullptr;
-    float *d_weights = nullptr;
-    (void)hipMalloc(&d_indices, total_slots * sizeof(int));
-    (void)hipMalloc(&d_weights, total_slots * sizeof(float));
-    (void)hipMemcpy(d_indices, routing_indices.data(), total_slots * sizeof(int), hipMemcpyHostToDevice);
-    (void)hipMemcpy(d_weights, routing_weights.data(), total_slots * sizeof(float), hipMemcpyHostToDevice);
-
-    ROCmMoEKernel gpu_kernel(0);
-    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
-    gpu_kernel.updateExpertMaskDevice(reinterpret_cast<const bool *>(mask_bytes.data()), num_experts);
-    gpu_kernel.applyExpertMaskDevice(d_weights, d_indices, seq_len, top_k);
-    (void)hipDeviceSynchronize();
-
-    // Read back
-    std::vector<float> result_weights(total_slots);
-    (void)hipMemcpy(result_weights.data(), d_weights, total_slots * sizeof(float), hipMemcpyDeviceToHost);
-
-    (void)hipFree(d_indices);
-    (void)hipFree(d_weights);
-
-    // Verify all weights unchanged
-    int mismatches = 0;
-    for (int i = 0; i < total_slots; ++i)
-    {
-        if (result_weights[i] != original_weights[i])
-        {
-            ++mismatches;
-            ADD_FAILURE() << "Weight at slot " << i << " changed: "
-                          << original_weights[i] << " -> " << result_weights[i];
-        }
-    }
-
-    EXPECT_EQ(mismatches, 0) << "All-active mask should leave all weights unchanged";
-
-    std::cout << "[ExpertMask_AllActiveNoChange] mismatches=" << mismatches
-              << " total_slots=" << total_slots << std::endl;
-}
-
-// ============================================================================
-// Phase 3 Tests: Device-Side Token Grouping
-// ============================================================================
 
 // ============================================================================
 // Test: groupTokensByExpertDevice() — basic correctness

@@ -222,25 +222,6 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Reject
         std::runtime_error);
 }
 
-TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceGraphControllerDefaultsEnabled)
-{
-    ScopedEnvVars env({
-        {"LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER", nullptr},
-    });
-
-    EXPECT_TRUE(debugEnv().moe_rebalance.device_rebalance_graph_controller)
-        << "Homogeneous GPU dynamic rebalance should use the graph-native device controller by default.";
-}
-
-TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceGraphControllerEnvCanDisableDefault)
-{
-    ScopedEnvVars env({
-        {"LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER", "0"},
-    });
-
-    EXPECT_FALSE(debugEnv().moe_rebalance.device_rebalance_graph_controller);
-}
-
 TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalancePayloadSidebandDefaultsOff)
 {
     ScopedEnvVars env({

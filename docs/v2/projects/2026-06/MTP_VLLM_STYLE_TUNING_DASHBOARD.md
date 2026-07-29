@@ -52,6 +52,26 @@ The complete Integration unit gate passes `589/589`. Architecture estimate:
 LocalTP 97%, ExpertParallel 95%; remote-participant stochastic coverage and
 all-format economy certification remain.
 
+The follow-on transfer-state audit added production-shaped cross-stream reset
+coverage on CUDA and ROCm: each of 32 request epochs now publishes reset work
+on one stream, records an event, and consumes the reset directory from a
+different stream. Both canonical rebalance matrices pass `31/31`. The audit
+also retired the unused ROCm-only histogram/expert-mask API, its blocking host
+observation method, three dead launchers, four self-referential integration
+tests, and two unconsumed persistent workspace buffers. Source synchronization
+and forbidden-dependency guards remain green. Architecture estimate:
+SingleDevice 95%, LocalTP 97%, ExpertParallel 95%.
+
+Homogeneous graph-stable GPU Dynamic/LLEP no longer has a debug-environment
+escape hatch to the host controller. Once that topology is recognized, every
+invalid device-controller prerequisite is fatal instead of selecting host
+publication/apply. The orchestrator's 45-test dependency suite, source policy
+guards, and both CUDA/ROCm `31/31` rebalance/reset matrices pass. Accelerator
+build caching was also verified directly for CUDA `nvcc` (including its
+internal `cicc`/`ptxas` work) and ROCm clang 20; a repeated two-object probe
+produced two direct hits, and container-wide cache identity/capacity is now
+fixed at a workspace-relative 50 GB.
+
 ## Device And Topology Matrix
 
 | Mode | Device / degree | Dense greedy | Dense stoch | MoE greedy | MoE stoch | Status |

@@ -347,7 +347,6 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/local_execution/orchestrators/DeviceSampler.cpp", "DeviceSampler::sample", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceSampler.cpp", "DeviceSampler::sampleGreedyFromLocalInfos", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceSampler.cpp", "DeviceSampler::sampleGreedyRowsFromLocalInfos", "backend_sync_compute", 1),
-        ("src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp", "ROCmMoEKernel::syncHistogramToHost", "raw_stream", 1),
         ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::waitForEventWithProxy", "backend_event", 1),
     ),
     *reviewed(

@@ -89,6 +89,23 @@ def verify_ccache_declarations(repo_root: pathlib.Path) -> None:
     if 'CCACHE_MAX_SIZE="${LLAMINAR_CCACHE_MAXSIZE:-50G}"' not in setup_text:
         raise AssertionError(f"{setup_path} does not retain the 50G cache default")
 
+    devcontainer_path = repo_root / ".devcontainer/devcontainer.json"
+    devcontainer = json.loads(devcontainer_path.read_text(encoding="utf-8"))
+    container_env = devcontainer.get("containerEnv", {})
+    required_container_env = {
+        "CCACHE_DIR": "/home/vscode/.ccache",
+        "CCACHE_MAXSIZE": "50G",
+        "CCACHE_BASEDIR": "/workspaces/llaminar",
+        "CCACHE_NOHASHDIR": "1",
+    }
+    for variable, expected in required_container_env.items():
+        actual = container_env.get(variable)
+        if actual != expected:
+            raise AssertionError(
+                f"{devcontainer_path} must publish {variable}={expected!r} "
+                f"to every container process, got {actual!r}"
+            )
+
     dockerfile_path = repo_root / "Dockerfile"
     dockerfile = dockerfile_path.read_text(encoding="utf-8")
     if "CCACHE_MAXSIZE=50G" not in dockerfile:

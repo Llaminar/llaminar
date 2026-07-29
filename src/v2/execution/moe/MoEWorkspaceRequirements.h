@@ -61,8 +61,6 @@ namespace llaminar2
 
         constexpr const char *ROCM_SHARED_GATE = "rocm_moe_shared_gate";
         constexpr const char *ROCM_ROUTE_LOGITS_PARTIALS = "rocm_moe_route_logits_partials";
-        constexpr const char *ROCM_HISTOGRAM_COUNTS = "rocm_moe_histogram_counts";
-        constexpr const char *ROCM_EXPERT_MASK = "rocm_moe_expert_mask";
         constexpr const char *ROCM_ROUTER_Q8_HIDDEN = "rocm_moe_router_q8_hidden";
         constexpr const char *ROCM_ROUTER_Q8_SCALES = "rocm_moe_router_q8_scales";
         constexpr const char *ROCM_ROUTER_Q8_GATE_WEIGHTS = "rocm_moe_router_q8_gate_weights";
@@ -120,7 +118,6 @@ namespace llaminar2
          * sequential stages.
          */
         constexpr int kRouterGateCacheSlots = kMaximumMoELayersPerDevice;
-        constexpr int kHistogramLayerSlots = kMaximumMoELayersPerDevice;
         static_assert(
             kGroupedDescriptorTableSlots <= kRuntimePointerTableSlots,
             "Every persistent descriptor identity needs a matching runtime pointer-table identity");
@@ -313,10 +310,6 @@ namespace llaminar2
 
             add(reqs, ROCM_ROUTE_LOGITS_PARTIALS,
                 static_cast<std::size_t>(num_experts) * kMaxRouterPartitions * sizeof(float));
-            add(reqs, ROCM_HISTOGRAM_COUNTS,
-                static_cast<std::size_t>(kHistogramLayerSlots) *
-                    static_cast<std::size_t>(num_experts) * sizeof(uint64_t));
-            add(reqs, ROCM_EXPERT_MASK, static_cast<std::size_t>(num_experts) * sizeof(bool));
             add(reqs, ROCM_ROUTER_Q8_HIDDEN,
                 static_cast<std::size_t>(max_seq_len) *
                     static_cast<std::size_t>(d_model) * sizeof(int8_t));

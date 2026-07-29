@@ -523,7 +523,6 @@ run_one() {
       run_env+=("${name}=${!name}")
     fi
   }
-  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER
   inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH
   inherit_env_if_set LLAMINAR_MOE_ALLOW_LEGACY_COLLECTIVE_REBALANCE_TRANSFER
   inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND
