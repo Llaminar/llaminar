@@ -7,8 +7,9 @@
  * This complements the GPU Stage Timeline (which shows per-kernel GPU time)
  * by revealing WHERE wall-clock time is spent at the engine/orchestration level.
  *
- * Gated by LLAMINAR_PROFILING=1 (via KernelProfiler::isEnabled()). Zero overhead
- * when disabled — all record*() calls are inlined no-ops.
+ * Gated by the explicit PerfStats GPU timing request or focused legacy kernel
+ * timing through `KernelProfiler::isEnabled()`. Structured JSON/CSV export
+ * alone remains passive. Recorded phases are always mirrored into PerfStats.
  *
  * Lifecycle: Owned by ForwardExecutionEngine. Accumulated data is flushed by
  * flushStageTimeline() at benchmark end, alongside GPU stage timing tables.

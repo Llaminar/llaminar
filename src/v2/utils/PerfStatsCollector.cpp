@@ -110,9 +110,24 @@ namespace llaminar2
                    normalized == "off" || normalized == "no";
         }
 
+        /**
+         * @brief Return whether the deprecated unified profiling alias is enabled.
+         *
+         * The legacy switch is read directly from the process environment so it
+         * cannot leak back into `DebugEnv::ProfileConfig` or
+         * `DebugEnv::ExecutionConfig`.  This separation is architectural: a
+         * request for measurements must never select eager execution, disable a
+         * captured graph, or otherwise change the engine being measured.
+         */
+        bool legacyUnifiedProfilingRequested()
+        {
+            return isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_PROFILING"));
+        }
+
         bool isSummaryRequested()
         {
-            return !isFalseyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_TABLE")) ||
+            return legacyUnifiedProfilingRequested() ||
+                   !isFalseyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_TABLE")) ||
                    !isFalseyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_SUMMARY"));
         }
 
@@ -186,7 +201,8 @@ namespace llaminar2
 
         bool perfStatsGpuStageTimingRequested()
         {
-            return isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING")) ||
+            return legacyUnifiedProfilingRequested() ||
+                   isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING")) ||
                    filterRequestsStageGpuTiming();
         }
 
@@ -701,11 +717,30 @@ namespace llaminar2
         if (Logger::getInstance().getRank() > 0)
             return true;
 
+        if (legacyUnifiedProfilingRequested())
+        {
+            static std::once_flag warning_once;
+            std::call_once(
+                warning_once,
+                []
+                {
+                    LOG_WARN(
+                        "[PerfStatsCollector] LLAMINAR_PROFILING is deprecated "
+                        "and now aliases graph-safe PerfStats collection. Use "
+                        "LLAMINAR_PERF_STATS_SUMMARY=1 and "
+                        "LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1, optionally "
+                        "with LLAMINAR_PERF_STATS_JSON/CSV. The deprecated "
+                        "switch no longer changes graph capture or executor "
+                        "topology.");
+                });
+        }
+
         const std::string json_path =
             exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json");
         const std::string csv_path =
             exportPathFromEnv("LLAMINAR_PERF_STATS_CSV", "/tmp/llaminar_perf_stats.csv");
-        if (json_path.empty() && csv_path.empty())
+        const bool summary_requested = isSummaryRequested();
+        if (json_path.empty() && csv_path.empty() && !summary_requested)
             return true;
 
         const auto filters = filterListFromEnv();
@@ -745,7 +780,7 @@ namespace llaminar2
                 s.csv_version = s.version;
             }
         }
-        if (isSummaryRequested() && summary_version != version)
+        if (summary_requested && summary_version != version)
         {
             printSummary(filters, summaryLimitFromEnv());
             std::lock_guard<std::mutex> lock(s.mutex);

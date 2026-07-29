@@ -2314,7 +2314,7 @@ namespace llaminar2
                 return false;
             }
 
-            // Gate all phase timing behind LLAMINAR_PROFILING to eliminate ~18 chrono
+            // Gate legacy phase timing behind LLAMINAR_PROFILE_KERNELS to eliminate ~18 chrono
             // calls per GEMM (~630ns × 140 GEMMs/token = ~88μs/token).
             const bool phase_timing = debugEnv().profile.enabled;
             std::chrono::high_resolution_clock::time_point phase_start{};

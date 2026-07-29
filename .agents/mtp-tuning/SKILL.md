@@ -279,8 +279,10 @@ Start with real inference, then isolate:
 
 1. Capture a Release benchmark for the relevant lane with fixed d1/d2/d3 and
    dynamic depth.
-2. Enable perfstats/stage timing only to rank bottlenecks. Profiling may disable
-   graph capture, so do not quote profiled throughput as production speed.
+2. Enable `LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1` with JSON/CSV export to rank
+   graph-replay bottlenecks on the production captured topology. The deprecated
+   `LLAMINAR_PROFILING` alias must never disable graph capture or select eager
+   execution.
 3. Split host bridge accounting from producer work. A D2H timer that includes
    waiting for a producer event is not proof of copy overhead.
 4. Attack the biggest real chunk first. For MTP this is usually verifier forward,

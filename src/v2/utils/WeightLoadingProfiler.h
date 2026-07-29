@@ -2,7 +2,8 @@
  * @file WeightLoadingProfiler.h
  * @brief Profiling for weight loading phases (GGUF parse, tensor load, repack, device upload)
  *
- * Captures timing for each phase of weight loading when LLAMINAR_PROFILING=1 is set.
+ * Captures timing for each phase of weight loading when PerfStats export or
+ * explicit legacy kernel profiling is enabled.
  * Prints a summary table alongside the other profiling summaries in benchmark mode.
  *
  * Usage:

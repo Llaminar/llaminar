@@ -4156,7 +4156,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, LocalTPWoAllQuantizedFormatsGroupedVerifierR
      * quantized tensor format, not just the IQ3_S model file that exposed the
      * latest full-parity drift.
      */
-    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
     const std::vector<DeviceId> devices = {DeviceId::rocm(0), DeviceId::rocm(1)};
 
     uint32_t seed = 8800;
@@ -4188,7 +4187,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, LocalTPWoFloatingPointFormatsGroupedVerifier
      * LocalTP reconstruction gate so FP32, FP16, and BF16 verifier rows cannot
      * silently drift from serial decode when models use floating-point weights.
      */
-    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
     const std::vector<DeviceId> devices = {DeviceId::rocm(0), DeviceId::rocm(1)};
 
     uint32_t seed = 10800;
@@ -4220,7 +4218,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, ReplicatedWoAllQuantizedFormatsGroupedVerifi
      * This sweep proves that route for every ROCm native quantized format,
      * independently of the existing row-parallel allreduce reconstruction test.
      */
-    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
     const DeviceId device = DeviceId::rocm(0);
 
     uint32_t seed = 12800;
@@ -4249,7 +4246,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, ReplicatedWoFloatingPointFormatsGroupedVerif
      * shape-dependent reductions, so FP32/FP16/BF16 stay in the byte-equality
      * matrix instead of relying on relaxed numeric tolerances.
      */
-    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
     const DeviceId device = DeviceId::rocm(0);
 
     uint32_t seed = 14800;

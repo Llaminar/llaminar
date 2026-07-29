@@ -238,24 +238,43 @@ TEST(Test__PerfStatsCollector, PerfStatsStageGpuRequestsEnableGpuStageEventTimin
     }
 }
 
-TEST(Test__PerfStatsCollector, ExplicitProfilingOrGpuStageTimingEnablesGpuStageEventTiming)
+TEST(Test__PerfStatsCollector, DeprecatedUnifiedProfilingAliasesGraphSafePerfStatsOnly)
 {
-    {
-        ScopedEnv profiling("LLAMINAR_PROFILING", "1");
-        ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", nullptr);
-        EXPECT_TRUE(PerfStatsCollector::gpuStageEventTimingEnabled());
-    }
+    ScopedEnv kernel_profiling("LLAMINAR_PROFILE_KERNELS", nullptr);
+    ScopedEnv executor_profiling("LLAMINAR_EXECUTOR_PROFILING", nullptr);
+    ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv perf_stage_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv summary("LLAMINAR_PERF_STATS_SUMMARY", nullptr);
+    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
 
-    {
-        ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
-        ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
-        EXPECT_TRUE(PerfStatsCollector::gpuStageEventTimingEnabled());
-    }
+    EXPECT_TRUE(PerfStatsCollector::isEnabled());
+    EXPECT_TRUE(PerfStatsCollector::gpuStageEventTimingEnabled());
+    EXPECT_FALSE(debugEnv().profile.enabled);
+    EXPECT_FALSE(debugEnv().execution.executor_profiling);
+}
+
+TEST(Test__PerfStatsCollector, DeprecatedUnifiedProfilingFlushesSummaryWithoutExportPath)
+{
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", nullptr);
+    ScopedEnv csv("LLAMINAR_PERF_STATS_CSV", nullptr);
+    ScopedEnv table("LLAMINAR_PERF_STATS_TABLE", nullptr);
+    ScopedEnv summary("LLAMINAR_PERF_STATS_SUMMARY", nullptr);
+    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
+    PerfStatsCollector::reset();
+
+    PerfStatsCollector::addCounter("profiling", "summary_only_flush", 1.0);
+    testing::internal::CaptureStdout();
+    EXPECT_TRUE(PerfStatsCollector::flushFromEnv());
+    const std::string output = testing::internal::GetCapturedStdout();
+
+    EXPECT_NE(output.find("UNIFIED PERF STATS"), std::string::npos);
+    EXPECT_NE(output.find("profiling.summary_only_flush"), std::string::npos);
 }
 
 TEST(Test__PerfStatsCollector, ExistingProfilersPublishStructuredRecords)
 {
     ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv kernel_timing("LLAMINAR_PROFILE_KERNELS", "1");
     PerfStatsCollector::reset();
     KernelProfiler::resetAll();
     KVCacheProfiler::reset();

@@ -2289,7 +2289,7 @@ namespace llaminar2
             return false;
         }
 
-        // TP timing diagnostic — enabled via LLAMINAR_TP_TIMING=1 or LLAMINAR_PROFILING=1
+        // TP timing diagnostic: explicit executor instrumentation only.
         const bool tp_timing = debugEnv().tp_timing;
         const bool tp_profiling = debugEnv().execution.executor_profiling;
         const bool collect_timing = tp_timing || tp_profiling;

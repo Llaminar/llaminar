@@ -902,6 +902,53 @@ TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
         << "BenchmarkRunner must not bypass orchestration decodeStep when it is available";
 }
 
+/**
+ * @brief Prove the deprecated unified profiler measures orchestrated MTP through PerfStats.
+ *
+ * MTP returns from the orchestrated decode-step branch before the legacy
+ * token-by-token sampler loop.  This regression prevents the profiling
+ * migration from silently reporting no host transaction timing for the
+ * production MTP path.
+ */
+TEST(Test__BenchmarkRunnerCPU, DeprecatedProfilerRecordsOrchestratedDecodeStepPerfStats)
+{
+    ScopedEnv deprecated_profiling("LLAMINAR_PROFILING", "1");
+    PerfStatsCollector::reset();
+
+    auto runner = std::make_shared<MockOrchestratedDecodeRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 3;
+    config.mtp.enabled = true;
+
+    const auto result = bench.run(config);
+    ASSERT_TRUE(result.success) << result.failure_reason;
+
+    const auto records = PerfStatsCollector::snapshot({"decode_loop"});
+    const auto has_record = [&records](const std::string &name)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&name](const PerfStatRecord &record)
+            {
+                return record.domain == "decode_loop" &&
+                       record.name == name &&
+                       record.kind == PerfStatRecord::Kind::Timer &&
+                       record.count > 0;
+            });
+    };
+
+    EXPECT_TRUE(has_record("orchestrated_step"));
+    EXPECT_TRUE(has_record("orchestrated_maintenance"));
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__BenchmarkRunnerCPU, PostWarmupCallbackSeesDecodeHistogramBeforePrefillCaptureClearsState)
 {
     ScopedGpuGraphsSetting force_gpu_graph_warmup(true);
@@ -1130,6 +1177,50 @@ TEST(Test__BenchmarkRunnerCPU, UsesRequestBatchedDecodeStepWhenMTPBatchRequested
     EXPECT_EQ(runner->lastSamplingParams().temperature, 0.7f);
     EXPECT_EQ(runner->lastSamplingParams().top_k, 32);
     EXPECT_EQ(runner->lastSamplingParams().top_p, 0.9f);
+}
+
+/**
+ * @brief Prove request-batched MTP exposes its distinct host transaction timing.
+ */
+TEST(Test__BenchmarkRunnerCPU, DeprecatedProfilerRecordsRequestBatchedDecodePerfStats)
+{
+    ScopedEnv deprecated_profiling("LLAMINAR_PROFILING", "1");
+    PerfStatsCollector::reset();
+
+    auto runner = std::make_shared<MockBatchedOrchestratedDecodeRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 3;
+    config.mtp.enabled = true;
+    config.mtp.max_request_batch = 2;
+    config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+
+    const auto result = bench.run(config);
+    ASSERT_TRUE(result.success) << result.failure_reason;
+
+    const auto records = PerfStatsCollector::snapshot({"decode_loop"});
+    const auto has_record = [&records](const std::string &name)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&name](const PerfStatRecord &record)
+            {
+                return record.domain == "decode_loop" &&
+                       record.name == name &&
+                       record.kind == PerfStatRecord::Kind::Timer &&
+                       record.count > 0;
+            });
+    };
+
+    EXPECT_TRUE(has_record("request_batch_step"));
+    EXPECT_TRUE(has_record("request_batch_maintenance"));
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__BenchmarkRunnerCPU, FailsRequestBatchedPrefillWhenRunnerDoesNotOptIn)

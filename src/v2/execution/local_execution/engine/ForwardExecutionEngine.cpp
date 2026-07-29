@@ -2300,7 +2300,7 @@ namespace llaminar2
                                              << subphase.str());
         }
 
-        // Forward pass wall-clock profiler (enabled via LLAMINAR_PROFILING=1)
+        // Forward-pass host phases are exported through the explicit PerfStats timing gate.
         if (profiling_setup)
         {
             ForwardPassProfiler::PhaseTimings timings;

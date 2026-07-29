@@ -3524,7 +3524,6 @@ TEST_F(Test__CUDAGemmParity, LocalTPWoAllQuantizedFormatsGroupedVerifierRowsMatc
     if (cuda_devices < 2)
         GTEST_SKIP() << "CUDA LocalTP Wo regression requires at least two CUDA devices";
 
-    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
     const std::vector<DeviceId> devices = {DeviceId::cuda(0), DeviceId::cuda(1)};
 
     uint32_t seed = 18800;
@@ -3558,7 +3557,6 @@ TEST_F(Test__CUDAGemmParity, LocalTPWoFloatingPointFormatsGroupedVerifierRowsMat
     if (cuda_devices < 2)
         GTEST_SKIP() << "CUDA LocalTP Wo regression requires at least two CUDA devices";
 
-    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
     const std::vector<DeviceId> devices = {DeviceId::cuda(0), DeviceId::cuda(1)};
 
     uint32_t seed = 20800;
@@ -3590,7 +3588,6 @@ TEST_F(Test__CUDAGemmParity, ReplicatedWoAllQuantizedFormatsGroupedVerifierRowsM
 {
     SKIP_IF_NO_CUDA();
 
-    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
     const DeviceId device = DeviceId::cuda(0);
 
     uint32_t seed = 22800;
@@ -3620,7 +3617,6 @@ TEST_F(Test__CUDAGemmParity, ReplicatedWoFloatingPointFormatsGroupedVerifierRows
 {
     SKIP_IF_NO_CUDA();
 
-    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
     const DeviceId device = DeviceId::cuda(0);
 
     uint32_t seed = 24800;

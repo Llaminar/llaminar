@@ -498,8 +498,10 @@ namespace llaminar2
         /**
          * @brief Get executor profiling statistics
          *
-         * Returns per-stage overhead breakdown (coherence, allocation, etc.)
-         * when profiling is enabled (LLAMINAR_PROFILING=1).
+         * Returns per-stage overhead breakdown (coherence, allocation, etc.).
+         * The benchmark runner exports populated statistics through PerfStats;
+         * `LLAMINAR_EXECUTOR_PROFILING=1` explicitly enables additional legacy
+         * executor instrumentation when diagnosing eager execution.
          *
          * @return Pointer to GraphExecutorStats, or nullptr if not available
          */

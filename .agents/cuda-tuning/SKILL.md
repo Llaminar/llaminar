@@ -1,6 +1,6 @@
 ---
 name: cuda-kernel-profiling
-description: Profile and tune Llaminar V2 CUDA kernels using LLAMINAR_PROFILING (per-kernel + per-stage timing), Nsight Systems (nsys), and Nsight Compute (ncu), then validate with the GEMM perf-test harness, the benchmark subcommand, and parity tests. Use when asked to find the slowest CUDA kernel, diagnose occupancy / register pressure / memory-bound stalls, A/B two kernel variants, or close a prefill/decode throughput gap while keeping PyTorch parity.
+description: Profile and tune Llaminar V2 CUDA kernels using graph-safe PerfStats replay timing, Nsight Systems (nsys), and Nsight Compute (ncu), then validate with the GEMM perf-test harness, the benchmark subcommand, and parity tests. Use when asked to find the slowest CUDA kernel, diagnose occupancy / register pressure / memory-bound stalls, A/B two kernel variants, or close a prefill/decode throughput gap while keeping PyTorch parity.
 applyTo: "src/v2/kernels/cuda/**,src/v2/backends/cuda/**,src/v2/execution/**,tests/v2/performance/kernels/cuda/**,tests/v2/integration/kernels/cuda/**"
 ---
 
@@ -11,7 +11,7 @@ applyTo: "src/v2/kernels/cuda/**,src/v2/backends/cuda/**,src/v2/execution/**,tes
 A repeatable, evidence-driven workflow for making Llaminar V2 CUDA kernels faster
 without breaking correctness. It chains four tools:
 
-1. **`LLAMINAR_PROFILING`** — coarse per-kernel + per-stage GPU timing to find the hotspot.
+1. **PerfStats GPU event timing** — production-graph replay timing and structured route/host counters.
 2. **`nsys`** — timeline / launch-count view to understand kernel ordering and CPU↔GPU overlap.
 3. **`ncu`** — per-kernel hardware-counter deep dive (occupancy, registers, spills, stalls).
 4. **Perf-test harness + benchmark + parity** — isolate, A/B, and validate the change end-to-end.
@@ -44,32 +44,29 @@ tok/s on prefill, <0.5 tok/s on decode). A change inside the noise band is **not
 
 ---
 
-## Step 1: Find the hotspot with `LLAMINAR_PROFILING`
+## Step 1: Find the hotspot with graph-safe PerfStats
 
-`LLAMINAR_PROFILING=1` enables **per-kernel timing + executor overhead + GPU stage timing**
-in a single flag. It needs no special build (works on Release).
+PerfStats measures the same production graph topology used for ordinary
+inference. Enable structured output and explicit GPU-event timing around graph
+replay:
 
 ```bash
-LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 benchmark -m <model>.gguf -d cuda:0
+LLAMINAR_PERF_STATS_JSON=/tmp/cuda-profile.json \
+LLAMINAR_PERF_STATS_SUMMARY=1 \
+LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1 \
+./build_v2_release/llaminar2 benchmark -m <model>.gguf -d cuda:0
 ```
 
-Read the GPU Stage Timeline / kernel tables and rank stages by total GPU time. Profiled
-operations include `GEMM_Q8`, `ATTENTION`, `FFN_*`, `LM_HEAD`, `RMS_NORM`, `SWIGLU`,
-`ROPE`, MoE routing/expert kernels, etc.
+Rank `stage_gpu.graph_replay.total` and graph/segment rows alongside
+`forward_graph`, `forward_pass`, `kernel`, `mtp`, and model-specific route
+counters. A monolithic captured graph intentionally does not pretend to have
+per-stage event attribution inside replay. Use `nsys` to identify kernels
+inside that graph, then target a single launch with `ncu`.
 
-> ⚠️ **CRITICAL CAVEAT — profiling changes execution mode.**
-> `LLAMINAR_PROFILING=1` sets `executor_profiling=true`, which **disables decode GPU
-> graph capture** (`buildDecodeCapturePolicy` gates `allow_segmented_capture` on
-> `!executor_profiling`). So *profiled* decode runs eager (per-stage events) and is
-> **slower than the real benchmark**. Use profiling to find *where* time goes
-> (relative ranking), never to quote an absolute decode tok/s number. Measure absolute
-> throughput with profiling **off**.
-
-> ⚠️ **Never leave `LLAMINAR_PROFILING` exported.** Verify a clean shell before
-> quoting any benchmark number:
-> ```bash
-> env | grep -i LLAMINAR_PROFIL   # must print nothing
-> ```
+`LLAMINAR_PROFILING=1` is deprecated. It aliases the PerfStats summary and GPU
+replay-event request for compatibility, emits a warning, and must never disable
+capture or select eager execution. New commands and automation must use the
+explicit `LLAMINAR_PERF_STATS_*` variables.
 
 Pick the single highest-time stage that is plausibly tunable (skip stages that are
 already compute-bound at the math limit, e.g. the big dense GEMMs, unless that's the
@@ -396,7 +393,9 @@ GEMM got faster. When the kernel is at the register ceiling, only **register-neu
 
 ```bash
 # Hotspot ranking (relative only; decode runs eager under profiling)
-LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 benchmark -m M.gguf -d cuda:0
+LLAMINAR_PERF_STATS_JSON=/tmp/cuda-profile.json \
+LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1 \
+./build_v2_release/llaminar2 benchmark -m M.gguf -d cuda:0
 
 # Timeline + launch order
 sudo /usr/local/cuda/bin/nsys profile -t cuda --stats=true -o /tmp/t -f true \

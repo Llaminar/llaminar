@@ -290,12 +290,17 @@ namespace llaminar2
     /**
      * @brief Kernel profiling configuration group
      *
-     * Controls per-operation timing instrumentation for performance analysis.
-     * When disabled, profiling methods have zero overhead (compile-time elimination).
+     * Controls the legacy hand-instrumented per-kernel timing tables.
+     *
+     * `LLAMINAR_PROFILING` is intentionally not consumed here.  The unified
+     * profiling switch is deprecated and now aliases the graph-safe
+     * `PerfStatsCollector` path, so enabling it must never alter executor or
+     * kernel execution topology.  Use `LLAMINAR_PROFILE_KERNELS` only when a
+     * focused legacy kernel table is explicitly required.
      */
     struct ProfileConfig
     {
-        bool enabled = false;       ///< Enable profiling (LLAMINAR_PROFILING=1 or legacy LLAMINAR_PROFILE_KERNELS=1)
+        bool enabled = false;       ///< Enable legacy hand-instrumented kernel timing (LLAMINAR_PROFILE_KERNELS=1)
         bool per_layer = false;     ///< Breakdown by layer index (LLAMINAR_PROFILE_PER_LAYER=1)
         bool per_iteration = false; ///< Print stats per decode iteration (LLAMINAR_PROFILE_PER_ITER=1)
         int print_interval = 0;     ///< Print every N iterations (0=only at end)
@@ -307,17 +312,15 @@ namespace llaminar2
 
         void reload()
         {
-            // New unified env var - enables all profiling
-            const char *unified_env = std::getenv("LLAMINAR_PROFILING");
-            if (unified_env)
-            {
-                enabled = (std::atoi(unified_env) != 0);
-            }
-            // Legacy env var - still supported for backward compatibility
+            enabled = false;
+            per_layer = false;
+            per_iteration = false;
+            print_interval = 0;
+
             const char *enabled_env = std::getenv("LLAMINAR_PROFILE_KERNELS");
             if (enabled_env)
             {
-                enabled = enabled || (std::atoi(enabled_env) != 0);
+                enabled = (std::atoi(enabled_env) != 0);
             }
 
             const char *per_layer_env = std::getenv("LLAMINAR_PROFILE_PER_LAYER");
@@ -1086,6 +1089,7 @@ namespace llaminar2
         void reload()
         {
             fast_decode = true;
+            executor_profiling = false;
             gpu_graphs = true;
             gpu_graph_verify = false;
             gpu_graph_recapture = false;
@@ -1109,17 +1113,10 @@ namespace llaminar2
                 execution_mode = mode_env;
             }
 
-            // New unified env var - enables all profiling including executor profiling
-            const char *unified_env = std::getenv("LLAMINAR_PROFILING");
-            if (unified_env)
-            {
-                executor_profiling = (std::atoi(unified_env) != 0);
-            }
-            // Legacy env var - still supported for backward compatibility
             const char *prof_env = std::getenv("LLAMINAR_EXECUTOR_PROFILING");
             if (prof_env)
             {
-                executor_profiling = executor_profiling || (std::atoi(prof_env) != 0);
+                executor_profiling = (std::atoi(prof_env) != 0);
             }
 
             const char *valid_env = std::getenv("LLAMINAR_EXECUTOR_VALIDATION");

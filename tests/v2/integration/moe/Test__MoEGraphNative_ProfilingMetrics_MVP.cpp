@@ -1,6 +1,6 @@
 /**
  * @file Test__MoEGraphNative_ProfilingMetrics_MVP.cpp
- * @brief Phase 14 integration: verifies that LLAMINAR_PROFILING=1 causes the
+ * @brief Phase 14 integration: verifies that explicit legacy kernel profiling causes the
  *        graph-native MoE overlay stages to emit profiling rows with the three
  *        new phase names and correct data.
  *

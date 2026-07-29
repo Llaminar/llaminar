@@ -1328,6 +1328,34 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PerfStatsExportDoesNotEnableKernelTimin
         << "Generic perf JSON/CSV export must stay passive and must not enable kernel/forward timing.";
 }
 
+/**
+ * @brief Prevent diagnostics from selecting a different decode execution engine.
+ *
+ * GPU profiling used to disable cached graph replay so the eager stage timeline
+ * could surround every stage. That made measurements unrepresentative and also
+ * violated graph-owned MTP publication contracts. Whole-graph GPU events now
+ * provide trustworthy production-path timing, so capture admission must remain
+ * entirely independent of both unified and executor profiling switches.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy, DecodeCapturePolicyCannotDependOnProfilingFlags)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto policy_source = sliceBetween(
+        source,
+        "DeviceGraphExecutor::DecodeCapturePolicy DeviceGraphOrchestrator::buildDecodeCapturePolicy(",
+        "bool DeviceGraphOrchestrator::hasHeterogeneousCollectiveExecutionDomain()");
+    const auto executable_policy = stripCommentsAndStringLiterals(policy_source);
+
+    EXPECT_EQ(executable_policy.find("executor_profiling"), std::string::npos)
+        << "Executor diagnostics must never disable or weaken production graph capture.";
+    EXPECT_EQ(executable_policy.find("LLAMINAR_PROFILING"), std::string::npos)
+        << "The deprecated unified profiling alias belongs in PerfStats, not capture policy.";
+    EXPECT_NE(executable_policy.find("allow_cached_graph_replay"), std::string::npos)
+        << "The guard must continue to inspect the production replay admission policy.";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, GraphCaptureControllerLimitsStreamSyncToDiagnostics)
 {
     const auto source = readFile(repoRoot() / "src/v2/execution/local_execution/graph/DeviceGraphCaptureController.cpp");

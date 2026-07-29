@@ -274,8 +274,10 @@ namespace llaminar2
             {
                 controller->logHistogramSummary();
 
-                // Print MoE profiling summary when LLAMINAR_PROFILING=1
-                if (KernelProfiler::isEnabled())
+                // Keep the legacy human-readable table behind its explicit
+                // switch. PerfStats requests export the same measurements as
+                // structured records and must not revive legacy console output.
+                if (debugEnv().profile.enabled)
                 {
                     std::print("{}", controller->getProfilingSummary());
                 }

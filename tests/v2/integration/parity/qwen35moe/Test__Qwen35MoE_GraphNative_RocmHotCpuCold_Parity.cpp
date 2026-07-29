@@ -18,7 +18,7 @@
  *   - Parity bodies are NOT unconditionally skipped — Phase 14 graph-native is implemented.
  *   - Asserts LLAMINAR_MOE_LEGACY_OVERLAY_DOMAIN_RUNTIME is NOT set.
  *   - Verifies MoEExpertOverlayProfiler cpu_fallback_rows > 0 in the
- *     profiler parity case. CTest discovery injects LLAMINAR_PROFILING=1.
+ *     profiler parity case. CTest discovery injects LLAMINAR_PROFILE_KERNELS=1.
  *
  * NOTE on multi-rank CPU sidecar: The cpu_cold domain is specified on world rank 1.
  * If OrchestrationRunner does not yet fully drive a participant-graph on rank 1
@@ -788,7 +788,7 @@ TEST_F(Qwen35MoEGraphNativeRocmHotCpuCold, DecodeParity)
  *        after a forward pass when the cold tier has expert assignments.
  *
  * Hardware-gated: skips when ROCm is absent or model file is missing.
- * CTest discovery injects LLAMINAR_PROFILING=1 for this profiler parity case.
+ * CTest discovery injects LLAMINAR_PROFILE_KERNELS=1 for this profiler parity case.
  *
  * This test validates the Phase 14 graph-native profiler metric end-to-end:
  *   - gn_sparse_dispatch row: compact_dispatch_bytes > 0 for cold-tier rows
@@ -809,7 +809,7 @@ TEST_F(Qwen35MoEGraphNativeRocmHotCpuCold, ProfilerCpuFallbackRows)
     // Profiling must be enabled at process startup because DebugEnv caches env
     // values. CTest discovery injects and mpirun-forwards this for profiler cases.
     ASSERT_TRUE(MoEExpertOverlayProfiler::isEnabled())
-        << "Profiler parity tests must run with LLAMINAR_PROFILING=1; "
+        << "Profiler parity tests must run with LLAMINAR_PROFILE_KERNELS=1; "
            "CTest discovery should inject and mpirun-forward it.";
 
     const bool hardware_and_model_ok = collectivelyCheckHardwareAndModel();
@@ -839,7 +839,7 @@ TEST_F(Qwen35MoEGraphNativeRocmHotCpuCold, ProfilerCpuFallbackRows)
 
     const auto &rows = MoEExpertOverlayProfiler::rows();
     ASSERT_FALSE(rows.empty())
-        << "No profiler rows emitted after forward pass with LLAMINAR_PROFILING=1. "
+        << "No profiler rows emitted after forward pass with LLAMINAR_PROFILE_KERNELS=1. "
            "Check that graph-native sparse stages (gn_sparse_dispatch, gn_local_expert, "
            "gn_return_reduce) are recording rows via MoEExpertOverlayProfiler.";
 

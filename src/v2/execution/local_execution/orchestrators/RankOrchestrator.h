@@ -2052,7 +2052,8 @@ namespace llaminar2
         // Lightweight wall-clock accumulation of the orchestrator-level decode
         // lifecycle. Measured at the forwardTP() level — above all per-device
         // GPU work — revealing dispatch/collect/gather overhead invisible to
-        // per-device StageTimeline.  Gated on LLAMINAR_PROFILING=1.
+        // per-device StageTimeline. Explicit executor diagnostics remain gated
+        // on LLAMINAR_EXECUTOR_PROFILING=1.
         // Printed by flushStageTimeline() at benchmark end.
         // =====================================================================
         struct TPDecodeStats

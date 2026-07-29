@@ -36,7 +36,8 @@ namespace llaminar2
      * @brief Inter-step overhead profiling data from the decode loop.
      *
      * Tracks time spent BETWEEN forward() calls: sampling, token broadcast,
-     * and other loop housekeeping. Printed as part of the LLAMINAR_PROFILING output.
+     * and other loop housekeeping. Structured timings are exported in the
+     * `decode_loop` PerfStats domain; the human table is legacy-only.
      */
     struct DecodeLoopProfile
     {

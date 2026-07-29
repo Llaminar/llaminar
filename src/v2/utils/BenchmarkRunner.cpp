@@ -790,10 +790,46 @@ namespace llaminar2
         result.token_latencies_ms.reserve(static_cast<size_t>(std::max(0, n_tokens)));
         int tokens_generated = 0;
 
-        // Sampler profiling (enabled when LLAMINAR_PROFILING=1)
-        const bool profile_sampler = debugEnv().profile.enabled;
+        /*
+         * Host decode-loop timing is opt-in because two clock reads per token
+         * are measurable overhead at high decode rates. Use the same explicit
+         * timing gate as graph replay profiling; generic JSON/CSV counter
+         * export alone must remain passive.
+         */
+        const bool profile_sampler = KernelProfiler::isEnabled();
         double sampler_total_us = 0.0;
         double inter_step_total_us = 0.0;
+
+        /**
+         * Record host work surrounding a production decode transaction.
+         *
+         * Orchestrated MTP does not pass through the legacy token-by-token
+         * sampler below: `decodeStepForBenchmark()` owns proposal, grouped
+         * verification, acceptance, and result publication.  Measuring that
+         * call boundary therefore captures the real host-visible transaction
+         * cost without inserting instrumentation inside captured GPU graphs.
+         */
+        const auto record_decode_loop_interval =
+            [profile_sampler](
+                const char *name,
+                std::chrono::high_resolution_clock::time_point interval_start,
+                PerfStatsCollector::Tags tags = {})
+        {
+            if (!profile_sampler)
+                return;
+
+            const auto interval_end = std::chrono::high_resolution_clock::now();
+            const auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         interval_end - interval_start)
+                                         .count();
+            PerfStatsCollector::recordTimingNs(
+                "decode_loop",
+                name,
+                duration_ns > 0 ? static_cast<uint64_t>(duration_ns) : 0,
+                "decode",
+                {},
+                std::move(tags));
+        };
 
         // Synchronize before timing decode phase (skip for single-rank)
         if (mpi_ctx_->world_size() > 1)
@@ -857,7 +893,17 @@ namespace llaminar2
                 }
 
                 runner_->setDecodeStepTokenBudget(remaining_budget);
+                const auto decode_step_start =
+                    profile_sampler ? std::chrono::high_resolution_clock::now()
+                                    : std::chrono::high_resolution_clock::time_point{};
                 DecodeBatchStepOutput step = runner_->decodeBatchStepForBenchmark(request_batch);
+                record_decode_loop_interval(
+                    "request_batch_step",
+                    decode_step_start,
+                    {
+                        {"implementation", "orchestrated_decode_step"},
+                        {"request_batch", std::to_string(request_batch)},
+                    });
                 runner_->setDecodeStepTokenBudget(0);
 
                 const bool local_step_ok =
@@ -933,7 +979,17 @@ namespace llaminar2
                     return result;
                 }
 
+                const auto maintenance_start =
+                    profile_sampler ? std::chrono::high_resolution_clock::now()
+                                    : std::chrono::high_resolution_clock::time_point{};
                 const bool maintenance_success = runner_->maybeApplyDecodeBoundaryMaintenance();
+                record_decode_loop_interval(
+                    "request_batch_maintenance",
+                    maintenance_start,
+                    {
+                        {"implementation", "decode_boundary_maintenance"},
+                        {"request_batch", std::to_string(request_batch)},
+                    });
                 if (!synchronizeSuccess(maintenance_success, "request-batched decode maintenance"))
                 {
                     last_failure_reason_ = "request-batched decode maintenance failed";
@@ -976,7 +1032,17 @@ namespace llaminar2
                 const auto step_start = std::chrono::high_resolution_clock::now();
                 const int remaining = n_tokens - tokens_generated;
                 runner_->setDecodeStepTokenBudget(remaining);
+                const auto decode_step_start =
+                    profile_sampler ? std::chrono::high_resolution_clock::now()
+                                    : std::chrono::high_resolution_clock::time_point{};
                 DecodeStepOutput step = runner_->decodeStepForBenchmark();
+                record_decode_loop_interval(
+                    "orchestrated_step",
+                    decode_step_start,
+                    {
+                        {"implementation", "orchestrated_decode_step"},
+                        {"request_batch", "1"},
+                    });
                 runner_->setDecodeStepTokenBudget(0);
 
                 if (!synchronizeSuccess(step.error.empty(), "decode step"))
@@ -1052,7 +1118,17 @@ namespace llaminar2
                     break;
                 }
 
+                const auto maintenance_start =
+                    profile_sampler ? std::chrono::high_resolution_clock::now()
+                                    : std::chrono::high_resolution_clock::time_point{};
                 const bool maintenance_success = runner_->maybeApplyDecodeBoundaryMaintenance();
+                record_decode_loop_interval(
+                    "orchestrated_maintenance",
+                    maintenance_start,
+                    {
+                        {"implementation", "decode_boundary_maintenance"},
+                        {"request_batch", "1"},
+                    });
                 if (!synchronizeSuccess(maintenance_success, "decode maintenance"))
                 {
                     last_failure_reason_ = "decode maintenance failed";
@@ -1217,6 +1293,16 @@ namespace llaminar2
             decode_loop_profile_.sampler_total_us += sampler_total_us;
             decode_loop_profile_.inter_step_total_us += inter_step_total_us;
             decode_loop_profile_.decode_tokens += tokens_generated;
+            PerfStatsCollector::recordTimingNs(
+                "decode_loop",
+                "sampler",
+                static_cast<uint64_t>(std::max(0.0, sampler_total_us) * 1000.0),
+                "decode");
+            PerfStatsCollector::recordTimingNs(
+                "decode_loop",
+                "inter_step",
+                static_cast<uint64_t>(std::max(0.0, inter_step_total_us) * 1000.0),
+                "decode");
 
             double avg_us = sampler_total_us / tokens_generated;
             double pct = (sampler_total_us / 1000.0) / time_ms * 100.0;
@@ -2115,7 +2201,7 @@ namespace llaminar2
             }
         }
 
-        // Print executor overhead profiling if enabled (LLAMINAR_PROFILING=1).
+        // Print the legacy executor table only for LLAMINAR_PROFILE_KERNELS=1.
         // These are host executor timings, not GPU stage timings; graph-captured
         // execution is represented in forward_graph/stage_gpu perf records.
         if (print_legacy_profile_tables && runner_)

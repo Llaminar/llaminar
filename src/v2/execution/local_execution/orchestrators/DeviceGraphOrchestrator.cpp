@@ -8389,12 +8389,12 @@ namespace llaminar2
          * A homogeneous GPU collective graph has exactly one legal production
          * architecture: capture the collective inside the full graph. Do not
          * convert a missing capability, disabled collective capture switch, or
-         * stale stage contract into eager execution. Profiling remains an
-         * explicit non-production execution mode and is handled below.
+         * stale stage contract into eager execution. Diagnostics measure this
+         * production topology through PerfStats GPU events and never weaken
+         * the capture requirement.
          */
         if (has_collective_nodes &&
             env.execution.gpu_graphs &&
-            !env.execution.executor_profiling &&
             ctx &&
             ctx->isGPU() &&
             !heterogeneous_collective_domain &&
@@ -8414,15 +8414,14 @@ namespace llaminar2
             policy.collective_segmented_enabled ||
             policy.collectives_graph_capturable;
 
-        // When profiling is enabled (LLAMINAR_PROFILING=1), disable GPU graph
-        // capture/replay so decode runs through executeFastDecode(). This ensures
-        // StageTimeline GPU events are recorded for every stage on every iteration,
-        // giving accurate per-stage-type GPU timing. Without this, GPU graph replay
-        // runs hipGraphLaunch() which bypasses per-stage event recording, causing
-        // the accumulated timeline to report ~0 GPU time for Phase 3 iterations.
+        /*
+         * Profiling is deliberately absent from this policy. PerfStats records
+         * explicit GPU events around graph replay; selecting eager execution to
+         * obtain per-stage timings would measure a different engine and can
+         * violate graph-owned MTP publication contracts.
+         */
         policy.allow_cached_graph_replay =
             env.execution.gpu_graphs &&
-            !env.execution.executor_profiling &&
             ctx && ctx->isGPU() &&
             can_use_segmented_graph;
 

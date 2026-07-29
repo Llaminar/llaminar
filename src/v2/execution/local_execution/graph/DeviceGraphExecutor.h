@@ -89,8 +89,8 @@ namespace llaminar2
 
         /// Fast decode — minimal overhead for cached decode graphs.
         /// Buffers are already on-device, weights already uploaded.
-        /// Profiling is gated by LLAMINAR_PROFILING env var so that decode
-        /// stage timings are correctly reported when profiling is enabled.
+        /// Legacy per-stage profiling remains independently opt-in; production
+        /// graph replay timing is collected by PerfStats events around replay.
         static StageRunPolicy fastDecode()
         {
             StageRunPolicy p;

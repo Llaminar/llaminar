@@ -299,8 +299,9 @@ For complex heterogeneous setups, define named TP domains and PP stage mappings.
 # Benchmark on a specific CPU socket only
 ./build_v2_release/llaminar2 benchmark -m model.gguf -d cpu:0
 
-# With full profiling (kernel + executor overhead)
-LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 benchmark -m model.gguf -d cuda:0
+# With graph-safe PerfStats summary and GPU replay timing
+LLAMINAR_PERF_STATS_SUMMARY=1 LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1 \
+  ./build_v2_release/llaminar2 benchmark -m model.gguf -d cuda:0
 ```
 
 **Device Selection** (`-d <device>:<ordinal>`):
@@ -341,15 +342,20 @@ LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 benchmark -m model.gguf -d cud
 
 ### Kernel Profiling
 
-Enable per-kernel timing breakdown:
+Enable structured production-graph timing:
 
 ```bash
-LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 benchmark -m model.gguf -d cuda:0
+LLAMINAR_PERF_STATS_JSON=/tmp/llaminar_perf_stats.json \
+LLAMINAR_PERF_STATS_SUMMARY=1 \
+LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1 \
+  ./build_v2_release/llaminar2 benchmark -m model.gguf -d cuda:0
 ```
 
-**Profiled Operations**: `GEMM_Q8`, `ATTENTION`, `FFN_DOWN`, `FFN_GATE`, `FFN_UP`, `LM_HEAD`, `QUANTIZE_Q8`, `RMS_NORM`, `SWIGLU`, `ROPE`, `RESIDUAL_ADD`, `EMBEDDING`
+PerfStats reports graph replay GPU events, host execution phases, MTP and prefix-cache timings, and kernel route counters. Use `nsys`/`ncu` or `rocprof` for dispatch-level attribution inside a monolithic captured graph.
 
-**Note**: `LLAMINAR_PROFILING=1` enables kernel timing, executor overhead profiling, and GPU stage timing in a single flag.
+**Note**: `LLAMINAR_PROFILING=1` is deprecated. It aliases the graph-safe PerfStats summary/timing request and no longer changes graph capture or executor topology.
+Use `LLAMINAR_PROFILE_KERNELS=1` only for a focused legacy hand-instrumented
+kernel table; it is not the whole-model production profiling workflow.
 
 ---
 
@@ -2268,12 +2274,13 @@ Before considering a file complete, verify:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `LLAMINAR_LOG_LEVEL` | Logging verbosity (ERROR/WARN/INFO/DEBUG/TRACE) | INFO |
-| `LLAMINAR_PROFILING` | Enable all profiling (kernel timing + executor overhead + GPU stage timing) | Disabled |
+| `LLAMINAR_PROFILING` | Deprecated compatibility alias for PerfStats summary + graph-replay GPU timing; never changes execution topology | Disabled |
 | `LLAMINAR_PROFILE_KERNELS` | (Legacy) Enable per-kernel timing in benchmark mode | Disabled |
 | `LLAMINAR_EXECUTOR_PROFILING` | (Legacy) Enable per-stage profiling in DeviceGraphExecutor | Disabled |
 | `LLAMINAR_GPU_STAGE_TIMING` | GPU event-based per-stage timing on production graph paths (also enables structured `stage_gpu` records) | Disabled |
 | `LLAMINAR_GPU_STAGE_TIMING_DETAIL` | Print per-stage detail in GPU stage timing (implies GPU_STAGE_TIMING) | Disabled |
-| `LLAMINAR_PERF_STATS_GPU_STAGE_TIMING` | Enable GPU event timing for JSON/CSV perf stats without legacy profiling | Disabled |
+| `LLAMINAR_PERF_STATS_SUMMARY` | Print the unified PerfStats table | Disabled |
+| `LLAMINAR_PERF_STATS_GPU_STAGE_TIMING` | Enable GPU event timing around production graph replay | Disabled |
 | `LLAMINAR_PERF_STATS_JSON` / `LLAMINAR_PERF_STATS_CSV` | Export unified perf counters and timers as JSON/CSV; use `LLAMINAR_PERF_STATS_FILTER=stage_gpu` for graph-safe stage timing export | Disabled |
 | `LLAMINAR_VALIDATE_BUFFERS` | Enable buffer validation after stage execution | Auto-ON in Debug/Integration |
 | `LLAMINAR_VALIDATE_INPUTS` | Enable input validation before stage execution | Auto-ON in Debug/Integration |

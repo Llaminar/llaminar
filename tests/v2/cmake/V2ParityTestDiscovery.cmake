@@ -145,9 +145,10 @@ foreach(_full_name IN LISTS _all_tests)
     set(_test_mpi_cmd ${_mpi_cmd})
     if("${_full_name}" MATCHES "Profiler")
         # OpenMPI does not always forward CTest-set environment variables to
-        # launched ranks unless they are explicitly exported. Keep profiler
-        # parity tests self-contained in CTest instead of requiring opt-in env.
-        list(APPEND _test_mpi_cmd "-x" "LLAMINAR_PROFILING=1")
+        # launched ranks unless they are explicitly exported. These legacy
+        # profiler-row parity tests intentionally request the hand-instrumented
+        # table instead of the graph-safe PerfStats compatibility alias.
+        list(APPEND _test_mpi_cmd "-x" "LLAMINAR_PROFILE_KERNELS=1")
     endif()
 
     # Build the full command: mpirun ... <binary> --gtest_filter=<full_name>
@@ -177,7 +178,7 @@ foreach(_full_name IN LISTS _all_tests)
 
     set(_test_env_vars ${_env_vars})
     if("${_full_name}" MATCHES "Profiler")
-        list(APPEND _test_env_vars "LLAMINAR_PROFILING=1")
+        list(APPEND _test_env_vars "LLAMINAR_PROFILE_KERNELS=1")
     endif()
 
     string(JOIN ";" _env_joined ${_test_env_vars})

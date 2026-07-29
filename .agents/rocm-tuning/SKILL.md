@@ -13,10 +13,11 @@ the V7 native kernel matching/beating AMD's Composable Kernel (CK) on N-heavy LL
 
 It chains three tools:
 
-1. **`rocprof`** — per-dispatch GPU kernel timing (the *only* trustworthy latency number).
-2. **LLVM ISA toolchain** (`llvm-objcopy` / `llvm-readelf` / `llvm-objdump`) — extract code
+1. **PerfStats GPU event timing** — production-graph replay timing and structured route/host counters.
+2. **`rocprof`** — per-dispatch GPU kernel timing (the *only* trustworthy latency number).
+3. **LLVM ISA toolchain** (`llvm-objcopy` / `llvm-readelf` / `llvm-objdump`) — extract code
    objects, read VGPR/SGPR/LDS metadata, disassemble, and census instructions.
-3. **The dispatch-comparison perf test + parity** — A/B variants and validate correctness.
+4. **The dispatch-comparison perf test + parity** — A/B variants and validate correctness.
 
 The golden rule of gfx906 tuning: **wallclock lies.** On PCIe-bottlenecked topologies,
 >90% of GEMM wallclock is memory transfer. Always quote `rocprof` per-dispatch GPU time,
@@ -26,6 +27,21 @@ The full reference write-up lives at
 `src/v2/kernels/rocm/gemm/README.vnni-gemm-tuning.md` (and the companion
 `README.native-vnni-isa-analysis.md` for GEMV). Read those for the V1-V7 history and the
 CK ISA census; this skill is the operational checklist.
+
+For whole-model diagnosis, first measure the production captured graph:
+
+```bash
+LLAMINAR_PERF_STATS_JSON=/tmp/rocm-profile.json \
+LLAMINAR_PERF_STATS_SUMMARY=1 \
+LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1 \
+./build_v2_release/llaminar2 benchmark -m <model>.gguf -d rocm:0
+```
+
+The `stage_gpu` graph-replay rows are GPU-event measurements around the real
+captured graph. They do not fabricate per-stage attribution inside a monolithic
+graph; use rocprof for that dispatch-level view. `LLAMINAR_PROFILING=1` is
+deprecated and exists only as a warning compatibility alias to these PerfStats
+requests. It must never disable graph capture or select eager execution.
 
 ---
 

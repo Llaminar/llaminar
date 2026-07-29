@@ -243,7 +243,7 @@ namespace llaminar2
         /// Log current histogram summary (for OBSERVE mode)
         void logHistogramSummary() const;
 
-        /// Get a structured profiling summary string for LLAMINAR_PROFILING output.
+        /// Get the legacy human-readable profiling summary.
         /// Includes: histogram stats, rebalance timing, expert movement counts.
         std::string getProfilingSummary() const;
 

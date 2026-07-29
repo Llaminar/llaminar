@@ -72,13 +72,28 @@ internal `cicc`/`ptxas` work) and ROCm clang 20; a repeated two-object probe
 produced two direct hits, and container-wide cache identity/capacity is now
 fixed at a workspace-relative 50 GB.
 
+Fresh SingleDevice Release comparison uses `ggml-org/llama.cpp` master
+`afeebe103bd99cda8f5dfaefcabadf890db7fda7`, the same raw prompt, greedy
+sampling, 128 forced tokens, fixed d1/d3, and one GPU. llama.cpp runs a warmed
+raw `/completion` request (596 prompt tokens including BOS); Llaminar reports
+595 prompt tokens and averages three runs after warmup. CUDA dense d3 and ROCm
+dense d3 beat llama.cpp. Both d1 lanes and both MoE d3 lanes miss, with the
+largest gaps accompanying lower Llaminar MoE acceptance. CUDA dense at the
+default 4096 context also fails workspace admission after model load; c1024,
+which covers the 723-token workload, is green.
+
+Legacy `LLAMINAR_PROFILING` is now a topology-neutral PerfStats alias. Fresh
+CUDA/ROCm MoE d1 smokes each replayed all 30 grouped verifier calls as one
+486-stage graph and emitted structured decode-step/maintenance timing; neither
+backend selected eager or segmented execution.
+
 ## Device And Topology Matrix
 
 | Mode | Device / degree | Dense greedy | Dense stoch | MoE greedy | MoE stoch | Status |
 |---|---|:---:|:---:|:---:|:---:|---|
 | SingleDevice | CPU d1 | R | R | A | A | CPU refresh paused |
-| SingleDevice | CUDA d1 | G | G | R | R | Dense green; MoE below baseline |
-| SingleDevice | ROCm d1 | A | A | A | A | MoE nearly break-even |
+| SingleDevice | CUDA d1 | A | G | A | R | d1 loses to llama.cpp; dense d3 wins |
+| SingleDevice | ROCm d1 | A | A | A | A | d1/MoE d3 lose; dense d3 wins |
 | LocalTP | CUDA deg2 | A | A | R | R | Resident request batch green; perf pending |
 | LocalTP | ROCm deg2 | A | A | R | R | Resident request batch green; perf pending |
 | LocalTP | ROCm deg4 | A | R | R | R | Preset/bench refresh pending |
@@ -89,21 +104,18 @@ fixed at a workspace-relative 50 GB.
 
 ## SingleDevice Speeds
 
-| Lane | Baseline | MTP | Acceptance | RAG |
-|---|---:|---:|---:|:---:|
-| CUDA dense greedy | `44.46` | `74.92 tok/s` d3 (`1.69x`) | n/a | G |
-| CUDA dense stoch | `44.47` | `57.07 tok/s` d1 (`1.28x`) | n/a | G |
-| ROCm dense greedy | `31.30` | `39.79 tok/s` dyn (`1.27x`) | n/a | A |
-| ROCm dense stoch | `31.79` | `32.16 tok/s` dyn (`1.01x`) | n/a | A |
-| CUDA MoE stoch | `138.31` | `99.93 tok/s` d3 (`0.72x`) | `30/39` | R |
-| ROCm MoE stoch | `84.18` | `80.19 tok/s` d3 (`0.95x`) | `30/39` | A |
+Matched llama.cpp comparison:
 
-MoE depth sweep:
-
-| Device | d1 | d2 | d3 | Dynamic |
-|---|---:|---:|---:|---:|
-| CUDA | `74.02` (`0.54x`) | `77.96` (`0.56x`) | `99.93` (`0.72x`) | `88.74` (`0.64x`) |
-| ROCm | `61.78` (`0.73x`) | `61.98` (`0.74x`) | `80.19` (`0.95x`) | `61.67` (`0.73x`) |
+| Backend/model | Depth | Llaminar | llama.cpp | Ratio | Acceptance L/LC | RAG |
+|---|---:|---:|---:|---:|---:|:---:|
+| CUDA dense 27B | d1 | `36.24` | `59.64` | `0.61x` | `77.67/88.06%` | R |
+| CUDA dense 27B | d3 | `64.84` | `60.91` | `1.06x` | `80.56/69.11%` | G |
+| CUDA MoE 35B | d1 | `93.01` | `153.92` | `0.60x` | `80.28/98.44%` | R |
+| CUDA MoE 35B | d3 | `159.61` | `171.81` | `0.93x` | `70.27/93.94%` | R |
+| ROCm dense 27B | d1 | `20.08` | `25.15` | `0.80x` | `89.55/88.06%` | R |
+| ROCm dense 27B | d3 | `39.28` | `22.66` | `1.73x` | `80.56/69.11%` | G |
+| ROCm MoE 35B | d1 | `46.33` | `73.93` | `0.63x` | `86.76/98.44%` | R |
+| ROCm MoE 35B | d3 | `74.94` | `95.84` | `0.78x` | `78.30/94.95%` | R |
 
 ## Focused Proofs
 

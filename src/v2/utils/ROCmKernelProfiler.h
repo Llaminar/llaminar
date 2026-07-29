@@ -7,8 +7,9 @@
  * timing which only measures kernel launch time, HIP events measure
  * actual kernel execution time on the GPU.
  *
- * Enable via LLAMINAR_PROFILING=1 environment variable (shared with
- * KernelProfiler.h and CUDAKernelProfiler.h for unified control).
+ * Enable the legacy hand-instrumented table via
+ * LLAMINAR_PROFILE_KERNELS=1. Production graph timing belongs to the
+ * PerfStats `stage_gpu` domain.
  *
  * Usage:
  *   // Option 1: Scoped timing (RAII)

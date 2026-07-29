@@ -295,7 +295,7 @@ protected:
         if (isProfilerTest())
         {
             ASSERT_TRUE(MoEExpertOverlayProfiler::isEnabled())
-                << "Profiler parity tests must run with LLAMINAR_PROFILING=1; "
+                << "Profiler parity tests must run with LLAMINAR_PROFILE_KERNELS=1; "
                    "CTest discovery should inject and mpirun-forward it.";
         }
 
@@ -737,7 +737,7 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarm, ProfilerAllGpuNoFallbackRows)
     }
 
     ASSERT_TRUE(MoEExpertOverlayProfiler::isEnabled())
-        << "Profiler parity tests must run with LLAMINAR_PROFILING=1; "
+        << "Profiler parity tests must run with LLAMINAR_PROFILE_KERNELS=1; "
            "CTest discovery should inject and mpirun-forward it.";
 
     const bool hardware_and_model_ok = collectivelyCheckHardwareAndModel();
@@ -777,7 +777,7 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarm, ProfilerAllGpuNoFallbackRows)
 
     const auto rows = MoEExpertOverlayProfiler::rows();
     ASSERT_FALSE(rows.empty())
-        << "No profiler rows emitted after forward pass with LLAMINAR_PROFILING=1";
+        << "No profiler rows emitted after forward pass with LLAMINAR_PROFILE_KERNELS=1";
 
     for (const auto &row : rows)
     {
