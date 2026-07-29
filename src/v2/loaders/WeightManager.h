@@ -1009,6 +1009,25 @@ namespace llaminar2
             const std::shared_ptr<TensorBase> &original,
             DeviceId target_device);
 
+        /**
+         * @brief Return whether a replicated GPU weight is only a host-side
+         *        source for a later device-owned preparation step.
+         *
+         * Quantized GEMM weights, mirrored floating-point GEMM weights, token
+         * embeddings, and complete MoE expert tensors are not consumed through
+         * a raw per-device TensorBase allocation. Their owning GPU subsystem
+         * repacks or slices the immutable model bytes into its own device
+         * storage. Replicating the host tensor per GPU therefore adds no useful
+         * residency; for large 3D expert tensors it can copy the complete model
+         * once per participant before loading even begins.
+         *
+         * @param name Canonical GGUF tensor name.
+         * @return true when every GPU participant may share the immutable host
+         *         tensor while constructing independent device-owned state.
+         */
+        [[nodiscard]] bool isReplicatedGpuPreparationSource(
+            const std::string &name) const;
+
         // =========================================================================
         // Proportional slicing helpers (used when tp_config_ is set)
         // =========================================================================

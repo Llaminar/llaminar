@@ -350,10 +350,14 @@ namespace llaminar2
         return std::clamp(prefill_effective_seq_len_, 1, params_.seq_len);
     }
 
-    bool GDNRecurrenceStage::shouldUseRealLengthContract() const
+    bool GDNRecurrenceStage::shouldUseScalarRealLengthContract() const
     {
-        const int state_size =
-            params_.n_heads * params_.d_k * params_.d_v;
+        /*
+         * Scalar padded prefill and request batching have different state
+         * owners.  A one-request graph must advance the primary recurrence
+         * bank through chunkForwardWithEffectiveSeqLen(); only a genuine
+         * multi-request graph may update the packed request-state bank.
+         */
         return params_.seq_len > 1 &&
                prefill_replay_params_set_ &&
                prefill_bucket_seq_len_ == params_.seq_len &&
@@ -363,9 +367,7 @@ namespace llaminar2
                params_.request_seq_len == params_.seq_len &&
                params_.request_seq_lens_device != nullptr &&
                params_.kernel &&
-               params_.kernel->supportsRequestLiveStateBank(
-                   /*request_count=*/1,
-                   state_size);
+               params_.kernel->supportsPaddedPrefillRealLength();
     }
 
     std::string GDNRecurrenceStage::workspaceStableId() const
@@ -761,13 +763,16 @@ namespace llaminar2
     {
         if (params_.device_id.is_gpu())
         {
+            if (!params_.kernel || !params_.request_seq_lens_device)
+                return false;
+            if (params_.request_count <= 1)
+                return params_.kernel->supportsPaddedPrefillRealLength();
+
             const int state_size =
                 params_.n_heads * params_.d_k * params_.d_v;
-            return params_.kernel &&
-                   params_.request_seq_lens_device != nullptr &&
-                   params_.kernel->supportsRequestLiveStateBank(
-                       params_.request_count,
-                       state_size);
+            return params_.kernel->supportsRequestLiveStateBank(
+                params_.request_count,
+                state_size);
         }
         return params_.kernel && params_.kernel->supportsPaddedPrefillRealLength();
     }
@@ -1003,8 +1008,9 @@ namespace llaminar2
                     !request_batched &&
                     prefill_replay_params_set_ &&
                     effective_seq_len < params_.seq_len;
-                const bool use_real_length_contract = shouldUseRealLengthContract();
-                if (padded_effective_len && !use_real_length_contract)
+                const bool use_scalar_real_length_contract =
+                    shouldUseScalarRealLengthContract();
+                if (padded_effective_len && !use_scalar_real_length_contract)
                 {
                     LOG_ERROR("[GDNRecurrenceStage] Padded prefill requires a backend real-length contract");
                     return false;
@@ -1025,7 +1031,7 @@ namespace llaminar2
                                                                             << " d_v=" << params_.d_v
                                                                             << " seq=" << params_.seq_len
                                                                             << " effective_seq=" << effective_seq_len);
-                if (request_batched || use_real_length_contract)
+                if (request_batched)
                 {
                     if (!params_.request_seq_lens_device)
                     {
@@ -1046,6 +1052,24 @@ namespace llaminar2
                         d_output, params_.recurrence_state,
                         params_.seq_len, params_.request_count, params_.request_seq_len,
                         params_.n_heads, params_.d_k, params_.d_v,
+                        params_.chunk_size, params_.use_qk_l2norm,
+                        params_.request_seq_lens_device);
+                }
+                else if (use_scalar_real_length_contract)
+                {
+                    /*
+                     * Request zero's resident length scalar is graph-stable
+                     * metadata, but the recurrence owner remains the primary
+                     * scalar bank.  The effective-length kernel reads that
+                     * scalar on device and commits the terminal real row
+                     * directly into the state consumed by decode.
+                     */
+                    ok = params_.kernel->chunkForwardWithEffectiveSeqLen(
+                        d_q, d_k, d_v,
+                        d_alpha, d_beta,
+                        d_alog, d_dtbias,
+                        d_output, params_.recurrence_state,
+                        params_.seq_len, params_.n_heads, params_.d_k, params_.d_v,
                         params_.chunk_size, params_.use_qk_l2norm,
                         params_.request_seq_lens_device);
                 }

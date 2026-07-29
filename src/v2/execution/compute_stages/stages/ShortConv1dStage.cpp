@@ -260,10 +260,16 @@ namespace llaminar2
         return std::clamp(prefill_effective_seq_len_, 1, params_.seq_len);
     }
 
-    bool ShortConv1dStage::shouldUseRealLengthContract() const
+    bool ShortConv1dStage::shouldUseScalarRealLengthContract() const
     {
-        const int state_size =
-            params_.channels * std::max(0, params_.kernel_size - 1);
+        /*
+         * A one-request graph bucket owns the ordinary scalar live state.  Its
+         * device length is dynamic, but that does not make it a request-batched
+         * transaction.  Keep it on forwardWithEffectiveSeqLen(), which commits
+         * directly into the primary device state consumed by subsequent
+         * decode.  The packed request-state bank belongs exclusively to true
+         * multi-request execution.
+         */
         return params_.seq_len > 1 &&
                prefill_replay_params_set_ &&
                prefill_bucket_seq_len_ == params_.seq_len &&
@@ -273,9 +279,7 @@ namespace llaminar2
                params_.request_seq_len == params_.seq_len &&
                params_.request_seq_lens_device != nullptr &&
                params_.kernel &&
-               params_.kernel->supportsRequestLiveStateBank(
-                   /*request_count=*/1,
-                   state_size);
+               params_.kernel->supportsPaddedPrefillRealLength();
     }
 
     std::string ShortConv1dStage::workspaceStableId() const
@@ -343,13 +347,16 @@ namespace llaminar2
     {
         if (params_.device_id.is_gpu())
         {
+            if (!params_.kernel || !params_.request_seq_lens_device)
+                return false;
+            if (params_.request_count <= 1)
+                return params_.kernel->supportsPaddedPrefillRealLength();
+
             const int state_size =
                 params_.channels * std::max(0, params_.kernel_size - 1);
-            return params_.kernel &&
-                   params_.request_seq_lens_device != nullptr &&
-                   params_.kernel->supportsRequestLiveStateBank(
-                       params_.request_count,
-                       state_size);
+            return params_.kernel->supportsRequestLiveStateBank(
+                params_.request_count,
+                state_size);
         }
         return params_.kernel && params_.kernel->supportsPaddedPrefillRealLength();
     }
@@ -698,15 +705,16 @@ namespace llaminar2
                 params_.seq_len > 1 &&
                 prefill_replay_params_set_ &&
                 effective_seq_len < params_.seq_len;
-            const bool use_real_length_contract = shouldUseRealLengthContract();
-            if (padded_effective_len && !use_real_length_contract)
+            const bool use_scalar_real_length_contract =
+                shouldUseScalarRealLengthContract();
+            if (padded_effective_len && !use_scalar_real_length_contract)
             {
                 LOG_ERROR("[ShortConv1dStage] Padded prefill requires a backend real-length contract");
                 return false;
             }
 
             bool ok = false;
-            if (request_batched || use_real_length_contract)
+            if (request_batched)
             {
                 const int state_size = params_.channels * std::max(0, params_.kernel_size - 1);
                 if (!params_.request_seq_lens_device)
@@ -725,6 +733,21 @@ namespace llaminar2
                     d_output, params_.conv_state,
                     params_.seq_len, params_.request_count, params_.request_seq_len,
                     params_.channels, params_.kernel_size,
+                    params_.request_seq_lens_device,
+                    /*apply_silu=*/true);
+            }
+            else if (use_scalar_real_length_contract)
+            {
+                /*
+                 * The first element of the persistent request-length allocation
+                 * is also the scalar request's graph-stable effective length.
+                 * The backend reads it on device and commits only those rows
+                 * into the primary live state; no request-bank handoff exists.
+                 */
+                ok = params_.kernel->forwardWithEffectiveSeqLen(
+                    d_input, d_weight, d_bias,
+                    d_output, params_.conv_state,
+                    params_.seq_len, params_.channels, params_.kernel_size,
                     params_.request_seq_lens_device,
                     /*apply_silu=*/true);
             }

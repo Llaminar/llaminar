@@ -58,6 +58,7 @@
 #include "../../../utils/CUDATestUtils.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/NativeVNNIEquivalenceInventory.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/VerifierRowTestInventory.h"
 
@@ -607,21 +608,54 @@ namespace
             return;
 
         size_t first_mismatch = 0;
-        while (first_mismatch < count && actual[first_mismatch] == expected[first_mismatch])
+        while (first_mismatch < count)
+        {
+            std::uint32_t actual_word = 0;
+            std::uint32_t expected_word = 0;
+            std::memcpy(
+                &actual_word,
+                actual + first_mismatch,
+                sizeof(actual_word));
+            std::memcpy(
+                &expected_word,
+                expected + first_mismatch,
+                sizeof(expected_word));
+            if (actual_word != expected_word)
+                break;
             ++first_mismatch;
+        }
 
         std::uint32_t actual_bits = 0;
         std::uint32_t expected_bits = 0;
         std::memcpy(&actual_bits, actual + first_mismatch, sizeof(actual_bits));
         std::memcpy(&expected_bits, expected + first_mismatch, sizeof(expected_bits));
 
+        size_t matching_expected_column = count;
+        for (size_t column = 0; column < count; ++column)
+        {
+            std::uint32_t candidate_bits = 0;
+            std::memcpy(
+                &candidate_bits,
+                expected + column,
+                sizeof(candidate_bits));
+            if (candidate_bits == actual_bits)
+            {
+                matching_expected_column = column;
+                break;
+            }
+        }
+
         ADD_FAILURE()
-            << label << " is not bitwise serial-decode equivalent at column "
+            << label << " is not bitwise equivalent at column "
             << first_mismatch
             << " actual=" << actual[first_mismatch]
             << " expected=" << expected[first_mismatch]
             << " actual_bits=" << actual_bits
             << " expected_bits=" << expected_bits
+            << " matching_expected_column="
+            << (matching_expected_column == count
+                    ? std::string("none")
+                    : std::to_string(matching_expected_column))
             << " max_abs=" << maxAbsError(actual, expected, count)
             << " rel_l2=" << relativeL2Error(actual, expected, count)
             << " cosine=" << cosineSimilarity(actual, expected, count);
@@ -2173,6 +2207,470 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillHeuristicAllFormatsMatchesCPU)
             << format.name << " heuristic prefill cosine="
             << parity.cosine_similarity << " relative_l2="
             << parity.relative_l2_error;
+
+        cleanupWorkspaceIfNeeded(cuda_kernel);
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+    }
+#endif
+}
+
+/**
+ * @test Prove CUDA NativeVNNI active rows are byte-invariant for the complete
+ * finite M-totality witness inventory and every quantized format.
+ *
+ * The production graph may capture a larger M than the request's semantic
+ * token count. Before this regression, BK64 used separately expressed FP32
+ * arithmetic for interior and border tiles, so padding alone changed rounding.
+ * The shared inventory now exhausts every ordinary-prefill M through two full
+ * 128-row tiles and both ends of every larger canonical graph-bucket interval.
+ *
+ * One explicit stream, prepared weight, workspace, and fixed device buffers
+ * are reused per format. Every witness also launches its final active row
+ * through the independent production M=1 route. This prevents exact-M and
+ * bucket-M implementations from agreeing with each other while both drift
+ * from serial decode. Only result bytes are downloaded after the launches,
+ * keeping the regression focused on production kernel arithmetic instead of
+ * measuring thousands of allocation and coherence setup transactions.
+ */
+TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    struct LaunchSelection
+    {
+        int tile_id = -1;
+        int split_k = -1;
+        int used_bk256 = -1;
+        int used_streamk = -1;
+    };
+    const auto read_launch_selection = []
+    {
+        LaunchSelection selection;
+        cudaNativeVNNIPrefill_getLastLaunchSelection(
+            &selection.tile_id,
+            &selection.split_k,
+            &selection.used_bk256,
+            &selection.used_streamk);
+        return selection;
+    };
+
+    ScopedCudaPrefillModes modes;
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    constexpr int canonical_prefix_rows =
+        kDefaultNativeVNNIVerifierRowCapacity + 1;
+    std::array<bool, 6> tensor_core_tile_seen{};
+    bool bk256_narrow_seen = false;
+    bool bk256_wide_seen = false;
+    bool profiled_narrow_large_k_crossover_seen = false;
+
+    for (const auto &geometry :
+         nativeVNNIPrefillAllFormatGeometryEquivalenceCases())
+    {
+        SCOPED_TRACE(geometry.label);
+        ASSERT_FALSE(geometry.row_cases.empty());
+        const int N = geometry.output_columns;
+        const int K = geometry.reduction_columns;
+        const int maximum_bucket_rows = std::max_element(
+            geometry.row_cases.begin(),
+            geometry.row_cases.end(),
+            [](const auto &lhs, const auto &rhs)
+            {
+                return lhs.bucket_rows < rhs.bucket_rows;
+            })->bucket_rows;
+        const std::vector<float> input_values =
+            randomFP32(static_cast<size_t>(maximum_bucket_rows) * K);
+
+        for (const auto &format : cudaSmallMNativeFormats())
+        {
+            SCOPED_TRACE(format.name);
+
+            cudaStream_t stream = nullptr;
+            ASSERT_EQ(
+                cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+                cudaSuccess);
+
+            auto weights = format.create(N, K);
+            ASSERT_NE(weights, nullptr);
+            ASSERT_TRUE(weights->ensureOnDevice(gpu_device_, stream));
+
+            auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+            ASSERT_NE(cuda_kernel, nullptr)
+                << format.name << " CUDA prepared kernel";
+            cuda_kernel->setGPUStream(stream);
+            ASSERT_TRUE(setupWorkspaceIfNeeded(
+                cuda_kernel,
+                maximum_bucket_rows,
+                N,
+                K));
+
+            auto input = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{
+                    static_cast<size_t>(maximum_bucket_rows),
+                    static_cast<size_t>(K)});
+            std::memcpy(
+                input->mutable_data(),
+                input_values.data(),
+                input_values.size() * sizeof(float));
+            auto exact_output = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{
+                    static_cast<size_t>(maximum_bucket_rows),
+                    static_cast<size_t>(N)});
+            auto bucket_output = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{
+                    static_cast<size_t>(maximum_bucket_rows),
+                    static_cast<size_t>(N)});
+            auto serial_row_input = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{1, static_cast<size_t>(K)});
+            auto serial_row_output = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{1, static_cast<size_t>(N)});
+            ASSERT_TRUE(input->ensureOnDevice(gpu_device_, stream));
+            ASSERT_TRUE(exact_output->allocateOnDevice(gpu_device_, stream));
+            ASSERT_TRUE(bucket_output->allocateOnDevice(gpu_device_, stream));
+            ASSERT_TRUE(serial_row_input->ensureOnDevice(gpu_device_, stream));
+            ASSERT_TRUE(serial_row_output->allocateOnDevice(gpu_device_, stream));
+
+            ASSERT_TRUE(cuda_kernel->multiply_tensor(
+                input.get(),
+                exact_output.get(),
+                canonical_prefix_rows,
+                N,
+                K,
+                /*transpose_B=*/true,
+                1.0f,
+                0.0f));
+            const size_t canonical_prefix_values =
+                static_cast<size_t>(canonical_prefix_rows) * N;
+            std::vector<float> canonical_prefix(canonical_prefix_values);
+            ASSERT_EQ(
+                cudaMemcpyAsync(
+                    canonical_prefix.data(),
+                    exact_output->gpu_data_ptr(),
+                    canonical_prefix_values * sizeof(float),
+                    cudaMemcpyDeviceToHost,
+                    stream),
+                cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+            for (const auto &test_case : geometry.row_cases)
+            {
+                SCOPED_TRACE(
+                    std::string("active_m=") +
+                    std::to_string(test_case.active_rows) +
+                    " bucket_m=" +
+                    std::to_string(test_case.bucket_rows));
+
+                ASSERT_TRUE(cuda_kernel->multiply_tensor(
+                    input.get(),
+                    exact_output.get(),
+                    test_case.active_rows,
+                    N,
+                    K,
+                    /*transpose_B=*/true,
+                    1.0f,
+                    0.0f));
+                const LaunchSelection exact_selection = read_launch_selection();
+                ASSERT_TRUE(cuda_kernel->multiply_tensor(
+                    input.get(),
+                    bucket_output.get(),
+                    test_case.bucket_rows,
+                    N,
+                    K,
+                    /*transpose_B=*/true,
+                    1.0f,
+                    0.0f));
+                const LaunchSelection bucket_selection = read_launch_selection();
+
+                /*
+                 * Lock the measured BK256-to-BK64 crossover into the same
+                 * regression that proves its arithmetic. M=33 is the first
+                 * exact request above BK256's 32-row narrow tile, while the
+                 * corresponding M=64 selection is the graph-captured
+                 * production launch used for that request.
+                 */
+                if (format.name == "Q4_0" &&
+                    N == 513 &&
+                    K == 2048 &&
+                    test_case.active_rows == 33)
+                {
+                    EXPECT_EQ(exact_selection.tile_id, 0);
+                    EXPECT_EQ(exact_selection.used_bk256, 0);
+                    EXPECT_EQ(bucket_selection.tile_id, 0);
+                    EXPECT_EQ(bucket_selection.used_bk256, 0);
+                    profiled_narrow_large_k_crossover_seen = true;
+                }
+
+                /*
+                 * Route the witness's final active row through production M=1.
+                 * The same stream orders the row upload, GEMV launch, and all
+                 * result downloads, so this oracle adds no device-wide fence
+                 * and cannot observe partially published data.
+                 */
+                const float *serial_row_source =
+                    input_values.data() +
+                    static_cast<size_t>(test_case.active_rows - 1) * K;
+                ASSERT_EQ(
+                    cudaMemcpyAsync(
+                        serial_row_input->gpu_data_ptr(),
+                        serial_row_source,
+                        static_cast<size_t>(K) * sizeof(float),
+                        cudaMemcpyHostToDevice,
+                        stream),
+                    cudaSuccess);
+                ASSERT_TRUE(cuda_kernel->multiply_tensor(
+                    serial_row_input.get(),
+                    serial_row_output.get(),
+                    1,
+                    N,
+                    K,
+                    /*transpose_B=*/true,
+                    1.0f,
+                    0.0f));
+
+                SCOPED_TRACE(
+                    std::string("exact_selection={tile=") +
+                    std::to_string(exact_selection.tile_id) +
+                    ",split_k=" + std::to_string(exact_selection.split_k) +
+                    ",bk256=" + std::to_string(exact_selection.used_bk256) +
+                    ",streamk=" + std::to_string(exact_selection.used_streamk) +
+                    "} bucket_selection={tile=" +
+                    std::to_string(bucket_selection.tile_id) +
+                    ",split_k=" + std::to_string(bucket_selection.split_k) +
+                    ",bk256=" + std::to_string(bucket_selection.used_bk256) +
+                    ",streamk=" + std::to_string(bucket_selection.used_streamk) +
+                    "}");
+
+                for (const LaunchSelection &selection :
+                     {exact_selection, bucket_selection})
+                {
+                    EXPECT_EQ(selection.split_k, 1)
+                        << "production AUTO prefill changed the canonical K tree";
+                    EXPECT_EQ(selection.used_streamk, 0)
+                        << "production AUTO prefill selected atomic Stream-K";
+                    if (selection.tile_id >= 0 &&
+                        selection.tile_id <
+                            static_cast<int>(tensor_core_tile_seen.size()))
+                    {
+                        tensor_core_tile_seen[
+                            static_cast<size_t>(selection.tile_id)] = true;
+                    }
+                    bk256_narrow_seen |= selection.tile_id == -3;
+                    bk256_wide_seen |= selection.tile_id == -2;
+                }
+
+                const size_t active_values =
+                    static_cast<size_t>(test_case.active_rows) * N;
+                std::vector<float> exact_host(active_values);
+                std::vector<float> bucket_host(active_values);
+                std::vector<float> serial_row_host(static_cast<size_t>(N));
+                ASSERT_EQ(
+                    cudaMemcpyAsync(
+                        exact_host.data(),
+                        exact_output->gpu_data_ptr(),
+                        active_values * sizeof(float),
+                        cudaMemcpyDeviceToHost,
+                        stream),
+                    cudaSuccess);
+                ASSERT_EQ(
+                    cudaMemcpyAsync(
+                        bucket_host.data(),
+                        bucket_output->gpu_data_ptr(),
+                        active_values * sizeof(float),
+                        cudaMemcpyDeviceToHost,
+                        stream),
+                    cudaSuccess);
+                ASSERT_EQ(
+                    cudaMemcpyAsync(
+                        serial_row_host.data(),
+                        serial_row_output->gpu_data_ptr(),
+                        static_cast<size_t>(N) * sizeof(float),
+                        cudaMemcpyDeviceToHost,
+                        stream),
+                    cudaSuccess);
+                ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+                const std::string label =
+                    std::string(format.name) + " active M=" +
+                    std::to_string(test_case.active_rows) +
+                    " bucket M=" +
+                    std::to_string(test_case.bucket_rows);
+                expectBitwiseEqualFloatRow(
+                    label.c_str(),
+                    bucket_host.data(),
+                    exact_host.data(),
+                    active_values);
+                const std::string prefix_label =
+                    std::string(format.name) +
+                    " canonical M=17 prefix at active M=" +
+                    std::to_string(test_case.active_rows);
+                expectBitwiseEqualFloatRow(
+                    prefix_label.c_str(),
+                    exact_host.data(),
+                    canonical_prefix.data(),
+                    canonical_prefix_values);
+                const std::string serial_label =
+                    std::string(format.name) +
+                    " final active row vs production M=1 at active M=" +
+                    std::to_string(test_case.active_rows);
+                expectBitwiseEqualFloatRow(
+                    serial_label.c_str(),
+                    exact_host.data() +
+                        static_cast<size_t>(test_case.active_rows - 1) * N,
+                    serial_row_host.data(),
+                    static_cast<size_t>(N));
+            }
+
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            cuda_kernel->setGPUStream(nullptr);
+            cleanupWorkspaceIfNeeded(cuda_kernel);
+            llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+            ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+        }
+    }
+
+    for (size_t tile = 0; tile < tensor_core_tile_seen.size(); ++tile)
+    {
+        EXPECT_TRUE(tensor_core_tile_seen[tile])
+            << "M/N/K inventory did not reach CUDA tensor-core tile " << tile;
+    }
+    EXPECT_TRUE(bk256_narrow_seen)
+        << "M/N/K inventory did not reach narrow-N BK256";
+    EXPECT_TRUE(bk256_wide_seen)
+        << "M/N/K inventory did not reach wide-N BK256";
+    EXPECT_TRUE(profiled_narrow_large_k_crossover_seen)
+        << "M/N/K inventory did not reach the profiled BK256-to-BK64 crossover";
+#endif
+}
+
+/**
+ * @test Lock the profiled Qwen3.6 GDN projection tile overlays to the
+ * production automatic dispatcher without relaxing byte equality.
+ *
+ * Q4_1, Q5_1, and IQ1_S use asymmetric NativeVNNI prefill arithmetic. Their
+ * Qwen3.6 GDN QKV geometry is common enough to justify an exact dispatch
+ * overlay, but a faster tile is admissible only when it preserves every FP32
+ * output bit. This regression therefore computes a conservative
+ * `T64x128_w2x2` reference, restores production automatic dispatch, checks the
+ * selected measured winner, and compares the complete output tensor byte for
+ * byte. Stream-K, BK256, split-K, and deterministic test mode remain disabled
+ * so this is the same single-partition route used by captured production
+ * prefill graphs.
+ */
+TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactTile)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    constexpr int M = 128;
+    constexpr int N = 8192;
+    constexpr int K = 2048;
+    constexpr int conservative_tile = 1; // T64x128_w2x2
+
+    struct OverlayCase
+    {
+        const char *format_name;
+        int expected_tile;
+    };
+    constexpr std::array<OverlayCase, 3> cases = {{
+        {"Q4_1", 3},  // T64x128_w2x4
+        {"Q5_1", 3},  // T64x128_w2x4
+        {"IQ1_S", 2}, // T64x128_w4x2
+    }};
+
+    ScopedCudaPrefillModes modes;
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    const std::vector<float> input =
+        randomFP32(static_cast<size_t>(M) * static_cast<size_t>(K));
+
+    for (const auto &overlay : cases)
+    {
+        SCOPED_TRACE(overlay.format_name);
+        const auto format = std::find_if(
+            cudaSmallMNativeFormats().begin(),
+            cudaSmallMNativeFormats().end(),
+            [&](const CUDASmallMFormatSpec &candidate)
+            {
+                return std::strcmp(candidate.name, overlay.format_name) == 0;
+            });
+        ASSERT_NE(format, cudaSmallMNativeFormats().end())
+            << "Missing quantized verifier format " << overlay.format_name;
+
+        auto weights = format->create(
+            static_cast<size_t>(N),
+            static_cast<size_t>(K));
+        ASSERT_NE(weights, nullptr);
+        ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
+
+        auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+        ASSERT_NE(cuda_kernel, nullptr)
+            << overlay.format_name << " CUDA prepared kernel";
+        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+        std::vector<float> conservative_output(
+            static_cast<size_t>(M) * static_cast<size_t>(N),
+            0.0f);
+        cudaNativeVNNIPrefill_setForceTile(conservative_tile, 1);
+        ASSERT_TRUE(cudaMultiplyViaTensor(
+            cuda_kernel,
+            input.data(),
+            conservative_output.data(),
+            M,
+            N,
+            K,
+            gpu_device_));
+
+        int tile_id = -1;
+        int split_k = -1;
+        int used_bk256 = -1;
+        int used_streamk = -1;
+        cudaNativeVNNIPrefill_getLastLaunchSelection(
+            &tile_id,
+            &split_k,
+            &used_bk256,
+            &used_streamk);
+        ASSERT_EQ(tile_id, conservative_tile);
+        ASSERT_EQ(split_k, 1);
+        ASSERT_EQ(used_bk256, 0);
+        ASSERT_EQ(used_streamk, 0);
+
+        std::vector<float> production_output(
+            static_cast<size_t>(M) * static_cast<size_t>(N),
+            0.0f);
+        cudaNativeVNNIPrefill_setForceTile(-1, 0);
+        ASSERT_TRUE(cudaMultiplyViaTensor(
+            cuda_kernel,
+            input.data(),
+            production_output.data(),
+            M,
+            N,
+            K,
+            gpu_device_));
+
+        cudaNativeVNNIPrefill_getLastLaunchSelection(
+            &tile_id,
+            &split_k,
+            &used_bk256,
+            &used_streamk);
+        EXPECT_EQ(tile_id, overlay.expected_tile)
+            << overlay.format_name << " did not use its profiled production tile";
+        EXPECT_EQ(split_k, 1);
+        EXPECT_EQ(used_bk256, 0);
+        EXPECT_EQ(used_streamk, 0);
+
+        expectBitwiseEqualFloatRow(
+            (std::string(overlay.format_name) +
+             " production profiled tile vs conservative tile")
+                .c_str(),
+            production_output.data(),
+            conservative_output.data(),
+            production_output.size());
 
         cleanupWorkspaceIfNeeded(cuda_kernel);
         llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());

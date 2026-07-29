@@ -24,7 +24,7 @@
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../kernels/cpu/moe/CPUMoEKernel.h"
-#include "../../../kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "../../../kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "../../../kernels/cpu/primitives/VectorPrimitives.h"
 #include "../../../kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "../../../loaders/PreparedWeightStore.h"

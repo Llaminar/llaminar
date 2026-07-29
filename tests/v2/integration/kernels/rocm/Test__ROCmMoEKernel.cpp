@@ -28,7 +28,7 @@
 #include <hip/hip_runtime.h>
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
-#include "kernels/rocm/ROCmWeightPacker.h"
+#include "kernels/rocm/gemm/ROCmWeightPacker.h"
 #include "kernels/cpu/moe/CPUMoEKernel.h"
 #include "kernels/KernelFactory.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -15560,6 +15560,166 @@ TEST(Test__ROCmMoEKernel, SoftmaxTopKParallelSelectionPreservesTieOrder)
         EXPECT_NEAR(actual_weights[k], expected_row0[k], 1e-6f) << "row0 k=" << k;
     for (int k = 0; k < top_k; ++k)
         EXPECT_NEAR(actual_weights[top_k + k], 0.25f, 1e-6f) << "row1 k=" << k;
+}
+
+/**
+ * @brief Prove active ROCm router rows are byte-identical in a padded graph.
+ *
+ * Qwen3.6 prefill captures an M=2048 graph for a request whose semantic token
+ * count may be smaller.  The launch geometry must never change any active
+ * router probability, selected expert, or normalized top-k weight.  This
+ * regression uses the production 256-expert/top-8 geometry and the original
+ * failure's M=1583 boundary, then compares an exact eager launch with a padded
+ * captured replay byte-for-byte.
+ *
+ * The device effective-length scalar is a tensor so both its lifetime and its
+ * H2D publication occur before capture.  All compared outputs remain
+ * device-authoritative until the explicit test observation boundary.
+ */
+TEST(Test__ROCmMoEKernel, SoftmaxTopKQwen36ActiveRowsAreByteExactAcrossPaddedGraphBucket)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int real_seq_len = 1583;
+    constexpr int bucket_seq_len = 2048;
+    constexpr int num_experts = 256;
+    constexpr int top_k = 8;
+    const DeviceId device = DeviceId::rocm(0);
+    hipStream_t stream = rocmMoETestStream();
+
+    std::vector<float> bucket_logits_values(
+        static_cast<size_t>(bucket_seq_len) * num_experts);
+    for (size_t i = 0; i < bucket_logits_values.size(); ++i)
+    {
+        bucket_logits_values[i] =
+            0.037f * std::sin(static_cast<float>(i % 65521) * 0.0073f) +
+            0.019f * std::cos(static_cast<float>(i % 32749) * 0.011f);
+    }
+    std::vector<float> exact_logits_values(
+        bucket_logits_values.begin(),
+        bucket_logits_values.begin() +
+            static_cast<std::ptrdiff_t>(
+                static_cast<size_t>(real_seq_len) * num_experts));
+
+    auto exact_logits = TestTensorFactory::createFP32(
+        {static_cast<size_t>(real_seq_len),
+         static_cast<size_t>(num_experts)});
+    auto bucket_logits = TestTensorFactory::createFP32(
+        {static_cast<size_t>(bucket_seq_len),
+         static_cast<size_t>(num_experts)});
+    std::copy(
+        exact_logits_values.begin(),
+        exact_logits_values.end(),
+        exact_logits->mutable_data());
+    std::copy(
+        bucket_logits_values.begin(),
+        bucket_logits_values.end(),
+        bucket_logits->mutable_data());
+    auto exact_indices = TestTensorFactory::createINT32(
+        {static_cast<size_t>(real_seq_len),
+         static_cast<size_t>(top_k)});
+    auto bucket_indices = TestTensorFactory::createINT32(
+        {static_cast<size_t>(bucket_seq_len),
+         static_cast<size_t>(top_k)});
+    auto exact_weights = TestTensorFactory::createFP32(
+        {static_cast<size_t>(real_seq_len),
+         static_cast<size_t>(top_k)});
+    auto bucket_weights = TestTensorFactory::createFP32(
+        {static_cast<size_t>(bucket_seq_len),
+         static_cast<size_t>(top_k)});
+    auto effective_rows = TestTensorFactory::createINT32({1u});
+    effective_rows->mutable_int32_data()[0] = real_seq_len;
+
+    ASSERT_TRUE(exact_logits->ensureOnDevice(device, stream));
+    ASSERT_TRUE(bucket_logits->ensureOnDevice(device, stream));
+    ASSERT_TRUE(exact_indices->ensureOnDevice(device, stream));
+    ASSERT_TRUE(bucket_indices->ensureOnDevice(device, stream));
+    ASSERT_TRUE(exact_weights->ensureOnDevice(device, stream));
+    ASSERT_TRUE(bucket_weights->ensureOnDevice(device, stream));
+    ASSERT_TRUE(effective_rows->ensureOnDevice(device, stream));
+
+    ASSERT_TRUE(hipMoE_softmax_topk(
+        static_cast<float *>(exact_logits->gpu_data_ptr()),
+        static_cast<int *>(exact_indices->gpu_data_ptr()),
+        static_cast<float *>(exact_weights->gpu_data_ptr()),
+        real_seq_len,
+        num_experts,
+        top_k,
+        /*normalize_weights=*/true,
+        /*device_idx=*/0,
+        stream,
+        /*device_effective_seq_len=*/nullptr));
+
+    hipGraph_t graph = nullptr;
+    ASSERT_EQ(
+        hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+        hipSuccess);
+    const bool captured = hipMoE_softmax_topk(
+        static_cast<float *>(bucket_logits->gpu_data_ptr()),
+        static_cast<int *>(bucket_indices->gpu_data_ptr()),
+        static_cast<float *>(bucket_weights->gpu_data_ptr()),
+        bucket_seq_len,
+        num_experts,
+        top_k,
+        /*normalize_weights=*/true,
+        /*device_idx=*/0,
+        stream,
+        static_cast<const int *>(effective_rows->gpu_data_ptr()));
+    const hipError_t capture_status =
+        hipStreamEndCapture(stream, &graph);
+    ASSERT_TRUE(captured);
+    ASSERT_EQ(capture_status, hipSuccess)
+        << hipGetErrorString(capture_status);
+    ASSERT_NE(graph, nullptr);
+
+    hipGraphExec_t executable = nullptr;
+    ASSERT_EQ(
+        hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+        hipSuccess);
+    ASSERT_EQ(hipGraphLaunch(executable, stream), hipSuccess);
+
+    TransferEngine::publishDeviceWrite(exact_logits, device, stream);
+    TransferEngine::publishDeviceWrite(exact_indices, device, stream);
+    TransferEngine::publishDeviceWrite(exact_weights, device, stream);
+    TransferEngine::publishDeviceWrite(bucket_logits, device, stream);
+    TransferEngine::publishDeviceWrite(bucket_indices, device, stream);
+    TransferEngine::publishDeviceWrite(bucket_weights, device, stream);
+    ASSERT_TRUE(exact_logits->ensureOnHost(stream));
+    ASSERT_TRUE(exact_indices->ensureOnHost(stream));
+    ASSERT_TRUE(exact_weights->ensureOnHost(stream));
+    ASSERT_TRUE(bucket_logits->ensureOnHost(stream));
+    ASSERT_TRUE(bucket_indices->ensureOnHost(stream));
+    ASSERT_TRUE(bucket_weights->ensureOnHost(stream));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    const size_t active_logits =
+        static_cast<size_t>(real_seq_len) * num_experts;
+    const size_t active_topk =
+        static_cast<size_t>(real_seq_len) * top_k;
+    EXPECT_EQ(
+        std::memcmp(
+            exact_logits->data(),
+            bucket_logits->data(),
+            active_logits * sizeof(float)),
+        0)
+        << "active softmax probabilities changed in the padded graph";
+    EXPECT_EQ(
+        std::memcmp(
+            exact_indices->int32_data(),
+            bucket_indices->int32_data(),
+            active_topk * sizeof(int32_t)),
+        0)
+        << "active expert IDs changed in the padded graph";
+    EXPECT_EQ(
+        std::memcmp(
+            exact_weights->data(),
+            bucket_weights->data(),
+            active_topk * sizeof(float)),
+        0)
+        << "active normalized top-k weights changed in the padded graph";
+
+    ASSERT_EQ(hipGraphExecDestroy(executable), hipSuccess);
+    ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
 }
 
 TEST(Test__ROCmMoEKernel, VerifierRowsRouteUsesDecodeEquivalentRouterAndMatchesHostReference)

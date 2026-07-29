@@ -287,19 +287,6 @@ namespace llaminar2
             int device_idx,
             void *stream);
 
-        /**
-         * @brief Allgather across local GPUs on explicit producer streams.
-         *
-         * Enqueues one grouped RCCL allgather over the supplied streams and
-         * returns after launch. The caller's streams provide producer and
-         * consumer ordering.
-         */
-        bool allgatherMultiOnStreams(const std::vector<const void *> &send_buffers,
-                                     const std::vector<void *> &recv_buffers,
-                                     size_t send_count,
-                                     CollectiveDataType dtype,
-                                     const std::vector<void *> &streams);
-
         bool broadcastMultiOnStreams(const std::vector<const void *> &send_buffers,
                                      const std::vector<void *> &recv_buffers,
                                      size_t count,

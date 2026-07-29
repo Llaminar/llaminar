@@ -18,11 +18,25 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <unistd.h>
 
 namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Emit a fatal CUDA cache diagnostic without stdio buffering.
+         *
+         * MPI abort teardown can discard buffered stdio owned by a worker
+         * process. Request-reset failures are fatal and immediately terminate,
+         * so write the already-formatted line directly to descriptor 2.
+         */
+        void writeFatalResetDiagnostic(const char *message, size_t length)
+        {
+            if (message && length > 0)
+                (void)::write(STDERR_FILENO, message, length);
+        }
+
         /**
          * @brief Check whether the opt-in MTP publication trace is enabled.
          *
@@ -369,11 +383,55 @@ namespace llaminar2
             static_cast<size_t>(n_layers_) * static_cast<size_t>(batch_size_);
         const size_t metadata_bytes = entry_count * sizeof(int);
         auto stream = static_cast<cudaStream_t>(context.execution_stream);
-        if (cudaMemsetAsync(d_head_params_, 0, metadata_bytes, stream) != cudaSuccess ||
-            cudaMemsetAsync(d_count_params_, 0, metadata_bytes, stream) != cudaSuccess)
+        const cudaError_t head_status =
+            cudaMemsetAsync(d_head_params_, 0, metadata_bytes, stream);
+        if (head_status != cudaSuccess)
         {
-            LOG_ERROR("[CUDARingKVCacheBase] Failed to enqueue request-state metadata reset"
-                      << " reason=" << context.reason);
+            LOG_ERROR("[CUDARingKVCacheBase] Failed to enqueue request-state head reset"
+                      << " reason=" << context.reason
+                      << " status=" << cudaGetErrorString(head_status)
+                      << " stream=" << context.execution_stream
+                      << " bytes=" << metadata_bytes);
+            char message[512];
+            const int length = std::snprintf(
+                message,
+                sizeof(message),
+                "[FATAL] CUDA KV request reset failed: field=head status=%s "
+                "stream=%p bytes=%zu reason=%s\n",
+                cudaGetErrorString(head_status),
+                context.execution_stream,
+                metadata_bytes,
+                context.reason);
+            if (length > 0)
+                writeFatalResetDiagnostic(
+                    message,
+                    std::min(static_cast<size_t>(length), sizeof(message) - 1));
+            return false;
+        }
+
+        const cudaError_t count_status =
+            cudaMemsetAsync(d_count_params_, 0, metadata_bytes, stream);
+        if (count_status != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARingKVCacheBase] Failed to enqueue request-state count reset"
+                      << " reason=" << context.reason
+                      << " status=" << cudaGetErrorString(count_status)
+                      << " stream=" << context.execution_stream
+                      << " bytes=" << metadata_bytes);
+            char message[512];
+            const int length = std::snprintf(
+                message,
+                sizeof(message),
+                "[FATAL] CUDA KV request reset failed: field=count status=%s "
+                "stream=%p bytes=%zu reason=%s\n",
+                cudaGetErrorString(count_status),
+                context.execution_stream,
+                metadata_bytes,
+                context.reason);
+            if (length > 0)
+                writeFatalResetDiagnostic(
+                    message,
+                    std::min(static_cast<size_t>(length), sizeof(message) - 1));
             return false;
         }
 

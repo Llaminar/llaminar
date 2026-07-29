@@ -1742,10 +1742,10 @@ TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_OnStreamGraphCapture_Comple
  * @brief Regresses large back-to-back K/V raw allgathers inside RCCL graph capture.
  *
  * Qwen phase-split prefill publishes full K and V state by capturing two
- * adjacent LocalTP raw allgathers.  The payload here matches the order and
- * size class of that handoff so graph-captured RCCL allgather emulation must
- * replay correct bytes for both K and V, including the late rows that are
- * restored by prefix-cache partial hits.
+ * adjacent LocalTP raw allgathers. The payload here matches the order and size
+ * class of that handoff so native graph-captured RCCL allgather must replay
+ * correct bytes for both K and V, including the late rows restored by
+ * prefix-cache partial hits.
  */
 TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_GraphCapturedLargeBackToBackKVPayloads_ReplaysCorrectly)
 {

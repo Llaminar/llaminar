@@ -29,7 +29,6 @@ extern "C"
 {
     void cudaNativeVNNIPrefill_setStreamKMode(int mode);
     int cudaNativeVNNIPrefill_getStreamKMode();
-    void cudaNativeVNNIPrefill_freeStreamKFixup();
 }
 
 namespace
@@ -290,7 +289,6 @@ namespace
         }
 
         // Free stream-K fixup buffer
-        cudaNativeVNNIPrefill_freeStreamKFixup();
 
         // Summary: count wins
         int sk1_wins = 0, sk2_wins = 0, std_wins = 0, ties = 0;

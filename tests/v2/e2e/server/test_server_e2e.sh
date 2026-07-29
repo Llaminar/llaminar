@@ -2326,7 +2326,7 @@ if require_prefix_rebalance_clear:
             continue
         record_tags = record.get("tags") or {}
         if (
-            record_tags.get("reset") == "clear_cache"
+            record_tags.get("reset") in {"clear_cache", "request-clear-cache"}
             and record_tags.get("window") == "request_reset"
         ):
             device_request_reset_exports += numeric(record.get("value", record.get("count", 0.0)))
@@ -2360,6 +2360,37 @@ if require_moe_rebalance_movement:
     if not has_record(domain="moe_rebalance"):
         print("FAIL: MoE rebalance movement probe emitted no moe_rebalance counters")
         sys.exit(0)
+
+    if mode == "llep":
+        if "cuda:" in extra_flags:
+            expected_allgather_primitive = "ncclAllGather"
+        elif "rocm:" in extra_flags:
+            expected_allgather_primitive = "rcclAllGather"
+        else:
+            print("FAIL: LLEP movement probe could not identify its homogeneous GPU collective backend")
+            sys.exit(0)
+
+        raw_allgather_calls = [
+            record
+            for record in records
+            if record.get("domain") == "tp_raw_allgather_runtime"
+            and record.get("name") == "calls"
+        ]
+        if not raw_allgather_calls:
+            print("FAIL: LLEP movement probe emitted no raw allgather physical-primitive evidence")
+            sys.exit(0)
+        for record in raw_allgather_calls:
+            record_tags = record.get("tags") or {}
+            if (
+                record_tags.get("path") != "native_single_device_on_stream"
+                or record_tags.get("backend_primitive") != expected_allgather_primitive
+                or record_tags.get("host_rendezvous") != "false"
+            ):
+                print(
+                    "FAIL: LLEP raw allgather used a non-native or host-rendezvous path: "
+                    f"{record_tags}"
+                )
+                sys.exit(0)
 
     # A live transfer-slot expert is stronger evidence than any intermediate
     # planner counter: its descriptor is valid, resident, locally executable,
@@ -2687,9 +2718,23 @@ run_prefill_graph_probe() {
     local tag="$1"
     local port="$2"
 
-    local messages_json payload response validation i
-    messages_json=$(python3 - <<'PY'
+    local messages_json payload response validation i probe_marker
+    local reference_prompt_tokens="" observed_prompt_tokens=""
+
+    for i in 1 2 3; do
+        case "$i" in
+            1) probe_marker="A" ;;
+            2) probe_marker="B" ;;
+            3) probe_marker="C" ;;
+            *)
+                fail "[${tag}] Prefill graph probe has an invalid request index ${i}"
+                return
+                ;;
+        esac
+
+        messages_json=$(python3 - "$probe_marker" <<'PY'
 import json
+import sys
 
 filler = " ".join(
     "capture probe filler: alpha beta gamma delta epsilon zeta eta theta."
@@ -2698,7 +2743,15 @@ filler = " ".join(
 messages = [
     {
         "role": "system",
-        "content": "You are a calculator. Reply with only the numeric answer.",
+        # The one-token marker is intentionally the first cacheable payload
+        # token. Prefix-cache cells must execute all three prefills instead of
+        # satisfying requests two and three from a full RAM-tier prefix hit.
+        # The shell-side prompt-token assertion below proves A/B/C preserve the
+        # same graph geometry before accepting capture/replay evidence.
+        "content": (
+            f"{sys.argv[1]} You are a calculator. "
+            "Reply with only the numeric answer."
+        ),
     },
     {
         "role": "user",
@@ -2711,9 +2764,8 @@ messages = [
 ]
 print(json.dumps(messages, separators=(",", ":")))
 PY
-)
+        )
 
-    for i in 1 2 3; do
         payload=$(make_chat_payload "$messages_json" 8 "false" "false")
         response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
             -H "Content-Type: application/json" \
@@ -2749,6 +2801,20 @@ except Exception as exc:
     print(f'FAIL: malformed response: {exc}')
 ")
         if [[ "$validation" == ok* ]]; then
+            observed_prompt_tokens=$(
+                printf '%s\n' "$validation" |
+                    sed -n 's/.*prompt_tokens=\([0-9][0-9]*\).*/\1/p'
+            )
+            if [ -z "$observed_prompt_tokens" ]; then
+                fail "[${tag}] Prefill graph probe request ${i}: missing prompt-token geometry"
+                return
+            fi
+            if [ -z "$reference_prompt_tokens" ]; then
+                reference_prompt_tokens="$observed_prompt_tokens"
+            elif [ "$observed_prompt_tokens" != "$reference_prompt_tokens" ]; then
+                fail "[${tag}] Prefill graph probe request ${i}: prefix-distinct prompt changed graph geometry (${observed_prompt_tokens} != ${reference_prompt_tokens})"
+                return
+            fi
             continue
         fi
         fail "[${tag}] Prefill graph probe request ${i}: ${validation}"
@@ -2935,7 +3001,13 @@ run_backend_tests() {
         server_env+=("LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER=${probe_gpu_cache_experts}")
     fi
     if suite_runs_moe_rebalance_movement_probe "$suite_options"; then
-        local probe_transfer_slots="${LLAMINAR_E2E_MOE_REBALANCE_COMPACT_PAYLOAD_SLOTS:-32}"
+        # One compact slot is sufficient to prove that the production LLEP
+        # payload lane plans, publishes, transports, and applies a real expert
+        # movement. Larger fixed capacities multiply the graph-captured
+        # allgather payload by every MoE layer even when those slots are empty;
+        # capacity/throughput sweeps belong in the dedicated transfer perf
+        # harness rather than this correctness-oriented server probe.
+        local probe_transfer_slots="${LLAMINAR_E2E_MOE_REBALANCE_COMPACT_PAYLOAD_SLOTS:-1}"
         local probe_maintenance_slack=1
         local probe_initial_maintenance_period=1
         local probe_rebalance_window

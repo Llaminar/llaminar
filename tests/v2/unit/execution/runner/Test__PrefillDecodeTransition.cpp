@@ -2123,7 +2123,9 @@ namespace
         bool prepareGreedyAllPositionBatchOutcomeGraph(
             int verifier_token_count,
             const int32_t *stop_tokens,
-            int stop_token_count) override
+            int stop_token_count,
+            const MTPGreedyPenaltyPolicy &penalty_policy =
+                MTPGreedyPenaltyPolicy{}) override
         {
             using namespace sampling_math;
             if (!primary_device_.is_gpu() ||
@@ -2144,6 +2146,7 @@ namespace
             greedy_outcome_graph_verifier_token_count_ =
                 verifier_token_count;
             greedy_outcome_graph_stop_token_count_ = stop_token_count;
+            greedy_outcome_graph_penalty_policy_ = penalty_policy;
             greedy_outcome_graph_stop_tokens_.fill(-1);
             for (int i = 0; i < stop_token_count; ++i)
             {
@@ -4753,6 +4756,10 @@ namespace
         {
             return verify_greedy_all_position_batch_outcome_count_;
         }
+        const MTPGreedyPenaltyPolicy &greedyOutcomeGraphPenaltyPolicy() const
+        {
+            return greedy_outcome_graph_penalty_policy_;
+        }
         int applyMainPenaltiesCount() const { return apply_main_penalties_count_; }
         int applyMTPPenaltiesCount() const { return apply_mtp_penalties_count_; }
         int applyAllPositionPenaltiesCount() const { return apply_all_position_penalties_count_; }
@@ -5931,6 +5938,7 @@ namespace
         std::array<int32_t,
                    sampling_math::kSpeculativeBatchMaxStopTokens>
             greedy_outcome_graph_stop_tokens_{};
+        MTPGreedyPenaltyPolicy greedy_outcome_graph_penalty_policy_{};
         std::array<int32_t,
                    sampling_math::kSpeculativeBatchMaxOutputTokens *
                        kMockResidentOutcomeRequestCapacity>
@@ -9166,7 +9174,7 @@ namespace
     }
 
     TEST_F(Test__PrefillDecodeTransition,
-           PenaltyGreedyGPUFailsBeforeUncapturedVerifierTransform)
+           PenaltyGreedyGPUUsesCapturedVerifierTransform)
     {
         const std::filesystem::path export_path =
             std::filesystem::temp_directory_path() /
@@ -9200,12 +9208,12 @@ namespace
             const int forward_count_after_prefill = mock->forwardCallCount();
 
             GenerationResult step = runner->decodeStep();
-            ASSERT_FALSE(step.success());
+            ASSERT_TRUE(step.success()) << step.error;
             EXPECT_THAT(
-                step.error,
-                HasSubstr(
-                    "GPU greedy MTP penalties must execute inside the captured "
-                    "verifier graph"));
+                step.tokens,
+                ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                            MockInferenceRunner::MTP_ARGMAX_TOKEN));
             EXPECT_EQ(mock->applyMainPenaltiesCount(), 1)
                 << "the first temperature-zero target token is still sampled "
                    "from penalty-mutated logits";
@@ -9213,18 +9221,26 @@ namespace
                 << "each greedy MTP sidecar draft should see the sampler "
                    "history built by prior accepted tokens";
             EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0)
-                << "uncaptured verifier transforms must fail before launching "
-                   "the grouped verifier graph";
-            EXPECT_EQ(mock->setAllPositionCount(), 1)
-                << "the only all-position transition is fail-path teardown; no "
-                   "verifier graph is enabled or executed";
-            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
-            EXPECT_EQ(mock->verifyGreedyAllPositionBatchOutcomeCount(), 0);
+                << "greedy verifier penalties belong to the captured outcome "
+                   "kernel, never to a host-scheduled row mutation";
+            EXPECT_EQ(mock->setAllPositionCount(), 2);
+            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
+            EXPECT_EQ(mock->verifyGreedyAllPositionBatchOutcomeCount(), 1);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
-            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 0);
-            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill)
-                << "the unsupported graph transform must fail before verifier "
-                   "execution instead of entering a fallback lane";
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
+                << "all verifier rows must execute in one grouped forward";
+            EXPECT_FLOAT_EQ(
+                mock->greedyOutcomeGraphPenaltyPolicy().presence_penalty,
+                sampling.presence_penalty);
+            EXPECT_FLOAT_EQ(
+                mock->greedyOutcomeGraphPenaltyPolicy().frequency_penalty,
+                sampling.frequency_penalty);
+            EXPECT_EQ(mock->greedyOutcomeGraphPenaltyPolicy().enabled, 1);
+            EXPECT_EQ(
+                mock->greedyOutcomeGraphPenaltyPolicy()
+                    .first_token_already_in_history,
+                0);
             EXPECT_EQ(
                 mock->forwardMTPFromDeviceTargetAtLivePositionForDeviceSamplingCount(),
                 1)
@@ -9256,8 +9272,7 @@ namespace
                                PerfStatRecord::Kind::Counter,
                                "greedy_vllm_penalty_rows_preapplied");
             EXPECT_EQ(row_penalties, nullptr)
-                << "the uncaptured row transform must not run before the hard "
-                   "failure";
+                << "the uncaptured row transform must remain retired";
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -13441,14 +13456,14 @@ namespace
     }
 
     /**
-     * @brief LocalTP penalty verification fails before an uncaptured transform.
+     * @brief LocalTP penalties are owned by the captured grouped verifier.
      */
     TEST_F(Test__PrefillDecodeTransition,
-           LocalTPPenaltyGreedyFailsBeforeUncapturedVerifierTransform)
+           LocalTPPenaltyGreedyArmsCapturedVerifierPolicyWithoutRowMutation)
     {
         const std::filesystem::path export_path =
             std::filesystem::temp_directory_path() /
-            "llaminar_mtp_localtp_grouped_host_reject_precleanup_unit.json";
+            "llaminar_mtp_localtp_grouped_device_penalty_unit.json";
         {
             ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
             PerfStatsCollector::reset();
@@ -13476,46 +13491,57 @@ namespace
             ASSERT_TRUE(harness.runner->prefill({1, 2, 3, 4, 5}));
 
             GenerationResult step = harness.runner->decodeStep();
-            ASSERT_FALSE(step.success());
-            EXPECT_THAT(
-                step.error,
-                HasSubstr(
-                    "Grouped-outcome GPU greedy MTP penalties must execute "
-                    "inside the captured verifier graph"));
-
-            EXPECT_EQ(harness.child0->verifyGreedyAllPositionBatchOutcomeCount(), 0);
-            EXPECT_EQ(harness.child1->verifyGreedyAllPositionBatchOutcomeCount(), 0);
-            EXPECT_EQ(harness.child0->sampleAllPositionLogitsBatchedCount(), 0);
-            EXPECT_EQ(harness.child1->sampleAllPositionLogitsBatchedCount(), 0);
+            ASSERT_TRUE(step.success()) << step.error;
+            EXPECT_EQ(harness.child0->verifyGreedyAllPositionBatchOutcomeCount(), 1);
+            EXPECT_EQ(harness.child1->verifyGreedyAllPositionBatchOutcomeCount(), 1);
+            EXPECT_FLOAT_EQ(
+                harness.child0
+                    ->greedyOutcomeGraphPenaltyPolicy()
+                    .presence_penalty,
+                1.0f);
+            EXPECT_FLOAT_EQ(
+                harness.child1
+                    ->greedyOutcomeGraphPenaltyPolicy()
+                    .presence_penalty,
+                1.0f);
+            EXPECT_EQ(
+                harness.child0
+                    ->greedyOutcomeGraphPenaltyPolicy()
+                    .first_token_already_in_history,
+                0);
+            EXPECT_EQ(harness.child0->applyAllPositionPenaltiesCount(), 0);
+            EXPECT_EQ(harness.child1->applyAllPositionPenaltiesCount(), 0);
+            EXPECT_EQ(harness.child0->sampleAllPositionLogitsBatchedCount(), 1);
+            EXPECT_EQ(harness.child1->sampleAllPositionLogitsBatchedCount(), 1);
             EXPECT_EQ(harness.child0->publishMTPSpecStateCount(), 0);
             EXPECT_EQ(harness.child1->publishMTPSpecStateCount(), 0);
             EXPECT_EQ(harness.child0->publishMTPSpecStateBatchCount(), 0);
             EXPECT_EQ(harness.child1->publishMTPSpecStateBatchCount(), 0);
             EXPECT_EQ(harness.child0->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
             EXPECT_EQ(harness.child1->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
-            EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 0);
-            EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 0);
-            EXPECT_THAT(harness.child0->publicationEvents(), IsEmpty());
-            EXPECT_THAT(harness.child1->publicationEvents(), IsEmpty());
+            EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 1);
+            EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 1);
+            EXPECT_THAT(
+                harness.child0->publicationEvents(),
+                ElementsAre("device_outcome_publish", "host_outcome_bridge"));
+            EXPECT_THAT(
+                harness.child1->publicationEvents(),
+                ElementsAre("device_outcome_publish"));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             EXPECT_EQ(findPerfRecord(records,
                                      PerfStatRecord::Kind::Counter,
                                      "grouped_outcome_host_publication_uses"),
                       nullptr);
-            EXPECT_EQ(findPerfRecord(records,
+            EXPECT_NE(findPerfRecord(records,
                                      PerfStatRecord::Kind::Counter,
                                      "rank_mirrored_localtp_greedy_resident_outcomes"),
-                      nullptr);
-            EXPECT_EQ(findPerfRecord(records,
-                                     PerfStatRecord::Kind::Counter,
-                                     "grouped_outcome_pending_condition_resident_mailboxes"),
                       nullptr);
             ASSERT_EQ(findPerfRecord(records,
                                      PerfStatRecord::Kind::Counter,
                                      "grouped_outcome_pending_condition_host_tokens"),
                       nullptr);
-            EXPECT_EQ(findPerfRecord(records,
+            EXPECT_NE(findPerfRecord(records,
                                      PerfStatRecord::Kind::Counter,
                                      "acceptance_trace"),
                       nullptr);

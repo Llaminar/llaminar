@@ -74,7 +74,7 @@
 #include "ROCmQuantisedGemmKernel.h"
 #include "transfer/TransferEngine.h"
 #include "../ROCmKernelBase.h"
-#include "../ROCmWeightPacker.h"     // packWeightsToROCm, packNativeVNNI
+#include "ROCmWeightPacker.h"     // packWeightsToROCm, packNativeVNNI
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "backends/DeviceId.h"       // DeviceId
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.

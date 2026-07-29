@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include "../../common/SamplingMath.h"
+#include "../../../execution/mtp/MTPVerifierOutcomeGraph.h"
 
 // Maximum k supported by the top-k kernel
 constexpr int TOPK_MAX_K = 256;
@@ -260,6 +261,109 @@ __global__ void cuda_argmax_partial_f32_batched_rows_kernel(
     if (tid == 0)
     {
         const int offset = row * row_partial_capacity + blockIdx.x;
+        partial_vals[offset] = smax[0];
+        partial_idxs[offset] = sidx[0];
+    }
+}
+
+/**
+ * @brief Grouped verifier argmax pass with serial-row penalty semantics.
+ *
+ * Row `r` sees the durable generated-token histogram plus verifier input
+ * tokens `[prefix_begin, r]`.  That is exactly the history visible to `r`
+ * serial decode calls, but it avoids materializing one sparse host map per row
+ * and avoids mutating the logits matrix before reduction.
+ */
+__global__ void cuda_argmax_partial_f32_batched_rows_mtp_penalty_kernel(
+    const float *__restrict__ data,
+    int rows,
+    int cols,
+    int row_stride,
+    const int *__restrict__ verifier_input_tokens,
+    const int *__restrict__ generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    float *__restrict__ partial_vals,
+    int *__restrict__ partial_idxs,
+    int row_partial_capacity)
+{
+    extern __shared__ char shared_mem[];
+    float *smax = reinterpret_cast<float *>(shared_mem);
+    int *sidx = reinterpret_cast<int *>(
+        shared_mem + blockDim.x * sizeof(float));
+
+    const int row = blockIdx.y;
+    if (row >= rows)
+        return;
+
+    const int tid = threadIdx.x;
+    const int gid = blockIdx.x * blockDim.x + tid;
+    const int grid_stride = blockDim.x * gridDim.x;
+    const float *row_data =
+        data + static_cast<size_t>(row) * static_cast<size_t>(row_stride);
+    const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
+    const int prefix_begin =
+        request_policy.first_token_already_in_history != 0 ? 1 : 0;
+
+    float local_max = -FLT_MAX;
+    int local_idx = INT_MAX;
+    for (int token = gid; token < cols; token += grid_stride)
+    {
+        float value = row_data[token];
+        if (request_policy.enabled != 0)
+        {
+            int count = generated_token_counts[token];
+            for (int history_index = prefix_begin;
+                 history_index <= row;
+                 ++history_index)
+            {
+                count += verifier_input_tokens[history_index] == token ? 1 : 0;
+            }
+
+            if (count > 0)
+            {
+                float penalty = 0.0f;
+                if (request_policy.presence_penalty != 0.0f)
+                    penalty += request_policy.presence_penalty;
+                if (request_policy.frequency_penalty != 0.0f)
+                {
+                    const float frequency_component =
+                        request_policy.frequency_penalty *
+                        static_cast<float>(count);
+                    penalty += frequency_component;
+                }
+                value -= penalty;
+            }
+        }
+        if (argmax_better(value, token, local_max, local_idx))
+        {
+            local_max = value;
+            local_idx = token;
+        }
+    }
+
+    smax[tid] = local_max;
+    sidx[tid] = local_idx;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
+    {
+        if (tid < stride &&
+            argmax_better(
+                smax[tid + stride],
+                sidx[tid + stride],
+                smax[tid],
+                sidx[tid]))
+        {
+            smax[tid] = smax[tid + stride];
+            sidx[tid] = sidx[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0)
+    {
+        const int offset =
+            row * row_partial_capacity + static_cast<int>(blockIdx.x);
         partial_vals[offset] = smax[0];
         partial_idxs[offset] = sidx[0];
     }
@@ -3548,6 +3652,62 @@ cuda_summarize_greedy_speculative_verify_batch_device_controls_kernel(
 }
 
 /**
+ * @brief Publish one request's immutable grouped-greedy controls on device.
+ */
+__global__ void cuda_configure_mtp_greedy_penalty_policy_kernel(
+    llaminar2::MTPGreedyPenaltyPolicy *__restrict__ controls,
+    float presence_penalty,
+    float frequency_penalty,
+    int first_token_already_in_history)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    controls->presence_penalty = presence_penalty;
+    controls->frequency_penalty = frequency_penalty;
+    controls->first_token_already_in_history =
+        first_token_already_in_history != 0 ? 1 : 0;
+    controls->enabled =
+        presence_penalty != 0.0f || frequency_penalty != 0.0f ? 1 : 0;
+}
+
+/**
+ * @brief Advance the generated-token histogram from the compact outcome.
+ *
+ * A single thread owns the short row, so duplicate tokens are updated in
+ * deterministic program order without atomics.  Pending-condition row zero was
+ * emitted by the previous transaction and is deliberately skipped.
+ */
+__global__ void cuda_commit_mtp_greedy_penalty_history_kernel(
+    const int *__restrict__ output_tokens,
+    const int *__restrict__ output_meta,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    int output_token_capacity,
+    int vocab_size,
+    int *__restrict__ generated_token_counts)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    if (output_meta[llaminar2::sampling_math::kSpecBatchMetaOk] == 0)
+        return;
+
+    int output_count =
+        output_meta[llaminar2::sampling_math::kSpecBatchMetaOutputCount];
+    if (output_count < 0)
+        output_count = 0;
+    if (output_count > output_token_capacity)
+        output_count = output_token_capacity;
+    const int begin =
+        policy->first_token_already_in_history != 0 ? 1 : 0;
+    for (int i = begin; i < output_count; ++i)
+    {
+        const int token = output_tokens[i];
+        if (token >= 0 && token < vocab_size)
+            ++generated_token_counts[token];
+    }
+}
+
+/**
  * @brief Derive publication rows/counts from compact speculative metadata.
  *
  * Each request is independent, so one CUDA thread maps one compact metadata row
@@ -3956,6 +4116,163 @@ extern "C"
         {
             fprintf(stderr, "CUDA Argmax FP32 batched rows launch failed: %s\n",
                     cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_configure_mtp_greedy_penalty_policy(
+        llaminar2::MTPGreedyPenaltyPolicy *controls,
+        float presence_penalty,
+        float frequency_penalty,
+        bool first_token_already_in_history,
+        int device_idx,
+        void *stream)
+    {
+        if (!controls || !stream)
+            return false;
+
+        cudaSetDevice(device_idx);
+        cuda_configure_mtp_greedy_penalty_policy_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            controls,
+            presence_penalty,
+            frequency_penalty,
+            first_token_already_in_history ? 1 : 0);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA MTP greedy penalty policy launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_argmax_f32_batched_rows_mtp_penalties(
+        const float *data,
+        int rows,
+        int cols,
+        int row_stride,
+        const int *verifier_input_tokens,
+        const int *generated_token_counts,
+        const llaminar2::MTPGreedyPenaltyPolicy *policy,
+        float *out_values,
+        int *out_indices,
+        float *partial_vals,
+        int *partial_idxs,
+        int partial_capacity,
+        int device_idx,
+        void *stream,
+        int output_stride)
+    {
+        if (rows <= 0 || cols <= 0 || row_stride < cols ||
+            !data || !verifier_input_tokens || !generated_token_counts ||
+            !policy || !out_values || !out_indices ||
+            !partial_vals || !partial_idxs || partial_capacity < rows ||
+            !stream || output_stride <= 0)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        const int row_partial_capacity = partial_capacity / rows;
+        if (row_partial_capacity < 1)
+            return false;
+
+        const int threads = ARGMAX_REDUCE_THREADS;
+        const long per_block =
+            static_cast<long>(threads) * ARGMAX_ELEMS_PER_THREAD;
+        long blocks =
+            (static_cast<long>(cols) + per_block - 1) / per_block;
+        if (blocks < 1)
+            blocks = 1;
+        if (blocks > row_partial_capacity)
+            blocks = row_partial_capacity;
+        const int num_blocks = static_cast<int>(blocks);
+        const size_t shared_bytes =
+            static_cast<size_t>(threads) * (sizeof(float) + sizeof(int));
+        cuda_argmax_partial_f32_batched_rows_mtp_penalty_kernel<<<
+            dim3(num_blocks, rows),
+            dim3(threads),
+            shared_bytes,
+            static_cast<cudaStream_t>(stream)>>>(
+            data,
+            rows,
+            cols,
+            row_stride,
+            verifier_input_tokens,
+            generated_token_counts,
+            policy,
+            partial_vals,
+            partial_idxs,
+            row_partial_capacity);
+        cuda_argmax_finalize_f32_batched_rows_kernel<<<
+            rows,
+            ARGMAX_FINALIZE_THREADS,
+            static_cast<size_t>(ARGMAX_FINALIZE_THREADS) *
+                (sizeof(float) + sizeof(int)),
+            static_cast<cudaStream_t>(stream)>>>(
+            partial_vals,
+            partial_idxs,
+            num_blocks,
+            row_partial_capacity,
+            out_values,
+            out_indices,
+            output_stride);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA MTP penalty-aware batched argmax launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_commit_mtp_greedy_penalty_history(
+        const int *output_tokens,
+        const int *output_meta,
+        const llaminar2::MTPGreedyPenaltyPolicy *policy,
+        int output_token_capacity,
+        int vocab_size,
+        int *generated_token_counts,
+        int device_idx,
+        void *stream)
+    {
+        if (!output_tokens || !output_meta || !policy ||
+            output_token_capacity <= 0 || vocab_size <= 0 ||
+            !generated_token_counts || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_commit_mtp_greedy_penalty_history_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            output_tokens,
+            output_meta,
+            policy,
+            output_token_capacity,
+            vocab_size,
+            generated_token_counts);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA MTP greedy penalty history commit launch failed: %s\n",
+                cudaGetErrorString(err));
             return false;
         }
         return true;

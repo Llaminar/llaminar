@@ -763,20 +763,22 @@ TEST_F(Test__LocalTPContext, RawAllgatherUsesParticipantProducerStreams)
     const std::string source = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_SOURCE);
     ASSERT_FALSE(source.empty());
 
-    const size_t fn = source.find("bool LocalTPContext::allgatherRawWithBarrierMultiGpu(");
+    const size_t fn = source.find("bool LocalTPContext::allgatherRawOnStream(");
     ASSERT_NE(fn, std::string::npos);
-    const size_t next_fn = source.find("bool LocalTPContext::gatherFromDevices(", fn);
+    const size_t next_fn = source.find("bool LocalTPContext::groupedP2PRawOnStream(", fn);
     ASSERT_NE(next_fn, std::string::npos);
 
     const std::string block = source.substr(fn, next_fn - fn);
-    EXPECT_NE(block.find("raw_allgather_producer_streams_"), std::string::npos);
-    EXPECT_NE(block.find("backend_impl_->allgatherMultiOnStreams("), std::string::npos);
-    EXPECT_EQ(block.find("backend_impl_->allgatherMultiWithComputeDeps("), std::string::npos)
-        << "raw allgather must use the caller's producer streams, not globally "
-           "registered compute streams";
+    EXPECT_NE(block.find("backend_impl_->allgatherSingleDeviceOnStream("), std::string::npos);
+    EXPECT_NE(block.find("recordLocalTPRuntimeRawAllgather("), std::string::npos);
+    EXPECT_EQ(block.find("allgatherRawWithBarrierMultiGpu("), std::string::npos);
+    EXPECT_EQ(block.find("backend_impl_->allgatherMultiOnStreams("), std::string::npos);
+    EXPECT_EQ(block.find("allreduceGroupedOnExplicitStreams("), std::string::npos);
+    EXPECT_EQ(block.find("cudaMemsetAsyncDevice"), std::string::npos);
+    EXPECT_EQ(block.find("hipMemsetAsyncDevice"), std::string::npos);
     EXPECT_EQ(block.find("backend_impl_->allgatherMulti("), std::string::npos)
-        << "raw allgather must not continue on producer streams before collective "
-           "completion is ordered on those same streams";
+        << "Every GPU raw allgather must be the native participant-local "
+           "collective on the exact producer stream.";
 }
 
 /**
@@ -823,26 +825,8 @@ TEST_F(Test__LocalTPContext, ConstructNegativeWeightThrows)
 // Backend Auto-Detection Tests
 // =============================================================================
 
-/**
- * @test AUTO backend with all CUDA devices -> NCCL (requires 2+ CUDA GPUs)
- */
-TEST_F(Test__LocalTPContext, AutoBackendAllCuda)
-{
-    std::unique_ptr<ILocalTPContext> ctx;
-    try
-    {
-        ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::AUTO);
-    }
-    catch (const std::runtime_error &e)
-    {
-        GTEST_SKIP() << "NCCL initialization failed (need 2+ CUDA GPUs): " << e.what();
-    }
-
-    EXPECT_EQ(ctx->backend(), CollectiveBackendType::NCCL);
-}
-
-// NOTE: Hardware-dependent backend auto-detection tests (AutoBackendAllRocm,
-// AutoBackendMixedGpus, AutoBackendSelectsHeterogeneousFor*)
+// NOTE: Hardware-dependent backend auto-detection tests (all-CUDA, all-ROCm,
+// mixed GPUs, and heterogeneous selections)
 // have been migrated to integration tests in Test__LocalTPBackendBehavior.cpp.
 // Those tests require actual GPU hardware (RCCL, HETEROGENEOUS backends).
 
@@ -1179,7 +1163,6 @@ public:
     std::atomic<int> allreduce_on_stream_call_count{0};
     std::atomic<int> allgather_call_count{0};
     std::atomic<int> allgather_multi_call_count{0};
-    std::atomic<int> allgather_multi_on_streams_call_count{0};
     std::atomic<int> allgather_on_stream_call_count{0};
     std::atomic<int> reduce_scatter_call_count{0};
     std::atomic<int> synchronize_call_count{0};
@@ -1202,7 +1185,6 @@ public:
     CollectiveOp last_op = CollectiveOp::ALLREDUCE_SUM;
     std::vector<void *> last_multi_buffers;
     std::vector<void *> last_allreduce_multi_streams;
-    std::vector<void *> last_allgather_multi_streams;
     int last_allreduce_on_stream_device_idx = -1;
     void *last_allreduce_on_stream_stream = nullptr;
     int last_allgather_on_stream_device_idx = -1;
@@ -1392,27 +1374,6 @@ public:
         return !should_fail_allgather;
     }
 
-    bool allgatherMultiOnStreams(
-        const std::vector<const void *> &send_bufs,
-        const std::vector<void *> &recv_bufs,
-        size_t send_count,
-        CollectiveDataType dtype,
-        const std::vector<void *> &streams) override
-    {
-        allgather_multi_on_streams_call_count++;
-        last_allgather_count = send_count;
-        last_dtype = dtype;
-        last_allgather_multi_streams = streams;
-        (void)send_bufs;
-        (void)recv_bufs;
-        return !should_fail_allgather;
-    }
-
-    bool supportsAllgatherMultiOnStreams() const override
-    {
-        return multi_gpu_mode;
-    }
-
     bool allgatherSingleDeviceOnStream(
         const void *send_buf,
         void *recv_buf,
@@ -1449,7 +1410,6 @@ public:
         allreduce_on_stream_call_count = 0;
         allgather_call_count = 0;
         allgather_multi_call_count = 0;
-        allgather_multi_on_streams_call_count = 0;
         allgather_on_stream_call_count = 0;
         reduce_scatter_call_count = 0;
         synchronize_call_count = 0;
@@ -1463,7 +1423,6 @@ public:
         supports_allgather_on_stream = true;
         last_multi_buffers.clear();
         last_allreduce_multi_streams.clear();
-        last_allgather_multi_streams.clear();
         last_allreduce_on_stream_device_idx = -1;
         last_allreduce_on_stream_stream = nullptr;
         last_allgather_on_stream_device_idx = -1;
@@ -1511,7 +1470,7 @@ TEST_F(Test__LocalTPContext, HostBackendAlwaysAvailable)
     EXPECT_EQ(ctx->degree(), 2);
 }
 
-TEST_F(Test__LocalTPContext, RawAllgatherGraphCaptureSupportUsesAllreducePrimitive)
+TEST_F(Test__LocalTPContext, RawAllgatherGraphCaptureSupportRequiresNativeAllgather)
 {
     auto ctx_base = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {}, CollectiveBackendType::HOST);
     auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
@@ -1520,26 +1479,25 @@ TEST_F(Test__LocalTPContext, RawAllgatherGraphCaptureSupportUsesAllreducePrimiti
     auto backend = std::make_unique<MockCollectiveBackend>();
     auto *backend_raw = backend.get();
     backend_raw->multi_gpu_mode = true;
-    backend_raw->supports_allgather_on_stream = false;
-    backend_raw->supports_allreduce_on_stream = true;
+    backend_raw->supports_allgather_on_stream = true;
+    backend_raw->supports_allreduce_on_stream = false;
     ctx->setBackendForTesting(
         std::move(backend),
         CollectiveBackendType::NCCL,
         /*initialized=*/true);
 
     EXPECT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture())
-        << "NCCL graph-captured raw allgather is implemented through the validated allreduce primitive.";
+        << "NCCL graph capture uses the native participant-local allgather.";
 
-    backend_raw->supports_allreduce_on_stream = false;
+    backend_raw->supports_allgather_on_stream = false;
+    backend_raw->supports_allreduce_on_stream = true;
     EXPECT_FALSE(ctx->supportsRawAllgatherOnStreamGraphCapture());
     EXPECT_EQ(backend_raw->allgather_on_stream_call_count.load(), 0);
     EXPECT_EQ(backend_raw->allgather_multi_call_count.load(), 0)
-        << "Support probing must not enter the host-synchronized raw allgather barrier.";
-    EXPECT_EQ(backend_raw->allgather_multi_on_streams_call_count.load(), 0)
-        << "Support probing must not launch eager grouped allgather.";
+        << "Support probing must not launch a collective.";
 }
 
-TEST_F(Test__LocalTPContext, RCCLRawAllgatherGraphCaptureSupportUsesAllreducePrimitive)
+TEST_F(Test__LocalTPContext, RCCLRawAllgatherGraphCaptureSupportRequiresNativeAllgather)
 {
     auto ctx_base = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {}, CollectiveBackendType::HOST);
     auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
@@ -1548,21 +1506,22 @@ TEST_F(Test__LocalTPContext, RCCLRawAllgatherGraphCaptureSupportUsesAllreducePri
     auto backend = std::make_unique<MockCollectiveBackend>();
     auto *backend_raw = backend.get();
     backend_raw->multi_gpu_mode = true;
-    backend_raw->supports_allgather_on_stream = false;
-    backend_raw->supports_allreduce_on_stream = true;
+    backend_raw->supports_allgather_on_stream = true;
+    backend_raw->supports_allreduce_on_stream = false;
     ctx->setBackendForTesting(
         std::move(backend),
         CollectiveBackendType::RCCL,
         /*initialized=*/true);
 
     EXPECT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture())
-        << "RCCL graph-captured raw allgather is implemented via captured allreduce emulation.";
+        << "RCCL graph capture uses the native participant-local allgather.";
 
-    backend_raw->supports_allreduce_on_stream = false;
+    backend_raw->supports_allgather_on_stream = false;
+    backend_raw->supports_allreduce_on_stream = true;
     EXPECT_FALSE(ctx->supportsRawAllgatherOnStreamGraphCapture());
 }
 
-TEST_F(Test__LocalTPContext, GraphCapturedRawAllgatherUsesGroupedAllreduceEmulation)
+TEST_F(Test__LocalTPContext, RawAllgatherAlwaysUsesNativeParticipantPrimitive)
 {
     std::ifstream source("src/v2/collective/LocalTPContext.cpp");
     ASSERT_TRUE(source.is_open());
@@ -1571,25 +1530,22 @@ TEST_F(Test__LocalTPContext, GraphCapturedRawAllgatherUsesGroupedAllreduceEmulat
 
     const size_t entry = contents.find("bool LocalTPContext::allgatherRawOnStream(");
     ASSERT_NE(entry, std::string::npos);
-    const size_t graph_capture_branch = contents.find("if (isGraphCaptureActive())", entry);
-    ASSERT_NE(graph_capture_branch, std::string::npos);
-    const size_t eager_handoff = contents.find("return allgatherRawWithBarrierMultiGpu(", graph_capture_branch);
-    ASSERT_NE(eager_handoff, std::string::npos);
-    const std::string graph_body = contents.substr(graph_capture_branch, eager_handoff - graph_capture_branch);
+    const size_t next_method = contents.find(
+        "bool LocalTPContext::groupedP2PRawOnStream(",
+        entry);
+    ASSERT_NE(next_method, std::string::npos);
+    const std::string body = contents.substr(entry, next_method - entry);
 
-    const size_t emulation_comment = graph_body.find(
-        "deterministic publish-and-sum transaction");
-    ASSERT_NE(emulation_comment, std::string::npos);
-    const size_t grouped_allreduce_call = graph_body.find(
-        "allreduceGroupedOnExplicitStreams(",
-        emulation_comment);
-    ASSERT_NE(grouped_allreduce_call, std::string::npos);
-    EXPECT_NE(graph_body.find("nccl_backend_detail::cudaMemsetAsyncDevice"), std::string::npos);
-    EXPECT_NE(graph_body.find("nccl_backend_detail::cudaMemcpyAsyncSameDevice"), std::string::npos);
-    EXPECT_NE(graph_body.find("rccl_backend_detail::hipMemsetAsyncDevice"), std::string::npos);
-    EXPECT_NE(graph_body.find("rccl_backend_detail::hipMemcpyAsyncSameDevice"), std::string::npos);
-    EXPECT_EQ(graph_body.find("backend_impl_->allgatherSingleDeviceOnStream"), std::string::npos)
-        << "Graph-captured raw allgather should not depend on backend-native allgather replay.";
+    EXPECT_NE(body.find("supportsAllgatherSingleDeviceOnStream"), std::string::npos);
+    EXPECT_NE(body.find("backend_impl_->allgatherSingleDeviceOnStream"), std::string::npos);
+    EXPECT_NE(body.find("recordLocalTPRuntimeRawAllgather"), std::string::npos);
+    EXPECT_NE(contents.find("\"native_single_device_on_stream\""), std::string::npos);
+    EXPECT_NE(contents.find("\"host_rendezvous\", \"false\""), std::string::npos);
+    EXPECT_EQ(body.find("allgatherRawWithBarrierMultiGpu"), std::string::npos);
+    EXPECT_EQ(body.find("allreduceGroupedOnExplicitStreams"), std::string::npos);
+    EXPECT_EQ(body.find("allgatherMultiOnStreams"), std::string::npos);
+    EXPECT_EQ(body.find("cudaMemsetAsyncDevice"), std::string::npos);
+    EXPECT_EQ(body.find("hipMemsetAsyncDevice"), std::string::npos);
 }
 
 TEST_F(Test__LocalTPContext, RawAllgatherGraphCaptureFailsWithoutOnStreamSupport)
@@ -1602,7 +1558,7 @@ TEST_F(Test__LocalTPContext, RawAllgatherGraphCaptureFailsWithoutOnStreamSupport
     auto *backend_raw = backend.get();
     backend_raw->multi_gpu_mode = true;
     backend_raw->supports_allgather_on_stream = false;
-    backend_raw->supports_allreduce_on_stream = false;
+    backend_raw->supports_allreduce_on_stream = true;
     ctx->setBackendForTesting(
         std::move(backend),
         CollectiveBackendType::NCCL,
@@ -1629,11 +1585,11 @@ TEST_F(Test__LocalTPContext, RawAllgatherGraphCaptureFailsWithoutOnStreamSupport
     EXPECT_EQ(backend_raw->allgather_on_stream_call_count.load(), 0);
     EXPECT_EQ(backend_raw->allgather_multi_call_count.load(), 0)
         << "Unsupported graph-captured raw allgather must fail, not fall back.";
-    EXPECT_EQ(backend_raw->allgather_multi_on_streams_call_count.load(), 0)
-        << "Unsupported graph-captured raw allgather must fail, not enter eager grouped launch.";
+    EXPECT_EQ(backend_raw->allreduce_on_stream_call_count.load(), 0)
+        << "Native allgather support is mandatory; allreduce emulation is forbidden.";
 }
 
-TEST_F(Test__LocalTPContext, RawAllgatherResultSurvivesBackToBackGenerations)
+TEST_F(Test__LocalTPContext, RawAllgatherHasNoHostRendezvousGeneration)
 {
     auto ctx_base = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {}, CollectiveBackendType::HOST);
     auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
@@ -1658,94 +1614,44 @@ TEST_F(Test__LocalTPContext, RawAllgatherResultSurvivesBackToBackGenerations)
     void *slot0_stream = reinterpret_cast<void *>(0x1234);
     void *slot1_stream = reinterpret_cast<void *>(0x5678);
 
-    std::promise<void> release_second_generation;
-    auto release_second_generation_future = release_second_generation.get_future().share();
-    std::atomic<bool> slot0_first_returned{false};
-    std::atomic<bool> slot1_entering_second{false};
-    std::atomic<bool> slot0_first_result{false};
-    std::atomic<bool> slot1_first_result{false};
-    std::atomic<bool> slot0_second_result{false};
-    std::atomic<bool> slot1_second_result{false};
+    EXPECT_TRUE(ctx->allgatherRawOnStream(
+        &send0_gen0,
+        recv0_gen0,
+        1,
+        CollectiveDataType::INT32,
+        0,
+        slot0_stream,
+        "raw_stage_0"));
+    EXPECT_TRUE(ctx->allgatherRawOnStream(
+        &send0_gen1,
+        recv0_gen1,
+        1,
+        CollectiveDataType::INT32,
+        0,
+        slot0_stream,
+        "raw_stage_1"));
+    EXPECT_TRUE(ctx->allgatherRawOnStream(
+        &send1_gen0,
+        recv1_gen0,
+        1,
+        CollectiveDataType::INT32,
+        1,
+        slot1_stream,
+        "raw_stage_0"));
+    EXPECT_TRUE(ctx->allgatherRawOnStream(
+        &send1_gen1,
+        recv1_gen1,
+        1,
+        CollectiveDataType::INT32,
+        1,
+        slot1_stream,
+        "raw_stage_1"));
 
-    std::thread slot0([&]()
-                      {
-                          const bool first = ctx->allgatherRawOnStream(
-                              &send0_gen0,
-                              recv0_gen0,
-                              1,
-                              CollectiveDataType::INT32,
-                              0,
-                              slot0_stream,
-                              "raw_stage_0");
-                          slot0_first_result.store(first, std::memory_order_release);
-                          slot0_first_returned.store(true, std::memory_order_release);
-                          release_second_generation_future.wait();
-                          const bool second = ctx->allgatherRawOnStream(
-                              &send0_gen1,
-                              recv0_gen1,
-                              1,
-                              CollectiveDataType::INT32,
-                              0,
-                              slot0_stream,
-                              "raw_stage_1");
-                          slot0_second_result.store(second, std::memory_order_release);
-                      });
-
-    std::thread slot1([&]()
-                      {
-                          const bool first = ctx->allgatherRawOnStream(
-                              &send1_gen0,
-                              recv1_gen0,
-                              1,
-                              CollectiveDataType::INT32,
-                              1,
-                              slot1_stream,
-                              "raw_stage_0");
-                          slot1_first_result.store(first, std::memory_order_release);
-                          slot1_entering_second.store(true, std::memory_order_release);
-                          const bool second = ctx->allgatherRawOnStream(
-                              &send1_gen1,
-                              recv1_gen1,
-                              1,
-                              CollectiveDataType::INT32,
-                              1,
-                              slot1_stream,
-                              "raw_stage_1");
-                          slot1_second_result.store(second, std::memory_order_release);
-                      });
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while ((!slot0_first_returned.load(std::memory_order_acquire) ||
-            !slot1_entering_second.load(std::memory_order_acquire)) &&
-           std::chrono::steady_clock::now() < deadline)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    const bool saw_slot0_first_return =
-        slot0_first_returned.load(std::memory_order_acquire);
-    const bool saw_slot1_second_entry =
-        slot1_entering_second.load(std::memory_order_acquire);
-    const int launches_before_release = backend_raw->allgather_multi_on_streams_call_count.load();
-
-    release_second_generation.set_value();
-    slot0.join();
-    slot1.join();
-
-    EXPECT_TRUE(saw_slot0_first_return);
-    EXPECT_TRUE(saw_slot1_second_entry);
-    EXPECT_EQ(launches_before_release, 1)
-        << "The second raw allgather must not launch before both participants have "
-           "observed the first generation result.";
-    EXPECT_TRUE(slot0_first_result.load(std::memory_order_acquire));
-    EXPECT_TRUE(slot1_first_result.load(std::memory_order_acquire));
-    EXPECT_TRUE(slot0_second_result.load(std::memory_order_acquire));
-    EXPECT_TRUE(slot1_second_result.load(std::memory_order_acquire));
+    EXPECT_EQ(backend_raw->allgather_on_stream_call_count.load(), 4);
+    EXPECT_EQ(backend_raw->last_allgather_on_stream_device_idx, 1);
+    EXPECT_EQ(backend_raw->last_allgather_on_stream_stream, slot1_stream);
     EXPECT_EQ(backend_raw->allgather_multi_call_count.load(), 0);
-    EXPECT_EQ(backend_raw->allgather_multi_on_streams_call_count.load(), 2);
-    ASSERT_EQ(backend_raw->last_allgather_multi_streams.size(), 2u);
-    EXPECT_EQ(backend_raw->last_allgather_multi_streams[0], slot0_stream);
-    EXPECT_EQ(backend_raw->last_allgather_multi_streams[1], slot1_stream);
+    EXPECT_EQ(backend_raw->allreduce_on_stream_call_count.load(), 0);
 }
 
 TEST_F(Test__LocalTPContext, GroupedOnStreamAllreduceResultSurvivesBackToBackGenerations)
@@ -2044,31 +1950,6 @@ TEST_F(Test__LocalTPContext, ReduceScatterNullTensorsFails)
     auto valid_tensor = TestTensorFactory::createFP32({2, 4});
     EXPECT_FALSE(ctx->reduceScatter(nullptr, valid_tensor.get()));
     EXPECT_FALSE(ctx->reduceScatter(valid_tensor.get(), nullptr));
-}
-
-// =============================================================================
-// Multi-Device Scenarios (Backend Not Initialized)
-// =============================================================================
-
-/**
- * @test Multi-device allreduce when backend not initialized falls back gracefully
- *
- * When GPU backends (NCCL, RCCL) are requested but not available, the context
- * should still work with degraded behavior (no actual reduction, just returns true).
- */
-TEST_F(Test__LocalTPContext, MultiDeviceAllreduceBackendUnavailableFallback)
-{
-    // Use HOST backend — the original NCCL request throws when <2 CUDA GPUs exist.
-    // This test validates "does not crash" behavior, not NCCL specifically.
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::HOST);
-
-    auto tensor = TestTensorFactory::createFP32({2, 4});
-    TestTensorFactory::fillValue(tensor.get(), 1.0f);
-
-    // Should not crash. May return true (HOST fallback) or false (backend failure)
-    // The exact behavior depends on whether NCCL is available
-    ctx->allreduce(tensor.get());
-    SUCCEED(); // Test passes if no crash
 }
 
 /**

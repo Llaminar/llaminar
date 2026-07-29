@@ -47,7 +47,7 @@
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
 #include "../../mocks/MockComputeStage.h"
 #ifdef HAVE_ROCM
-#include "kernels/rocm/ROCmWeightPacker.h"
+#include "kernels/rocm/gemm/ROCmWeightPacker.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
 #include "kernels/rocm/gdn/ROCmShortConvolution.h"

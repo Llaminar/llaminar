@@ -1370,6 +1370,30 @@ TEST(Test__GpuWorkspaceAllocationPolicy, StageVerifierUsesTensorDeviceOrdinalFor
               std::string::npos);
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     BackendEventWaitsCannotDependOnAmbientGpuOrdinal)
+{
+    const auto cuda_source =
+        readFile(repoRoot() / "src/v2/backends/cuda/CUDABackend.cu");
+    const auto rocm_source =
+        readFile(repoRoot() / "src/v2/backends/rocm/ROCmBackend.cpp");
+    const auto cuda_wait = sliceBetween(
+        cuda_source,
+        "bool CUDABackend::streamWaitEvent(",
+        "// ====================================================================\n    // Async H2D Without Sync");
+    const auto rocm_wait = sliceBetween(
+        rocm_source,
+        "bool ROCmBackend::streamWaitEvent(",
+        "// ====================================================================\n    // Async H2D Without Sync");
+
+    EXPECT_NE(cuda_wait.find("cudaSetDevice(device_id)"), std::string::npos)
+        << "CUDA event waits must select the stream/event owner's explicit ordinal.";
+    EXPECT_NE(rocm_wait.find("hipSetDevice(device_id)"), std::string::npos)
+        << "ROCm event waits must select the stream/event owner's explicit ordinal.";
+    EXPECT_EQ(cuda_wait.find("(void)device_id"), std::string::npos);
+    EXPECT_EQ(rocm_wait.find("(void)device_id"), std::string::npos);
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MoERebalanceMaintenanceAlwaysPublishesDeviceEvent)
 {
     const auto source =
@@ -2480,6 +2504,71 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPVerifierGDNStateSnapshotsUseDecodeEq
     EXPECT_NE(rocm_effective_body.find("rocmGDN_chunk_forward_kernel_route("), std::string::npos);
     EXPECT_NE(rocm_effective_body.find("device_effective_seq_len"), std::string::npos)
         << "ROCm padded verifier snapshots must be guarded by the device effective length.";
+}
+
+/**
+ * @brief Prevent scalar padded prefill from mutating only the request-state bank.
+ *
+ * The persistent device request-length allocation is shared metadata, not a
+ * declaration that a one-request graph owns batched recurrent state.  Scalar
+ * graph buckets must call the device-effective-length APIs, which advance the
+ * primary short-conv and recurrence banks consumed by subsequent decode.
+ * Genuine multi-request graphs use the request-batched APIs instead.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     ScalarPaddedGDNUsesPrimaryDeviceStateWhileBatchesUseRequestBanks)
+{
+    const auto root = repoRoot();
+    const auto conv_source = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(readFile(
+            root / "src/v2/execution/compute_stages/stages/ShortConv1dStage.cpp")));
+    const auto recurrence_source = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(readFile(
+            root / "src/v2/execution/compute_stages/stages/GDNRecurrenceStage.cpp")));
+
+    EXPECT_NE(
+        conv_source.find(
+            "if(request_batched){"),
+        std::string::npos);
+    EXPECT_NE(
+        conv_source.find(
+            "forwardBatchedRequestsWithDeviceSeqLens("),
+        std::string::npos);
+    EXPECT_NE(
+        conv_source.find(
+            "elseif(use_scalar_real_length_contract){"),
+        std::string::npos);
+    EXPECT_NE(
+        conv_source.find(
+            "forwardWithEffectiveSeqLen("),
+        std::string::npos);
+    EXPECT_EQ(
+        conv_source.find(
+            "request_batched||use_scalar_real_length_contract"),
+        std::string::npos)
+        << "Scalar graph buckets must not be folded into request-bank execution.";
+
+    EXPECT_NE(
+        recurrence_source.find(
+            "if(request_batched){"),
+        std::string::npos);
+    EXPECT_NE(
+        recurrence_source.find(
+            "chunkForwardBatchedRequestsWithDeviceSeqLens("),
+        std::string::npos);
+    EXPECT_NE(
+        recurrence_source.find(
+            "elseif(use_scalar_real_length_contract){"),
+        std::string::npos);
+    EXPECT_NE(
+        recurrence_source.find(
+            "chunkForwardWithEffectiveSeqLen("),
+        std::string::npos);
+    EXPECT_EQ(
+        recurrence_source.find(
+            "request_batched||use_scalar_real_length_contract"),
+        std::string::npos)
+        << "Scalar graph buckets must commit the primary recurrence bank.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIDispatchSweepUsesExplicitStream)
@@ -4861,7 +4950,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
         std::string::npos);
     EXPECT_NE(
         compact_graph_outcome_stage.find(
-            "enqueueArgmaxF32BatchedRowsDevice("),
+            "enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice("),
         std::string::npos);
     EXPECT_NE(
         compact_graph_outcome_stage.find(

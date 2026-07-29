@@ -3908,6 +3908,13 @@ namespace llaminar2::test
             << "The HTTP regression must assert the host request cleanup drain counter.";
         EXPECT_NE(server_e2e.find("device_maintenance_graph_request_reset_exports"), std::string::npos)
             << "The HTTP regression must accept the device-side request-reset export counter.";
+        EXPECT_NE(
+            server_e2e.find(
+                "record_tags.get(\"reset\") in {\"clear_cache\", \"request-clear-cache\"}"),
+            std::string::npos)
+            << "The HTTP regression must accept both the IKVCache operation "
+               "name and the request-boundary reset reason emitted by the "
+               "device maintenance epilogue.";
         EXPECT_NE(server_e2e.find("mode != \"llep\""), std::string::npos)
             << "LLEP prefix-cache clear probes should not require dynamic publish drain/export counters.";
         EXPECT_NE(server_e2e.find("request-clear-cache"), std::string::npos)
@@ -5506,6 +5513,34 @@ namespace llaminar2::test
                       std::string::npos)
                 << backend
                 << " storage lifetime must use the shared residency/ownership policy";
+            EXPECT_NE(source->find(
+                          "prefillAssignmentReadsTransferSlotOccupant("),
+                      std::string::npos)
+                << backend
+                << " prefill leasing must share the forward-layer lifetime policy";
+            EXPECT_EQ(source->find("prior.layer != plan.layer"),
+                      std::string::npos)
+                << backend
+                << " the bounded transfer directory must reclaim event-ordered "
+                   "non-owner replicas across layer boundaries";
+            EXPECT_NE(source->find(
+                          "const auto &occupant_runtime = runtime_layers[prior.layer];"),
+                      std::string::npos)
+                << backend
+                << " cross-layer reuse must classify ownership and residency "
+                   "against the prior occupant's runtime bank";
+            EXPECT_NE(source->find(
+                          "const bool has_active_runtime_claim ="),
+                      std::string::npos)
+                << backend
+                << " prefill leasing must derive post-reset liveness from the "
+                   "authoritative device runtime, not a stale directory epoch";
+            EXPECT_NE(source->find(
+                          "if (!has_active_runtime_claim)"),
+                      std::string::npos)
+                << backend
+                << " event-ordered prefill must reclaim persistent directory "
+                   "occupants whose request-local runtime claims were reset";
             EXPECT_EQ(source->find("const bool locally_live ="),
                       std::string::npos)
                 << backend
@@ -6440,6 +6475,51 @@ namespace llaminar2::test
             std::string::npos)
             << "Calling the model-internal full builder directly bypasses "
                "policy scopes such as prefix-runtime device rehydration.";
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         PrefixRuntimeRehydrationHasOneModelOwnedLifecycle)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path orchestrator_source_path =
+            root /
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
+        const fs::path orchestrator_header_path =
+            root /
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h";
+        ASSERT_TRUE(fs::exists(orchestrator_source_path))
+            << orchestrator_source_path;
+        ASSERT_TRUE(fs::exists(orchestrator_header_path))
+            << orchestrator_header_path;
+
+        const std::string source = readFile(orchestrator_source_path);
+        const std::string header = readFile(orchestrator_header_path);
+        ASSERT_FALSE(source.empty()) << orchestrator_source_path;
+        ASSERT_FALSE(header.empty()) << orchestrator_header_path;
+
+        EXPECT_EQ(
+            header.find("prefix_runtime_device_rehydration_pending_"),
+            std::string::npos)
+            << "The model graph owns the pending prefix-runtime transaction; "
+               "an orchestrator mirror becomes stale when a full prefix hit "
+               "returns terminal logits without launching a main graph.";
+        EXPECT_NE(
+            source.find(
+                "prefixCacheRuntimeStateRequiresDeviceRehydration();"),
+            std::string::npos)
+            << "Forward graph policy must be read from the model-runtime owner.";
+        EXPECT_NE(
+            source.find(
+                "completePrefixCacheRuntimeStateDeviceRehydration();"),
+            std::string::npos)
+            << "A successful rehydration graph must retire that same "
+               "model-runtime transaction.";
+        EXPECT_EQ(
+            source.find(
+                "prefix-runtime rehydration policy disagrees with the model runtime owner"),
+            std::string::npos)
+            << "A duplicate-owner consistency check is not a lifecycle; make "
+               "the duplicate state structurally impossible instead.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefixPlacementFingerprintDoesNotKeyOnRuntimeMovement)

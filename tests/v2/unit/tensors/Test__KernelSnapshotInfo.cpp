@@ -22,7 +22,7 @@
 #include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 
 namespace llaminar2
 {

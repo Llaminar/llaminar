@@ -132,6 +132,42 @@ TEST_F(Test__CUDAEventSynchronization, EventRecordAndWait)
     backend_->destroyEvent(event, device_id_);
 }
 
+/**
+ * @brief Event waits select the resource-owning ordinal in multi-device use.
+ *
+ * RankOrchestrator resets LocalTP children from one host thread.  This test
+ * deliberately leaves that thread on CUDA device 1 before asking the backend
+ * to queue a dependency for device 0.  The backend contract, not ambient
+ * thread state, must determine which CUDA context owns the stream and event.
+ */
+TEST_F(Test__CUDAEventSynchronization,
+       StreamWaitEventSelectsDeclaredDeviceOverAmbientDevice)
+{
+    if (device_count_ < 2)
+        GTEST_SKIP() << "Requires at least two CUDA devices";
+
+    constexpr int owner_device = 0;
+    constexpr int ambient_device = 1;
+    void *stream = backend_->createStream(owner_device);
+    void *event = backend_->createEvent(owner_device);
+    ASSERT_NE(stream, nullptr);
+    ASSERT_NE(event, nullptr);
+    ASSERT_TRUE(backend_->recordEvent(event, owner_device, stream));
+
+    ASSERT_EQ(cudaSetDevice(ambient_device), cudaSuccess);
+    ASSERT_TRUE(
+        backend_->streamWaitEvent(stream, event, owner_device));
+
+    int selected_device = -1;
+    ASSERT_EQ(cudaGetDevice(&selected_device), cudaSuccess);
+    EXPECT_EQ(selected_device, owner_device)
+        << "CUDABackend event waits must honor their device_id argument";
+    ASSERT_TRUE(backend_->synchronizeStream(stream, owner_device));
+
+    backend_->destroyEvent(event, owner_device);
+    backend_->destroyStream(stream, owner_device);
+}
+
 // ============================================================================
 // Test: Event Sync is Fast (Not Blocking All Work)
 // ============================================================================

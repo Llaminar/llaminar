@@ -76,6 +76,37 @@ namespace llaminar2
             void *partial_idxs = nullptr,
             int partial_capacity = 0,
             int output_stride = 1) override;
+        bool enqueueConfigureMTPGreedyPenaltyPolicyDevice(
+            void *controls_device,
+            float presence_penalty,
+            float frequency_penalty,
+            bool first_token_already_in_history,
+            int device_id,
+            void *stream) override;
+        bool enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+            const void *data_device,
+            int rows,
+            int cols,
+            const void *verifier_input_tokens_device,
+            const void *generated_token_counts_device,
+            const void *penalty_policy_device,
+            int device_id,
+            void *stream,
+            void *out_values_device,
+            void *out_indices_device,
+            void *partial_vals,
+            void *partial_idxs,
+            int partial_capacity,
+            int output_stride = 1) override;
+        bool enqueueCommitMTPGreedyPenaltyHistoryDevice(
+            const void *output_tokens_device,
+            const void *output_meta_device,
+            const void *penalty_policy_device,
+            int output_token_capacity,
+            int vocab_size,
+            void *generated_token_counts_device,
+            int device_id,
+            void *stream) override;
 
         // GPU-side top-k selection for sampling
         bool topKF32(const void *data_device, int n, int k, int device_id,

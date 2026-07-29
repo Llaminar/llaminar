@@ -1338,6 +1338,11 @@ TEST(Test__MTPGraphConstruction,
             reinterpret_cast<const int32_t *>(0x1000),
         .stop_tokens_device =
             reinterpret_cast<const int32_t *>(0x2000),
+        .penalty_policy_device =
+            reinterpret_cast<const MTPGreedyPenaltyPolicy *>(0x2100),
+        .generated_token_counts_device =
+            reinterpret_cast<int32_t *>(0x2200),
+        .generated_token_count_capacity = 32,
         .verifier_tokens_device =
             reinterpret_cast<int32_t *>(0x3000),
         .argmax_values_device =
@@ -1399,11 +1404,20 @@ TEST(Test__MTPGraphConstruction,
     EXPECT_TRUE(has_input(BufferId::ALL_POSITION_LOGITS));
     EXPECT_TRUE(has_input(BufferId::MTP_VERIFIER_INPUT_TOKENS));
     EXPECT_TRUE(has_input(BufferId::MTP_VERIFIER_STOP_TOKENS));
+    EXPECT_TRUE(has_input(BufferId::MTP_GREEDY_PENALTY_POLICY));
     EXPECT_TRUE(has_output(BufferId::STOCHASTIC_VERIFY_TOKENS));
     EXPECT_TRUE(
         has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS));
     EXPECT_TRUE(
         has_output(BufferId::STOCHASTIC_BATCH_OUTPUT_META));
+    EXPECT_TRUE(std::any_of(
+        contract.inouts.begin(),
+        contract.inouts.end(),
+        [](const BufferBinding &binding)
+        {
+            return binding.id ==
+                   BufferId::MTP_GENERATED_TOKEN_COUNTS;
+        }));
 
     MTPVerifierOutcomeStage non_root_stage({
         .device_id = DeviceId::cuda(1),
@@ -1431,9 +1445,12 @@ TEST(Test__MTPGraphConstruction,
             });
     };
 
-    EXPECT_TRUE(non_root_contract.inputs.empty())
-        << "A compact-outcome receiver must not request coherence for root-only "
-           "verifier logits or controls.";
+    EXPECT_EQ(non_root_contract.inputs.size(), 1u)
+        << "A compact-outcome receiver reads only its device-local penalty "
+           "policy before committing the broadcast outcome.";
+    EXPECT_EQ(
+        non_root_contract.inputs.front().id,
+        BufferId::MTP_GREEDY_PENALTY_POLICY);
     EXPECT_FALSE(non_root_has_output(BufferId::STOCHASTIC_VERIFY_TOKENS));
     EXPECT_FALSE(
         non_root_has_output(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS));

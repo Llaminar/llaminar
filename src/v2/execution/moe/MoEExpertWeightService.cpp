@@ -16,8 +16,8 @@
 #include "../../tensors/BlockStructures.h"
 #include "../../kernels/KernelFactory.h"
 #include "../../kernels/PackedWeightsSerialization.h"
-#include "../../kernels/cpu/native_vnni/CPUPackedWeights.h"
-#include "../../kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "../../kernels/cpu/gemm/CPUPackedWeights.h"
+#include "../../kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "../../loaders/MmapRegion.h"
 #include "../../loaders/ExpertGemmRegistry.h"
 #include "../../loaders/GPUVramPreflight.h"
@@ -37,7 +37,7 @@
 #endif
 
 #ifdef HAVE_ROCM
-#include "../../kernels/rocm/ROCmWeightPacker.h"
+#include "../../kernels/rocm/gemm/ROCmWeightPacker.h"
 #include "../../kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #endif
 

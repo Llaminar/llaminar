@@ -39,6 +39,7 @@
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../utils/DebugEnv.h"
+#include "ROCmNativeVNNIDecodeEquivalentMath.h"
 #include "ROCmMoEGroupedPrefillDispatchGenerated.inc"
 
 // Local copy of DeviceNativeVNNIMatrixDesc to avoid pulling in x86-only headers
@@ -647,8 +648,13 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
             __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
         const float scale_hi =
             __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
-        acc += (static_cast<float>(acc_lo) * scale_lo +
-                static_cast<float>(acc_hi) * scale_hi) * scale_ab;
+        acc = rocm_native_vnni_commit_dual_scale_block(
+            acc,
+            acc_lo,
+            acc_hi,
+            scale_lo,
+            scale_hi,
+            scale_ab);
         acc += moe_prefill_native_vnni_dual_scale_correction<FMT>(
             a4, payload, emin_base, linear, scale_lo, scale_hi, scale_ab);
     }

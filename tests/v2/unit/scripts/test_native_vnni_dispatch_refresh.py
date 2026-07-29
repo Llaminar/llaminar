@@ -1430,7 +1430,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertNotIn("CPUNativeVNNIPrefillPolicyGenerated.inc", result.stdout)
         self.assertIn("src/v2/kernels/cuda/gemm", result.stdout)
         self.assertIn("src/v2/kernels/rocm/gemm", result.stdout)
-        self.assertIn("src/v2/kernels/cpu/native_vnni", result.stdout)
+        self.assertIn("src/v2/kernels/cpu/gemm", result.stdout)
         stdout = result.stdout.replace("\\,", ",")
         self.assertIn(
             "LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=32B_LM_Head",
@@ -3479,7 +3479,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             / "v2"
             / "kernels"
             / "cpu"
-            / "native_vnni"
+            / "gemm"
             / "CPUNativeVNNIGemv.h"
         )
         generated_path = source_path.parent / "CPUNativeVNNIVerifierRowsPolicyGenerated.inc"
@@ -3562,7 +3562,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             / "v2"
             / "kernels"
             / "cpu"
-            / "native_vnni"
+            / "gemm"
             / "CPUNativeVNNIGemv.h"
         )
         source = source_path.read_text(encoding="utf-8")
@@ -3611,7 +3611,14 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertNotIn("CUDANativeVNNIPrefillDispatchGenerated.inc", cuda_source)
         self.assertNotIn("selectPrefillTileGenerated", cuda_source)
         self.assertNotIn("CUDANativeVNNIPrefillDispatchGenerated.inc", cuda_workspace_source)
-        self.assertIn("choosePrefillTile(M, N, K, prefill_ctx, complexity)", cuda_source)
+        self.assertIn(
+            "chooseQ40PrefillRoute(M, N, K, prefill_ctx)",
+            cuda_source,
+        )
+        self.assertIn(
+            "M, N, K, prefill_ctx, complexity, CB",
+            cuda_source,
+        )
 
         self.assertNotIn("ROCmNativeVNNIPrefillDispatchGenerated.inc", rocm_source)
         self.assertNotIn("selectROCmNativeVNNIPrefillGenerated", rocm_source)

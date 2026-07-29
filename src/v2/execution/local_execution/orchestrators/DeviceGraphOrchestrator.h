@@ -66,6 +66,7 @@
 #include <algorithm>
 #include <array>
 #include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <mutex>
 #include <unordered_map>
@@ -2164,7 +2165,9 @@ namespace llaminar2
         bool prepareGreedyAllPositionBatchOutcomeGraph(
             int verifier_token_count,
             const int32_t *stop_tokens,
-            int stop_token_count) override;
+            int stop_token_count,
+            const MTPGreedyPenaltyPolicy &penalty_policy =
+                MTPGreedyPenaltyPolicy{}) override;
         bool verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
             const DeviceGreedyBatchOutcomeRequest *requests,
             int request_count,
@@ -3029,6 +3032,13 @@ namespace llaminar2
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Committed KV/GDN request reset failed"
                           << " reason=" << reset_reason);
+                std::fprintf(
+                    stderr,
+                    "[FATAL] Committed KV/GDN request reset failed: "
+                    "device=%s reason=%s\n",
+                    state_.device_id.toString().c_str(),
+                    reset_reason);
+                std::fflush(stderr);
                 std::terminate();
             }
             if (request.reset_mtp &&
@@ -3038,6 +3048,24 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Shifted-MTP request reset failed"
                           << " reason=" << reset_reason);
                 std::terminate();
+            }
+            if (request.reset_mtp && state_.device_id.is_gpu())
+            {
+                /*
+                 * Sampling history is part of the same request-owned MTP
+                 * transaction as shifted KV and recurrent state.  Zero it on
+                 * the reset stream before publishing reset-ready; the next
+                 * verifier graph then consumes one explicit transitive event
+                 * instead of trusting a host-side sampler mirror.
+                 */
+                if (!resetMTPGeneratedTokenHistoryOnStream(
+                        reset_transaction.executionStream(),
+                        reset_reason))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Device-owned MTP generated-token history reset failed"
+                              << " reason=" << reset_reason);
+                    std::terminate();
+                }
             }
             if (request.reset_logical_sequence)
                 state_.clearLogicalSequenceState();
@@ -3661,6 +3689,16 @@ namespace llaminar2
             void *producer_stream,
             DeviceId device,
             const char *producer);
+
+        /**
+         * @brief Zero and publish the device-owned generated-token histogram.
+         *
+         * Kept out of the inline reset transaction so backend selection and
+         * IBackend's complete type remain private to the implementation unit.
+         */
+        bool resetMTPGeneratedTokenHistoryOnStream(
+            void *reset_stream,
+            const char *reason);
 
         /**
          * @brief Clear the device-side "sample token is ready" marker for one draft slot.
@@ -5679,6 +5717,9 @@ namespace llaminar2
         int request_sequence_lengths_active_count_ = 0; ///< Rows populated for the current request-batched prefill.
         void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 stable compact verifier token row/matrix.
         void *mtp_verifier_stop_tokens_dev_ = nullptr; ///< INT32 fixed-width stop-token controls read inside captured reducers.
+        void *mtp_greedy_penalty_policy_dev_ = nullptr; ///< Graph-stable MTPGreedyPenaltyPolicy written on the exact verifier stream.
+        void *mtp_generated_token_counts_dev_ = nullptr; ///< INT32 [vocab], device-authoritative generated-token histogram.
+        int mtp_generated_token_count_capacity_ = 0; ///< Vocabulary extent owned by mtp_generated_token_counts_dev_.
         void *stochastic_topk_partial_vals_dev_ = nullptr; ///< FP32 target/verifier top-k partial scratch.
         void *stochastic_topk_partial_idxs_dev_ = nullptr; ///< INT32 target/verifier top-k partial scratch.
         int stochastic_topk_partial_capacity_ = 0;
@@ -6516,6 +6557,7 @@ namespace llaminar2
                 GreedyVerifierOutcomeGraphState::Idle;
             int verifier_token_count = 0;
             int stop_token_count = 0;
+            MTPGreedyPenaltyPolicy penalty_policy;
             std::array<int32_t,
                        sampling_math::kSpeculativeBatchMaxStopTokens>
                 stop_tokens = {-1, -1, -1, -1, -1, -1, -1, -1};
@@ -6584,16 +6626,6 @@ namespace llaminar2
         std::vector<std::vector<bool>> current_expert_masks_;
         uint64_t current_expert_mask_epoch_ = 0;
         uint64_t moe_runtime_movement_epoch_ = 0;
-        /**
-         * @brief Selects the next main forward as the prefix rehydration graph.
-         *
-         * populatePrefix() sets this only after the model builder has imported a
-         * valid pointer-free runtime snapshot and published device transfer
-         * plans. The flag is retired only after successful execution and model
-         * acknowledgement; failed inference therefore cannot limp onward with
-         * immutable placement substituted for the cached placement.
-         */
-        bool prefix_runtime_device_rehydration_pending_ = false;
 
         /// Optional expert weight payload provider for metadata-based host retention (owned)
         std::unique_ptr<ExpertWeightPayloadProvider> expert_payload_provider_;

@@ -16,6 +16,7 @@
  *   - request-boundary dynamic metadata reset without stale graph-facing state
  *     (8666332f)
  *   - Session epoch reset (8666332f)
+ *   - Adjacent initialization/request resets before the first graph launch
  *   - Stale activation buffer K/V in decode after graph cache reuse
  *     (AttentionComputeStage decode-mode KV cache override)
  *
@@ -174,6 +175,28 @@ protected:
 // Root cause (eeca83dd): embedding kernel's dynamic_params_active_ remained
 // true after clear_cache(), causing stale GPU-side token IDs to be used
 // instead of re-uploading the new prompt.
+TEST_P(Test__MultiTurnSessionReset, ConsecutiveGPUClearsBeforeFirstPrefillProduceValidOutput)
+{
+    if (GetParam() == TestBackend::CPU)
+        GTEST_SKIP() << "Adjacent event generations are a GPU stream-ordering contract";
+
+    /*
+     * Server construction publishes an initialization reset, then request
+     * setup clears the same runner before any graph has consumed that event.
+     * A reset generation must therefore be allowed to consume and supersede
+     * its predecessor on the explicit reset stream.
+     */
+    runner_->clearCache();
+    runner_->clearCache();
+
+    const std::vector<int32_t> prompt = {9707}; // "Hello"
+    const auto tokens = runInference(prompt, 5);
+    ASSERT_FALSE(tokens.empty())
+        << "Consecutive request boundaries before first prefill produced no tokens";
+    ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()))
+        << "Consecutive request boundaries left invalid graph-facing state";
+}
+
 TEST_P(Test__MultiTurnSessionReset, R2_After_ClearCache_ProducesValidOutput)
 {
     std::vector<int32_t> prompt_r1 = {9707}; // "Hello"

@@ -9,8 +9,8 @@
 #include <gtest/gtest.h>
 
 #include "kernels/PackedWeightsSerialization.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNIWeightPacker.h"
-#include "kernels/cpu/native_vnni/CPUPackedWeights.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUPackedWeights.h"
 
 using namespace llaminar2;
 using namespace llaminar2::cpu::native_vnni;

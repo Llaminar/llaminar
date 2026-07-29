@@ -174,10 +174,14 @@ namespace llaminar2
                 return false;
             }
 
-            if (!backend->enqueueArgmaxF32BatchedRowsDevice(
+            if (!backend
+                     ->enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
                     logits,
                     params_.verifier_row_count,
                     params_.vocab_size,
+                    params_.binding.verifier_input_tokens_device,
+                    params_.binding.generated_token_counts_device,
+                    params_.binding.penalty_policy_device,
                     params_.device_id.gpu_ordinal(),
                     stream,
                     params_.binding.argmax_values_device,
@@ -221,6 +225,29 @@ namespace llaminar2
             }
         }
 
+        /*
+         * The compact buffers are canonical only after the LocalTP broadcast.
+         * Advancing each participant's mirrored count table here gives the next
+         * captured verifier one transitive stream dependency from both root
+         * sampling and collective publication. A single thread owns this short
+         * update, so repeated output tokens require no atomics.
+         */
+        IBackend *history_backend = getBackendFor(params_.device_id);
+        if (!history_backend ||
+            !history_backend->enqueueCommitMTPGreedyPenaltyHistoryDevice(
+                params_.binding.output_tokens_device,
+                params_.binding.output_meta_device,
+                params_.binding.penalty_policy_device,
+                params_.binding.output_token_capacity,
+                params_.vocab_size,
+                params_.binding.generated_token_counts_device,
+                params_.device_id.gpu_ordinal(),
+                stream))
+        {
+            LOG_ERROR("[MTPVerifierOutcomeStage] Device-owned generated-token history commit failed");
+            return false;
+        }
+
         PerfStatsCollector::addCounter(
             "mtp",
             "graph_owned_greedy_outcome_stage_enqueues",
@@ -238,6 +265,7 @@ namespace llaminar2
     {
         return static_cast<size_t>(params_.verifier_row_count) *
                    static_cast<size_t>(params_.vocab_size) * sizeof(float) +
+               static_cast<size_t>(params_.vocab_size) * sizeof(int32_t) +
                static_cast<size_t>(params_.binding.output_token_capacity +
                                    params_.binding.output_meta_capacity) *
                    sizeof(int32_t);
@@ -285,6 +313,10 @@ namespace llaminar2
             contract.addOutput(BufferId::STOCHASTIC_VERIFY_TOKENS);
             contract.addOutput(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS);
         }
+        contract.addInput(BufferId::MTP_GREEDY_PENALTY_POLICY);
+        contract.addInOut(
+            BufferId::MTP_GENERATED_TOKEN_COUNTS,
+            "INT32");
         contract.addOutput(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS);
         contract.addOutput(BufferId::STOCHASTIC_BATCH_OUTPUT_META);
         return contract;

@@ -150,6 +150,8 @@ namespace llaminar2
         MTP_POSITION_IDS, ///< Arena-owned INT32 request positions for device-resident batched MTP sidecar replay
         MTP_VERIFIER_INPUT_TOKENS, ///< Arena-owned INT32 verifier token row fed directly to GPU embedding
         MTP_VERIFIER_STOP_TOKENS, ///< Arena-owned fixed-width INT32 stop-token controls for captured verifier reduction
+        MTP_GREEDY_PENALTY_POLICY, ///< Arena-owned request policy read by captured grouped greedy sampling
+        MTP_GENERATED_TOKEN_COUNTS, ///< Arena-owned generated-token histogram for presence/frequency penalties
         MTP_VERIFIER_POSITION_IDS, ///< Arena-owned INT32 absolute positions expanded from device-owned live KV counts
         MTP_LOGICAL_SEQUENCE_STATE, ///< Arena-owned INT32 published logical-state rows that outlive graph workspace generations
 
@@ -351,6 +353,10 @@ namespace llaminar2
             return "MTP_VERIFIER_INPUT_TOKENS";
         case BufferId::MTP_VERIFIER_STOP_TOKENS:
             return "MTP_VERIFIER_STOP_TOKENS";
+        case BufferId::MTP_GREEDY_PENALTY_POLICY:
+            return "MTP_GREEDY_PENALTY_POLICY";
+        case BufferId::MTP_GENERATED_TOKEN_COUNTS:
+            return "MTP_GENERATED_TOKEN_COUNTS";
         case BufferId::MTP_VERIFIER_POSITION_IDS:
             return "MTP_VERIFIER_POSITION_IDS";
         case BufferId::MTP_LOGICAL_SEQUENCE_STATE:

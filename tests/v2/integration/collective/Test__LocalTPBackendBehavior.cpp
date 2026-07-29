@@ -189,6 +189,26 @@ protected:
 // appropriate backend based on device configuration.
 
 /**
+ * @test AUTO backend with all CUDA devices selects NCCL
+ */
+TEST_F(Test__LocalTPBackendBehavior, AutoBackend_AllCuda_SelectsNCCL)
+{
+    if (cuda_count_ < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ CUDA GPUs, found " << cuda_count_;
+    }
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+
+    auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::AUTO);
+    ASSERT_NE(ctx, nullptr);
+    EXPECT_EQ(ctx->backend(), CollectiveBackendType::NCCL)
+        << "AUTO backend should select NCCL for all-CUDA configuration";
+}
+
+/**
  * @test AUTO backend with all ROCm devices selects RCCL
  */
 TEST_F(Test__LocalTPBackendBehavior, AutoBackend_AllRocm_SelectsRCCL)

@@ -430,6 +430,122 @@ namespace
     }
 
     /**
+     * @brief Prove that graph-bucket padding cannot alter any active prefill row.
+     *
+     * An exact-shape prefill is the byte oracle.  A bucketed prefill may publish
+     * additional padded rows, but every prefix byte covering the real request
+     * must remain identical.  Fixed-size stage products, such as one compact
+     * terminal row, are compared in full.  Naming the first semantic stage,
+     * element, and IEEE-754 word makes this suitable both as a regression and
+     * as a first-divergence diagnostic for a large captured model graph.
+     *
+     * @param exact Exact-shape prefill snapshots.
+     * @param padded Graph-bucketed prefill snapshots.
+     * @param ordered_keys Semantic stage keys in forward execution order.
+     * @param real_rows Number of non-padding token rows in both executions.
+     */
+    ::testing::AssertionResult paddedPrefillActiveRowsByteIdentical(
+        const std::map<std::string, RequestBatchStageSnapshot> &exact,
+        const std::map<std::string, RequestBatchStageSnapshot> &padded,
+        const std::vector<std::string> &ordered_keys,
+        size_t real_rows)
+    {
+        if (real_rows == 0)
+            return ::testing::AssertionFailure() << "real prefill row count is zero";
+
+        size_t comparable = 0;
+        for (const std::string &key : ordered_keys)
+        {
+            const auto exact_it = exact.find(key);
+            const auto padded_it = padded.find(key);
+            if (exact_it == exact.end() && padded_it == padded.end())
+                continue;
+            if (exact_it == exact.end() || padded_it == padded.end())
+            {
+                return ::testing::AssertionFailure()
+                       << "snapshot availability differs at " << key
+                       << " exact=" << (exact_it != exact.end() ? "present" : "missing")
+                       << " padded=" << (padded_it != padded.end() ? "present" : "missing");
+            }
+
+            ++comparable;
+            const std::vector<float> &oracle = exact_it->second.data;
+            const std::vector<float> &candidate = padded_it->second.data;
+            if (oracle.empty() || candidate.empty())
+            {
+                return ::testing::AssertionFailure()
+                       << "empty snapshot at " << key
+                       << " exact_elements=" << oracle.size()
+                       << " padded_elements=" << candidate.size();
+            }
+
+            size_t compared_elements = oracle.size();
+            size_t row_width = 0;
+            if (oracle.size() % real_rows == 0)
+            {
+                row_width = oracle.size() / real_rows;
+                if (row_width == 0 ||
+                    candidate.size() < oracle.size() ||
+                    candidate.size() % row_width != 0)
+                {
+                    return ::testing::AssertionFailure()
+                           << "padded snapshot geometry differs at " << key
+                           << " exact_elements=" << oracle.size()
+                           << " padded_elements=" << candidate.size()
+                           << " real_rows=" << real_rows
+                           << " inferred_row_width=" << row_width;
+                }
+            }
+            else if (candidate.size() != oracle.size())
+            {
+                return ::testing::AssertionFailure()
+                       << "fixed-size snapshot geometry differs at " << key
+                       << " exact_elements=" << oracle.size()
+                       << " padded_elements=" << candidate.size();
+            }
+
+            if (std::memcmp(
+                    oracle.data(),
+                    candidate.data(),
+                    compared_elements * sizeof(float)) == 0)
+            {
+                continue;
+            }
+
+            for (size_t index = 0; index < compared_elements; ++index)
+            {
+                uint32_t exact_bits = 0;
+                uint32_t padded_bits = 0;
+                std::memcpy(&exact_bits, &oracle[index], sizeof(exact_bits));
+                std::memcpy(&padded_bits, &candidate[index], sizeof(padded_bits));
+                if (exact_bits == padded_bits)
+                    continue;
+
+                auto failure = ::testing::AssertionFailure();
+                failure << "first active-row byte mismatch at " << key
+                        << " element=" << index;
+                if (row_width > 0)
+                {
+                    failure << " row=" << (index / row_width)
+                            << " column=" << (index % row_width)
+                            << " padded_rows=" << (candidate.size() / row_width);
+                }
+                failure << " exact=" << oracle[index]
+                        << " padded=" << candidate[index]
+                        << " exact_bits=0x" << std::hex << std::setw(8)
+                        << std::setfill('0') << exact_bits
+                        << " padded_bits=0x" << std::setw(8) << padded_bits
+                        << std::dec << std::setfill(' ');
+                return failure;
+            }
+        }
+
+        if (comparable == 0)
+            return ::testing::AssertionFailure() << "no comparable padded prefill snapshots";
+        return ::testing::AssertionSuccess();
+    }
+
+    /**
      * @brief Compare one unequal-length request against its isolated prefill.
      *
      * Full-row stages use the scalar and flattened-batch terminal row indices.
@@ -2195,7 +2311,8 @@ namespace
         IOrchestrationRunner &runner,
         const std::string &placement,
         int context_length,
-        int max_tokens)
+        int max_tokens,
+        const SamplingParams *sampling_override = nullptr)
     {
         NeedleRecallRunResult result;
         result.placement = placement;
@@ -2225,6 +2342,8 @@ namespace
 
         SamplingParams greedy;
         greedy.temperature = 0.0f;
+        if (sampling_override)
+            greedy = *sampling_override;
         GenerationResult generated;
         try
         {
@@ -5002,6 +5121,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegre
         {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "600"},
         {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
         {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_padded_prefill_bucket_stats.json"},
         {"LLAMINAR_PERF_STATS_FILTER", "forward_graph"},
     });
@@ -5038,29 +5159,83 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegre
     config.kv_cache_precision = "auto";
 
     auto factory = createOrchestrationRunnerFactory();
+    std::vector<int32_t> prompt;
+    PrefixRuntimeStateSnapshot exact_state;
+    {
+        ScopedDebugEnv exact_shape_env({
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
+        });
+        auto exact = factory->createFromOrchestrationConfig(config);
+        ASSERT_NE(exact, nullptr);
+        ASSERT_TRUE(exact->initialize()) << exact->lastError();
+
+        auto tokenizer = exact->tokenizer();
+        ASSERT_NE(tokenizer, nullptr);
+        const auto encoded =
+            tokenizer->encode(" the", /*add_bos=*/false, /*add_eos=*/false);
+        ASSERT_FALSE(encoded.empty());
+        prompt.assign(595, static_cast<int32_t>(encoded.front()));
+
+        ASSERT_TRUE(exact->prefill(prompt)) << exact->lastError();
+        EXPECT_EQ(exact->currentPosition(), 595);
+        exact_state = exact->prefixStateProbe();
+        exact->shutdown();
+    }
+
+    /*
+     * Exact-shape execution above is the state oracle, not part of the padded
+     * graph lifecycle under test.  Discard its counters before measuring the
+     * warmup/capture/replay sequence.
+     */
+    PerfStatsCollector::reset();
+
+    PrefixRuntimeStateSnapshot warmup_state;
+    PrefixRuntimeStateSnapshot capture_state;
+    PrefixRuntimeStateSnapshot replay_state;
     auto runner = factory->createFromOrchestrationConfig(config);
     ASSERT_NE(runner, nullptr);
     ASSERT_TRUE(runner->initialize()) << runner->lastError();
 
-    auto tokenizer = runner->tokenizer();
-    ASSERT_NE(tokenizer, nullptr);
-    const auto encoded = tokenizer->encode(" the", /*add_bos=*/false, /*add_eos=*/false);
-    ASSERT_FALSE(encoded.empty());
-    const std::vector<int32_t> prompt(595, static_cast<int32_t>(encoded.front()));
-
     ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
     EXPECT_EQ(runner->currentPosition(), 595);
+    warmup_state = runner->prefixStateProbe();
     runner->clearCache();
 
     ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
     EXPECT_EQ(runner->currentPosition(), 595);
+    capture_state = runner->prefixStateProbe();
     runner->clearCache();
 
     ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
     EXPECT_EQ(runner->currentPosition(), 595);
+    replay_state = runner->prefixStateProbe();
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     runner->shutdown();
+
+    MTPRuntimeSnapshotComparisonOptions state_compare_options;
+    state_compare_options.compare_main_kv_payload_hashes = true;
+    state_compare_options.compare_shifted_mtp_kv = false;
+    state_compare_options.compare_gdn_hashes = true;
+    for (const auto &[phase_name, state] :
+         std::vector<std::pair<std::string, PrefixRuntimeStateSnapshot>>{
+             {"warmup", warmup_state},
+             {"capture", capture_state},
+             {"replay", replay_state}})
+    {
+        const MTPStateValidationResult equivalent =
+            compareMTPRuntimeStateSnapshots(
+                exact_state,
+                state,
+                state_compare_options);
+        EXPECT_TRUE(equivalent)
+            << "ROCm padded-prefill " << phase_name
+            << " changed exact-shape KV/GDN device state: "
+            << equivalent.reason
+            << "\nexact: " << summarizeStateContinuityProbe(exact_state)
+            << "\n" << phase_name << ": "
+            << summarizeStateContinuityProbe(state);
+    }
 
     auto lifecycle_count = [&](const std::string &capture_phase,
                                const std::string &cache_phase,
@@ -5121,14 +5296,21 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegre
     EXPECT_GE(forward_lookup_count("miss"), 1.0);
     EXPECT_GE(forward_lookup_count("hit"), 1.0);
     /*
-     * `clearCache()` now resets request-owned KV/GDN/short-conv state and
-     * invalidates any prefill executable that could have captured pointers into
-     * that state.  The padded bucket cache should still hit the host-side
-     * forward graph, but each post-reset prefill must re-arm capture from Cold
-     * instead of replaying or capturing an executable across request state.
+     * Request reset clears the stable device-state buffers without invalidating
+     * their addresses.  The executable therefore remains reusable: one warmup
+     * prepares resources, the following request captures once, and the third
+     * request replays the same graph after another reset.  Exact-state
+     * comparisons above prove that reuse, rather than repeated recapture, is
+     * semantically valid.
      */
-    EXPECT_GE(lifecycle_count("warmup", "warmup", "none"), 2.0);
-    EXPECT_EQ(lifecycle_count("capture", "ready", "armed_warmup"), 0.0);
+    EXPECT_EQ(lifecycle_count("warmup", "warmup", "none"), 1.0);
+    EXPECT_EQ(
+        lifecycle_count(
+            "capture",
+            "ready",
+            "lazy_initialized_after_request_reset"),
+        1.0);
+    EXPECT_EQ(lifecycle_count("replay", "ready", "none"), 1.0);
     PerfStatsCollector::reset();
 }
 
@@ -5690,6 +5872,21 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
             << "Exact prefix hits must rehydrate live LLEP placement before "
                "the first M=1 decode graph.";
 
+        /*
+         * Exercise the terminal-only full-hit lifecycle that serving uses when
+         * cached logits satisfy a request before any main forward graph runs.
+         * The following request reset must retire the pending model-owned
+         * rehydration transaction; no orchestrator shadow may survive it.
+         */
+        cached->clearCache();
+        ASSERT_TRUE(cached->prefill(seed_prompt))
+            << cached->lastError();
+        const auto terminal_only_full_hit_probe = cached->prefixStateProbe();
+        EXPECT_GE(
+            terminal_only_full_hit_probe.prefix_cache_hits +
+                terminal_only_full_hit_probe.prefix_cache_partial_hits,
+            1u);
+
         cached->clearCache();
         if (capture_stage_continuity)
             cached->clearSnapshots();
@@ -6052,6 +6249,20 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
         EXPECT_EQ(seed_full_hit_decode.tokens, seed_miss_decode.tokens)
             << "Exact prefix hits must rehydrate live LLEP placement before "
                "the first M=1 decode graph.";
+
+        /*
+         * Keep CUDA coverage symmetric with ROCm for a terminal-only full hit:
+         * reset the request before a main graph can consume the restored MoE
+         * transaction, then prove the next prefix request starts cleanly.
+         */
+        cached->clearCache();
+        ASSERT_TRUE(cached->prefill(seed_prompt))
+            << cached->lastError();
+        const auto terminal_only_full_hit_probe = cached->prefixStateProbe();
+        EXPECT_GE(
+            terminal_only_full_hit_probe.prefix_cache_hits +
+                terminal_only_full_hit_probe.prefix_cache_partial_hits,
+            1u);
 
         cached->clearCache();
         if (capture_stage_continuity)
@@ -6552,6 +6763,351 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPNeedleRecallM
         << summarizeNeedleRecallResult(static_overlay_result)
         << "\noverlay: "
         << summarizeNeedleRecallResult(overlay_result);
+}
+
+/**
+ * @brief Prove graph-bucket padding is byte-invariant for a real Qwen3.6 prefill.
+ *
+ * The graph bucket is an allocation and launch geometry only.  It must not
+ * participate in model semantics: active rows, terminal logits, KV payloads,
+ * and recurrent GDN state must match an exact-shape execution byte for byte.
+ * This focused single-CUDA test deliberately disables MTP, prefix caching,
+ * rebalancing, and collectives so a failure cannot be misattributed to those
+ * higher-level features.
+ */
+TEST(Test__KVPrefixMTPStateProbe, Qwen36SingleCUDAPaddedPrefillMatchesExactActiveRowsAndState)
+{
+    ScopedDebugEnv common_env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+    });
+
+    if (mpiWorldSize() != 1)
+    {
+        GTEST_SKIP() << "Focused padded-prefill regression requires one MPI rank";
+    }
+
+    const std::string model_path = firstEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_MODEL", "LLAMINAR_PARITY_MOE_MODEL"},
+        "/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf");
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 MoE model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.cuda_device_count() < 1)
+    {
+        GTEST_SKIP() << "Need one CUDA device for padded-prefill regression";
+    }
+
+    constexpr int kContextLength = 2048;
+    constexpr int kMaximumGeneratedTokens = 64;
+    auto make_config = [&]()
+    {
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = kContextLength;
+        config.batch_size = 1;
+        config.tp_degree = 1;
+        config.pp_degree = 1;
+        config.device_for_this_rank = GlobalDeviceAddress::cuda(0);
+        config.activation_precision = "fp32";
+        config.kv_cache_precision = "auto";
+        config.prefix_cache.enabled = false;
+        config.prefix_cache.storage_mode = PrefixCacheStorageMode::Disabled;
+        config.mtp.enabled = false;
+        config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+        return config;
+    };
+
+    const int diagnostic_layer =
+        firstIntEnvOrDefault(
+            {"LLAMINAR_TEST_QWEN36_BUCKET_SNAPSHOT_LAYER"},
+            0);
+    ASSERT_GE(diagnostic_layer, 0);
+    ASSERT_LE(diagnostic_layer, 40);
+    std::vector<std::string> snapshot_keys =
+        prefillReplayContinuitySnapshotKeys(
+            diagnostic_layer,
+            diagnostic_layer);
+    snapshot_keys.insert(snapshot_keys.begin(), "EMBEDDING");
+    snapshot_keys.push_back("FINAL_NORM");
+    snapshot_keys.push_back("LM_HEAD");
+
+    std::vector<int32_t> prompt_tokens;
+    std::map<std::string, RequestBatchStageSnapshot> exact_snapshots;
+    std::map<std::string, RequestBatchStageSnapshot> padded_snapshots;
+    PrefixRuntimeStateSnapshot exact_state;
+    PrefixRuntimeStateSnapshot padded_state;
+
+    auto factory = createOrchestrationRunnerFactory();
+    {
+        ScopedDebugEnv exact_shape_env({
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
+        });
+        auto exact = factory->createFromOrchestrationConfig(make_config());
+        ASSERT_NE(exact, nullptr);
+        ASSERT_TRUE(exact->initialize()) << exact->lastError();
+
+        auto tokenizer = exact->tokenizer();
+        ASSERT_NE(tokenizer, nullptr);
+        const NeedlePromptForProbe prompt =
+            buildNeedlePromptForProbe(
+                "beginning",
+                /*record_count=*/900,
+                kContextLength,
+                kMaximumGeneratedTokens,
+                "full");
+        const std::vector<int> encoded =
+            tokenizer->encodeChat(
+                prompt.messages,
+                /*add_generation_prompt=*/true,
+                /*tools_json=*/"",
+                /*enable_thinking=*/false);
+        prompt_tokens.assign(encoded.begin(), encoded.end());
+        ASSERT_GT(prompt_tokens.size(), 1024u);
+        ASSERT_LT(prompt_tokens.size(), static_cast<size_t>(kContextLength));
+
+        exact->setSnapshotCaptureFilter(snapshot_keys);
+        exact->enableSnapshotCapture();
+        exact->clearSnapshots();
+        exact->clearCache();
+        ASSERT_TRUE(exact->prefill(prompt_tokens)) << exact->lastError();
+        exact_snapshots =
+            captureRequestBatchSnapshots(*exact, snapshot_keys);
+        exact_state = exact->prefixStateProbe();
+        exact->disableSnapshotCapture();
+        exact->shutdown();
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCache();
+    {
+        ScopedDebugEnv padded_shape_env({
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        });
+        auto padded = factory->createFromOrchestrationConfig(make_config());
+        ASSERT_NE(padded, nullptr);
+        ASSERT_TRUE(padded->initialize()) << padded->lastError();
+        padded->setSnapshotCaptureFilter(snapshot_keys);
+        padded->enableSnapshotCapture();
+        padded->clearSnapshots();
+        padded->clearCache();
+        ASSERT_TRUE(padded->prefill(prompt_tokens)) << padded->lastError();
+        padded_snapshots =
+            captureRequestBatchSnapshots(*padded, snapshot_keys);
+        padded_state = padded->prefixStateProbe();
+        padded->disableSnapshotCapture();
+        padded->shutdown();
+    }
+    llaminar::v2::kernels::KernelFactory::clearCache();
+
+    ASSERT_TRUE(paddedPrefillActiveRowsByteIdentical(
+        exact_snapshots,
+        padded_snapshots,
+        snapshot_keys,
+        prompt_tokens.size()));
+
+    MTPRuntimeSnapshotComparisonOptions compare_options;
+    compare_options.compare_main_kv_payload_hashes = true;
+    compare_options.compare_shifted_mtp_kv = false;
+    compare_options.compare_gdn_hashes = true;
+    const MTPStateValidationResult state_equivalence =
+        compareMTPRuntimeStateSnapshots(
+            exact_state,
+            padded_state,
+            compare_options);
+    ASSERT_TRUE(state_equivalence)
+        << "graph-bucketed prefill changed persistent device state: "
+        << state_equivalence.reason
+        << "\nexact: " << summarizeStateContinuityProbe(exact_state)
+        << "\npadded: " << summarizeStateContinuityProbe(padded_state);
+}
+
+/**
+ * @brief Reproduce the CUDA2 grouped-MTP request-reset lifecycle at long context.
+ *
+ * This is deliberately narrower than the HTTP server matrix. It retains the
+ * production Dynamic ExpertOverlay, RAM prefix cache, Qwen presence penalty,
+ * grouped verifier, graph capture, and request-boundary cache reset, while
+ * removing unrelated REST, SSE, and malformed-request probes. The second
+ * prompt begins by clearing state produced by the first long MTP transaction,
+ * which is the exact boundary where stale graph/GDN ownership previously
+ * surfaced.
+ */
+TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEDynamicPrefixMTPPenaltyCUDA2LongRequestsResetDeviceState)
+{
+    const char *diagnostic_bucket_override =
+        std::getenv("LLAMINAR_TEST_QWEN36_BUCKETS_ENABLED");
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS",
+         diagnostic_bucket_override ? diagnostic_bucket_override : "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+        {"LLAMINAR_MOE_REBALANCE_WINDOW", "4"},
+        {"LLAMINAR_MOE_REBALANCE_MAX_WINDOW", "4"},
+        {"LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH", "1"},
+        {"LLAMINAR_MOE_REBALANCE_DYNAMIC_IMBALANCE_THRESHOLD_PER_MILLE", "0"},
+        {"LLAMINAR_MOE_REBALANCE_DYNAMIC_MIN_IMPROVEMENT_PER_MILLE", "0"},
+        {"LLAMINAR_MOE_REBALANCE_DYNAMIC_MAX_SWAPS_PER_LAYER", "20"},
+        {"LLAMINAR_MOE_REBALANCE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE", "20"},
+        {"LLAMINAR_MOE_REBALANCE_DYNAMIC_MIN_WINDOW_ACTIVATIONS", "0"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS", "4"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS", "4"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS", "1"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS", "0"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT", "0"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR", "0"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "0"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER", "0"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "0"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PER_MILLE", "1000"},
+        {"LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS", "32"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS", "32"},
+    });
+
+    if (mpiWorldSize() != 1)
+    {
+        GTEST_SKIP() << "Focused CUDA2 request-reset regression requires one MPI rank";
+    }
+
+    const std::string model_path = firstEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_MODEL", "LLAMINAR_PARITY_MOE_MODEL"},
+        "/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf");
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 MoE model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.cuda_device_count() < 2)
+    {
+        GTEST_SKIP() << "Need at least two CUDA devices for CUDA2 reset regression";
+    }
+
+    const int context_length = firstIntEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_OVERLAY_RECALL_CONTEXT_TOKENS"},
+        2048);
+    const int max_tokens = firstIntEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_OVERLAY_RECALL_MAX_TOKENS"},
+        64);
+    const bool diagnostic_mtp_enabled =
+        firstIntEnvOrDefault(
+            {"LLAMINAR_TEST_QWEN36_BUCKET_MTP_ENABLED"},
+            1) != 0;
+    const bool diagnostic_prefix_enabled =
+        firstIntEnvOrDefault(
+            {"LLAMINAR_TEST_QWEN36_BUCKET_PREFIX_ENABLED"},
+            1) != 0;
+    const bool diagnostic_dynamic_enabled =
+        firstIntEnvOrDefault(
+            {"LLAMINAR_TEST_QWEN36_BUCKET_DYNAMIC_ENABLED"},
+            1) != 0;
+    const int diagnostic_placement =
+        firstIntEnvOrDefault(
+            {"LLAMINAR_TEST_QWEN36_BUCKET_PLACEMENT"},
+            0);
+
+    OrchestrationConfig config = OrchestrationConfig::defaults();
+    config.model_path = model_path;
+    config.max_seq_len = context_length;
+    config.batch_size = 1;
+    config.tp_degree = diagnostic_placement == 2 ? 2 : 1;
+    config.pp_degree = 1;
+    if (diagnostic_placement == 1)
+    {
+        config.device_for_this_rank = GlobalDeviceAddress::cuda(0);
+    }
+    else if (diagnostic_placement == 2)
+    {
+        config.tp_scope = TPScope::LOCAL;
+        config.tp_devices = {
+            GlobalDeviceAddress::cuda(0),
+            GlobalDeviceAddress::cuda(1)};
+        config.default_backend = CollectiveBackendType::NCCL;
+    }
+    config.activation_precision = "fp32";
+    config.kv_cache_precision = "auto";
+    config.tp_allreduce_precision_override = "schema";
+    config.prefix_cache.enabled = diagnostic_prefix_enabled;
+    config.prefix_cache.storage_mode =
+        diagnostic_prefix_enabled
+            ? PrefixCacheStorageMode::Ram
+            : PrefixCacheStorageMode::Disabled;
+    config.prefix_cache.block_size = 64;
+    config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
+    config.prefix_cache.moe_policy =
+        PrefixCacheMoEPolicy::PlacementFingerprint;
+    config.prefix_cache.ram_budget_bytes =
+        4ull * 1024ull * 1024ull * 1024ull;
+    config.mtp.enabled = diagnostic_mtp_enabled;
+    config.mtp.draft_tokens = 2;
+    config.mtp.verify_mode = MTPVerifyMode::Greedy;
+    config.mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    if (diagnostic_placement == 0)
+    {
+        config.moe_routed_expert_plan =
+            qwen36MoEOverlayCuda2TPHotOnlyForProbe(
+                RoutedExpertAssignmentPolicy::StaticOwner);
+    }
+    config.moe_rebalance.mode =
+        diagnostic_dynamic_enabled
+            ? MoERebalanceRuntimeMode::Dynamic
+            : MoERebalanceRuntimeMode::Off;
+    config.moe_rebalance.window_size = 4;
+    config.moe_rebalance.max_window_size = 4;
+    config.moe_rebalance.window_growth_factor = 1.0f;
+    config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 0;
+    config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
+    config.moe_rebalance.dynamic_max_swaps_per_layer = 20;
+    config.moe_rebalance.dynamic_max_plan_entries_per_wave = 20;
+    config.moe_rebalance.dynamic_min_window_activations = 0;
+    config.moe_rebalance.device_min_load_spread_improvement = 0;
+    config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
+    config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
+    config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
+    config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
+    config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
+    config.moe_rebalance.release_raw_expert_weights = true;
+
+    auto factory = createOrchestrationRunnerFactory();
+    auto runner = factory->createFromOrchestrationConfig(config);
+    ASSERT_NE(runner, nullptr);
+    ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+    SamplingParams qwen_greedy;
+    qwen_greedy.temperature = 0.0f;
+    qwen_greedy.presence_penalty = 1.5f;
+
+    const NeedleRecallRunResult beginning = runNeedleRecallPrompt(
+        *runner,
+        "beginning",
+        context_length,
+        max_tokens,
+        &qwen_greedy);
+    EXPECT_TRUE(beginning.containsTarget())
+        << summarizeNeedleRecallResult(beginning);
+
+    if (firstIntEnvOrDefault(
+            {"LLAMINAR_TEST_QWEN36_BUCKET_RUN_SECOND"},
+            1) != 0)
+    {
+        const NeedleRecallRunResult middle = runNeedleRecallPrompt(
+            *runner,
+            "middle",
+            context_length,
+            max_tokens,
+            &qwen_greedy);
+        EXPECT_TRUE(middle.containsTarget())
+            << summarizeNeedleRecallResult(middle);
+    }
+
+    runner->shutdown();
+    llaminar::v2::kernels::KernelFactory::clearCache();
 }
 
 TEST(Test__KVPrefixMTPStateProbe, MTP_ShiftedCacheCountProbeOnGPU)

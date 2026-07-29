@@ -1080,13 +1080,6 @@ namespace llaminar2
             }
         }
 
-        // Static method stubs kept for ABI compatibility but are no-ops.
-        // NativeVNNI is now always enabled; CUTLASS fallback no longer exists.
-        void CUDAQuantisedGemmKernel::setNativeVNNIEnabled(bool /*enabled*/) {}
-        bool CUDAQuantisedGemmKernel::isNativeVNNIEnabled() { return true; }
-        void CUDAQuantisedGemmKernel::setForceCutlassFallback(bool /*enabled*/) {}
-        bool CUDAQuantisedGemmKernel::isForceCutlassFallback() { return false; }
-
         // =====================================================================
         // Constructor / Destructor
         // =====================================================================

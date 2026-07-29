@@ -7040,14 +7040,16 @@ namespace llaminar2
     bool RankOrchestrator::prepareGreedyAllPositionBatchOutcomeGraph(
         int verifier_token_count,
         const int32_t *stop_tokens,
-        int stop_token_count)
+        int stop_token_count,
+        const MTPGreedyPenaltyPolicy &penalty_policy)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
             return pp_sidecar->prepareGreedyAllPositionBatchOutcomeGraph(
                 verifier_token_count,
                 stop_tokens,
-                stop_token_count);
+                stop_token_count,
+                penalty_policy);
         }
         if (device_runners_.size() == 1 && device_runners_[0])
         {
@@ -7055,7 +7057,8 @@ namespace llaminar2
                 ->prepareGreedyAllPositionBatchOutcomeGraph(
                     verifier_token_count,
                     stop_tokens,
-                    stop_token_count);
+                    stop_token_count,
+                    penalty_policy);
         }
         if (device_runners_.size() < 2 ||
             !usesMirroredLocalTPMTPHeadForVerifier())
@@ -7083,7 +7086,8 @@ namespace llaminar2
                      ->prepareGreedyAllPositionBatchOutcomeGraph(
                          verifier_token_count,
                          stop_tokens,
-                         stop_token_count))
+                         stop_token_count,
+                         penalty_policy))
             {
                 if (tp_ctx_)
                     tp_ctx_->requestAbort();

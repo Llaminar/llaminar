@@ -1302,6 +1302,10 @@ protected:
         // Embedding
         mock_loader_->addFP32RandomTensor("token_embd.weight",
                                           {VOCAB_SIZE, HIDDEN_DIM}, -1.0f, 1.0f, 55);
+        // Complete MoE expert tensors are immutable host-side preparation
+        // sources. The expert service creates the actual per-device slabs.
+        mock_loader_->addFP32RandomTensor("blk.0.ffn_gate_exps.weight",
+                                          {128, 64, 8}, -1.0f, 1.0f, 56);
 
         // Create TensorParallelConfig for 2-way TP (LOCAL) using equalSplit factory
         std::vector<DeviceId> devices = {
@@ -1326,6 +1330,40 @@ protected:
     DeviceShardingAssignment assignment0_;
     DeviceShardingAssignment assignment1_;
 };
+
+/**
+ * @brief Replicated MoE sources must not be cloned once per GPU participant.
+ *
+ * This regression models the Qwen3.6 LocalTP startup path. Before the source
+ * ownership distinction was made in the REPLICATE branch, every device copied
+ * each complete 3D expert tensor into anonymous host memory before the expert
+ * service packed its device slabs. The copies were unused and pushed a 35B
+ * two-GPU server beyond the startup gate.
+ */
+TEST_F(WeightManagerComputeSliceBoundariesTest,
+       ReplicatedMoEPreparationSourceIsSharedAcrossGpuParticipants)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    const DeviceId cuda0(DeviceType::CUDA, 0);
+    const DeviceId cuda1(DeviceType::CUDA, 1);
+    auto expert0 =
+        wm.getWeightForDevice("blk.0.ffn_gate_exps.weight", cuda0, 0);
+    auto expert1 =
+        wm.getWeightForDevice("blk.0.ffn_gate_exps.weight", cuda1, 0);
+
+    ASSERT_NE(expert0, nullptr);
+    ASSERT_NE(expert1, nullptr);
+    EXPECT_EQ(expert0.get(), expert1.get());
+    EXPECT_EQ(expert0->raw_data(), expert1->raw_data());
+    EXPECT_TRUE(expert0->isHostResident());
+}
 
 TEST_F(WeightManagerComputeSliceBoundariesTest, HeadsDimension_QWeight)
 {

@@ -36,8 +36,8 @@
 #include <unistd.h>
 #include <vector>
 
-#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNITileConfig.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeVNNITileConfig.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"

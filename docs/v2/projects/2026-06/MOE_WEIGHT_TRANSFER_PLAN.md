@@ -26,10 +26,10 @@ costs ~800ms per rebalance. Transferring pre-packed weights eliminates this.
 | Deliverable | File | Status |
 |---|---|---|
 | `IPackedWeights` abstract interface | `src/v2/kernels/IPackedWeights.h` | ✅ |
-| `CPUPackedWeights` concrete (wraps `CPUNativeVNNIPackedWeights`) | `src/v2/kernels/cpu/native_vnni/CPUPackedWeights.h` | ✅ |
+| `CPUPackedWeights` concrete (wraps `CPUNativeVNNIPackedWeights`) | `src/v2/kernels/cpu/gemm/CPUPackedWeights.h` | ✅ |
 | `CPUPackedWeightsWithNativeBlocks` (deferred packing variant) | same file | ✅ |
 | `ITensorGemm::detachWeights/attachWeights/releaseWeights/hasWeights` | `src/v2/tensors/TensorKernels.h` | ✅ |
-| `CPUNativeVNNIGemmKernel` implementations | `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h` | ✅ |
+| `CPUNativeVNNIGemmKernel` implementations | `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h` | ✅ |
 | Departed expert weight freeing in `MoEFFNStage` | `src/v2/execution/compute_stages/stages/MoEFFNStage.cpp` | ✅ |
 
 ---

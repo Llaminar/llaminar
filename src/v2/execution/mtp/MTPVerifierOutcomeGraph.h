@@ -22,6 +22,28 @@
 namespace llaminar2
 {
     /**
+     * @brief Request policy consumed by graph-owned grouped greedy sampling.
+     *
+     * Presence and frequency penalties are part of the decode algorithm, not a
+     * post-processing step.  The policy is therefore published into persistent
+     * device storage before verifier graph replay and read by the grouped
+     * argmax itself.  `first_token_already_in_history` distinguishes a newly
+     * sampled first target from a rejected correction that was emitted by the
+     * preceding transaction and is now being consumed as its pending condition.
+     */
+    struct alignas(16) MTPGreedyPenaltyPolicy
+    {
+        float presence_penalty = 0.0f;
+        float frequency_penalty = 0.0f;
+        int32_t first_token_already_in_history = 0;
+        int32_t enabled = 0;
+    };
+
+    static_assert(sizeof(MTPGreedyPenaltyPolicy) == 4 * sizeof(int32_t));
+    constexpr int kMTPGreedyPenaltyPolicyWords =
+        static_cast<int>(sizeof(MTPGreedyPenaltyPolicy) / sizeof(int32_t));
+
+    /**
      * @brief Verifier outcome operation captured at the end of a forward graph.
      *
      * The enum is deliberately closed.  A new sampling regime must add a real
@@ -49,6 +71,9 @@ namespace llaminar2
     {
         const int32_t *verifier_input_tokens_device = nullptr;
         const int32_t *stop_tokens_device = nullptr;
+        const MTPGreedyPenaltyPolicy *penalty_policy_device = nullptr;
+        int32_t *generated_token_counts_device = nullptr;
+        int generated_token_count_capacity = 0;
 
         int32_t *verifier_tokens_device = nullptr;
         float *argmax_values_device = nullptr;
@@ -68,6 +93,9 @@ namespace llaminar2
         {
             return verifier_input_tokens_device != nullptr &&
                    stop_tokens_device != nullptr &&
+                   penalty_policy_device != nullptr &&
+                   generated_token_counts_device != nullptr &&
+                   generated_token_count_capacity > 0 &&
                    verifier_tokens_device != nullptr &&
                    argmax_values_device != nullptr &&
                    argmax_partial_values_device != nullptr &&

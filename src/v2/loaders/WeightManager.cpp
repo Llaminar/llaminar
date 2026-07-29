@@ -14,6 +14,7 @@
 #include "../execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "../execution/moe/MoEExpertWeightService.h"
 #include "../utils/Logger.h"
+#include "../utils/PerfStatsCollector.h"
 #include "../utils/WeightLoadingProfiler.h"
 #include "../utils/DebugEnv.h"
 #include "../tensors/TensorFactory.h"
@@ -32,7 +33,7 @@
 #ifdef HAVE_ROCM
 #include "../kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "../kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
-#include "../kernels/rocm/ROCmWeightPacker.h"
+#include "../kernels/rocm/gemm/ROCmWeightPacker.h"
 #endif
 #ifdef HAVE_CUDA
 #include "../kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
@@ -2600,6 +2601,21 @@ namespace llaminar2
 
         registerCloneMetadata(name, original, clone, target_device);
         return clone;
+    }
+
+    bool WeightManager::isReplicatedGpuPreparationSource(
+        const std::string &name) const
+    {
+        /*
+         * Expert tensors are deliberately excluded from isGemmWeight(): the
+         * MoEExpertWeightService, rather than an ordinary ITensorGemm, owns
+         * their device slabs. They still obey the same immutable-source rule.
+         */
+        const bool is_moe_expert =
+            name.find("_exps.weight") != std::string::npos;
+        return name == "token_embd.weight" ||
+               is_moe_expert ||
+               isGemmWeight(name);
     }
 
     std::shared_ptr<TensorBase> WeightManager::getWeightForDevice(
@@ -7108,12 +7124,20 @@ namespace llaminar2
         {
         case ShardingMode::REPLICATE:
         {
-            // For host-resident REPLICATE weights (e.g., token_embd.weight),
-            // all devices share identical host data — no clone needed.
-            // Non-host-resident REPLICATE weights (norms, biases) need per-device
-            // clones because TransferEngine allocates separate GPU storage for
-            // each device. releaseAllHostWeightData() may free host data after
-            // the first upload, which would otherwise break the second upload.
+            /*
+             * A replicated weight has one of two ownership contracts:
+             *
+             * 1. Norms, biases, and other raw runtime operands receive a
+             *    distinct TensorBase/device allocation per participant.
+             * 2. Preparation-only sources remain immutable on the host while
+             *    the GEMM or expert subsystem creates independent device-owned
+             *    packed storage.
+             *
+             * Decide that contract before cloning. Marking a tensor
+             * HOST_RESIDENT later in preloadForDevices() is too late: by then
+             * the full payload has already been copied once per GPU. Qwen3.6
+             * expert tensors make that ordering bug tens of gigabytes.
+             */
             std::shared_ptr<TensorBase> cached;
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -7135,9 +7159,29 @@ namespace llaminar2
                 }
             }
 
+            const bool share_preparation_source =
+                cached &&
+                device.is_gpu() &&
+                isReplicatedGpuPreparationSource(name);
+            if (share_preparation_source)
+            {
+                cached->setHostResident();
+            }
+
             if (cached && cached->isHostResident())
             {
                 result = cached;
+                if (share_preparation_source &&
+                    PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "weight_loading",
+                        "gpu_avoided_replicated_host_clone_bytes",
+                        static_cast<double>(cached->size_bytes()),
+                        "preload",
+                        device.to_string(),
+                        {{"weight_role", toString(inferWeightRole(name))}});
+                }
                 LOG_DEBUG("[WeightManager] Sharing host-resident REPLICATE weight: " << name
                                                                                      << " for " << device.to_string()
                                                                                      << " (" << (result->size_bytes() / (1024 * 1024)) << " MB)");

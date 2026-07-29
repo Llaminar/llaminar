@@ -79,7 +79,7 @@ _ISA_REGIME_BY_PAIR = {
 }
 
 _IMPLEMENTATION_PATHS = (
-    Path("src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemv.h"),
+    Path("src/v2/kernels/cpu/gemm/CPUNativeVNNIGemv.h"),
     Path(
         "tests/v2/performance/kernels/cpu/native_vnni/"
         "Perf__CPUNativeVNNI_GEMV.cpp"

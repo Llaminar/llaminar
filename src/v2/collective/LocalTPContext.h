@@ -472,24 +472,6 @@ namespace llaminar2
         std::vector<void *> compute_streams_;
 
         // =====================================================================
-        // Raw Device AllGather Barrier State
-        // =====================================================================
-        // Used by graph-visible live-state handoff stages where the payload is
-        // owned by backend kernels rather than TensorBase instances.
-        mutable std::mutex raw_allgather_mutex_;
-        std::condition_variable raw_allgather_cv_;
-        int raw_allgather_arrivals_{0};
-        int raw_allgather_departures_{0};
-        uint64_t raw_allgather_generation_{0};
-        bool raw_allgather_result_{false};
-        size_t raw_allgather_send_count_{0};
-        CollectiveDataType raw_allgather_dtype_{CollectiveDataType::FLOAT32};
-        std::string raw_allgather_stage_name_;
-        std::vector<const void *> raw_allgather_send_buffers_;
-        std::vector<void *> raw_allgather_recv_buffers_;
-        std::vector<void *> raw_allgather_producer_streams_;
-
-        // =====================================================================
         // BAR-Backed Tensor Registry
         // =====================================================================
         // For collective allreduce, we track which stage outputs are
@@ -561,15 +543,6 @@ namespace llaminar2
                                                const std::string &stage_name,
                                                const std::string &precision,
                                                const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands = nullptr);
-
-        bool allgatherRawWithBarrierMultiGpu(
-            const void *local_send,
-            void *full_recv,
-            size_t send_count,
-            CollectiveDataType dtype,
-            int device_index,
-            void *producer_stream,
-            const std::string &stage_name);
 
         /**
          * @brief Enqueue the required per-device asynchronous GPU allreduce.

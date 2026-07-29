@@ -67,6 +67,7 @@
 #include "transfer/TransferEngine.h"
 #include <chrono>
 #include <algorithm>
+#include <cstdio>
 #include <map>
 #include <array>
 #include <cctype>
@@ -86,6 +87,52 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Report the exact device timeline dependency that could not be joined.
+         *
+         * Request reset is a fatal ownership boundary: continuing after one of
+         * its event waits fails would allow cache memory to be cleared while an
+         * older graph still owns it. The ordinary logger retains the message
+         * for diagnostics, while the direct stderr write guarantees that the
+         * dependency name survives an immediately following std::terminate().
+         *
+         * @param device Device whose timeline dependency failed.
+         * @param boundary Logical operation attempting to join the dependency.
+         * @param dependency Stable name of the failed publication or event edge.
+         * @param consumer User-facing name of the consuming operation.
+         * @return Always false, so callers can return the diagnostic directly.
+         */
+        bool reportDeviceTimelineJoinFailure(
+            DeviceId device,
+            const char *boundary,
+            const char *dependency,
+            const char *consumer)
+        {
+            const char *safe_boundary =
+                boundary && boundary[0] != '\0' ? boundary : "unknown";
+            const char *safe_dependency =
+                dependency && dependency[0] != '\0' ? dependency : "unknown";
+            const char *safe_consumer =
+                consumer && consumer[0] != '\0' ? consumer : "unknown";
+            const std::string device_name = device.toString();
+
+            LOG_ERROR("[DeviceTimelineJoin] Failed to join required device event"
+                      << " boundary=" << safe_boundary
+                      << " dependency=" << safe_dependency
+                      << " consumer=" << safe_consumer
+                      << " device=" << device_name);
+            std::fprintf(
+                stderr,
+                "[FATAL] Device timeline join failed: boundary=%s "
+                "dependency=%s consumer=%s device=%s\n",
+                safe_boundary,
+                safe_dependency,
+                safe_consumer,
+                device_name.c_str());
+            std::fflush(stderr);
+            return false;
+        }
+
         constexpr size_t kStochasticDistributionMaxK = 256;
         constexpr size_t kStochasticTopKSmallKCap = 64;
         constexpr size_t kStochasticTopKPartialBlocks = 128;
@@ -4787,6 +4834,18 @@ namespace llaminar2
                     sampling_math::kSpeculativeBatchMaxStopTokens,
                     "INT32",
                     state_.device_id) ||
+                !arena_->registerBuffer(
+                    BufferId::MTP_GREEDY_PENALTY_POLICY,
+                    1,
+                    static_cast<size_t>(kMTPGreedyPenaltyPolicyWords),
+                    "INT32",
+                    state_.device_id) ||
+                !arena_->registerBuffer(
+                    BufferId::MTP_GENERATED_TOKEN_COUNTS,
+                    1,
+                    stochastic_vocab_cols,
+                    "INT32",
+                    state_.device_id) ||
                 !arena_->registerBuffer(BufferId::MTP_VERIFIER_POSITION_IDS,
                                         1,
                                         static_cast<size_t>(stochastic_target_row_capacity_),
@@ -5007,6 +5066,8 @@ namespace llaminar2
             arena_->isRegistered(BufferId::MTP_POSITION_IDS) &&
             arena_->isRegistered(BufferId::MTP_VERIFIER_INPUT_TOKENS) &&
             arena_->isRegistered(BufferId::MTP_VERIFIER_STOP_TOKENS) &&
+            arena_->isRegistered(BufferId::MTP_GREEDY_PENALTY_POLICY) &&
+            arena_->isRegistered(BufferId::MTP_GENERATED_TOKEN_COUNTS) &&
             arena_->isRegistered(BufferId::MTP_VERIFIER_POSITION_IDS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS) &&
@@ -5032,6 +5093,12 @@ namespace llaminar2
             arena_->allocateDeviceStorage(BufferId::MTP_POSITION_IDS, state_.device_id);
             arena_->allocateDeviceStorage(BufferId::MTP_VERIFIER_INPUT_TOKENS, state_.device_id);
             arena_->allocateDeviceStorage(BufferId::MTP_VERIFIER_STOP_TOKENS, state_.device_id);
+            arena_->allocateDeviceStorage(
+                BufferId::MTP_GREEDY_PENALTY_POLICY,
+                state_.device_id);
+            arena_->allocateDeviceStorage(
+                BufferId::MTP_GENERATED_TOKEN_COUNTS,
+                state_.device_id);
             arena_->allocateDeviceStorage(BufferId::MTP_VERIFIER_POSITION_IDS, state_.device_id);
             arena_->allocateDeviceStorage(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS, state_.device_id);
             arena_->allocateDeviceStorage(BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS, state_.device_id);
@@ -5074,6 +5141,18 @@ namespace llaminar2
                 arena_->getDevicePtr(
                     BufferId::MTP_VERIFIER_STOP_TOKENS,
                     state_.device_id);
+            mtp_greedy_penalty_policy_dev_ =
+                arena_->getDevicePtr(
+                    BufferId::MTP_GREEDY_PENALTY_POLICY,
+                    state_.device_id);
+            mtp_generated_token_counts_dev_ =
+                arena_->getDevicePtr(
+                    BufferId::MTP_GENERATED_TOKEN_COUNTS,
+                    state_.device_id);
+            mtp_generated_token_count_capacity_ =
+                static_cast<int>(
+                    arena_->getCols(
+                        BufferId::MTP_GENERATED_TOKEN_COUNTS));
             mtp_verifier_position_ids_dev_ =
                 arena_->getDevicePtr(BufferId::MTP_VERIFIER_POSITION_IDS, state_.device_id);
             stochastic_topk_partial_vals_dev_ =
@@ -5111,6 +5190,14 @@ namespace llaminar2
             outcome_binding.stop_tokens_device =
                 static_cast<const int32_t *>(
                     mtp_verifier_stop_tokens_dev_);
+            outcome_binding.penalty_policy_device =
+                static_cast<const MTPGreedyPenaltyPolicy *>(
+                    mtp_greedy_penalty_policy_dev_);
+            outcome_binding.generated_token_counts_device =
+                static_cast<int32_t *>(
+                    mtp_generated_token_counts_dev_);
+            outcome_binding.generated_token_count_capacity =
+                mtp_generated_token_count_capacity_;
             outcome_binding.verifier_tokens_device =
                 static_cast<int32_t *>(stochastic_verify_tokens_dev_);
             outcome_binding.argmax_values_device =
@@ -10583,17 +10670,19 @@ namespace llaminar2
          */
         input.position_offset = state_.positions[0];
         input.token_offset = state_.positions[0];
+        /*
+         * The graph builder is the single owner of this transaction.  A full
+         * prefix hit may restore portable MoE placement and return terminal
+         * logits without launching a main forward graph.  In that case the
+         * next request reset retires the pending model transaction.  Keeping a
+         * second orchestrator flag made that legal lifecycle look pending
+         * forever and caused the following request to disagree with the model.
+         */
         input.rehydrate_prefix_runtime_on_device =
-            prefix_runtime_device_rehydration_pending_ &&
-            execution_role == ForwardExecutionRole::MainInference;
-        if (input.rehydrate_prefix_runtime_on_device &&
-            (!graph_builder_ ||
-             !graph_builder_->
-                 prefixCacheRuntimeStateRequiresDeviceRehydration()))
-        {
-            throw std::runtime_error(
-                "DeviceGraphOrchestrator prefix-runtime rehydration policy disagrees with the model runtime owner");
-        }
+            execution_role == ForwardExecutionRole::MainInference &&
+            graph_builder_ &&
+            graph_builder_->
+                prefixCacheRuntimeStateRequiresDeviceRehydration();
         input.device = state_.device_id;
         input.kv_cache = state_.kv_cache.get();
 
@@ -10675,7 +10764,6 @@ namespace llaminar2
         {
             graph_builder_->
                 completePrefixCacheRuntimeStateDeviceRehydration();
-            prefix_runtime_device_rehydration_pending_ = false;
         }
 
         /*
@@ -16347,7 +16435,11 @@ namespace llaminar2
                 ForwardGraphOutputKind::Any,
                 consumer))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_graph_producer_observation",
+                "ForwardGraphOutputReady",
+                consumer);
         }
 
         /*
@@ -16361,33 +16453,53 @@ namespace llaminar2
                 observation_stream,
                 consumer))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_graph_producer_observation",
+                "MTPSidecarLogitsReady",
+                consumer);
         }
         if (!waitForPendingLogitsStreamForObservation(
                 PendingLogitsStreamRole::MainDecode,
                 observation_stream,
                 consumer))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_graph_producer_observation",
+                "MainDecodeLogitsReady",
+                consumer);
         }
         if (!waitForPendingLogitsStreamForObservation(
                 PendingLogitsStreamRole::AllPositionVerifier,
                 observation_stream,
                 consumer))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_graph_producer_observation",
+                "AllPositionVerifierLogitsReady",
+                consumer);
         }
         if (!waitForPendingShiftedMTPKVReadyForObservation(
                 observation_stream,
                 consumer))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_graph_producer_observation",
+                "ShiftedMTPKVReady",
+                consumer);
         }
         if (!waitForPendingAllPositionVerifierStateReadyForObservation(
                 observation_stream,
                 consumer))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_graph_producer_observation",
+                "AllPositionVerifierReady",
+                consumer);
         }
         /*
          * Prefix harvest reads the archived terminal row, but observation does
@@ -16399,7 +16511,11 @@ namespace llaminar2
                 observation_stream,
                 consumer))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_graph_producer_observation",
+                "MTPPrefillTerminalArchiveReady",
+                consumer);
         }
         return true;
     }
@@ -20204,6 +20320,45 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::resetMTPGeneratedTokenHistoryOnStream(
+        void *reset_stream,
+        const char *reason)
+    {
+        IBackend *const backend = getBackendFor(state_.device_id);
+        const size_t history_bytes =
+            static_cast<size_t>(mtp_generated_token_count_capacity_) *
+            sizeof(int32_t);
+        if (!state_.device_id.is_gpu() ||
+            !reset_stream ||
+            !backend ||
+            !mtp_generated_token_counts_dev_ ||
+            mtp_generated_token_count_capacity_ != state_.vocab_size ||
+            !backend->memset(
+                mtp_generated_token_counts_dev_,
+                0,
+                history_bytes,
+                state_.device_id.gpu_ordinal(),
+                reset_stream) ||
+            !publishPreparedArenaGraphInput(
+                BufferId::MTP_GENERATED_TOKEN_COUNTS,
+                mtp_generated_token_counts_dev_,
+                reset_stream,
+                state_.device_id,
+                "request_reset_mtp_generated_history"))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Could not reset device-owned MTP generated-token history"
+                      << " reason=" << (reason ? reason : "unknown")
+                      << " device=" << state_.device_id.toString()
+                      << " stream=" << reset_stream
+                      << " history=" << mtp_generated_token_counts_dev_
+                      << " capacity="
+                      << mtp_generated_token_count_capacity_
+                      << " vocab=" << state_.vocab_size);
+            return false;
+        }
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::materializePendingMTPVerifierInputTokensOnDevice(
         void *execution_stream,
         DeviceId execution_device)
@@ -22821,7 +22976,11 @@ namespace llaminar2
         if (!observation_stream)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Live inference-state observation requires an explicit stream");
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_inference_state_observation",
+                "ExplicitObservationStream",
+                observation_name);
         }
 
         const char *consumer =
@@ -22840,26 +22999,42 @@ namespace llaminar2
                 observation_stream,
                 consumer))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_inference_state_observation",
+                "LivePrefixCheckpointReady",
+                consumer);
         }
         if (!waitForPendingAcceptedSpecPublicationReadyForObservation(
                 observation_stream,
                 consumer))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_inference_state_observation",
+                "AcceptedSpecPublicationReady",
+                consumer);
         }
         if (!waitForPendingLivePrefixMutationReadyForObservation(
                 observation_stream,
                 consumer))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_inference_state_observation",
+                "LivePrefixMutationReady",
+                consumer);
         }
         if (!waitForPendingLiveGraphProducersForObservation(
                 observation_stream,
                 consumer,
                 observation_role))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_inference_state_observation",
+                "LiveGraphProducersReady",
+                consumer);
         }
         const DeviceResidentMTPTransactionLease transaction =
             currentDeviceResidentMTPTransactionLease();
@@ -22869,13 +23044,21 @@ namespace llaminar2
                 observation_stream,
                 consumer))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_inference_state_observation",
+                "MTPTransactionReady",
+                consumer);
         }
         if (!waitForDeviceResidentLogicalSequenceStateMailboxForObservation(
                 observation_stream,
                 consumer))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "live_inference_state_observation",
+                "LogicalSequenceStateReady",
+                consumer);
         }
         return true;
     }
@@ -23025,6 +23208,27 @@ namespace llaminar2
             {
                 return false;
             }
+            if (!backend->enqueueConfigureMTPGreedyPenaltyPolicyDevice(
+                    mtp_greedy_penalty_policy_dev_,
+                    transaction.penalty_policy.presence_penalty,
+                    transaction.penalty_policy.frequency_penalty,
+                    transaction.penalty_policy
+                            .first_token_already_in_history != 0,
+                    metadata_device.gpu_ordinal(),
+                    execution_stream))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to publish graph-owned greedy penalty policy");
+                return false;
+            }
+            if (!publishPreparedArenaGraphInput(
+                    BufferId::MTP_GREEDY_PENALTY_POLICY,
+                    mtp_greedy_penalty_policy_dev_,
+                    execution_stream,
+                    metadata_device,
+                    "greedy_verifier_penalty_policy"))
+            {
+                return false;
+            }
             PerfStatsCollector::addCounter(
                 "mtp",
                 "graph_owned_greedy_control_uploads",
@@ -23036,7 +23240,18 @@ namespace llaminar2
                       sizeof(int32_t) *
                       sampling_math::
                           kSpeculativeBatchMaxStopTokens)},
-                 {"rows", std::to_string(expected_rows)}});
+                 {"rows", std::to_string(expected_rows)},
+                 {"presence_penalty",
+                  std::to_string(
+                      transaction.penalty_policy.presence_penalty)},
+                 {"frequency_penalty",
+                  std::to_string(
+                      transaction.penalty_policy.frequency_penalty)},
+                 {"pending_condition",
+                  transaction.penalty_policy
+                                  .first_token_already_in_history != 0
+                      ? "true"
+                      : "false"}});
         }
         else if (greedy_verifier_outcome_graph_transaction_.state !=
                  GreedyVerifierOutcomeGraphState::Idle)
@@ -24229,7 +24444,8 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::prepareGreedyAllPositionBatchOutcomeGraph(
         int verifier_token_count,
         const int32_t *stop_tokens,
-        int stop_token_count)
+        int stop_token_count,
+        const MTPGreedyPenaltyPolicy &penalty_policy)
     {
         using namespace sampling_math;
 
@@ -24240,6 +24456,9 @@ namespace llaminar2
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
             (stop_token_count > 0 && !stop_tokens) ||
             !mtp_verifier_stop_tokens_dev_ ||
+            !mtp_greedy_penalty_policy_dev_ ||
+            !mtp_generated_token_counts_dev_ ||
+            mtp_generated_token_count_capacity_ != state_.vocab_size ||
             !mtp_verifier_input_tokens_dev_ ||
             !stochastic_verify_tokens_dev_ ||
             !stochastic_verify_accept_probs_dev_ ||
@@ -24271,6 +24490,14 @@ namespace llaminar2
             transaction.stop_tokens[static_cast<size_t>(i)] =
                 stop_tokens[i];
         }
+        transaction.penalty_policy = penalty_policy;
+        transaction.penalty_policy.first_token_already_in_history =
+            penalty_policy.first_token_already_in_history != 0 ? 1 : 0;
+        transaction.penalty_policy.enabled =
+            penalty_policy.presence_penalty != 0.0f ||
+                    penalty_policy.frequency_penalty != 0.0f
+                ? 1
+                : 0;
 
         greedy_verifier_outcome_graph_transaction_ = transaction;
         mtp_verifier_outcome_graph_mode_ =
@@ -26658,8 +26885,6 @@ namespace llaminar2
             terminal_block.has_model_runtime_state &&
             terminal_block.model_runtime_state_storage &&
             !terminal_block.model_runtime_state_storage->empty();
-        prefix_runtime_device_rehydration_pending_ = false;
-
         /*
          * A prefix restore is not an overlay on top of the current request; it is
          * a complete replacement of live sequence state.  Decode may have warmed
@@ -26757,7 +26982,7 @@ namespace llaminar2
             {
                 return fail("model runtime state restore failed");
             }
-            prefix_runtime_device_rehydration_pending_ =
+            const bool device_rehydration_pending =
                 graph_builder_->
                     prefixCacheRuntimeStateRequiresDeviceRehydration();
             LOG_INFO("[DeviceGraphOrchestrator] Adopted prefix-runtime restore "
@@ -26765,7 +26990,7 @@ namespace llaminar2
                      << " device=" << state_.device_id.toString()
                      << " cached_tokens=" << hit.cached_tokens
                      << " device_payload_rehydration="
-                     << (prefix_runtime_device_rehydration_pending_
+                     << (device_rehydration_pending
                              ? "pending"
                              : "not_required"));
             ++moe_runtime_movement_epoch_;
@@ -30481,13 +30706,43 @@ namespace llaminar2
         if (!state_.device_id.is_gpu())
             return true;
 
-        if (!reset_stream ||
-            !waitForLiveInferenceStateReadyForObservation(
+        /*
+         * Server initialization and request admission may establish adjacent
+         * reset boundaries before any forward graph consumes the first
+         * publication.  Treat the newer reset as the explicit consumer of the
+         * prior reset generation.  This queues the dependency onto the exact
+         * reset stream and retires the old publication before the same
+         * lifecycle-owned event is recorded for the new generation.
+         */
+        if (!reset_stream)
+        {
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "request_state_reset",
+                "ExplicitResetStream",
+                consumer_name);
+        }
+        if (!waitForPendingRequestStateReset(
+                reset_stream,
+                DeviceTimelineRole::RequestStateReset,
+                consumer_name))
+        {
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "request_state_reset",
+                "RequestStateResetReady",
+                consumer_name);
+        }
+        if (!waitForLiveInferenceStateReadyForObservation(
                 reset_stream,
                 consumer_name,
                 DeviceTimelineRole::RequestStateReset))
         {
-            return false;
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "request_state_reset",
+                "LiveInferenceStateReady",
+                consumer_name);
         }
         PerfStatsCollector::addCounter(
             "request_reset",
@@ -30566,7 +30821,8 @@ namespace llaminar2
         if (!consumer_stream ||
             !ready.event ||
             !ready.producer_stream ||
-            (consumer_role != DeviceTimelineRole::MainForwardGraph &&
+            (consumer_role != DeviceTimelineRole::RequestStateReset &&
+             consumer_role != DeviceTimelineRole::MainForwardGraph &&
              consumer_role != DeviceTimelineRole::MTPSidecarGraph &&
              consumer_role != DeviceTimelineRole::PrefixRestoreMutation))
         {

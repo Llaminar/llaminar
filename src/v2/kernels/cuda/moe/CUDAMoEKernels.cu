@@ -5371,35 +5371,84 @@ namespace
                 !rebalance_transfer_slot_identity_ok(
                     prior,
                     slot_index,
-                    config) ||
-                prior.layer != plan.layer ||
-                prior.expert >= config.num_experts ||
-                !rebalance_transfer_slot_has_active_runtime_claim(
-                    prior,
-                    slot_index,
-                    runtime_layers,
                     config))
             {
                 continue;
             }
 
-            bool assigned_locally = false;
-            for (uint32_t span_index = 0u;
-                 spans && span_index < span_count;
-                 ++span_index)
+            /*
+             * Request reset intentionally preserves model-lifetime transfer
+             * allocations while removing every request-local runtime claim.
+             * Their directory generations can therefore be newer than the
+             * restored runtime epoch. The generic maintenance allocator must
+             * conservatively protect that shape because a copy may be awaiting
+             * apply, but prefill projection has a stronger ordering proof: its
+             * transfer stream waits on the compute-ready event after all prior
+             * layer apply/compute work. A valid logical occupant with no active
+             * runtime claim is consequently retired and immediately reusable.
+             *
+             * Keep malformed logical identities out of the lease pool. Empty
+             * entries were already consumed by the ordinary allocator above.
+             */
+            if (prior.layer >= config.num_layers ||
+                prior.expert >= config.num_experts)
             {
-                const auto &span = spans[span_index];
-                if (span.expert == prior.expert &&
-                    span.destination_participant == config.participant_id &&
-                    span.route_row_end > span.route_row_begin)
+                continue;
+            }
+            const bool has_active_runtime_claim =
+                rebalance_transfer_slot_has_active_runtime_claim(
+                    prior,
+                    slot_index,
+                    runtime_layers,
+                    config);
+            if (!has_active_runtime_claim)
+            {
+                selected_slot = slot_index;
+                break;
+            }
+
+            bool assigned_locally = false;
+            if (prior.layer == plan.layer)
+            {
+                for (uint32_t span_index = 0u;
+                     spans && span_index < span_count;
+                     ++span_index)
                 {
-                    assigned_locally = true;
-                    break;
+                    const auto &span = spans[span_index];
+                    if (span.expert == prior.expert &&
+                        span.destination_participant == config.participant_id &&
+                        span.route_row_end > span.route_row_begin)
+                    {
+                        assigned_locally = true;
+                        break;
+                    }
                 }
             }
 
+            /*
+             * The compute-ready event before projection establishes that every
+             * earlier layer has finished reading its payload. Future layers
+             * will publish a fresh assignment before they execute. Therefore
+             * only a same-layer assignment can make this non-owner replica live
+             * for the current prefill stage; apply carries the previous layer,
+             * expert, and generation and retires that exact old publication.
+             */
+            assigned_locally =
+                llaminar2::moe_rebalance_policy::
+                    prefillAssignmentReadsTransferSlotOccupant(
+                        plan.layer,
+                        prior.layer,
+                        assigned_locally);
+            const auto &occupant_runtime = runtime_layers[prior.layer];
+            if (occupant_runtime.active_bank > 1u ||
+                occupant_runtime.expert_count != config.num_experts ||
+                occupant_runtime.participant_id != config.participant_id ||
+                occupant_runtime.participant_count != config.participant_count)
+            {
+                continue;
+            }
             const auto &active_bank =
-                target_runtime.banks[target_runtime.active_bank];
+                occupant_runtime.banks[occupant_runtime.active_bank];
             const auto occupancy =
                 llaminar2::moe_rebalance_policy::classifyTransferSlotOccupancy(
                     /*transfer_backed=*/true,
@@ -8606,50 +8655,89 @@ namespace
         float *__restrict__ reductions,
         int *__restrict__ reduction_indices)
     {
-        for (int k = 0; k < top_k; ++k)
-        {
-            float best_value = -1.0f;
-            int best = kMaxExperts;
-            for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
-            {
-                const float value = values[expert];
-                if (moe_topk_pair_better(value, expert, best_value, best))
-                {
-                    best_value = value;
-                    best = expert;
-                }
-            }
-            reductions[threadIdx.x] = best_value;
-            reduction_indices[threadIdx.x] = best;
-            __syncthreads();
+        constexpr unsigned kFullWarpMask = 0xffffffffu;
+        constexpr int kWarpWidth = 32;
+        const int lane = threadIdx.x & (kWarpWidth - 1);
+        const int warp_id = threadIdx.x / kWarpWidth;
+        (void)reductions;
+        (void)reduction_indices;
 
-            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+        /*
+         * Router rows are independent and the grid supplies thousands of
+         * blocks during prefill, so block-level parallelism is already ample.
+         * Within a row, one warp can scan all supported experts with a stable
+         * strided tournament.  This removes the two CTA barriers that the
+         * former eight-warp merge paid for every selected slot.  The remaining
+         * block barrier publishes the complete selected table once.
+         *
+         * This is not a reduced-capability path: lanes stride over the whole
+         * `num_experts` range, including the supported 257..1024 geometries.
+         */
+        if (warp_id == 0)
+        {
+            for (int k = 0; k < top_k; ++k)
             {
-                if (threadIdx.x < stride)
+                float best_value = -INFINITY;
+                int best = kMaxExperts;
+                for (int expert = lane;
+                     expert < num_experts;
+                     expert += kWarpWidth)
                 {
-                    const float other_value = reductions[threadIdx.x + stride];
-                    const int other_idx = reduction_indices[threadIdx.x + stride];
-                    const float current_value = reductions[threadIdx.x];
-                    const int current_idx = reduction_indices[threadIdx.x];
-                    if (moe_topk_pair_better(other_value, other_idx, current_value, current_idx))
+                    const float value = values[expert];
+                    if (moe_topk_pair_better(
+                            value,
+                            expert,
+                            best_value,
+                            best))
                     {
-                        reductions[threadIdx.x] = other_value;
-                        reduction_indices[threadIdx.x] = other_idx;
+                        best_value = value;
+                        best = expert;
                     }
                 }
-                __syncthreads();
-            }
 
-            if (threadIdx.x == 0)
-            {
-                const int winner = reduction_indices[0];
-                selected[k] = winner;
-                selected_weights[k] = reductions[0];
-                if (winner >= 0 && winner < num_experts)
-                    values[winner] = -1.0f;
+                for (int offset = kWarpWidth / 2;
+                     offset > 0;
+                     offset >>= 1)
+                {
+                    const float other_value =
+                        __shfl_down_sync(
+                            kFullWarpMask,
+                            best_value,
+                            offset);
+                    const int other_id =
+                        __shfl_down_sync(
+                            kFullWarpMask,
+                            best,
+                            offset);
+                    if (moe_topk_pair_better(
+                            other_value,
+                            other_id,
+                            best_value,
+                            best))
+                    {
+                        best_value = other_value;
+                        best = other_id;
+                    }
+                }
+
+                const int winner =
+                    __shfl_sync(kFullWarpMask, best, 0);
+                if (lane == 0)
+                {
+                    selected[k] = best;
+                    selected_weights[k] = best_value;
+                }
+                for (int expert = lane;
+                     expert < num_experts;
+                     expert += kWarpWidth)
+                {
+                    if (expert == winner)
+                        values[expert] = -INFINITY;
+                }
+                __syncwarp(kFullWarpMask);
             }
-            __syncthreads();
         }
+        __syncthreads();
     }
 
     __global__ void softmax_topk_kernel(
@@ -8693,107 +8781,87 @@ namespace
         __shared__ float selected_weights[kMaxTopK];
 
         const size_t row_offset = static_cast<size_t>(token) * num_experts;
-        float local_max = -INFINITY;
         for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
-            local_max = fmaxf(local_max, logits[row_offset + expert]);
-        reductions[threadIdx.x] = local_max;
+            values[expert] = logits[row_offset + expert];
         __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
-        {
-            if (threadIdx.x < stride)
-                reductions[threadIdx.x] = fmaxf(reductions[threadIdx.x], reductions[threadIdx.x + stride]);
-            __syncthreads();
-        }
-        const float max_value = reductions[0];
 
+        /*
+         * Softmax is strictly monotonic, so select experts from the raw router
+         * logits. This prevents an all-expert probability reduction from
+         * changing a near-tie decision when M changes. The pair reduction has a
+         * fixed tree and a lower-expert-id tie break, matching decode routing.
+         */
+        moe_select_topk_probabilities_block(
+            values,
+            num_experts,
+            top_k,
+            selected,
+            selected_weights,
+            reductions,
+            red_idx);
+
+        /*
+         * Compute the full softmax with the same fixed 256-thread reduction
+         * tree used by `softmax_topk_decode_runtime_kernel`.  The previous
+         * correctness-first implementation accumulated all 256 exponentials
+         * on thread zero.  Although that made the addition order obvious, it
+         * left the remaining 255 threads idle during the most expensive part
+         * of every router row.
+         *
+         * The reduction below is independent of `seq_len`: one block always
+         * owns one row and `num_experts` alone determines which values each
+         * thread contributes.  Exact-M and padded graph launches therefore
+         * execute the same arithmetic tree for every active row.  Keeping this
+         * tree identical to decode is also important for grouped MTP verifier
+         * rows, whose published weights must be byte-identical to serial
+         * single-token routing.
+         */
+        const float max_value = selected_weights[0];
         float local_sum = 0.0f;
         for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
         {
-            const float prob = expf(logits[row_offset + expert] - max_value);
-            values[expert] = prob;
-            local_sum += prob;
+            const float exponential =
+                expf(logits[row_offset + expert] - max_value);
+            values[expert] = exponential;
+            local_sum += exponential;
         }
         reductions[threadIdx.x] = local_sum;
         __syncthreads();
+
         for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
         {
             if (threadIdx.x < stride)
                 reductions[threadIdx.x] += reductions[threadIdx.x + stride];
             __syncthreads();
         }
-        const float denom = reductions[0];
+
+        const float denominator = reductions[0];
         for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
         {
-            const float prob = denom > 0.0f ? values[expert] / denom : 0.0f;
-            values[expert] = prob;
-            logits[row_offset + expert] = prob;
+            const float probability =
+                denominator > 0.0f ? values[expert] / denominator : 0.0f;
+            values[expert] = probability;
+            logits[row_offset + expert] = probability;
         }
         __syncthreads();
 
-        // Parallel top-k selection. The original implementation ran the entire
-        // top_k * num_experts argmax scan on thread 0 with the other 255 lanes idle.
-        // Here each selection round does a block-wide parallel argmax reduction over
-        // the (still-unselected) experts, masks the winner, and repeats. Ties break
-        // toward the lower expert index to match the original serial scan exactly.
-        float topk_sum = 0.0f;
-        for (int k = 0; k < top_k; ++k)
-        {
-            // Each thread finds the best (value,index) over its strided expert subset.
-            float best_value = -1.0f;
-            int best = 0;
-            for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
-            {
-                const float value = values[expert];
-                if (value > best_value)
-                {
-                    best_value = value;
-                    best = expert;
-                }
-            }
-            reductions[threadIdx.x] = best_value;
-            red_idx[threadIdx.x] = best;
-            __syncthreads();
-
-            // Tree reduction to the global argmax for this round.
-            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
-            {
-                if (threadIdx.x < stride)
-                {
-                    const float other = reductions[threadIdx.x + stride];
-                    const int other_idx = red_idx[threadIdx.x + stride];
-                    const float cur = reductions[threadIdx.x];
-                    const int cur_idx = red_idx[threadIdx.x];
-                    if (other > cur || (other == cur && other_idx < cur_idx))
-                    {
-                        reductions[threadIdx.x] = other;
-                        red_idx[threadIdx.x] = other_idx;
-                    }
-                }
-                __syncthreads();
-            }
-
-            const int winner = red_idx[0];
-            const float winner_value = reductions[0];
-            topk_sum += winner_value;
-            if (threadIdx.x == 0)
-            {
-                selected[k] = winner;
-                selected_weights[k] = winner_value;
-                values[winner] = -1.0f; // mask out for the next round
-            }
-            __syncthreads(); // ensure the mask is visible before the next round
-        }
-
-        // Thread 0 writes the final indices + (optionally normalized) weights.
         if (threadIdx.x == 0)
         {
+            float selected_sum = 0.0f;
+            for (int k = 0; k < top_k; ++k)
+            {
+                selected_weights[k] = values[selected[k]];
+                selected_sum += selected_weights[k];
+            }
+
             for (int k = 0; k < top_k; ++k)
             {
                 const size_t out = static_cast<size_t>(token) * top_k + k;
                 expert_indices[out] = selected[k];
-                expert_weights[out] = normalize_weights && topk_sum > 0.0f
-                                          ? selected_weights[k] / topk_sum
-                                          : selected_weights[k];
+                expert_weights[out] =
+                    normalize_weights && selected_sum > 0.0f
+                        ? selected_weights[k] / selected_sum
+                        : selected_weights[k];
             }
         }
     }

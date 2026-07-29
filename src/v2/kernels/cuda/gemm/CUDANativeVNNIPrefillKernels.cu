@@ -23,6 +23,14 @@
 #include <string>
 #include <vector>
 
+extern "C" bool cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+    uint8_t codebook_id,
+    int n,
+    int k,
+    int sm_count,
+    int *uses_ordered_reducer,
+    int *k_partitions);
+
 // =========================================================================
 // Per-device prefill context — replaces process-global statics for SM count
 // cache and stream-K fixup buffer.  Owned by KernelFactory, one per device.
@@ -99,12 +107,6 @@ static float *getOrAllocSplitkPartials(CUDAPrefillContext_ *ctx, size_t required
 namespace
 {
     using llaminar2::cuda_native_vnni::fp16_bits_to_float;
-
-    constexpr int BK = 32;
-    [[maybe_unused]] constexpr int Q40_PAYLOAD_BYTES = llaminar2::cuda_native_vnni::CodebookTraits<0>::payload_bytes;
-    constexpr int SMEM_PAD = 16;
-    [[maybe_unused]] constexpr int SMEM_STRIDE = BK + SMEM_PAD;
-    [[maybe_unused]] constexpr int STAGES = 2;
 
     // BK=64 constants (CUTLASS-standard K-tile for INT8 on SM80+)
     constexpr int BK64 = 64;
@@ -259,406 +261,6 @@ namespace
 #endif
     }
 
-    template <int BN, int BLOCK_SIZE>
-    __device__ __forceinline__ void load_q40_tile_to_smem(
-        const uint8_t *raw_payload,
-        const uint16_t *scales_B,
-        int8_t *decoded_tile,
-        uint16_t *decoded_scales,
-        int kb,
-        int block_n,
-        int N)
-    {
-        for (int col = threadIdx.x; col < BN; col += BLOCK_SIZE)
-        {
-            int32_t *dst_words = reinterpret_cast<int32_t *>(decoded_tile + col * SMEM_STRIDE);
-            const int gcol = block_n + col;
-            if (gcol < N)
-            {
-                int32_t packed_groups[8];
-                const size_t linear = static_cast<size_t>(kb) * N + gcol;
-                llaminar2::cuda_native_vnni::decode_groups_vec<0>(
-                    raw_payload + static_cast<size_t>(col) * Q40_PAYLOAD_BYTES,
-                    packed_groups);
-#pragma unroll
-                for (int g = 0; g < 8; ++g)
-                    dst_words[g] = packed_groups[g];
-                decoded_scales[col] = scales_B[linear];
-            }
-            else
-            {
-#pragma unroll
-                for (int g = 0; g < 8; ++g)
-                    dst_words[g] = 0;
-                decoded_scales[col] = uint16_t{0};
-            }
-        }
-    }
-
-    template <int BN, int BLOCK_SIZE>
-    __device__ __forceinline__ void decode_q40_raw_tile_to_smem(
-        const uint8_t *raw_payload,
-        int8_t *decoded_tile,
-        int valid_cols)
-    {
-        for (int col = threadIdx.x; col < BN; col += BLOCK_SIZE)
-        {
-            int32_t *dst_words = reinterpret_cast<int32_t *>(decoded_tile + col * SMEM_STRIDE);
-            if (col < valid_cols)
-            {
-                int32_t packed_groups[8];
-                llaminar2::cuda_native_vnni::decode_groups_vec<0>(
-                    raw_payload + static_cast<size_t>(col) * Q40_PAYLOAD_BYTES,
-                    packed_groups);
-#pragma unroll
-                for (int g = 0; g < 8; ++g)
-                    dst_words[g] = packed_groups[g];
-            }
-            else
-            {
-#pragma unroll
-                for (int g = 0; g < 8; ++g)
-                    dst_words[g] = 0;
-            }
-        }
-    }
-
-    template <int BM, int BN, int WARPS_M, int WARPS_N, int SPLIT_K = 1, bool SINGLE_PASS_MATERIALIZE = false>
-    __global__ void q40NativeVNNITensorCoreKernel(
-        const int8_t *__restrict__ A,
-        const uint8_t *__restrict__ payload,
-        const uint16_t *__restrict__ scales_B,
-        float *__restrict__ C,
-        const float *__restrict__ scales_A,
-        const float *__restrict__ C_existing,
-        const float *__restrict__ bias,
-        int M,
-        int N,
-        int K,
-        float alpha,
-        float beta)
-    {
-#if __CUDA_ARCH__ >= 800
-        constexpr int NUM_WARPS = WARPS_M * WARPS_N;
-        constexpr int BLOCK_SIZE = NUM_WARPS * 32;
-        constexpr int WARP_M = BM / WARPS_M;
-        constexpr int WARP_N = BN / WARPS_N;
-        constexpr int WM = WARP_M / 16;
-        constexpr int WN = WARP_N / 8;
-        constexpr int A_VEC_LOADS = BM * BK / 16;
-
-        static_assert(BM % WARPS_M == 0 && BN % WARPS_N == 0);
-        static_assert(WARP_M % 16 == 0);
-        static_assert(WARP_N % 8 == 0);
-
-        const int warp_id = threadIdx.x >> 5;
-        const int lane_id = threadIdx.x & 31;
-        const int wr = warp_id / WARPS_N;
-        const int wc = warp_id % WARPS_N;
-        const int gid = lane_id >> 2;
-
-        const int block_m = blockIdx.x * BM;
-        const int block_n = blockIdx.y * BN;
-
-        const int num_k_blocks_total = K / BK;
-        int kb_begin = 0;
-        int kb_end = num_k_blocks_total;
-        if constexpr (SPLIT_K > 1)
-        {
-            const int blocks_per_part = (num_k_blocks_total + SPLIT_K - 1) / SPLIT_K;
-            kb_begin = static_cast<int>(blockIdx.z) * blocks_per_part;
-            kb_end = min(kb_begin + blocks_per_part, num_k_blocks_total);
-        }
-        const int num_k_iters = kb_end - kb_begin;
-        if (num_k_iters <= 0)
-            return;
-
-        __shared__ int8_t smem_A[STAGES][BM * SMEM_STRIDE];
-        __shared__ int8_t smem_B[STAGES][BN * SMEM_STRIDE];
-        __shared__ uint8_t smem_B_raw[STAGES][BN * Q40_PAYLOAD_BYTES];
-        __shared__ uint16_t smem_scales_B[STAGES][BN];
-
-        float acc[WM][WN][4];
-#pragma unroll
-        for (int i = 0; i < WM; ++i)
-#pragma unroll
-            for (int j = 0; j < WN; ++j)
-#pragma unroll
-                for (int e = 0; e < 4; ++e)
-                    acc[i][j][e] = 0.0f;
-
-        auto load_A_tile = [&](int stage, int kb) __attribute__((always_inline))
-        {
-#pragma unroll 4
-            for (int idx = threadIdx.x; idx < A_VEC_LOADS; idx += BLOCK_SIZE)
-            {
-                const int linear = idx << 4;
-                const int row = linear >> 5;
-                const int col = linear & 31;
-                const int grow = block_m + row;
-                void *dst = &smem_A[stage][row * SMEM_STRIDE + col];
-                const bool valid = grow < M;
-                const void *src = valid
-                                      ? static_cast<const void *>(&A[static_cast<size_t>(grow) * K + kb * BK + col])
-                                      : static_cast<const void *>(A);
-                cp_async_cg_16_zfill_128(dst, src, valid ? 16 : 0);
-            }
-        };
-
-        auto load_B_payload_tile = [&](int stage, int kb) __attribute__((always_inline))
-        {
-#pragma unroll 2
-            for (int col = threadIdx.x; col < BN; col += BLOCK_SIZE)
-            {
-                const int gcol = block_n + col;
-                void *dst = &smem_B_raw[stage][col * Q40_PAYLOAD_BYTES];
-                const bool valid = gcol < N;
-                const void *src = valid
-                                      ? static_cast<const void *>(&payload[(static_cast<size_t>(kb) * N + gcol) * Q40_PAYLOAD_BYTES])
-                                      : static_cast<const void *>(payload);
-                cp_async_cg_16_zfill_128(dst, src, valid ? Q40_PAYLOAD_BYTES : 0);
-            }
-        };
-
-        auto materialize_B_stage = [&](int stage, int kb) __attribute__((always_inline))
-        {
-            if constexpr (SINGLE_PASS_MATERIALIZE)
-            {
-                load_q40_tile_to_smem<BN, BLOCK_SIZE>(
-                    smem_B_raw[stage],
-                    scales_B,
-                    smem_B[stage],
-                    smem_scales_B[stage],
-                    kb,
-                    block_n,
-                    N);
-            }
-            else
-            {
-                const int valid_cols = max(0, min(BN, N - block_n));
-                for (int col = threadIdx.x; col < BN; col += BLOCK_SIZE)
-                {
-                    const int gcol = block_n + col;
-                    smem_scales_B[stage][col] = (gcol < N)
-                                                    ? scales_B[static_cast<size_t>(kb) * N + gcol]
-                                                    : uint16_t{0};
-                }
-                __syncthreads();
-                decode_q40_raw_tile_to_smem<BN, BLOCK_SIZE>(smem_B_raw[stage], smem_B[stage], valid_cols);
-            }
-        };
-
-        const bool is_interior_tile = (block_m + BM <= M) && (block_n + BN <= N);
-
-        auto compute_k_block_interior = [&](int stage, int kb) __attribute__((always_inline))
-        {
-#pragma unroll
-            for (int wi = 0; wi < WM; ++wi)
-            {
-                const int a_row_base = wr * WARP_M + wi * 16;
-
-                uint32_t A_frag[4];
-                load_ldmatrix_a_m16n8k32(
-                    A_frag,
-                    reinterpret_cast<const int *>(&smem_A[stage][a_row_base * SMEM_STRIDE]),
-                    SMEM_STRIDE / 4,
-                    lane_id);
-
-                const int grow0 = block_m + a_row_base + gid;
-                const float sa0 = scales_A[grow0 * num_k_blocks_total + kb];
-                const float sa1 = scales_A[(grow0 + 8) * num_k_blocks_total + kb];
-
-#pragma unroll
-                for (int wj = 0; wj < WN; ++wj)
-                {
-                    const int b_col_base = wc * WARP_N + wj * 8;
-                    const float sb0 = fp16_bits_to_float(smem_scales_B[stage][b_col_base + frag_col(lane_id, 0)]);
-                    const float sb1 = fp16_bits_to_float(smem_scales_B[stage][b_col_base + frag_col(lane_id, 1)]);
-
-                    const float cs00 = sa0 * sb0;
-                    const float cs01 = sa0 * sb1;
-                    const float cs10 = sa1 * sb0;
-                    const float cs11 = sa1 * sb1;
-
-                    uint32_t B_frag[2];
-                    load_ldmatrix_b_m16n8k32(
-                        B_frag,
-                        reinterpret_cast<const int *>(&smem_B[stage][b_col_base * SMEM_STRIDE]),
-                        SMEM_STRIDE / 4,
-                        lane_id);
-
-                    int32_t D_frag[4] = {0, 0, 0, 0};
-                    mma_m16n8k32_s8(D_frag, A_frag, B_frag);
-
-                    acc[wi][wj][0] += static_cast<float>(D_frag[0]) * cs00;
-                    acc[wi][wj][1] += static_cast<float>(D_frag[1]) * cs01;
-                    acc[wi][wj][2] += static_cast<float>(D_frag[2]) * cs10;
-                    acc[wi][wj][3] += static_cast<float>(D_frag[3]) * cs11;
-                }
-            }
-        };
-
-        auto compute_k_block_border = [&](int stage, int kb) __attribute__((always_inline))
-        {
-#pragma unroll
-            for (int wi = 0; wi < WM; ++wi)
-            {
-                const int a_row_base = wr * WARP_M + wi * 16;
-
-                uint32_t A_frag[4];
-                load_ldmatrix_a_m16n8k32(
-                    A_frag,
-                    reinterpret_cast<const int *>(&smem_A[stage][a_row_base * SMEM_STRIDE]),
-                    SMEM_STRIDE / 4,
-                    lane_id);
-
-                const int grow0 = block_m + a_row_base + gid;
-                const int grow1 = grow0 + 8;
-                const float sa0 = (grow0 < M) ? scales_A[grow0 * num_k_blocks_total + kb] : 0.0f;
-                const float sa1 = (grow1 < M) ? scales_A[grow1 * num_k_blocks_total + kb] : 0.0f;
-
-#pragma unroll
-                for (int wj = 0; wj < WN; ++wj)
-                {
-                    const int b_col_base = wc * WARP_N + wj * 8;
-                    const int gc0 = block_n + b_col_base + frag_col(lane_id, 0);
-                    const int gc1 = block_n + b_col_base + frag_col(lane_id, 1);
-                    const float sb0 = (gc0 < N) ? fp16_bits_to_float(smem_scales_B[stage][gc0 - block_n]) : 0.0f;
-                    const float sb1 = (gc1 < N) ? fp16_bits_to_float(smem_scales_B[stage][gc1 - block_n]) : 0.0f;
-
-                    uint32_t B_frag[2];
-                    load_ldmatrix_b_m16n8k32(
-                        B_frag,
-                        reinterpret_cast<const int *>(&smem_B[stage][b_col_base * SMEM_STRIDE]),
-                        SMEM_STRIDE / 4,
-                        lane_id);
-
-                    int32_t D_frag[4] = {0, 0, 0, 0};
-                    mma_m16n8k32_s8(D_frag, A_frag, B_frag);
-
-#pragma unroll
-                    for (int e = 0; e < 4; ++e)
-                    {
-                        const float sa = (e < 2) ? sa0 : sa1;
-                        const float sb = (e & 1) ? sb1 : sb0;
-                        acc[wi][wj][e] += static_cast<float>(D_frag[e]) * sa * sb;
-                    }
-                }
-            }
-        };
-
-        // ── 2-stage async pipeline ──────────────────────────────────
-        load_A_tile(0, kb_begin);
-        load_B_payload_tile(0, kb_begin);
-        cp_async_commit();
-        cp_async_wait<0>();
-        materialize_B_stage(0, kb_begin);
-        __syncthreads();
-
-        for (int ki = 0; ki < num_k_iters; ++ki)
-        {
-            const int stage = ki & 1;
-            const int kb = kb_begin + ki;
-
-            if (ki + 1 < num_k_iters)
-            {
-                load_A_tile(stage ^ 1, kb + 1);
-                load_B_payload_tile(stage ^ 1, kb + 1);
-                cp_async_commit();
-            }
-
-            if (is_interior_tile)
-                compute_k_block_interior(stage, kb);
-            else
-                compute_k_block_border(stage, kb);
-
-            if (ki + 1 < num_k_iters)
-            {
-                cp_async_wait<0>();
-                materialize_B_stage(stage ^ 1, kb + 1);
-                __syncthreads();
-            }
-        }
-
-        const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
-
-        // Two-phase split-K: each z-slice writes to partials at offset
-        // blockIdx.z * M * N. The reduce kernel sums across z-slices.
-        float *__restrict__ C_out = C;
-        if constexpr (SPLIT_K > 1)
-            C_out = C + blockIdx.z * M * N;
-
-#pragma unroll
-        for (int wj = 0; wj < WN; ++wj)
-        {
-            const int tile_n = block_n + wc * WARP_N + wj * 8;
-            const int gc0 = tile_n + frag_col(lane_id, 0);
-            const int gc1 = tile_n + frag_col(lane_id, 1);
-            const bool gc0_valid = gc0 < N;
-            const bool gc1_valid = gc1 < N;
-            const float bias0 = (bias && gc0_valid) ? bias[gc0] : 0.0f;
-            const float bias1 = (bias && gc1_valid) ? bias[gc1] : 0.0f;
-
-#pragma unroll
-            for (int wi = 0; wi < WM; ++wi)
-            {
-                const int tile_m = block_m + wr * WARP_M + wi * 16;
-                const bool interior = (tile_m + 15 < M) && (tile_n + 7 < N);
-
-                if (interior && (simple_epilogue || SPLIT_K > 1))
-                {
-                    const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
-                    const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
-                    const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
-                    const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
-
-                    C_out[out_idx0] = acc[wi][wj][0] * alpha;
-                    C_out[out_idx1] = acc[wi][wj][1] * alpha;
-                    C_out[out_idx2] = acc[wi][wj][2] * alpha;
-                    C_out[out_idx3] = acc[wi][wj][3] * alpha;
-                    continue;
-                }
-
-#pragma unroll
-                for (int e = 0; e < 4; ++e)
-                {
-                    const int gr = tile_m + frag_row(lane_id, e);
-                    const int gc = (e & 1) ? gc1 : gc0;
-
-                    if (gr < M && gc < N)
-                    {
-                        const int out_idx = gr * N + gc;
-                        float val = acc[wi][wj][e] * alpha;
-
-                        if constexpr (SPLIT_K == 1)
-                        {
-                            if (beta != 0.0f && C_existing)
-                                val += beta * C_existing[out_idx];
-                            if (bias)
-                                val += (e & 1) ? bias1 : bias0;
-                        }
-                        C_out[out_idx] = val;
-                    }
-                }
-            }
-        }
-#else
-        (void)A;
-        (void)payload;
-        (void)scales_B;
-        (void)C;
-        (void)scales_A;
-        (void)C_existing;
-        (void)bias;
-        (void)M;
-        (void)N;
-        (void)K;
-        (void)alpha;
-        (void)beta;
-#endif
-    }
-
-    // =========================================================================
     // =========================================================================
     // BK=64 kernel: processes 2 quantized blocks per K-tile iteration.
     // Halves the number of K-loop iterations, halving barrier and decode
@@ -711,6 +313,8 @@ namespace
         int K,
         float alpha,
         float beta,
+        int serial_m1_k_partitions,
+        int serial_m1_uses_ordered_reducer,
         float *__restrict__ tmp_fixup)
     {
 #if __CUDA_ARCH__ >= 800
@@ -798,15 +402,52 @@ namespace
         [[maybe_unused]] __shared__ uint16_t smem_iq1m_qh[STAGES_][IS_IQ1_M ? 2 * BN : 1];
 
         float acc[WM][WN][4];
-        auto zero_acc = [&]() __attribute__((always_inline))
+        float serial_acc[WM][WN][4];
+
+        /**
+         * Fold a completed K partition with the same ascending FP32 reducer
+         * used by public M=1 KPAR decode.
+         *
+         * The tensor-core CTA still owns all K work for several rows, so this
+         * adds no global partial buffer or extra launch. It merely preserves
+         * the serial policy's parenthesization in private registers.
+         */
+        auto commit_serial_m1_partition =
+            [&](int completed_block) __attribute__((always_inline))
         {
+            if constexpr (STREAM_K || SPLIT_K != 1)
+                return;
+            if (!serial_m1_uses_ordered_reducer)
+                return;
+
+            const int blocks_per_partition =
+                (num_q40_blocks + serial_m1_k_partitions - 1) /
+                serial_m1_k_partitions;
+            const bool partition_complete =
+                completed_block == num_q40_blocks ||
+                (completed_block % blocks_per_partition) == 0;
+            if (!partition_complete)
+                return;
+
 #pragma unroll
             for (int i = 0; i < WM; ++i)
 #pragma unroll
                 for (int j = 0; j < WN; ++j)
 #pragma unroll
                     for (int e = 0; e < 4; ++e)
+                    {
+                        /*
+                         * Serial KPAR scales every partition before reducing
+                         * it. Applying alpha after the fold is observably
+                         * different for non-unit alpha.
+                         */
+                        const float partial =
+                            __fmul_rn(alpha, acc[i][j][e]);
+                        serial_acc[i][j][e] = __fadd_rn(
+                            serial_acc[i][j][e],
+                            partial);
                         acc[i][j][e] = 0.0f;
+                    }
         };
 
         // Load A tile: BM × BK64 bytes via 16-byte async copies
@@ -942,9 +583,15 @@ namespace
                     if constexpr (IS_IQ1_M)
                         smem_iq1m_qh[stage][2 * col + scale_slot] = qh_packed;
                 }
-                else if (gcol < N)
+                else
                 {
-                    // K-tail or out-of-bounds block: zero-fill this half
+                    /*
+                     * `ldmatrix` fetches a complete physical fragment even when
+                     * only one semantic output column remains. Every invalid
+                     * column must therefore be initialized. Leaving gcol>=N
+                     * untouched let stale shared-memory bytes participate in
+                     * the valid border-column MMA result.
+                     */
                     *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(0, 0, 0, 0);
                     *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(0, 0, 0, 0);
                     smem_scales_B[stage][2 * col + scale_slot] = uint16_t{0};
@@ -955,7 +602,6 @@ namespace
                     if constexpr (IS_IQ1_M)
                         smem_iq1m_qh[stage][2 * col + scale_slot] = 0;
                 }
-                // gcol >= N: no smem write needed (border tiles use compute_k_tile_border)
             }
             else
             {
@@ -1222,30 +868,37 @@ namespace
                     sa_pre[wi][1] = smem_sa[stage][(local_row0 + 8) * 2 + half];
                 }
 
-                // Pre-load ALL B scales for this half into registers
-                float sb_pre[WN][2];
-                [[maybe_unused]] float mb_pre[WN][2];      // min_B (asymmetric) or scale_hi (dual-scale)
-                [[maybe_unused]] float emin_lo_pre[WN][2]; // Q2_K: emins lo half
-                [[maybe_unused]] float emin_hi_pre[WN][2]; // Q2_K: emins hi half
+                /*
+                 * Preserve the exact FP16 metadata bits until the shared
+                 * decode-equivalent contribution helper consumes them. Earlier
+                 * versions expanded these values and then re-expressed every
+                 * format's FP32 formula locally, allowing the tensor-core path
+                 * to acquire a different contraction tree from serial DP4A.
+                 */
+                uint16_t scale_bits_pre[WN][2];
+                [[maybe_unused]] uint16_t secondary_bits_pre[WN][2];
+                [[maybe_unused]] uint32_t emin_bits_pre[WN][2];
 #pragma unroll
                 for (int wj = 0; wj < WN; ++wj)
                 {
                     const int b_col_base = wc * WARP_N + wj * 8;
-                    sb_pre[wj][0] = fp16_bits_to_float(smem_scales_B[stage][2 * (b_col_base + frag_col(lane_id, 0)) + scale_slot]);
-                    sb_pre[wj][1] = fp16_bits_to_float(smem_scales_B[stage][2 * (b_col_base + frag_col(lane_id, 1)) + scale_slot]);
+                    scale_bits_pre[wj][0] =
+                        smem_scales_B[stage][2 * (b_col_base + frag_col(lane_id, 0)) + scale_slot];
+                    scale_bits_pre[wj][1] =
+                        smem_scales_B[stage][2 * (b_col_base + frag_col(lane_id, 1)) + scale_slot];
                     if constexpr (NEEDS_MINS)
                     {
-                        mb_pre[wj][0] = fp16_bits_to_float(smem_mins_B[stage][2 * (b_col_base + frag_col(lane_id, 0)) + scale_slot]);
-                        mb_pre[wj][1] = fp16_bits_to_float(smem_mins_B[stage][2 * (b_col_base + frag_col(lane_id, 1)) + scale_slot]);
+                        secondary_bits_pre[wj][0] =
+                            smem_mins_B[stage][2 * (b_col_base + frag_col(lane_id, 0)) + scale_slot];
+                        secondary_bits_pre[wj][1] =
+                            smem_mins_B[stage][2 * (b_col_base + frag_col(lane_id, 1)) + scale_slot];
                     }
                     if constexpr (IS_DUAL_SCALE_ASYM)
                     {
-                        const uint32_t em_c0 = smem_emins_B[stage][2 * (b_col_base + frag_col(lane_id, 0)) + scale_slot];
-                        const uint32_t em_c1 = smem_emins_B[stage][2 * (b_col_base + frag_col(lane_id, 1)) + scale_slot];
-                        emin_lo_pre[wj][0] = fp16_bits_to_float(static_cast<uint16_t>(em_c0));
-                        emin_hi_pre[wj][0] = fp16_bits_to_float(static_cast<uint16_t>(em_c0 >> 16));
-                        emin_lo_pre[wj][1] = fp16_bits_to_float(static_cast<uint16_t>(em_c1));
-                        emin_hi_pre[wj][1] = fp16_bits_to_float(static_cast<uint16_t>(em_c1 >> 16));
+                        emin_bits_pre[wj][0] =
+                            smem_emins_B[stage][2 * (b_col_base + frag_col(lane_id, 0)) + scale_slot];
+                        emin_bits_pre[wj][1] =
+                            smem_emins_B[stage][2 * (b_col_base + frag_col(lane_id, 1)) + scale_slot];
                     }
                 }
 
@@ -1253,9 +906,9 @@ namespace
                 // Decouples A ldmatrix from MMA, enabling the restructured
                 // wj→wi loop that loads each B fragment ONCE instead of WM times.
                 uint32_t A_frag_all[WM][4];
-                [[maybe_unused]] float sum_A_row0_all[WM], sum_A_row1_all[WM];
-                [[maybe_unused]] float sum_A_lo_row0_all[WM], sum_A_lo_row1_all[WM];
-                [[maybe_unused]] float sum_A_hi_row0_all[WM], sum_A_hi_row1_all[WM];
+                [[maybe_unused]] int sum_A_row0_all[WM], sum_A_row1_all[WM];
+                [[maybe_unused]] int sum_A_lo_row0_all[WM], sum_A_lo_row1_all[WM];
+                [[maybe_unused]] int sum_A_hi_row0_all[WM], sum_A_hi_row1_all[WM];
                 [[maybe_unused]] int sg0_r0_all[WM], sg1_r0_all[WM], sg2_r0_all[WM], sg3_r0_all[WM];
                 [[maybe_unused]] int sg0_r1_all[WM], sg1_r1_all[WM], sg2_r1_all[WM], sg3_r1_all[WM];
 
@@ -1274,10 +927,10 @@ namespace
                         const int grow1 = grow0 + 8;
                         if (sums_A)
                         {
-                            sum_A_row0_all[wi] = static_cast<float>(
-                                sums_A[static_cast<size_t>(grow0) * num_q40_blocks + kb]);
-                            sum_A_row1_all[wi] = static_cast<float>(
-                                sums_A[static_cast<size_t>(grow1) * num_q40_blocks + kb]);
+                            sum_A_row0_all[wi] =
+                                sums_A[static_cast<size_t>(grow0) * num_q40_blocks + kb];
+                            sum_A_row1_all[wi] =
+                                sums_A[static_cast<size_t>(grow1) * num_q40_blocks + kb];
                         }
                         else
                         {
@@ -1290,8 +943,8 @@ namespace
                                 s0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], s0);
                                 s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
                             }
-                            sum_A_row0_all[wi] = static_cast<float>(s0);
-                            sum_A_row1_all[wi] = static_cast<float>(s1);
+                            sum_A_row0_all[wi] = s0;
+                            sum_A_row1_all[wi] = s1;
                         }
                     }
 
@@ -1312,10 +965,10 @@ namespace
                             shi0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], shi0);
                             shi1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], shi1);
                         }
-                        sum_A_lo_row0_all[wi] = static_cast<float>(slo0);
-                        sum_A_lo_row1_all[wi] = static_cast<float>(slo1);
-                        sum_A_hi_row0_all[wi] = static_cast<float>(shi0);
-                        sum_A_hi_row1_all[wi] = static_cast<float>(shi1);
+                        sum_A_lo_row0_all[wi] = slo0;
+                        sum_A_lo_row1_all[wi] = slo1;
+                        sum_A_hi_row0_all[wi] = shi0;
+                        sum_A_hi_row1_all[wi] = shi1;
                     }
 
                     if constexpr (IS_IQ1_M)
@@ -1365,93 +1018,124 @@ namespace
                         const float sa0 = sa_pre[wi][0];
                         const float sa1 = sa_pre[wi][1];
 
+                        int32_t dot_lo[4] = {0, 0, 0, 0};
+                        int32_t dot_hi[4] = {0, 0, 0, 0};
                         if constexpr (IS_DUAL_SCALE)
                         {
                             const uint32_t B_lo[2] = {B_frag[0], 0u};
                             const uint32_t B_hi[2] = {0u, B_frag[1]};
-                            int32_t D_lo[4] = {0, 0, 0, 0};
-                            int32_t D_hi[4] = {0, 0, 0, 0};
-                            mma_m16n8k32_s8(D_lo, A_frag_all[wi], B_lo);
-                            mma_m16n8k32_s8(D_hi, A_frag_all[wi], B_hi);
-
-                            acc[wi][wj][0] += sa0 * (sb_pre[wj][0] * static_cast<float>(D_lo[0]) + mb_pre[wj][0] * static_cast<float>(D_hi[0]));
-                            acc[wi][wj][1] += sa0 * (sb_pre[wj][1] * static_cast<float>(D_lo[1]) + mb_pre[wj][1] * static_cast<float>(D_hi[1]));
-                            acc[wi][wj][2] += sa1 * (sb_pre[wj][0] * static_cast<float>(D_lo[2]) + mb_pre[wj][0] * static_cast<float>(D_hi[2]));
-                            acc[wi][wj][3] += sa1 * (sb_pre[wj][1] * static_cast<float>(D_lo[3]) + mb_pre[wj][1] * static_cast<float>(D_hi[3]));
-
-                            if constexpr (IS_DUAL_SCALE_ASYM)
-                            {
-                                acc[wi][wj][0] += sa0 * (emin_lo_pre[wj][0] * sum_A_lo_row0_all[wi] + emin_hi_pre[wj][0] * sum_A_hi_row0_all[wi]);
-                                acc[wi][wj][1] += sa0 * (emin_lo_pre[wj][1] * sum_A_lo_row0_all[wi] + emin_hi_pre[wj][1] * sum_A_hi_row0_all[wi]);
-                                acc[wi][wj][2] += sa1 * (emin_lo_pre[wj][0] * sum_A_lo_row1_all[wi] + emin_hi_pre[wj][0] * sum_A_hi_row1_all[wi]);
-                                acc[wi][wj][3] += sa1 * (emin_lo_pre[wj][1] * sum_A_lo_row1_all[wi] + emin_hi_pre[wj][1] * sum_A_hi_row1_all[wi]);
-                            }
-
-                            if constexpr (IS_IQ1_M)
-                            {
-                                constexpr float IQ1S_DELTA_VAL = 0.125f;
-                                const int b_col_base = wc * WARP_N + wj * 8;
-                                const uint16_t qh_c0 = smem_iq1m_qh[stage][2 * (b_col_base + frag_col(lane_id, 0)) + scale_slot];
-                                const uint16_t qh_c1 = smem_iq1m_qh[stage][2 * (b_col_base + frag_col(lane_id, 1)) + scale_slot];
-
-                                auto iq1m_corr = [&](uint16_t qh_packed, float sg0, float sg1, float sg2, float sg3,
-                                                     float s_lo, float s_hi) -> float
-                                {
-                                    const uint8_t qh0 = static_cast<uint8_t>(qh_packed);
-                                    const uint8_t qh1 = static_cast<uint8_t>(qh_packed >> 8);
-                                    const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA_VAL : IQ1S_DELTA_VAL;
-                                    const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA_VAL : IQ1S_DELTA_VAL;
-                                    const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA_VAL : IQ1S_DELTA_VAL;
-                                    const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA_VAL : IQ1S_DELTA_VAL;
-                                    return (d0 * sg0 + d1 * sg1) * s_lo + (d2 * sg2 + d3 * sg3) * s_hi;
-                                };
-
-                                acc[wi][wj][0] += sa0 * iq1m_corr(qh_c0,
-                                                                  static_cast<float>(sg0_r0_all[wi]), static_cast<float>(sg1_r0_all[wi]),
-                                                                  static_cast<float>(sg2_r0_all[wi]), static_cast<float>(sg3_r0_all[wi]),
-                                                                  sb_pre[wj][0], mb_pre[wj][0]);
-                                acc[wi][wj][1] += sa0 * iq1m_corr(qh_c1,
-                                                                  static_cast<float>(sg0_r0_all[wi]), static_cast<float>(sg1_r0_all[wi]),
-                                                                  static_cast<float>(sg2_r0_all[wi]), static_cast<float>(sg3_r0_all[wi]),
-                                                                  sb_pre[wj][1], mb_pre[wj][1]);
-                                acc[wi][wj][2] += sa1 * iq1m_corr(qh_c0,
-                                                                  static_cast<float>(sg0_r1_all[wi]), static_cast<float>(sg1_r1_all[wi]),
-                                                                  static_cast<float>(sg2_r1_all[wi]), static_cast<float>(sg3_r1_all[wi]),
-                                                                  sb_pre[wj][0], mb_pre[wj][0]);
-                                acc[wi][wj][3] += sa1 * iq1m_corr(qh_c1,
-                                                                  static_cast<float>(sg0_r1_all[wi]), static_cast<float>(sg1_r1_all[wi]),
-                                                                  static_cast<float>(sg2_r1_all[wi]), static_cast<float>(sg3_r1_all[wi]),
-                                                                  sb_pre[wj][1], mb_pre[wj][1]);
-                            }
+                            mma_m16n8k32_s8(
+                                dot_lo,
+                                A_frag_all[wi],
+                                B_lo);
+                            mma_m16n8k32_s8(
+                                dot_hi,
+                                A_frag_all[wi],
+                                B_hi);
                         }
                         else
                         {
-                            int32_t D[4] = {0, 0, 0, 0};
-                            mma_m16n8k32_s8(D, A_frag_all[wi], B_frag);
+                            mma_m16n8k32_s8(
+                                dot_lo,
+                                A_frag_all[wi],
+                                B_frag);
+                        }
 
-                            if constexpr (IS_ASYMMETRIC)
-                            {
-                                const float sa0_sum0 = sa0 * sum_A_row0_all[wi];
-                                const float sa1_sum1 = sa1 * sum_A_row1_all[wi];
-                                acc[wi][wj][0] += static_cast<float>(D[0]) * sa0 * sb_pre[wj][0] + sa0_sum0 * mb_pre[wj][0];
-                                acc[wi][wj][1] += static_cast<float>(D[1]) * sa0 * sb_pre[wj][1] + sa0_sum0 * mb_pre[wj][1];
-                                acc[wi][wj][2] += static_cast<float>(D[2]) * sa1 * sb_pre[wj][0] + sa1_sum1 * mb_pre[wj][0];
-                                acc[wi][wj][3] += static_cast<float>(D[3]) * sa1 * sb_pre[wj][1] + sa1_sum1 * mb_pre[wj][1];
-                            }
-                            else
-                            {
-                                const float cs00 = sa0 * sb_pre[wj][0];
-                                const float cs01 = sa0 * sb_pre[wj][1];
-                                const float cs10 = sa1 * sb_pre[wj][0];
-                                const float cs11 = sa1 * sb_pre[wj][1];
-                                acc[wi][wj][0] += static_cast<float>(D[0]) * cs00;
-                                acc[wi][wj][1] += static_cast<float>(D[1]) * cs01;
-                                acc[wi][wj][2] += static_cast<float>(D[2]) * cs10;
-                                acc[wi][wj][3] += static_cast<float>(D[3]) * cs11;
-                            }
+                        const int b_col_base =
+                            wc * WARP_N + wj * 8;
+                        const uint16_t qh_c0 = IS_IQ1_M
+                            ? smem_iq1m_qh[stage][
+                                  2 * (b_col_base +
+                                       frag_col(lane_id, 0)) +
+                                  scale_slot]
+                            : uint16_t{0};
+                        const uint16_t qh_c1 = IS_IQ1_M
+                            ? smem_iq1m_qh[stage][
+                                  2 * (b_col_base +
+                                       frag_col(lane_id, 1)) +
+                                  scale_slot]
+                            : uint16_t{0};
+
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                        {
+                            const int column = e & 1;
+                            const bool first_row = e < 2;
+                            const float activation_scale =
+                                first_row ? sa0 : sa1;
+                            const int activation_sum =
+                                IS_ASYMMETRIC
+                                    ? (first_row
+                                           ? sum_A_row0_all[wi]
+                                           : sum_A_row1_all[wi])
+                                    : 0;
+                            const int activation_sum_lo =
+                                (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
+                                    ? (first_row
+                                           ? sum_A_lo_row0_all[wi]
+                                           : sum_A_lo_row1_all[wi])
+                                    : 0;
+                            const int activation_sum_hi =
+                                (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
+                                    ? (first_row
+                                           ? sum_A_hi_row0_all[wi]
+                                           : sum_A_hi_row1_all[wi])
+                                    : 0;
+                            const uint32_t emin_bits =
+                                IS_DUAL_SCALE_ASYM
+                                    ? emin_bits_pre[wj][column]
+                                    : uint32_t{0};
+                            const uint16_t secondary_bits =
+                                NEEDS_MINS
+                                    ? secondary_bits_pre[wj][column]
+                                    : uint16_t{0};
+                            const uint16_t iq1m_qh =
+                                column ? qh_c1 : qh_c0;
+                            const int subgroup_sum0 = IS_IQ1_M
+                                ? (first_row
+                                       ? sg0_r0_all[wi]
+                                       : sg0_r1_all[wi])
+                                : 0;
+                            const int subgroup_sum1 = IS_IQ1_M
+                                ? (first_row
+                                       ? sg1_r0_all[wi]
+                                       : sg1_r1_all[wi])
+                                : 0;
+                            const int subgroup_sum2 = IS_IQ1_M
+                                ? (first_row
+                                       ? sg2_r0_all[wi]
+                                       : sg2_r1_all[wi])
+                                : 0;
+                            const int subgroup_sum3 = IS_IQ1_M
+                                ? (first_row
+                                       ? sg3_r0_all[wi]
+                                       : sg3_r1_all[wi])
+                                : 0;
+                            const float contribution =
+                                llaminar2::cuda_native_vnni::
+                                    native_vnni_block_contribution_from_reduced_terms_rn<
+                                        CODEBOOK_ID>(
+                                        dot_lo[e],
+                                        dot_hi[e],
+                                        activation_scale,
+                                        scale_bits_pre[wj][column],
+                                        secondary_bits,
+                                        emin_bits,
+                                        activation_sum,
+                                        activation_sum_lo,
+                                        activation_sum_hi,
+                                        iq1m_qh,
+                                        subgroup_sum0,
+                                        subgroup_sum1,
+                                        subgroup_sum2,
+                                        subgroup_sum3);
+                            acc[wi][wj][e] = __fadd_rn(
+                                acc[wi][wj][e],
+                                contribution);
                         }
                     }
                 }
+                commit_serial_m1_partition(kb + 1);
             }
         };
 
@@ -1484,17 +1168,17 @@ namespace
                     const float sa1 = (grow1 < M) ? smem_sa[stage][(local_row0 + 8) * 2 + half] : 0.0f;
 
                     // sum_A for asymmetric correction (border variant with bounds check)
-                    [[maybe_unused]] float sum_A_row0 = 0.0f, sum_A_row1 = 0.0f;
+                    [[maybe_unused]] int sum_A_row0 = 0, sum_A_row1 = 0;
                     if constexpr (IS_ASYMMETRIC)
                     {
                         if (sums_A)
                         {
                             if (grow0 < M)
-                                sum_A_row0 = static_cast<float>(
-                                    sums_A[static_cast<size_t>(grow0) * num_q40_blocks + kb]);
+                                sum_A_row0 =
+                                    sums_A[static_cast<size_t>(grow0) * num_q40_blocks + kb];
                             if (grow1 < M)
-                                sum_A_row1 = static_cast<float>(
-                                    sums_A[static_cast<size_t>(grow1) * num_q40_blocks + kb]);
+                                sum_A_row1 =
+                                    sums_A[static_cast<size_t>(grow1) * num_q40_blocks + kb];
                         }
                         else if (grow0 < M)
                         {
@@ -1503,7 +1187,7 @@ namespace
 #pragma unroll
                             for (int w = 0; w < 8; ++w)
                                 s0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], s0);
-                            sum_A_row0 = static_cast<float>(s0);
+                            sum_A_row0 = s0;
                             if (grow1 < M)
                             {
                                 const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
@@ -1511,7 +1195,7 @@ namespace
 #pragma unroll
                                 for (int w = 0; w < 8; ++w)
                                     s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
-                                sum_A_row1 = static_cast<float>(s1);
+                                sum_A_row1 = s1;
                             }
                         }
                         else if (grow1 < M)
@@ -1521,13 +1205,13 @@ namespace
 #pragma unroll
                             for (int w = 0; w < 8; ++w)
                                 s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
-                            sum_A_row1 = static_cast<float>(s1);
+                            sum_A_row1 = s1;
                         }
                     }
 
                     // Split sums for dual_scale_asym (Q2_K) and IQ1_M
-                    [[maybe_unused]] float sum_A_lo_row0 = 0.0f, sum_A_lo_row1 = 0.0f;
-                    [[maybe_unused]] float sum_A_hi_row0 = 0.0f, sum_A_hi_row1 = 0.0f;
+                    [[maybe_unused]] int sum_A_lo_row0 = 0, sum_A_lo_row1 = 0;
+                    [[maybe_unused]] int sum_A_hi_row0 = 0, sum_A_hi_row1 = 0;
                     if constexpr (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
                     {
                         if (grow0 < M)
@@ -1538,8 +1222,8 @@ namespace
                                 slo = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], slo);
                             for (int w = 4; w < 8; ++w)
                                 shi = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], shi);
-                            sum_A_lo_row0 = static_cast<float>(slo);
-                            sum_A_hi_row0 = static_cast<float>(shi);
+                            sum_A_lo_row0 = slo;
+                            sum_A_hi_row0 = shi;
                         }
                         if (grow1 < M)
                         {
@@ -1549,8 +1233,46 @@ namespace
                                 slo = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], slo);
                             for (int w = 4; w < 8; ++w)
                                 shi = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], shi);
-                            sum_A_lo_row1 = static_cast<float>(slo);
-                            sum_A_hi_row1 = static_cast<float>(shi);
+                            sum_A_lo_row1 = slo;
+                            sum_A_hi_row1 = shi;
+                        }
+                    }
+
+                    [[maybe_unused]] int subgroup_r0[4] = {0, 0, 0, 0};
+                    [[maybe_unused]] int subgroup_r1[4] = {0, 0, 0, 0};
+                    if constexpr (IS_IQ1_M)
+                    {
+                        if (grow0 < M)
+                        {
+                            const int32_t *row0_words =
+                                reinterpret_cast<const int32_t *>(
+                                    &smem_A[stage][
+                                        (a_row_base + gid) *
+                                            SMEM_STRIDE_64 +
+                                        k_offset]);
+#pragma unroll
+                            for (int word = 0; word < 8; ++word)
+                            {
+                                subgroup_r0[word / 2] +=
+                                    llaminar2::cuda_native_vnni::
+                                        sum_packed_i8(row0_words[word]);
+                            }
+                        }
+                        if (grow1 < M)
+                        {
+                            const int32_t *row1_words =
+                                reinterpret_cast<const int32_t *>(
+                                    &smem_A[stage][
+                                        (a_row_base + gid + 8) *
+                                            SMEM_STRIDE_64 +
+                                        k_offset]);
+#pragma unroll
+                            for (int word = 0; word < 8; ++word)
+                            {
+                                subgroup_r1[word / 2] +=
+                                    llaminar2::cuda_native_vnni::
+                                        sum_packed_i8(row1_words[word]);
+                            }
                         }
                     }
 
@@ -1560,23 +1282,36 @@ namespace
                         const int b_col_base = wc * WARP_N + wj * 8;
                         const int lc0 = b_col_base + frag_col(lane_id, 0);
                         const int lc1 = b_col_base + frag_col(lane_id, 1);
-                        const float sb0 = (block_n + lc0 < N)
-                                              ? fp16_bits_to_float(smem_scales_B[stage][2 * lc0 + scale_slot])
-                                              : 0.0f;
-                        const float sb1 = (block_n + lc1 < N)
-                                              ? fp16_bits_to_float(smem_scales_B[stage][2 * lc1 + scale_slot])
-                                              : 0.0f;
-
-                        [[maybe_unused]] float mb0 = 0.0f, mb1 = 0.0f;
-                        if constexpr (NEEDS_MINS)
-                        {
-                            mb0 = (block_n + lc0 < N)
-                                      ? fp16_bits_to_float(smem_mins_B[stage][2 * lc0 + scale_slot])
-                                      : 0.0f;
-                            mb1 = (block_n + lc1 < N)
-                                      ? fp16_bits_to_float(smem_mins_B[stage][2 * lc1 + scale_slot])
-                                      : 0.0f;
-                        }
+                        const bool column0_valid = block_n + lc0 < N;
+                        const bool column1_valid = block_n + lc1 < N;
+                        const uint16_t scale_bits[2] = {
+                            column0_valid
+                                ? smem_scales_B[stage][2 * lc0 + scale_slot]
+                                : uint16_t{0},
+                            column1_valid
+                                ? smem_scales_B[stage][2 * lc1 + scale_slot]
+                                : uint16_t{0}};
+                        const uint16_t secondary_bits[2] = {
+                            NEEDS_MINS && column0_valid
+                                ? smem_mins_B[stage][2 * lc0 + scale_slot]
+                                : uint16_t{0},
+                            NEEDS_MINS && column1_valid
+                                ? smem_mins_B[stage][2 * lc1 + scale_slot]
+                                : uint16_t{0}};
+                        const uint32_t emin_bits[2] = {
+                            IS_DUAL_SCALE_ASYM && column0_valid
+                                ? smem_emins_B[stage][2 * lc0 + scale_slot]
+                                : uint32_t{0},
+                            IS_DUAL_SCALE_ASYM && column1_valid
+                                ? smem_emins_B[stage][2 * lc1 + scale_slot]
+                                : uint32_t{0}};
+                        const uint16_t iq1m_qh[2] = {
+                            IS_IQ1_M && column0_valid
+                                ? smem_iq1m_qh[stage][2 * lc0 + scale_slot]
+                                : uint16_t{0},
+                            IS_IQ1_M && column1_valid
+                                ? smem_iq1m_qh[stage][2 * lc1 + scale_slot]
+                                : uint16_t{0}};
 
                         uint32_t B_frag[2];
                         load_ldmatrix_b_m16n8k32(
@@ -1584,142 +1319,66 @@ namespace
                             reinterpret_cast<const int *>(&smem_B[stage][b_col_base * SMEM_STRIDE_64 + k_offset]),
                             SMEM_STRIDE_64 / 4, lane_id);
 
+                        int32_t dot_lo[4] = {0, 0, 0, 0};
+                        int32_t dot_hi[4] = {0, 0, 0, 0};
                         if constexpr (IS_DUAL_SCALE)
                         {
                             const uint32_t B_lo[2] = {B_frag[0], 0u};
                             const uint32_t B_hi[2] = {0u, B_frag[1]};
-                            int32_t D_lo[4] = {0, 0, 0, 0};
-                            int32_t D_hi[4] = {0, 0, 0, 0};
-                            mma_m16n8k32_s8(D_lo, A_frag, B_lo);
-                            mma_m16n8k32_s8(D_hi, A_frag, B_hi);
-
-#pragma unroll
-                            for (int e = 0; e < 4; ++e)
-                            {
-                                const float sa = (e < 2) ? sa0 : sa1;
-                                const float sb = (e & 1) ? sb1 : sb0; // scale_lo
-                                const float mb = (e & 1) ? mb1 : mb0; // scale_hi
-                                acc[wi][wj][e] += sa * (sb * static_cast<float>(D_lo[e]) + mb * static_cast<float>(D_hi[e]));
-                            }
-
-                            if constexpr (IS_DUAL_SCALE_ASYM)
-                            {
-                                [[maybe_unused]] float emlo0 = 0.0f, emhi0 = 0.0f, emlo1 = 0.0f, emhi1 = 0.0f;
-                                if (block_n + lc0 < N)
-                                {
-                                    const uint32_t em = smem_emins_B[stage][2 * lc0 + scale_slot];
-                                    emlo0 = fp16_bits_to_float(static_cast<uint16_t>(em));
-                                    emhi0 = fp16_bits_to_float(static_cast<uint16_t>(em >> 16));
-                                }
-                                if (block_n + lc1 < N)
-                                {
-                                    const uint32_t em = smem_emins_B[stage][2 * lc1 + scale_slot];
-                                    emlo1 = fp16_bits_to_float(static_cast<uint16_t>(em));
-                                    emhi1 = fp16_bits_to_float(static_cast<uint16_t>(em >> 16));
-                                }
-#pragma unroll
-                                for (int e = 0; e < 4; ++e)
-                                {
-                                    const float sa = (e < 2) ? sa0 : sa1;
-                                    const float elo = (e & 1) ? emlo1 : emlo0;
-                                    const float ehi = (e & 1) ? emhi1 : emhi0;
-                                    const float slo = (e < 2) ? sum_A_lo_row0 : sum_A_lo_row1;
-                                    const float shi = (e < 2) ? sum_A_hi_row0 : sum_A_hi_row1;
-                                    acc[wi][wj][e] += sa * (elo * slo + ehi * shi);
-                                }
-                            }
-
-                            if constexpr (IS_IQ1_M)
-                            {
-                                constexpr float IQ1S_DELTA_VAL = 0.125f;
-                                // Sub-group sums: 4 groups of 8 A-elements each (bounds-checked)
-                                int sg0_r0b = 0, sg1_r0b = 0, sg2_r0b = 0, sg3_r0b = 0;
-                                int sg0_r1b = 0, sg1_r1b = 0, sg2_r1b = 0, sg3_r1b = 0;
-                                if (grow0 < M)
-                                {
-                                    const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
-                                    for (int w = 0; w < 2; ++w)
-                                        sg0_r0b += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
-                                    for (int w = 2; w < 4; ++w)
-                                        sg1_r0b += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
-                                    for (int w = 4; w < 6; ++w)
-                                        sg2_r0b += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
-                                    for (int w = 6; w < 8; ++w)
-                                        sg3_r0b += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
-                                }
-                                if (grow1 < M)
-                                {
-                                    const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
-                                    for (int w = 0; w < 2; ++w)
-                                        sg0_r1b += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
-                                    for (int w = 2; w < 4; ++w)
-                                        sg1_r1b += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
-                                    for (int w = 4; w < 6; ++w)
-                                        sg2_r1b += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
-                                    for (int w = 6; w < 8; ++w)
-                                        sg3_r1b += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
-                                }
-
-                                const uint16_t qh_c0 = (block_n + lc0 < N) ? smem_iq1m_qh[stage][2 * lc0 + scale_slot] : 0;
-                                const uint16_t qh_c1 = (block_n + lc1 < N) ? smem_iq1m_qh[stage][2 * lc1 + scale_slot] : 0;
-
-                                auto iq1m_corr = [&](uint16_t qh_packed, float s0, float s1, float s2, float s3,
-                                                     float s_lo, float s_hi) -> float
-                                {
-                                    const uint8_t qh0 = static_cast<uint8_t>(qh_packed);
-                                    const uint8_t qh1 = static_cast<uint8_t>(qh_packed >> 8);
-                                    const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA_VAL : IQ1S_DELTA_VAL;
-                                    const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA_VAL : IQ1S_DELTA_VAL;
-                                    const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA_VAL : IQ1S_DELTA_VAL;
-                                    const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA_VAL : IQ1S_DELTA_VAL;
-                                    return (d0 * s0 + d1 * s1) * s_lo + (d2 * s2 + d3 * s3) * s_hi;
-                                };
-
-#pragma unroll
-                                for (int e = 0; e < 4; ++e)
-                                {
-                                    const float sa = (e < 2) ? sa0 : sa1;
-                                    const uint16_t qh = (e & 1) ? qh_c1 : qh_c0;
-                                    const float sg0v = static_cast<float>((e < 2) ? sg0_r0b : sg0_r1b);
-                                    const float sg1v = static_cast<float>((e < 2) ? sg1_r0b : sg1_r1b);
-                                    const float sg2v = static_cast<float>((e < 2) ? sg2_r0b : sg2_r1b);
-                                    const float sg3v = static_cast<float>((e < 2) ? sg3_r0b : sg3_r1b);
-                                    const float sbl = (e & 1) ? sb1 : sb0;
-                                    const float sbh = (e & 1) ? mb1 : mb0;
-                                    acc[wi][wj][e] += sa * iq1m_corr(qh, sg0v, sg1v, sg2v, sg3v, sbl, sbh);
-                                }
-                            }
+                            mma_m16n8k32_s8(dot_lo, A_frag, B_lo);
+                            mma_m16n8k32_s8(dot_hi, A_frag, B_hi);
                         }
                         else
                         {
-                            int32_t D[4] = {0, 0, 0, 0};
-                            mma_m16n8k32_s8(D, A_frag, B_frag);
+                            mma_m16n8k32_s8(dot_lo, A_frag, B_frag);
+                        }
 
-                            if constexpr (IS_ASYMMETRIC)
-                            {
 #pragma unroll
-                                for (int e = 0; e < 4; ++e)
-                                {
-                                    const float sa = (e < 2) ? sa0 : sa1;
-                                    const float sb = (e & 1) ? sb1 : sb0;
-                                    const float mb = (e & 1) ? mb1 : mb0;
-                                    const float sum_A = (e < 2) ? sum_A_row0 : sum_A_row1;
-                                    acc[wi][wj][e] += static_cast<float>(D[e]) * sa * sb + sa * mb * sum_A;
-                                }
-                            }
-                            else
-                            {
-#pragma unroll
-                                for (int e = 0; e < 4; ++e)
-                                {
-                                    const float sa = (e < 2) ? sa0 : sa1;
-                                    const float sb = (e & 1) ? sb1 : sb0;
-                                    acc[wi][wj][e] += static_cast<float>(D[e]) * sa * sb;
-                                }
-                            }
+                        for (int e = 0; e < 4; ++e)
+                        {
+                            const int column = e & 1;
+                            const bool first_row = e < 2;
+                            const float activation_scale =
+                                first_row ? sa0 : sa1;
+                            const int *subgroup_sums =
+                                first_row ? subgroup_r0 : subgroup_r1;
+                            const float contribution =
+                                llaminar2::cuda_native_vnni::
+                                    native_vnni_block_contribution_from_reduced_terms_rn<
+                                        CODEBOOK_ID>(
+                                        dot_lo[e],
+                                        dot_hi[e],
+                                        activation_scale,
+                                        scale_bits[column],
+                                        secondary_bits[column],
+                                        emin_bits[column],
+                                        IS_ASYMMETRIC
+                                            ? (first_row
+                                                   ? sum_A_row0
+                                                   : sum_A_row1)
+                                            : 0,
+                                        (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
+                                            ? (first_row
+                                                   ? sum_A_lo_row0
+                                                   : sum_A_lo_row1)
+                                            : 0,
+                                        (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
+                                            ? (first_row
+                                                   ? sum_A_hi_row0
+                                                   : sum_A_hi_row1)
+                                            : 0,
+                                        iq1m_qh[column],
+                                        IS_IQ1_M ? subgroup_sums[0] : 0,
+                                        IS_IQ1_M ? subgroup_sums[1] : 0,
+                                        IS_IQ1_M ? subgroup_sums[2] : 0,
+                                        IS_IQ1_M ? subgroup_sums[3] : 0);
+                            acc[wi][wj][e] = __fadd_rn(
+                                acc[wi][wj][e],
+                                contribution);
                         }
                     }
                 }
+                commit_serial_m1_partition(kb + 1);
             }
         };
 
@@ -1779,7 +1438,10 @@ namespace
                         for (int j = 0; j < WN; ++j)
 #pragma unroll
                             for (int e = 0; e < 4; ++e)
+                            {
                                 acc[i][j][e] = 0.0f;
+                                serial_acc[i][j][e] = 0.0f;
+                            }
 
                     // ── Inline k-loop (run_pipeline) ──
                     if constexpr (STAGES_ == 1)
@@ -1947,7 +1609,10 @@ namespace
                 for (int j = 0; j < WN; ++j)
 #pragma unroll
                     for (int e = 0; e < 4; ++e)
+                    {
                         acc[i][j][e] = 0.0f;
+                        serial_acc[i][j][e] = 0.0f;
+                    }
 
             if constexpr (STAGES_ == 1)
             {
@@ -2008,6 +1673,22 @@ namespace
                 }
             }
 
+            float output_alpha = alpha;
+            if constexpr (SPLIT_K == 1)
+            {
+                if (serial_m1_uses_ordered_reducer)
+                {
+#pragma unroll
+                    for (int i = 0; i < WM; ++i)
+#pragma unroll
+                        for (int j = 0; j < WN; ++j)
+#pragma unroll
+                            for (int e = 0; e < 4; ++e)
+                                acc[i][j][e] = serial_acc[i][j][e];
+                    output_alpha = 1.0f;
+                }
+            }
+
             // Epilogue: write accumulators to global memory
             const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
 
@@ -2043,10 +1724,10 @@ namespace
                         const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
 
                         // Direct stores: for SPLIT_K > 1, beta/bias handled by reduce kernel
-                        C_out[out_idx0] = acc[wi][wj][0] * alpha;
-                        C_out[out_idx1] = acc[wi][wj][1] * alpha;
-                        C_out[out_idx2] = acc[wi][wj][2] * alpha;
-                        C_out[out_idx3] = acc[wi][wj][3] * alpha;
+                        C_out[out_idx0] = acc[wi][wj][0] * output_alpha;
+                        C_out[out_idx1] = acc[wi][wj][1] * output_alpha;
+                        C_out[out_idx2] = acc[wi][wj][2] * output_alpha;
+                        C_out[out_idx3] = acc[wi][wj][3] * output_alpha;
                         continue;
                     }
 
@@ -2059,7 +1740,7 @@ namespace
                         if (gr < M && gc < N)
                         {
                             const int out_idx = gr * N + gc;
-                            float val = acc[wi][wj][e] * alpha;
+                            float val = acc[wi][wj][e] * output_alpha;
 
                             if constexpr (SPLIT_K == 1)
                             {
@@ -2089,6 +1770,8 @@ namespace
         (void)K;
         (void)alpha;
         (void)beta;
+        (void)serial_m1_k_partitions;
+        (void)serial_m1_uses_ordered_reducer;
         (void)tmp_fixup;
 #endif
     }
@@ -2118,6 +1801,7 @@ namespace
     constexpr int BK128_STRIDE = BK128 + BK128_PAD; // 144, 16-byte aligned
 
     template <int BM, int BN, int WARPS_M, int WARPS_N, int SPLIT_K = 1,
+              bool ORDERED_M1 = false,
               int BLOCK_SIZE_ = WARPS_M * WARPS_N * 32,
               int MIN_BLOCKS_HINT = (BLOCK_SIZE_ >= 512 ? 1 : 2)>
     __global__ __launch_bounds__(BLOCK_SIZE_, MIN_BLOCKS_HINT) void nativeVnniTC_BK256(
@@ -2132,7 +1816,8 @@ namespace
         int N,
         int K,
         float alpha,
-        float beta)
+        float beta,
+        int serial_m1_k_partitions)
     {
 #if __CUDA_ARCH__ >= 800
         constexpr int NUM_WARPS = WARPS_M * WARPS_N;
@@ -2146,6 +1831,9 @@ namespace
 
         static_assert(BM % WARPS_M == 0 && BN % WARPS_N == 0);
         static_assert(WARP_M % 16 == 0 && WARP_N % 8 == 0);
+        static_assert(
+            !ORDERED_M1 || SPLIT_K == 1,
+            "Ordered public-M1 emulation owns the complete K reduction");
 
         const int warp_id = threadIdx.x >> 5;
         const int lane_id = threadIdx.x & 31;
@@ -2182,13 +1870,18 @@ namespace
         float *smem_sa = reinterpret_cast<float *>(smem_raw + SA_ALIGNED);
 
         float acc[WM][WN][4];
+        float serial_acc[WM][WN][4];
 #pragma unroll
         for (int i = 0; i < WM; ++i)
 #pragma unroll
             for (int j = 0; j < WN; ++j)
 #pragma unroll
                 for (int e = 0; e < 4; ++e)
+                {
                     acc[i][j][e] = 0.0f;
+                    if constexpr (ORDERED_M1)
+                        serial_acc[i][j][e] = 0.0f;
+                }
 
         // Load A: BM × 128 bytes (one K-half) via 16-byte async copies
         auto load_A_half = [&](int outer_kt, int half_idx) __attribute__((always_inline))
@@ -2285,73 +1978,277 @@ namespace
 #pragma unroll
             for (int hi = 0; hi < 2; ++hi)
             {
-                // Pre-load ALL A MMA fragments for this half (4 k-subtiles × WM rows).
-                // This decouples A ldmatrix loads from MMA, enabling the compiler
-                // to pipeline them. The restructured loop iterates wj in the middle,
-                // loading each B fragment once per (k, wj) instead of WM times.
-                uint32_t A_frag_all[WM][4][4];
-                float sa_all[WM][2][4];
-#pragma unroll
-                for (int k = 0; k < 4; ++k)
+                if constexpr (!ORDERED_M1)
                 {
-                    const int k_offset = k * 32;
-                    const int scale_idx = hi * 4 + k;
+                    /*
+                     * Ordinary prefill preloads all four A fragments for this
+                     * half. That maximizes instruction-level parallelism when
+                     * no second reducer accumulator is live.
+                     */
+                    uint32_t A_frag_all[WM][4][4];
+                    float sa_all[WM][2][4];
 #pragma unroll
-                    for (int wi = 0; wi < WM; ++wi)
+                    for (int k = 0; k < 4; ++k)
                     {
-                        const int a_row_base = wr * WARP_M + wi * 16;
-                        load_ldmatrix_a_m16n8k32(
-                            A_frag_all[wi][k],
-                            reinterpret_cast<const int *>(&smem_A[a_row_base * BK128_STRIDE + k_offset]),
-                            BK128_STRIDE / 4, lane_id);
-
-                        const int local_row0 = a_row_base + gid;
-                        sa_all[wi][0][k] = smem_sa[local_row0 * 8 + scale_idx];
-                        sa_all[wi][1][k] = smem_sa[(local_row0 + 8) * 8 + scale_idx];
-                    }
-                }
-
-                // Compute: k (outer) → wj (middle, loads B) → wi (inner, reuses pre-loaded A)
-#pragma unroll
-                for (int k = 0; k < 4; ++k)
-                {
-                    const int b_k_offset = hi * 128 + k * 32;
-                    const int scale_idx_b = hi * 4 + k;
-
-                    float sb_pre[WN][2];
-#pragma unroll
-                    for (int wj = 0; wj < WN; ++wj)
-                    {
-                        const int b_col_base = wc * WARP_N + wj * 8;
-                        sb_pre[wj][0] = fp16_bits_to_float(
-                            smem_scales_B[scale_idx_b * BN + b_col_base + frag_col(lane_id, 0)]);
-                        sb_pre[wj][1] = fp16_bits_to_float(
-                            smem_scales_B[scale_idx_b * BN + b_col_base + frag_col(lane_id, 1)]);
-                    }
-
-#pragma unroll
-                    for (int wj = 0; wj < WN; ++wj)
-                    {
-                        uint32_t B_frag[2];
-                        load_ldmatrix_b_m16n8k32(
-                            B_frag,
-                            reinterpret_cast<const int *>(&smem_B[(wc * WARP_N + wj * 8) * BK256_STRIDE + b_k_offset]),
-                            BK256_STRIDE / 4, lane_id);
-
+                        const int k_offset = k * 32;
+                        const int scale_idx = hi * 4 + k;
 #pragma unroll
                         for (int wi = 0; wi < WM; ++wi)
                         {
-                            int32_t D[4] = {0, 0, 0, 0};
-                            mma_m16n8k32_s8(D, A_frag_all[wi][k], B_frag);
+                            const int a_row_base =
+                                wr * WARP_M + wi * 16;
+                            load_ldmatrix_a_m16n8k32(
+                                A_frag_all[wi][k],
+                                reinterpret_cast<const int *>(
+                                    &smem_A[
+                                        a_row_base * BK128_STRIDE +
+                                        k_offset]),
+                                BK128_STRIDE / 4,
+                                lane_id);
 
-                            const float cs00 = sa_all[wi][0][k] * sb_pre[wj][0];
-                            const float cs01 = sa_all[wi][0][k] * sb_pre[wj][1];
-                            const float cs10 = sa_all[wi][1][k] * sb_pre[wj][0];
-                            const float cs11 = sa_all[wi][1][k] * sb_pre[wj][1];
-                            acc[wi][wj][0] += static_cast<float>(D[0]) * cs00;
-                            acc[wi][wj][1] += static_cast<float>(D[1]) * cs01;
-                            acc[wi][wj][2] += static_cast<float>(D[2]) * cs10;
-                            acc[wi][wj][3] += static_cast<float>(D[3]) * cs11;
+                            const int local_row0 =
+                                a_row_base + gid;
+                            sa_all[wi][0][k] =
+                                smem_sa[
+                                    local_row0 * 8 + scale_idx];
+                            sa_all[wi][1][k] =
+                                smem_sa[
+                                    (local_row0 + 8) * 8 +
+                                    scale_idx];
+                        }
+                    }
+
+#pragma unroll
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        const int b_k_offset =
+                            hi * 128 + k * 32;
+                        const int scale_idx_b = hi * 4 + k;
+
+                        uint16_t scale_bits_pre[WN][2];
+#pragma unroll
+                        for (int wj = 0; wj < WN; ++wj)
+                        {
+                            const int b_col_base =
+                                wc * WARP_N + wj * 8;
+                            scale_bits_pre[wj][0] =
+                                smem_scales_B[
+                                    scale_idx_b * BN +
+                                    b_col_base +
+                                    frag_col(lane_id, 0)];
+                            scale_bits_pre[wj][1] =
+                                smem_scales_B[
+                                    scale_idx_b * BN +
+                                    b_col_base +
+                                    frag_col(lane_id, 1)];
+                        }
+
+#pragma unroll
+                        for (int wj = 0; wj < WN; ++wj)
+                        {
+                            uint32_t B_frag[2];
+                            load_ldmatrix_b_m16n8k32(
+                                B_frag,
+                                reinterpret_cast<const int *>(
+                                    &smem_B[
+                                        (wc * WARP_N + wj * 8) *
+                                            BK256_STRIDE +
+                                        b_k_offset]),
+                                BK256_STRIDE / 4,
+                                lane_id);
+
+#pragma unroll
+                            for (int wi = 0; wi < WM; ++wi)
+                            {
+                                int32_t D[4] = {0, 0, 0, 0};
+                                mma_m16n8k32_s8(
+                                    D,
+                                    A_frag_all[wi][k],
+                                    B_frag);
+
+#pragma unroll
+                                for (int e = 0; e < 4; ++e)
+                                {
+                                    const int column = e & 1;
+                                    const float activation_scale =
+                                        (e < 2)
+                                            ? sa_all[wi][0][k]
+                                            : sa_all[wi][1][k];
+                                    const float contribution =
+                                        llaminar2::
+                                            cuda_native_vnni::
+                                                native_vnni_block_contribution_from_reduced_terms_rn<
+                                                    0>(
+                                                    D[e],
+                                                    0,
+                                                    activation_scale,
+                                                    scale_bits_pre[wj][column],
+                                                    uint16_t{0},
+                                                    uint32_t{0},
+                                                    0,
+                                                    0,
+                                                    0,
+                                                    uint16_t{0},
+                                                    0,
+                                                    0,
+                                                    0,
+                                                    0);
+                                    acc[wi][wj][e] =
+                                        __fadd_rn(
+                                            acc[wi][wj][e],
+                                            contribution);
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    /*
+                     * Ordered M1 equivalence keeps both the current partition
+                     * and ascending reducer totals live. Load only one
+                     * 32-value A fragment per row at a time, reducing fragment
+                     * liveness from 32 registers to eight for this tile
+                     * geometry. B still loads once per (K block, output
+                     * fragment) and is reused by every local M fragment.
+                     */
+                    const int blocks_per_partition =
+                        (num_q40_blocks +
+                         serial_m1_k_partitions - 1) /
+                        serial_m1_k_partitions;
+#pragma unroll
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        const int completed_block =
+                            ot * 8 + hi * 4 + k + 1;
+                        if (completed_block > num_q40_blocks)
+                            break;
+
+                        const int k_offset = k * 32;
+                        const int b_k_offset =
+                            hi * 128 + k * 32;
+                        const int scale_idx = hi * 4 + k;
+
+                        uint32_t A_frag[WM][4];
+                        float sa[WM][2];
+#pragma unroll
+                        for (int wi = 0; wi < WM; ++wi)
+                        {
+                            const int a_row_base =
+                                wr * WARP_M + wi * 16;
+                            load_ldmatrix_a_m16n8k32(
+                                A_frag[wi],
+                                reinterpret_cast<const int *>(
+                                    &smem_A[
+                                        a_row_base * BK128_STRIDE +
+                                        k_offset]),
+                                BK128_STRIDE / 4,
+                                lane_id);
+                            const int local_row0 =
+                                a_row_base + gid;
+                            sa[wi][0] =
+                                smem_sa[
+                                    local_row0 * 8 + scale_idx];
+                            sa[wi][1] =
+                                smem_sa[
+                                    (local_row0 + 8) * 8 +
+                                    scale_idx];
+                        }
+
+#pragma unroll
+                        for (int wj = 0; wj < WN; ++wj)
+                        {
+                            const int b_col_base =
+                                wc * WARP_N + wj * 8;
+                            const uint16_t scale_bits[2] = {
+                                smem_scales_B[
+                                    scale_idx * BN +
+                                    b_col_base +
+                                    frag_col(lane_id, 0)],
+                                smem_scales_B[
+                                    scale_idx * BN +
+                                    b_col_base +
+                                    frag_col(lane_id, 1)]};
+                            uint32_t B_frag[2];
+                            load_ldmatrix_b_m16n8k32(
+                                B_frag,
+                                reinterpret_cast<const int *>(
+                                    &smem_B[
+                                        b_col_base *
+                                            BK256_STRIDE +
+                                        b_k_offset]),
+                                BK256_STRIDE / 4,
+                                lane_id);
+
+#pragma unroll
+                            for (int wi = 0; wi < WM; ++wi)
+                            {
+                                int32_t D[4] = {0, 0, 0, 0};
+                                mma_m16n8k32_s8(
+                                    D,
+                                    A_frag[wi],
+                                    B_frag);
+#pragma unroll
+                                for (int e = 0; e < 4; ++e)
+                                {
+                                    const int column = e & 1;
+                                    const float contribution =
+                                        llaminar2::
+                                            cuda_native_vnni::
+                                                native_vnni_block_contribution_from_reduced_terms_rn<
+                                                    0>(
+                                                    D[e],
+                                                    0,
+                                                    (e < 2)
+                                                        ? sa[wi][0]
+                                                        : sa[wi][1],
+                                                    scale_bits[column],
+                                                    uint16_t{0},
+                                                    uint32_t{0},
+                                                    0,
+                                                    0,
+                                                    0,
+                                                    uint16_t{0},
+                                                    0,
+                                                    0,
+                                                    0,
+                                                    0);
+                                    acc[wi][wj][e] =
+                                        __fadd_rn(
+                                            acc[wi][wj][e],
+                                            contribution);
+                                }
+                            }
+                        }
+
+                        const bool partition_complete =
+                            completed_block ==
+                                num_q40_blocks ||
+                            (completed_block %
+                             blocks_per_partition) == 0;
+                        if (partition_complete)
+                        {
+#pragma unroll
+                            for (int wi = 0; wi < WM; ++wi)
+#pragma unroll
+                                for (int wj = 0;
+                                     wj < WN;
+                                     ++wj)
+#pragma unroll
+                                    for (int e = 0;
+                                         e < 4;
+                                         ++e)
+                                    {
+                                        const float partial =
+                                            __fmul_rn(
+                                                alpha,
+                                                acc[wi][wj][e]);
+                                        serial_acc[wi][wj][e] =
+                                            __fadd_rn(
+                                                serial_acc[wi][wj][e],
+                                                partial);
+                                        acc[wi][wj][e] = 0.0f;
+                                    }
                         }
                     }
                 }
@@ -2373,6 +2270,19 @@ namespace
         }
 
         // Epilogue: write accumulators to global memory
+        if constexpr (ORDERED_M1)
+        {
+#pragma unroll
+            for (int wi = 0; wi < WM; ++wi)
+#pragma unroll
+                for (int wj = 0; wj < WN; ++wj)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                        acc[wi][wj][e] =
+                            serial_acc[wi][wj][e];
+        }
+        const float output_alpha =
+            ORDERED_M1 ? 1.0f : alpha;
         const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
 
         // Two-phase split-K: each z-slice writes to partials at offset
@@ -2405,10 +2315,14 @@ namespace
                     const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
                     const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
 
-                    C_out[out_idx0] = acc[wi][wj][0] * alpha;
-                    C_out[out_idx1] = acc[wi][wj][1] * alpha;
-                    C_out[out_idx2] = acc[wi][wj][2] * alpha;
-                    C_out[out_idx3] = acc[wi][wj][3] * alpha;
+                    C_out[out_idx0] =
+                        __fmul_rn(acc[wi][wj][0], output_alpha);
+                    C_out[out_idx1] =
+                        __fmul_rn(acc[wi][wj][1], output_alpha);
+                    C_out[out_idx2] =
+                        __fmul_rn(acc[wi][wj][2], output_alpha);
+                    C_out[out_idx3] =
+                        __fmul_rn(acc[wi][wj][3], output_alpha);
                     continue;
                 }
 
@@ -2421,7 +2335,8 @@ namespace
                     if (gr < M && gc < N)
                     {
                         const int out_idx = gr * N + gc;
-                        float val = acc[wi][wj][e] * alpha;
+                        float val =
+                            __fmul_rn(acc[wi][wj][e], output_alpha);
 
                         if constexpr (SPLIT_K == 1)
                         {
@@ -2448,6 +2363,7 @@ namespace
         (void)K;
         (void)alpha;
         (void)beta;
+        (void)serial_m1_k_partitions;
 #endif
     }
 
@@ -2465,12 +2381,10 @@ namespace
         return llaminar2::debugEnv().gemm.cuda_force_prefill_split_k;
     }();
 
-    // Deterministic mode: disables stream-K and caps BK64 split-K to 1 on
-    // shapes where split-K rounding drift is known to affect parity.
-    // BK256 stays enabled: on the FFN-down parity shapes we measured, BK256
-    // split-K is bitwise identical to split_k=1 while preserving more of the
-    // native path's throughput.
-    // Set via LLAMINAR_DETERMINISTIC=1 env var.
+    // Deterministic mode remains a diagnostic control for explicitly forced
+    // candidates. Production auto dispatch is batch invariant unconditionally:
+    // it never needs this switch to reject atomic or differently parenthesized
+    // K reductions.
     static bool g_deterministic_mode = []()
     {
         return llaminar2::debugEnv().gemm.deterministic;
@@ -2514,49 +2428,64 @@ namespace
     }
 
     // ─── Asymmetric-format heuristic ──────────────────────────────────
-    // Sweep data (Q4_1, Q5_1, IQ1_S across 7B shapes, M=64..512) shows:
-    //   - T64x128_w2x2 sk=1 wins all well-filling shapes for Q4_1
-    //   - Split-K critical for underfilled shapes (M=64, small N)
-    //   - T128x128 and larger warp configs consistently lose due to
-    //     register spilling from min-correction instructions
-    //   - Q5_1/IQ1_S have 2 outlier shapes (~20% gap at M=512) where
-    //     w2x4 ILP would help, but fixing those regresses Q4_1, so we
-    //     optimize for Q4_1 (most commonly used asymmetric format)
-    TileChoice choosePrefillTile_Asymmetric(int M, int N, int K, CUDAPrefillContext_ *prefill_ctx)
+    // Broad sweep data (Q4_1, Q5_1, IQ1_S across 7B shapes, M=64..512)
+    // retains w2x2 as the conservative general rule. Exact production
+    // geometries may override it only after a byte-gated tile tournament and
+    // an isolated occupancy/spill profile establish a better winner.
+    TileChoice choosePrefillTile_Asymmetric(
+        int M,
+        int N,
+        int K,
+        uint8_t codebook,
+        CUDAPrefillContext_ *prefill_ctx)
     {
         const int SM = querySmCount(prefill_ctx);
-        constexpr int HBK = 128;
-        const int ki = K / HBK;
         const int t64x128 = ((M + 63) / 64) * ((N + 127) / 128);
+
+        /*
+         * Qwen3.6 MoE GDN QKV projection, 128-row graph bucket.
+         *
+         * A 50-sample production-path tournament proved every candidate
+         * byte-identical to the exact-M AUTO oracle. Q4_1 and Q5_1 selected
+         * T64x128_w2x4; IQ1_S selected T64x128_w4x2. On GA102, profiling the
+         * Q4_1 winner reduced registers from 168 to 128 per thread, doubled
+         * theoretical occupancy from 16.67% to 33.33%, raised achieved
+         * occupancy from 13.34% to 26.42%, and retained zero local-memory
+         * spills. Keep this overlay exact instead of extrapolating one measured
+         * geometry over the older all-shape heuristic.
+         */
+        if (M == 128 && N == 8192 && K == 2048)
+        {
+            if (codebook == 5 || codebook == 7)
+                return {TileId::T64x128_w2x4, 1};
+            if (codebook == 16)
+                return {TileId::T64x128_w4x2, 1};
+        }
 
         // Well-filling: enough tiles to saturate SMs → w2x2, no split-K
         if (t64x128 >= SM)
             return {TileId::T64x128_w2x2, 1};
 
-        // Underfilled: use split-K to improve utilization, always w2x2
-        const int target = 3 * SM / 2;
-        int sk = 1;
-        for (int s = 2; s <= 8; s *= 2)
-        {
-            if (ki < s * 7) // min 7 K-iters per partition
-                break;
-            sk = s;
-            if (t64x128 * s >= target)
-                break;
-        }
-        return {TileId::T64x128_w2x2, sk};
+        /*
+         * Underfilled shapes still retain one ordered K walk per output row.
+         * Split-K partials cannot reconstruct the serial FP32 addition sequence:
+         * reducing two rounded partition sums changes parenthesization. Recover
+         * occupancy with output geometry, not a mathematically different K tree.
+         */
+        return {TileId::T64x128_w2x2, 1};
     }
 
     // ─── Sweep-derived tile + split_k heuristic ───────────────────────
-    // Fills-first strategy: prefer the largest tile family that fills the
-    // GPU without split_k, only adding split_k when no family fills.
+    // Fills-first strategy: prefer the largest output tile family that fills the
+    // GPU while preserving one canonical, increasing-K reduction per row.
     // Within 64×128, warp config depends on real tile count:
     //   tiles ≥ 112 → w2x2 (more blocks/SM at high tile count)
     //   ki ≤ 7      → w4x2 (small K, 4 warps in M-dim)
     //   otherwise   → w2x4 (default, 8 warps for ILP)
     TileChoice choosePrefillTile(int M, int N, int K,
                                  CUDAPrefillContext_ *prefill_ctx,
-                                 FormatComplexity complexity = FormatComplexity::Simple)
+                                 FormatComplexity complexity = FormatComplexity::Simple,
+                                 uint8_t codebook = 0)
     {
         // Force-tile override for sweep benchmarks
         if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
@@ -2568,7 +2497,8 @@ namespace
         // Asymmetric/dual-scale formats: specialized heuristic biased
         // toward w2x2 due to higher register pressure from min-correction
         if (complexity != FormatComplexity::Simple)
-            return choosePrefillTile_Asymmetric(M, N, K, prefill_ctx);
+            return choosePrefillTile_Asymmetric(
+                M, N, K, codebook, prefill_ctx);
 
         const int SM = querySmCount(prefill_ctx);
         constexpr int HBK = 128; // heuristic block-K unit (analysis granularity)
@@ -2637,100 +2567,53 @@ namespace
             if (ki <= 14 && t64x128 < (13 * SM / 10) && t64 >= 2 * SM)
                 return {TileId::T64x64_w2x2, 1};
 
-            int sk = 1;
-            // Marginal wave fill (< 1.5 waves) + sufficient K → sk=2
-            if (t64x128 < (3 * SM / 2) && ki >= 28)
-                sk = 2;
+            const TileId warp = pick_warp(t64x128, ki);
 
-            TileId warp = pick_warp(t64x128 * sk, ki);
-
-            // 128×128+sk override for very large K at moderate M
+            // 128×128 override for very large K at moderate M.
             if (M >= 256 && ki >= 40 && t128 >= 32 && t64x128 <= (3 * SM / 2))
-                return {TileId::T128x128_w4x2, 2};
+                return {TileId::T128x128_w4x2, 1};
 
-            // 128×128_sk2 when tiles fill and K is very large
+            // Prefer the larger tile when its output grid remains economical.
             if (M >= 128 && ki >= 40 && t128 >= 32 && t64x128 >= (3 * SM / 2))
-            {
-                if (t128 * 2 >= SM)
-                    return {TileId::T128x128_w4x2, 2};
-            }
+                return {TileId::T128x128_w4x2, 1};
 
-            return {warp, sk};
+            return {warp, 1};
         }
 
         // ═══ TIER 3: 64×64 fills ═══
         if (fills_64)
         {
-            // Try upgrading to 64×128 with split_k for large K
+            // A wider output tile can amortize large-K setup without changing
+            // the K reduction tree.
             if (ki >= 14 && t64x128 >= 28)
             {
-                const int target = 3 * SM / 2; // ~1.5 waves
-                int sk = 1;
-                for (int s = 1; s <= 4; s *= 2)
-                {
-                    if (ki < s * 7) // min 7 K-iters per partition
-                        break;
-                    sk = s;
-                    if (t64x128 * s >= target)
-                        break;
-                }
-                TileId warp = pick_warp(t64x128 * sk, ki);
+                const TileId warp = pick_warp(t64x128, ki);
 
-                // Further upgrade: 128×128+sk for very large K
+                // Further upgrade for very large K when a useful output grid
+                // remains available.
                 if (t128 >= 16 && ki >= 40 && M >= 128)
-                {
-                    int sk128 = 1;
-                    for (int s = 1; s <= 8; s *= 2)
-                    {
-                        if (ki < s * 7)
-                            break;
-                        sk128 = s;
-                        if (t128 * s >= SM)
-                            break;
-                    }
-                    if (t128 * sk128 >= (7 * SM / 10))
-                        return {TileId::T128x128_w4x2, sk128};
-                }
+                    return {TileId::T128x128_w4x2, 1};
 
-                return {warp, sk};
+                return {warp, 1};
             }
             return {TileId::T64x64_w2x2, 1};
         }
 
-        // ═══ TIER 4: Nothing fills → split_k required ═══
+        // ═══ TIER 4: Nothing fills → finest useful output tile ═══
         TileId tile;
-        int bm, bn;
         if (t128 >= 16 && ki >= 40 && M >= 128)
         {
             tile = TileId::T128x128_w4x2;
-            bm = 128;
-            bn = 128;
         }
         else if (t64x128 >= 8 && ki >= 8)
         {
             tile = pick_warp(0, ki); // will yield w2x4 or w4x2
-            bm = 64;
-            bn = 128;
         }
         else
         {
             tile = TileId::T64x64_w2x2;
-            bm = 64;
-            bn = 64;
         }
-
-        const int base = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
-        const int target = 3 * SM / 2; // ~1.5 waves
-        int sk = 1;
-        for (int s = 1; s <= 8; s *= 2)
-        {
-            if (base >= 8 && ki < s)
-                break;
-            sk = s;
-            if (base * s >= target)
-                break;
-        }
-        return {tile, sk};
+        return {tile, 1};
     }
 
     bool isAmperePlus(int device_id)
@@ -2747,67 +2630,6 @@ namespace
         cached_result = (prop.major >= 8);
         cached_device = device_id;
         return cached_result;
-    }
-
-    template <int BM, int BN, int WM, int WN, int SPLIT_K = 1, bool SINGLE_PASS_MATERIALIZE = false>
-    bool launchQ40TensorCoreVariant(
-        const int8_t *d_A_int8,
-        const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        float *d_C_fp32,
-        const float *d_scales_A_block,
-        int M,
-        int N,
-        int K,
-        float alpha,
-        float beta,
-        const float *d_C_existing,
-        const float *d_bias,
-        cudaStream_t cuda_stream,
-        CUDAPrefillContext_ *prefill_ctx = nullptr)
-    {
-        const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, SPLIT_K);
-        const dim3 block(WM * WN * 32);
-
-        // Two-phase split-K: allocate partials, pass as C, reduce after
-        float *d_kernel_C = d_C_fp32;
-        if constexpr (SPLIT_K > 1)
-        {
-            const size_t partials_bytes = static_cast<size_t>(SPLIT_K) * M * N * sizeof(float);
-            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes, cuda_stream) : nullptr;
-            if (!partials)
-                return false;
-            d_kernel_C = partials;
-        }
-
-        q40NativeVNNITensorCoreKernel<BM, BN, WM, WN, SPLIT_K, SINGLE_PASS_MATERIALIZE><<<grid, block, 0, cuda_stream>>>(
-            d_A_int8,
-            d_payload,
-            d_scales,
-            d_kernel_C,
-            d_scales_A_block,
-            d_C_existing,
-            d_bias,
-            M,
-            N,
-            K,
-            alpha,
-            beta);
-        if (cudaGetLastError() != cudaSuccess)
-            return false;
-
-        if constexpr (SPLIT_K > 1)
-        {
-            const int total = M * N;
-            const int threads = 256;
-            const int blocks = (total + threads - 1) / threads;
-            splitk_reduce<<<blocks, threads, 0, cuda_stream>>>(
-                d_kernel_C, d_C_fp32, d_C_existing, d_bias,
-                M, N, SPLIT_K, beta);
-            if (cudaGetLastError() != cudaSuccess)
-                return false;
-        }
-        return true;
     }
 
     template <uint8_t CODEBOOK_ID, int BM, int BN, int WM, int WN, int SPLIT_K = 1>
@@ -2828,7 +2650,9 @@ namespace
         const float *d_C_existing,
         const float *d_bias,
         cudaStream_t cuda_stream,
-        CUDAPrefillContext_ *prefill_ctx = nullptr)
+        CUDAPrefillContext_ *prefill_ctx = nullptr,
+        int serial_m1_k_partitions = 1,
+        int serial_m1_uses_ordered_reducer = 0)
     {
         const int num_k_tiles = (K / 32 + 1) / 2; // ceil: handles K%64!=0
         int kt_per_part = num_k_tiles;
@@ -2870,6 +2694,8 @@ namespace
             K,
             alpha,
             beta,
+            serial_m1_k_partitions,
+            serial_m1_uses_ordered_reducer,
             nullptr);
         if (cudaGetLastError() != cudaSuccess)
             return false;
@@ -2889,89 +2715,11 @@ namespace
         return true;
     }
 
-    // Single-buffered BK=64 launch helper (STAGES_=1, higher occupancy target)
-    template <uint8_t CODEBOOK_ID, int BM, int BN, int WM, int WN, int SPLIT_K = 1>
-    bool launchNativeVNNITC_BK64_SB(
-        const int8_t *d_A_int8,
-        const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
-        float *d_C_fp32,
-        const float *d_scales_A_block,
-        const int32_t *d_sums_A_block,
-        int M,
-        int N,
-        int K,
-        float alpha,
-        float beta,
-        const float *d_C_existing,
-        const float *d_bias,
-        cudaStream_t cuda_stream,
-        CUDAPrefillContext_ *prefill_ctx = nullptr)
-    {
-        const int num_k_tiles = (K / 32 + 1) / 2;
-        int kt_per_part = num_k_tiles;
-        if constexpr (SPLIT_K > 1)
-            kt_per_part = (num_k_tiles + SPLIT_K - 1) / SPLIT_K;
-        if (kt_per_part <= 0)
-            return false;
-
-        const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, SPLIT_K);
-        const dim3 block(WM * WN * 32);
-
-        // Two-phase split-K: allocate partials, pass as C, reduce after
-        float *d_kernel_C = d_C_fp32;
-        if constexpr (SPLIT_K > 1)
-        {
-            const size_t partials_bytes = static_cast<size_t>(SPLIT_K) * M * N * sizeof(float);
-            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes, cuda_stream) : nullptr;
-            if (!partials)
-                return false;
-            d_kernel_C = partials;
-        }
-
-        (void)cudaGetLastError();
-
-        // STAGES_=1: single-buffered, half smem, higher occupancy
-        nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN, SPLIT_K, /*STAGES_=*/1><<<grid, block, 0, cuda_stream>>>(
-            d_A_int8,
-            d_payload,
-            d_scales,
-            d_mins,
-            d_emins,
-            d_kernel_C,
-            d_scales_A_block,
-            d_sums_A_block,
-            d_C_existing,
-            d_bias,
-            M,
-            N,
-            K,
-            alpha,
-            beta,
-            nullptr);
-        if (cudaGetLastError() != cudaSuccess)
-            return false;
-
-        if constexpr (SPLIT_K > 1)
-        {
-            const int total = M * N;
-            const int threads = 256;
-            const int blocks = (total + threads - 1) / threads;
-            splitk_reduce<<<blocks, threads, 0, cuda_stream>>>(
-                d_kernel_C, d_C_fp32, d_C_existing, d_bias,
-                M, N, SPLIT_K, beta);
-            if (cudaGetLastError() != cudaSuccess)
-                return false;
-        }
-        return true;
-    }
-
     // =========================================================================
-    // Stream-K force mode: 0 = auto (heuristic), 1 = force ON, -1 = force OFF
-    // Controllable from tests via extern "C" cudaNativeVNNIPrefill_setStreamKMode()
-    // Also controllable via LLAMINAR_STREAM_K env var (0=auto, 1=force, -1=off, 2=two-pass)
+    // Stream-K diagnostic mode: 0/-1 = disabled, 1 = force one-pass,
+    // 2 = force two-pass. Atomic Stream-K is intentionally absent from automatic
+    // production dispatch because its scheduler-dependent reduction cannot meet
+    // the batch-invariant publication contract.
     // =========================================================================
     static int g_stream_k_force_mode = []()
     {
@@ -3063,6 +2811,7 @@ namespace
             nullptr, // d_bias: applied post-hoc below
             M, N, K,
             alpha, 0.0f,
+            1, 0,
             nullptr); // No fixup buffer needed — partials use atomicAdd on C
 
         cudaError_t err = cudaGetLastError();
@@ -3201,6 +2950,7 @@ namespace
             d_bias,
             M, N, K,
             alpha, beta,
+            1, 0,
             fixup_buf);
 
         if (cudaGetLastError() != cudaSuccess)
@@ -3216,70 +2966,23 @@ namespace
     }
 
     // =========================================================================
-    // Stream-K profitability heuristic: determines whether stream-K is likely
-    // to outperform standard tiling for a given GEMM shape.
-    // Stream-K wins when wave-tail inefficiency is significant AND there is
-    // enough total work to amortize the memset + atomicAdd overhead.
+    // Stream-K eligibility is explicit and diagnostic only. Automatic production
+    // dispatch must preserve the canonical increasing-K FP32 reduction.
     // =========================================================================
     bool shouldUseStreamK(int M, int N, int K, int bm, int bn, CUDAPrefillContext_ *prefill_ctx)
     {
-        // Deterministic mode: stream-K uses FP32 atomicAdd, disable completely
+        (void)M;
+        (void)N;
+        (void)K;
+        (void)bm;
+        (void)bn;
+        (void)prefill_ctx;
+
+        // Deterministic mode rejects even an explicitly requested diagnostic.
         if (g_deterministic_mode)
             return false;
 
-        // Respect force mode from test harness
-        if (g_stream_k_force_mode < 0)
-            return false;
-        if (g_stream_k_force_mode > 0)
-            return true;
-
-        // Auto mode: data-driven heuristic from A/B profiling (v2_perf_cuda_streamk_ab).
-        //
-        // The atomicAdd-based stream-K approach has two overheads vs standard:
-        //   1. cudaMemsetAsync to zero C before kernel (~10µs for 7MB)
-        //   2. All writes use atomicAdd instead of direct stores (~2x epilogue cost)
-        //
-        // Stream-K wins when the K-loop compute dominates per-tile time, making
-        // these overheads proportionally small. total_work = tiles × k_tiles
-        // captures this: high total_work means work is spread across many K-iters
-        // and can be redistributed to fill wave tails.
-        //
-        // Profiled results (Qwen2.5-7B, RTX 3090, T128x128, all-atomicAdd):
-        //   Down M=512: tiles=112, k=296, total_work=33152, wave_eff=68.3% → 1.133x ✓
-        //   QKV  M=596: tiles=180, k=56,  total_work=10080, wave_eff=54.9% → 1.070x ✓
-        //   Wo   M=512: tiles=112, k=56,  total_work=6272,  wave_eff=68.3% → 0.959x ✗
-        //   QKV  M=256: tiles=72,  k=56,  total_work=4032,  wave_eff=43.9% → 0.884x ✗
-        //
-        // total_work >= 8000 cleanly separates wins from losses.
-        const int nsm = querySmCount(prefill_ctx);
-        const int total_tiles = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
-
-        // Need at least 1 SM-wave of tiles (otherwise standard is fine)
-        if (total_tiles < nsm)
-            return false;
-
-        // Estimate occupancy: T128x128 (bm≥128) → 2 blocks/SM; T64x128 → 3.
-        // This matches the actual max_blocks_per_sm queried in the launch helper.
-        const int occ = (bm >= 128) ? 2 : 3;
-        const int total_slots = nsm * occ;
-
-        // Compute wave tail efficiency using actual concurrent slot count
-        const float waves = static_cast<float>(total_tiles) / static_cast<float>(total_slots);
-        const float frac = waves - static_cast<float>(static_cast<int>(waves));
-        const float wave_eff = (frac < 0.001f) ? 1.0f : frac;
-
-        // total_work = tiles × k_tiles: measures whether there's enough K-loop
-        // work per tile to amortize the memset + atomicAdd overhead.
-        const int num_k_tiles = (K / 32 + 1) / 2;
-        const long long total_work = static_cast<long long>(total_tiles) * num_k_tiles;
-
-        // Output matrix must fit in L2 cache for atomicAdd to be efficient.
-        // RTX 3090 has 6MB L2; output > 4MB causes DRAM atomicAdd contention.
-        const long long output_bytes = static_cast<long long>(M) * N * sizeof(float);
-        if (output_bytes > 4LL * 1024 * 1024)
-            return false;
-
-        return wave_eff < 0.70f && total_work >= 8000;
+        return g_stream_k_force_mode > 0;
     }
 
     // BK=256 launch helper: sets >48KB dynamic smem opt-in before first launch
@@ -3298,7 +3001,9 @@ namespace
         const float *d_C_existing,
         const float *d_bias,
         cudaStream_t cuda_stream,
-        CUDAPrefillContext_ *prefill_ctx = nullptr)
+        CUDAPrefillContext_ *prefill_ctx,
+        int serial_m1_k_partitions,
+        int serial_m1_uses_ordered_reducer)
     {
         // Compute dynamic smem size (must match kernel layout: A uses K=128 half)
         constexpr int SCALES_B_OFF = BM * BK128_STRIDE + BN * BK256_STRIDE;
@@ -3306,13 +3011,56 @@ namespace
         constexpr int SA_ALIGNED = (SA_OFF + 3) & ~3;
         constexpr int smem_bytes = SA_ALIGNED + BM * 8 * static_cast<int>(sizeof(float));
 
-        // Opt-in for >48KB dynamic shared memory (once per kernel template)
-        static bool smem_configured = false;
-        if (!smem_configured)
+        if constexpr (SPLIT_K > 1)
         {
-            auto fn_ptr = nativeVnniTC_BK256<BM, BN, WM, WN, SPLIT_K>;
-            cudaFuncSetAttribute(fn_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-            smem_configured = true;
+            if (serial_m1_uses_ordered_reducer)
+                return false;
+        }
+
+        /*
+         * Ordinary and ordered-M1 kernels have intentionally different
+         * register schedules, so configure and launch the exact specialization
+         * selected by the immutable public-M1 arithmetic contract.
+         */
+        static bool smem_configured[2] = {false, false};
+        const int ordered_index =
+            serial_m1_uses_ordered_reducer ? 1 : 0;
+        if (!smem_configured[ordered_index])
+        {
+            cudaError_t attribute_status = cudaSuccess;
+            if (serial_m1_uses_ordered_reducer)
+            {
+                auto fn_ptr =
+                    nativeVnniTC_BK256<
+                        BM,
+                        BN,
+                        WM,
+                        WN,
+                        SPLIT_K,
+                        true>;
+                attribute_status = cudaFuncSetAttribute(
+                    fn_ptr,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    smem_bytes);
+            }
+            else
+            {
+                auto fn_ptr =
+                    nativeVnniTC_BK256<
+                        BM,
+                        BN,
+                        WM,
+                        WN,
+                        SPLIT_K,
+                        false>;
+                attribute_status = cudaFuncSetAttribute(
+                    fn_ptr,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    smem_bytes);
+            }
+            if (attribute_status != cudaSuccess)
+                return false;
+            smem_configured[ordered_index] = true;
         }
 
         const int num_outer_tiles = (K / 32 + 7) / 8;
@@ -3338,19 +3086,52 @@ namespace
 
         (void)cudaGetLastError(); // clear stale errors
 
-        nativeVnniTC_BK256<BM, BN, WM, WN, SPLIT_K><<<grid, block, smem_bytes, cuda_stream>>>(
-            d_A_int8,
-            d_payload,
-            d_scales,
-            d_kernel_C,
-            d_scales_A_block,
-            d_C_existing,
-            d_bias,
-            M,
-            N,
-            K,
-            alpha,
-            beta);
+        if (serial_m1_uses_ordered_reducer)
+        {
+            nativeVnniTC_BK256<
+                BM,
+                BN,
+                WM,
+                WN,
+                SPLIT_K,
+                true><<<grid, block, smem_bytes, cuda_stream>>>(
+                d_A_int8,
+                d_payload,
+                d_scales,
+                d_kernel_C,
+                d_scales_A_block,
+                d_C_existing,
+                d_bias,
+                M,
+                N,
+                K,
+                alpha,
+                beta,
+                serial_m1_k_partitions);
+        }
+        else
+        {
+            nativeVnniTC_BK256<
+                BM,
+                BN,
+                WM,
+                WN,
+                SPLIT_K,
+                false><<<grid, block, smem_bytes, cuda_stream>>>(
+                d_A_int8,
+                d_payload,
+                d_scales,
+                d_kernel_C,
+                d_scales_A_block,
+                d_C_existing,
+                d_bias,
+                M,
+                N,
+                K,
+                alpha,
+                beta,
+                serial_m1_k_partitions);
+        }
         if (cudaGetLastError() != cudaSuccess)
             return false;
 
@@ -3368,23 +3149,6 @@ namespace
         return true;
     }
 
-    int chooseSplitK_BK256(int M, int N, int K, int bm, int bn, CUDAPrefillContext_ *prefill_ctx)
-    {
-        const int grid_blocks = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
-        const int num_outer_tiles = (K / 32 + 7) / 8;
-
-        // BK256 split-K is capped at 2: sweep data (0.5B-14B) shows sk=4/8
-        // alias to sk=1/sk=2 performance due to a kernel partitioning bug.
-        // sk=2 consistently matches or beats sk=1 across all FFN_Down shapes,
-        // so use sk=2 when there's enough K-work to split and the grid is underfilled.
-        if (num_outer_tiles < 4)
-            return 1;
-        const int SM = querySmCount(prefill_ctx);
-        if (grid_blocks >= SM)
-            return 1; // Already enough blocks for good utilization
-        return 2;
-    }
-
     struct PrefillWorkspacePlan
     {
         int tile_id = -1;
@@ -3394,6 +3158,71 @@ namespace
         size_t splitk_partials_bytes = 0;
         size_t streamk_fixup_bytes = 0;
     };
+
+    /**
+     * @brief Complete Q4_0 large-K route shared by planning and execution.
+     *
+     * Workspace planning and kernel launch must consume the same immutable
+     * decision. Duplicating these predicates previously allowed planning to
+     * reserve a T64x64 route while execution silently launched BK256. Keeping
+     * the family typed also makes every supported route visible at each
+     * exhaustive switch.
+     */
+    enum class Q40PrefillRoute
+    {
+        Generic,
+        BK256Narrow,
+        BK256Wide,
+        ProfiledT64x64,
+    };
+
+    /**
+     * @brief Select one Q4_0 large-K route without allocating or launching.
+     *
+     * An explicit BK256 force is strongest. An explicit ordinary tile force
+     * then disables every AUTO overlay so tournament candidates remain
+     * forceable. Production AUTO uses BK256 for its profitable first 32 rows,
+     * the profiled T64x64 crossover for narrow larger-M work, and otherwise the
+     * total generic tile heuristic.
+     */
+    Q40PrefillRoute chooseQ40PrefillRoute(
+        int M,
+        int N,
+        int K,
+        CUDAPrefillContext_ *prefill_ctx)
+    {
+        const auto bk256_geometry = [&]()
+        {
+            return (M <= 32) && (N <= 1024)
+                ? Q40PrefillRoute::BK256Narrow
+                : Q40PrefillRoute::BK256Wide;
+        };
+
+        if (g_bk256_force_mode > 0)
+            return bk256_geometry();
+        if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
+            return Q40PrefillRoute::Generic;
+
+        /*
+         * BK256 wins while a narrow projection fits in its first 32-row tile.
+         * Above that boundary, the second BK256 M fragment increases latency
+         * without increasing the four-to-eight block output grid. Production
+         * tournaments on the 512x2048, 896x4864, and 1024x5120 Qwen
+         * geometries consistently selected T64x64 from M=33 onward. Its finer
+         * output grid was 16-34% faster on GA102, while the all-format
+         * equivalence sweep proved the same increasing-K arithmetic byte for
+         * byte.
+         */
+        if ((M > 32) && (N <= 1024) && (K > 2 * N))
+            return Q40PrefillRoute::ProfiledT64x64;
+
+        const bool bk256_disabled = (g_bk256_force_mode < 0);
+        const int SM = querySmCount(prefill_ctx);
+        const int t64x128 = ((M + 63) / 64) * ((N + 127) / 128);
+        if (!bk256_disabled && (K > 2 * N) && (t64x128 < SM))
+            return bk256_geometry();
+        return Q40PrefillRoute::Generic;
+    }
 
     void tileShape(TileId tile, int &bm, int &bn)
     {
@@ -3430,24 +3259,39 @@ namespace
 
         if constexpr (CB == 0)
         {
-            const bool bk256_forced = (g_bk256_force_mode > 0);
-            const bool bk256_disabled = (g_bk256_force_mode < 0);
-            const int SM = querySmCount(prefill_ctx);
-            const int t64x128_check = ((M + 63) / 64) * ((N + 127) / 128);
-            const bool bk256_auto = !bk256_disabled && (K > 2 * N) && (t64x128_check < SM);
-            if (bk256_forced || bk256_auto)
+            const Q40PrefillRoute route =
+                chooseQ40PrefillRoute(M, N, K, prefill_ctx);
+            switch (route)
             {
-                const bool use_narrow_bn64 = (M <= 32) && (N <= 1024);
-                const int bk256_bn = use_narrow_bn64 ? 64 : 128;
-                int sk = chooseSplitK_BK256(M, N, K, 128, bk256_bn, prefill_ctx);
-                if (g_deterministic_mode)
-                    sk = 1;
-                plan.tile_id = use_narrow_bn64 ? -3 : -2;
+            case Q40PrefillRoute::BK256Narrow:
+            case Q40PrefillRoute::BK256Wide:
+            {
+                /*
+                 * BK256 retains one ordered K walk. A two-part workspace
+                 * reduction is deterministic in scheduling but not equivalent
+                 * in FP32 parenthesization, so it is not a production candidate.
+                 */
+                constexpr int sk = 1;
+                plan.tile_id =
+                    route == Q40PrefillRoute::BK256Narrow ? -3 : -2;
                 plan.split_k = sk;
                 plan.bk256 = true;
-                if (sk > 1)
-                    plan.splitk_partials_bytes = static_cast<size_t>(sk) * M * N * sizeof(float);
                 return plan;
+            }
+            case Q40PrefillRoute::ProfiledT64x64:
+            {
+                /*
+                 * Lock the measured winner directly instead of passing through
+                 * the older generic heuristic, whose eight-block T64x128
+                 * choice remains underfilled at the N=1024 boundary.
+                 */
+                plan.tile_id =
+                    static_cast<int>(TileId::T64x64_w2x2);
+                plan.split_k = 1;
+                return plan;
+            }
+            case Q40PrefillRoute::Generic:
+                break;
             }
         }
 
@@ -3460,7 +3304,8 @@ namespace
         else
         {
             constexpr FormatComplexity complexity = getFormatComplexity(CB);
-            tc = choosePrefillTile(M, N, K, prefill_ctx, complexity);
+            tc = choosePrefillTile(
+                M, N, K, prefill_ctx, complexity, CB);
         }
 
         if (g_deterministic_mode && tc.split_k > 1)
@@ -3519,72 +3364,68 @@ namespace
         float alpha, float beta,
         const float *d_C_existing,
         const float *d_bias,
+        int serial_m1_k_partitions,
+        int serial_m1_uses_ordered_reducer,
         cudaStream_t cuda_stream,
         CUDAPrefillContext_ *prefill_ctx)
     {
+        Q40PrefillRoute q40_route = Q40PrefillRoute::Generic;
+
         // ─── BK256 path (CB=0 only) ──────────────────────────────────
         // BK256 processes 256 K-elements per outer tile (4× fewer K-iterations
         // than BK64), benefiting K-heavy shapes like FFN_Down (K=18944).
         // Uses 1 block/SM occupancy, so only helps when BK64 can't fill the GPU.
         if constexpr (CB == 0)
         {
-            const bool bk256_forced = (g_bk256_force_mode > 0);
-            const bool bk256_disabled = (g_bk256_force_mode < 0);
-            const int SM = querySmCount(prefill_ctx);
-            const int t64x128_check = ((M + 63) / 64) * ((N + 127) / 128);
-            const bool bk256_auto = !bk256_disabled && (K > 2 * N) && (t64x128_check < SM);
-            if (bk256_forced || bk256_auto)
+            q40_route = chooseQ40PrefillRoute(M, N, K, prefill_ctx);
+            if (q40_route == Q40PrefillRoute::BK256Narrow ||
+                q40_route == Q40PrefillRoute::BK256Wide)
             {
-                const bool use_narrow_bn64 = (M <= 32) && (N <= 1024);
-                const int bk256_bn = use_narrow_bn64 ? 64 : 128;
-                int sk = chooseSplitK_BK256(M, N, K, 128, bk256_bn, prefill_ctx);
-                if (g_deterministic_mode)
-                    sk = 1;
-                bool ok = false;
-                if (use_narrow_bn64)
+                constexpr int sk = 1;
+                if (q40_route == Q40PrefillRoute::BK256Narrow)
                 {
-                    if (sk >= 2)
-                    {
-                        recordLastLaunchSelection(-3, 2, true, 0);
-                        ok = launchNativeVNNITC_BK256<128, 64, 4, 2, 2>(
-                            d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
-                    }
-                    else
-                    {
-                        recordLastLaunchSelection(-3, 1, true, 0);
-                        ok = launchNativeVNNITC_BK256<128, 64, 4, 2, 1>(
-                            d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
-                    }
+                    recordLastLaunchSelection(-3, sk, true, 0);
+                    return launchNativeVNNITC_BK256<128, 64, 4, 2, sk>(
+                        d_A_int8, d_payload, d_scales, d_C_fp32,
+                        d_scales_A_block, M, N, K, alpha, beta,
+                        d_C_existing, d_bias, cuda_stream, prefill_ctx,
+                        serial_m1_k_partitions,
+                        serial_m1_uses_ordered_reducer);
                 }
-                else
-                {
-                    if (sk >= 2)
-                    {
-                        recordLastLaunchSelection(-2, 2, true, 0);
-                        ok = launchNativeVNNITC_BK256<128, 128, 4, 4, 2>(
-                            d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
-                    }
-                    else
-                    {
-                        recordLastLaunchSelection(-2, 1, true, 0);
-                        ok = launchNativeVNNITC_BK256<128, 128, 4, 4, 1>(
-                            d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
-                    }
-                }
-                if (ok)
-                    return true;
-                // Fall through to BK64 dispatch if BK256 failed
+
+                recordLastLaunchSelection(-2, sk, true, 0);
+                return launchNativeVNNITC_BK256<128, 128, 4, 4, sk>(
+                    d_A_int8, d_payload, d_scales, d_C_fp32,
+                    d_scales_A_block, M, N, K, alpha, beta,
+                    d_C_existing, d_bias, cuda_stream, prefill_ctx,
+                    serial_m1_k_partitions,
+                    serial_m1_uses_ordered_reducer);
             }
         }
 
         // ─── Tile selection (3-tier priority) ─────────────────────────
         TileChoice tc;
 
-        if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
+        if constexpr (CB == 0)
+        {
+            if (q40_route == Q40PrefillRoute::ProfiledT64x64)
+            {
+                tc = {TileId::T64x64_w2x2, 1};
+            }
+            else if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
+            {
+                tc = {static_cast<TileId>(g_force_tile_id),
+                      (g_force_split_k > 0) ? g_force_split_k : 1};
+            }
+            else
+            {
+                constexpr FormatComplexity complexity =
+                    getFormatComplexity(CB);
+                tc = choosePrefillTile(
+                    M, N, K, prefill_ctx, complexity, CB);
+            }
+        }
+        else if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
         {
             // Force-tile: bypass everything for sweep benchmarks
             tc = {static_cast<TileId>(g_force_tile_id),
@@ -3593,20 +3434,16 @@ namespace
         else
         {
             constexpr FormatComplexity complexity = getFormatComplexity(CB);
-            tc = choosePrefillTile(M, N, K, prefill_ctx, complexity);
+            tc = choosePrefillTile(
+                M, N, K, prefill_ctx, complexity, CB);
         }
 
-        // Deterministic parity mode uses the stable single-partition path.
-        // Split-K is race-free here, but it changes FP32 accumulation order;
-        // for short prompts and grouped MoE rows those ULPs can compound into
-        // near-tie greedy token flips. Production auto mode keeps the faster
-        // split-K/StreamK choices for Phase 14 throughput.
+        // Deterministic mode also clamps an explicitly forced diagnostic. Auto
+        // dispatch already returns split_k=1 for every production geometry.
         if (g_deterministic_mode && tc.split_k > 1)
             tc.split_k = 1;
 
-        // ─── Tile launch with StreamK evaluation (CB=0) ──────────────
-        // For CB=0: try StreamK (wave-tail smoothing) before standard split_k.
-        // Other formats use standard split_k directly.
+        // ─── Tile launch with optional diagnostic Stream-K (CB=0) ─────
 #define DISPATCH_TILE_SK(BM_, BN_, WM_, WN_)                                            \
     do                                                                                  \
     {                                                                                   \
@@ -3638,25 +3475,29 @@ namespace
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 8>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
                 d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
-                cuda_stream, prefill_ctx);                                              \
+                cuda_stream, prefill_ctx, serial_m1_k_partitions,                       \
+                serial_m1_uses_ordered_reducer);                                        \
         case 4:                                                                         \
             recordLastLaunchSelection(static_cast<int>(tc.tile), 4, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 4>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
                 d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
-                cuda_stream, prefill_ctx);                                              \
+                cuda_stream, prefill_ctx, serial_m1_k_partitions,                       \
+                serial_m1_uses_ordered_reducer);                                        \
         case 2:                                                                         \
             recordLastLaunchSelection(static_cast<int>(tc.tile), 2, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 2>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
                 d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
-                cuda_stream, prefill_ctx);                                              \
+                cuda_stream, prefill_ctx, serial_m1_k_partitions,                       \
+                serial_m1_uses_ordered_reducer);                                        \
         default:                                                                        \
             recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 1>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
                 d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
-                cuda_stream, prefill_ctx);                                              \
+                cuda_stream, prefill_ctx, serial_m1_k_partitions,                       \
+                serial_m1_uses_ordered_reducer);                                        \
         }                                                                               \
     } while (0)
 
@@ -3703,12 +3544,6 @@ extern "C"
     int cudaNativeVNNIPrefill_getBK256Mode()
     {
         return g_bk256_force_mode;
-    }
-
-    void cudaNativeVNNIPrefill_freeStreamKFixup()
-    {
-        // Fixup buffer is now owned by CUDAPrefillContext, freed on context destroy.
-        // This function is kept for backward compatibility but is a no-op.
     }
 
     // Deterministic mode API: disables stream-K and enables parity-preserving
@@ -3943,6 +3778,18 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
         return false;
 
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    int serial_m1_uses_ordered_reducer = 0;
+    int serial_m1_k_partitions = 0;
+    if (!cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+            codebook_id,
+            N,
+            K,
+            querySmCount(prefill_ctx),
+            &serial_m1_uses_ordered_reducer,
+            &serial_m1_k_partitions))
+    {
+        return false;
+    }
 
     bool ok = false;
     switch (codebook_id)
@@ -3951,32 +3798,44 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
     case 0:
         ok = launchGenericPrefillBK64<0>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
     case 4:
         ok = launchGenericPrefillBK64<4>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
     case 6: // Q5_0
         ok = launchGenericPrefillBK64<6>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
     case 11: // IQ3_S
         ok = launchGenericPrefillBK64<11>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
     case 12: // IQ3_XXS
         ok = launchGenericPrefillBK64<12>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
     case 15: // IQ2_XXS
         ok = launchGenericPrefillBK64<15>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
 
     // --- Asymmetric formats (need min correction, d_mins required) ---
@@ -3985,21 +3844,27 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
             return false;
         ok = launchGenericPrefillBK64<5>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
     case 7: // Q5_1 / Q5_K
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<7>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
     case 16: // IQ1_S
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<16>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
 
     // --- Dual-scale formats (separate lo/hi scales via split MMA) ---
@@ -4008,49 +3873,63 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
             return false;
         ok = launchGenericPrefillBK64<8>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
     case 9: // Q3_K
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<9>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
     case 10: // Q2_K (dual-scale + asymmetric via emins)
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<10>(
             d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
     case 13: // IQ2_S
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<13>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
     case 14: // IQ2_XS
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<14>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
     case 17: // IQ1_M (dual-scale + delta correction)
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<17>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
 
     // --- 8-bit format (no decode overhead, single-scale) ---
     case 19: // Q8_0
         ok = launchGenericPrefillBK64<19>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
         break;
 
     default:
@@ -4083,203 +3962,4 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
                 {"sums_a", d_sums_A_block ? "1" : "0"}});
     }
     return ok;
-}
-
-// =========================================================================
-// GEMM Sweep Benchmark API
-// =========================================================================
-// Exposes all tile-config variants via numbered config IDs so an external
-// benchmark driver can systematically sweep (BM, BN, WARPS_M, WARPS_N,
-// SPLIT_K) for any (M, N, K) shape.
-// =========================================================================
-
-namespace
-{
-    struct SweepConfig
-    {
-        int bm, bn, warps_m, warps_n;
-        const char *name;
-    };
-
-    // 17 tile configs covering the practical design space.
-    // Constraint: WARP_M = BM/WARPS_M >= 16, WARP_N = BN/WARPS_N >= 8.
-    static constexpr SweepConfig kSweepConfigs[] = {
-        {32, 128, 1, 2, "32x128_w1x2"},   //  0:  64 thr, ~27KB smem
-        {32, 128, 1, 4, "32x128_w1x4"},   //  1: 128 thr, ~27KB smem
-        {64, 64, 2, 1, "64x64_w2x1"},     //  2:  64 thr, ~22KB smem
-        {64, 64, 2, 2, "64x64_w2x2"},     //  3: 128 thr, ~22KB smem
-        {64, 128, 2, 2, "64x128_w2x2"},   //  4: 128 thr, ~33KB smem (DEFAULT small-M)
-        {64, 128, 4, 2, "64x128_w4x2"},   //  5: 256 thr, ~33KB smem
-        {64, 128, 2, 4, "64x128_w2x4"},   //  6: 256 thr, ~33KB smem
-        {128, 64, 4, 1, "128x64_w4x1"},   //  7: 128 thr, ~33KB smem
-        {128, 64, 2, 1, "128x64_w2x1"},   //  8:  64 thr, ~33KB smem (high ILP)
-        {128, 128, 4, 2, "128x128_w4x2"}, //  9: 256 thr, ~44KB smem (DEFAULT large-M)
-        {128, 128, 2, 2, "128x128_w2x2"}, // 10: 128 thr, ~44KB smem (high ILP)
-        {128, 128, 4, 4, "128x128_w4x4"}, // 11: 512 thr, ~44KB smem
-    };
-    static constexpr int kNumSweepConfigs = sizeof(kSweepConfigs) / sizeof(kSweepConfigs[0]);
-
-    template <int BM, int BN, int WM, int WN>
-    bool sweepLaunchQ40(int split_k,
-                        const int8_t *A, const uint8_t *payload, const uint16_t *scales,
-                        float *C, const float *scales_A,
-                        int M, int N, int K, float alpha, float beta,
-                        const float *C_existing, const float *bias,
-                        cudaStream_t stream)
-    {
-        switch (split_k)
-        {
-        case 8:
-            return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 8>(
-                A, payload, scales, nullptr, nullptr, C, scales_A,
-                nullptr, M, N, K, alpha, beta, C_existing, bias, stream);
-        case 4:
-            return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 4>(
-                A, payload, scales, nullptr, nullptr, C, scales_A,
-                nullptr, M, N, K, alpha, beta, C_existing, bias, stream);
-        case 2:
-            return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 2>(
-                A, payload, scales, nullptr, nullptr, C, scales_A,
-                nullptr, M, N, K, alpha, beta, C_existing, bias, stream);
-        default:
-            return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 1>(
-                A, payload, scales, nullptr, nullptr, C, scales_A,
-                nullptr, M, N, K, alpha, beta, C_existing, bias, stream);
-        }
-    }
-
-} // namespace
-
-extern "C"
-{
-    int cudaGemmSweepNumConfigs() { return kNumSweepConfigs; }
-
-    void cudaGemmSweepGetConfig(int idx, int *bm, int *bn, int *warps_m, int *warps_n, const char **name)
-    {
-        if (idx < 0 || idx >= kNumSweepConfigs)
-            return;
-        if (bm)
-            *bm = kSweepConfigs[idx].bm;
-        if (bn)
-            *bn = kSweepConfigs[idx].bn;
-        if (warps_m)
-            *warps_m = kSweepConfigs[idx].warps_m;
-        if (warps_n)
-            *warps_n = kSweepConfigs[idx].warps_n;
-        if (name)
-            *name = kSweepConfigs[idx].name;
-    }
-
-    bool cudaGemmSweepLaunch(
-        int config_idx, int split_k,
-        const int8_t *A, const uint8_t *payload, const uint16_t *scales,
-        float *C, const float *scales_A,
-        int M, int N, int K,
-        float alpha, float beta,
-        const float *C_existing, const float *bias,
-        int device_id, void *stream)
-    {
-        if (config_idx < 0 || config_idx >= kNumSweepConfigs)
-            return false;
-        if (!A || !payload || !scales || !C || !scales_A)
-            return false;
-        if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
-            return false;
-        if (!isAmperePlus(device_id))
-            return false;
-        if (cudaSetDevice(device_id) != cudaSuccess)
-            return false;
-
-        cudaStream_t cs = static_cast<cudaStream_t>(stream);
-
-        switch (config_idx)
-        {
-        case 0:
-            return sweepLaunchQ40<32, 128, 1, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
-        case 1:
-            return sweepLaunchQ40<32, 128, 1, 4>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
-        case 2:
-            return sweepLaunchQ40<64, 64, 2, 1>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
-        case 3:
-            return sweepLaunchQ40<64, 64, 2, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
-        case 4:
-            return sweepLaunchQ40<64, 128, 2, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
-        case 5:
-            return sweepLaunchQ40<64, 128, 4, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
-        case 6:
-            return sweepLaunchQ40<64, 128, 2, 4>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
-        case 7:
-            return sweepLaunchQ40<128, 64, 4, 1>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
-        case 8:
-            return sweepLaunchQ40<128, 64, 2, 1>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
-        case 9:
-            return sweepLaunchQ40<128, 128, 4, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
-        case 10:
-            return sweepLaunchQ40<128, 128, 2, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
-        case 11:
-            return sweepLaunchQ40<128, 128, 4, 4>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
-        default:
-            return false;
-        }
-    }
-
-    // Stream-K variant of sweep launch: calls launchNativeVNNITC_BK64_StreamK
-    // directly for a given tile config. Used by the A/B perf harness.
-    bool cudaGemmSweepLaunchStreamK(
-        int config_idx,
-        const int8_t *A, const uint8_t *payload, const uint16_t *scales,
-        float *C, const float *scales_A,
-        int M, int N, int K,
-        float alpha, float beta,
-        const float *C_existing, const float *bias,
-        int device_id, void *stream)
-    {
-        if (config_idx < 0 || config_idx >= kNumSweepConfigs)
-            return false;
-        if (!A || !payload || !scales || !C || !scales_A)
-            return false;
-        if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
-            return false;
-        if (!isAmperePlus(device_id))
-            return false;
-        if (cudaSetDevice(device_id) != cudaSuccess)
-            return false;
-
-        // Benchmark helper: use a thread-local context for the sweep
-        static thread_local CUDAPrefillContext_ tl_sweep_ctx{};
-        tl_sweep_ctx.device_id = device_id;
-        CUDAPrefillContext_ *pctx = &tl_sweep_ctx;
-
-        cudaStream_t cs = static_cast<cudaStream_t>(stream);
-
-        switch (config_idx)
-        {
-        case 0:
-            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
-        case 1:
-            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
-        case 2:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
-        case 3:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
-        case 4:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
-        case 5:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
-        case 6:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
-        case 7:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 4, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
-        case 8:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
-        case 9:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
-        case 10:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
-        case 11:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
-        default:
-            return false;
-        }
-    }
 }

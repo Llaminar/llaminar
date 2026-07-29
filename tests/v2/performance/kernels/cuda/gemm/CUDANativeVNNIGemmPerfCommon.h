@@ -533,15 +533,14 @@ namespace llaminar2::test::native_vnni_gemm_perf
         std::memcpy(A_tensor->mutable_data(), input_ptr, static_cast<size_t>(m) * k * sizeof(float));
         auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(n)});
 
-        DeviceId gpu_device = DeviceId::cuda(cuda_device_id);
-        if (!A_tensor->ensureOnDevice(gpu_device))
-            throw std::runtime_error("ensureOnDevice A failed");
-        if (!C_tensor->ensureOnDevice(gpu_device))
-            throw std::runtime_error("ensureOnDevice C failed");
-
         // Production CUDA GEMM stages always receive a worker-owned stream.
         // The perf harness mirrors that contract with one nonblocking stream
-        // retained across warmup, canonical event timing, and output download.
+        // retained across input publication, warmup, canonical event timing,
+        // and output download.  Creating the stream before either upload is
+        // important: ensureOnDevice() publishes the resulting device write,
+        // and that publication must carry the exact stream that performed the
+        // H2D transfer rather than an ambiguous legacy null-stream token.
+        //
         // Keeping a stable stream is also required for Nsight to attribute the
         // separately profiled launch to the same production execution path.
         cudaStream_t execution_stream = nullptr;
@@ -564,6 +563,12 @@ namespace llaminar2::test::native_vnni_gemm_perf
                     (void)cudaStreamDestroy(stream);
             }
         } execution_stream_guard{kernel, execution_stream};
+
+        DeviceId gpu_device = DeviceId::cuda(cuda_device_id);
+        if (!A_tensor->ensureOnDevice(gpu_device, execution_stream))
+            throw std::runtime_error("ensureOnDevice A failed");
+        if (!C_tensor->ensureOnDevice(gpu_device, execution_stream))
+            throw std::runtime_error("ensureOnDevice C failed");
 
         std::vector<double> times_us;
         times_us.reserve(static_cast<size_t>(bench_runs));

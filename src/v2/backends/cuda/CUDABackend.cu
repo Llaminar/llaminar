@@ -13,6 +13,7 @@
 #include "NvidiaDeviceContext.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
+#include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
 #include <cuda_runtime.h>
@@ -819,6 +820,30 @@ namespace llaminar2
         float *out_values, int *out_indices,
         float *partial_vals, int *partial_idxs, int partial_capacity,
         int device_idx, void *stream, int output_stride);
+    extern "C" bool cudaOps_configure_mtp_greedy_penalty_policy(
+        MTPGreedyPenaltyPolicy *controls,
+        float presence_penalty,
+        float frequency_penalty,
+        bool first_token_already_in_history,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_argmax_f32_batched_rows_mtp_penalties(
+        const float *data, int rows, int cols, int row_stride,
+        const int *verifier_input_tokens,
+        const int *generated_token_counts,
+        const MTPGreedyPenaltyPolicy *policy,
+        float *out_values, int *out_indices,
+        float *partial_vals, int *partial_idxs, int partial_capacity,
+        int device_idx, void *stream, int output_stride);
+    extern "C" bool cudaOps_commit_mtp_greedy_penalty_history(
+        const int *output_tokens,
+        const int *output_meta,
+        const MTPGreedyPenaltyPolicy *policy,
+        int output_token_capacity,
+        int vocab_size,
+        int *generated_token_counts,
+        int device_idx,
+        void *stream);
 
     extern "C" bool cudaOps_topk_f32(
         const float *data, int n, int k, float *out_values, int *out_indices,
@@ -1374,6 +1399,112 @@ namespace llaminar2
             device_id,
             static_cast<cudaStream_t>(stream),
             output_stride);
+    }
+
+    bool CUDABackend::enqueueConfigureMTPGreedyPenaltyPolicyDevice(
+        void *controls_device,
+        float presence_penalty,
+        float frequency_penalty,
+        bool first_token_already_in_history,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !controls_device || !stream)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_configure_mtp_greedy_penalty_policy(
+            static_cast<MTPGreedyPenaltyPolicy *>(controls_device),
+            presence_penalty,
+            frequency_penalty,
+            first_token_already_in_history,
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+        const void *data_device,
+        int rows,
+        int cols,
+        const void *verifier_input_tokens_device,
+        const void *generated_token_counts_device,
+        const void *penalty_policy_device,
+        int device_id,
+        void *stream,
+        void *out_values_device,
+        void *out_indices_device,
+        void *partial_vals,
+        void *partial_idxs,
+        int partial_capacity,
+        int output_stride)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !data_device || rows <= 0 || cols <= 0 ||
+            !verifier_input_tokens_device ||
+            !generated_token_counts_device || !penalty_policy_device ||
+            !stream || !out_values_device || !out_indices_device ||
+            !partial_vals || !partial_idxs || partial_capacity < rows ||
+            output_stride <= 0)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        PerfStatsCollector::ScopedTimer timer(
+            "backend",
+            "cuda_mtp_penalty_argmax_batched_rows_device_launch",
+            "decode");
+        return cudaOps_argmax_f32_batched_rows_mtp_penalties(
+            static_cast<const float *>(data_device),
+            rows,
+            cols,
+            cols,
+            static_cast<const int *>(verifier_input_tokens_device),
+            static_cast<const int *>(generated_token_counts_device),
+            static_cast<const MTPGreedyPenaltyPolicy *>(
+                penalty_policy_device),
+            static_cast<float *>(out_values_device),
+            static_cast<int *>(out_indices_device),
+            static_cast<float *>(partial_vals),
+            static_cast<int *>(partial_idxs),
+            partial_capacity,
+            device_id,
+            stream,
+            output_stride);
+    }
+
+    bool CUDABackend::enqueueCommitMTPGreedyPenaltyHistoryDevice(
+        const void *output_tokens_device,
+        const void *output_meta_device,
+        const void *penalty_policy_device,
+        int output_token_capacity,
+        int vocab_size,
+        void *generated_token_counts_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !output_tokens_device || !output_meta_device ||
+            !penalty_policy_device || output_token_capacity <= 0 ||
+            vocab_size <= 0 || !generated_token_counts_device || !stream)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_commit_mtp_greedy_penalty_history(
+            static_cast<const int *>(output_tokens_device),
+            static_cast<const int *>(output_meta_device),
+            static_cast<const MTPGreedyPenaltyPolicy *>(
+                penalty_policy_device),
+            output_token_capacity,
+            vocab_size,
+            static_cast<int *>(generated_token_counts_device),
+            device_id,
+            stream);
     }
 
     bool CUDABackend::topKF32(const void *data_device, int n, int k, int device_id,
@@ -3229,8 +3360,32 @@ namespace llaminar2
 
     bool CUDABackend::streamWaitEvent(void *stream, void *event, int device_id)
     {
-        (void)device_id;
-        cudaError_t err = cudaStreamWaitEvent(
+        if (!stream || !event ||
+            device_id < 0 || device_id >= device_count_)
+        {
+            LOG_ERROR("[CUDABackend::streamWaitEvent] invalid event-wait ownership"
+                      << " device=" << device_id
+                      << " stream=" << stream
+                      << " event=" << event);
+            return false;
+        }
+
+        /*
+         * LocalTP orchestrators submit child resets serially from one host
+         * thread. The ambient CUDA device therefore belongs to whichever child
+         * ran most recently, not necessarily to this stream/event pair. Select
+         * the caller-declared owner before touching either resource so a
+         * cross-child reset cannot become cudaErrorInvalidResourceHandle.
+         */
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::streamWaitEvent] cudaSetDevice("
+                      << device_id << ") failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+        err = cudaStreamWaitEvent(
             static_cast<cudaStream_t>(stream),
             static_cast<cudaEvent_t>(event), 0);
         if (err != cudaSuccess)

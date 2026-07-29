@@ -316,7 +316,7 @@ namespace llaminar2
         mutable std::vector<float> v_deinterleave_;
 
         int effectivePrefillSeqLen() const;
-        bool shouldUseRealLengthContract() const;
+        bool shouldUseScalarRealLengthContract() const;
         std::string workspaceStableId() const;
         std::string deinterleaveScratchBufferName() const;
         std::string speculativeStateSlotsBufferName() const;

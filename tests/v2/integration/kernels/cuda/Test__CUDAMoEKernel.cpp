@@ -123,6 +123,18 @@ extern "C" bool cudaMoE_route_logits(
     int device_idx,
     void *stream);
 
+extern "C" bool cudaMoE_softmax_topk(
+    float *logits,
+    int *expert_indices,
+    float *expert_weights,
+    int seq_len,
+    int num_experts,
+    int top_k,
+    bool normalize_weights,
+    int device_idx,
+    void *stream,
+    const int *device_effective_seq_len);
+
 extern "C" bool cudaMoE_materialize_runtime_prefill_descriptor_tables(
     const void *runtime,
     llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
@@ -1413,7 +1425,7 @@ namespace
                 /*num_experts=*/257,
                 /*top_k=*/16));
             reqs.merge(llaminar2::MoEWorkspaceBuffers::cudaMoE(
-                /*max_seq_len=*/1536,
+                /*max_seq_len=*/2048,
                 /*d_model=*/2048,
                 /*intermediate=*/512,
                 /*num_experts=*/256,
@@ -11089,6 +11101,384 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsEffectiveSeqLenMasksPaddedRowsAcross
             }
         }
     }
+
+    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+#endif
+}
+
+/**
+ * @brief Prove production Qwen3.6 routing is invariant to a padded graph bucket.
+ *
+ * The small masking regression above verifies invalid padded rows, but cannot
+ * expose launch-geometry drift in active rows. Qwen3.6 35B-A3B routes 2,048
+ * hidden columns over 256 experts with top-8 selection. This test executes the
+ * same 1,583 real rows once at their exact shape and once through a captured
+ * 2,048-row graph, then requires every active expert ID and normalized weight
+ * to be bitwise identical.
+ */
+TEST_F(Test__CUDAMoEKernel, Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraphBucket)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int real_seq_len = 1583;
+    constexpr int bucket_seq_len = 2048;
+    constexpr int d_model = 2048;
+    constexpr int num_experts = 256;
+    constexpr int top_k = 8;
+
+    std::vector<float> bucket_hidden_values(
+        static_cast<size_t>(bucket_seq_len) * d_model);
+    for (size_t i = 0; i < bucket_hidden_values.size(); ++i)
+    {
+        bucket_hidden_values[i] =
+            0.031f * std::sin(static_cast<float>(i % 65521) * 0.0073f) +
+            0.013f * std::cos(static_cast<float>(i % 32749) * 0.011f);
+    }
+    std::vector<float> exact_hidden_values(
+        bucket_hidden_values.begin(),
+        bucket_hidden_values.begin() +
+            static_cast<std::ptrdiff_t>(
+                static_cast<size_t>(real_seq_len) * d_model));
+
+    std::vector<float> gate_values(
+        static_cast<size_t>(num_experts) * d_model);
+    for (size_t i = 0; i < gate_values.size(); ++i)
+    {
+        gate_values[i] =
+            0.021f * std::cos(static_cast<float>(i % 16381) * 0.017f) -
+            0.009f * std::sin(static_cast<float>(i % 8191) * 0.023f);
+    }
+
+    auto exact_hidden =
+        makeTensor({real_seq_len, d_model}, exact_hidden_values);
+    auto bucket_hidden =
+        makeTensor({bucket_seq_len, d_model}, bucket_hidden_values);
+    auto gate = makeTensor({num_experts, d_model}, gate_values);
+    auto exact_indices = makeZeros({real_seq_len, top_k});
+    auto exact_weights = makeZeros({real_seq_len, top_k});
+    auto bucket_indices = makeZeros({bucket_seq_len, top_k});
+    auto bucket_weights = makeZeros({bucket_seq_len, top_k});
+
+    const llaminar2::DeviceId device = llaminar2::DeviceId::cuda(0);
+    ASSERT_TRUE(exact_hidden->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(bucket_hidden->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(gate->ensureOnDevice(device, stream_));
+
+    CudaAllocation exact_logits_allocation(
+        static_cast<size_t>(real_seq_len) * num_experts * sizeof(float));
+    CudaAllocation bucket_logits_allocation(
+        static_cast<size_t>(bucket_seq_len) * num_experts * sizeof(float));
+    auto *exact_logits =
+        static_cast<float *>(exact_logits_allocation.get());
+    auto *bucket_logits =
+        static_cast<float *>(bucket_logits_allocation.get());
+    ASSERT_TRUE(cudaMoE_route_logits(
+        static_cast<const float *>(exact_hidden->gpu_data_ptr()),
+        static_cast<const float *>(gate->gpu_data_ptr()),
+        exact_logits,
+        real_seq_len,
+        d_model,
+        num_experts,
+        /*device_idx=*/0,
+        stream_));
+    ASSERT_TRUE(cudaMoE_route_logits(
+        static_cast<const float *>(bucket_hidden->gpu_data_ptr()),
+        static_cast<const float *>(gate->gpu_data_ptr()),
+        bucket_logits,
+        bucket_seq_len,
+        d_model,
+        num_experts,
+        /*device_idx=*/0,
+        stream_));
+
+    const size_t active_logits =
+        static_cast<size_t>(real_seq_len) * num_experts;
+    std::vector<float> exact_logits_host(active_logits);
+    std::vector<float> bucket_logits_host(
+        static_cast<size_t>(bucket_seq_len) * num_experts);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  exact_logits_host.data(),
+                  exact_logits,
+                  exact_logits_host.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  bucket_logits_host.data(),
+                  bucket_logits,
+                  bucket_logits_host.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    if (std::memcmp(
+            exact_logits_host.data(),
+            bucket_logits_host.data(),
+            active_logits * sizeof(float)) != 0)
+    {
+        size_t first = 0;
+        while (first < active_logits)
+        {
+            uint32_t exact_bits = 0;
+            uint32_t bucket_bits = 0;
+            std::memcpy(
+                &exact_bits,
+                &exact_logits_host[first],
+                sizeof(exact_bits));
+            std::memcpy(
+                &bucket_bits,
+                &bucket_logits_host[first],
+                sizeof(bucket_bits));
+            if (exact_bits != bucket_bits)
+                break;
+            ++first;
+        }
+        ASSERT_EQ(first, active_logits)
+            << "router GEMM changed at row=" << (first / num_experts)
+            << " expert=" << (first % num_experts)
+            << " exact=" << exact_logits_host[first]
+            << " bucket=" << bucket_logits_host[first];
+    }
+
+    const size_t active_topk =
+        static_cast<size_t>(real_seq_len) * top_k;
+    CudaAllocation exact_topk_indices_allocation(
+        active_topk * sizeof(int));
+    CudaAllocation exact_topk_weights_allocation(
+        active_topk * sizeof(float));
+    CudaAllocation bucket_topk_indices_allocation(
+        static_cast<size_t>(bucket_seq_len) * top_k * sizeof(int));
+    CudaAllocation bucket_topk_weights_allocation(
+        static_cast<size_t>(bucket_seq_len) * top_k * sizeof(float));
+    CudaAllocation direct_effective_seq_len_allocation(sizeof(int));
+    auto *direct_effective_seq_len =
+        static_cast<int *>(direct_effective_seq_len_allocation.get());
+    ASSERT_EQ(cudaMemcpyAsync(
+                  direct_effective_seq_len,
+                  &real_seq_len,
+                  sizeof(int),
+                  cudaMemcpyHostToDevice,
+                  stream_),
+              cudaSuccess);
+    ASSERT_TRUE(cudaMoE_softmax_topk(
+        exact_logits,
+        static_cast<int *>(exact_topk_indices_allocation.get()),
+        static_cast<float *>(exact_topk_weights_allocation.get()),
+        real_seq_len,
+        num_experts,
+        top_k,
+        /*normalize_weights=*/true,
+        /*device_idx=*/0,
+        stream_,
+        direct_effective_seq_len));
+    ASSERT_TRUE(cudaMoE_softmax_topk(
+        bucket_logits,
+        static_cast<int *>(bucket_topk_indices_allocation.get()),
+        static_cast<float *>(bucket_topk_weights_allocation.get()),
+        bucket_seq_len,
+        num_experts,
+        top_k,
+        /*normalize_weights=*/true,
+        /*device_idx=*/0,
+        stream_,
+        /*device_effective_seq_len=*/nullptr));
+
+    std::vector<int> direct_exact_indices(active_topk);
+    std::vector<int> direct_bucket_indices(
+        static_cast<size_t>(bucket_seq_len) * top_k);
+    std::vector<float> direct_exact_weights(active_topk);
+    std::vector<float> direct_bucket_weights(
+        static_cast<size_t>(bucket_seq_len) * top_k);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  direct_exact_indices.data(),
+                  exact_topk_indices_allocation.get(),
+                  direct_exact_indices.size() * sizeof(int),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  direct_bucket_indices.data(),
+                  bucket_topk_indices_allocation.get(),
+                  direct_bucket_indices.size() * sizeof(int),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  direct_exact_weights.data(),
+                  exact_topk_weights_allocation.get(),
+                  direct_exact_weights.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  direct_bucket_weights.data(),
+                  bucket_topk_weights_allocation.get(),
+                  direct_bucket_weights.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    EXPECT_EQ(
+        std::memcmp(
+            direct_exact_indices.data(),
+            direct_bucket_indices.data(),
+            active_topk * sizeof(int)),
+        0)
+        << "softmax/top-k integer selection changed with padded launch geometry";
+    EXPECT_EQ(
+        std::memcmp(
+            direct_exact_weights.data(),
+            direct_bucket_weights.data(),
+            active_topk * sizeof(float)),
+        0)
+        << "softmax/top-k normalized weights changed with padded launch geometry";
+
+    llaminar2::MoERoutingResult exact_result;
+    ASSERT_TRUE(cuda_kernel_->routeWithTensors(
+        exact_hidden.get(), gate.get(),
+        real_seq_len, d_model, num_experts, top_k,
+        /*normalize_weights=*/true,
+        exact_indices.get(), exact_weights.get(), exact_result));
+    std::vector<float> exact_indices_immediate(exact_indices->numel());
+    std::vector<float> exact_weights_immediate(exact_weights->numel());
+    ASSERT_EQ(cudaMemcpyAsync(
+                  exact_indices_immediate.data(),
+                  exact_indices->gpu_data_ptr(),
+                  exact_indices_immediate.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  exact_weights_immediate.data(),
+                  exact_weights->gpu_data_ptr(),
+                  exact_weights_immediate.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    int *device_effective_seq_len = nullptr;
+    ASSERT_EQ(cudaMalloc(&device_effective_seq_len, sizeof(int)), cudaSuccess);
+    auto free_effective = std::unique_ptr<int, void (*)(int *)>(
+        device_effective_seq_len,
+        [](int *ptr)
+        {
+            if (ptr)
+                cudaFree(ptr);
+        });
+    ASSERT_EQ(cudaMemcpyAsync(
+                  device_effective_seq_len,
+                  &real_seq_len,
+                  sizeof(int),
+                  cudaMemcpyHostToDevice,
+                  stream_),
+              cudaSuccess);
+
+    llaminar2::MoERoutingResult warmup_result;
+    ASSERT_TRUE(cuda_kernel_->routeWithTensorsEffectiveSeqLen(
+        bucket_hidden.get(), gate.get(),
+        bucket_seq_len, d_model, num_experts, top_k,
+        /*normalize_weights=*/true,
+        bucket_indices.get(), bucket_weights.get(),
+        warmup_result, device_effective_seq_len));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    std::vector<float> warmup_indices(bucket_indices->numel());
+    std::vector<float> warmup_weights(bucket_weights->numel());
+    ASSERT_EQ(cudaMemcpyAsync(
+                  warmup_indices.data(),
+                  bucket_indices->gpu_data_ptr(),
+                  warmup_indices.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  warmup_weights.data(),
+                  bucket_weights->gpu_data_ptr(),
+                  warmup_weights.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    EXPECT_EQ(
+        std::memcmp(
+            exact_indices_immediate.data(),
+            warmup_indices.data(),
+            active_topk * sizeof(float)),
+        0)
+        << "public padded warmup changed active expert IDs";
+    EXPECT_EQ(
+        std::memcmp(
+            exact_weights_immediate.data(),
+            warmup_weights.data(),
+            active_topk * sizeof(float)),
+        0)
+        << "public padded warmup changed active route weights";
+
+    llaminar2::MoERoutingResult captured_result;
+    ASSERT_EQ(
+        cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal),
+        cudaSuccess);
+    const bool captured_route =
+        cuda_kernel_->routeWithTensorsEffectiveSeqLen(
+            bucket_hidden.get(), gate.get(),
+            bucket_seq_len, d_model, num_experts, top_k,
+            /*normalize_weights=*/true,
+            bucket_indices.get(), bucket_weights.get(),
+            captured_result, device_effective_seq_len);
+    cudaGraph_t graph = nullptr;
+    const cudaError_t capture_status =
+        cudaStreamEndCapture(stream_, &graph);
+    EXPECT_TRUE(captured_route);
+    ASSERT_EQ(capture_status, cudaSuccess)
+        << cudaGetErrorString(capture_status);
+    ASSERT_NE(graph, nullptr);
+
+    cudaGraphExec_t executable = nullptr;
+    ASSERT_EQ(
+        cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+        cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+
+    std::vector<float> bucket_indices_host(bucket_indices->numel());
+    std::vector<float> bucket_weights_host(bucket_weights->numel());
+    ASSERT_EQ(cudaMemcpyAsync(
+                  bucket_indices_host.data(),
+                  bucket_indices->gpu_data_ptr(),
+                  bucket_indices_host.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  bucket_weights_host.data(),
+                  bucket_weights->gpu_data_ptr(),
+                  bucket_weights_host.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    EXPECT_EQ(
+        std::memcmp(
+            exact_indices_immediate.data(),
+            bucket_indices_host.data(),
+            active_topk * sizeof(float)),
+        0)
+        << "active expert IDs changed when exact rows were replayed through "
+           "the production prefill bucket";
+    EXPECT_EQ(
+        std::memcmp(
+            exact_weights_immediate.data(),
+            bucket_weights_host.data(),
+            active_topk * sizeof(float)),
+        0)
+        << "active normalized route weights changed when exact rows were "
+           "replayed through the production prefill bucket";
 
     ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
     ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);

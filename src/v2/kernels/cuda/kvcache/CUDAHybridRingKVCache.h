@@ -19,7 +19,9 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 
+#include <cstdio>
 #include <cstdint>
+#include <unistd.h>
 
 namespace llaminar2
 {
@@ -436,12 +438,22 @@ namespace llaminar2
         {
             if (!Base::resetRequestState(context))
                 return false;
-            for (auto &state : gdn_states_)
+            for (size_t gdn_index = 0; gdn_index < gdn_states_.size(); ++gdn_index)
             {
+                auto &state = gdn_states_[gdn_index];
                 if (!state.resetGPUKernelState(context.execution_stream))
                 {
                     LOG_ERROR("[CUDAHybridRingKVCache] Failed to enqueue cache-owned GDN request reset"
-                              << " reason=" << context.reason);
+                              << " reason=" << context.reason
+                              << " gdn_index=" << gdn_index
+                              << " stream=" << context.execution_stream);
+                    const char message[] =
+                        "[FATAL] CUDA hybrid cache request reset failed: "
+                        "owner=gdn\n";
+                    (void)::write(
+                        STDERR_FILENO,
+                        message,
+                        sizeof(message) - 1);
                     return false;
                 }
             }

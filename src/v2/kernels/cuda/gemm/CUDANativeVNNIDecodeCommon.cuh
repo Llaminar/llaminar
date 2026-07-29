@@ -89,6 +89,155 @@ namespace llaminar2::cuda_native_vnni
                static_cast<int>(vals[2]) + static_cast<int>(vals[3]);
     }
 
+    /**
+     * @brief Convert one exact INT8 dot-product block into its canonical FP32
+     *        NativeVNNI contribution.
+     *
+     * CUDA has several economical engines capable of producing the same exact
+     * integer dot products: serial DP4A decode, grouped DP4A verification, and
+     * grouped tensor-core MMA. Integer equality is not sufficient for MTP,
+     * however. Re-parenthesizing the scale, asymmetric-minimum, or IQ1_M delta
+     * terms changes FP32 result bytes and can change later sampling decisions.
+     *
+     * This function is therefore the single arithmetic publication contract
+     * shared by every CUDA NativeVNNI engine. Callers may obtain the integer
+     * terms differently, but they must pass those exact terms here before
+     * adding the returned contribution to an output accumulator. Every
+     * multiply and add names round-to-nearest explicitly so nvcc cannot fuse
+     * or reassociate one kernel family differently from another.
+     *
+     * Unused correction arguments are compiled away for codebooks that do not
+     * need them. Keeping one complete signature is intentional: it makes a new
+     * format's correction requirements visible at every execution engine and
+     * prevents a tensor-core-only approximation from quietly appearing.
+     *
+     * @tparam CODEBOOK_ID NativeVNNI codebook identifier.
+     * @param dot_lo Integer dot product for the low or complete 32-value block.
+     * @param dot_hi Integer dot product for the high dual-scale half.
+     * @param activation_scale FP32 scale for the quantized activation block.
+     * @param scale_bits FP16 weight scale bits for the low or complete block.
+     * @param secondary_bits FP16 asymmetric minimum or high-half scale bits.
+     * @param emin_bits Packed Q2_K low/high asymmetric-minimum FP16 bits.
+     * @param activation_sum Sum of all 32 quantized activation values.
+     * @param activation_sum_lo Sum of the low sixteen activation values.
+     * @param activation_sum_hi Sum of the high sixteen activation values.
+     * @param iq1m_qh Packed IQ1_M delta-sign bytes from the weight payload.
+     * @param subgroup_sum0 Sum of IQ1_M activation values 0 through 7.
+     * @param subgroup_sum1 Sum of IQ1_M activation values 8 through 15.
+     * @param subgroup_sum2 Sum of IQ1_M activation values 16 through 23.
+     * @param subgroup_sum3 Sum of IQ1_M activation values 24 through 31.
+     * @return Canonically rounded FP32 contribution for this 32-value block.
+     */
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ float
+    native_vnni_block_contribution_from_reduced_terms_rn(
+        int dot_lo,
+        int dot_hi,
+        float activation_scale,
+        uint16_t scale_bits,
+        uint16_t secondary_bits,
+        uint32_t emin_bits,
+        int activation_sum,
+        int activation_sum_lo,
+        int activation_sum_hi,
+        uint16_t iq1m_qh,
+        int subgroup_sum0,
+        int subgroup_sum1,
+        int subgroup_sum2,
+        int subgroup_sum3)
+    {
+        using Traits = CodebookTraits<CODEBOOK_ID>;
+
+        if constexpr (Traits::is_dual_scale)
+        {
+            const float scale_lo = fp16_bits_to_float(scale_bits);
+            const float scale_hi = fp16_bits_to_float(secondary_bits);
+            const float dot_term = __fadd_rn(
+                __fmul_rn(scale_lo, static_cast<float>(dot_lo)),
+                __fmul_rn(scale_hi, static_cast<float>(dot_hi)));
+            float contribution = __fmul_rn(activation_scale, dot_term);
+
+            if constexpr (Traits::is_dual_scale_asym)
+            {
+                const float min_lo =
+                    fp16_bits_to_float(static_cast<uint16_t>(emin_bits));
+                const float min_hi =
+                    fp16_bits_to_float(static_cast<uint16_t>(emin_bits >> 16));
+                const float min_term = __fadd_rn(
+                    __fmul_rn(
+                        min_lo,
+                        static_cast<float>(activation_sum_lo)),
+                    __fmul_rn(
+                        min_hi,
+                        static_cast<float>(activation_sum_hi)));
+                contribution = __fadd_rn(
+                    contribution,
+                    __fmul_rn(activation_scale, min_term));
+            }
+
+            if constexpr (Traits::is_iq1_m)
+            {
+                constexpr float kIQ1MDelta = 0.125f;
+                const uint8_t qh0 = static_cast<uint8_t>(iq1m_qh);
+                const uint8_t qh1 =
+                    static_cast<uint8_t>(iq1m_qh >> 8);
+                const float delta0 =
+                    (qh0 & 0x08) ? -kIQ1MDelta : kIQ1MDelta;
+                const float delta1 =
+                    (qh0 & 0x80) ? -kIQ1MDelta : kIQ1MDelta;
+                const float delta2 =
+                    (qh1 & 0x08) ? -kIQ1MDelta : kIQ1MDelta;
+                const float delta3 =
+                    (qh1 & 0x80) ? -kIQ1MDelta : kIQ1MDelta;
+                const float low_delta = __fmul_rn(
+                    __fadd_rn(
+                        __fmul_rn(
+                            delta0,
+                            static_cast<float>(subgroup_sum0)),
+                        __fmul_rn(
+                            delta1,
+                            static_cast<float>(subgroup_sum1))),
+                    scale_lo);
+                const float high_delta = __fmul_rn(
+                    __fadd_rn(
+                        __fmul_rn(
+                            delta2,
+                            static_cast<float>(subgroup_sum2)),
+                        __fmul_rn(
+                            delta3,
+                            static_cast<float>(subgroup_sum3))),
+                    scale_hi);
+                contribution = __fadd_rn(
+                    contribution,
+                    __fmul_rn(
+                        activation_scale,
+                        __fadd_rn(low_delta, high_delta)));
+            }
+
+            return contribution;
+        }
+        else
+        {
+            const float weight_scale = fp16_bits_to_float(scale_bits);
+            float contribution = __fmul_rn(
+                __fmul_rn(activation_scale, weight_scale),
+                static_cast<float>(dot_lo));
+
+            if constexpr (Traits::is_asymmetric)
+            {
+                const float weight_min =
+                    fp16_bits_to_float(secondary_bits);
+                contribution = __fadd_rn(
+                    contribution,
+                    __fmul_rn(
+                        __fmul_rn(activation_scale, weight_min),
+                        static_cast<float>(activation_sum)));
+            }
+
+            return contribution;
+        }
+    }
+
     __device__ __forceinline__ uint32_t load_payload_word(const uint8_t *payload, int group_idx)
     {
         return *reinterpret_cast<const uint32_t *>(payload + (group_idx & 3) * 4);

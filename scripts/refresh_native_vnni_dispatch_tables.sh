@@ -6768,7 +6768,7 @@ refresh_cpu_decode() {
       --policy-json "${cpu_decode_policy_json}" \
       --include "${cpu_decode_inc}"
     if (( install )); then
-      local target="${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIDecodePolicyGenerated.inc"
+      local target="${repo_root}/src/v2/kernels/cpu/gemm/CPUNativeVNNIDecodePolicyGenerated.inc"
       run_cmd cp "${cpu_decode_inc}" "${target}.inprogress"
       run_cmd mv "${target}.inprogress" "${target}"
       rebuild_cpu_native_vnni_trainer "${cpu_avx2_sweep_bin}"
@@ -6798,7 +6798,7 @@ refresh_cpu_decode() {
 }
 
 authenticate_completed_cpu_decode() {
-  local installed_inc="${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIDecodePolicyGenerated.inc"
+  local installed_inc="${repo_root}/src/v2/kernels/cpu/gemm/CPUNativeVNNIDecodePolicyGenerated.inc"
 
   # The continuation boundary is deliberately stronger than a file-exists
   # checkpoint. The policy validator authenticates sealed certification and
@@ -7371,7 +7371,7 @@ refresh_cpu() {
       "${cpu_final_profiler_features}"
 
     if (( install )); then
-      local cpu_install_target="${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIVerifierRowsPolicyGenerated.inc"
+      local cpu_install_target="${repo_root}/src/v2/kernels/cpu/gemm/CPUNativeVNNIVerifierRowsPolicyGenerated.inc"
       run_cmd cp "${cpu_inc}" "${cpu_install_target}.inprogress"
       run_cmd mv "${cpu_install_target}.inprogress" "${cpu_install_target}"
     fi
@@ -7413,7 +7413,7 @@ refresh_cpu() {
     "${cpu_profiler_features}" "${cpu_profiler_raw}"
 
   if (( install )); then
-    run_cmd cp "${cpu_inc}" "${repo_root}/src/v2/kernels/cpu/native_vnni/CPUNativeVNNIVerifierRowsPolicyGenerated.inc"
+    run_cmd cp "${cpu_inc}" "${repo_root}/src/v2/kernels/cpu/gemm/CPUNativeVNNIVerifierRowsPolicyGenerated.inc"
   fi
   finish_backend_collection_target
 }

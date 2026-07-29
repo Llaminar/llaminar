@@ -1854,63 +1854,6 @@ namespace llaminar2
 #endif
     }
 
-    bool NCCLBackend::allgatherMultiOnStreams(
-        const std::vector<const void *> &send_bufs,
-        const std::vector<void *> &recv_bufs,
-        size_t send_count,
-        CollectiveDataType dtype,
-        const std::vector<void *> &streams)
-    {
-#ifdef HAVE_NCCL
-        if (!initialized_)
-        {
-            last_error_ = "NCCLBackend not initialized";
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        if (!is_multi_gpu_single_process_)
-        {
-            last_error_ = "allgatherMultiOnStreams requires multi-GPU single-process mode";
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        if (send_bufs.size() != static_cast<size_t>(num_ranks_) ||
-            recv_bufs.size() != static_cast<size_t>(num_ranks_) ||
-            streams.size() != static_cast<size_t>(num_ranks_))
-        {
-            last_error_ = "Buffer/stream count does not match GPU count";
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        if (!coordinator_)
-        {
-            last_error_ = "NCCLCoordinator not initialized";
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        if (!coordinator_->allgatherMultiOnStreams(send_bufs, recv_bufs, send_count, dtype, streams))
-        {
-            last_error_ = "NCCLCoordinator allgatherMultiOnStreams failed: " + coordinator_->lastError();
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        return true;
-#else
-        (void)send_bufs;
-        (void)recv_bufs;
-        (void)send_count;
-        (void)dtype;
-        (void)streams;
-        last_error_ = "NCCL not available";
-        return false;
-#endif
-    }
-
     bool NCCLBackend::broadcastMultiOnStreams(
         const std::vector<const void *> &send_bufs,
         const std::vector<void *> &recv_bufs,
@@ -1971,15 +1914,6 @@ namespace llaminar2
     }
 
     bool NCCLBackend::supportsBroadcastMultiOnStreams() const
-    {
-#ifdef HAVE_NCCL
-        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
-#else
-        return false;
-#endif
-    }
-
-    bool NCCLBackend::supportsAllgatherMultiOnStreams() const
     {
 #ifdef HAVE_NCCL
         return initialized_ && coordinator_ && is_multi_gpu_single_process_;

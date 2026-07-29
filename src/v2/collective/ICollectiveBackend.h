@@ -1063,39 +1063,6 @@ namespace llaminar2
         virtual bool supportsGroupedP2PSingleDeviceOnStream() const { return false; }
 
         /**
-         * @brief Multi-GPU AllGather on caller-provided producer streams.
-         *
-         * Enqueues one grouped backend collective over streams[i], where
-         * send_bufs[i] and recv_bufs[i] live on device i. Stream ordering then
-         * provides the full dependency chain:
-         * producer kernels -> allgather -> consumers on the same stream.
-         *
-         * This is the eager LocalTP path for raw graph-visible handoffs. GPU
-         * graph capture uses LocalTPContext's explicit publish-and-sum
-         * allgather transaction so both NCCL and RCCL record the same validated
-         * graph-safe allreduce primitive.
-         */
-        virtual bool allgatherMultiOnStreams(
-            const std::vector<const void *> &send_bufs,
-            const std::vector<void *> &recv_bufs,
-            size_t send_count,
-            CollectiveDataType dtype,
-            const std::vector<void *> &streams)
-        {
-            (void)send_bufs;
-            (void)recv_bufs;
-            (void)send_count;
-            (void)dtype;
-            (void)streams;
-            return false;
-        }
-
-        /**
-         * @brief Whether allgatherMultiOnStreams is available.
-         */
-        virtual bool supportsAllgatherMultiOnStreams() const { return false; }
-
-        /**
          * @brief Multi-GPU Broadcast on caller-provided producer streams.
          *
          * Enqueues one grouped backend broadcast over streams[i]. This is the

@@ -178,6 +178,73 @@ namespace llaminar2
                 std::move(tags));
         }
 
+        /**
+         * @brief Record the physical primitive used by a raw LocalTP allgather.
+         *
+         * Raw graph-state handoffs carry planner metadata, recurrent state, and
+         * occasionally large expert payloads.  Their telemetry must therefore
+         * distinguish a native NCCL/RCCL allgather from any emulation that
+         * increases traffic or introduces a host rendezvous.
+         */
+        void recordLocalTPRuntimeRawAllgather(
+            const DeviceGroup &device_group,
+            CollectiveBackendType backend,
+            const DeviceId &device,
+            const std::string &stage_name,
+            size_t degree,
+            int device_index,
+            size_t elements,
+            CollectiveDataType dtype,
+            bool graph_capture)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+
+            const size_t element_bytes = collectiveDataTypeBytes(dtype);
+            const size_t local_bytes = elements * element_bytes;
+            const size_t result_elements = elements * degree;
+            PerfStatsCollector::Tags tags{
+                {"stage", stage_name.empty() ? "unnamed" : stage_name},
+                {"backend", collectiveBackendTypeToString(backend)},
+                {"scope", "local"},
+                {"degree", std::to_string(degree)},
+                {"device_index", std::to_string(device_index)},
+                {"dtype", collectiveDataTypeName(dtype)},
+                {"element_bytes", std::to_string(element_bytes)},
+                {"elements", std::to_string(elements)},
+                {"result_elements", std::to_string(result_elements)},
+                {"path", "native_single_device_on_stream"},
+                {"backend_primitive",
+                 backend == CollectiveBackendType::NCCL
+                     ? "ncclAllGather"
+                     : "rcclAllGather"},
+                {"graph_capture", graph_capture ? "true" : "false"},
+                {"host_rendezvous", "false"},
+                {"homogeneous", device_group.is_homogeneous ? "true" : "false"}};
+
+            PerfStatsCollector::addCounter(
+                "tp_raw_allgather_runtime",
+                "calls",
+                1.0,
+                {},
+                device.toString(),
+                tags);
+            PerfStatsCollector::addCounter(
+                "tp_raw_allgather_runtime",
+                "local_bytes",
+                static_cast<double>(local_bytes),
+                {},
+                device.toString(),
+                tags);
+            PerfStatsCollector::addCounter(
+                "tp_raw_allgather_runtime",
+                "result_bytes",
+                static_cast<double>(result_elements * element_bytes),
+                {},
+                device.toString(),
+                std::move(tags));
+        }
+
         size_t sidebandResultElements(
             LocalTPCollectiveSidebandKind kind,
             size_t element_count,
@@ -777,7 +844,6 @@ namespace llaminar2
         // Wake any threads blocked on the barrier condition variable
         barrier_cv_.notify_all();
         grouped_onstream_allreduce_cv_.notify_all();
-        raw_allgather_cv_.notify_all();
     }
 
     const std::vector<GlobalDeviceAddress> &LocalTPContext::devices() const
@@ -1800,7 +1866,7 @@ namespace llaminar2
             return false;
         if (!backend_impl_->isMultiGpuSingleProcess())
             return false;
-        return backend_impl_->supportsAllreduceSingleDeviceOnStream();
+        return backend_impl_->supportsAllgatherSingleDeviceOnStream();
     }
 
     bool LocalTPContext::supportsCollectiveSidebandOnStreamGraphCapture() const
@@ -2903,155 +2969,48 @@ namespace llaminar2
             return false;
         }
 
-        if (isGraphCaptureActive())
+        if (!backend_impl_->supportsAllgatherSingleDeviceOnStream())
         {
-            if (!supportsRawAllgatherOnStreamGraphCapture())
-            {
-                LOG_ERROR("LocalTPContext::allgatherRawOnStream: backend cannot capture raw allgather on explicit stream"
-                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                          << " backend=" << collectiveBackendTypeToString(backend_));
-                return false;
-            }
-
-            /*
-             * Graph-captured LocalTP raw allgather is implemented as a
-             * deterministic publish-and-sum transaction on both NCCL and RCCL:
-             *
-             *   1. Each participant zeroes its full receive buffer.
-             *   2. Each participant copies its local payload into its own
-             *      disjoint receive slice on the same explicit stream.
-             *   3. The validated graph-captured allreduce primitive sums the
-             *      full buffers so every participant receives every slice.
-             *
-             * This keeps the maintenance graphs on one graph-safe collective
-             * primitive and avoids backend-specific allgather replay behavior
-             * from deciding whether the MoE rebalance planner sees its peer
-             * histograms.
-             */
-            const size_t element_bytes = collectiveDataTypeBytes(dtype);
-            if (element_bytes == 0)
-            {
-                LOG_ERROR("LocalTPContext::allgatherRawOnStream: unsupported dtype"
-                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                          << " dtype=" << static_cast<int>(dtype));
-                return false;
-            }
-            const size_t degree_size = static_cast<size_t>(degree());
-            const size_t local_bytes = send_count * element_bytes;
-            const size_t full_count = send_count * degree_size;
-            const size_t full_bytes = full_count * element_bytes;
-            auto *recv_bytes = static_cast<unsigned char *>(full_recv);
-            const auto *send_bytes = static_cast<const unsigned char *>(local_send);
-            const auto *recv_begin = recv_bytes;
-            const auto *recv_end = recv_bytes + full_bytes;
-            const auto *send_begin = send_bytes;
-            const auto *send_end = send_bytes + local_bytes;
-            const char *backend_name =
-                backend_ == CollectiveBackendType::NCCL ? "NCCL" : "RCCL";
-            if (send_begin < recv_end && recv_begin < send_end)
-            {
-                LOG_ERROR("LocalTPContext::allgatherRawOnStream: graph-captured allreduce emulation requires non-overlapping send/recv buffers"
-                          << " backend=" << backend_name
-                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
-                return false;
-            }
-
-            const int ordinal = devices_[static_cast<size_t>(device_index)].device_ordinal;
-            bool device_ops_ok = false;
-            if (backend_ == CollectiveBackendType::NCCL)
-            {
-#ifdef HAVE_CUDA
-                device_ops_ok = nccl_backend_detail::cudaSetDeviceOrdinal(ordinal) &&
-                                nccl_backend_detail::cudaMemsetAsyncDevice(
-                                    full_recv,
-                                    0,
-                                    full_bytes,
-                                    ordinal,
-                                    producer_stream);
-                if (device_ops_ok)
-                {
-                    void *slice =
-                        recv_bytes + static_cast<size_t>(device_index) * local_bytes;
-                    device_ops_ok = nccl_backend_detail::cudaMemcpyAsyncSameDevice(
-                        slice,
-                        local_send,
-                        local_bytes,
-                        ordinal,
-                        producer_stream);
-                }
-#else
-                (void)ordinal;
-                device_ops_ok = false;
-#endif
-            }
-            else
-            {
-#ifdef HAVE_ROCM
-                device_ops_ok = rccl_backend_detail::hipSetDeviceOrdinal(ordinal) &&
-                                rccl_backend_detail::hipMemsetAsyncDevice(
-                                    full_recv,
-                                    0,
-                                    full_bytes,
-                                    ordinal,
-                                    producer_stream);
-                if (device_ops_ok)
-                {
-                    void *slice =
-                        recv_bytes + static_cast<size_t>(device_index) * local_bytes;
-                    device_ops_ok = rccl_backend_detail::hipMemcpyAsyncSameDevice(
-                        slice,
-                        local_send,
-                        local_bytes,
-                        ordinal,
-                        producer_stream);
-                }
-#else
-                (void)ordinal;
-                device_ops_ok = false;
-#endif
-            }
-            if (!device_ops_ok)
-            {
-                LOG_ERROR("LocalTPContext::allgatherRawOnStream: graph-captured local slice publication failed"
-                          << " backend=" << backend_name
-                          << " ordinal=" << ordinal
-                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
-                return false;
-            }
-
-            const std::string emulated_allreduce_stage =
-                (stage_name.empty() ? std::string("raw_allgather")
-                                    : stage_name) +
-                (backend_ == CollectiveBackendType::NCCL
-                     ? "_nccl_graph_allgather_sum"
-                     : "_rccl_graph_allgather_sum");
-            if (!allreduceGroupedOnExplicitStreams(
-                    full_recv,
-                    full_count,
-                    dtype,
-                    device_index,
-                    producer_stream,
-                    emulated_allreduce_stage,
-                    "raw_allgather_emulation",
-                    nullptr))
-            {
-                LOG_ERROR("LocalTPContext::allgatherRawOnStream: allreduce-backed graph allgather emulation failed"
-                          << " backend=" << backend_name
-                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                          << " backend_error=" << backend_impl_->lastError());
-                return false;
-            }
-            return true;
+            LOG_ERROR("LocalTPContext::allgatherRawOnStream: backend does not support native allgather on the producer stream"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend=" << collectiveBackendTypeToString(backend_));
+            return false;
         }
 
-        return allgatherRawWithBarrierMultiGpu(
-            local_send,
-            full_recv,
+        /*
+         * There is deliberately one GPU raw-allgather path.  NCCL/RCCL enqueue
+         * the native collective directly on each participant's producer stream,
+         * which provides producer -> collective -> consumer ordering in eager
+         * execution and records that same ordering into a captured graph.  A
+         * host rendezvous would add contention and an allreduce-based emulation
+         * would multiply traffic for the large LLEP expert payload.
+         */
+        if (!backend_impl_->allgatherSingleDeviceOnStream(
+                local_send,
+                full_recv,
+                send_count,
+                dtype,
+                device_index,
+                producer_stream))
+        {
+            LOG_ERROR("LocalTPContext::allgatherRawOnStream: native on-stream allgather failed"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " backend_error=" << backend_impl_->lastError());
+            return false;
+        }
+
+        recordLocalTPRuntimeRawAllgather(
+            device_group_,
+            backend_,
+            devices_[static_cast<size_t>(device_index)].toLocalDeviceId(),
+            stage_name,
+            static_cast<size_t>(degree()),
+            device_index,
             send_count,
             dtype,
-            device_index,
-            producer_stream,
-            stage_name);
+            isGraphCaptureActive());
+        return true;
     }
 
     bool LocalTPContext::groupedP2PRawOnStream(
@@ -3154,168 +3113,6 @@ namespace llaminar2
             return false;
         }
         return true;
-    }
-
-    bool LocalTPContext::allgatherRawWithBarrierMultiGpu(
-        const void *local_send,
-        void *full_recv,
-        size_t send_count,
-        CollectiveDataType dtype,
-        int device_index,
-        void *producer_stream,
-        const std::string &stage_name)
-    {
-        const int num_participants = degree();
-
-        std::unique_lock<std::mutex> lock(raw_allgather_mutex_);
-
-        raw_allgather_cv_.wait(lock, [&]()
-                               { return abort_requested_.load(std::memory_order_acquire) ||
-                                        raw_allgather_departures_ == 0; });
-        if (abort_requested_.load(std::memory_order_acquire))
-            return false;
-
-        const uint64_t my_generation = raw_allgather_generation_;
-
-        auto reset_generation_state = [&]()
-        {
-            raw_allgather_arrivals_ = 0;
-            raw_allgather_departures_ = 0;
-            raw_allgather_send_buffers_.clear();
-            raw_allgather_recv_buffers_.clear();
-            raw_allgather_producer_streams_.clear();
-            raw_allgather_stage_name_.clear();
-            raw_allgather_send_count_ = 0;
-        };
-
-        auto depart_generation = [&]()
-        {
-            if (raw_allgather_departures_ > 0)
-                --raw_allgather_departures_;
-            if (raw_allgather_departures_ == 0)
-            {
-                reset_generation_state();
-                raw_allgather_cv_.notify_all();
-            }
-        };
-
-        auto abort_generation = [&]()
-        {
-            raw_allgather_result_ = false;
-            reset_generation_state();
-            raw_allgather_generation_++;
-            lock.unlock();
-            raw_allgather_cv_.notify_all();
-        };
-
-        if (raw_allgather_arrivals_ == 0)
-        {
-            raw_allgather_send_buffers_.assign(num_participants, nullptr);
-            raw_allgather_recv_buffers_.assign(num_participants, nullptr);
-            raw_allgather_producer_streams_.assign(num_participants, nullptr);
-            raw_allgather_stage_name_ = stage_name;
-            raw_allgather_send_count_ = send_count;
-            raw_allgather_dtype_ = dtype;
-            raw_allgather_result_ = false;
-        }
-        else if (raw_allgather_stage_name_ != stage_name ||
-                 raw_allgather_send_count_ != send_count ||
-                 raw_allgather_dtype_ != dtype)
-        {
-            LOG_ERROR("LocalTPContext::allgatherRawWithBarrierMultiGpu: mismatched participant contract"
-                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                      << " expected_stage=" << (raw_allgather_stage_name_.empty() ? "(none)" : raw_allgather_stage_name_)
-                      << " send_count=" << send_count
-                      << " expected_send_count=" << raw_allgather_send_count_
-                      << " dtype=" << collectiveDataTypeName(dtype)
-                      << " expected_dtype=" << collectiveDataTypeName(raw_allgather_dtype_));
-            abort_generation();
-            return false;
-        }
-
-        if (raw_allgather_send_buffers_[device_index] ||
-            raw_allgather_recv_buffers_[device_index] ||
-            raw_allgather_producer_streams_[device_index])
-        {
-            LOG_ERROR("LocalTPContext::allgatherRawWithBarrierMultiGpu: duplicate participant"
-                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                      << " device_index=" << device_index);
-            abort_generation();
-            return false;
-        }
-
-        raw_allgather_send_buffers_[device_index] = local_send;
-        raw_allgather_recv_buffers_[device_index] = full_recv;
-        raw_allgather_producer_streams_[device_index] = producer_stream;
-        raw_allgather_arrivals_++;
-
-        if (raw_allgather_arrivals_ == num_participants)
-        {
-            for (int i = 0; i < num_participants; ++i)
-            {
-                if (!raw_allgather_send_buffers_[i] ||
-                    !raw_allgather_recv_buffers_[i] ||
-                    !raw_allgather_producer_streams_[i])
-                {
-                    LOG_ERROR("LocalTPContext::allgatherRawWithBarrierMultiGpu: missing participant buffer"
-                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                              << " slot=" << i);
-                    abort_generation();
-                    return false;
-                }
-            }
-
-            LOG_DEBUG("LocalTPContext::allgatherRawWithBarrierMultiGpu: launching explicit-stream allgather"
-                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                      << " participants=" << num_participants
-                      << " send_count=" << send_count
-                      << " dtype=" << collectiveDataTypeName(dtype));
-
-            bool success = false;
-            if (!backend_impl_ || !backend_impl_->supportsAllgatherMultiOnStreams())
-            {
-                LOG_ERROR("LocalTPContext::allgatherRawWithBarrierMultiGpu: backend "
-                          << collectiveBackendTypeToString(backend_)
-                          << " does not support explicit-stream raw allgather"
-                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
-            }
-            else
-            {
-                success = backend_impl_->allgatherMultiOnStreams(
-                    raw_allgather_send_buffers_,
-                    raw_allgather_recv_buffers_,
-                    send_count,
-                    dtype,
-                    raw_allgather_producer_streams_);
-            }
-            if (!success)
-            {
-                LOG_ERROR("LocalTPContext::allgatherRawWithBarrierMultiGpu: allgatherMultiOnStreams failed"
-                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                          << " error=" << (backend_impl_ ? backend_impl_->lastError() : std::string("missing backend")));
-            }
-
-            raw_allgather_result_ = success;
-            raw_allgather_departures_ = num_participants;
-            raw_allgather_generation_++;
-            depart_generation();
-            const bool result = raw_allgather_result_;
-            lock.unlock();
-            raw_allgather_cv_.notify_all();
-            return result;
-        }
-
-        raw_allgather_cv_.wait(lock, [&]()
-                               { return abort_requested_.load(std::memory_order_acquire) ||
-                                        raw_allgather_generation_ != my_generation; });
-        if (abort_requested_.load(std::memory_order_acquire))
-        {
-            depart_generation();
-            return false;
-        }
-        const bool result = raw_allgather_result_;
-        depart_generation();
-        return result;
     }
 
     bool LocalTPContext::gatherFromDevices(

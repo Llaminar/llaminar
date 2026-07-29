@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "loaders/PreparedWeightStore.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "../../utils/PreparedWeightTestHarness.h"
 

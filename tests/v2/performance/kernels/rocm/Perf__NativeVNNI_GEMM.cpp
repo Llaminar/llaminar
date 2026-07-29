@@ -698,6 +698,42 @@ namespace
         return values;
     }
 
+    /**
+     * @brief Parse a comma-separated environment variable into integer values.
+     *
+     * Performance tuning frequently needs to isolate one format and one row
+     * count so a profiler trace contains exactly the launch under study.  Keep
+     * that selection inside the stable focused harness instead of creating
+     * one-off binaries whose allocation or launch behavior can drift from the
+     * production wrapper.
+     *
+     * @param name Environment-variable name.
+     * @return Parsed values. Invalid tokens are ignored; an unset variable
+     *         returns an empty set, which callers interpret as "run all".
+     */
+    static std::set<int> getEnvCsvIntSet(const char *name)
+    {
+        std::set<int> values;
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return values;
+
+        std::stringstream stream(raw);
+        std::string token;
+        while (std::getline(stream, token, ','))
+        {
+            token = trim(token);
+            if (token.empty())
+                continue;
+
+            char *end = nullptr;
+            const long value = std::strtol(token.c_str(), &end, 10);
+            if (end != token.c_str() && *end == '\0' && value > 0)
+                values.insert(static_cast<int>(value));
+        }
+        return values;
+    }
+
     static bool shouldRunName(const std::set<std::string> &filters, const std::string &name)
     {
         return filters.empty() || filters.count(toLower(name)) != 0;
@@ -2087,6 +2123,29 @@ namespace
             GTEST_SKIP() << "No ROCm device available";
 
         const GEMMShape shape{"3B_FFN_Up", 11008, 2048};
+        const std::set<std::string> format_filters =
+            getEnvCsvSet("LLAMINAR_ROCM_NVNNI_FOCUSED_FORMATS");
+        const std::set<int> m_filters =
+            getEnvCsvIntSet("LLAMINAR_ROCM_NVNNI_FOCUSED_M");
+
+        std::vector<int> selected_format_indices;
+        for (int fi = 0; fi < static_cast<int>(GEMM_FORMATS.size()); ++fi)
+        {
+            if (shouldRunName(format_filters, GEMM_FORMATS[fi].name))
+                selected_format_indices.push_back(fi);
+        }
+
+        std::vector<int> selected_m_indices;
+        for (int mi = 0; mi < static_cast<int>(M_VALUES.size()); ++mi)
+        {
+            if (m_filters.empty() || m_filters.count(M_VALUES[mi]) != 0)
+                selected_m_indices.push_back(mi);
+        }
+
+        ASSERT_FALSE(selected_format_indices.empty())
+            << "LLAMINAR_ROCM_NVNNI_FOCUSED_FORMATS selected no format";
+        ASSERT_FALSE(selected_m_indices.empty())
+            << "LLAMINAR_ROCM_NVNNI_FOCUSED_M selected no row count";
 
         fprintf(stderr, "\n[NativeVNNI GEMM] Focused: %s (N=%d K=%d) using %d GPU(s)\n",
                 shape.name.c_str(), shape.N, shape.K, NUM_GPUS);
@@ -2096,7 +2155,7 @@ namespace
         std::vector<double> int8_refs(M_VALUES.size(), 0.0);
         {
             std::vector<std::thread> threads;
-            for (int mi = 0; mi < (int)M_VALUES.size(); ++mi)
+            for (const int mi : selected_m_indices)
             {
                 int g = mi % NUM_GPUS;
                 threads.emplace_back([&, mi, g]()
@@ -2119,8 +2178,8 @@ namespace
             double cost;
         };
         std::vector<WorkItem> items;
-        for (int fi = 0; fi < (int)GEMM_FORMATS.size(); ++fi)
-            for (int mi = 0; mi < (int)M_VALUES.size(); ++mi)
+        for (const int fi : selected_format_indices)
+            for (const int mi : selected_m_indices)
                 items.push_back({fi, mi, (double)shape.N * shape.K * M_VALUES[mi]});
 
         std::sort(items.begin(), items.end(),
@@ -2133,8 +2192,8 @@ namespace
 
         // Results indexed by (format_idx * num_m + m_idx)
         const size_t num_m = M_VALUES.size();
-        const size_t total = GEMM_FORMATS.size() * num_m;
-        std::vector<GEMMBenchResult> results(total);
+        const size_t total = items.size();
+        std::vector<GEMMBenchResult> results(GEMM_FORMATS.size() * num_m);
         std::atomic<int> done_count{0};
 
         {
@@ -2211,9 +2270,9 @@ namespace
         for (int c = 1; c <= 9; ++c)
             table.column(c).set_cell_text_align(fort::text_align::right);
 
-        for (int fi = 0; fi < (int)GEMM_FORMATS.size(); ++fi)
+        for (const int fi : selected_format_indices)
         {
-            for (int mi = 0; mi < (int)num_m; ++mi)
+            for (const int mi : selected_m_indices)
             {
                 size_t idx = fi * num_m + mi;
                 const auto &r = results[idx];

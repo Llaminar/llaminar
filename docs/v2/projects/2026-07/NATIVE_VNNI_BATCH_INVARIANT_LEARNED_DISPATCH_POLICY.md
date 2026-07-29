@@ -124,7 +124,7 @@ repeat-byte mismatches. The compiler emitted 1,944 exact policies plus the
 cross-validated generic policy into:
 
 ```text
-src/v2/kernels/cpu/native_vnni/CPUNativeVNNIVerifierRowsPolicyGenerated.inc
+src/v2/kernels/cpu/gemm/CPUNativeVNNIVerifierRowsPolicyGenerated.inc
 ```
 
 That artifact does **not** certify the expanded speculative-depth envelope and
@@ -2958,8 +2958,8 @@ Primary migration surfaces:
 
 - `tests/v2/performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_GEMV.cpp`
 - `tests/v2/performance/kernels/cpu/analyze_cpu_native_vnni_verifier_trainer.py`
-- `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemv.h`
-- `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIVerifierRowsPolicyGenerated.inc`
+- `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemv.h`
+- `src/v2/kernels/cpu/gemm/CPUNativeVNNIVerifierRowsPolicyGenerated.inc`
 - CPU fused and MoE callers in `CPUNativeVNNIGemmKernel.h`
 
 ## 15. Transactional Retune and Installation
@@ -3835,10 +3835,10 @@ CPU:
 - `tests/v2/performance/kernels/cpu/analyze_cpu_native_vnni_decode_trainer.py`
 - `tests/v2/performance/kernels/cpu/analyze_cpu_native_vnni_verifier_trainer.py`
 - `tests/v2/performance/kernels/cpu/analyze_cpu_native_vnni_prefill_trainer.py`
-- `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemv.h`
-- `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h`
-- `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIDecodePolicyGenerated.inc`
-- `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIVerifierRowsPolicyGenerated.inc`
+- `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemv.h`
+- `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h`
+- `src/v2/kernels/cpu/gemm/CPUNativeVNNIDecodePolicyGenerated.inc`
+- `src/v2/kernels/cpu/gemm/CPUNativeVNNIVerifierRowsPolicyGenerated.inc`
 
 Canonical integration coverage:
 

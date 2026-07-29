@@ -35,6 +35,7 @@
 #include "backends/IBackend.h"
 #include "backends/IGPUGraphCapture.h"
 #include "execution/mtp/MTPRejectionSampler.h"
+#include "execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "kernels/common/SamplingMath.h"
 #include "utils/Sampler.h"
 
@@ -1832,6 +1833,410 @@ namespace
             EXPECT_EQ(gpu_tokens[i], expected_tokens[i]) << "token index " << i;
 
         cleanup();
+    }
+
+    /**
+     * @brief Proves the captured grouped greedy penalty path is serial-decode exact.
+     *
+     * The production verifier does not replay rows through the host sampler.  It
+     * reads a persistent device histogram, extends that history with only the
+     * speculative prefix visible to each row, reduces every row in parallel,
+     * summarizes the accepted prefix, and commits emitted tokens back into the
+     * histogram.  This regression captures that complete sequence so either
+     * backend cannot accidentally preserve correct row argmax while corrupting
+     * the state consumed by the next MTP transaction.
+     */
+    TEST_P(GPUSamplingTest,
+           MTPPenaltyGroupedOutcomeAndHistoryAreSerialDecodeByteExact)
+    {
+        using namespace sampling_math;
+
+        constexpr int vocab_size = 257;
+        constexpr int partial_capacity = 1024;
+        constexpr float presence_penalty = 0.75f;
+        constexpr float frequency_penalty = 0.50f;
+        constexpr std::array<int, 4> grouped_rows = {2, 4, 8, 16};
+
+        auto run_backend_case = [&](IWorkerGPUContext &ctx,
+                                    int rows,
+                                    bool first_token_already_in_history)
+        {
+            const int compare_rows = rows - 1;
+            std::vector<int> draft_tokens(static_cast<size_t>(rows));
+            for (int row = 0; row < rows; ++row)
+            {
+                // Reusing three token ids makes later rows exercise increasing
+                // frequency penalties rather than only binary presence state.
+                draft_tokens[static_cast<size_t>(row)] = 20 + (row % 3);
+            }
+
+            std::vector<int> initial_counts(
+                static_cast<size_t>(vocab_size),
+                0);
+            initial_counts[3] = 2;
+            initial_counts[5] = 1;
+            initial_counts[11] = 3;
+            if (first_token_already_in_history)
+            {
+                // A pending terminal token was emitted by the preceding
+                // transaction.  The grouped verifier must neither score nor
+                // commit that first token twice.
+                ++initial_counts[static_cast<size_t>(draft_tokens[0])];
+            }
+
+            std::vector<float> logits(
+                static_cast<size_t>(rows) *
+                    static_cast<size_t>(vocab_size),
+                -50.0f);
+            for (int row = 0; row < rows; ++row)
+            {
+                float *row_logits =
+                    logits.data() +
+                    static_cast<size_t>(row) *
+                        static_cast<size_t>(vocab_size);
+                if (row < compare_rows - 1)
+                {
+                    // Accept all early drafts.  The large margin keeps these
+                    // rows focused on cumulative duplicate-token frequency.
+                    row_logits[draft_tokens[static_cast<size_t>(row + 1)]] =
+                        20.0f;
+                    row_logits[70 + row] = 18.0f;
+                }
+                else if (row == compare_rows - 1)
+                {
+                    // Without the speculative-prefix penalty, the repeated
+                    // token wins.  Serial history lowers it below the new token
+                    // and deliberately terminates the accepted prefix.
+                    row_logits[draft_tokens[static_cast<size_t>(row)]] = 7.10f;
+                    row_logits[100 + row] = 6.00f;
+                }
+                else
+                {
+                    // The terminal bonus row also proves deterministic
+                    // lowest-token tie breaking after fused penalty scoring.
+                    row_logits[200] = 13.0f;
+                    row_logits[201] = 13.0f;
+                }
+            }
+
+            std::vector<float> expected_values(static_cast<size_t>(rows));
+            std::vector<int> expected_indices(static_cast<size_t>(rows), -1);
+            const int prefix_begin =
+                first_token_already_in_history ? 1 : 0;
+            for (int row = 0; row < rows; ++row)
+            {
+                float best_value = -std::numeric_limits<float>::max();
+                int best_token = std::numeric_limits<int>::max();
+                for (int token = 0; token < vocab_size; ++token)
+                {
+                    float value =
+                        logits[static_cast<size_t>(row) *
+                                   static_cast<size_t>(vocab_size) +
+                               static_cast<size_t>(token)];
+                    int count =
+                        initial_counts[static_cast<size_t>(token)];
+                    for (int history_index = prefix_begin;
+                         history_index <= row;
+                         ++history_index)
+                    {
+                        count +=
+                            draft_tokens[static_cast<size_t>(history_index)] ==
+                                    token
+                                ? 1
+                                : 0;
+                    }
+                    if (count > 0)
+                    {
+                        float penalty = 0.0f;
+                        penalty += presence_penalty;
+                        const float frequency_component =
+                            frequency_penalty *
+                            static_cast<float>(count);
+                        penalty += frequency_component;
+                        value -= penalty;
+                    }
+                    if (value > best_value ||
+                        (value == best_value && token < best_token))
+                    {
+                        best_value = value;
+                        best_token = token;
+                    }
+                }
+                expected_values[static_cast<size_t>(row)] = best_value;
+                expected_indices[static_cast<size_t>(row)] = best_token;
+            }
+
+            std::array<int, kSpeculativeBatchMaxOutputTokens>
+                expected_output_tokens{};
+            std::array<int, kSpeculativeBatchMetaCount>
+                expected_output_meta{};
+            summarize_greedy_speculative_verify_batch(
+                draft_tokens[0],
+                expected_indices.data(),
+                draft_tokens.data(),
+                compare_rows,
+                /*stop_tokens=*/nullptr,
+                /*stop_token_count=*/0,
+                expected_output_tokens.data(),
+                static_cast<int>(expected_output_tokens.size()),
+                expected_output_meta.data());
+            ASSERT_EQ(expected_output_meta[kSpecBatchMetaOk], 1);
+
+            std::vector<int> expected_counts = initial_counts;
+            const int commit_begin =
+                first_token_already_in_history ? 1 : 0;
+            const int output_count =
+                expected_output_meta[kSpecBatchMetaOutputCount];
+            for (int index = commit_begin; index < output_count; ++index)
+            {
+                const int token =
+                    expected_output_tokens[static_cast<size_t>(index)];
+                ASSERT_GE(token, 0);
+                ASSERT_LT(token, vocab_size);
+                ++expected_counts[static_cast<size_t>(token)];
+            }
+
+            void *d_logits = nullptr;
+            void *d_argmax_values = nullptr;
+            void *d_argmax_indices = nullptr;
+            void *d_partial_values = nullptr;
+            void *d_partial_indices = nullptr;
+            void *d_draft_tokens = nullptr;
+            void *d_output_tokens = nullptr;
+            void *d_output_meta = nullptr;
+            void *d_policy = nullptr;
+            void *d_counts = nullptr;
+            auto cleanup = [&]()
+            {
+                void *ptrs[] = {
+                    d_logits,
+                    d_argmax_values,
+                    d_argmax_indices,
+                    d_partial_values,
+                    d_partial_indices,
+                    d_draft_tokens,
+                    d_output_tokens,
+                    d_output_meta,
+                    d_policy,
+                    d_counts};
+                for (void *ptr : ptrs)
+                {
+                    if (ptr)
+                        backend_->free(ptr, device_id_);
+                }
+            };
+
+            d_logits = backend_->allocate(
+                logits.size() * sizeof(float),
+                device_id_);
+            d_argmax_values = backend_->allocate(
+                static_cast<size_t>(rows) * sizeof(float),
+                device_id_);
+            d_argmax_indices = backend_->allocate(
+                static_cast<size_t>(rows) * sizeof(int),
+                device_id_);
+            d_partial_values = backend_->allocate(
+                partial_capacity * sizeof(float),
+                device_id_);
+            d_partial_indices = backend_->allocate(
+                partial_capacity * sizeof(int),
+                device_id_);
+            d_draft_tokens = backend_->allocate(
+                draft_tokens.size() * sizeof(int),
+                device_id_);
+            d_output_tokens = backend_->allocate(
+                expected_output_tokens.size() * sizeof(int),
+                device_id_);
+            d_output_meta = backend_->allocate(
+                expected_output_meta.size() * sizeof(int),
+                device_id_);
+            d_policy = backend_->allocate(
+                sizeof(MTPGreedyPenaltyPolicy),
+                device_id_);
+            d_counts = backend_->allocate(
+                initial_counts.size() * sizeof(int),
+                device_id_);
+
+            ASSERT_NE(d_logits, nullptr);
+            ASSERT_NE(d_argmax_values, nullptr);
+            ASSERT_NE(d_argmax_indices, nullptr);
+            ASSERT_NE(d_partial_values, nullptr);
+            ASSERT_NE(d_partial_indices, nullptr);
+            ASSERT_NE(d_draft_tokens, nullptr);
+            ASSERT_NE(d_output_tokens, nullptr);
+            ASSERT_NE(d_output_meta, nullptr);
+            ASSERT_NE(d_policy, nullptr);
+            ASSERT_NE(d_counts, nullptr);
+
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_logits,
+                    logits.data(),
+                    logits.size() * sizeof(float),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_draft_tokens,
+                    draft_tokens.data(),
+                    draft_tokens.size() * sizeof(int),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_counts,
+                    initial_counts.data(),
+                    initial_counts.size() * sizeof(int),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(
+                    backend_
+                        ->enqueueConfigureMTPGreedyPenaltyPolicyDevice(
+                            d_policy,
+                            presence_penalty,
+                            frequency_penalty,
+                            first_token_already_in_history,
+                            device_id_,
+                            stream));
+                ASSERT_TRUE(
+                    backend_->synchronizeStream(stream, device_id_));
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(
+                    backend_
+                        ->enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+                            d_logits,
+                            rows,
+                            vocab_size,
+                            d_draft_tokens,
+                            d_counts,
+                            d_policy,
+                            device_id_,
+                            stream,
+                            d_argmax_values,
+                            d_argmax_indices,
+                            d_partial_values,
+                            d_partial_indices,
+                            partial_capacity));
+                ASSERT_TRUE(
+                    backend_->enqueueSummarizeGreedySpeculativeVerifyBatch(
+                        d_argmax_indices,
+                        d_draft_tokens,
+                        compare_rows,
+                        draft_tokens[0],
+                        /*stop_tokens=*/nullptr,
+                        /*stop_token_count=*/0,
+                        device_id_,
+                        stream,
+                        static_cast<int>(expected_output_tokens.size()),
+                        d_output_tokens,
+                        d_output_meta));
+                ASSERT_TRUE(
+                    backend_->enqueueCommitMTPGreedyPenaltyHistoryDevice(
+                        d_output_tokens,
+                        d_output_meta,
+                        d_policy,
+                        static_cast<int>(expected_output_tokens.size()),
+                        vocab_size,
+                        d_counts,
+                        device_id_,
+                        stream));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(
+                    backend_->synchronizeStream(stream, device_id_));
+            });
+
+            std::vector<float> actual_values(static_cast<size_t>(rows));
+            std::vector<int> actual_indices(static_cast<size_t>(rows), -1);
+            std::array<int, kSpeculativeBatchMaxOutputTokens>
+                actual_output_tokens{};
+            std::array<int, kSpeculativeBatchMetaCount>
+                actual_output_meta{};
+            std::vector<int> actual_counts(
+                static_cast<size_t>(vocab_size),
+                -1);
+            ASSERT_TRUE(backend_->deviceToHost(
+                actual_values.data(),
+                d_argmax_values,
+                actual_values.size() * sizeof(float),
+                device_id_));
+            ASSERT_TRUE(backend_->deviceToHost(
+                actual_indices.data(),
+                d_argmax_indices,
+                actual_indices.size() * sizeof(int),
+                device_id_));
+            ASSERT_TRUE(backend_->deviceToHost(
+                actual_output_tokens.data(),
+                d_output_tokens,
+                actual_output_tokens.size() * sizeof(int),
+                device_id_));
+            ASSERT_TRUE(backend_->deviceToHost(
+                actual_output_meta.data(),
+                d_output_meta,
+                actual_output_meta.size() * sizeof(int),
+                device_id_));
+            ASSERT_TRUE(backend_->deviceToHost(
+                actual_counts.data(),
+                d_counts,
+                actual_counts.size() * sizeof(int),
+                device_id_));
+
+            EXPECT_EQ(
+                std::memcmp(
+                    actual_values.data(),
+                    expected_values.data(),
+                    actual_values.size() * sizeof(float)),
+                0)
+                << "penalized argmax value bytes diverged for rows=" << rows
+                << " pending_first=" << first_token_already_in_history;
+            EXPECT_EQ(actual_indices, expected_indices);
+            EXPECT_EQ(actual_output_tokens, expected_output_tokens);
+            EXPECT_EQ(actual_output_meta, expected_output_meta);
+            EXPECT_EQ(
+                std::memcmp(
+                    actual_counts.data(),
+                    expected_counts.data(),
+                    actual_counts.size() * sizeof(int)),
+                0)
+                << "persistent history bytes diverged for rows=" << rows
+                << " pending_first=" << first_token_already_in_history;
+
+            cleanup();
+        };
+
+        for (const int rows : grouped_rows)
+        {
+            for (const bool first_token_already_in_history :
+                 {false, true})
+            {
+                if (GetParam() == "CUDA")
+                {
+                    auto &ctx =
+                        GPUDeviceContextPool::instance().getNvidiaContext(
+                            device_id_);
+                    run_backend_case(
+                        ctx,
+                        rows,
+                        first_token_already_in_history);
+                }
+                else
+                {
+                    auto &ctx =
+                        GPUDeviceContextPool::instance().getAMDContext(
+                            device_id_);
+                    run_backend_case(
+                        ctx,
+                        rows,
+                        first_token_already_in_history);
+                }
+            }
+        }
     }
 
     TEST_P(GPUSamplingTest, GreedySpeculativeSummaryQwen36VocabMatchesHostRows)

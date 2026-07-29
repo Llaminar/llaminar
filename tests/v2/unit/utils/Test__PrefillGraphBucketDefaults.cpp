@@ -10,10 +10,12 @@
  */
 
 #include "utils/PrefillGraphBucketDefaults.h"
+#include "../../utils/NativeVNNIEquivalenceInventory.h"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 
 namespace llaminar2
@@ -101,6 +103,125 @@ namespace llaminar2
                 nativeVNNIBatchInvariantTileRows(maximum, maximum, maximum);
 
             EXPECT_EQ(rows, 2);
+        }
+
+        /**
+         * @test Prove row planning remains total across M, N, and K boundaries.
+         *
+         * This is deliberately a Cartesian host-only check. It includes
+         * one-less/exact/one-more alignment points, verifier and tile limits,
+         * graph-prefill sizes, and the largest positive API value. Every
+         * positive geometry must return a usable row tile without overflow,
+         * rejecting the historical assumption that only swept model shapes
+         * need a valid generic decision.
+         */
+        TEST(Test__PrefillGraphBucketDefaults,
+             IsTotalAcrossPositiveMAndGeometryBoundaries)
+        {
+            constexpr int maximum = std::numeric_limits<int>::max();
+            constexpr std::array<int, 12> m_values = {
+                1, 2, 15, 16, 17, 31,
+                32, 127, 128, 129, 4096, maximum};
+            constexpr std::array<int, 10> geometry_values = {
+                1, 31, 32, 33, 127,
+                128, 129, 4095, 4096, maximum};
+
+            for (int m : m_values)
+            {
+                for (int n : geometry_values)
+                {
+                    for (int k : geometry_values)
+                    {
+                        const int rows =
+                            nativeVNNIBatchInvariantTileRows(m, n, k);
+                        EXPECT_GE(rows, 1)
+                            << "M=" << m << " N=" << n << " K=" << k;
+                        EXPECT_LE(rows, m)
+                            << "M=" << m << " N=" << n << " K=" << k;
+                        EXPECT_LE(
+                            rows,
+                            kDefaultNativeVNNIBatchInvariantTileRows)
+                            << "M=" << m << " N=" << n << " K=" << k;
+                        if (m > 1)
+                        {
+                            EXPECT_GE(rows, 2)
+                                << "Positive grouped geometry lost grouped "
+                                   "execution at M="
+                                << m << " N=" << n << " K=" << k;
+                        }
+                    }
+                }
+            }
+        }
+
+        /**
+         * @test Validate the finite GPU byte-equivalence witness construction.
+         */
+        TEST(Test__PrefillGraphBucketDefaults,
+             EquivalenceInventoryExhaustsTileRowsAndBucketBoundaries)
+        {
+            const auto cases =
+                test::nativeVNNIPrefillBucketEquivalenceCases();
+            ASSERT_FALSE(cases.empty());
+
+            int previous_active_rows = 0;
+            for (const auto &test_case : cases)
+            {
+                EXPECT_GT(test_case.active_rows, previous_active_rows);
+                EXPECT_GT(test_case.bucket_rows, test_case.active_rows);
+                EXPECT_TRUE(std::binary_search(
+                    kDefaultPrefillGraphBucketSizes.begin(),
+                    kDefaultPrefillGraphBucketSizes.end(),
+                    test_case.bucket_rows));
+                previous_active_rows = test_case.active_rows;
+            }
+
+            for (int m =
+                     kDefaultNativeVNNIVerifierRowCapacity + 1;
+                 m <= 256;
+                 ++m)
+            {
+                const bool is_exact_bucket = std::binary_search(
+                    kDefaultPrefillGraphBucketSizes.begin(),
+                    kDefaultPrefillGraphBucketSizes.end(),
+                    m);
+                const bool has_witness = std::any_of(
+                    cases.begin(),
+                    cases.end(),
+                    [m](const auto &test_case)
+                    {
+                        return test_case.active_rows == m;
+                    });
+                EXPECT_EQ(has_witness, !is_exact_bucket)
+                    << "M=" << m;
+            }
+
+            for (size_t index = 1;
+                 index < kDefaultPrefillGraphBucketSizes.size();
+                 ++index)
+            {
+                const int lower =
+                    kDefaultPrefillGraphBucketSizes[index - 1];
+                const int upper =
+                    kDefaultPrefillGraphBucketSizes[index];
+                if (upper <= 256)
+                    continue;
+                for (int active_rows : {lower + 1, upper - 1})
+                {
+                    if (active_rows == upper)
+                        continue;
+                    EXPECT_TRUE(std::any_of(
+                        cases.begin(),
+                        cases.end(),
+                        [active_rows, upper](const auto &test_case)
+                        {
+                            return test_case.active_rows == active_rows &&
+                                   test_case.bucket_rows == upper;
+                        }))
+                        << "Missing graph-bucket edge witness active M="
+                        << active_rows << " bucket M=" << upper;
+                }
+            }
         }
 
         TEST(Test__PrefillGraphBucketDefaults, TrainingRowsAreOrderedAndDisjoint)

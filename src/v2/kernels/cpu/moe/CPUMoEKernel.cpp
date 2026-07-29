@@ -10,7 +10,7 @@
 #include "../../cpu/primitives/SoftmaxPrimitives_New.h"
 #include "../../cpu/primitives/SwiGLUPrimitives.h"
 #include "../../cpu/primitives/VectorPrimitives.h"
-#include "../../cpu/native_vnni/CPUNativeVNNIGemv.h"
+#include "../gemm/CPUNativeVNNIGemv.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/PerfStatsCollector.h"

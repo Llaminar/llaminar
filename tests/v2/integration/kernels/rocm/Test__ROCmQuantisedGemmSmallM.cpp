@@ -22,6 +22,7 @@
 #include "utils/PerfStatsCollector.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/NativeVNNIEquivalenceInventory.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/ScopedGPUStream.h"
 #include "../../../utils/TestTensorFactory.h"
@@ -3511,6 +3512,294 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ80M2MatchesReference)
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ8_0Random(shape, seed); },
         0.985f);
+}
+
+/**
+ * @test Prove ROCm NativeVNNI active rows are byte-invariant for the complete
+ * finite M-totality witness inventory and every quantized format.
+ *
+ * This is the ROCm half of the cross-backend graph-bucket contract. The shared
+ * inventory exhausts every ordinary-prefill M through two complete 128-row
+ * tiles and both open ends of every larger canonical bucket interval. Every
+ * loader-supported source format travels through persistent preparation and
+ * the public production GEMM entry point; no deterministic mode or row-replay
+ * implementation substitutes for the optimized grouped implementation.
+ *
+ * Seventeen independent production M=1 launches establish the serial-decode
+ * oracle for the first ordinary-prefill tile. The optimized M=17 launch and
+ * every larger exact/bucket launch must publish that prefix byte-for-byte.
+ * Each finite M-totality witness also compares its final active row with an
+ * independent M=1 launch. The final row walks every tile residue and boundary
+ * in the exhaustive range, while the prefix prevents a broken implementation
+ * from preserving only its boundary row.
+ * Allocations, stream creation, preparation, and workspace binding are reused
+ * for all witnesses of one format. Only result bytes are downloaded, keeping
+ * the test sensitive to device arithmetic without making setup dominate the
+ * integration gate.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifdef HAVE_ROCM
+    const DeviceId device = DeviceId::rocm(0);
+    constexpr int canonical_prefix_rows =
+        kDefaultNativeVNNIVerifierRowCapacity + 1;
+    uint64_t geometry_index = 0;
+
+    for (const auto &geometry :
+         nativeVNNIPrefillAllFormatGeometryEquivalenceCases())
+    {
+        SCOPED_TRACE(geometry.label);
+        ASSERT_FALSE(geometry.row_cases.empty());
+        const int N = geometry.output_columns;
+        const int K = geometry.reduction_columns;
+        const int maximum_bucket_rows = std::max_element(
+            geometry.row_cases.begin(),
+            geometry.row_cases.end(),
+            [](const auto &lhs, const auto &rhs)
+            {
+                return lhs.bucket_rows < rhs.bucket_rows;
+            })->bucket_rows;
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(maximum_bucket_rows), static_cast<size_t>(K)},
+            -0.75f,
+            0.75f,
+            static_cast<uint32_t>(77123u + geometry_index));
+
+        for (const auto &format : quantizedVerifierFormats())
+        {
+            SCOPED_TRACE(format.label);
+            auto weights = format.create(
+                {static_cast<size_t>(N), static_cast<size_t>(K)},
+                77124u);
+            ASSERT_NE(weights, nullptr);
+            auto prepared = makeGpuPreparedGemm(
+                weights.get(),
+                device,
+                std::string("test.rocm.prefill_m_invariance.") +
+                    geometry.label + "." + format.label,
+                ModelContextId{
+                    static_cast<uint64_t>(
+                        771240 + geometry_index * 100 +
+                        format.source_codebook_id)});
+            auto *kernel =
+                dynamic_cast<ROCmQuantisedGemmKernel *>(prepared.kernel);
+            ASSERT_NE(kernel, nullptr)
+                << format.label << " production prepared ROCm kernel";
+
+            hipStream_t stream = nullptr;
+            ASSERT_EQ(
+                hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+                hipSuccess);
+            kernel->setGPUStream(stream);
+            auto workspace = bindWorkspace(
+                *kernel,
+                maximum_bucket_rows,
+                N,
+                K);
+            ASSERT_NE(workspace, nullptr);
+
+            auto exact_output = TestTensorFactory::createFP32(
+                {static_cast<size_t>(maximum_bucket_rows),
+                 static_cast<size_t>(N)});
+            auto bucket_output = TestTensorFactory::createFP32(
+                {static_cast<size_t>(maximum_bucket_rows),
+                 static_cast<size_t>(N)});
+            auto serial_input = TestTensorFactory::createFP32(
+                {1u, static_cast<size_t>(K)});
+            auto serial_output = TestTensorFactory::createFP32(
+                {1u, static_cast<size_t>(N)});
+            ASSERT_TRUE(input->ensureOnDevice(device, stream));
+            ASSERT_TRUE(exact_output->allocateOnDevice(device, stream));
+            ASSERT_TRUE(bucket_output->allocateOnDevice(device, stream));
+            ASSERT_TRUE(serial_input->allocateOnDevice(device, stream));
+            ASSERT_TRUE(serial_output->allocateOnDevice(device, stream));
+
+            /*
+             * Build the oracle from the real public M=1 dispatch. Device-to-
+             * device row copies preserve the exact FP32 source bytes and keep
+             * every operation ordered on the kernel stream. No host-side GEMV
+             * or dequantized reference participates in the expected result.
+             */
+            const size_t serial_row_input_bytes =
+                static_cast<size_t>(K) * sizeof(float);
+            const size_t serial_row_output_bytes =
+                static_cast<size_t>(N) * sizeof(float);
+            std::vector<float> serial_decode_prefix(
+                static_cast<size_t>(canonical_prefix_rows) * N);
+            for (int row = 0; row < canonical_prefix_rows; ++row)
+            {
+                ASSERT_EQ(
+                    hipMemcpyAsync(
+                        serial_input->gpu_data_ptr(),
+                        static_cast<const float *>(input->gpu_data_ptr()) +
+                            static_cast<size_t>(row) * K,
+                        serial_row_input_bytes,
+                        hipMemcpyDeviceToDevice,
+                        stream),
+                    hipSuccess);
+                TransferEngine::publishCurrentDeviceWrite(
+                    serial_input.get(),
+                    stream);
+                ASSERT_TRUE(kernel->multiply_tensor(
+                    serial_input.get(),
+                    serial_output.get(),
+                    1,
+                    N,
+                    K))
+                    << "serial row=" << row;
+                ASSERT_EQ(
+                    hipMemcpyAsync(
+                        serial_decode_prefix.data() +
+                            static_cast<size_t>(row) * N,
+                        serial_output->gpu_data_ptr(),
+                        serial_row_output_bytes,
+                        hipMemcpyDeviceToHost,
+                        stream),
+                    hipSuccess);
+            }
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+            ASSERT_TRUE(kernel->multiply_tensor(
+                input.get(),
+                exact_output.get(),
+                canonical_prefix_rows,
+                N,
+                K));
+            const size_t canonical_prefix_values =
+                static_cast<size_t>(canonical_prefix_rows) * N;
+            std::vector<float> canonical_prefix(canonical_prefix_values);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    canonical_prefix.data(),
+                    exact_output->gpu_data_ptr(),
+                    canonical_prefix_values * sizeof(float),
+                    hipMemcpyDeviceToHost,
+                    stream),
+                hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            expectBitwiseFP32RowsEqual(
+                std::string(
+                    "ROCm NativeVNNI ordinary-prefill M=17 versus serial M=1 format=") +
+                    format.label,
+                canonical_prefix.data(),
+                serial_decode_prefix.data(),
+                canonical_prefix_values,
+                static_cast<size_t>(N));
+
+            for (const auto &test_case : geometry.row_cases)
+            {
+                SCOPED_TRACE(
+                    std::string("active_m=") +
+                    std::to_string(test_case.active_rows) +
+                    " bucket_m=" +
+                    std::to_string(test_case.bucket_rows));
+
+                ASSERT_TRUE(kernel->multiply_tensor(
+                    input.get(),
+                    exact_output.get(),
+                    test_case.active_rows,
+                    N,
+                    K));
+                ASSERT_TRUE(kernel->multiply_tensor(
+                    input.get(),
+                    bucket_output.get(),
+                    test_case.bucket_rows,
+                    N,
+                    K));
+
+                const int final_active_row =
+                    test_case.active_rows - 1;
+                ASSERT_EQ(
+                    hipMemcpyAsync(
+                        serial_input->gpu_data_ptr(),
+                        static_cast<const float *>(input->gpu_data_ptr()) +
+                            static_cast<size_t>(final_active_row) * K,
+                        serial_row_input_bytes,
+                        hipMemcpyDeviceToDevice,
+                        stream),
+                    hipSuccess);
+                TransferEngine::publishCurrentDeviceWrite(
+                    serial_input.get(),
+                    stream);
+                ASSERT_TRUE(kernel->multiply_tensor(
+                    serial_input.get(),
+                    serial_output.get(),
+                    1,
+                    N,
+                    K))
+                    << "serial final active row=" << final_active_row;
+
+                const size_t active_values =
+                    static_cast<size_t>(test_case.active_rows) * N;
+                std::vector<float> exact_host(active_values);
+                std::vector<float> bucket_host(active_values);
+                std::vector<float> serial_final_row(
+                    static_cast<size_t>(N));
+                ASSERT_EQ(
+                    hipMemcpyAsync(
+                        exact_host.data(),
+                        exact_output->gpu_data_ptr(),
+                        active_values * sizeof(float),
+                        hipMemcpyDeviceToHost,
+                        stream),
+                    hipSuccess);
+                ASSERT_EQ(
+                    hipMemcpyAsync(
+                        bucket_host.data(),
+                        bucket_output->gpu_data_ptr(),
+                        active_values * sizeof(float),
+                        hipMemcpyDeviceToHost,
+                        stream),
+                    hipSuccess);
+                ASSERT_EQ(
+                    hipMemcpyAsync(
+                        serial_final_row.data(),
+                        serial_output->gpu_data_ptr(),
+                        serial_row_output_bytes,
+                        hipMemcpyDeviceToHost,
+                        stream),
+                    hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+                expectBitwiseFP32RowsEqual(
+                    std::string("ROCm NativeVNNI active rows format=") +
+                        format.label + " active M=" +
+                        std::to_string(test_case.active_rows) +
+                        " bucket M=" +
+                        std::to_string(test_case.bucket_rows),
+                    bucket_host.data(),
+                    exact_host.data(),
+                    active_values,
+                    static_cast<size_t>(N));
+                expectBitwiseFP32RowsEqual(
+                    std::string("ROCm NativeVNNI canonical M=17 prefix format=") +
+                        format.label + " active M=" +
+                        std::to_string(test_case.active_rows),
+                    exact_host.data(),
+                    canonical_prefix.data(),
+                    canonical_prefix_values,
+                    static_cast<size_t>(N));
+                expectBitwiseFP32RowsEqual(
+                    std::string("ROCm NativeVNNI final active row versus serial M=1 format=") +
+                        format.label + " active M=" +
+                        std::to_string(test_case.active_rows),
+                    exact_host.data() +
+                        static_cast<size_t>(final_active_row) * N,
+                    serial_final_row.data(),
+                    static_cast<size_t>(N),
+                    static_cast<size_t>(N));
+            }
+
+            kernel->unbindWorkspace();
+            kernel->setGPUStream(nullptr);
+            ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+        }
+        ++geometry_index;
+    }
+#endif
 }
 
 /**

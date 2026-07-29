@@ -132,6 +132,41 @@ TEST_F(Test__ROCmEventSynchronization, EventRecordAndWait)
     backend_->destroyEvent(event, device_id_);
 }
 
+/**
+ * @brief Event waits remain valid when another HIP child is ambient.
+ *
+ * The ROCm backend restores ambient device state after resource operations, so
+ * success of the wait and preservation of device 1 together prove it selected
+ * device 0 only for the duration of the backend call.
+ */
+TEST_F(Test__ROCmEventSynchronization,
+       StreamWaitEventSelectsDeclaredDeviceOverAmbientDevice)
+{
+    if (device_count_ < 2)
+        GTEST_SKIP() << "Requires at least two ROCm devices";
+
+    constexpr int owner_device = 0;
+    constexpr int ambient_device = 1;
+    void *stream = backend_->createStream(owner_device);
+    void *event = backend_->createEvent(owner_device);
+    ASSERT_NE(stream, nullptr);
+    ASSERT_NE(event, nullptr);
+    ASSERT_TRUE(backend_->recordEvent(event, owner_device, stream));
+
+    ASSERT_EQ(hipSetDevice(ambient_device), hipSuccess);
+    ASSERT_TRUE(
+        backend_->streamWaitEvent(stream, event, owner_device));
+
+    int restored_device = -1;
+    ASSERT_EQ(hipGetDevice(&restored_device), hipSuccess);
+    EXPECT_EQ(restored_device, ambient_device)
+        << "ROCmBackend must restore the caller's ambient HIP device";
+    ASSERT_TRUE(backend_->synchronizeStream(stream, owner_device));
+
+    backend_->destroyEvent(event, owner_device);
+    backend_->destroyStream(stream, owner_device);
+}
+
 // ============================================================================
 // Test: Event Sync is Fast (Not Blocking All Work)
 // ============================================================================

@@ -229,8 +229,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def tier_settings(tier: str, long_max_tokens: int) -> TierSettings:
     usable_max = max(1, long_max_tokens - 1)
     if tier == "lite":
-        min_lines = max(8, min(32, long_max_tokens // 16))
-        requested_lines = max(50, min(90, long_max_tokens // 6))
+        # A short numbered sentence costs roughly 8-16 model tokens once the
+        # line number and delimiter are included. Keep both the requested and
+        # accepted line counts inside the configured completion budget; a
+        # 128-token smoke run cannot physically emit the old fixed request for
+        # 50 lines.
+        min_lines = max(1, min(32, usable_max // 16))
+        requested_lines = max(
+            min_lines,
+            min(90, max(1, usable_max // 8)),
+        )
         min_completion = max(64, int(long_max_tokens * 0.45))
         return TierSettings(
             min_numbered_lines=min_lines,
@@ -241,10 +249,15 @@ def tier_settings(tier: str, long_max_tokens: int) -> TierSettings:
 
     # Full-tier structured generation is primarily an anti-degeneration and
     # long-completion check. Some large MoE models spend more tokens per line,
-    # so leave enough token-budget headroom while still requiring sustained
-    # numbered output.
-    min_lines = max(40, min(120, long_max_tokens // 20))
-    requested_lines = max(140, min(220, long_max_tokens // 6))
+    # so scale the evidence threshold to the actual completion budget. At the
+    # canonical 512+ token budget this still requires at least 40 lines; at a
+    # deliberately shortened 128-token matrix budget it requires ten clean,
+    # monotonic lines instead of an impossible fixed forty.
+    min_lines = max(1, min(120, usable_max // 12))
+    requested_lines = max(
+        min_lines,
+        min(220, max(1, usable_max // 8)),
+    )
     min_completion = max(256, int(long_max_tokens * 0.65))
     return TierSettings(
         min_numbered_lines=min_lines,
@@ -1013,6 +1026,17 @@ def run_self_test() -> int:
     assert ok
     ok, detail = validate_number_progression([1, 2, 1, 2, 1, 2, 1])
     assert not ok, detail
+
+    for budget in (64, 128, 512, 2048):
+        lite = tier_settings("lite", budget)
+        full = tier_settings("full", budget)
+        assert 1 <= lite.min_numbered_lines <= lite.requested_numbered_lines
+        assert 1 <= full.min_numbered_lines <= full.requested_numbered_lines
+        assert lite.min_completion_tokens < budget
+        assert full.min_completion_tokens < budget
+        assert full.min_numbered_lines >= lite.min_numbered_lines
+    assert tier_settings("full", 128).min_numbered_lines == 10
+    assert tier_settings("full", 512).min_numbered_lines >= 40
 
     print("PASS [self-test] helper pure-function checks", flush=True)
     return 0

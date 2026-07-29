@@ -136,6 +136,37 @@ namespace llaminar2::moe_rebalance_policy
         return result;
     }
 
+    /**
+     * @brief Decide whether a prefill assignment still reads a slot occupant.
+     *
+     * Transfer-backed LLEP prefill is a forward-only streaming pipeline. Before
+     * layer `N` leases physical payload storage, its transfer stream waits on an
+     * event recorded after all compute-stream work through layer `N - 1`.
+     * Consequently, a non-owner replica from another layer is no longer read by
+     * the current forward pass and may be replaced transactionally. A replica
+     * from the layer being prepared remains protected when that layer's
+     * device-owned assignment sends rows to the local participant.
+     *
+     * Keeping this rule backend-neutral prevents CUDA and ROCm from drifting on
+     * transfer-directory lifetime. Ownership remains an independent protection
+     * in classifyTransferSlotOccupancy(); this helper only answers whether the
+     * current layer assignment contributes a live read.
+     *
+     * @param prepared_layer              Layer whose arrivals are being leased.
+     * @param occupant_layer              Layer currently naming the physical slot.
+     * @param same_layer_assigned_locally Whether that occupant has local rows in
+     *                                    the prepared layer's assignment.
+     * @return true only when the current layer will read the existing occupant.
+     */
+    LLAMINAR_MOE_REBALANCE_HD bool prefillAssignmentReadsTransferSlotOccupant(
+        uint32_t prepared_layer,
+        uint32_t occupant_layer,
+        bool same_layer_assigned_locally) noexcept
+    {
+        return prepared_layer == occupant_layer &&
+               same_layer_assigned_locally;
+    }
+
     LLAMINAR_MOE_REBALANCE_HD uint32_t participantBit(uint32_t participant) noexcept
     {
         return 1u << participant;

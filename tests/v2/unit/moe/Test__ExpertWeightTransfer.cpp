@@ -10,8 +10,8 @@
 
 #include "execution/moe/ExpertWeightTransfer.h"
 #include "kernels/PackedWeightsSerialization.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNIWeightPacker.h"
-#include "kernels/cpu/native_vnni/CPUPackedWeights.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUPackedWeights.h"
 #include "utils/MPITags.h"
 
 #include <cstring>

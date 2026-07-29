@@ -720,6 +720,101 @@ namespace llaminar2
         }
 
         /**
+         * @brief Publish grouped-greedy penalty controls with a device kernel.
+         *
+         * The policy values are launch arguments, while @p controls_device is a
+         * persistent arena address captured by the verifier graph.  Backends
+         * must enqueue one non-blocking kernel on the exact non-null stream;
+         * host-to-device copies and synchronization are forbidden.
+         */
+        virtual bool enqueueConfigureMTPGreedyPenaltyPolicyDevice(
+            void *controls_device,
+            float presence_penalty,
+            float frequency_penalty,
+            bool first_token_already_in_history,
+            int device_id,
+            void *stream)
+        {
+            (void)controls_device;
+            (void)presence_penalty;
+            (void)frequency_penalty;
+            (void)first_token_already_in_history;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue decode-equivalent grouped argmax with device history.
+         *
+         * Every verifier row is scored against the persistent generated-token
+         * histogram plus only the preceding tokens in that row's speculative
+         * branch.  Implementations must preserve serial float operation order
+         * and deterministic lowest-token tie breaking.
+         */
+        virtual bool enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+            const void *data_device,
+            int rows,
+            int cols,
+            const void *verifier_input_tokens_device,
+            const void *generated_token_counts_device,
+            const void *penalty_policy_device,
+            int device_id,
+            void *stream,
+            void *out_values_device,
+            void *out_indices_device,
+            void *partial_vals,
+            void *partial_idxs,
+            int partial_capacity,
+            int output_stride = 1)
+        {
+            (void)data_device;
+            (void)rows;
+            (void)cols;
+            (void)verifier_input_tokens_device;
+            (void)generated_token_counts_device;
+            (void)penalty_policy_device;
+            (void)device_id;
+            (void)stream;
+            (void)out_values_device;
+            (void)out_indices_device;
+            (void)partial_vals;
+            (void)partial_idxs;
+            (void)partial_capacity;
+            (void)output_stride;
+            return false;
+        }
+
+        /**
+         * @brief Commit newly emitted compact outcome tokens to device history.
+         *
+         * This operation runs after compact LocalTP publication so every
+         * participant advances an identical mirrored histogram.  It is a
+         * graph-capturable in-place update with no atomics, allocation, copy,
+         * or synchronization.
+         */
+        virtual bool enqueueCommitMTPGreedyPenaltyHistoryDevice(
+            const void *output_tokens_device,
+            const void *output_meta_device,
+            const void *penalty_policy_device,
+            int output_token_capacity,
+            int vocab_size,
+            void *generated_token_counts_device,
+            int device_id,
+            void *stream)
+        {
+            (void)output_tokens_device;
+            (void)output_meta_device;
+            (void)penalty_policy_device;
+            (void)output_token_capacity;
+            (void)vocab_size;
+            (void)generated_token_counts_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief GPU-side top-k selection over FP32 data
          *
          * Finds the k largest elements (value and index) entirely on the GPU.

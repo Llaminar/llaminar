@@ -1985,7 +1985,7 @@ Current active slice:
 - `src/v2/kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip`
 - `src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp`
 - `src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu`
-- `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h`
+- `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h`
 - `src/v2/execution/compute_stages/stages/FusedQKVGEMMStage.cpp`
 - `src/v2/execution/compute_stages/stages/FusedGateUpGEMMStage.cpp`
 - `src/v2/execution/compute_stages/stages/FusedSwiGLUStage.cpp`

@@ -134,6 +134,11 @@ namespace llaminar2::test
                 .from(DeviceTimelineRole::RequestStateReset);
         EXPECT_TRUE(reset.validForPublication());
         EXPECT_TRUE(
+            reset.to(DeviceTimelineRole::RequestStateReset)
+                .validForConsumption())
+            << "An adjacent request boundary must consume the previous reset "
+               "generation before republishing the lifecycle-owned event.";
+        EXPECT_TRUE(
             reset.to(DeviceTimelineRole::MainForwardGraph)
                 .validForConsumption());
         EXPECT_TRUE(

@@ -32,6 +32,7 @@ namespace llaminar2
                     .name = "request_state_reset_ready",
                     .producer = DeviceTimelineRole::RequestStateReset,
                     .consumers = roles({
+                        DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::MainForwardGraph,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::PrefixRestoreMutation,

@@ -20,6 +20,7 @@
 
 #include "../../../backends/DeviceId.h"
 #include "../../mtp/MTPRejectionSampler.h"
+#include "../../mtp/MTPVerifierOutcomeGraph.h"
 #include "../../prefix_cache/PrefixCacheStateProbe.h"
 #include "../../prefix_cache/PrefixStateSnapshot.h"
 
@@ -2325,11 +2326,14 @@ namespace llaminar2
         virtual bool prepareGreedyAllPositionBatchOutcomeGraph(
             int verifier_token_count,
             const int32_t *stop_tokens,
-            int stop_token_count)
+            int stop_token_count,
+            const MTPGreedyPenaltyPolicy &penalty_policy =
+                MTPGreedyPenaltyPolicy{})
         {
             (void)verifier_token_count;
             (void)stop_tokens;
             (void)stop_token_count;
+            (void)penalty_policy;
             return false;
         }
 

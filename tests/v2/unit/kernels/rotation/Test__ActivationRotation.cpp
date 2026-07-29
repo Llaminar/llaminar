@@ -1629,7 +1629,7 @@ TEST(Test__ActivationRotation, RotationChangesVector)
 //   X @ W^T == (X@R) @ Pack(R^T @ dequant(W))
 // ============================================================================
 
-#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 
 TEST(Test__ActivationRotation, FusedPacking_GEMM_Invariance_Q4_0)
 {

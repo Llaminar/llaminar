@@ -1947,6 +1947,64 @@ TEST_F(Test__DeviceGraphOrchestrator, HarvestPrefixWaitsForLiveGraphProducersBef
 }
 
 /**
+ * @brief Require request reset to diagnose each event dependency independently.
+ *
+ * Request reset is a fatal device-ownership boundary. A compound boolean that
+ * combines every wait reports only that the boundary failed, which makes a
+ * stale or foreign event indistinguishable from a missing reset stream. Keep
+ * stable names for each layer of the join so an E2E abort identifies the exact
+ * publication that violated its lifecycle.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, RequestResetJoinNamesEveryRequiredDeviceTimelineDependency)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto join_pos =
+        source.find("bool DeviceGraphOrchestrator::joinPriorDeviceWorkForRequestStateReset(");
+    ASSERT_NE(join_pos, std::string::npos);
+    const auto publish_pos =
+        source.find("void DeviceGraphOrchestrator::publishRequestStateResetReady(", join_pos);
+    ASSERT_NE(publish_pos, std::string::npos);
+    const std::string join_body =
+        source.substr(join_pos, publish_pos - join_pos);
+
+    EXPECT_NE(join_body.find("\"ExplicitResetStream\""), std::string::npos);
+    EXPECT_NE(join_body.find("\"RequestStateResetReady\""), std::string::npos);
+    EXPECT_NE(join_body.find("\"LiveInferenceStateReady\""), std::string::npos);
+    EXPECT_EQ(join_body.find("!reset_stream ||"), std::string::npos)
+        << "A compound reset join hides which ownership edge failed.";
+
+    const auto live_pos =
+        source.find("bool DeviceGraphOrchestrator::waitForLiveInferenceStateReadyForObservation(");
+    ASSERT_NE(live_pos, std::string::npos);
+    const auto live_end =
+        source.find(
+            "bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(",
+            live_pos);
+    ASSERT_NE(live_end, std::string::npos);
+    const std::string live_body =
+        source.substr(live_pos, live_end - live_pos);
+
+    for (const char *dependency : {
+             "\"LivePrefixCheckpointReady\"",
+             "\"AcceptedSpecPublicationReady\"",
+             "\"LivePrefixMutationReady\"",
+             "\"LiveGraphProducersReady\"",
+             "\"MTPTransactionReady\"",
+             "\"LogicalSequenceStateReady\""})
+    {
+        EXPECT_NE(live_body.find(dependency), std::string::npos)
+            << "Missing named reset diagnostic for " << dependency;
+    }
+
+    EXPECT_NE(source.find("[FATAL] Device timeline join failed:"), std::string::npos)
+        << "Fatal reset diagnostics must bypass buffered log-file teardown.";
+}
+
+/**
  * @brief Guard prefix-harvest terminal-hidden capture against decode-state mutation.
  *
  * Prefix-cache harvest may need to materialize the prompt terminal hidden row

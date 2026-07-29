@@ -8841,11 +8841,12 @@ namespace llaminar2
                         effectiveMTPMaxDraftDepth(mtp) + 1);
             if (!stochastic_verify &&
                 runner_->primaryDeviceId().is_gpu() &&
-                active_sampling_params_.has_penalties())
+                active_sampling_params_.dry_multiplier != 0.0f &&
+                active_sampling_params_.dry_penalty_last_n != 0)
             {
                 return fail_after_checkpoint(
-                    "GPU greedy MTP penalties must execute inside the captured "
-                    "verifier graph before graph-owned outcome reduction");
+                    "GPU grouped greedy MTP requires a device-owned DRY "
+                    "history implementation");
             }
             if (!stochastic_verify &&
                 runner_->primaryDeviceId().is_gpu() &&
@@ -8958,7 +8959,21 @@ namespace llaminar2
                                  verifier_row_count,
                                  stop_tokens_.data(),
                                  static_cast<int>(
-                                     stop_tokens_.size())))
+                                     stop_tokens_.size()),
+                                 MTPGreedyPenaltyPolicy{
+                                     .presence_penalty =
+                                         active_sampling_params_
+                                             .presence_penalty,
+                                     .frequency_penalty =
+                                         active_sampling_params_
+                                             .frequency_penalty,
+                                     .first_token_already_in_history =
+                                         first_token_is_pending_condition
+                                             ? 1
+                                             : 0,
+                                     .enabled =
+                                         use_sampling_penalties ? 1 : 0,
+                                 }))
                     {
                         runner_->setComputeAllPositionLogits(false);
                         runner_->setComputeRowIndexedAllPositionLogits(
@@ -8989,9 +9004,9 @@ namespace llaminar2
                  * disabling the graph mode first is allowed to rebind or clear
                  * the active verifier-logit view, which turns a valid remote
                  * shard winner into the default token 0.  Compact device
-                 * outcome reducers are excluded because they must consume the
-                 * same stream themselves, and penalty-bearing greedy rows are
-                 * sampled later after row-local penalties are applied.
+                 * outcome reducers are excluded because their captured
+                 * penalty-aware argmax already owns row transformation and
+                 * sampling on the verifier stream.
                  */
                 if (!stochastic_verify &&
                     !use_greedy_device_batch_outcome &&
@@ -9776,17 +9791,15 @@ namespace llaminar2
                         "mtp",
                         "all_position_verifier_greedy_device_summary",
                         "decode");
-                    const int compare_rows =
-                        static_cast<int>(draft_tokens.size()) - 1;
-                    const int bonus_row = compare_rows;
-                    if (!apply_all_position_row_penalties_for_history(
-                            compare_rows,
-                            bonus_row,
-                            "greedy_vllm_penalty_rows_preapplied"))
-                    {
-                        return fail_after_checkpoint(
-                            "All-position greedy MTP row penalty application failed");
-                    }
+                    /*
+                     * prepareGreedyAllPositionBatchOutcomeGraph() supplied the
+                     * immutable penalty policy before verifier graph replay.
+                     * MTPVerifierOutcomeStage therefore produced the canonical
+                     * compact outcome on the verifier stream.  Mutating logits
+                     * here would be both too late and semantically dangerous:
+                     * the host would be modifying rows after the graph had
+                     * already sampled them.  This boundary is consume-only.
+                     */
                     DeviceSpeculativeOutcomeHandle device_outcome_handle;
                     if (!runner_->verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
                             draft_tokens.data(),
@@ -12050,12 +12063,12 @@ namespace llaminar2
                         "Grouped-outcome greedy MTP cannot apply row-local penalties to deferred token shadows");
                 }
                 if (runner_->primaryDeviceId().is_gpu() &&
-                    use_sampling_penalties)
+                    active_sampling_params_.dry_multiplier != 0.0f &&
+                    active_sampling_params_.dry_penalty_last_n != 0)
                 {
                     return fail_after_checkpoint(
-                        "Grouped-outcome GPU greedy MTP penalties must "
-                        "execute inside the captured verifier graph before "
-                        "graph-owned outcome reduction");
+                        "Grouped-outcome GPU greedy MTP requires a "
+                        "device-owned DRY history implementation");
                 }
                 if (!runner_->supportsMTPDeviceDraftTokenInput())
                 {
@@ -12187,7 +12200,21 @@ namespace llaminar2
                                  verifier_row_count,
                                  stop_tokens_.data(),
                                  static_cast<int>(
-                                     stop_tokens_.size())))
+                                     stop_tokens_.size()),
+                                 MTPGreedyPenaltyPolicy{
+                                     .presence_penalty =
+                                         active_sampling_params_
+                                             .presence_penalty,
+                                     .frequency_penalty =
+                                         active_sampling_params_
+                                             .frequency_penalty,
+                                     .first_token_already_in_history =
+                                         first_token_is_pending_condition
+                                             ? 1
+                                             : 0,
+                                     .enabled =
+                                         use_sampling_penalties ? 1 : 0,
+                                 }))
                     {
                         runner_->setComputeAllPositionLogits(false);
                         runner_->setComputeRowIndexedAllPositionLogits(
@@ -12219,67 +12246,8 @@ namespace llaminar2
                      */
                 }
 
-                auto apply_grouped_greedy_row_penalties_for_history =
-                    [&](int bonus_row) -> bool
-                {
-                    if (!use_sampling_penalties)
-                        return true;
-
-                    Sampler row_penalty_sampler = sampler_;
-                    row_penalty_sampler.record_token(first_token);
-                    const int compare_rows =
-                        static_cast<int>(draft_tokens.size()) - 1;
-                    for (int row = 0; row < compare_rows; ++row)
-                    {
-                        auto penalty_map =
-                            row_penalty_sampler.compute_penalty_map(
-                                active_sampling_params_,
-                                vocab);
-                        if (!penalty_map.empty() &&
-                            !runner_->applyPenaltiesToAllPositionLogitsOnDeviceRow(
-                                row,
-                                penalty_map,
-                                vocab))
-                        {
-                            return false;
-                        }
-                        row_penalty_sampler.record_token(
-                            draft_tokens[static_cast<size_t>(row + 1)]);
-                    }
-
-                    auto bonus_penalty_map =
-                        row_penalty_sampler.compute_penalty_map(
-                            active_sampling_params_,
-                            vocab);
-                    if (!bonus_penalty_map.empty() &&
-                        !runner_->applyPenaltiesToAllPositionLogitsOnDeviceRow(
-                            bonus_row,
-                            bonus_penalty_map,
-                            vocab))
-                    {
-                        return false;
-                    }
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "grouped_outcome_greedy_penalty_rows_preapplied",
-                        static_cast<double>(compare_rows + 1),
-                        "decode",
-                        {},
-                        {{"policy_path",
-                          "grouped_outcome_device_resident_publication"}});
-                    return true;
-                };
-
                 const int compare_rows =
                     static_cast<int>(draft_tokens.size()) - 1;
-                const int bonus_row = compare_rows;
-                if (!apply_grouped_greedy_row_penalties_for_history(bonus_row))
-                {
-                    runner_->setComputeAllPositionLogits(false);
-                    runner_->setComputeRowIndexedAllPositionLogits(false, 0);
-                    return fail_after_checkpoint(
-                        "Grouped-outcome greedy MTP row penalty application failed");
-                }
 
                 DeviceSpeculativeOutcomeHandle outcome_handle;
                 {

@@ -14,6 +14,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
+#include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../kernels/common/SamplingMath.h"
 #include <hip/hip_runtime.h>
 #include <chrono>
@@ -333,6 +334,30 @@ namespace llaminar2
         float *out_values, int *out_indices,
         float *partial_vals, int *partial_idxs, int partial_capacity,
         int device_idx, void *stream, int output_stride);
+    extern "C" bool rocmOps_configure_mtp_greedy_penalty_policy(
+        MTPGreedyPenaltyPolicy *controls,
+        float presence_penalty,
+        float frequency_penalty,
+        bool first_token_already_in_history,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_argmax_f32_batched_rows_mtp_penalties(
+        const float *data, int rows, int cols, int row_stride,
+        const int *verifier_input_tokens,
+        const int *generated_token_counts,
+        const MTPGreedyPenaltyPolicy *policy,
+        float *out_values, int *out_indices,
+        float *partial_vals, int *partial_idxs, int partial_capacity,
+        int device_idx, void *stream, int output_stride);
+    extern "C" bool rocmOps_commit_mtp_greedy_penalty_history(
+        const int *output_tokens,
+        const int *output_meta,
+        const MTPGreedyPenaltyPolicy *policy,
+        int output_token_capacity,
+        int vocab_size,
+        int *generated_token_counts,
+        int device_idx,
+        void *stream);
 
     bool ROCmBackend::argmaxF32(const void *data_device, int n, int device_id,
                                 float *out_value, int *out_index, void *stream,
@@ -520,6 +545,112 @@ namespace llaminar2
             device_id,
             static_cast<hipStream_t>(stream),
             output_stride);
+    }
+
+    bool ROCmBackend::enqueueConfigureMTPGreedyPenaltyPolicyDevice(
+        void *controls_device,
+        float presence_penalty,
+        float frequency_penalty,
+        bool first_token_already_in_history,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !controls_device || !stream)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_configure_mtp_greedy_penalty_policy(
+            static_cast<MTPGreedyPenaltyPolicy *>(controls_device),
+            presence_penalty,
+            frequency_penalty,
+            first_token_already_in_history,
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+        const void *data_device,
+        int rows,
+        int cols,
+        const void *verifier_input_tokens_device,
+        const void *generated_token_counts_device,
+        const void *penalty_policy_device,
+        int device_id,
+        void *stream,
+        void *out_values_device,
+        void *out_indices_device,
+        void *partial_vals,
+        void *partial_idxs,
+        int partial_capacity,
+        int output_stride)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !data_device || rows <= 0 || cols <= 0 ||
+            !verifier_input_tokens_device ||
+            !generated_token_counts_device || !penalty_policy_device ||
+            !stream || !out_values_device || !out_indices_device ||
+            !partial_vals || !partial_idxs || partial_capacity < rows ||
+            output_stride <= 0)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        PerfStatsCollector::ScopedTimer timer(
+            "backend",
+            "rocm_mtp_penalty_argmax_batched_rows_device_launch",
+            "decode");
+        return rocmOps_argmax_f32_batched_rows_mtp_penalties(
+            static_cast<const float *>(data_device),
+            rows,
+            cols,
+            cols,
+            static_cast<const int *>(verifier_input_tokens_device),
+            static_cast<const int *>(generated_token_counts_device),
+            static_cast<const MTPGreedyPenaltyPolicy *>(
+                penalty_policy_device),
+            static_cast<float *>(out_values_device),
+            static_cast<int *>(out_indices_device),
+            static_cast<float *>(partial_vals),
+            static_cast<int *>(partial_idxs),
+            partial_capacity,
+            device_id,
+            stream,
+            output_stride);
+    }
+
+    bool ROCmBackend::enqueueCommitMTPGreedyPenaltyHistoryDevice(
+        const void *output_tokens_device,
+        const void *output_meta_device,
+        const void *penalty_policy_device,
+        int output_token_capacity,
+        int vocab_size,
+        void *generated_token_counts_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !output_tokens_device || !output_meta_device ||
+            !penalty_policy_device || output_token_capacity <= 0 ||
+            vocab_size <= 0 || !generated_token_counts_device || !stream)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_commit_mtp_greedy_penalty_history(
+            static_cast<const int *>(output_tokens_device),
+            static_cast<const int *>(output_meta_device),
+            static_cast<const MTPGreedyPenaltyPolicy *>(
+                penalty_policy_device),
+            output_token_capacity,
+            vocab_size,
+            static_cast<int *>(generated_token_counts_device),
+            device_id,
+            stream);
     }
 
     // Forward declaration for HIP top-k kernel (implemented in ROCmSamplingKernels.hip)
@@ -3372,8 +3503,31 @@ namespace llaminar2
 
     bool ROCmBackend::streamWaitEvent(void *stream, void *event, int device_id)
     {
-        (void)device_id;
-        hipError_t err = hipStreamWaitEvent(
+        if (!stream || !event ||
+            device_id < 0 || device_id >= device_count_)
+        {
+            LOG_ERROR("[ROCmBackend::streamWaitEvent] invalid event-wait ownership"
+                      << " device=" << device_id
+                      << " stream=" << stream
+                      << " event=" << event);
+            return false;
+        }
+
+        /*
+         * A LocalTP control thread can alternate between several HIP children.
+         * Event waits must select the stream/event owner's ordinal explicitly,
+         * then restore the caller's ambient device just like recordEvent().
+         */
+        HipDeviceSaveRestore device_guard;
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::streamWaitEvent] hipSetDevice("
+                      << device_id << ") failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+        err = hipStreamWaitEvent(
             static_cast<hipStream_t>(stream),
             static_cast<hipEvent_t>(event), 0);
         if (err != hipSuccess)

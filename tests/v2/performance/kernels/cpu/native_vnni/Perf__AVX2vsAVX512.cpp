@@ -21,8 +21,8 @@
 #include <string>
 #include <vector>
 
-#include "kernels/cpu/native_vnni/CPUNativeVNNIGemv.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/SIMDHelpers.h"
 #include "utils/CPUFeatures.h"

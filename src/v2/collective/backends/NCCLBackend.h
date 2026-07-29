@@ -305,14 +305,6 @@ namespace llaminar2
             void *stream) override;
         bool supportsGroupedP2PSingleDeviceOnStream() const override;
 
-        bool allgatherMultiOnStreams(
-            const std::vector<const void *> &send_bufs,
-            const std::vector<void *> &recv_bufs,
-            size_t send_count,
-            CollectiveDataType dtype,
-            const std::vector<void *> &streams) override;
-        bool supportsAllgatherMultiOnStreams() const override;
-
         bool broadcastMultiOnStreams(
             const std::vector<const void *> &send_bufs,
             const std::vector<void *> &recv_bufs,

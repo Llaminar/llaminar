@@ -257,7 +257,7 @@ namespace llaminar2
         std::vector<float> host_verifier_state_slots_;
 
         int effectivePrefillSeqLen() const;
-        bool shouldUseRealLengthContract() const;
+        bool shouldUseScalarRealLengthContract() const;
         std::string workspaceStableId() const;
         std::string inplacePrefillScratchBufferName() const;
         std::string speculativeStateSlotsBufferName() const;

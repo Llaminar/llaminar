@@ -22,8 +22,8 @@
 #pragma once
 
 #include "IPackedWeights.h"
-#include "cpu/native_vnni/CPUPackedWeights.h"
-#include "cpu/native_vnni/CPUNativeVNNIWeightPacker.h"
+#include "cpu/gemm/CPUPackedWeights.h"
+#include "cpu/gemm/CPUNativeVNNIWeightPacker.h"
 #include "utils/Logger.h"
 
 #include <cstring>

@@ -52,9 +52,9 @@
 #include <unistd.h>
 #include <vector>
 
-#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNITileConfig.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNITraits.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeVNNITileConfig.h"
+#include "kernels/cpu/gemm/CPUNativeVNNITraits.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"

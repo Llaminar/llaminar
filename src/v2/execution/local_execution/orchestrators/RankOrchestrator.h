@@ -792,7 +792,9 @@ namespace llaminar2
         bool prepareGreedyAllPositionBatchOutcomeGraph(
             int verifier_token_count,
             const int32_t *stop_tokens,
-            int stop_token_count) override;
+            int stop_token_count,
+            const MTPGreedyPenaltyPolicy &penalty_policy =
+                MTPGreedyPenaltyPolicy{}) override;
         bool verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
             const DeviceGreedyBatchOutcomeRequest *requests,
             int request_count,

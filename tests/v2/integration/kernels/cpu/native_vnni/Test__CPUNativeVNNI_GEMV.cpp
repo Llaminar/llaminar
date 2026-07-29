@@ -34,7 +34,7 @@
 #ifdef HAVE_ONEDNN
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #endif
-#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"

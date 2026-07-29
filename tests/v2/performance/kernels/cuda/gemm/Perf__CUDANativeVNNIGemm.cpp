@@ -42,7 +42,6 @@ extern "C"
     int cudaNativeVNNIPrefill_getBK256Mode();
     void cudaNativeVNNIPrefill_setForceTile(int tile_id, int split_k);
     void cudaNativeVNNIPrefill_getForceTile(int *tile_id, int *split_k);
-    void cudaNativeVNNIPrefill_freeStreamKFixup();
     int cudaNativeVNNIPrefill_getTileCount(int tile_id, int M, int N);
     bool cudaNativeVNNIGemvTuned_queryGeneratedDispatch(
         uint8_t codebook_id,
@@ -803,12 +802,19 @@ namespace
             merge(consumer->getWorkspaceRequirements(m, shape->n, shape->k));
         }
 
-        // The bitwise oracle executes production serial decode through M=1.
-        // Include that route before binding the immutable tournament workspace.
+        /*
+         * The ordinary-prefill tournament has a different arithmetic contract
+         * from grouped verifier decode.  Verifier M=2..16 must reproduce the
+         * public M=1 K-partition tree exactly; prefill candidates must reproduce
+         * the production exact-M prefill result while changing only physical
+         * tile geometry.  Include that AUTO route even when a caller requests
+         * only forced candidates so the immutable workspace can always build
+         * the correct exact-M oracle.
+         */
         cudaNativeVNNIPrefill_setBK256Mode(0);
         cudaNativeVNNIPrefill_setStreamKMode(0);
         cudaNativeVNNIPrefill_setForceTile(-1, 0);
-        merge(consumer->getWorkspaceRequirements(1, shape->n, shape->k));
+        merge(consumer->getWorkspaceRequirements(m, shape->n, shape->k));
         return merged;
     }
 
@@ -818,7 +824,9 @@ namespace
      * Construction performs every allocation and transfer shared by the
      * candidates. `measure()` contains only production kernel launches and
      * stream-local event timing. `bitMismatches()` performs the small D2H row
-     * sample after timing and compares it with production serial M=1 results.
+     * sample after timing and compares it with one production AUTO launch at
+     * the same exact M. Dedicated grouped-verifier integration suites retain
+     * the stricter M=1 serial-decode oracle for M=2..16.
      */
     class PreparedSweepExecution
     {
@@ -859,20 +867,7 @@ namespace
                 static_cast<size_t>(m_) * k_ * sizeof(float));
             output_ = std::make_unique<FP32Tensor>(
                 std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_)});
-            serial_input_ = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{1, static_cast<size_t>(k_)});
-            serial_output_ = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{1, static_cast<size_t>(n_)});
 
-            const DeviceId device = DeviceId::cuda(device_id_);
-            if (!input_->ensureOnDevice(device) ||
-                !output_->ensureOnDevice(device) ||
-                !serial_input_->ensureOnDevice(device) ||
-                !serial_output_->ensureOnDevice(device))
-            {
-                throw std::runtime_error(
-                    "failed to allocate persistent CUDA sweep tensors");
-            }
             if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) !=
                 cudaSuccess)
                 throw std::runtime_error(
@@ -894,10 +889,26 @@ namespace
                     "failed to create persistent CUDA sweep stop event");
             }
             kernel_->setGPUStream(static_cast<void *>(stream_));
-            oracle_rows_ = serialOracleRows(m_);
-            serial_oracle_.resize(oracle_rows_.size() * static_cast<size_t>(n_));
-            candidate_rows_.resize(serial_oracle_.size());
-            buildSerialOracle();
+
+            /*
+             * Upload and publish every persistent tensor on the same exact
+             * stream consumed by the measured kernel.  A null-stream setup
+             * publication would violate the production ownership contract and
+             * make this harness blind to stream-ordering regressions.
+             */
+            const DeviceId device = DeviceId::cuda(device_id_);
+            if (!input_->ensureOnDevice(device, stream_) ||
+                !output_->ensureOnDevice(device, stream_))
+            {
+                throw std::runtime_error(
+                    "failed to allocate persistent CUDA sweep tensors");
+            }
+
+            oracle_rows_ = sampledRows(m_);
+            exact_m_oracle_.resize(
+                oracle_rows_.size() * static_cast<size_t>(n_));
+            candidate_rows_.resize(exact_m_oracle_.size());
+            buildExactMPrefillOracle();
         }
 
         ~PreparedSweepExecution()
@@ -982,10 +993,10 @@ namespace
             checkStream("candidate row download");
 
             size_t mismatches = 0;
-            for (size_t index = 0; index < serial_oracle_.size(); ++index)
+            for (size_t index = 0; index < exact_m_oracle_.size(); ++index)
             {
                 if (std::memcmp(
-                        &serial_oracle_[index], &candidate_rows_[index],
+                        &exact_m_oracle_[index], &candidate_rows_[index],
                         sizeof(float)) != 0)
                 {
                     ++mismatches;
@@ -995,7 +1006,7 @@ namespace
         }
 
     private:
-        static std::vector<int> serialOracleRows(int m)
+        static std::vector<int> sampledRows(int m)
         {
             std::set<int> rows;
             for (int row = 0; row < std::min(m, 4); ++row)
@@ -1029,37 +1040,28 @@ namespace
             }
         }
 
-        void buildSerialOracle()
+        void buildExactMPrefillOracle()
         {
             cudaNativeVNNIPrefill_setBK256Mode(0);
             cudaNativeVNNIPrefill_setStreamKMode(0);
             cudaNativeVNNIPrefill_setForceTile(-1, 0);
-            const float *host_input = host_input_->data();
-            float *device_input = reinterpret_cast<float *>(
-                serial_input_->gpu_data_ptr());
+            launch(m_, input_.get(), output_.get());
+
             const float *device_output = reinterpret_cast<const float *>(
-                serial_output_->gpu_data_ptr());
+                output_->gpu_data_ptr());
             for (size_t index = 0; index < oracle_rows_.size(); ++index)
             {
                 const size_t row = static_cast<size_t>(oracle_rows_[index]);
                 if (cudaMemcpyAsync(
-                        device_input,
-                        host_input + row * static_cast<size_t>(k_),
-                        static_cast<size_t>(k_) * sizeof(float),
-                        cudaMemcpyHostToDevice, stream_) != cudaSuccess)
-                    throw std::runtime_error(
-                        "CUDA sweep serial-oracle row upload failed");
-                launch(1, serial_input_.get(), serial_output_.get());
-                if (cudaMemcpyAsync(
-                        serial_oracle_.data() +
+                        exact_m_oracle_.data() +
                             index * static_cast<size_t>(n_),
-                        device_output,
+                        device_output + row * static_cast<size_t>(n_),
                         static_cast<size_t>(n_) * sizeof(float),
                         cudaMemcpyDeviceToHost, stream_) != cudaSuccess)
                     throw std::runtime_error(
-                        "CUDA sweep serial-oracle row download failed");
+                        "CUDA sweep exact-M oracle row download failed");
             }
-            checkStream("serial oracle construction");
+            checkStream("exact-M oracle construction");
         }
 
         ITensorGemm *kernel_ = nullptr;
@@ -1072,13 +1074,11 @@ namespace
         std::unique_ptr<FP32Tensor> host_input_;
         std::unique_ptr<FP32Tensor> input_;
         std::unique_ptr<FP32Tensor> output_;
-        std::unique_ptr<FP32Tensor> serial_input_;
-        std::unique_ptr<FP32Tensor> serial_output_;
         cudaStream_t stream_ = nullptr;
         cudaEvent_t start_ = nullptr;
         cudaEvent_t stop_ = nullptr;
         std::vector<int> oracle_rows_;
-        std::vector<float> serial_oracle_;
+        std::vector<float> exact_m_oracle_;
         std::vector<float> candidate_rows_;
     };
 
@@ -1322,7 +1322,6 @@ namespace
         cudaNativeVNNIPrefill_setBK256Mode(0);
         cudaNativeVNNIPrefill_setStreamKMode(0);
         cudaNativeVNNIPrefill_setForceTile(-1, 0);
-        cudaNativeVNNIPrefill_freeStreamKFixup();
 
         // Collect valid rows
         std::vector<SweepRow> valid_rows;

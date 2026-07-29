@@ -34,7 +34,7 @@
 #include "tensors/Tensors.h"
 #include "../../utils/TestTensorFactory.h"
 #include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "v2/kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;

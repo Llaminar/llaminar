@@ -94,6 +94,84 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             self.assertNotIn("no-prefill-graph-buckets", row)
             self.assertIn("prefill-graph-probe", row)
 
+    def test_prefill_graph_probe_defeats_full_prefix_hits_at_fixed_geometry(
+        self,
+    ) -> None:
+        """Prefix-cache cells must execute warmup, capture, and replay.
+
+        Repeating one byte-identical prompt lets the RAM prefix tier answer the
+        second and third requests without launching prefill at all. The probe
+        therefore needs distinct first-block keys and an explicit equal-token
+        assertion so every request exercises the same prefill graph key.
+        """
+
+        harness = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text(
+            encoding="utf-8"
+        )
+        probe_match = re.search(
+            r"run_prefill_graph_probe\(\) \{(.*?)\n\}",
+            harness,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(probe_match)
+        probe = probe_match.group(1)
+        for marker in ('probe_marker="A"', 'probe_marker="B"', 'probe_marker="C"'):
+            self.assertIn(marker, probe)
+        self.assertIn(
+            'observed_prompt_tokens" != "$reference_prompt_tokens',
+            probe,
+        )
+        self.assertIn(
+            'f"{sys.argv[1]} You are a calculator.',
+            probe,
+        )
+
+    def test_llep_perf_gate_requires_native_raw_allgather(self) -> None:
+        """LLEP must prove native NCCL/RCCL transport without host rendezvous."""
+
+        harness = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'record.get("domain") == "tp_raw_allgather_runtime"',
+            harness,
+        )
+        self.assertIn(
+            'record_tags.get("path") != "native_single_device_on_stream"',
+            harness,
+        )
+        self.assertIn(
+            'record_tags.get("backend_primitive") != expected_allgather_primitive',
+            harness,
+        )
+        self.assertIn(
+            'record_tags.get("host_rendezvous") != "false"',
+            harness,
+        )
+        self.assertIn(
+            'expected_allgather_primitive = "ncclAllGather"',
+            harness,
+        )
+        self.assertIn(
+            'expected_allgather_primitive = "rcclAllGather"',
+            harness,
+        )
+
+    def test_movement_probe_uses_one_compact_payload_by_default(self) -> None:
+        """The correctness probe must not inflate every captured MoE transfer."""
+
+        harness = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "LLAMINAR_E2E_MOE_REBALANCE_COMPACT_PAYLOAD_SLOTS:-1",
+            harness,
+        )
+        self.assertNotIn(
+            "LLAMINAR_E2E_MOE_REBALANCE_COMPACT_PAYLOAD_SLOTS:-32",
+            harness,
+        )
+
     def test_release_ci_has_combined_dynamic_llep_prefix_mtp_gpu_cells(
         self,
     ) -> None:

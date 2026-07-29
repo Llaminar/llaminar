@@ -449,6 +449,42 @@ TEST(Test__MoERebalanceController, TransferSlotStorageLifetimeIsIndependentOfCom
     EXPECT_FALSE(native_weight_descriptor.protected_from_reuse);
 }
 
+TEST(Test__MoERebalanceController, PrefillTransferSlotLifetimeFollowsForwardLayerOrdering)
+{
+    /*
+     * Same-layer replicas remain live when the device-owned grouped
+     * assignment sends rows to this participant. This is the only case where
+     * assignment liveness protects a non-owner transfer slot.
+     */
+    EXPECT_TRUE(
+        moe_rebalance_policy::prefillAssignmentReadsTransferSlotOccupant(
+            /*prepared_layer=*/5u,
+            /*occupant_layer=*/5u,
+            /*same_layer_assigned_locally=*/true));
+    EXPECT_FALSE(
+        moe_rebalance_policy::prefillAssignmentReadsTransferSlotOccupant(
+            /*prepared_layer=*/5u,
+            /*occupant_layer=*/5u,
+            /*same_layer_assigned_locally=*/false));
+
+    /*
+     * A completed earlier layer and a not-yet-executed later layer cannot be
+     * current consumers at layer 5. The explicit compute-to-transfer event
+     * orders earlier reads before replacement, while later layers republish
+     * their own assignment and payload before executing.
+     */
+    EXPECT_FALSE(
+        moe_rebalance_policy::prefillAssignmentReadsTransferSlotOccupant(
+            /*prepared_layer=*/5u,
+            /*occupant_layer=*/4u,
+            /*same_layer_assigned_locally=*/true));
+    EXPECT_FALSE(
+        moe_rebalance_policy::prefillAssignmentReadsTransferSlotOccupant(
+            /*prepared_layer=*/5u,
+            /*occupant_layer=*/6u,
+            /*same_layer_assigned_locally=*/true));
+}
+
 TEST(Test__MoERebalanceController, DeviceSideTransferWaveValueGateUsesPayloadSlots)
 {
     EXPECT_TRUE(moe_rebalance_policy::transferWaveMeetsSpreadImprovementFloor(

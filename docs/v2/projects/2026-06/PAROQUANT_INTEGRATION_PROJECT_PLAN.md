@@ -148,7 +148,7 @@ Current quantized GEMM flows through prepared handles:
 | Prepared store | `src/v2/loaders/PreparedWeightStore.cpp` | Owns model prepared handles and caches |
 | CUDA packer | `src/v2/kernels/cuda/gemm/CUDAWeightPacker.cpp` | Packs native quantized formats for CUDA kernels |
 | CUDA quant GEMM | `src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp` | Decode/prefill GEMM implementation |
-| CPU VNNI packer | `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIWeightPacker.h` | CPU reference/performance path |
+| CPU VNNI packer | `src/v2/kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h` | CPU reference/performance path |
 | Stage execution | `src/v2/execution/compute_stages/stages/GEMMStage.cpp` | Calls prepared GEMM kernels |
 
 Important repository convention: model-owned prepared GEMM state should remain in `PreparedWeightStore`, not in global `KernelFactory` registries.

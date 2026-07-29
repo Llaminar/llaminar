@@ -378,7 +378,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/kernels/rocm/kvcache/ROCmRingKVCacheTQ.hip", "ROCmRingKVCacheTQ::publishBatchedEntryTables", "backend_sync_copy", 2),
         ("src/v2/kernels/rocm/kvcache/ROCmTurboQuantKernels.hip", "hip_tq_upload_codebooks", "raw_stream", 1),
         ("src/v2/kernels/rocm/kvcache/ROCmTurboQuantKernels.hip", "hip_tq_upload_rope_freqs", "raw_stream", 1),
-        ("src/v2/kernels/rocm/ROCmWeightPacker.cpp", "MoEBatchPackedWeightsROCm::uploadToDevice", "backend_sync_copy", 1),
+        ("src/v2/kernels/rocm/gemm/ROCmWeightPacker.cpp", "MoEBatchPackedWeightsROCm::uploadToDevice", "backend_sync_copy", 1),
         ("src/v2/kernels/KernelFactory.cpp", "KernelFactory::prepareEmbeddingHandleLocal", "backend_sync_copy", 1),
         ("src/v2/loaders/gpu_pipeline/DeviceLoadPipeline.cpp", "workerLoop", "backend_event", 1),
         ("src/v2/loaders/gpu_pipeline/DeviceLoadPipeline.cpp", "DeviceLoadPipeline::processJobs", "worker_stream", 3),

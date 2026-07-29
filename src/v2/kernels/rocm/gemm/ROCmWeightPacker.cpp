@@ -17,7 +17,7 @@
 
 #include "ROCmWeightPacker.h"
 #include "backends/BackendManager.h"
-#include "gemm/ROCmQuantisedGemmKernel.h"
+#include "ROCmQuantisedGemmKernel.h"
 #include "tensors/TensorClasses.h"   // IINT8Unpackable (for packVnniBlock, requantizeRowToInt8)
 #include "tensors/VnniPackContext.h" // VnniPackContext, vnniLinearIdx, etc.
 #include "tensors/IQQuantTables.h"   // iq3s_grid, ksigns_iq2xs, etc. (for IQ grid init)
