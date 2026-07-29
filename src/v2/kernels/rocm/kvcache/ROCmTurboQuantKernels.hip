@@ -295,7 +295,7 @@ namespace llaminar2
 
         float scaled = x * s_combined_scale;
 
-        __shared__ float s_scaled[128];
+        __shared__ float s_scaled[D];
         s_scaled[tid] = scaled;
         __syncthreads();
 
@@ -364,7 +364,7 @@ namespace llaminar2
 
         float scaled = x * s_combined_scale;
 
-        __shared__ float s_scaled[128];
+        __shared__ float s_scaled[D];
         s_scaled[tid] = scaled;
         __syncthreads();
 
@@ -380,7 +380,7 @@ namespace llaminar2
         if (rotated > d_TQ4_THRESHOLDS_HIP[idx + 1]) idx += 2;
         if (rotated > d_TQ4_THRESHOLDS_HIP[idx]) idx += 1;
 
-        __shared__ uint8_t s_indices[128];
+        __shared__ uint8_t s_indices[D];
         s_indices[tid] = static_cast<uint8_t>(idx);
         __syncthreads();
 
@@ -430,7 +430,7 @@ namespace llaminar2
      * it does not change the reduction or dot-product order within a row/head,
      * which is the requirement for serial-decode byte equivalence.
      */
-    template <int D>
+    template <int D, bool VUsesTQ8>
     __global__ void hip_tq_quantize_grouped_ring_kernel(
         const float *__restrict__ d_k_input,
         const float *__restrict__ d_v_input,
@@ -485,7 +485,7 @@ namespace llaminar2
         }
         __syncthreads();
 
-        __shared__ float s_scaled[128];
+        __shared__ float s_scaled[D];
         s_scaled[tid] = x * s_combined_scale;
         __syncthreads();
 
@@ -495,7 +495,7 @@ namespace llaminar2
         for (int j = 0; j < D; ++j)
             rotated += rot_row[j] * s_scaled[j];
 
-        if (phase == 0)
+        if (phase == 0 || VUsesTQ8)
         {
             int idx = 0;
             if (rotated > d_TQ8_THRESHOLDS_HIP[idx + 127]) idx += 128;
@@ -508,8 +508,10 @@ namespace llaminar2
             if (rotated > d_TQ8_THRESHOLDS_HIP[idx]) idx += 1;
 
             constexpr size_t block_size = sizeof(TQ8Block<D>);
-            uint8_t *block = d_k_ring +
-                             (static_cast<size_t>(ring_row) * n_kv_heads + head) * block_size;
+            uint8_t *ring = phase == 0 ? d_k_ring : d_v_ring;
+            uint8_t *block = ring +
+                             (static_cast<size_t>(ring_row) * n_kv_heads + head) *
+                                 block_size;
             if (tid == 0)
             {
                 auto *norms = reinterpret_cast<float *>(block);
@@ -526,7 +528,7 @@ namespace llaminar2
         if (rotated > d_TQ4_THRESHOLDS_HIP[idx + 1]) idx += 2;
         if (rotated > d_TQ4_THRESHOLDS_HIP[idx]) idx += 1;
 
-        __shared__ uint8_t s_indices[128];
+        __shared__ uint8_t s_indices[D];
         s_indices[tid] = static_cast<uint8_t>(idx);
         __syncthreads();
 
@@ -640,7 +642,7 @@ namespace llaminar2
         const float inv_scale = 1.0f / sqrtf(static_cast<float>(D));
         float centroid_val = d_TQ8_CENTROIDS_HIP[idx] * inv_scale;
 
-        __shared__ float s_centroid[128];
+        __shared__ float s_centroid[D];
         s_centroid[tid] = centroid_val;
         __syncthreads();
 
@@ -661,7 +663,7 @@ namespace llaminar2
             float cos_val, sin_val;
             __sincosf(angle, &sin_val, &cos_val);
 
-            __shared__ float s_vals[128];
+            __shared__ float s_vals[D];
             s_vals[tid] = val;
             __syncthreads();
 
@@ -742,7 +744,7 @@ namespace llaminar2
         const float inv_scale = 1.0f / sqrtf(static_cast<float>(D));
         float centroid_val = d_TQ4_CENTROIDS_HIP[full_idx] * inv_scale;
 
-        __shared__ float s_centroid[128];
+        __shared__ float s_centroid[D];
         s_centroid[tid] = centroid_val;
         __syncthreads();
 
@@ -1740,6 +1742,7 @@ namespace llaminar2
             int max_seq_len, int verifier_rows,
             int n_kv_heads, int head_dim,
             bool k_head_major, bool v_head_major,
+            TurboQuantKVMode mode,
             hipStream_t stream)
         {
             if (!d_k_input || !d_v_input || !d_rotations || !d_k_ring || !d_v_ring ||
@@ -1753,23 +1756,60 @@ namespace llaminar2
             const dim3 grid(n_kv_heads, 2, verifier_rows);
             if (head_dim == 64)
             {
-                hipLaunchKernelGGL(
-                    hip_tq_quantize_grouped_ring_kernel<64>, grid, dim3(64), 0, stream,
-                    d_k_input, d_v_input, d_rotations,
-                    static_cast<uint8_t *>(d_k_ring), static_cast<uint8_t *>(d_v_ring),
-                    ring_head, d_ring_head, d_row_count,
-                    max_seq_len, verifier_rows, n_kv_heads,
-                    k_head_major, v_head_major);
+                if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                    hipLaunchKernelGGL(
+                        (hip_tq_quantize_grouped_ring_kernel<64, true>), grid, dim3(64), 0, stream,
+                        d_k_input, d_v_input, d_rotations,
+                        static_cast<uint8_t *>(d_k_ring), static_cast<uint8_t *>(d_v_ring),
+                        ring_head, d_ring_head, d_row_count,
+                        max_seq_len, verifier_rows, n_kv_heads,
+                        k_head_major, v_head_major);
+                else
+                    hipLaunchKernelGGL(
+                        (hip_tq_quantize_grouped_ring_kernel<64, false>), grid, dim3(64), 0, stream,
+                        d_k_input, d_v_input, d_rotations,
+                        static_cast<uint8_t *>(d_k_ring), static_cast<uint8_t *>(d_v_ring),
+                        ring_head, d_ring_head, d_row_count,
+                        max_seq_len, verifier_rows, n_kv_heads,
+                        k_head_major, v_head_major);
             }
             else if (head_dim == 128)
             {
-                hipLaunchKernelGGL(
-                    hip_tq_quantize_grouped_ring_kernel<128>, grid, dim3(128), 0, stream,
-                    d_k_input, d_v_input, d_rotations,
-                    static_cast<uint8_t *>(d_k_ring), static_cast<uint8_t *>(d_v_ring),
-                    ring_head, d_ring_head, d_row_count,
-                    max_seq_len, verifier_rows, n_kv_heads,
-                    k_head_major, v_head_major);
+                if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                    hipLaunchKernelGGL(
+                        (hip_tq_quantize_grouped_ring_kernel<128, true>), grid, dim3(128), 0, stream,
+                        d_k_input, d_v_input, d_rotations,
+                        static_cast<uint8_t *>(d_k_ring), static_cast<uint8_t *>(d_v_ring),
+                        ring_head, d_ring_head, d_row_count,
+                        max_seq_len, verifier_rows, n_kv_heads,
+                        k_head_major, v_head_major);
+                else
+                    hipLaunchKernelGGL(
+                        (hip_tq_quantize_grouped_ring_kernel<128, false>), grid, dim3(128), 0, stream,
+                        d_k_input, d_v_input, d_rotations,
+                        static_cast<uint8_t *>(d_k_ring), static_cast<uint8_t *>(d_v_ring),
+                        ring_head, d_ring_head, d_row_count,
+                        max_seq_len, verifier_rows, n_kv_heads,
+                        k_head_major, v_head_major);
+            }
+            else if (head_dim == 256)
+            {
+                if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                    hipLaunchKernelGGL(
+                        (hip_tq_quantize_grouped_ring_kernel<256, true>), grid, dim3(256), 0, stream,
+                        d_k_input, d_v_input, d_rotations,
+                        static_cast<uint8_t *>(d_k_ring), static_cast<uint8_t *>(d_v_ring),
+                        ring_head, d_ring_head, d_row_count,
+                        max_seq_len, verifier_rows, n_kv_heads,
+                        k_head_major, v_head_major);
+                else
+                    hipLaunchKernelGGL(
+                        (hip_tq_quantize_grouped_ring_kernel<256, false>), grid, dim3(256), 0, stream,
+                        d_k_input, d_v_input, d_rotations,
+                        static_cast<uint8_t *>(d_k_ring), static_cast<uint8_t *>(d_v_ring),
+                        ring_head, d_ring_head, d_row_count,
+                        max_seq_len, verifier_rows, n_kv_heads,
+                        k_head_major, v_head_major);
             }
             else
             {
@@ -1786,13 +1826,14 @@ namespace llaminar2
         int ring_head, int max_seq_len,
         int verifier_rows, int n_kv_heads, int head_dim,
         bool k_head_major, bool v_head_major,
+        TurboQuantKVMode mode,
         hipStream_t stream)
     {
         return launch_hip_tq_quantize_grouped_ring(
             d_k_input, d_v_input, d_rotations, d_k_ring, d_v_ring,
             ring_head, nullptr, nullptr,
             max_seq_len, verifier_rows, n_kv_heads, head_dim,
-            k_head_major, v_head_major, stream);
+            k_head_major, v_head_major, mode, stream);
     }
 
     extern "C" bool hip_tq_quantize_grouped_ring_dynamic(
@@ -1802,6 +1843,7 @@ namespace llaminar2
         const int *d_ring_head, const int *d_row_count, int max_seq_len,
         int verifier_rows, int n_kv_heads, int head_dim,
         bool k_head_major, bool v_head_major,
+        TurboQuantKVMode mode,
         hipStream_t stream)
     {
         if (!d_ring_head)
@@ -1810,7 +1852,7 @@ namespace llaminar2
             d_k_input, d_v_input, d_rotations, d_k_ring, d_v_ring,
             0, d_ring_head, d_row_count,
             max_seq_len, verifier_rows, n_kv_heads, head_dim,
-            k_head_major, v_head_major, stream);
+            k_head_major, v_head_major, mode, stream);
     }
 
     namespace
@@ -2118,6 +2160,7 @@ namespace llaminar2
         int tail, int count, int max_seq_len,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start, int rope_dim,
+        TurboQuantKVMode mode,
         hipStream_t stream)
     {
         if (count <= 0)
@@ -2133,9 +2176,14 @@ namespace llaminar2
                                static_cast<const uint8_t *>(d_K_cache), d_K_rotations, d_K_out,
                                count, n_kv_heads, rope_theta, position_start,
                                rope_dim, max_seq_len, tail);
-            hipLaunchKernelGGL((hip_tq4_dequantize_tiled_fp16_kernel<64, TILE>), grid, dim3(64), 0, stream,
-                               static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
-                               count, n_kv_heads, max_seq_len, tail);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                hipLaunchKernelGGL((hip_tq8_dequantize_tiled_fp16_kernel<64, TILE>), grid, dim3(64), 0, stream,
+                                   static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
+                                   count, n_kv_heads, 0.0f, 0, 0, max_seq_len, tail);
+            else
+                hipLaunchKernelGGL((hip_tq4_dequantize_tiled_fp16_kernel<64, TILE>), grid, dim3(64), 0, stream,
+                                   static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
+                                   count, n_kv_heads, max_seq_len, tail);
         }
         else if (head_dim == 128)
         {
@@ -2144,9 +2192,30 @@ namespace llaminar2
                                static_cast<const uint8_t *>(d_K_cache), d_K_rotations, d_K_out,
                                count, n_kv_heads, rope_theta, position_start,
                                rope_dim, max_seq_len, tail);
-            hipLaunchKernelGGL((hip_tq4_dequantize_tiled_fp16_kernel<128, TILE>), grid, dim3(128), 0, stream,
-                               static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
-                               count, n_kv_heads, max_seq_len, tail);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                hipLaunchKernelGGL((hip_tq8_dequantize_tiled_fp16_kernel<128, TILE>), grid, dim3(128), 0, stream,
+                                   static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
+                                   count, n_kv_heads, 0.0f, 0, 0, max_seq_len, tail);
+            else
+                hipLaunchKernelGGL((hip_tq4_dequantize_tiled_fp16_kernel<128, TILE>), grid, dim3(128), 0, stream,
+                                   static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
+                                   count, n_kv_heads, max_seq_len, tail);
+        }
+        else if (head_dim == 256)
+        {
+            const dim3 grid(n_kv_heads, (count + TILE - 1) / TILE);
+            hipLaunchKernelGGL((hip_tq8_dequantize_tiled_fp16_kernel<256, TILE>), grid, dim3(256), 0, stream,
+                               static_cast<const uint8_t *>(d_K_cache), d_K_rotations, d_K_out,
+                               count, n_kv_heads, rope_theta, position_start,
+                               rope_dim, max_seq_len, tail);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                hipLaunchKernelGGL((hip_tq8_dequantize_tiled_fp16_kernel<256, TILE>), grid, dim3(256), 0, stream,
+                                   static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
+                                   count, n_kv_heads, 0.0f, 0, 0, max_seq_len, tail);
+            else
+                hipLaunchKernelGGL((hip_tq4_dequantize_tiled_fp16_kernel<256, TILE>), grid, dim3(256), 0, stream,
+                                   static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
+                                   count, n_kv_heads, max_seq_len, tail);
         }
         else
             return false;
@@ -2171,6 +2240,7 @@ namespace llaminar2
         float rope_theta,
         int position_start,
         int rope_dim,
+        TurboQuantKVMode mode,
         hipStream_t stream)
     {
         if (!d_K_out || !d_V_out || !d_K_entry_table || !d_V_entry_table ||
@@ -2197,12 +2267,20 @@ namespace llaminar2
                 d_K_out, d_K_entry_table, d_heads, d_counts, d_rotations,
                 entry_offset, request_count, max_kv_len, max_seq_len,
                 n_kv_heads, rope_theta, position_start, rope_dim);
-            hipLaunchKernelGGL(
-                (hip_tq4_batched_ring_dequant_fp16_device_state_kernel<64, tile>),
-                grid, dim3(64), 0, stream,
-                d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
-                entry_offset, request_count, max_kv_len, max_seq_len,
-                n_kv_heads);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                hipLaunchKernelGGL(
+                    (hip_tq8_batched_ring_dequant_fp16_device_state_kernel<64, tile>),
+                    grid, dim3(64), 0, stream,
+                    d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                    entry_offset, request_count, max_kv_len, max_seq_len,
+                    n_kv_heads, 0.0f, 0, 0);
+            else
+                hipLaunchKernelGGL(
+                    (hip_tq4_batched_ring_dequant_fp16_device_state_kernel<64, tile>),
+                    grid, dim3(64), 0, stream,
+                    d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                    entry_offset, request_count, max_kv_len, max_seq_len,
+                    n_kv_heads);
         }
         else if (head_dim == 128)
         {
@@ -2212,12 +2290,43 @@ namespace llaminar2
                 d_K_out, d_K_entry_table, d_heads, d_counts, d_rotations,
                 entry_offset, request_count, max_kv_len, max_seq_len,
                 n_kv_heads, rope_theta, position_start, rope_dim);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                hipLaunchKernelGGL(
+                    (hip_tq8_batched_ring_dequant_fp16_device_state_kernel<128, tile>),
+                    grid, dim3(128), 0, stream,
+                    d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                    entry_offset, request_count, max_kv_len, max_seq_len,
+                    n_kv_heads, 0.0f, 0, 0);
+            else
+                hipLaunchKernelGGL(
+                    (hip_tq4_batched_ring_dequant_fp16_device_state_kernel<128, tile>),
+                    grid, dim3(128), 0, stream,
+                    d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                    entry_offset, request_count, max_kv_len, max_seq_len,
+                    n_kv_heads);
+        }
+        else if (head_dim == 256)
+        {
             hipLaunchKernelGGL(
-                (hip_tq4_batched_ring_dequant_fp16_device_state_kernel<128, tile>),
-                grid, dim3(128), 0, stream,
-                d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                (hip_tq8_batched_ring_dequant_fp16_device_state_kernel<256, tile>),
+                grid, dim3(256), 0, stream,
+                d_K_out, d_K_entry_table, d_heads, d_counts, d_rotations,
                 entry_offset, request_count, max_kv_len, max_seq_len,
-                n_kv_heads);
+                n_kv_heads, rope_theta, position_start, rope_dim);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                hipLaunchKernelGGL(
+                    (hip_tq8_batched_ring_dequant_fp16_device_state_kernel<256, tile>),
+                    grid, dim3(256), 0, stream,
+                    d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                    entry_offset, request_count, max_kv_len, max_seq_len,
+                    n_kv_heads, 0.0f, 0, 0);
+            else
+                hipLaunchKernelGGL(
+                    (hip_tq4_batched_ring_dequant_fp16_device_state_kernel<256, tile>),
+                    grid, dim3(256), 0, stream,
+                    d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                    entry_offset, request_count, max_kv_len, max_seq_len,
+                    n_kv_heads);
         }
         else
         {

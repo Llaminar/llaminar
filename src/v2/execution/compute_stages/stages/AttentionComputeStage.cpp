@@ -38,80 +38,6 @@ namespace llaminar2
 
     namespace
     {
-        int rocmAttentionRequestedDecodeSplitCap(int kv_len)
-        {
-            if (debugEnv().gemm.deterministic)
-                return 1;
-            if (kv_len <= 64)
-                return 1;
-            if (kv_len < 128)
-                return 2;
-            if (kv_len < 256)
-                return 4;
-            return 8;
-        }
-
-        int cudaAttentionSMCount(int device_ordinal)
-        {
-            static int sm_count_cache[8] = {0};
-            const int cache_idx = device_ordinal & 7;
-            int num_sms = sm_count_cache[cache_idx];
-            if (num_sms > 0)
-                return num_sms;
-
-            num_sms = 82;
-#if defined(HAVE_CUDA)
-            int queried_sms = 0;
-            if (cudaDeviceGetAttribute(&queried_sms,
-                                       cudaDevAttrMultiProcessorCount,
-                                       device_ordinal) == cudaSuccess &&
-                queried_sms > 0)
-            {
-                num_sms = queried_sms;
-            }
-#endif
-            sm_count_cache[cache_idx] = num_sms;
-            return num_sms;
-        }
-
-        /**
-         * @brief CUDA small-M decode split count used as a graph capture bucket.
-         *
-         * This mirrors CUDAFlashAttentionKernelT::computeNumSplitsForDevice().
-         * The previous capture signature used raw `kv_len / 16`; that kept
-         * recapturing every sixteen decode tokens even after the actual CUDA
-         * launcher had already capped `num_splits` by SM occupancy or
-         * MAX_NUM_SPLITS.  The signature should encode launch topology, not
-         * exact token position, so long-context verifier graphs can replay
-         * until the real split count changes.
-         */
-        int cudaAttentionDecodeSplitBucket(int kv_len, int n_heads, int device_ordinal)
-        {
-            constexpr int kMinKVPerSplit = 16;
-            constexpr int kMaxNumSplits = 32;
-            constexpr int kMaxBlocksPerSM = 4;
-            if (debugEnv().gemm.deterministic || kv_len <= 1)
-                return 1;
-            if (n_heads <= 0)
-                return 1;
-
-            const int desired_splits =
-                std::max(1, (kMaxBlocksPerSM * cudaAttentionSMCount(device_ordinal)) / n_heads);
-            const int max_splits_by_kv = std::max(1, kv_len / kMinKVPerSplit);
-            return std::clamp(std::min(desired_splits, max_splits_by_kv),
-                              1,
-                              kMaxNumSplits);
-        }
-
-        int attentionDecodeLaunchBucket(DeviceId device, int kv_len, int n_heads)
-        {
-            if (device.is_cuda())
-                return cudaAttentionDecodeSplitBucket(kv_len, n_heads, device.cuda_ordinal());
-            if (device.is_rocm())
-                return rocmAttentionRequestedDecodeSplitCap(kv_len);
-            return 0;
-        }
-
         /**
          * @brief True when a verifier Q tensor is laid out as [head][row][dim].
          *
@@ -203,13 +129,6 @@ namespace llaminar2
             return true;
         }
 
-        void combineAttentionVariant(uint64_t &h, uint64_t value)
-        {
-            constexpr uint64_t kPrime = 1099511628211ull;
-            h ^= value;
-            h *= kPrime;
-        }
-
         bool copyAttentionFP32DeviceRow(
             TensorBase *dst,
             int dst_row,
@@ -284,52 +203,22 @@ namespace llaminar2
         if (!params_.kv_cache)
             return 1;
 
-        if (params_.device_id.is_rocm())
-        {
-            const auto &rocm_env = debugEnv().rocm;
-            const auto kp = params_.kv_cache->k_precision();
-            const auto vp = params_.kv_cache->v_precision();
-            const bool native_kv =
-                !rocm_env.fa_disable_native_kv &&
-                params_.head_dim >= 64 &&
-                ((kp == ActivationPrecision::FP16 && vp == ActivationPrecision::FP16) ||
-                 (kp == ActivationPrecision::BF16 && vp == ActivationPrecision::BF16) ||
-                 (kp == ActivationPrecision::Q8_1 && vp == ActivationPrecision::Q8_1 &&
-                  params_.head_dim % 32 == 0));
-            const bool small_native_decode =
-                native_kv &&
-                params_.batch_size == 1 &&
-                params_.causal &&
-                !rocm_env.fa_decode_via_prefill &&
-                logical_seq_len > 1 &&
-                logical_seq_len <= attention::kMaxGroupedVerifierAttentionRows &&
-                kv_len > logical_seq_len;
-            return small_native_decode ? logical_seq_len : 1;
-        }
-
-        const auto kp = params_.kv_cache->k_precision();
-        const auto vp = params_.kv_cache->v_precision();
         /*
-         * CUDA grouped verifier attention consumes FP16 K/V whenever the cache
-         * is either physically FP16 or RoPE-on-read asks get_kv_converted() for
-         * an FP16 shadow.  The latter is the production Q8/BF16 cache path:
-         * cache precision describes storage, while verifier attention sees the
-         * converted post-append span.  Preparing only one AttentionDeviceParams
-         * row in that case sends the M=2..16 verifier through multi-row prefill
-         * semantics instead of row-local serial-decode semantics.
+         * Every GPU grouped verifier call below is row-local and consumes one
+         * AttentionDeviceParams record per logical row. Cache storage format
+         * cannot change that launch contract: native FP16/BF16/FP32/Q8 caches
+         * and RoPE-on-read converted views all enter the same grouped API.
+         * Returning one row for any format leaves rows 1..M uninitialized and
+         * silently turns a valid grouped launch into zero output.
          */
-        const bool cuda_effective_fp16_kv =
-            (kp == ActivationPrecision::FP16 && vp == ActivationPrecision::FP16) ||
-            params_.apply_rope_to_k;
-        const bool cuda_small_fp16_decode =
-            params_.device_id.is_cuda() &&
-            cuda_effective_fp16_kv &&
+        const bool gpu_grouped_verifier =
+            params_.device_id.is_gpu() &&
             params_.batch_size == 1 &&
             params_.causal &&
             logical_seq_len > 1 &&
             logical_seq_len <= attention::kMaxGroupedVerifierAttentionRows &&
             kv_len > logical_seq_len;
-        return cuda_small_fp16_decode ? logical_seq_len : 1;
+        return gpu_grouped_verifier ? logical_seq_len : 1;
     }
 
     void AttentionComputeStage::updateDynamicParams(int pos_offset, int seq_len)
@@ -431,132 +320,6 @@ namespace llaminar2
         const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
         prefill_effective_seq_len_ = std::clamp(real_seq_len, 1, std::max(1, params_.seq_len));
         prefill_replay_params_set_ = true;
-    }
-
-    uint64_t AttentionComputeStage::graphCaptureVariantSignature() const
-    {
-        if (!params_.device_id.is_gpu() ||
-            !params_.kv_cache ||
-            params_.layer_idx < 0 ||
-            params_.batch_size != 1 ||
-            params_.seq_len <= 0 ||
-            params_.head_dim <= 0)
-        {
-            return 0;
-        }
-        if (params_.device_id.is_rocm() && debugEnv().rocm.fa_decode_via_prefill)
-        {
-            return 0;
-        }
-
-        const int cache_capacity = std::max(1, params_.kv_cache->max_seq_len());
-        const int effective_kv_len = std::clamp(
-            std::max(0, params_.position_offset) + params_.seq_len,
-            std::max(1, params_.seq_len),
-            cache_capacity);
-
-        AttentionMode mode = params_.attention_mode;
-        if (params_.auto_detect_mode)
-        {
-            mode = detect_attention_mode(params_.batch_size, params_.seq_len, effective_kv_len);
-        }
-
-        const bool decode_like =
-            mode == AttentionMode::DECODE ||
-            mode == AttentionMode::BATCHED_DECODE ||
-            (params_.seq_len < effective_kv_len && params_.batch_size == 1);
-        if (!decode_like)
-        {
-            return 0;
-        }
-
-        /*
-         * Multirow MTP verifier graphs append M=2..16 rows and then run the
-         * native-KV M=2..16 verifier path. The row count is a first-class
-         * replay signature input, but exact token positions are not: dynamic
-         * attention params and device sequence state carry row-local KV lengths
-         * into the captured kernel arguments before every replay.  The graph
-         * signature therefore records only the launch regime bucket that can
-         * change kernel topology or split count.
-         */
-        const bool multirow_verifier_decode =
-            params_.seq_len > 1 &&
-            params_.seq_len <= attention::kMaxGroupedVerifierAttentionRows &&
-            params_.seq_len < effective_kv_len;
-        if (!multirow_verifier_decode && params_.device_id.is_cuda())
-        {
-            return 0;
-        }
-
-        const int decode_rows = std::min(
-            params_.seq_len,
-            attention::kMaxGroupedVerifierAttentionRows);
-        if (decode_rows <= 0 ||
-            params_.seq_len > attention::kMaxGroupedVerifierAttentionRows)
-        {
-            return 0;
-        }
-
-        uint64_t signature = 1469598103934665603ull;
-        combineAttentionVariant(signature, 0xA77E0002ull);
-        combineAttentionVariant(signature, params_.device_id.is_cuda() ? 1ull : 2ull);
-        combineAttentionVariant(signature, static_cast<uint64_t>(params_.seq_len));
-        /*
-         * MTP verifier rows must be decode-equivalent before they are allowed to
-         * publish live KV/GDN state.  CUDA FA2 prefill currently converts Q to
-         * half for WMMA; that is a good throughput path for ordinary prefill but
-         * can drift enough on real Qwen3.6 MoE verifier rows to change the next
-         * token.  Keep the capture signature tied to the row-local decode bucket
-         * until a fused multi-row verifier kernel proves serial-decode parity.
-         */
-        combineAttentionVariant(signature, multirow_verifier_decode
-                                               ? static_cast<uint64_t>(
-                                                     attentionDecodeLaunchBucket(params_.device_id,
-                                                                                 effective_kv_len,
-                                                                                 params_.n_heads))
-                                               : 0ull);
-        combineAttentionVariant(signature, static_cast<uint64_t>(params_.n_heads));
-        combineAttentionVariant(signature, static_cast<uint64_t>(params_.n_kv_heads));
-        combineAttentionVariant(signature, static_cast<uint64_t>(params_.head_dim));
-        combineAttentionVariant(signature, static_cast<uint64_t>(params_.kv_cache->k_precision()));
-        combineAttentionVariant(signature, static_cast<uint64_t>(params_.kv_cache->v_precision()));
-        combineAttentionVariant(signature, params_.apply_rope_to_k ? 1ull : 0ull);
-        combineAttentionVariant(signature, static_cast<uint64_t>(
-                                             std::max(0, static_cast<int>(
-                                                             params_.partial_rotary_factor *
-                                                             params_.head_dim))));
-
-        if (params_.device_id.is_rocm())
-        {
-            const auto &rocm_env = debugEnv().rocm;
-            combineAttentionVariant(signature, rocm_env.fa_decode_num_splits_present ? 1ull : 0ull);
-            combineAttentionVariant(signature, rocm_env.fa_decode_num_splits
-                                                   ? static_cast<uint64_t>(std::max(0, *rocm_env.fa_decode_num_splits))
-                                                   : 0ull);
-            combineAttentionVariant(signature, rocm_env.fa_decode_tpb
-                                                   ? static_cast<uint64_t>(std::max(0, *rocm_env.fa_decode_tpb))
-                                                   : 0ull);
-        }
-
-        for (int row = 0; row < decode_rows; ++row)
-        {
-            const int row_kv_len =
-                std::max(1, effective_kv_len - (decode_rows - 1 - row));
-            combineAttentionVariant(signature, static_cast<uint64_t>(row));
-            combineAttentionVariant(signature, multirow_verifier_decode
-                                                   ? static_cast<uint64_t>(
-                                                         attentionDecodeLaunchBucket(params_.device_id,
-                                                                                     row_kv_len,
-                                                                                     params_.n_heads))
-                                                   : 0ull);
-            if (params_.device_id.is_rocm())
-            {
-                const int requested_split_cap = rocmAttentionRequestedDecodeSplitCap(row_kv_len);
-                combineAttentionVariant(signature, static_cast<uint64_t>(requested_split_cap));
-            }
-        }
-
-        return signature;
     }
 
     // =============================================================================

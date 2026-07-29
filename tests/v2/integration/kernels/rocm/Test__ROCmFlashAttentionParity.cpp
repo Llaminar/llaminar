@@ -39,6 +39,7 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/cpu/turboquant/TurboQuantContext.h"
 #include "loaders/ModelContext.h"
 #include "transfer/TransferEngine.h"
 #include "utils/MPIContext.h"
@@ -332,11 +333,31 @@ protected:
 
     // Workspace manager for FlashDecode tests (owned by fixture)
     std::unique_ptr<DeviceWorkspaceManager> workspace_;
+#ifdef HAVE_ROCM
+    hipStream_t test_stream_ = nullptr;
+#endif
 
     void SetUp() override
     {
 #ifdef HAVE_ROCM
         ASSERT_EQ(hipSetDevice(0), hipSuccess) << "Failed to set active ROCm device to 0";
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&test_stream_, hipStreamNonBlocking),
+            hipSuccess)
+            << "Failed to create the explicit ROCm fixture stream";
+#endif
+    }
+
+    void TearDown() override
+    {
+#ifdef HAVE_ROCM
+        workspace_.reset();
+        if (test_stream_)
+        {
+            EXPECT_EQ(hipStreamSynchronize(test_stream_), hipSuccess);
+            EXPECT_EQ(hipStreamDestroy(test_stream_), hipSuccess);
+            test_stream_ = nullptr;
+        }
 #endif
     }
 
@@ -384,8 +405,10 @@ protected:
      */
     bool setupWorkspace(
         llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> &kernel,
-        int batch_size, int n_heads, int head_dim)
+        int batch_size, int n_heads, int head_dim,
+        hipStream_t stream = nullptr)
     {
+        kernel.setGPUStream(stream ? stream : test_stream_);
         auto reqs = kernel.getWorkspaceRequirements(batch_size, n_heads, head_dim);
 
         // Compute actual budget from requirements (with alignment padding) + 1MB margin
@@ -401,6 +424,40 @@ protected:
         }
         kernel.bindWorkspace(workspace_.get());
         return true;
+    }
+
+    /**
+     * @brief Bind cache-owned conversion and grouped-gather workspace.
+     *
+     * Production graph planning binds this storage before capture. Reference
+     * caches in integration tests must honor the same allocation contract so
+     * the oracle cannot rely on a dynamic scratch path that production forbids.
+     */
+    std::unique_ptr<DeviceWorkspaceManager> bindKVCacheWorkspace(
+        IKVCache &cache,
+        int max_tokens,
+        int batch_size,
+        int head_dim)
+    {
+        auto *consumer = dynamic_cast<IWorkspaceConsumer *>(&cache);
+        if (!consumer)
+        {
+            ADD_FAILURE() << "ROCm KV cache does not implement IWorkspaceConsumer";
+            return nullptr;
+        }
+
+        const WorkspaceRequirements requirements =
+            consumer->getWorkspaceRequirements(max_tokens, batch_size, head_dim);
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(
+            DeviceId::rocm(0),
+            requirements.total_bytes_with_alignment() + 4096);
+        if (!workspace->allocate(requirements))
+        {
+            ADD_FAILURE() << "Failed to allocate ROCm KV-cache workspace";
+            return nullptr;
+        }
+        consumer->bindWorkspace(workspace.get());
+        return workspace;
     }
 
     void cleanupWorkspace(
@@ -1088,10 +1145,11 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_LargeKVLen_GQA)
 /**
  * @brief Prove a captured HIP decode consumes a later device KV-length update.
  *
- * The replayed graph and direct execution use the same backend kernel and
- * reduction order, so this is an exact ownership test rather than an
- * approximate cross-backend parity check. Any stale descriptor or host-owned
- * update path changes the visible KV prefix and fails byte equality.
+ * The graph owns a cache-capacity-sized physical split envelope. Replays cross
+ * the former split-count and wavefront-count boundaries while device metadata
+ * selects the active prefix. A direct same-backend decode must agree byte for
+ * byte at every length, proving that mode shifts do not require recapture or
+ * alter reduction order.
  */
 TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedDeviceKVLenByteExact)
 {
@@ -1100,9 +1158,19 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedDe
         GTEST_SKIP() << "ROCm not available";
     }
 
-    constexpr int capture_kv_len = 65;
-    constexpr int replay_kv_len = 66;
-    constexpr int max_kv_len = 80;
+    constexpr int capture_kv_len = 1;
+    constexpr int max_kv_len = 16384;
+    constexpr std::array<int, 24> replay_kv_lengths{
+        1, 2, 3,
+        7, 8, 9,
+        127, 128,
+        255, 256, 257,
+        511, 512,
+        1023, 1024, 1025,
+        2047, 2048,
+        4095, 4096,
+        8191, 8192, 8193,
+        16383};
     constexpr int n_heads = 4;
     constexpr int n_kv_heads = 2;
     constexpr int head_dim = 64;
@@ -1139,14 +1207,21 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedDe
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
     rocm_kernel.setGPUStream(stream);
-    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim, stream));
 
-    // Warmup establishes the stream-owned device parameter block before capture.
+    // Warmup establishes allocations. The explicit capacity-bearing update
+    // after it defines the immutable graph envelope used during capture.
     ASSERT_TRUE(rocm_kernel.compute_tensor(
         &q_tensor, &k_tensor, &v_tensor, &captured_output,
         1, seq_len, capture_kv_len, n_heads, n_kv_heads, head_dim,
         false, -1, nullptr, nullptr, &mpi_ctx_, 0));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_TRUE(rocm_kernel.prepareDynamicAttnParams(
+        capture_kv_len,
+        capture_kv_len - 1,
+        1,
+        stream,
+        max_kv_len));
 
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;
@@ -1162,37 +1237,45 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedDe
     ASSERT_NE(graph, nullptr);
     ASSERT_EQ(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), hipSuccess);
 
-    ASSERT_TRUE(rocm_kernel.prepareDynamicAttnParams(
-        replay_kv_len, replay_kv_len - 1, 1, stream));
-    ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
-    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    for (const int replay_kv_len : replay_kv_lengths)
+    {
+        ASSERT_TRUE(rocm_kernel.prepareDynamicAttnParams(
+            replay_kv_len,
+            replay_kv_len - 1,
+            1,
+            stream,
+            max_kv_len));
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    std::vector<float> captured(out_size, 0.0f);
-    ASSERT_EQ(hipMemcpyAsync(captured.data(), captured_output.gpu_data_ptr(),
-                             out_size * sizeof(float), hipMemcpyDeviceToHost, stream),
-              hipSuccess);
-    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        std::vector<float> captured(out_size, 0.0f);
+        ASSERT_EQ(hipMemcpyAsync(captured.data(), captured_output.gpu_data_ptr(),
+                                 out_size * sizeof(float), hipMemcpyDeviceToHost, stream),
+                  hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    ASSERT_TRUE(rocm_kernel.compute_tensor(
-        &q_tensor, &k_tensor, &v_tensor, &direct_output,
-        1, seq_len, replay_kv_len, n_heads, n_kv_heads, head_dim,
-        false, -1, nullptr, nullptr, &mpi_ctx_, 0));
-    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        ASSERT_TRUE(rocm_kernel.compute_tensor(
+            &q_tensor, &k_tensor, &v_tensor, &direct_output,
+            1, seq_len, replay_kv_len, n_heads, n_kv_heads, head_dim,
+            false, -1, nullptr, nullptr, &mpi_ctx_, 0));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    std::vector<float> direct(out_size, 0.0f);
-    ASSERT_EQ(hipMemcpyAsync(direct.data(), direct_output.gpu_data_ptr(),
-                             out_size * sizeof(float), hipMemcpyDeviceToHost, stream),
-              hipSuccess);
-    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        std::vector<float> direct(out_size, 0.0f);
+        ASSERT_EQ(hipMemcpyAsync(direct.data(), direct_output.gpu_data_ptr(),
+                                 out_size * sizeof(float), hipMemcpyDeviceToHost, stream),
+                  hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    ASSERT_FALSE(hasNaNOrInf(captured.data(), out_size));
-    ASSERT_FALSE(hasNaNOrInf(direct.data(), out_size));
+        ASSERT_FALSE(hasNaNOrInf(captured.data(), out_size));
+        ASSERT_FALSE(hasNaNOrInf(direct.data(), out_size));
 
-    EXPECT_TRUE(expectBitwiseEqualFP32Rows(
-        captured.data(),
-        direct.data(),
-        out_size,
-        "ROCm captured replay after device KV-length update"));
+        EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+            captured.data(),
+            direct.data(),
+            out_size,
+            "ROCm captured replay at KV length " +
+                std::to_string(replay_kv_len)));
+    }
 
     (void)hipGraphExecDestroy(graph_exec);
     (void)hipGraphDestroy(graph);
@@ -1293,7 +1376,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_Qwen35LongKVLen)
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
     rocm_kernel.setGPUStream(stream);
-    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim, stream));
 
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device,
@@ -1421,7 +1504,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_Qwen35TwoKVHeads
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
     rocm_kernel.setGPUStream(stream);
-    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim, stream));
 
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device,
@@ -1554,7 +1637,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_MultiRowContinua
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
     rocm_kernel.setGPUStream(stream);
-    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim, stream));
 
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device,
@@ -1668,7 +1751,7 @@ void runQwen36DeviceDerivedRowsMatchSerialDecode(
     ASSERT_TRUE(workspace.allocate(reqs));
     rocm_kernel.bindWorkspace(&workspace);
     ASSERT_TRUE(rocm_kernel.prepareDynamicAttnParamsFromDeviceSequenceState(
-        d_cached_tokens, seq_len, seq_len, stream));
+        d_cached_tokens, seq_len, seq_len, stream, kv_len));
     ASSERT_TRUE(rocm_kernel.compute_tensor(
         q_grouped_tensor.get(), k_tensor.get(), v_tensor.get(), out_grouped_tensor.get(),
         1, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
@@ -1917,7 +2000,7 @@ void Test__ROCmFlashAttentionParity::runAttentionStageFP16CacheQwen36RoPEOnReadR
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> serial_kernel(0);
     serial_kernel.setGPUStream(stream);
-    ASSERT_TRUE(setupWorkspace(serial_kernel, 1, n_heads, head_dim));
+    ASSERT_TRUE(setupWorkspace(serial_kernel, 1, n_heads, head_dim, stream));
 
     for (int row = 0; row < seq_len; ++row)
     {
@@ -2019,26 +2102,55 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
     quantizeToFP16(V_data_fp32.data(), V_data_fp16.data(), kv_size);
 
     const DeviceId device = DeviceId::rocm(0);
+    const bool turboquant_cache =
+        cache_precision == ActivationPrecision::TQ4 ||
+        cache_precision == ActivationPrecision::TQ8;
+    auto make_kv_source =
+        [&](const std::vector<float> &fp32_source,
+            const std::vector<uint16_t> &fp16_source,
+            size_t offset,
+            size_t count,
+            const std::vector<size_t> &shape) -> std::shared_ptr<TensorBase>
+    {
+        if (turboquant_cache)
+        {
+            auto tensor = std::make_shared<FP32Tensor>(shape);
+            std::copy(
+                fp32_source.begin() + static_cast<std::ptrdiff_t>(offset),
+                fp32_source.begin() + static_cast<std::ptrdiff_t>(offset + count),
+                tensor->mutable_data());
+            return tensor;
+        }
+
+        return std::make_shared<FP16Tensor>(
+            shape,
+            std::vector<uint16_t>(
+                fp16_source.begin() + static_cast<std::ptrdiff_t>(offset),
+                fp16_source.begin() + static_cast<std::ptrdiff_t>(offset + count)));
+    };
+
     auto q_grouped_tensor = std::make_shared<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(seq_len), q_cols});
-    auto history_k_tensor = std::make_shared<FP16Tensor>(
-        std::vector<size_t>{static_cast<size_t>(history_len), kv_cols},
-        std::vector<uint16_t>(K_data_fp16.begin(), K_data_fp16.begin() + static_cast<std::ptrdiff_t>(history_size)));
-    auto history_v_tensor = std::make_shared<FP16Tensor>(
-        std::vector<size_t>{static_cast<size_t>(history_len), kv_cols},
-        std::vector<uint16_t>(V_data_fp16.begin(), V_data_fp16.begin() + static_cast<std::ptrdiff_t>(history_size)));
-    auto current_k_tensor = std::make_shared<FP16Tensor>(
-        std::vector<size_t>{static_cast<size_t>(seq_len), kv_cols},
-        std::vector<uint16_t>(K_data_fp16.begin() + static_cast<std::ptrdiff_t>(history_size), K_data_fp16.end()));
-    auto current_v_tensor = std::make_shared<FP16Tensor>(
-        std::vector<size_t>{static_cast<size_t>(seq_len), kv_cols},
-        std::vector<uint16_t>(V_data_fp16.begin() + static_cast<std::ptrdiff_t>(history_size), V_data_fp16.end()));
-    auto full_k_tensor = std::make_shared<FP16Tensor>(
-        std::vector<size_t>{static_cast<size_t>(kv_len), kv_cols},
-        K_data_fp16);
-    auto full_v_tensor = std::make_shared<FP16Tensor>(
-        std::vector<size_t>{static_cast<size_t>(kv_len), kv_cols},
-        V_data_fp16);
+    auto history_k_tensor = make_kv_source(
+        K_data_fp32, K_data_fp16, 0, history_size,
+        std::vector<size_t>{static_cast<size_t>(history_len), kv_cols});
+    auto history_v_tensor = make_kv_source(
+        V_data_fp32, V_data_fp16, 0, history_size,
+        std::vector<size_t>{static_cast<size_t>(history_len), kv_cols});
+    auto current_k_tensor = make_kv_source(
+        K_data_fp32, K_data_fp16, history_size,
+        static_cast<size_t>(seq_len) * kv_cols,
+        std::vector<size_t>{static_cast<size_t>(seq_len), kv_cols});
+    auto current_v_tensor = make_kv_source(
+        V_data_fp32, V_data_fp16, history_size,
+        static_cast<size_t>(seq_len) * kv_cols,
+        std::vector<size_t>{static_cast<size_t>(seq_len), kv_cols});
+    auto full_k_tensor = make_kv_source(
+        K_data_fp32, K_data_fp16, 0, kv_size,
+        std::vector<size_t>{static_cast<size_t>(kv_len), kv_cols});
+    auto full_v_tensor = make_kv_source(
+        V_data_fp32, V_data_fp16, 0, kv_size,
+        std::vector<size_t>{static_cast<size_t>(kv_len), kv_cols});
     auto out_grouped_tensor = std::make_shared<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(seq_len), q_cols});
     std::copy(Q_data.begin(), Q_data.end(), q_grouped_tensor->mutable_data());
@@ -2064,6 +2176,13 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
     config.max_seq_len = kv_len + 8;
     config.n_kv_heads = n_kv_heads;
     config.head_dim = head_dim;
+    std::unique_ptr<TurboQuantContext> turboquant_context;
+    if (turboquant_cache)
+    {
+        turboquant_context =
+            std::make_unique<TurboQuantContext>(head_dim, 42, 42);
+        config.turboquant_ctx = turboquant_context.get();
+    }
     auto kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(config);
     ASSERT_NE(kv_cache, nullptr);
     std::unique_ptr<DeviceWorkspaceManager> kv_workspace;
@@ -2121,6 +2240,7 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
     attn_params.apply_rope_to_k = true;
     attn_params.rope_theta = rope_theta;
     attn_params.partial_rotary_factor = partial_rotary_factor;
+    attn_params.turboquant_ctx = turboquant_context.get();
     attn_params.mpi_ctx = &mpi_ctx;
     attn_params.head_start = head_start;
     attn_params.gqa_n_rep = effective_gqa_n_rep;
@@ -2136,6 +2256,7 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
     append_params.batch_size = 1;
     append_params.seq_len = seq_len;
     append_params.head_dim = head_dim;
+    append_params.turboquant_ctx = turboquant_context.get();
 
     KVCacheAppendStage append_stage(append_params);
     AttentionComputeStage attn_stage(attn_params);
@@ -2154,13 +2275,34 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
 
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;
-    ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+    ASSERT_EQ(
+        hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+        hipSuccess);
     bool capture_ok = false;
+    std::string capture_exception;
     {
         GraphCaptureGuard guard;
-        capture_ok = append_stage.execute(nullptr) && attn_stage.execute(nullptr);
+        try
+        {
+            capture_ok =
+                append_stage.execute(nullptr) &&
+                attn_stage.execute(nullptr);
+        }
+        catch (const std::exception &error)
+        {
+            capture_exception = error.what();
+        }
+        catch (...)
+        {
+            capture_exception = "non-standard exception";
+        }
     }
-    ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+    const hipError_t capture_end_status =
+        hipStreamEndCapture(stream, &graph);
+    ASSERT_TRUE(capture_exception.empty())
+        << "Captured append+attention threw: " << capture_exception;
+    ASSERT_EQ(capture_end_status, hipSuccess)
+        << "Captured append+attention did not close cleanly";
     ASSERT_TRUE(capture_ok);
     ASSERT_NE(graph, nullptr);
     ASSERT_EQ(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), hipSuccess);
@@ -2177,6 +2319,9 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
 
     auto ref_cache = llaminar::v2::kernels::KernelFactory::createKVCache(config);
     ASSERT_NE(ref_cache, nullptr);
+    auto ref_kv_workspace =
+        bindKVCacheWorkspace(*ref_cache, kv_len, /*batch_size=*/1, head_dim);
+    ASSERT_NE(ref_kv_workspace, nullptr);
     ASSERT_TRUE(ref_cache->appendWithStream(0, 0, full_k_tensor.get(), full_v_tensor.get(), kv_len, stream));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
@@ -2190,7 +2335,7 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> serial_kernel(0);
     serial_kernel.setGPUStream(stream);
-    ASSERT_TRUE(setupWorkspace(serial_kernel, 1, n_heads, head_dim));
+    ASSERT_TRUE(setupWorkspace(serial_kernel, 1, n_heads, head_dim, stream));
 
     for (int row = 0; row < seq_len; ++row)
     {
@@ -2312,10 +2457,12 @@ TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwe
  * device-parameter, workspace, and graph contracts. Sweep every legal depth
  * through the real captured append-plus-attention production sequence.
  *
- * Native FP16 and Q8_1 cache storage are both covered. Q8_1 follows the real
- * converted FP16 RoPE-on-read path, and both LocalTP head offsets verify that
- * global GQA ownership remains correct on either shard. Every grouped FP32
- * output row must match the corresponding ROCm M=1 decode row byte-for-byte.
+ * Every production cache storage format is covered, including selectable
+ * TQ8-K/TQ4-V and TQ8-K/TQ8-V. Quantized and reduced precision caches follow
+ * the real converted FP16 RoPE-on-read path, and both LocalTP head offsets
+ * verify that global GQA ownership remains correct on either shard. Every
+ * grouped FP32 output row must match the corresponding ROCm M=1 decode row
+ * byte-for-byte.
  */
 TEST_F(
     Test__ROCmFlashAttentionParity,
@@ -2326,9 +2473,13 @@ TEST_F(
     constexpr int kLocalKVHeads = 1;
     constexpr int kHeadDim = 256;
     constexpr int kGlobalGQARep = 16;
-    constexpr std::array<ActivationPrecision, 2> kCacheFormats = {
+    constexpr std::array<ActivationPrecision, 6> kCacheFormats = {
+        ActivationPrecision::FP32,
         ActivationPrecision::FP16,
+        ActivationPrecision::BF16,
         ActivationPrecision::Q8_1,
+        ActivationPrecision::TQ4,
+        ActivationPrecision::TQ8,
     };
 
     for (const ActivationPrecision cache_precision : kCacheFormats)
@@ -2356,6 +2507,79 @@ TEST_F(
                     cache_precision,
                     head_start,
                     kGlobalGQARep);
+                if (::testing::Test::HasFatalFailure())
+                    return;
+            }
+        }
+    }
+}
+
+/**
+ * @brief Cross every sequence-parallel split boundary through the real MTP graph.
+ *
+ * The exhaustive test above proves M-totality at one short-context geometry.
+ * This companion matrix proves that cache format, LocalTP shard ownership, MTP
+ * row count, and live sequence regime compose correctly. The selected M values
+ * cover the first grouped case, a middle verifier depth, and the maximum
+ * supported verifier pass. Final KV lengths bracket each production split
+ * transition at 256, 1024 for LocalTP, and 8192.
+ *
+ * Each cell captures append plus grouped attention once and compares every
+ * output row with an independent M=1 invocation on the same ROCm backend.
+ * Equality is byte-for-byte; a numerically close result is still a failure.
+ */
+TEST_F(
+    Test__ROCmFlashAttentionParity,
+    CapturedAppendThenAttention_AllNativeKVFormats_Qwen36LocalTPSequenceParallelBoundariesMatchSerialByteExact)
+{
+    constexpr int kLocalHeads = 8;
+    constexpr int kLocalKVHeads = 1;
+    constexpr int kHeadDim = 256;
+    constexpr int kGlobalGQARep = 16;
+    constexpr std::array<ActivationPrecision, 6> kCacheFormats = {
+        ActivationPrecision::FP32,
+        ActivationPrecision::FP16,
+        ActivationPrecision::BF16,
+        ActivationPrecision::Q8_1,
+        ActivationPrecision::TQ4,
+        ActivationPrecision::TQ8,
+    };
+    constexpr std::array<int, 3> kVerifierRows = {2, 8, 16};
+    constexpr std::array<int, 9> kFinalKVLengths = {
+        255, 256, 257,
+        1023, 1024, 1025,
+        8191, 8192, 8193,
+    };
+
+    for (const ActivationPrecision cache_precision : kCacheFormats)
+    {
+        for (const int head_start : {0, kLocalHeads})
+        {
+            for (const int verifier_rows : kVerifierRows)
+            {
+                for (const int final_kv_len : kFinalKVLengths)
+                {
+                    ASSERT_GT(final_kv_len, verifier_rows);
+                    SCOPED_TRACE(
+                        "cache_precision=" +
+                        std::to_string(static_cast<int>(cache_precision)) +
+                        " head_start=" + std::to_string(head_start) +
+                        " verifier_rows=" + std::to_string(verifier_rows) +
+                        " final_kv_len=" + std::to_string(final_kv_len));
+                    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+                        mpi_ctx_,
+                        verifier_rows,
+                        final_kv_len - verifier_rows,
+                        kLocalHeads,
+                        kLocalKVHeads,
+                        kHeadDim,
+                        "Captured ROCm sequence-parallel boundary vs M1",
+                        cache_precision,
+                        head_start,
+                        kGlobalGQARep);
+                    if (::testing::Test::HasFatalFailure())
+                        return;
+                }
             }
         }
     }
@@ -4603,31 +4827,45 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3InputSensitivit
     }
 
     /*
-     * The public GPU forward contract terminates at graph-declared logits.
-     * Although this test inspects intermediate layer-3 snapshots, constructing
-     * an embedding-plus-layers-only PP fragment and asking it to masquerade as
-     * a complete inference forward would leave no legal device publication
-     * boundary. Own the real final norm and LM head in this diagnostic graph so
-     * snapshot capture exercises an ordinary, fully declared GPU forward.
+     * CPU PP fragments legally publish their terminal hidden state, so the CPU
+     * snapshot source stops after layer four and does not introduce an LM-head
+     * GEMV dependency. A standalone GPU forward has a stricter public boundary:
+     * it must publish graph-declared logits. The ROCm graph therefore owns the
+     * terminal norm and LM head. Both graphs execute identical embedding and
+     * layer-0..4 prefixes, which is the only region sampled by this test.
      */
-    auto stage_ctx =
+    auto cpu_stage_ctx =
+        ModelContext::createForPPStage(
+            TEST_MODEL_PATH,
+            /*first_layer=*/0,
+            /*last_layer=*/4,
+            /*has_embedding=*/true,
+            /*has_lm_head=*/false);
+    auto rocm_stage_ctx =
         ModelContext::createForPPStage(
             TEST_MODEL_PATH,
             /*first_layer=*/0,
             /*last_layer=*/4,
             /*has_embedding=*/true,
             /*has_lm_head=*/true);
-    ASSERT_NE(stage_ctx, nullptr);
+    ASSERT_NE(cpu_stage_ctx, nullptr);
+    ASSERT_NE(rocm_stage_ctx, nullptr);
 
-    FactoryPPStageConfig config;
-    config.first_layer = 0;
-    config.last_layer = 4;
-    config.has_embedding = true;
-    config.has_lm_head = true;
-    ASSERT_TRUE(config.isValid());
+    FactoryPPStageConfig cpu_config;
+    cpu_config.first_layer = 0;
+    cpu_config.last_layer = 4;
+    cpu_config.has_embedding = true;
+    cpu_config.has_lm_head = false;
+    ASSERT_TRUE(cpu_config.isValid());
 
-    auto cpu_runner = createPPStageRunner(stage_ctx, DeviceId::cpu(), config);
-    auto rocm_runner = createPPStageRunner(stage_ctx, DeviceId::rocm(0), config);
+    FactoryPPStageConfig rocm_config = cpu_config;
+    rocm_config.has_lm_head = true;
+    ASSERT_TRUE(rocm_config.isValid());
+
+    auto cpu_runner =
+        createPPStageRunner(cpu_stage_ctx, DeviceId::cpu(), cpu_config);
+    auto rocm_runner =
+        createPPStageRunner(rocm_stage_ctx, DeviceId::rocm(0), rocm_config);
     ASSERT_NE(cpu_runner, nullptr);
     ASSERT_NE(rocm_runner, nullptr);
 

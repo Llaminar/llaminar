@@ -176,14 +176,29 @@ namespace llaminar2
         // append() call below. If a future asymmetric FP16/Q8_1 cache is
         // added, the conversion paths must be split into separate K and V
         // gates using k_precision() / v_precision() respectively.
-        if (k_precision() == ActivationPrecision::FP16 &&
-            (K->native_type() != TensorType::FP16 || V->native_type() != TensorType::FP16))
+        const ActivationPrecision destination_precision = k_precision();
+        const bool floating_cache =
+            destination_precision == ActivationPrecision::FP32 ||
+            destination_precision == ActivationPrecision::FP16 ||
+            destination_precision == ActivationPrecision::BF16;
+        const bool source_matches_cache =
+            (destination_precision == ActivationPrecision::FP32 &&
+             K->native_type() == TensorType::FP32 &&
+             V->native_type() == TensorType::FP32) ||
+            (destination_precision == ActivationPrecision::FP16 &&
+             K->native_type() == TensorType::FP16 &&
+             V->native_type() == TensorType::FP16) ||
+            (destination_precision == ActivationPrecision::BF16 &&
+             K->native_type() == TensorType::BF16 &&
+             V->native_type() == TensorType::BF16);
+
+        if (floating_cache && !source_matches_cache)
         {
             const auto &k_shape = K->shape();
             const auto &v_shape = V->shape();
             if (k_shape.size() < 2 || v_shape.size() < 2)
             {
-                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Invalid K/V shape for FP16 conversion");
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Invalid K/V shape for floating cache conversion");
                 return false;
             }
 
@@ -195,7 +210,7 @@ namespace llaminar2
             }
             if (K->native_type() != V->native_type())
             {
-                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Asymmetric K/V source types are unsupported for fused FP16 append: K="
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Asymmetric K/V source types are unsupported for fused floating append: K="
                           << static_cast<int>(K->native_type())
                           << " V=" << static_cast<int>(V->native_type()));
                 return false;
@@ -211,7 +226,13 @@ namespace llaminar2
                     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
                 };
                 const uint64_t append_ns = to_ns(append_end - append_start);
-                const uint64_t bytes = static_cast<uint64_t>(elements) * sizeof(uint16_t) * 2;
+                const uint64_t destination_element_bytes =
+                    destination_precision == ActivationPrecision::FP32
+                        ? sizeof(float)
+                        : sizeof(uint16_t);
+                const uint64_t bytes =
+                    static_cast<uint64_t>(elements) *
+                    destination_element_bytes * 2;
                 KVCacheProfiler::record(KVCacheOpType::APPEND, append_ns, static_cast<uint64_t>(num_tokens), bytes);
             }
 

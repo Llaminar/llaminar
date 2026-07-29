@@ -1,153 +1,105 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Scope: Qwen3.6 dense/MoE MTP on CUDA/ROCm/CPU across SingleDevice, LocalTP,
-LocalPP, NodeLocalTP, and ExpertOverlay. Keep under 6 KB.
+Scope: Qwen3.6 dense/MoE MTP on CPU, CUDA, and ROCm across SingleDevice,
+LocalTP, NodeLocalTP, LocalPP, and ExpertParallel. Keep this dashboard under
+6 KB; put implementation detail in project handoffs.
 
-RAG: **G** correct/speed-positive, **A** correct but slow/stale, **R** failing
-or unproven. Fresh rows use `--decode-tokens 16 --perfstats`.
+RAG: **G** correct and economical, **A** correct but untuned/stale, **R**
+failing or not yet proven. Token equality alone is not verifier parity proof.
 
-## Snapshot
+## Current State
 
-Fresh E2E: dense baseline/RAM-prefix/MTP d2 `261/261` on CPU/CUDA/ROCm; CPU
-MoE MTP d2 `27/27`; CUDA Qwen3.5 MoE bucket `28/28`.
+| Goal | Completion | Remaining proof |
+|---|---:|---|
+| SingleDevice fully device-resident MTP | 95% | refresh d1 economy and MoE production lifetime |
+| LocalTP fully device-resident MTP | 97% | remote-participant stochastic/economy matrix |
+| ExpertParallel fully device-resident MTP | 95% | mirrored-head request batching across every EP mode |
 
-2026-07-23: best-effort M1/grouped NativeVNNI policies are installed on all
-backends; production smoke and the `576/576` unit gate pass. Ordinary prefill
-remains heuristic-only. All-format economical retuning remains open.
+- Homogeneous CUDA/ROCm execution is full-graph only. Device parameters select
+  serial/grouped and short/long sequence-parallel regimes inside one immutable
+  captured launch envelope; attention no longer requests host recapture
+  variants.
+- GPU KV append, TurboQuant conversion, verifier publication, sampling, and
+  compact NCCL/RCCL broadcast use planned persistent workspace and explicit
+  producer/consumer event ordering. Hot paths contain no allocation, host
+  transfer, blocking synchronization, or segmented execution.
+- CPU TurboQuant supports production `TQ8-K/TQ4-V` and `TQ8-K/TQ8-V`, D=64,
+  128, and 256, with direct small-work execution and physical-core-parallel
+  grouped execution.
+- Best-effort M1/grouped NativeVNNI policies are installed on all backends.
+  Ordinary prefill remains on the legacy production heuristic.
+- RAM/disk prefix tiers support model-SHA archives, FIFO demotion/overwrite,
+  cold-hit VRAM promotion, restart, and pressure paths.
+- Integration unit gate: `589/589` green on 2026-07-29.
 
-2026-07-24: the three-tier prefix lifecycle is operational. Model-SHA archives,
-RAM/disk demotion, bottom-tier overwrite, and cold-hit VRAM re-promotion are
-covered. CUDA/ROCm pressure and restart E2E cells pass with exact tokens and
-path counters.
+## Production Matrix
 
-LocalTP compact prefill now uses each child's mirrored full head; rank sampling
-fans out to child-resident mailboxes with no logits gather or tiny allreduce.
-CUDA2/ROCm2 unequal-length greedy+stochastic production cells are green.
-Attention is byte-exact across grouped formats/unequal lengths; captured scalar
-replay is byte-exact and has no pinned host mirror or parameter H2D path.
+| Mode | Device | Dense greedy/stoch | MoE greedy/stoch | Status |
+|---|---|:---:|:---:|---|
+| SingleDevice | CPU | R/R | A/A | refresh paused |
+| SingleDevice | CUDA | A/G | A/R | dense d3 wins; d1/MoE need tuning |
+| SingleDevice | ROCm | A/A | A/A | dense d3 wins; d1/MoE need tuning |
+| LocalTP | CUDA2 | A/A | R/R | resident request batch green; perf pending |
+| LocalTP | ROCm2 | A/A | R/R | resident request batch green; perf pending |
+| LocalTP | ROCm4 | A/R | R/R | full refresh pending |
+| NodeLocalTP | CPU2 | A/A | R/R | dense E2E green; MoE/perf pending |
+| ExpertParallel | GPU+CPU | A/R | G/R | Dynamic/LLEP greedy+prefix green |
 
-MoE graph metadata uses device-unique leased workspace slots; capture rejects
-publication/rebinding and replay never touches the lease mutex. CUDA2/ROCm2
-Dynamic PhaseSplit and focused graph/ROCm all-format proofs are green.
+## Fresh Correctness Proofs
 
-2026-07-27: CUDA decode dispatch is phase-invariant: eager graph warmup uses the
-captured policy, closing M3/M4 one-ULP drift. All-format, real GDN-weight, and
-Dense/MoE M1-M4 operation-equivalence gates pass.
+- CUDA and ROCm all-format grouped attention are serial-row byte exact for
+  every `M=2..16`, D=64/128/256, unequal row lengths, and long-context
+  sequence-parallel boundaries. Stable-graph long-context suites are green.
+- CPU fused TurboQuant quantization and grouped materialization are byte exact
+  against serial rows for both TQ modes, D=64/128/256, `M=1..16`, plain and
+  RoPE-on-read.
+- CUDA/ROCm deterministic MoE route planning covers `M=1..4`,
+  `top_k={1,2,4,8,16}`, all 256 expert metadata entries, and 20 repeated exact
+  launches per cell.
+- CUDA/ROCm GDN and short-conv capture-lifetime matrices cover M=2/3/4 with
+  byte-equal continuation and complete live state.
+- Fresh Release CUDA2/ROCm2 LLEP+MTP+RAM-prefix full-context cells pass
+  `22/22` each with strict full-graph PerfStats, 2048 generated tokens, clean
+  shutdown, and complete VRAM release. Dynamic/LLEP long-context and prefix
+  matrices are green.
+- Transfer-state stress covers all 336 slot rotations and 32 cross-stream
+  reset epochs on CUDA/ROCm. Source policies forbid eventless publication,
+  blocking GPU sync, hidden hot-path allocation, and direct coherence
+  transitions.
 
-2026-07-28: resident MTP timeline/transaction/response/PerfStats events are
-setup-owned; policy forbids event create/destroy in 11 hot paths. CUDA/ROCm
-sampling and Qwen3.6 stochastic full-graph smokes pass; unit gate `582/582`.
-Greedy verifier reduction and NCCL/RCCL compact broadcast are graph-owned;
-strict counters prove both.
-CUDA2/ROCm2 Dynamic and LLEP+RAM-prefix cells pass. Architecture estimate:
-LocalTP 96%, ExpertParallel 93%; stochastic/economy matrix refresh remains.
+## Kernel Economy
 
-2026-07-29: transfer-slot occupancy is now distinct from directory
-addressability; immutable runtime and directory baselines reset by
-explicit-stream asynchronous D2D. CUDA/ROCm pass all 336 slot rotations,
-promoted staging-origin claims, and repeated resets. Fresh Release CUDA2/ROCm2
-LLEP+MTP+RAM-prefix full-context cells pass `22/22` each with strict full-graph
-PerfStats, 2048-token generation, clean shutdown, and complete VRAM release.
-The complete Integration unit gate passes `589/589`. Architecture estimate:
-LocalTP 97%, ExpertParallel 95%; remote-participant stochastic coverage and
-all-format economy certification remain.
+- Stable LocalTP2 graph replay medians:
+  CUDA KV32 `9.196 us`, KV16384 `107.167 us`;
+  ROCm KV32 `24.454 us`, KV16384 `380.806 us`.
+- CUDA reduction output tiling: `8.54 -> 7.74 us`, 40 registers/thread, zero
+  spills, 100% theoretical occupancy, 16 blocks.
+- ROCm reduction output tiling: `16.58 -> 14.56 us`, 28 VGPR, 64 SGPR, zero
+  scratch/spills, 512 B LDS, 16 waves.
+- CUDA long attention phase: 64 registers/thread, zero spills, 50% achieved
+  occupancy, 53% compute and 49% memory throughput.
+- ROCm long phase: 36 allocated VGPR, 64 SGPR, zero scratch/spills, 99.8% VALU
+  utilization, 55.6% memory-unit busy, 75.6% L2 hit.
+- Deterministic MoE route planner: CUDA `3.392 us` versus `22.212 us`
+  (`6.55x`), 31 registers and zero spills; ROCm `11.2 us`, 16 VGPR, 33 SGPR,
+  1.25 KiB LDS, zero scratch/spills.
 
-The follow-on transfer-state audit added production-shaped cross-stream reset
-coverage on CUDA and ROCm: each of 32 request epochs now publishes reset work
-on one stream, records an event, and consumes the reset directory from a
-different stream. Both canonical rebalance matrices pass `31/31`. The audit
-also retired the unused ROCm-only histogram/expert-mask API, its blocking host
-observation method, three dead launchers, four self-referential integration
-tests, and two unconsumed persistent workspace buffers. Source synchronization
-and forbidden-dependency guards remain green. Architecture estimate:
-SingleDevice 95%, LocalTP 97%, ExpertParallel 95%.
+Matched llama.cpp master comparison, tok/s:
 
-Homogeneous graph-stable GPU Dynamic/LLEP no longer has a debug-environment
-escape hatch to the host controller. Once that topology is recognized, every
-invalid device-controller prerequisite is fatal instead of selecting host
-publication/apply. The orchestrator's 45-test dependency suite, source policy
-guards, and both CUDA/ROCm `31/31` rebalance/reset matrices pass. Accelerator
-build caching was also verified directly for CUDA `nvcc` (including its
-internal `cicc`/`ptxas` work) and ROCm clang 20; a repeated two-object probe
-produced two direct hits, and container-wide cache identity/capacity is now
-fixed at a workspace-relative 50 GB.
+| Backend/model | d1 L/LC | d3 L/LC |
+|---|---:|---:|
+| CUDA dense 27B | `36.24/59.64` | `64.84/60.91` |
+| CUDA MoE 35B | `93.01/153.92` | `159.61/171.81` |
+| ROCm dense 27B | `20.08/25.15` | `39.28/22.66` |
+| ROCm MoE 35B | `46.33/73.93` | `74.94/95.84` |
 
-Fresh SingleDevice Release comparison uses `ggml-org/llama.cpp` master
-`afeebe103bd99cda8f5dfaefcabadf890db7fda7`, the same raw prompt, greedy
-sampling, 128 forced tokens, fixed d1/d3, and one GPU. llama.cpp runs a warmed
-raw `/completion` request (596 prompt tokens including BOS); Llaminar reports
-595 prompt tokens and averages three runs after warmup. CUDA dense d3 and ROCm
-dense d3 beat llama.cpp. Both d1 lanes and both MoE d3 lanes miss, with the
-largest gaps accompanying lower Llaminar MoE acceptance. CUDA dense at the
-default 4096 context also fails workspace admission after model load; c1024,
-which covers the 723-token workload, is green.
+## Next Gates
 
-Legacy `LLAMINAR_PROFILING` is now a topology-neutral PerfStats alias. Fresh
-CUDA/ROCm MoE d1 smokes each replayed all 30 grouped verifier calls as one
-486-stage graph and emitted structured decode-step/maintenance timing; neither
-backend selected eager or segmented execution.
-
-## Device And Topology Matrix
-
-| Mode | Device / degree | Dense greedy | Dense stoch | MoE greedy | MoE stoch | Status |
-|---|---|:---:|:---:|:---:|:---:|---|
-| SingleDevice | CPU d1 | R | R | A | A | CPU refresh paused |
-| SingleDevice | CUDA d1 | A | G | A | R | d1 loses to llama.cpp; dense d3 wins |
-| SingleDevice | ROCm d1 | A | A | A | A | d1/MoE d3 lose; dense d3 wins |
-| LocalTP | CUDA deg2 | A | A | R | R | Resident request batch green; perf pending |
-| LocalTP | ROCm deg2 | A | A | R | R | Resident request batch green; perf pending |
-| LocalTP | ROCm deg4 | A | R | R | R | Preset/bench refresh pending |
-| LocalPP | CUDA stages | A | R | R | R | Correctness/bench refresh pending |
-| LocalPP | ROCm stages | R | R | R | R | Prior dense run speed-negative |
-| NodeLocalTP | CPU sockets | A | A | R | R | Dense E2E green; perf pending |
-| ExpertOverlay | GPU hot + CPU cold | A | R | G | R | Dynamic/LLEP greedy+prefix green; stochastic/perf pending |
-
-## SingleDevice Speeds
-
-Matched llama.cpp comparison:
-
-| Backend/model | Depth | Llaminar | llama.cpp | Ratio | Acceptance L/LC | RAG |
-|---|---:|---:|---:|---:|---:|:---:|
-| CUDA dense 27B | d1 | `36.24` | `59.64` | `0.61x` | `77.67/88.06%` | R |
-| CUDA dense 27B | d3 | `64.84` | `60.91` | `1.06x` | `80.56/69.11%` | G |
-| CUDA MoE 35B | d1 | `93.01` | `153.92` | `0.60x` | `80.28/98.44%` | R |
-| CUDA MoE 35B | d3 | `159.61` | `171.81` | `0.93x` | `70.27/93.94%` | R |
-| ROCm dense 27B | d1 | `20.08` | `25.15` | `0.80x` | `89.55/88.06%` | R |
-| ROCm dense 27B | d3 | `39.28` | `22.66` | `1.73x` | `80.56/69.11%` | G |
-| ROCm MoE 35B | d1 | `46.33` | `73.93` | `0.63x` | `86.76/98.44%` | R |
-| ROCm MoE 35B | d3 | `74.94` | `95.84` | `0.78x` | `78.30/94.95%` | R |
-
-## Focused Proofs
-
-- CUDA/ROCm routed verifier microbench passed strict cos/L2/KLD/max_abs gates.
-  ROCm M4: `0.1778 ms` graph vs `4.7366 ms` row replay. CUDA M4:
-  `0.1035 ms` graph vs `9.8135 ms` row replay.
-- CUDA/ROCm GDN and short-conv capture-lifetime matrices cover M=2/3/4 and
-  every accepted row with byte-equal continuation and complete live state.
-- CUDA Qwen3.6 MoE bucketed-prefill E2E passed `20/20`; capture launch `691 us`,
-  replay `288 us`.
-- CUDA2 ExpertOverlay Dynamic long-context prefix+MTP passed with explicit
-  sidecar graph invalidation.
-- LocalTP GPU grouped path: mirrored children publish resident outcomes;
-  request prefill/sampling uses full heads, device-token matrices, resident
-  conditions, and per-child mailboxes. No row replay, host plan/materializer,
-  logits gather, or tiny allreduce. ROCm attention uses one grouped phase and
-  reduction for shared verifier or independent request banks. Attention params
-  are device-written on CUDA/ROCm; source policy forbids host mirrors/H2D.
-  CUDA/ROCm attention and request-batch gates are green.
-- Long-context CUDA2/ROCm2 Dynamic/LLEP is green. Preallocated admission events
-  close split-prefill reuse; replicated logits publications are explicitly
-  retired. Verifier control writes publish exact-stream arena ownership, and
-  captured compact broadcasts cover root/receiver without sync or D2H.
-- Token equality alone is not an accepted verifier parity proof.
-
-## Next Phase 10 Moves
-
-1. Drive the full-context CPU/CUDA/ROCm MTP E2E matrix with path counters.
-2. Close captured collective and remote-participant lifetime for LocalTP/EP.
-3. Prove mirrored-head resident request batching across ExpertParallel modes.
-4. Attack MoE verifier producer economics directly. ROCm routed FFN and CUDA
-   dense GEMM buckets are the next largest pieces.
-5. Prefer grouped/concurrent decode-equivalent kernels over serial row replay.
-6. After each concrete win: run strict parity, refresh tok/s, update
-   this dashboard, and make a WiP commit.
+1. Localize the CUDA MoE lifetime/batch-invariance regression before accepting
+   a refreshed benchmark baseline.
+2. Run the full-context greedy and stochastic CPU/CUDA/ROCm matrix with strict
+   MTP, prefix, Dynamic/LLEP, collective, and full-graph counters.
+3. Close remote-participant lifetime and mirrored-head request batching for
+   every LocalTP and ExpertParallel mode.
+4. Tune d1 attention/GEMV and MoE grouped FFN until SingleDevice is at least
+   llama.cpp economy, preserving byte equality and the device-owned graph.

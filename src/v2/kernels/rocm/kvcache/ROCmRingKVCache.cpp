@@ -159,8 +159,14 @@ namespace llaminar2
     extern "C" void hip_ring_append_dynamic_q8_1(
         Q8_1Block *, Q8_1Block *, const Q8_1Block *, const Q8_1Block *,
         const int *, const int *, int, int, int, hipStream_t);
+    extern "C" bool hip_ring_append_converted_fp32(
+        float *, float *, const void *, const void *, TensorType,
+        const int *, const int *, int, int, int, hipStream_t);
     extern "C" bool hip_ring_append_converted_fp16(
         _Float16 *, _Float16 *, const void *, const void *, TensorType,
+        const int *, const int *, int, int, int, hipStream_t);
+    extern "C" bool hip_ring_append_converted_bf16(
+        hip_bfloat16 *, hip_bfloat16 *, const void *, const void *, TensorType,
         const int *, const int *, int, int, int, hipStream_t);
     extern "C" void hip_kv_sequence_state_advance(
         int *, int *, int, int, hipStream_t);
@@ -316,14 +322,29 @@ namespace llaminar2
 
         const auto stream = static_cast<hipStream_t>(gpu_stream);
 
-        if (k_precision() == ActivationPrecision::FP16 &&
-            (K->native_type() != TensorType::FP16 || V->native_type() != TensorType::FP16))
+        const ActivationPrecision destination_precision = k_precision();
+        const bool floating_cache =
+            destination_precision == ActivationPrecision::FP32 ||
+            destination_precision == ActivationPrecision::FP16 ||
+            destination_precision == ActivationPrecision::BF16;
+        const bool source_matches_cache =
+            (destination_precision == ActivationPrecision::FP32 &&
+             K->native_type() == TensorType::FP32 &&
+             V->native_type() == TensorType::FP32) ||
+            (destination_precision == ActivationPrecision::FP16 &&
+             K->native_type() == TensorType::FP16 &&
+             V->native_type() == TensorType::FP16) ||
+            (destination_precision == ActivationPrecision::BF16 &&
+             K->native_type() == TensorType::BF16 &&
+             V->native_type() == TensorType::BF16);
+
+        if (floating_cache && !source_matches_cache)
         {
             const auto &k_shape = K->shape();
             const auto &v_shape = V->shape();
             if (k_shape.size() < 2 || v_shape.size() < 2)
             {
-                LOG_ERROR("[IROCmRingKVCache::appendWithStream] Invalid K/V shape for FP16 conversion");
+                LOG_ERROR("[IROCmRingKVCache::appendWithStream] Invalid K/V shape for floating cache conversion");
                 return false;
             }
 
@@ -335,7 +356,7 @@ namespace llaminar2
             }
             if (K->native_type() != V->native_type())
             {
-                LOG_ERROR("[IROCmRingKVCache::appendWithStream] Asymmetric K/V source types are unsupported for fused FP16 append: K="
+                LOG_ERROR("[IROCmRingKVCache::appendWithStream] Asymmetric K/V source types are unsupported for fused floating append: K="
                           << static_cast<int>(K->native_type())
                           << " V=" << static_cast<int>(V->native_type()));
                 return false;
@@ -351,7 +372,13 @@ namespace llaminar2
                     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
                 };
                 const uint64_t append_ns = to_ns(append_end - append_start);
-                const uint64_t bytes = static_cast<uint64_t>(elements) * sizeof(uint16_t) * 2;
+                const uint64_t destination_element_bytes =
+                    destination_precision == ActivationPrecision::FP32
+                        ? sizeof(float)
+                        : sizeof(uint16_t);
+                const uint64_t bytes =
+                    static_cast<uint64_t>(elements) *
+                    destination_element_bytes * 2;
                 KVCacheProfiler::record(KVCacheOpType::APPEND, append_ns, static_cast<uint64_t>(num_tokens), bytes);
             }
 
@@ -1211,7 +1238,10 @@ namespace llaminar2
         TensorType src_type,
         int num_tokens, hipStream_t stream)
     {
-        if constexpr (Precision != ActivationPrecision::FP16)
+        if constexpr (
+            Precision != ActivationPrecision::FP32 &&
+            Precision != ActivationPrecision::FP16 &&
+            Precision != ActivationPrecision::BF16)
         {
             (void)layer;
             (void)seq_idx;
@@ -1220,7 +1250,7 @@ namespace llaminar2
             (void)src_type;
             (void)num_tokens;
             (void)stream;
-            LOG_ERROR("[ROCmRingKVCache::appendConvertedWithStream] Converted append is only implemented for FP16 cache storage");
+            LOG_ERROR("[ROCmRingKVCache::appendConvertedWithStream] Converted append requires floating cache storage");
             return false;
         }
         else
@@ -1255,11 +1285,30 @@ namespace llaminar2
             const int *d_append_count =
                 deviceDynamicAppendCountPtr(layer, seq_idx);
 
-            if (!hip_ring_append_converted_fp16(
-                    entry.d_K, entry.d_V,
-                    d_k_src, d_v_src, src_type,
+            bool launch_ok = false;
+            if constexpr (Precision == ActivationPrecision::FP32)
+            {
+                launch_ok = hip_ring_append_converted_fp32(
+                    entry.d_K, entry.d_V, d_k_src, d_v_src, src_type,
                     d_head, d_append_count,
-                    max_seq_len_, kv_dim_, num_tokens, stream))
+                    max_seq_len_, kv_dim_, num_tokens, stream);
+            }
+            else if constexpr (Precision == ActivationPrecision::FP16)
+            {
+                launch_ok = hip_ring_append_converted_fp16(
+                    entry.d_K, entry.d_V, d_k_src, d_v_src, src_type,
+                    d_head, d_append_count,
+                    max_seq_len_, kv_dim_, num_tokens, stream);
+            }
+            else if constexpr (Precision == ActivationPrecision::BF16)
+            {
+                launch_ok = hip_ring_append_converted_bf16(
+                    entry.d_K, entry.d_V, d_k_src, d_v_src, src_type,
+                    d_head, d_append_count,
+                    max_seq_len_, kv_dim_, num_tokens, stream);
+            }
+
+            if (!launch_ok)
             {
                 LOG_ERROR("[ROCmRingKVCache::appendConvertedWithStream] Fused converted append launch failed");
                 return false;

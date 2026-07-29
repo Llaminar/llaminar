@@ -196,6 +196,12 @@ if(HAVE_CUDA)
     endif()
 
     enable_language(CUDA)
+    # CUDA 13 supports the C++20 device dialect used by the production kernels.
+    # Set the project-wide floor here so standalone benchmarks and tools cannot
+    # silently fall back to CMake's older compiler default.
+    set(CMAKE_CUDA_STANDARD 20)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(CMAKE_CUDA_EXTENSIONS ON)
     find_package(CUDAToolkit REQUIRED)
     
     message(STATUS "V2: CUDA enabled")
@@ -295,6 +301,12 @@ if(HAVE_ROCM)
     
     # Enable HIP language for ROCm compilation
     enable_language(HIP)
+    # ROCm clang 20 supports C++20 throughout host and device compilation.
+    # Individual targets may opt into C++23, but no HIP translation unit may
+    # inherit the legacy C++17 default.
+    set(CMAKE_HIP_STANDARD 20)
+    set(CMAKE_HIP_STANDARD_REQUIRED ON)
+    set(CMAKE_HIP_EXTENSIONS ON)
     
     # Find HIP
     list(APPEND CMAKE_PREFIX_PATH ${ROCM_PATH})
@@ -406,6 +418,9 @@ if(HAVE_CUDA)
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_EXTENSIONS ON
     )
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set_property(TARGET cuda_backend PROPERTY JOB_POOL_LINK nvlink_pool)
@@ -482,7 +497,9 @@ if(HAVE_CUDA)
         target_include_directories(cuda_backend PUBLIC "${CUTLASS_DIR}/include")
         target_compile_definitions(cuda_backend PUBLIC HAVE_CUTLASS)
         
-        # CUTLASS requires C++17 minimum, we use C++23 for stacktrace
+        # Host adapters use the project's C++23 dialect. CUDA translation units
+        # use the explicit C++20 device dialect above, which is the common
+        # fully-supported level across the pinned CUDA and ROCm toolchains.
         target_compile_features(cuda_backend PUBLIC cxx_std_23)
         
         message(STATUS "V2: CUTLASS Tensor Core support enabled (Phase 2)")
@@ -627,7 +644,11 @@ if(HAVE_ROCM)
     # Resolve HIP device symbols at library build time (same rationale as cuda_backend).
     set_target_properties(rocm_backend PROPERTIES
         HIP_RESOLVE_DEVICE_SYMBOLS ON
+        HIP_STANDARD 20
+        HIP_STANDARD_REQUIRED ON
+        HIP_EXTENSIONS ON
     )
+    target_compile_features(rocm_backend PUBLIC cxx_std_23)
     target_include_directories(rocm_backend PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${ROCM_PATH}/include

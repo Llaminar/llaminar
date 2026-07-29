@@ -1862,15 +1862,16 @@ namespace llaminar2
          * @param seq_len Logical query row count for this attention stage.
          * @param query_rows Number of row-local dynamic attention params needed.
          * @param stream Explicit non-null backend stream.
-         * @param kv_stride Stable physical request-major K/V row capacity. A
-         *        negative value means tightly packed @p kv_len rows.
+         * @param kv_stride Stable positive physical request-major K/V row
+         *        capacity. This value is mandatory because the live count is a
+         *        device pointer and cannot safely determine host launch shape.
          */
         virtual bool prepareDynamicAttnParamsFromDeviceSequenceState(
             const int *post_append_cached_tokens_device,
             int seq_len,
             int query_rows,
             void *stream,
-            int kv_stride = -1)
+            int kv_stride)
         {
             (void)post_append_cached_tokens_device;
             (void)seq_len;

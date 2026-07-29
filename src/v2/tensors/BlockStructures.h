@@ -635,9 +635,11 @@ namespace llaminar2
     // Common instantiations
     using TQ4Block_64 = TQ4Block<64>;
     using TQ4Block_128 = TQ4Block<128>;
+    using TQ4Block_256 = TQ4Block<256>;
 
     static_assert(sizeof(TQ4Block_64) == 40, "TQ4Block_64 must be 40 bytes");
     static_assert(sizeof(TQ4Block_128) == 72, "TQ4Block_128 must be 72 bytes");
+    static_assert(sizeof(TQ4Block_256) == 136, "TQ4Block_256 must be 136 bytes");
 
     // ========================================================================
     // TQ8 Block — TurboQuant 8-bit quantization (256-level Lloyd-Max)
@@ -683,9 +685,11 @@ namespace llaminar2
     // Common instantiations
     using TQ8Block_64 = TQ8Block<64>;
     using TQ8Block_128 = TQ8Block<128>;
+    using TQ8Block_256 = TQ8Block<256>;
 
     static_assert(sizeof(TQ8Block_64) == 72, "TQ8Block_64 must be 72 bytes");
     static_assert(sizeof(TQ8Block_128) == 136, "TQ8Block_128 must be 136 bytes");
+    static_assert(sizeof(TQ8Block_256) == 264, "TQ8Block_256 must be 264 bytes");
 
     // ========================================================================
     // TQ2 Bit-packing Helpers (used by TQ4 3-bit index packing)

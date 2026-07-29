@@ -36,10 +36,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
-#include <limits>
-#include <mutex>
-#include <unordered_map>
-#include <vector>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../utils/DebugEnv.h"
@@ -234,380 +230,10 @@ namespace
     // Flash Decoding Configuration for MI50
     // =========================================================================
 
-    // Number of splits for Flash Decoding
-    // More splits = more parallelism but more reduction overhead
-    constexpr int FD_DEFAULT_NUM_SPLITS = 8;
-
-    // Threads per block for decode kernel
-    constexpr int FD_THREADS_PER_BLOCK = 256;
-
     // Max splits supported by reduction kernel shared-memory staging
     constexpr int FD_MAX_SPLITS_SUPPORTED = 32;
 
     constexpr int FD_TARGET_ELEMS_PER_SPLIT = 16384;
-    constexpr int FD_MIN_SPLITS = 1;
-    constexpr int FD_AUTOTUNE_MAX_TRIALS = 6;
-
-    inline int clampInt(int v, int lo, int hi)
-    {
-        return (v < lo) ? lo : ((v > hi) ? hi : v);
-    }
-
-    inline int roundUpPow2Clamped(int value, int max_allowed)
-    {
-        int p = 1;
-        while (p < value && p < max_allowed)
-        {
-            p <<= 1;
-        }
-        return clampInt(p, 1, max_allowed);
-    }
-
-    inline int chooseDecodeThreadsPerBlock(int head_dim, int kv_len, int effective_num_splits)
-    {
-        // Generic heuristic using work-per-split and split aspect.
-        const int safe_head_dim = std::max(head_dim, 1);
-        const int safe_splits = std::max(effective_num_splits, 1);
-        const int rows_per_split = std::max(1, kv_len / safe_splits);
-        const int64_t elems_per_split =
-            (static_cast<int64_t>(kv_len) * safe_head_dim) / safe_splits;
-
-        // Small per-split work or very short split rows favor lower TPB.
-        if ((rows_per_split <= 64 && elems_per_split <= 16384) ||
-            (rows_per_split <= 48 && elems_per_split <= 32768))
-        {
-            return 128;
-        }
-
-        return 256;
-    }
-
-    inline int chooseDecodeSplitsAuto(int kv_len, int head_dim, int max_allowed,
-                                      int n_heads = 0, int num_cus = 0)
-    {
-        const int safe_head_dim = std::max(head_dim, 1);
-        const int64_t total_elements = static_cast<int64_t>(kv_len) * safe_head_dim;
-
-        // Target work-per-split (elements), architecture-agnostic default.
-        const int target_elements_per_split = clampInt(
-            FD_TARGET_ELEMS_PER_SPLIT,
-            1024,
-            1 << 20);
-
-        int base_splits = static_cast<int>((total_elements + target_elements_per_split - 1) /
-                                           target_elements_per_split);
-        base_splits = std::max(base_splits, 1);
-
-        // Aspect-ratio adjustment: deeper KV relative to head_dim benefits from more splits.
-        // Uses ratio kv_len/head_dim (not hard-coded model dimensions).
-        if (kv_len >= safe_head_dim * 8)
-        {
-            base_splits = (base_splits * 3 + 1) / 2; // ~1.5x
-        }
-        else if (kv_len <= safe_head_dim * 2)
-        {
-            base_splits = std::max(1, (base_splits + 1) / 2);
-        }
-
-        // Don't over-split beyond useful row granularity.
-        base_splits = std::min(base_splits, std::max(kv_len, 1));
-
-        // Prefer power-of-two split counts for predictable reduction behavior.
-        int auto_splits = roundUpPow2Clamped(base_splits, max_allowed);
-
-        // CU-aware occupancy floor: when n_heads * splits is too low to fill
-        // the GPU, increase splits to target ~75% CU occupancy.  This is
-        // critical for TP configurations where per-rank head count drops.
-        if (n_heads > 0 && num_cus > 0)
-        {
-            const int target_blocks = (num_cus * 3) / 4; // 75% occupancy
-            if (n_heads * auto_splits < target_blocks)
-            {
-                int occ_splits = (target_blocks + n_heads - 1) / n_heads;
-                occ_splits = roundUpPow2Clamped(occ_splits, max_allowed);
-                auto_splits = std::max(auto_splits, occ_splits);
-            }
-        }
-
-        const int min_splits = clampInt(FD_MIN_SPLITS, 1, max_allowed);
-        auto_splits = clampInt(auto_splits, min_splits, max_allowed);
-        return auto_splits;
-    }
-
-    inline int chooseEffectiveDecodeSplits(int kv_len, int head_dim, int requested_num_splits,
-                                           int n_heads = 0, int num_cus = 0)
-    {
-        const int workspace_limit = (requested_num_splits > 0)
-            ? requested_num_splits
-            : FD_MAX_SPLITS_SUPPORTED;
-        const int max_allowed = std::max(1, std::min(FD_MAX_SPLITS_SUPPORTED, workspace_limit));
-
-        const int auto_splits = chooseDecodeSplitsAuto(kv_len, head_dim, max_allowed, n_heads, num_cus);
-        return std::max(1, std::min(auto_splits, max_allowed));
-    }
-
-    struct DecodeLaunchConfig
-    {
-        int splits = FD_DEFAULT_NUM_SPLITS;
-        int tpb = FD_THREADS_PER_BLOCK;
-    };
-
-    struct DecodeAutotuneSelection
-    {
-        DecodeLaunchConfig config{};
-        bool should_time = false;
-        uint32_t key = 0;
-        int candidate_index = -1;
-    };
-
-    struct DecodeAutotuneState
-    {
-        std::vector<DecodeLaunchConfig> candidates;
-        int max_trials = 0;
-        int next_trial = 0;
-        bool has_best = false;
-        DecodeLaunchConfig best{};
-        float best_ms = std::numeric_limits<float>::infinity();
-    };
-
-    inline int ilog2Floor(int value)
-    {
-        int v = std::max(value, 1);
-        int lg = 0;
-        while (v > 1)
-        {
-            v >>= 1;
-            lg++;
-        }
-        return lg;
-    }
-
-    inline int bucketAspectRatio(int kv_len, int head_dim)
-    {
-        const int safe_hd = std::max(head_dim, 1);
-        const float ratio = static_cast<float>(kv_len) / static_cast<float>(safe_hd);
-        if (ratio <= 1.0f)
-            return 0;
-        if (ratio <= 2.0f)
-            return 1;
-        if (ratio <= 4.0f)
-            return 2;
-        if (ratio <= 8.0f)
-            return 3;
-        if (ratio <= 16.0f)
-            return 4;
-        if (ratio <= 32.0f)
-            return 5;
-        return 6;
-    }
-
-    inline uint32_t makeDecodeAutotuneKey(int kv_len, int head_dim, int max_allowed_splits,
-                                          int n_heads = 0)
-    {
-        const int64_t total_elements = static_cast<int64_t>(std::max(kv_len, 1)) * std::max(head_dim, 1);
-        const int elem_bucket = clampInt(ilog2Floor(static_cast<int>(std::min<int64_t>(total_elements, INT32_MAX))), 0, 31);
-        const int aspect_bucket = bucketAspectRatio(kv_len, head_dim); // 0..6
-        const int hd_bucket = clampInt(ilog2Floor(std::max(head_dim, 1)), 0, 15);
-        const int split_cap_bucket = clampInt(ilog2Floor(std::max(max_allowed_splits, 1)), 0, 15);
-        const int heads_bucket = clampInt(ilog2Floor(std::max(n_heads, 1)), 0, 15);
-
-        return static_cast<uint32_t>(
-            (elem_bucket & 0x1F) |
-            ((aspect_bucket & 0x07) << 5) |
-            ((hd_bucket & 0x0F) << 8) |
-            ((split_cap_bucket & 0x0F) << 12) |
-            ((heads_bucket & 0x0F) << 16));
-    }
-
-    inline void addSplitCandidate(std::vector<int> &splits, int value, int max_allowed)
-    {
-        int clamped = clampInt(value, 1, max_allowed);
-        clamped = roundUpPow2Clamped(clamped, max_allowed);
-        if (std::find(splits.begin(), splits.end(), clamped) == splits.end())
-        {
-            splits.push_back(clamped);
-        }
-    }
-
-    inline std::vector<DecodeLaunchConfig> buildDecodeAutotuneCandidates(int kv_len, int head_dim, int max_allowed,
-                                                                         int n_heads = 0, int num_cus = 0)
-    {
-        const int min_splits = clampInt(FD_MIN_SPLITS, 1, max_allowed);
-
-        const int base_splits = chooseDecodeSplitsAuto(kv_len, head_dim, max_allowed, n_heads, num_cus);
-
-        std::vector<int> split_candidates;
-        split_candidates.reserve(12);
-        addSplitCandidate(split_candidates, min_splits, max_allowed);
-        addSplitCandidate(split_candidates, base_splits / 2, max_allowed);
-        addSplitCandidate(split_candidates, base_splits, max_allowed);
-        addSplitCandidate(split_candidates, base_splits * 2, max_allowed);
-        addSplitCandidate(split_candidates, 1, max_allowed);
-        addSplitCandidate(split_candidates, max_allowed, max_allowed);
-
-        // Occupancy-aware candidates: when the base heuristic has already been
-        // bumped by the CU floor, also explore splits that hit 50% and 100%
-        // occupancy so the autotuner can bracket the sweet spot.
-        if (n_heads > 0 && num_cus > 0)
-        {
-            for (int pct : {50, 100})
-            {
-                int target = (num_cus * pct) / 100;
-                int s = (target + n_heads - 1) / n_heads;
-                addSplitCandidate(split_candidates, s, max_allowed);
-            }
-        }
-
-        std::sort(split_candidates.begin(), split_candidates.end());
-
-        const int preferred_tpb = chooseDecodeThreadsPerBlock(head_dim, kv_len, base_splits);
-        int alt_tpb = (preferred_tpb == 128) ? 256 : 128;
-
-        std::vector<DecodeLaunchConfig> candidates;
-        candidates.reserve(split_candidates.size() * 2 + 2);
-
-        auto addCandidate = [&](int splits, int tpb)
-        {
-            DecodeLaunchConfig cfg{splits, tpb};
-            auto it = std::find_if(candidates.begin(), candidates.end(), [&](const DecodeLaunchConfig &existing)
-                                   { return existing.splits == cfg.splits && existing.tpb == cfg.tpb; });
-            if (it == candidates.end())
-            {
-                candidates.push_back(cfg);
-            }
-        };
-
-        addCandidate(base_splits, preferred_tpb);
-        addCandidate(base_splits, alt_tpb);
-
-        for (int s : split_candidates)
-        {
-            addCandidate(s, preferred_tpb);
-            addCandidate(s, alt_tpb);
-        }
-
-        return candidates;
-    }
-
-    inline std::unordered_map<uint32_t, DecodeAutotuneState> &decodeAutotuneMap()
-    {
-        static std::unordered_map<uint32_t, DecodeAutotuneState> states;
-        return states;
-    }
-
-    inline std::mutex &decodeAutotuneMutex()
-    {
-        static std::mutex lock;
-        return lock;
-    }
-
-    inline DecodeAutotuneSelection chooseDecodeLaunchConfig(int kv_len, int head_dim, int requested_num_splits,
-                                                             int n_heads = 0, int num_cus = 0)
-    {
-        DecodeAutotuneSelection selection;
-
-        const int heuristic_splits = chooseEffectiveDecodeSplits(kv_len, head_dim, requested_num_splits, n_heads, num_cus);
-        const int heuristic_tpb = chooseDecodeThreadsPerBlock(head_dim, kv_len, heuristic_splits);
-        selection.config = {heuristic_splits, heuristic_tpb};
-
-        const int workspace_limit = (requested_num_splits > 0)
-            ? requested_num_splits
-            : FD_MAX_SPLITS_SUPPORTED;
-        const int max_allowed = std::max(1, std::min(FD_MAX_SPLITS_SUPPORTED, workspace_limit));
-
-        const auto &rocm_env = llaminar2::debugEnv().rocm;
-        if (rocm_env.fa_decode_num_splits_present)
-        {
-            const int forced_splits = rocm_env.fa_decode_num_splits
-                ? clampInt(*rocm_env.fa_decode_num_splits, 1, max_allowed)
-                : heuristic_splits;
-            const int forced_tpb = rocm_env.fa_decode_tpb
-                ? clampInt(*rocm_env.fa_decode_tpb, 64, 256)
-                : chooseDecodeThreadsPerBlock(head_dim, kv_len, forced_splits);
-            selection.config = {forced_splits, forced_tpb};
-            return selection;
-        }
-
-        if (!rocm_env.fa_decode_autotune || llaminar2::debugEnv().gemm.deterministic)
-        {
-            // MTP verifier decode requires the grouped row path and the serial
-            // M=1 row path to use the same reduction shape. Online autotune
-            // trial rotation is useful during deliberate profiling, but it is
-            // process-local performance state rather than model state. If it is
-            // active in production, two identical decode requests can execute
-            // different split/TPB candidates and become only numerically close
-            // instead of byte-for-byte identical.
-            return selection;
-        }
-
-        const uint32_t key = makeDecodeAutotuneKey(kv_len, head_dim, max_allowed, n_heads);
-
-        std::lock_guard<std::mutex> guard(decodeAutotuneMutex());
-        auto &states = decodeAutotuneMap();
-        auto &state = states[key];
-
-        if (state.candidates.empty())
-        {
-            state.candidates = buildDecodeAutotuneCandidates(kv_len, head_dim, max_allowed, n_heads, num_cus);
-            const int max_trials_env = clampInt(FD_AUTOTUNE_MAX_TRIALS, 1, 24);
-            state.max_trials = std::min<int>(max_trials_env, static_cast<int>(state.candidates.size()));
-            state.next_trial = 0;
-            state.has_best = false;
-            state.best_ms = std::numeric_limits<float>::infinity();
-            state.best = selection.config;
-        }
-
-        selection.key = key;
-
-        if (state.next_trial < state.max_trials)
-        {
-            selection.config = state.candidates[state.next_trial];
-            selection.should_time = true;
-            selection.candidate_index = state.next_trial;
-            state.next_trial++;
-            return selection;
-        }
-
-        if (state.has_best)
-        {
-            selection.config = state.best;
-        }
-        else
-        {
-            selection.config = state.best;
-        }
-
-        return selection;
-    }
-
-    inline void recordDecodeAutotuneResult(uint32_t key, int candidate_index, float elapsed_ms)
-    {
-        if (!(elapsed_ms > 0.0f))
-        {
-            return;
-        }
-
-        std::lock_guard<std::mutex> guard(decodeAutotuneMutex());
-        auto &states = decodeAutotuneMap();
-        auto it = states.find(key);
-        if (it == states.end())
-        {
-            return;
-        }
-
-        auto &state = it->second;
-        if (candidate_index < 0 || candidate_index >= static_cast<int>(state.candidates.size()))
-        {
-            return;
-        }
-
-        if (!state.has_best || elapsed_ms < state.best_ms)
-        {
-            state.has_best = true;
-            state.best_ms = elapsed_ms;
-            state.best = state.candidates[candidate_index];
-        }
-    }
 
     // =========================================================================
     // Device Property Caching
@@ -1439,14 +1065,13 @@ namespace
      *
      * Grouped rows can own unequal live KV lengths even though graph capture
      * requires one fixed grid and block shape.  This helper mirrors
-     * `selectFlashDecodeNumSplits()`, `chooseDecodeSplitsAuto()`, and
-     * `chooseDecodeThreadsPerBlock()` for each row.  The phase kernel launches
-     * the maximum physical geometry, then only the scalar-selected split and
-     * wavefront prefix participates.  Consequently each row retains exactly
-     * the same KV partition, wavefront merge order, and reduction order as an
-     * independent M=1 call.
+     * The phase kernel launches the maximum physical geometry, then only the
+     * split and wavefront prefix selected from the live device-owned KV length
+     * participates. Consequently ordinary M=1 and grouped verifier rows retain
+     * the same KV partition, wavefront merge order, and reduction order while
+     * one graph executable spans every short- and long-sequence regime.
      */
-    __device__ __forceinline__ FlashDecodeRowConfig selectGroupedDecodeRowConfig(
+    __device__ __forceinline__ FlashDecodeRowConfig selectDecodeRowConfig(
         int kv_len,
         int head_dim,
         int n_heads,
@@ -1458,16 +1083,39 @@ namespace
         bool forced_tpb_present,
         int forced_tpb)
     {
-        int requested_cap = FD_DEFAULT_NUM_SPLITS;
-        if (deterministic || kv_len <= 64)
+        /*
+         * These regimes are offline-tuned launch policy, not online
+         * autotuning. The 256-thread physical workgroup is immutable in the
+         * graph. Only the active split prefix changes from device-owned
+         * sequence metadata:
+         *
+         *   - eight splits amortize phase/reduction overhead at short context;
+         *   - sixteen splits fill gfx906 for ordinary Qwen3.6 head counts;
+         *   - a LocalTP shard with at most eight query heads needs 32 splits
+         *     from 1K onward to expose the same block-level parallelism;
+         *   - ordinary 16-head execution crosses to 32 splits at 8K.
+         *
+         * The byte-equivalence sweep compares grouped rows against independent
+         * M=1 calls across every boundary, so changing prefix size cannot
+         * silently change grouped verifier arithmetic.
+         */
+        int requested_cap = 8;
+        if (deterministic)
             requested_cap = 1;
-        else if (kv_len < 128)
-            requested_cap = 2;
-        else if (kv_len < 256)
-            requested_cap = 4;
+        else if (kv_len >= 8192)
+            requested_cap = 32;
+        else if (n_heads <= 8 && kv_len >= 1024)
+            requested_cap = 32;
+        else if (kv_len >= 256)
+            requested_cap = 16;
 
         const int max_allowed = deviceClampInt(
-            requested_cap < max_launch_splits ? requested_cap : max_launch_splits,
+            deviceClampInt(
+                requested_cap < max_launch_splits
+                    ? requested_cap
+                    : max_launch_splits,
+                1,
+                kv_len > 0 ? kv_len : 1),
             1,
             FD_MAX_SPLITS_SUPPORTED);
         const int safe_head_dim = head_dim > 0 ? head_dim : 1;
@@ -1493,7 +1141,15 @@ namespace
 
         if (n_heads > 0 && num_cus > 0)
         {
-            const int target_blocks = (num_cus * 3) / 4;
+            /*
+             * The 36-VGPR FP16 specialization sustains seven resident
+             * workgroups per CU. Filling that envelope is especially
+             * important for LocalTP shards whose reduced head count would
+             * otherwise leave most CUs idle at long context.
+             */
+            constexpr int target_resident_blocks_per_cu = 7;
+            const int target_blocks =
+                num_cus * target_resident_blocks_per_cu;
             if (n_heads * row_splits < target_blocks)
             {
                 const int occupancy_splits =
@@ -1506,18 +1162,28 @@ namespace
         }
         row_splits = deviceClampInt(row_splits, 1, max_allowed);
         if (forced_splits_present)
-            row_splits = deviceClampInt(forced_splits, 1, max_allowed);
+        {
+            /*
+             * Offline profiling must be able to compare every split count
+             * admitted by the immutable capture envelope, including counts
+             * above the production heuristic for this live KV length.
+             */
+            row_splits = deviceClampInt(
+                forced_splits,
+                1,
+                deviceClampInt(
+                    max_launch_splits,
+                    1,
+                    FD_MAX_SPLITS_SUPPORTED));
+        }
 
-        const int rows_per_split = kv_len / row_splits > 1
-                                       ? kv_len / row_splits
-                                       : 1;
-        const int64_t elements_per_split =
-            total_elements / row_splits;
-        int row_threads =
-            ((rows_per_split <= 64 && elements_per_split <= 16384) ||
-             (rows_per_split <= 48 && elements_per_split <= 32768))
-                ? 128
-                : 256;
+        /*
+         * Offline A/B measurements showed that deactivating two wavefronts
+         * roughly doubled short-context latency and remained slower at every
+         * tested Qwen3.6 sequence length. Keep the logical workgroup identical
+         * to the captured 256-thread workgroup in production.
+         */
+        int row_threads = 256;
         if (forced_tpb_present)
             row_threads = deviceClampInt(forced_tpb, 64, 256);
 
@@ -1528,8 +1194,7 @@ namespace
      * @brief Flash Decoding kernel for single-query decode on MI50
      *        v3: wavefront-cooperative KV processing + exp2f intrinsic
      */
-    template <KVTypeTag KV_TYPE = KVTypeTag::FP32,
-              FlashDecodeRowMode ROW_MODE = FlashDecodeRowMode::OrdinaryBatch>
+    template <KVTypeTag KV_TYPE = KVTypeTag::FP32>
     __global__ __launch_bounds__(256, 4)
     void flash_decoding_mi50_kernel(
         const float *__restrict__ Q,
@@ -1545,6 +1210,7 @@ namespace
         int num_splits,
         float softmax_scale,
         const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        FlashDecodeRowMode row_mode,
         int query_rows_per_request,
         int num_cus,
         bool deterministic,
@@ -1555,16 +1221,22 @@ namespace
         int head_start = 0,
         int gqa_n_rep = 0)
     {
-        constexpr bool ROW_LOCAL_PARAMS =
-            ROW_MODE != FlashDecodeRowMode::OrdinaryBatch;
-        constexpr bool SHARED_KV =
-            ROW_MODE == FlashDecodeRowMode::SharedKVVerifier;
+        /*
+         * Ownership is runtime metadata, not a template axis. Keeping one
+         * compiled kernel per physical KV format guarantees that ordinary M=1
+         * and grouped verifier rows execute the same arithmetic instruction
+         * stream. The mode affects addresses only.
+         */
+        const bool row_local_params =
+            row_mode != FlashDecodeRowMode::OrdinaryBatch;
+        const bool shared_kv =
+            row_mode == FlashDecodeRowMode::SharedKVVerifier;
 
         int kv_len_runtime = kv_len;
         int kv_batch_stride = kv_len;
         if (device_params)
         {
-            const int param_row = ROW_LOCAL_PARAMS ? blockIdx.z : 0;
+            const int param_row = row_local_params ? blockIdx.z : 0;
             kv_len_runtime = device_params[param_row].kv_len;
             kv_batch_stride = device_params[param_row].kv_stride;
         }
@@ -1576,20 +1248,17 @@ namespace
         FlashDecodeRowConfig row_config{
             num_splits,
             static_cast<int>(blockDim.x)};
-        if constexpr (ROW_LOCAL_PARAMS)
-        {
-            row_config = selectGroupedDecodeRowConfig(
-                kv_len_runtime,
-                head_dim,
-                n_heads,
-                num_cus,
-                num_splits,
-                deterministic,
-                forced_splits_present,
-                forced_splits,
-                forced_tpb_present,
-                forced_tpb);
-        }
+        row_config = selectDecodeRowConfig(
+            kv_len_runtime,
+            head_dim,
+            n_heads,
+            num_cus,
+            num_splits,
+            deterministic,
+            forced_splits_present,
+            forced_splits,
+            forced_tpb_present,
+            forced_tpb);
         const int row_num_splits = row_config.splits;
         const int logical_threads = row_config.threads_per_block;
 
@@ -1601,8 +1270,7 @@ namespace
          * the same order even when another row in this grid needs four.
          */
         const int tid = threadIdx.x;
-        const bool active_thread =
-            !ROW_LOCAL_PARAMS || tid < logical_threads;
+        const bool active_thread = tid < logical_threads;
         const int wavefront_id = tid / WAVEFRONT_SIZE;
         const int lane_id = tid % WAVEFRONT_SIZE;
         const int num_wavefronts =
@@ -1721,11 +1389,11 @@ namespace
         [[maybe_unused]] const int q8_bpr = n_kv_heads * q8_bph; // blocks per KV row
 
         int cache_batch_idx = batch_idx;
-        if constexpr (SHARED_KV)
+        if (shared_kv)
         {
             cache_batch_idx = 0;
         }
-        else if constexpr (ROW_MODE == FlashDecodeRowMode::IndependentRequest)
+        else if (row_mode == FlashDecodeRowMode::IndependentRequest)
         {
             cache_batch_idx =
                 batch_idx / (query_rows_per_request > 0
@@ -2026,7 +1694,6 @@ namespace
      *
      * Combines partial outputs from all splits using stable softmax merge.
      */
-    template <FlashDecodeRowMode ROW_MODE = FlashDecodeRowMode::OrdinaryBatch>
     __global__ __launch_bounds__(256, 4)
     void flash_decoding_reduce_mi50_kernel(
         const float *__restrict__ O_partial,
@@ -2036,7 +1703,9 @@ namespace
         int n_heads,
         int head_dim,
         int num_splits,
+        int kv_len,
         const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        FlashDecodeRowMode row_mode,
         int num_cus,
         bool deterministic,
         bool forced_splits_present,
@@ -2044,32 +1713,32 @@ namespace
         bool forced_tpb_present,
         int forced_tpb)
     {
-        constexpr bool ROW_LOCAL_PARAMS =
-            ROW_MODE != FlashDecodeRowMode::OrdinaryBatch;
         const int head_idx = blockIdx.x;
         const int batch_idx = blockIdx.y;
+        const int output_tile = blockIdx.z;
+        const int output_tiles = gridDim.z;
 
         const int tid = threadIdx.x;
-        int row_num_splits = num_splits;
-        if constexpr (ROW_LOCAL_PARAMS)
-        {
-            row_num_splits = selectGroupedDecodeRowConfig(
-                                 device_params[batch_idx].kv_len,
-                                 head_dim,
-                                 n_heads,
-                                 num_cus,
-                                 num_splits,
-                                 deterministic,
-                                 forced_splits_present,
-                                 forced_splits,
-                                 forced_tpb_present,
-                                 forced_tpb)
-                                 .splits;
-        }
+        const int param_row =
+            row_mode != FlashDecodeRowMode::OrdinaryBatch ? batch_idx : 0;
+        const int row_kv_len =
+            device_params ? device_params[param_row].kv_len : kv_len;
+        const int row_num_splits =
+            selectDecodeRowConfig(
+                row_kv_len,
+                head_dim,
+                n_heads,
+                num_cus,
+                num_splits,
+                deterministic,
+                forced_splits_present,
+                forced_splits,
+                forced_tpb_present,
+                forced_tpb)
+                .splits;
         const int base_idx = (batch_idx * n_heads + head_idx) * num_splits;
 
         // Find global max and compute scales
-        __shared__ float global_m;
         __shared__ float global_l;
         __shared__ float split_scales[32]; // Support up to 32 splits
 
@@ -2080,8 +1749,6 @@ namespace
             {
                 m_max = fmaxf(m_max, m_partial[base_idx + s]);
             }
-            global_m = m_max;
-
             float l_sum = 0.0f;
             for (int s = 0; s < row_num_splits; s++)
             {
@@ -2096,10 +1763,23 @@ namespace
         float inv_l = (global_l > 0.0f) ? (1.0f / global_l) : 0.0f;
         float *O_out = O + (batch_idx * n_heads + head_idx) * head_dim;
         const int head_base = (batch_idx * n_heads + head_idx) * head_dim;
+        const int output_begin =
+            (head_dim * output_tile) / output_tiles;
+        const int output_end =
+            (head_dim * (output_tile + 1)) / output_tiles;
+        const int vectorized_elements =
+            (output_end - output_begin) & ~1;
 
-        // Combine partial outputs
-        for (int d = tid * 2; d + 1 < head_dim; d += blockDim.x * 2)
+        /*
+         * One wave owns each output tile. The scalar softmax merge is
+         * intentionally repeated by each tile, while every output component
+         * accumulates split partials in the original ascending order.
+         */
+        for (int offset = tid * 2;
+             offset + 1 < vectorized_elements;
+             offset += blockDim.x * 2)
         {
+            const int d = output_begin + offset;
             float O_sum0 = 0.0f;
             float O_sum1 = 0.0f;
             const int split_base0 = (head_base + d + 0) * num_splits;
@@ -2113,7 +1793,9 @@ namespace
             reinterpret_cast<float2 *>(O_out + d)[0] = make_float2(O_sum0 * inv_l, O_sum1 * inv_l);
         }
 
-        for (int d = (head_dim & ~1) + tid; d < head_dim; d += blockDim.x)
+        for (int d = output_begin + vectorized_elements + tid;
+             d < output_end;
+             d += blockDim.x)
         {
             float O_sum = 0.0f;
             const int split_base = (head_base + d) * num_splits;
@@ -2309,49 +1991,43 @@ static int launch_decode(
     hipStream_t hip_stream,
     int head_start = 0, int gqa_n_rep = 0)
 {
-    if (head_dim <= 0 || head_dim > 256)
+    if (!Q || !K_cache || !V_cache || !O || !O_partial || !m_partial ||
+        !l_partial || !hip_stream || batch_size <= 0 || kv_len <= 0 ||
+        n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 ||
+        head_dim > 256 || num_splits <= 0 ||
+        num_splits > FD_MAX_SPLITS_SUPPORTED)
     {
-        printf("[launch_decode] Error: head_dim=%d must be in [1, 256]\n", head_dim);
+        printf("[launch_decode] Invalid stable decode geometry: "
+               "batch=%d kv_len=%d heads=%d kv_heads=%d head_dim=%d "
+               "split_envelope=%d stream=%p\n",
+               batch_size,
+               kv_len,
+               n_heads,
+               n_kv_heads,
+               head_dim,
+               num_splits,
+               static_cast<void *>(hip_stream));
         return -1;
     }
 
-    float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    const float softmax_scale =
+        1.0f / sqrtf(static_cast<float>(head_dim));
 
     int current_device = 0;
     (void)hipGetDevice(&current_device);
     const int num_cus = getDeviceConfig(current_device).num_cus;
-
-    const DecodeAutotuneSelection tuned = chooseDecodeLaunchConfig(kv_len, head_dim, num_splits, n_heads, num_cus);
-    const int effective_num_splits = tuned.config.splits;
-    const int decode_threads_per_block = tuned.config.tpb;
-
-    // Autotuning MUST be disabled during HIP stream capture.
-    // hipEventCreate/Synchronize/Destroy are forbidden during capture and
-    // will invalidate the capture graph.
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    if (hip_stream)
-        (void)hipStreamIsCapturing(hip_stream, &capture_status);
-    const bool is_capturing = (capture_status == hipStreamCaptureStatusActive);
-
-    hipEvent_t tune_start = nullptr;
-    hipEvent_t tune_stop = nullptr;
-    const bool measure_tuning = tuned.should_time && !is_capturing;
-    if (measure_tuning)
-    {
-        if (hipEventCreate(&tune_start) == hipSuccess && hipEventCreate(&tune_stop) == hipSuccess)
-        {
-            (void)hipEventRecord(tune_start, hip_stream);
-        }
-        else
-        {
-            if (tune_start)
-                (void)hipEventDestroy(tune_start);
-            if (tune_stop)
-                (void)hipEventDestroy(tune_stop);
-            tune_start = nullptr;
-            tune_stop = nullptr;
-        }
-    }
+    const auto &rocm_env = llaminar2::debugEnv().rocm;
+    const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
+    const bool forced_splits_present =
+        rocm_env.fa_decode_num_splits_present &&
+        rocm_env.fa_decode_num_splits.has_value();
+    const int forced_splits =
+        forced_splits_present ? *rocm_env.fa_decode_num_splits : 0;
+    const bool forced_tpb_present =
+        rocm_env.fa_decode_num_splits_present &&
+        rocm_env.fa_decode_tpb.has_value();
+    const int forced_tpb =
+        forced_tpb_present ? *rocm_env.fa_decode_tpb : 0;
 
     // Split-K kernel (type-dispatched via template)
     // FP16 path stores Q as half in shared memory (halves LDS usage + bandwidth)
@@ -2361,58 +2037,45 @@ static int launch_decode(
     } else {
         smem_size = head_dim * sizeof(float);
     }
-    dim3 grid_split(n_heads, effective_num_splits, batch_size);
-    dim3 block_split(decode_threads_per_block);
+    const dim3 grid_split(n_heads, num_splits, batch_size);
+    constexpr int physical_threads = 256;
 
     hipLaunchKernelGGL(
-        (flash_decoding_mi50_kernel<KV_TYPE,
-                                    FlashDecodeRowMode::OrdinaryBatch>),
-        grid_split, block_split, smem_size, hip_stream,
+        (flash_decoding_mi50_kernel<KV_TYPE>),
+        grid_split, dim3(physical_threads), smem_size, hip_stream,
         Q, K_cache, V_cache,
         O_partial, m_partial, l_partial,
         kv_len, n_heads, n_kv_heads, head_dim,
-        effective_num_splits, softmax_scale, device_params,
+        num_splits, softmax_scale, device_params,
+        FlashDecodeRowMode::OrdinaryBatch,
         /*query_rows_per_request=*/1,
         num_cus,
-        /*deterministic=*/false,
-        /*forced_splits_present=*/false,
-        /*forced_splits=*/0,
-        /*forced_tpb_present=*/false,
-        /*forced_tpb=*/0,
+        deterministic,
+        forced_splits_present,
+        forced_splits,
+        forced_tpb_present,
+        forced_tpb,
         head_start, gqa_n_rep);
 
     // Reduction kernel (unchanged — operates on FP32 partials only)
-    dim3 grid_reduce(n_heads, batch_size);
-    dim3 block_reduce(256);
+    const int output_tiles = head_dim >= 256 ? 2 : 1;
+    dim3 grid_reduce(n_heads, batch_size, output_tiles);
+    dim3 block_reduce(64);
 
     hipLaunchKernelGGL(
-        (flash_decoding_reduce_mi50_kernel<
-            FlashDecodeRowMode::OrdinaryBatch>),
+        flash_decoding_reduce_mi50_kernel,
         grid_reduce, block_reduce, 0, hip_stream,
         O_partial, m_partial, l_partial, O,
-        n_heads, head_dim, effective_num_splits,
+        n_heads, head_dim, num_splits,
+        kv_len,
         device_params,
+        FlashDecodeRowMode::OrdinaryBatch,
         num_cus,
-        /*deterministic=*/false,
-        /*forced_splits_present=*/false,
-        /*forced_splits=*/0,
-        /*forced_tpb_present=*/false,
-        /*forced_tpb=*/0);
-
-    if (tune_start && tune_stop)
-    {
-        (void)hipEventRecord(tune_stop, hip_stream);
-        if (hipEventSynchronize(tune_stop) == hipSuccess)
-        {
-            float elapsed_ms = 0.0f;
-            if (hipEventElapsedTime(&elapsed_ms, tune_start, tune_stop) == hipSuccess)
-            {
-                recordDecodeAutotuneResult(tuned.key, tuned.candidate_index, elapsed_ms);
-            }
-        }
-        (void)hipEventDestroy(tune_start);
-        (void)hipEventDestroy(tune_stop);
-    }
+        deterministic,
+        forced_splits_present,
+        forced_splits,
+        forced_tpb_present,
+        forced_tpb);
 
     (void)hipGetLastError();  // Clear stale errors
     hipError_t err = hipGetLastError();
@@ -2436,10 +2099,9 @@ static int launch_decode(
  * ordinary scalar ROCm policy for that row.  This preserves byte identity
  * without host count reads or one launch pair per row.
  *
- * Online autotune trial rotation is intentionally rejected.  It is an explicit
- * profiling mode whose per-call candidate mutation cannot define a stable
- * scalar oracle for multiple rows inside one graph replay.  The normal
- * production heuristic and explicit fixed split/TPB overrides are supported.
+ * Explicit fixed split/TPB overrides remain available for offline profiling.
+ * Production never rotates candidates online; the device-owned row policy is
+ * deterministic for a given geometry and live KV length.
  */
 template <KVTypeTag KV_TYPE, FlashDecodeRowMode ROW_MODE>
 static int launch_grouped_decode(
@@ -2490,14 +2152,6 @@ static int launch_grouped_decode(
 
     const auto &rocm_env = llaminar2::debugEnv().rocm;
     const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
-    if (rocm_env.fa_decode_autotune && !deterministic &&
-        !rocm_env.fa_decode_num_splits_present)
-    {
-        printf("[launch_grouped_decode] Online flash-decode autotune is a "
-               "profiling-only mode and cannot define grouped row parity\n");
-        return -1;
-    }
-
     const bool forced_splits_present =
         rocm_env.fa_decode_num_splits_present &&
         rocm_env.fa_decode_num_splits.has_value();
@@ -2525,7 +2179,7 @@ static int launch_grouped_decode(
     const dim3 split_grid(n_heads, max_num_splits, row_count);
     constexpr int physical_threads = 256;
     hipLaunchKernelGGL(
-        (flash_decoding_mi50_kernel<KV_TYPE, ROW_MODE>),
+        (flash_decoding_mi50_kernel<KV_TYPE>),
         split_grid,
         dim3(physical_threads),
         smem_size,
@@ -2543,6 +2197,7 @@ static int launch_grouped_decode(
         max_num_splits,
         softmax_scale,
         device_params,
+        ROW_MODE,
         query_rows_per_request,
         num_cus,
         deterministic,
@@ -2560,11 +2215,12 @@ static int launch_grouped_decode(
         return -1;
     }
 
-    const dim3 reduce_grid(n_heads, row_count);
+    const int output_tiles = head_dim >= 256 ? 2 : 1;
+    const dim3 reduce_grid(n_heads, row_count, output_tiles);
     hipLaunchKernelGGL(
-        (flash_decoding_reduce_mi50_kernel<ROW_MODE>),
+        flash_decoding_reduce_mi50_kernel,
         reduce_grid,
-        dim3(256),
+        dim3(64),
         0,
         hip_stream,
         O_partial,
@@ -2574,7 +2230,9 @@ static int launch_grouped_decode(
         n_heads,
         head_dim,
         max_num_splits,
+        max_kv_len,
         device_params,
+        ROW_MODE,
         num_cus,
         deterministic,
         forced_splits_present,

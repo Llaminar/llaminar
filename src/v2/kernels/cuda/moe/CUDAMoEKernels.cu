@@ -32,6 +32,7 @@ namespace
     constexpr int kThreads = 256;
     constexpr int kMaxExperts = 1024;
     constexpr int kDeviceMoEMaxExperts = 256;
+    constexpr int kDeviceMoESmallGroupMaxSlots = 64;
     constexpr int kDeviceMoEMaxParticipants = 8;
     constexpr int kMaxTopK = 16;
     constexpr uint8_t kMixedCodebookSentinel = 0xffu;
@@ -11042,6 +11043,22 @@ namespace
         grouped_weights[dest] = routing_weights[idx];
     }
 
+    /**
+     * @brief Group a compact verifier route table in stable expert-major order.
+     *
+     * The compact MTP path has at most 64 route slots and 256 experts. One
+     * block therefore owns the complete grouping transaction. Each expert
+     * thread counts its own routes and computes its exact exclusive offset;
+     * each route thread then computes its stable rank among earlier routes to
+     * the same expert. Every output location has exactly one writer, so this
+     * implementation needs neither atomics nor a serial coordinator.
+     *
+     * Integer route counts and offsets are exact. More importantly, the
+     * grouped rows retain the same `(expert, original route slot)` order as
+     * serial decode. That ordering is part of the grouped-verifier bitwise
+     * equivalence contract because later gate/up and down kernels consume
+     * these arrays in order.
+     */
     __global__ void group_tokens_small_float_kernel(
         const float *__restrict__ routing_indices,
         const float *__restrict__ routing_weights,
@@ -11057,60 +11074,84 @@ namespace
         int top_k,
         int max_active_experts)
     {
-        if (threadIdx.x != 0 || blockIdx.x != 0)
-            return;
+        __shared__ int shared_route_experts[kDeviceMoESmallGroupMaxSlots];
+        __shared__ int shared_expert_counts[kDeviceMoEMaxExperts];
 
-        for (int expert = 0; expert < num_experts; ++expert)
+        const int tid = threadIdx.x;
+        shared_expert_counts[tid] = 0;
+
+        if (tid < total_slots)
         {
-            expert_counts[expert] = 0;
-            expert_offsets[expert] = 0;
+            grouped_token_indices[tid] = 0;
+            original_to_grouped[tid] = -1;
+            original_expert_ids[tid] = -1;
+            grouped_weights[tid] = 0.0f;
+
+            const int expert = static_cast<int>(routing_indices[tid]);
+            const int valid_expert =
+                (expert >= 0 && expert < num_experts) ? expert : -1;
+            shared_route_experts[tid] = valid_expert;
+            original_expert_ids[tid] = valid_expert;
         }
-        for (int idx = 0; idx < total_slots; ++idx)
+        if (tid < max_active_experts)
+            active_expert_ids[tid] = -1;
+        __syncthreads();
+
+        /*
+         * Route-slot count is deliberately tiny. Assigning one expert to each
+         * lane avoids contended atomics and gives identical behavior on CUDA
+         * and ROCm, including experts with no selected rows.
+         */
+        if (tid < num_experts)
         {
-            grouped_token_indices[idx] = 0;
-            original_to_grouped[idx] = -1;
-            original_expert_ids[idx] = -1;
-            grouped_weights[idx] = 0.0f;
+            int count = 0;
+            for (int slot = 0; slot < total_slots; ++slot)
+                count += shared_route_experts[slot] == tid ? 1 : 0;
+            shared_expert_counts[tid] = count;
         }
-        for (int slot = 0; slot < max_active_experts; ++slot)
-            active_expert_ids[slot] = -1;
+        __syncthreads();
 
-        for (int idx = 0; idx < total_slots; ++idx)
+        /*
+         * Every expert independently derives its prefix from immutable shared
+         * counts. The small fixed upper bound makes this cheaper than a
+         * multi-kernel scan while avoiding the sixteen block barriers needed
+         * by an in-place Hillis-Steele scan over 256 lanes.
+         */
+        if (tid < num_experts)
         {
-            const int expert = static_cast<int>(routing_indices[idx]);
-            if (expert >= 0 && expert < num_experts)
-                ++expert_counts[expert];
-        }
-
-        int running = 0;
-        int active_count = 0;
-        for (int expert = 0; expert < num_experts; ++expert)
-        {
-            expert_offsets[expert] = running;
-            const int count = expert_counts[expert];
-            if (count > 0 && active_count < max_active_experts)
-                active_expert_ids[active_count++] = expert;
-            running += count;
-        }
-
-        for (int idx = 0; idx < total_slots; ++idx)
-        {
-            const int expert = static_cast<int>(routing_indices[idx]);
-            if (expert < 0 || expert >= num_experts)
-                continue;
-
-            int local = 0;
-            for (int prev = 0; prev < idx; ++prev)
+            int offset = 0;
+            int active_rank = 0;
+            for (int expert = 0; expert < tid; ++expert)
             {
-                if (static_cast<int>(routing_indices[prev]) == expert)
-                    ++local;
+                const int count = shared_expert_counts[expert];
+                offset += count;
+                active_rank += count > 0 ? 1 : 0;
             }
 
-            const int dest = expert_offsets[expert] + local;
-            grouped_token_indices[dest] = idx / top_k;
-            original_to_grouped[idx] = dest;
-            original_expert_ids[idx] = expert;
-            grouped_weights[dest] = routing_weights[idx];
+            const int count = shared_expert_counts[tid];
+            expert_counts[tid] = count;
+            expert_offsets[tid] = offset;
+            if (count > 0 && active_rank < max_active_experts)
+                active_expert_ids[active_rank] = tid;
+        }
+        __syncthreads();
+
+        if (tid < total_slots)
+        {
+            const int expert = shared_route_experts[tid];
+            if (expert < 0 || expert >= num_experts)
+                return;
+
+            int stable_local_rank = 0;
+            for (int previous_slot = 0; previous_slot < tid; ++previous_slot)
+                stable_local_rank +=
+                    shared_route_experts[previous_slot] == expert ? 1 : 0;
+
+            const int destination =
+                expert_offsets[expert] + stable_local_rank;
+            grouped_token_indices[destination] = tid / top_k;
+            original_to_grouped[tid] = destination;
+            grouped_weights[destination] = routing_weights[tid];
         }
     }
 
@@ -15322,10 +15363,27 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        if (!stream)
+        if (!stream ||
+            !routing_indices || !routing_weights ||
+            !expert_counts || !expert_offsets ||
+            !grouped_token_indices || !original_to_grouped ||
+            !original_expert_ids || !grouped_weights ||
+            !active_expert_ids ||
+            total_slots <= 0 ||
+            total_slots > kDeviceMoESmallGroupMaxSlots ||
+            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+            top_k <= 0 || top_k > kMaxTopK ||
+            total_slots % top_k != 0 ||
+            max_active_experts <= 0 ||
+            max_active_experts > total_slots ||
+            max_active_experts > num_experts)
+        {
+            std::fprintf(stderr, "CUDA MoE small float grouping invalid arguments\n");
             return false;
+        }
+
         cudaSetDevice(device_idx);
-        group_tokens_small_float_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+        group_tokens_small_float_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             routing_indices, routing_weights, expert_counts, expert_offsets,
             grouped_token_indices, original_to_grouped, original_expert_ids, grouped_weights,
             active_expert_ids, total_slots, num_experts, top_k, max_active_experts);

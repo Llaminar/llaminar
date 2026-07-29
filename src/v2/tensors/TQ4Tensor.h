@@ -10,7 +10,7 @@
  * one block per attention head (each block = head_dim elements).
  *
  * The tensor uses raw byte storage internally because TQ4Block is templated
- * on head_dim (TQ4Block<64> vs TQ4Block<128>), which is only known at runtime.
+ * on head_dim (64, 128, or 256), which is only known at runtime.
  * Block structure is interpreted via head_dim_ metadata.
  *
  * Memory layout (POSITION_MAJOR):
@@ -61,7 +61,7 @@ namespace llaminar2
          * @brief Construct empty TQ4 tensor for KV cache pre-allocation.
          *
          * @param shape   Tensor shape: [num_positions, kv_dim] where kv_dim = n_kv_heads * head_dim
-         * @param head_dim Head dimension (64 or 128). Determines block size.
+         * @param head_dim Head dimension (64, 128, or 256). Determines block size.
          * @param device  Device placement (default: CPU).
          */
         TQ4Tensor(const std::vector<size_t> &shape, int head_dim, DeviceId device = DeviceId::cpu());
@@ -139,7 +139,7 @@ namespace llaminar2
          *
          * @param src       Source FP32 data [num_positions, kv_dim]
          * @param shape     Shape: [num_positions, kv_dim]
-         * @param head_dim  Head dimension (64 or 128)
+         * @param head_dim  Head dimension (64, 128, or 256)
          * @param turboquant_ctx  Pre-computed TurboQuant context
          * @return New TQ4Tensor with quantized data
          */
@@ -169,7 +169,7 @@ namespace llaminar2
 
     private:
         std::vector<size_t> shape_; ///< [num_positions, kv_dim]
-        int head_dim_;              ///< Head dimension (64 or 128)
+        int head_dim_;              ///< Head dimension (64, 128, or 256)
         size_t block_bytes_;
         size_t blocks_per_row_; ///< kv_dim / head_dim
         DeviceId device_;

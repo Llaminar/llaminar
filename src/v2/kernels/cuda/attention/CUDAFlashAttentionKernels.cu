@@ -75,7 +75,6 @@ namespace
     // Pipeline configuration
     constexpr int FA2_NUM_STAGES = 2;       // Double buffering
     constexpr int FA2_PRODUCER_WARPS = 2;   // Warps dedicated to loading (fixed)
-    constexpr int FA2_TILE_KV_DEFAULT = 64; // Default KV tile size
     /// Maximum compact verifier rows represented by DEVICE_PARAMS.
     constexpr int MAX_DYNAMIC_ATTENTION_PARAM_ROWS =
         llaminar2::attention::kMaxGroupedVerifierAttentionRows;
@@ -981,6 +980,24 @@ namespace
     }
 
     /**
+     * @brief Select the live split prefix inside a fixed captured launch envelope.
+     *
+     * Graph capture records `max_num_splits` physical split planes.  The live KV
+     * length is device-owned and may cross several sequence-parallel regimes
+     * while that graph is replayed.  Selecting only an active prefix preserves
+     * the historical serial-decode partition without changing launch topology.
+     */
+    __device__ __forceinline__ int activeDecodeSplits(
+        int kv_len,
+        int max_num_splits,
+        int min_kv_per_split)
+    {
+        return min(
+            max_num_splits,
+            max(1, kv_len / max(1, min_kv_per_split)));
+    }
+
+    /**
      * @brief Flash Decoding kernel for single-query decode (warp-cooperative)
      *
      * Parallelizes over KV cache using split-K pattern.
@@ -1025,7 +1042,13 @@ namespace
                                     ? (head_start + head_idx) / effective_gqa
                                     : head_idx / effective_gqa;
 
-        const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
+        const int row_num_splits =
+            activeDecodeSplits(kv_len_runtime, num_splits, 16);
+        if (split_idx >= row_num_splits)
+            return;
+
+        const int split_size =
+            (kv_len_runtime + row_num_splits - 1) / row_num_splits;
         const int kv_start = split_idx * split_size;
         const int kv_end = min(kv_start + split_size, kv_len_runtime);
 
@@ -1195,29 +1218,38 @@ namespace
         float *__restrict__ O,
         int n_heads,
         int head_dim,
-        int num_splits)
+        int max_num_splits,
+        int kv_len,
+        int min_kv_per_split,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
     {
         const int head_idx = blockIdx.x;
         const int batch_idx = blockIdx.y;
+        const int output_tile = blockIdx.z;
+        const int output_tiles = gridDim.z;
 
         const int tid = threadIdx.x;
-        const int base_idx = (batch_idx * n_heads + head_idx) * num_splits;
+        const int kv_len_runtime =
+            device_params ? device_params->kv_len : kv_len;
+        const int row_num_splits = activeDecodeSplits(
+            kv_len_runtime,
+            max_num_splits,
+            min_kv_per_split);
+        const int base_idx =
+            (batch_idx * n_heads + head_idx) * max_num_splits;
 
-        __shared__ float global_m;
         __shared__ float global_l;
         __shared__ float split_scales[32];
 
         if (tid == 0)
         {
             float m_max = -FLT_MAX;
-            for (int s = 0; s < num_splits; s++)
+            for (int s = 0; s < row_num_splits; s++)
             {
                 m_max = fmaxf(m_max, m_partial[base_idx + s]);
             }
-            global_m = m_max;
-
             float l_sum = 0.0f;
-            for (int s = 0; s < num_splits; s++)
+            for (int s = 0; s < row_num_splits; s++)
             {
                 float scale = __expf(m_partial[base_idx + s] - m_max);
                 split_scales[s] = scale;
@@ -1229,11 +1261,23 @@ namespace
 
         float inv_l = (global_l > 0.0f) ? (1.0f / global_l) : 0.0f;
         float *O_out = O + (batch_idx * n_heads + head_idx) * head_dim;
+        const int output_begin =
+            (head_dim * output_tile) / output_tiles;
+        const int output_end =
+            (head_dim * (output_tile + 1)) / output_tiles;
 
-        for (int d = tid; d < head_dim; d += blockDim.x)
+        /*
+         * Output tiles duplicate only the tiny scalar softmax merge above.
+         * Each output element retains the exact ascending split traversal used
+         * by the one-block decoder, so tiling changes occupancy without changing
+         * FP32 operation order or byte-level verifier results.
+         */
+        for (int d = output_begin + tid;
+             d < output_end;
+             d += blockDim.x)
         {
             float O_sum = 0.0f;
-            for (int s = 0; s < num_splits; s++)
+            for (int s = 0; s < row_num_splits; s++)
             {
                 const float *O_s = O_partial + (base_idx + s) * head_dim;
                 O_sum += split_scales[s] * O_s[d];
@@ -1311,19 +1355,13 @@ namespace
                                     ? (head_start + head_idx) / effective_gqa
                                     : head_idx / effective_gqa;
 
-        int row_num_splits = num_splits;
-        if constexpr (ROW_LOCAL_PARAMS)
-        {
-            /*
-             * `num_splits` is the serial policy result for the longest row.
-             * Shorter verifier rows apply the same minimum-16-KV-items cap as
-             * computeNumSplitsForDevice(), yielding exactly their M=1 split
-             * count without changing the captured grid dimensions.
-             */
-            row_num_splits = min(
-                num_splits,
-                max(1, kv_len_runtime / 16));
-        }
+        /*
+         * Ordinary and grouped rows share the same device-side policy.  Their
+         * physical grid is the graph-stable envelope; the live KV length
+         * selects the active prefix and therefore the exact serial partition.
+         */
+        const int row_num_splits =
+            activeDecodeSplits(kv_len_runtime, num_splits, 16);
 
         const int partial_idx =
             (batch_idx * n_heads + head_idx) * num_splits + split_idx;
@@ -1500,6 +1538,8 @@ namespace
     {
         const int head_idx = blockIdx.x;
         const int verifier_row = blockIdx.y;
+        const int output_tile = blockIdx.z;
+        const int output_tiles = gridDim.z;
         const int tid = threadIdx.x;
 
         const int row_kv_len = device_params[verifier_row].kv_len;
@@ -1509,7 +1549,6 @@ namespace
         const int base_idx =
             (verifier_row * n_heads + head_idx) * max_num_splits;
 
-        __shared__ float global_m;
         __shared__ float global_l;
         __shared__ float split_scales[32];
 
@@ -1520,8 +1559,6 @@ namespace
             {
                 m_max = fmaxf(m_max, m_partial[base_idx + split]);
             }
-            global_m = m_max;
-
             float l_sum = 0.0f;
             for (int split = 0; split < row_num_splits; ++split)
             {
@@ -1538,7 +1575,13 @@ namespace
             global_l > 0.0f ? (1.0f / global_l) : 0.0f;
         float *O_out =
             O + (verifier_row * n_heads + head_idx) * head_dim;
-        for (int d = tid; d < head_dim; d += blockDim.x)
+        const int output_begin =
+            (head_dim * output_tile) / output_tiles;
+        const int output_end =
+            (head_dim * (output_tile + 1)) / output_tiles;
+        for (int d = output_begin + tid;
+             d < output_end;
+             d += blockDim.x)
         {
             float O_sum = 0.0f;
             for (int split = 0; split < row_num_splits; ++split)
@@ -1611,7 +1654,13 @@ namespace
                                     ? (head_start + head_idx) / effective_gqa
                                     : head_idx / effective_gqa;
 
-        const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
+        const int row_num_splits =
+            activeDecodeSplits(kv_len_runtime, num_splits, 16);
+        if (split_idx >= row_num_splits)
+            return;
+
+        const int split_size =
+            (kv_len_runtime + row_num_splits - 1) / row_num_splits;
         const int kv_start = split_idx * split_size;
         const int kv_end = min(kv_start + split_size, kv_len_runtime);
 
@@ -1886,7 +1935,13 @@ namespace
         if (device_params)
             kv_count_rt = device_params->kv_len;
 
-        const int split_size = (kv_count_rt + num_splits - 1) / num_splits;
+        const int row_num_splits =
+            activeDecodeSplits(kv_count_rt, num_splits, 64);
+        if (split_idx >= row_num_splits)
+            return;
+
+        const int split_size =
+            (kv_count_rt + row_num_splits - 1) / row_num_splits;
         const int kv_start = split_idx * split_size;
         const int kv_end = min(kv_start + split_size, kv_count_rt);
 
@@ -2451,12 +2506,17 @@ extern "C"
 
         // Phase 2: Reduce partials to final output
         {
-            dim3 grid(n_heads, batch_size);
-            int block_size = min(head_dim, 256);
+            const int output_tiles = head_dim >= 256 ? 2 : 1;
+            dim3 grid(n_heads, batch_size, output_tiles);
+            const int block_size =
+                min((head_dim + output_tiles - 1) / output_tiles, 256);
 
             flash_decoding_reduce_fp32_kernel<<<grid, block_size, 0, cuda_stream>>>(
                 O_partial, m_partial, l_partial, O,
-                n_heads, head_dim, num_splits);
+                n_heads, head_dim, num_splits,
+                kv_len,
+                /*min_kv_per_split=*/16,
+                device_params);
         }
 
         return cudaGetLastError() == cudaSuccess ? 0 : -1;
@@ -2506,12 +2566,17 @@ extern "C"
 
         // Phase 2: Reduce partials (same as FP32 — operates on FP32 partials)
         {
-            dim3 grid(n_heads, batch_size);
-            int block_size = min(head_dim, 256);
+            const int output_tiles = head_dim >= 256 ? 2 : 1;
+            dim3 grid(n_heads, batch_size, output_tiles);
+            const int block_size =
+                min((head_dim + output_tiles - 1) / output_tiles, 256);
 
             flash_decoding_reduce_fp32_kernel<<<grid, block_size, 0, cuda_stream>>>(
                 O_partial, m_partial, l_partial, O,
-                n_heads, head_dim, num_splits);
+                n_heads, head_dim, num_splits,
+                kv_len,
+                /*min_kv_per_split=*/16,
+                device_params);
         }
 
         return cudaGetLastError() == cudaSuccess ? 0 : -1;
@@ -2595,8 +2660,10 @@ extern "C"
 
         /* Phase 2 merges each row's active split prefix in serial order. */
         {
-            const dim3 grid(n_heads, verifier_rows);
-            const int block_size = min(head_dim, 256);
+            const int output_tiles = head_dim >= 256 ? 2 : 1;
+            const dim3 grid(n_heads, verifier_rows, output_tiles);
+            const int block_size =
+                min((head_dim + output_tiles - 1) / output_tiles, 256);
             flash_decoding_grouped_row_reduce_fp32_kernel
                 <<<grid, block_size, 0, cuda_stream>>>(
                     O_partial,
@@ -2685,8 +2752,10 @@ extern "C"
         }
 
         {
-            const dim3 grid(n_heads, total_rows);
-            const int block_size = min(head_dim, 256);
+            const int output_tiles = head_dim >= 256 ? 2 : 1;
+            const dim3 grid(n_heads, total_rows, output_tiles);
+            const int block_size =
+                min((head_dim + output_tiles - 1) / output_tiles, 256);
             flash_decoding_grouped_row_reduce_fp32_kernel
                 <<<grid, block_size, 0, cuda_stream>>>(
                     O_partial,
@@ -2742,12 +2811,17 @@ extern "C"
 
         // Phase 2: Reduce partials (same as FP32 — operates on FP32 partials)
         {
-            dim3 grid(n_heads, batch_size);
-            int block_size = min(head_dim, 256);
+            const int output_tiles = head_dim >= 256 ? 2 : 1;
+            dim3 grid(n_heads, batch_size, output_tiles);
+            const int block_size =
+                min((head_dim + output_tiles - 1) / output_tiles, 256);
 
             flash_decoding_reduce_fp32_kernel<<<grid, block_size, 0, cuda_stream>>>(
                 O_partial, m_partial, l_partial, O,
-                n_heads, head_dim, num_splits);
+                n_heads, head_dim, num_splits,
+                kv_len,
+                /*min_kv_per_split=*/16,
+                device_params);
         }
 
         return cudaGetLastError() == cudaSuccess ? 0 : -1;
@@ -2807,12 +2881,17 @@ extern "C"
 
         // Phase 2: Reduce partials (same reduce kernel as FP32/Q8_1)
         {
-            dim3 grid(n_heads, batch_size);
-            int block_size = min(head_dim, 256);
+            const int output_tiles = head_dim >= 256 ? 2 : 1;
+            dim3 grid(n_heads, batch_size, output_tiles);
+            const int block_size =
+                min((head_dim + output_tiles - 1) / output_tiles, 256);
 
             flash_decoding_reduce_fp32_kernel<<<grid, block_size, 0, cuda_stream>>>(
                 O_partial, m_partial, l_partial, O,
-                n_heads, head_dim, num_splits);
+                n_heads, head_dim, num_splits,
+                kv_count,
+                /*min_kv_per_split=*/64,
+                device_params);
         }
 
         return cudaGetLastError() == cudaSuccess ? 0 : -1;

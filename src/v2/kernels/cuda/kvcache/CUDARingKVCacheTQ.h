@@ -1,6 +1,6 @@
 /**
  * @file CUDARingKVCacheTQ.h
- * @brief CUDA Ring Buffer KV Cache with TurboQuant (TQ8 K + TQ4 V)
+ * @brief CUDA ring KV cache with selectable TQ8-K/TQ4-V or TQ8-K/TQ8-V storage.
  * @author David Sanftenberg
  *
  * Asymmetric precision ring buffer cache:
@@ -28,7 +28,10 @@
 #pragma once
 
 #include "CUDARingKVCacheBase.h"
+#include "../../kvcache/KVCacheWorkspaceBuffers.h"
+#include "../../kvcache/TurboQuantKVMode.h"
 #include "../../../execution/config/RuntimeConfig.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/BlockStructures.h"
 #include "CUDATurboQuantKernels.h"
 #include <cuda_runtime.h>
@@ -51,7 +54,8 @@ namespace llaminar2
      * K is stored as TQ8Block<D>, V as TQ4Block<D>.
      * Implements IKVCache for integration with the pipeline.
      */
-    class CUDARingKVCacheTQ : public CUDARingKVCacheBase
+    class CUDARingKVCacheTQ : public CUDARingKVCacheBase,
+                              public IWorkspaceConsumer
     {
     public:
         /**
@@ -68,7 +72,8 @@ namespace llaminar2
         CUDARingKVCacheTQ(int n_layers, int batch_size, int max_seq_len,
                           int n_kv_heads, int head_dim,
                           const TurboQuantContext *tq_ctx,
-                          int device_id = 0);
+                          int device_id = 0,
+                          TurboQuantKVMode mode = TurboQuantKVMode::TQ8_K_TQ4_V);
 
         /**
          * @brief Construct a LocalTP shard of the asymmetric TQ cache.
@@ -92,7 +97,8 @@ namespace llaminar2
         CUDARingKVCacheTQ(int n_layers, int batch_size, int max_seq_len,
                           int n_kv_heads, int local_n_kv_heads, int kv_head_start,
                           int head_dim, const TurboQuantContext *tq_ctx,
-                          int device_id = 0);
+                          int device_id = 0,
+                          TurboQuantKVMode mode = TurboQuantKVMode::TQ8_K_TQ4_V);
 
         ~CUDARingKVCacheTQ();
 
@@ -105,7 +111,10 @@ namespace llaminar2
         // =====================================================================
 
         ActivationPrecision k_precision() const override { return ActivationPrecision::TQ8; }
-        ActivationPrecision v_precision() const override { return ActivationPrecision::TQ4; }
+        ActivationPrecision v_precision() const override
+        {
+            return turboQuantValuePrecision(mode_);
+        }
 
         // ITensor-based access (returns FP32 shadow tensors)
         ITensor *get_k(int layer, int seq_idx = 0) override;
@@ -184,6 +193,32 @@ namespace llaminar2
                               int *out_kv_len,
                               const KVReadParams *rope = nullptr) override;
 
+        // =====================================================================
+        // IWorkspaceConsumer Interface
+        // =====================================================================
+
+        /**
+         * @brief Declare the complete FP16 K/V materialization horizon.
+         *
+         * The active append bucket is not an upper bound on the resident cache
+         * length. Both buffers therefore cover every configured request and
+         * every cache position so one graph-stable allocation remains valid for
+         * decode, grouped verification, and chunked long-context prefill.
+         */
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m, int n = 0, int k = 0) const override;
+
+        /**
+         * @brief Bind graph-planned conversion storage before capture.
+         *
+         * Binding a different manager during capture is forbidden. Passing
+         * nullptr deliberately leaves reads unavailable; there is no hidden
+         * cache-owned allocation fallback.
+         */
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        bool hasWorkspace() const override { return workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
+
         // LocalTP sharding metadata.
         bool is_sharded() const override { return local_n_kv_heads_ != n_kv_heads_; }
         int local_n_kv_heads() const override { return local_n_kv_heads_; }
@@ -239,6 +274,7 @@ namespace llaminar2
 
         int local_n_kv_heads_; ///< Heads physically stored and processed by this shard.
         int kv_head_start_;    ///< First global KV head represented by local head zero.
+        TurboQuantKVMode mode_; ///< Immutable storage policy resolved before capture.
 
         // TurboQuant context (not owned)
         const TurboQuantContext *tq_ctx_;
@@ -266,19 +302,14 @@ namespace llaminar2
         std::unique_ptr<ITensor> batched_v_view_;
 
         // =====================================================================
-        // Per-Layer FP16 Scratch Buffers (one per layer, enables incremental dequant)
+        // Stable views over graph-planned FP16 conversion scratch
         // =====================================================================
         //
-        // Each layer has its own scratch buffer pair so that incremental
-        // dequant works during decode: only the newly appended position
-        // needs to be dequantized, not the entire sequence.
-        //
-        // FP16 output enables the FP16 flash attention path (2× less bandwidth).
-        // Internal dequant computation remains FP32; only the final write converts.
-        //
-        // VRAM cost: n_layers × 2 × max_seq_len × kv_dim × 2B (FP16)
-        // For Qwen2.5-7B (28 layers, 4 heads, D=128, max_seq=4096):
-        //   28 × 2 × 4096 × 512 × 2 = 224MB
+        // Every layer's wrapper points at the same graph-stable K/V workspace.
+        // This aliasing is intentional: a layer publishes converted rows, its
+        // attention stage consumes them, and only then may the next layer
+        // overwrite the buffers. The graph's stage dependencies enforce that
+        // producer/consumer lifetime.
         //
         struct ScratchBuffer
         {
@@ -296,7 +327,9 @@ namespace llaminar2
             }
         };
 
-        mutable std::vector<ScratchBuffer> layer_scratch_; ///< Per-layer scratch buffers
+        mutable std::vector<ScratchBuffer> layer_scratch_; ///< Per-layer views over shared storage.
+        DeviceWorkspaceManager *workspace_ = nullptr;      ///< Bound graph workspace, not owned.
+        size_t scratch_capacity_bytes_ = 0;                ///< Capacity of each K/V buffer.
 
         mutable cudaStream_t cached_stream_; ///< Last explicit stream used by append/read operations.
 

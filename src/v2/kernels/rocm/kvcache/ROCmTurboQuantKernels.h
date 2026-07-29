@@ -11,6 +11,7 @@
 #pragma once
 
 #include "../../../tensors/BlockStructures.h"
+#include "../../kvcache/TurboQuantKVMode.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <cstdint>
@@ -86,6 +87,7 @@ namespace llaminar2
         int ring_head, int max_seq_len,
         int verifier_rows, int n_kv_heads, int head_dim,
         bool k_head_major, bool v_head_major,
+        TurboQuantKVMode mode,
         hipStream_t stream);
 
     /**
@@ -101,6 +103,7 @@ namespace llaminar2
         const int *d_ring_head, const int *d_row_count, int max_seq_len,
         int verifier_rows, int n_kv_heads, int head_dim,
         bool k_head_major, bool v_head_major,
+        TurboQuantKVMode mode,
         hipStream_t stream);
 
     /** @brief Publish prepared device TQ8-K/TQ4-V rows in one D2D kernel. */
@@ -229,6 +232,7 @@ namespace llaminar2
         int tail, int count, int max_seq_len,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start, int rope_dim,
+        TurboQuantKVMode mode,
         hipStream_t stream);
 
     /**
@@ -254,6 +258,7 @@ namespace llaminar2
         float rope_theta,
         int position_start,
         int rope_dim,
+        TurboQuantKVMode mode,
         hipStream_t stream);
 
     // =========================================================================

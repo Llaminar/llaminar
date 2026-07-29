@@ -919,7 +919,14 @@ namespace llaminar2
                       "tensor is NOT on device "
                       << target_device.toString()
                       << " — data must be uploaded during warmup phase first."
+                      << " tensor=" << static_cast<const void *>(this)
+                      << " dtype=" << dtype_name()
+                      << " numel=" << numel()
                       << " gpu_data_ptr=" << gpu_data_ptr_
+                      << " gpu_device="
+                      << (gpu_device_.has_value()
+                              ? gpu_device_->toString()
+                              : std::string("<none>"))
                       << " device_valid=" << ::llaminar2::isDeviceValid(coherence_state_));
             return false;
         }

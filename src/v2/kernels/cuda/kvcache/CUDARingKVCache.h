@@ -32,6 +32,7 @@
 
 // Minimal includes - avoid MPI headers for nvcc compatibility
 #include "CUDARingKVCacheBase.h"                     // Common ring buffer base class
+#include "../../kvcache/KVCacheWorkspaceBuffers.h"   // Shared conversion workspace names
 #include "../../../execution/config/RuntimeConfig.h" // For ActivationPrecision
 #include "../../../interfaces/IWorkspaceConsumer.h"  // Workspace management
 #include "../../../backends/IWorkerGPUContext.h"     // Device context support
@@ -49,21 +50,6 @@ namespace llaminar2
     // Forward declarations
     class DeviceWorkspaceManager;
     struct WorkspaceRequirements;
-
-    // =========================================================================
-    // KV Cache Workspace Buffer Names
-    // =========================================================================
-
-    /**
-     * Standard buffer names for cache-owned conversion workspace.
-     */
-    namespace KVCacheWorkspaceBuffers
-    {
-        /// K conversion scratch used by append/read precision adaptation.
-        constexpr const char *CONV_SCRATCH_K = "kvcache_conv_scratch_k";
-        /// V conversion scratch used by append/read precision adaptation.
-        constexpr const char *CONV_SCRATCH_V = "kvcache_conv_scratch_v";
-    }
 
     // =========================================================================
     // ICUDARingKVCache Interface

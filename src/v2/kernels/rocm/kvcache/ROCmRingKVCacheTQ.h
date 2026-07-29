@@ -3,14 +3,17 @@
  * @brief ROCm/HIP ring buffer KV cache with TurboQuant compression
  * @author David Sanftenberg
  *
- * HIP mirror of CUDARingKVCacheTQ. Uses TQ8 for Keys and TQ4 for Values.
- * Memory savings: 56% vs FP16 (for D=64 with 2 KV heads).
+ * HIP mirror of CUDARingKVCacheTQ with immutable TQ8-K/TQ4-V or
+ * TQ8-K/TQ8-V storage selected before graph capture.
  */
 
 #pragma once
 
 #include "ROCmRingKVCacheBase.h"
+#include "../../kvcache/KVCacheWorkspaceBuffers.h"
+#include "../../kvcache/TurboQuantKVMode.h"
 #include "ROCmTurboQuantKernels.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/GpuTensorView.h"
 #include <hip/hip_runtime.h>
@@ -22,13 +25,15 @@ namespace llaminar2
 {
     class TurboQuantContext;
 
-    class ROCmRingKVCacheTQ : public ROCmRingKVCacheBase
+    class ROCmRingKVCacheTQ : public ROCmRingKVCacheBase,
+                              public IWorkspaceConsumer
     {
     public:
         ROCmRingKVCacheTQ(int n_layers, int batch_size, int max_seq_len,
                           int n_kv_heads, int head_dim,
                           const TurboQuantContext *tq_ctx,
-                          int device_id);
+                          int device_id,
+                          TurboQuantKVMode mode = TurboQuantKVMode::TQ8_K_TQ4_V);
 
         /**
          * @brief Construct a LocalTP TQ8-K/TQ4-V cache shard.
@@ -40,7 +45,8 @@ namespace llaminar2
         ROCmRingKVCacheTQ(int n_layers, int batch_size, int max_seq_len,
                           int n_kv_heads, int local_n_kv_heads, int kv_head_start,
                           int head_dim, const TurboQuantContext *tq_ctx,
-                          int device_id);
+                          int device_id,
+                          TurboQuantKVMode mode = TurboQuantKVMode::TQ8_K_TQ4_V);
 
         ~ROCmRingKVCacheTQ() override;
 
@@ -53,7 +59,10 @@ namespace llaminar2
         // =====================================================================
 
         ActivationPrecision k_precision() const override { return ActivationPrecision::TQ8; }
-        ActivationPrecision v_precision() const override { return ActivationPrecision::TQ4; }
+        ActivationPrecision v_precision() const override
+        {
+            return turboQuantValuePrecision(mode_);
+        }
 
         // ITensor-based access (returns FP32 shadow tensors)
         ITensor *get_k(int layer, int seq_idx = 0) override;
@@ -131,6 +140,25 @@ namespace llaminar2
                               int *out_kv_len,
                               const KVReadParams *rope = nullptr) override;
 
+        // =====================================================================
+        // IWorkspaceConsumer Interface
+        // =====================================================================
+
+        /**
+         * @brief Declare full-horizon FP16 conversion buffers for graph replay.
+         */
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m, int n = 0, int k = 0) const override;
+
+        /**
+         * @brief Bind planner-owned conversion storage before HIP graph capture.
+         *
+         * No private scratch is allocated when the workspace is absent.
+         */
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        bool hasWorkspace() const override { return workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
+
         // LocalTP sharding metadata.
         bool is_sharded() const override { return local_n_kv_heads_ != n_kv_heads_; }
         int local_n_kv_heads() const override { return local_n_kv_heads_; }
@@ -187,10 +215,11 @@ namespace llaminar2
         hipStream_t clearStream() const;
 
         size_t tq8_block_size_;
-        size_t tq4_block_size_;
+        size_t v_block_size_;
 
         int local_n_kv_heads_; ///< Heads physically stored by this ROCm shard.
         int kv_head_start_;    ///< First global head represented by local head zero.
+        TurboQuantKVMode mode_; ///< Immutable storage policy resolved before capture.
 
         ROCmTurboQuantRotations rotations_;
 
@@ -203,8 +232,10 @@ namespace llaminar2
         std::unique_ptr<ITensor> batched_k_view_;
         std::unique_ptr<ITensor> batched_v_view_;
 
-        // Per-layer FP16 scratch buffers (eliminates cross-layer invalidation)
+        // Per-layer wrappers over one graph-planned producer/consumer buffer.
         mutable std::vector<ScratchBuffer> layer_scratch_;
+        DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound graph workspace, not owned.
+        size_t scratch_capacity_bytes_ = 0;           ///< Capacity of each K/V buffer.
 
         mutable hipStream_t cached_stream_; ///< Last explicit stream used by append/read operations.
 

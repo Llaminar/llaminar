@@ -489,7 +489,7 @@ namespace llaminar2
          * When rope->rope_theta > 0, RoPE is fused into K dequantization.
          *
          * Supports all cache precisions: FP32 (passthrough), FP16, BF16, Q8_1,
-         * Q16_1, TQ4, TQ8, and split TQ (TQ8 K + TQ4 V).
+         * Q16_1, split TQ8-K/TQ4-V, and symmetric TQ8-K/TQ8-V.
          */
         bool get_kv_converted(int layer, int seq_idx,
                               ActivationPrecision target,
@@ -657,8 +657,8 @@ namespace llaminar2
     using CPURingKVCacheFP16 = CPURingKVCache<ActivationPrecision::FP16>;   ///< Float16 KV cache.
     using CPURingKVCacheQ8_1 = CPURingKVCache<ActivationPrecision::Q8_1>;   ///< 8-bit quantized KV cache.
     using CPURingKVCacheQ16_1 = CPURingKVCache<ActivationPrecision::Q16_1>; ///< 16-bit quantized KV cache.
-    using CPURingKVCacheTQ4 = CPURingKVCache<ActivationPrecision::TQ4>;     ///< TurboQuant 4-bit KV cache.
-    using CPURingKVCacheTQ8 = CPURingKVCache<ActivationPrecision::TQ8>;     ///< TurboQuant 8-bit KV cache.
+    using CPURingKVCacheTQ4 = CPURingKVCache<ActivationPrecision::TQ4>;     ///< Legacy symmetric TQ4 test type.
+    using CPURingKVCacheTQ8 = CPURingKVCache<ActivationPrecision::TQ8>;     ///< Symmetric TQ8-K/TQ8-V cache.
     /// Asymmetric TQ: TQ8 for K (high-fidelity scores), TQ4 for V (graceful degradation).
     using CPURingKVCacheTQ = CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4>;
 

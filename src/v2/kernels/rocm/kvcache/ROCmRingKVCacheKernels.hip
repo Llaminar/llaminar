@@ -792,10 +792,39 @@ namespace llaminar2
         dst[idx] = __float2half(to_float_device(src[idx]));
     }
 
-    template <typename SrcT>
-    __global__ void ring_append_convert_to_fp16_kernel(
-        _Float16 *__restrict__ d_K_cache,
-        _Float16 *__restrict__ d_V_cache,
+    /**
+     * @brief Convert a producer value to the cache's native floating format.
+     *
+     * Format conversion belongs to the ring owner because the same launch also
+     * consumes its device-resident head/count state. This keeps captured
+     * publication free of host temporaries and intermediate device buffers.
+     */
+    template <typename DstT>
+    __device__ __forceinline__ DstT kv_cache_from_float(float value);
+
+    template <>
+    __device__ __forceinline__ float kv_cache_from_float<float>(float value)
+    {
+        return value;
+    }
+
+    template <>
+    __device__ __forceinline__ _Float16 kv_cache_from_float<_Float16>(float value)
+    {
+        return static_cast<_Float16>(value);
+    }
+
+    template <>
+    __device__ __forceinline__ hip_bfloat16 kv_cache_from_float<hip_bfloat16>(
+        float value)
+    {
+        return hip_bfloat16(value);
+    }
+
+    template <typename DstT, typename SrcT>
+    __global__ void ring_append_convert_kernel(
+        DstT *__restrict__ d_K_cache,
+        DstT *__restrict__ d_V_cache,
         const SrcT *__restrict__ d_K_new,
         const SrcT *__restrict__ d_V_new,
         const int *__restrict__ d_head,
@@ -818,13 +847,16 @@ namespace llaminar2
         const int dst_offset = dst_pos * kv_dim + elem_idx;
         const int src_offset = token_idx * kv_dim + elem_idx;
 
-        d_K_cache[dst_offset] = static_cast<_Float16>(to_float_device(d_K_new[src_offset]));
-        d_V_cache[dst_offset] = static_cast<_Float16>(to_float_device(d_V_new[src_offset]));
+        d_K_cache[dst_offset] =
+            kv_cache_from_float<DstT>(to_float_device(d_K_new[src_offset]));
+        d_V_cache[dst_offset] =
+            kv_cache_from_float<DstT>(to_float_device(d_V_new[src_offset]));
     }
 
-    __global__ void ring_append_q8_1_to_fp16_kernel(
-        _Float16 *__restrict__ d_K_cache,
-        _Float16 *__restrict__ d_V_cache,
+    template <typename DstT>
+    __global__ void ring_append_q8_1_convert_kernel(
+        DstT *__restrict__ d_K_cache,
+        DstT *__restrict__ d_V_cache,
         const Q8_1Block *__restrict__ d_K_new,
         const Q8_1Block *__restrict__ d_V_new,
         const int *__restrict__ d_head,
@@ -854,8 +886,10 @@ namespace llaminar2
         const Q8_1Block &v_block = d_V_new[src_offset];
         const float k_scale = __half2float(__ushort_as_half(k_block.d));
         const float v_scale = __half2float(__ushort_as_half(v_block.d));
-        d_K_cache[dst_offset] = static_cast<_Float16>(k_scale * static_cast<float>(k_block.qs[lane]));
-        d_V_cache[dst_offset] = static_cast<_Float16>(v_scale * static_cast<float>(v_block.qs[lane]));
+        d_K_cache[dst_offset] = kv_cache_from_float<DstT>(
+            k_scale * static_cast<float>(k_block.qs[lane]));
+        d_V_cache[dst_offset] = kv_cache_from_float<DstT>(
+            v_scale * static_cast<float>(v_block.qs[lane]));
     }
 
     // =========================================================================
@@ -1138,8 +1172,9 @@ namespace llaminar2
         return hipGetLastError() == hipSuccess;
     }
 
-    extern "C" bool hip_ring_append_converted_fp16(
-        _Float16 *d_K_cache, _Float16 *d_V_cache,
+    template <typename DstT>
+    bool launch_ring_append_converted(
+        DstT *d_K_cache, DstT *d_V_cache,
         const void *d_K_new, const void *d_V_new,
         TensorType src_type,
         const int *d_head,
@@ -1160,7 +1195,8 @@ namespace llaminar2
         switch (src_type)
         {
         case TensorType::FP32:
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(ring_append_convert_to_fp16_kernel<float>),
+            hipLaunchKernelGGL(
+                               HIP_KERNEL_NAME(ring_append_convert_kernel<DstT, float>),
                                grid, block, 0, stream,
                                d_K_cache, d_V_cache,
                                static_cast<const float *>(d_K_new),
@@ -1168,7 +1204,8 @@ namespace llaminar2
                                d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
             break;
         case TensorType::FP16:
-            hipLaunchKernelGGL(ring_append_kernel_dynamic<_Float16>,
+            hipLaunchKernelGGL(
+                               HIP_KERNEL_NAME(ring_append_convert_kernel<DstT, _Float16>),
                                grid, block, 0, stream,
                                d_K_cache, d_V_cache,
                                static_cast<const _Float16 *>(d_K_new),
@@ -1176,7 +1213,8 @@ namespace llaminar2
                                d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
             break;
         case TensorType::BF16:
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(ring_append_convert_to_fp16_kernel<hip_bfloat16>),
+            hipLaunchKernelGGL(
+                               HIP_KERNEL_NAME(ring_append_convert_kernel<DstT, hip_bfloat16>),
                                grid, block, 0, stream,
                                d_K_cache, d_V_cache,
                                static_cast<const hip_bfloat16 *>(d_K_new),
@@ -1186,7 +1224,8 @@ namespace llaminar2
         case TensorType::Q8_1:
         {
             const int blocks_per_row = (kv_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-            hipLaunchKernelGGL(ring_append_q8_1_to_fp16_kernel,
+            hipLaunchKernelGGL(
+                               HIP_KERNEL_NAME(ring_append_q8_1_convert_kernel<DstT>),
                                grid, block, 0, stream,
                                d_K_cache, d_V_cache,
                                static_cast<const Q8_1Block *>(d_K_new),
@@ -1199,6 +1238,54 @@ namespace llaminar2
         }
 
         return hipGetLastError() == hipSuccess;
+    }
+
+    extern "C" bool hip_ring_append_converted_fp32(
+        float *d_K_cache, float *d_V_cache,
+        const void *d_K_new, const void *d_V_new,
+        TensorType src_type,
+        const int *d_head,
+        const int *d_append_count,
+        int max_seq_len,
+        int kv_dim,
+        int num_tokens,
+        hipStream_t stream)
+    {
+        return launch_ring_append_converted(
+            d_K_cache, d_V_cache, d_K_new, d_V_new, src_type,
+            d_head, d_append_count, max_seq_len, kv_dim, num_tokens, stream);
+    }
+
+    extern "C" bool hip_ring_append_converted_fp16(
+        _Float16 *d_K_cache, _Float16 *d_V_cache,
+        const void *d_K_new, const void *d_V_new,
+        TensorType src_type,
+        const int *d_head,
+        const int *d_append_count,
+        int max_seq_len,
+        int kv_dim,
+        int num_tokens,
+        hipStream_t stream)
+    {
+        return launch_ring_append_converted(
+            d_K_cache, d_V_cache, d_K_new, d_V_new, src_type,
+            d_head, d_append_count, max_seq_len, kv_dim, num_tokens, stream);
+    }
+
+    extern "C" bool hip_ring_append_converted_bf16(
+        hip_bfloat16 *d_K_cache, hip_bfloat16 *d_V_cache,
+        const void *d_K_new, const void *d_V_new,
+        TensorType src_type,
+        const int *d_head,
+        const int *d_append_count,
+        int max_seq_len,
+        int kv_dim,
+        int num_tokens,
+        hipStream_t stream)
+    {
+        return launch_ring_append_converted(
+            d_K_cache, d_V_cache, d_K_new, d_V_new, src_type,
+            d_head, d_append_count, max_seq_len, kv_dim, num_tokens, stream);
     }
 
     // =========================================================================

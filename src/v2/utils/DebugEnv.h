@@ -2640,7 +2640,6 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_TRACE_COHERENCE=1` - Enable detailed coherence timing logs
      * - `LLAMINAR_ROCM_TRACE_KERNELS=1` - Enable per-kernel timing breakdown
      * - `LLAMINAR_ROCM_SYNC_AFTER_KERNEL=1` - Force hipDeviceSynchronize after each kernel
-     * - `LLAMINAR_ROCM_FA_DECODE_AUTOTUNE=1` - Enable ROCm flash-decode online launch-policy trial rotation for profiling only
      * - `LLAMINAR_ROCM_GEMV_LAYOUT=vnni` - Use VNNI-packed weights for GEMV when available
      * - `LLAMINAR_ROCM_PACK_VNNI_ONLY=1` - Prefer VNNI-only host packed buffers (drop row-major host copy when safe)
      * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR=1` - Enable INT8 prefill grid-kpar split-K variant
@@ -2698,7 +2697,6 @@ namespace llaminar2
         bool trace_coherence = false;              ///< Log detailed coherence timings (LLAMINAR_ROCM_TRACE_COHERENCE)
         bool trace_kernels = false;                ///< Log per-kernel timing breakdown (LLAMINAR_ROCM_TRACE_KERNELS)
         bool sync_after_kernel = false;            ///< Force sync after each kernel (LLAMINAR_ROCM_SYNC_AFTER_KERNEL)
-        bool fa_decode_autotune = false;           ///< Enable ROCm flash-decode online trial rotation for explicit profiling only.
         bool fa_decode_num_splits_present = false; ///< True when LLAMINAR_ROCM_FA_DECODE_NUM_SPLITS is present, even if empty.
         std::optional<int> fa_decode_num_splits;   ///< Raw requested ROCm flash decode split count; dynamic call sites clamp it.
         std::optional<int> fa_decode_tpb;          ///< Raw requested ROCm flash decode TPB; dynamic call sites clamp it to 64..256.
@@ -2785,7 +2783,6 @@ namespace llaminar2
             trace_coherence = false;
             trace_kernels = false;
             sync_after_kernel = false;
-            fa_decode_autotune = false;
             fa_decode_num_splits_present = false;
             fa_decode_num_splits.reset();
             fa_decode_tpb.reset();
@@ -2877,9 +2874,6 @@ namespace llaminar2
             {
                 sync_after_kernel = (std::atoi(sync_env) != 0);
             }
-
-            const char *fa_decode_autotune_env = std::getenv("LLAMINAR_ROCM_FA_DECODE_AUTOTUNE");
-            fa_decode_autotune = fa_decode_autotune_env && std::atoi(fa_decode_autotune_env) != 0;
 
             const char *fa_decode_splits_env = std::getenv("LLAMINAR_ROCM_FA_DECODE_NUM_SPLITS");
             fa_decode_num_splits_present = fa_decode_splits_env != nullptr;

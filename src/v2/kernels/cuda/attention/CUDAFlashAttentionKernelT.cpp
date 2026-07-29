@@ -198,20 +198,30 @@ namespace llaminar2
         constexpr int MIN_KV_PER_SPLIT = 16;
 
         /**
-         * @brief Compute optimal num_splits for Flash Decoding based on GPU SM count.
+         * @brief Select the fixed split envelope for one captured decode graph.
          *
-         * The grid is (n_heads, num_splits, batch). With __launch_bounds__(256, 4) and
-         * 61 regs/thread, max concurrent blocks = num_sms × 4. We pick num_splits such
-         * that total grid fits within this capacity (avoiding an inefficient tail wave).
+         * The physical grid must not depend on the live KV length: doing so
+         * changes graph topology as decode advances and forces recapture.  The
+         * caller therefore supplies the stable cache capacity.  Device kernels
+         * derive the active split prefix from the live device-owned KV count.
+         *
+         * The grid is `(n_heads, split_envelope, batch)`. With
+         * `__launch_bounds__(256, 4)` and 61 registers per thread, the selected
+         * envelope fills the resident block capacity without an avoidable tail
+         * wave. The 32-split architectural bound matches the preallocated graph
+         * workspace.
          *
          * For Qwen2.5-7B (28 heads) on RTX 3090 (82 SMs): 328/28 = 11 splits = 308 blocks.
          */
-        static int computeNumSplitsForDevice(int kv_len, int n_heads, int device_idx)
+        static int computeDecodeSplitEnvelopeForDevice(
+            int kv_capacity,
+            int n_heads,
+            int device_idx)
         {
             if (debugEnv().gemm.deterministic)
                 return 1;
 
-            if (kv_len <= 1)
+            if (kv_capacity <= 1 || n_heads <= 0)
                 return 1;
 
             // Get SM count (cached per device via static array)
@@ -219,9 +229,20 @@ namespace llaminar2
             int num_sms = sm_count_cache[device_idx & 7];
             if (num_sms == 0)
             {
-                cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_idx);
-                if (num_sms <= 0)
-                    num_sms = 82; // Conservative fallback
+                const cudaError_t status = cudaDeviceGetAttribute(
+                    &num_sms,
+                    cudaDevAttrMultiProcessorCount,
+                    device_idx);
+                if (status != cudaSuccess || num_sms <= 0)
+                {
+                    throw std::runtime_error(
+                        "[CUDAFlashAttentionKernelT] Cannot construct a stable "
+                        "decode launch envelope because CUDA did not publish a "
+                        "positive SM count for device " +
+                        std::to_string(device_idx) +
+                        " (status=" +
+                        std::to_string(static_cast<int>(status)) + ")");
+                }
                 sm_count_cache[device_idx & 7] = num_sms;
             }
 
@@ -233,7 +254,7 @@ namespace llaminar2
             int desired_splits = max_concurrent / n_heads;
 
             // Clamp: each split needs enough work (MIN_KV_PER_SPLIT positions)
-            int max_splits_by_kv = kv_len / MIN_KV_PER_SPLIT;
+            int max_splits_by_kv = kv_capacity / MIN_KV_PER_SPLIT;
             if (max_splits_by_kv < 1)
                 max_splits_by_kv = 1;
 
@@ -557,7 +578,12 @@ namespace llaminar2
             if (seq_len == 1)
             {
                 // Flash Decoding for single-token decode
-                int num_splits = computeNumSplitsForDevice(kv_len, n_heads, device_idx);
+                const int launch_kv_capacity =
+                    dynamic_attn_kv_stride_ > 0 ? dynamic_attn_kv_stride_ : kv_len;
+                const int num_splits = computeDecodeSplitEnvelopeForDevice(
+                    launch_kv_capacity,
+                    n_heads,
+                    device_idx);
 
                 if (!allocateWorkspace(n_heads, head_dim, num_splits))
                 {
@@ -932,7 +958,12 @@ namespace llaminar2
                 if (seq_len == 1)
                 {
                     // DECODE: Flash Decoding with FP16 KV — no conversion needed
-                    int num_splits = computeNumSplitsForDevice(kv_len, n_heads, dev);
+                    const int launch_kv_capacity =
+                        dynamic_attn_kv_stride_ > 0 ? dynamic_attn_kv_stride_ : kv_len;
+                    const int num_splits = computeDecodeSplitEnvelopeForDevice(
+                        launch_kv_capacity,
+                        n_heads,
+                        dev);
 
                     if (!allocateWorkspace(n_heads, head_dim, num_splits))
                     {
@@ -1000,8 +1031,13 @@ namespace llaminar2
                      * policy used by serial decode, so block partitioning and
                      * FP32 merge order remain byte-identical to M=1.
                      */
+                    const int launch_kv_capacity =
+                        dynamic_attn_kv_stride_ > 0 ? dynamic_attn_kv_stride_ : kv_len;
                     const int max_num_splits =
-                        computeNumSplitsForDevice(kv_len, n_heads, dev);
+                        computeDecodeSplitEnvelopeForDevice(
+                            launch_kv_capacity,
+                            n_heads,
+                            dev);
                     int result;
                     {
                         CUDA_KERNEL_PROFILE_SCOPE_STREAM(
@@ -1078,7 +1114,12 @@ namespace llaminar2
                 }
 
                 // seq_len == 1 is guaranteed by the flag setup above
-                int num_splits = computeNumSplitsForDevice(kv_len, n_heads, dev);
+                const int launch_kv_capacity =
+                    dynamic_attn_kv_stride_ > 0 ? dynamic_attn_kv_stride_ : kv_len;
+                const int num_splits = computeDecodeSplitEnvelopeForDevice(
+                    launch_kv_capacity,
+                    n_heads,
+                    dev);
 
                 if (!allocateWorkspace(n_heads, head_dim, num_splits))
                 {
@@ -1315,7 +1356,7 @@ namespace llaminar2
             }
 
             const int max_num_splits =
-                computeNumSplitsForDevice(max_kv_len, n_heads, dev);
+                computeDecodeSplitEnvelopeForDevice(max_kv_len, n_heads, dev);
             if (!allocateWorkspace(n_heads, head_dim, max_num_splits))
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Workspace binding failed");
@@ -1583,11 +1624,23 @@ namespace llaminar2
         {
             const int sanitized_query_rows = sanitizeSmallDecodeQueryRows(query_rows);
             const int param_rows = sanitized_query_rows;
+            /*
+             * A live-length update must never narrow the immutable cache
+             * capacity that selected the captured launch envelope.  The
+             * capacity is reset only at the explicit kernel/request lifecycle
+             * boundary.  Preserving it here also keeps uncaptured diagnostics
+             * byte-comparable with graph replay.
+             */
+            const int resolved_kv_stride = std::max(
+                kv_len,
+                dynamic_attn_kv_stride_ > 0
+                    ? dynamic_attn_kv_stride_
+                    : kv_len);
             const bool same_params =
                 !dynamic_attn_device_derived_ &&
                 dynamic_attn_device_valid_ &&
                 dynamic_attn_kv_len_ == kv_len &&
-                dynamic_attn_kv_stride_ == kv_len &&
+                dynamic_attn_kv_stride_ == resolved_kv_stride &&
                 dynamic_attn_position_offset_ == position_offset &&
                 dynamic_attn_query_rows_ == sanitized_query_rows &&
                 dynamic_attn_param_rows_ == param_rows;
@@ -1596,7 +1649,7 @@ namespace llaminar2
                 return;
 
             dynamic_attn_kv_len_ = kv_len;
-            dynamic_attn_kv_stride_ = kv_len;
+            dynamic_attn_kv_stride_ = resolved_kv_stride;
             dynamic_attn_position_offset_ = position_offset;
             dynamic_attn_query_rows_ = sanitized_query_rows;
             dynamic_attn_param_rows_ = param_rows;
@@ -1607,7 +1660,11 @@ namespace llaminar2
                 return;
 
             (void)writeDynamicAttnParams(
-                kv_len, kv_len, position_offset, sanitized_query_rows, stream_);
+                kv_len,
+                resolved_kv_stride,
+                position_offset,
+                sanitized_query_rows,
+                stream_);
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::prepareDynamicAttnParams(
@@ -1686,12 +1743,10 @@ namespace llaminar2
             int kv_stride)
         {
             const int sanitized_query_rows = sanitizeSmallDecodeQueryRows(query_rows);
-            const int resolved_kv_stride =
-                kv_stride > 0 ? kv_stride : seq_len;
             if (!post_append_cached_tokens_device || seq_len <= 0 ||
-                resolved_kv_stride <= 0 || !stream)
+                kv_stride <= 0 || !stream)
             {
-                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Device-derived attention params require count pointer, positive seq_len, and explicit stream");
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Device-derived attention params require count pointer, positive seq_len/cache capacity, and explicit stream");
                 dynamic_attn_device_valid_ = false;
                 dynamic_attn_device_derived_ = false;
                 return false;
@@ -1721,7 +1776,7 @@ namespace llaminar2
                 post_append_cached_tokens_device,
                 seq_len,
                 sanitized_query_rows,
-                resolved_kv_stride,
+                kv_stride,
                 stream);
             if (rc != 0)
             {
@@ -1732,7 +1787,7 @@ namespace llaminar2
             }
 
             dynamic_attn_kv_len_ = 0;
-            dynamic_attn_kv_stride_ = resolved_kv_stride;
+            dynamic_attn_kv_stride_ = kv_stride;
             dynamic_attn_position_offset_ = 0;
             dynamic_attn_query_rows_ = sanitized_query_rows;
             dynamic_attn_param_rows_ = sanitized_query_rows;
@@ -1764,9 +1819,11 @@ namespace llaminar2
             int head_start,
             int gqa_n_rep)
         {
-            const int num_splits = debugEnv().gemm.deterministic
-                                       ? 1
-                                       : std::max(1, std::min(kv_count / 64, 32));
+            const int num_splits =
+                computeDecodeSplitEnvelopeForDevice(
+                    max_seq_len,
+                    n_heads,
+                    device_idx_);
 
             // Ensure workspace is allocated
             if (workspace_)

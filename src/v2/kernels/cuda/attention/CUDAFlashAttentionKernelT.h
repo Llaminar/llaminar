@@ -296,7 +296,7 @@ namespace llaminar2
                 int seq_len,
                 int query_rows,
                 void *stream,
-                int kv_stride = -1) override;
+                int kv_stride) override;
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,

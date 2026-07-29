@@ -132,7 +132,6 @@ namespace llaminar2
             }
             return true; // Device-side params buffer handles dynamic kv_len/position
         }
-        uint64_t graphCaptureVariantSignature() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;

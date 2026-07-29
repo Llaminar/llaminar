@@ -6,8 +6,10 @@ flags for custom configurations, so a configuration that defines only C/C++
 flags silently compiles device kernels with the accelerator compiler's
 unoptimized defaults. Accelerator translation units are also expensive enough
 that continuously evicting or bypassing ccache makes ordinary iteration
-needlessly slow. This test checks both declarative contracts and, when supplied,
-the generated compile database used by the current test binary.
+needlessly slow. CUDA and HIP must also share the project's modern device
+dialect instead of relying on compiler defaults. This test checks all three
+declarative contracts and, when supplied, the generated compile database used
+by the current test binary.
 """
 
 from __future__ import annotations
@@ -35,6 +37,21 @@ REQUIRED_CONFIGURATION_FLAGS = {
     ),
 }
 
+REQUIRED_DEVICE_STANDARDS = {
+    "CUDA": (
+        "set(CMAKE_CUDA_STANDARD 20)",
+        "set(CMAKE_CUDA_STANDARD_REQUIRED ON)",
+        "CUDA_STANDARD 20",
+        "CUDA_STANDARD_REQUIRED ON",
+    ),
+    "HIP": (
+        "set(CMAKE_HIP_STANDARD 20)",
+        "set(CMAKE_HIP_STANDARD_REQUIRED ON)",
+        "HIP_STANDARD 20",
+        "HIP_STANDARD_REQUIRED ON",
+    ),
+}
+
 
 def parse_args() -> argparse.Namespace:
     """Parse paths supplied by CTest or a developer's direct invocation."""
@@ -59,7 +76,7 @@ def declared_cache_value(cmake_text: str, variable: str) -> str:
 
 
 def verify_declarations(cmake_path: pathlib.Path) -> None:
-    """Require optimized CUDA/HIP definitions for every custom build type."""
+    """Require optimized modern CUDA/HIP definitions for every build type."""
 
     cmake_text = cmake_path.read_text(encoding="utf-8")
     for variable, required_flags in REQUIRED_CONFIGURATION_FLAGS.items():
@@ -69,6 +86,17 @@ def verify_declarations(cmake_path: pathlib.Path) -> None:
         if missing:
             raise AssertionError(
                 f"{variable} is missing required flags {missing}: {value!r}"
+            )
+    for backend, required_fragments in REQUIRED_DEVICE_STANDARDS.items():
+        missing = [
+            fragment
+            for fragment in required_fragments
+            if fragment not in cmake_text
+        ]
+        if missing:
+            raise AssertionError(
+                f"{backend} target is missing C++20 device-standard "
+                f"declarations {missing}"
             )
 
 
@@ -124,6 +152,16 @@ def command_text(entry: dict[str, object]) -> str:
     raise AssertionError(f"compile command has no command/arguments field: {entry}")
 
 
+def device_standard(tokens: set[str]) -> int | None:
+    """Return the numeric C++ dialect selected by one accelerator command."""
+
+    for token in tokens:
+        match = re.fullmatch(r"-std=(?:gnu\+\+|c\+\+)(\d+)", token)
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
 def verify_generated_commands(compile_commands_path: pathlib.Path) -> None:
     """Check accelerator optimization in commands emitted for this build tree."""
 
@@ -148,6 +186,12 @@ def verify_generated_commands(compile_commands_path: pathlib.Path) -> None:
             if "-O3" not in tokens:
                 raise AssertionError(
                     f"{backend} Integration kernel lacks -O3: {entry.get('file')}"
+                )
+            standard = device_standard(tokens)
+            if standard is None or standard < 20:
+                raise AssertionError(
+                    f"{backend} kernel requires C++20 or newer, got "
+                    f"{standard}: {entry.get('file')}"
                 )
 
 

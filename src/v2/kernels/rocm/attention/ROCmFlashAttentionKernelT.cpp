@@ -21,6 +21,8 @@
 #include "../../attention/AttentionDeviceParams.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstring>
 #include <stdexcept>
 
@@ -239,8 +241,9 @@ namespace llaminar2
 {
     namespace rocm
     {
-        // Default number of splits for Flash Decoding
-        constexpr int DEFAULT_NUM_SPLITS = 8;
+        constexpr int MAX_FLASH_DECODE_SPLITS = 32;
+        constexpr int MIN_KV_ROWS_PER_SPLIT = 16;
+        constexpr int TARGET_RESIDENT_BLOCKS_PER_CU = 7;
         /*
          * MTP target verification runs `draft_count + 1` continuation rows.
          * Draft depths through fifteen therefore require M=2..16 to remain on
@@ -251,18 +254,91 @@ namespace llaminar2
         constexpr int MAX_SMALL_DECODE_ROWS =
             attention::kMaxGroupedVerifierAttentionRows;
 
-        static int selectFlashDecodeNumSplits(int kv_len)
+        /**
+         * @brief Select a graph-stable physical split envelope.
+         *
+         * Production callers pass the KV cache capacity, query-head count, and
+         * device ordinal. The captured grid therefore remains invariant while
+         * the HIP kernel activates the appropriate split and wavefront prefix
+         * from device-resident sequence metadata.
+         *
+         * gfx906 can retain seven 36-VGPR wavefronts per SIMD for the native
+         * FP16 decode kernel. One 256-thread workgroup contributes one
+         * wavefront to each of the CU's four SIMDs, so seven resident
+         * workgroups per CU are available before VGPR pressure becomes the
+         * limiter. The physical envelope is rounded upward to a power of two
+         * so the device policy can select 1/2/4/8/16/32 active split planes
+         * without recapturing the graph.
+         */
+        static int selectFlashDecodeSplitEnvelope(
+            int kv_capacity,
+            int n_heads,
+            int device_idx)
         {
             if (debugEnv().gemm.deterministic)
                 return 1;
 
-            if (kv_len <= 64)
+            if (kv_capacity <= 0 || n_heads <= 0 || device_idx < 0)
+            {
+                throw std::invalid_argument(
+                    "[ROCmFlashAttentionKernelT] Stable decode envelope "
+                    "requires positive KV capacity/query-head count and an "
+                    "explicit device ordinal");
+            }
+
+            if (kv_capacity <= 64)
                 return 1;
-            if (kv_len < 128)
-                return 2;
-            if (kv_len < 256)
-                return 4;
-            return DEFAULT_NUM_SPLITS;
+
+            constexpr size_t kMaxCachedDevices = 64;
+            if (static_cast<size_t>(device_idx) >= kMaxCachedDevices)
+            {
+                throw std::out_of_range(
+                    "[ROCmFlashAttentionKernelT] Device ordinal exceeds the "
+                    "fixed launch-property cache");
+            }
+
+            static std::array<std::atomic<int>, kMaxCachedDevices> cu_cache{};
+            int num_cus =
+                cu_cache[static_cast<size_t>(device_idx)].load(
+                    std::memory_order_relaxed);
+            if (num_cus == 0)
+            {
+                const hipError_t status = hipDeviceGetAttribute(
+                    &num_cus,
+                    hipDeviceAttributeMultiprocessorCount,
+                    device_idx);
+                if (status != hipSuccess || num_cus <= 0)
+                {
+                    throw std::runtime_error(
+                        "[ROCmFlashAttentionKernelT] Cannot construct a stable "
+                        "decode launch envelope because HIP did not publish a "
+                        "positive CU count for device " +
+                        std::to_string(device_idx) +
+                        " (status=" +
+                        std::to_string(static_cast<int>(status)) + ")");
+                }
+                cu_cache[static_cast<size_t>(device_idx)].store(
+                    num_cus,
+                    std::memory_order_relaxed);
+            }
+
+            const int occupancy_splits =
+                (TARGET_RESIDENT_BLOCKS_PER_CU * num_cus + n_heads - 1) /
+                n_heads;
+            const int capacity_splits =
+                std::max(1, kv_capacity / MIN_KV_ROWS_PER_SPLIT);
+            const int desired_splits = std::clamp(
+                std::min(occupancy_splits, capacity_splits),
+                1,
+                MAX_FLASH_DECODE_SPLITS);
+
+            int envelope = 1;
+            while (envelope < desired_splits &&
+                   envelope < MAX_FLASH_DECODE_SPLITS)
+            {
+                envelope <<= 1;
+            }
+            return std::clamp(envelope, 1, MAX_FLASH_DECODE_SPLITS);
         }
 
         // =====================================================================
@@ -657,7 +733,13 @@ namespace llaminar2
             if (seq_len == 1 && !decode_via_prefill)
             {
                 // Flash Decoding for single-token decode
-                const int num_splits = selectFlashDecodeNumSplits(kv_len);
+                const int launch_kv_capacity =
+                    dynamic_attn_kv_stride_ > 0 ? dynamic_attn_kv_stride_ : kv_len;
+                const int num_splits =
+                    selectFlashDecodeSplitEnvelope(
+                        launch_kv_capacity,
+                        n_heads,
+                        device_idx);
 
                 allocateWorkspace(n_heads, head_dim, num_splits);
 
@@ -727,11 +809,21 @@ namespace llaminar2
                 (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
             small_decode_rows_ = (sanitized_query_rows > 1) ? sanitized_query_rows : 0;
             const int param_rows = std::max(1, sanitized_query_rows);
+            /*
+             * Live sequence state may select a smaller active prefix, but it
+             * must not shrink the cache-capacity envelope already bound to a
+             * graph.  Only resetDynamicState() starts a new capacity lifetime.
+             */
+            const int resolved_kv_stride = std::max(
+                kv_len,
+                dynamic_attn_kv_stride_ > 0
+                    ? dynamic_attn_kv_stride_
+                    : kv_len);
             const bool same_params =
                 !dynamic_attn_device_derived_ &&
                 dynamic_attn_device_valid_ &&
                 dynamic_attn_kv_len_ == kv_len &&
-                dynamic_attn_kv_stride_ == kv_len &&
+                dynamic_attn_kv_stride_ == resolved_kv_stride &&
                 dynamic_attn_position_offset_ == position_offset &&
                 dynamic_attn_query_rows_ == sanitized_query_rows &&
                 dynamic_attn_param_rows_ == param_rows;
@@ -740,7 +832,7 @@ namespace llaminar2
                 return;
 
             dynamic_attn_kv_len_ = kv_len;
-            dynamic_attn_kv_stride_ = kv_len;
+            dynamic_attn_kv_stride_ = resolved_kv_stride;
             dynamic_attn_position_offset_ = position_offset;
             dynamic_attn_query_rows_ = sanitized_query_rows;
             dynamic_attn_param_rows_ = param_rows;
@@ -751,7 +843,11 @@ namespace llaminar2
                 return;
 
             (void)writeDynamicAttnParams(
-                kv_len, kv_len, position_offset, sanitized_query_rows, stream_);
+                kv_len,
+                resolved_kv_stride,
+                position_offset,
+                sanitized_query_rows,
+                stream_);
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::prepareDynamicAttnParams(
@@ -835,12 +931,10 @@ namespace llaminar2
         {
             const int sanitized_query_rows =
                 (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
-            const int resolved_kv_stride =
-                kv_stride > 0 ? kv_stride : seq_len;
             if (!post_append_cached_tokens_device || seq_len <= 0 ||
-                resolved_kv_stride <= 0 || !stream)
+                kv_stride <= 0 || !stream)
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Device-derived attention params require count pointer, positive seq_len, and explicit stream");
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Device-derived attention params require count pointer, positive seq_len/cache capacity, and explicit stream");
                 dynamic_attn_device_valid_ = false;
                 dynamic_attn_device_derived_ = false;
                 return false;
@@ -870,7 +964,7 @@ namespace llaminar2
                 post_append_cached_tokens_device,
                 seq_len,
                 sanitized_query_rows,
-                resolved_kv_stride,
+                kv_stride,
                 stream);
             if (rc != 0)
             {
@@ -882,7 +976,7 @@ namespace llaminar2
 
             small_decode_rows_ = (sanitized_query_rows > 1) ? sanitized_query_rows : 0;
             dynamic_attn_kv_len_ = 0;
-            dynamic_attn_kv_stride_ = resolved_kv_stride;
+            dynamic_attn_kv_stride_ = kv_stride;
             dynamic_attn_position_offset_ = 0;
             dynamic_attn_query_rows_ = sanitized_query_rows;
             dynamic_attn_param_rows_ = sanitized_query_rows;
@@ -1184,7 +1278,13 @@ namespace llaminar2
                 else if (seq_len == 1 && !decode_via_prefill)
                 {
                     // Flash Decoding with native KV cache
-                    const int num_splits = selectFlashDecodeNumSplits(kv_len);
+                    const int launch_kv_capacity =
+                        dynamic_attn_kv_stride_ > 0 ? dynamic_attn_kv_stride_ : kv_len;
+                    const int num_splits =
+                        selectFlashDecodeSplitEnvelope(
+                            launch_kv_capacity,
+                            n_heads,
+                            dev);
 
                     allocateWorkspace(n_heads, head_dim, num_splits);
 
@@ -1402,7 +1502,13 @@ namespace llaminar2
                 return false;
             }
 
-            const int max_num_splits = selectFlashDecodeNumSplits(kv_len);
+            const int launch_kv_capacity =
+                dynamic_attn_kv_stride_ > 0 ? dynamic_attn_kv_stride_ : kv_len;
+            const int max_num_splits =
+                selectFlashDecodeSplitEnvelope(
+                    launch_kv_capacity,
+                    n_heads,
+                    dev);
             allocateWorkspace(n_heads, head_dim, max_num_splits);
             if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
             {
@@ -1661,7 +1767,10 @@ namespace llaminar2
             }
 
             const int max_num_splits =
-                selectFlashDecodeNumSplits(max_kv_len);
+                selectFlashDecodeSplitEnvelope(
+                    max_kv_len,
+                    n_heads,
+                    dev);
             allocateWorkspace(n_heads, head_dim, max_num_splits);
             if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
             {
@@ -1845,7 +1954,7 @@ namespace llaminar2
             const int batch_size = (m > 0) ? m : 1;
             const int n_heads = (n > 0) ? n : 128;     // Max expected heads
             const int head_dim = (k > 0) ? k : 128;    // Max expected head dim
-            const int num_splits = DEFAULT_NUM_SPLITS; // 8 splits
+            const int num_splits = MAX_FLASH_DECODE_SPLITS;
             const int max_kv_len = 4096;               // decode workspace bound
 
             // Conservative conversion buffer sizing for mixed-precision KV
@@ -2131,7 +2240,8 @@ namespace llaminar2
                 return false;
             }
 
-            const int num_splits = selectFlashDecodeNumSplits(kv_len);
+            const int num_splits =
+                selectFlashDecodeSplitEnvelope(kv_len, n_heads, dev);
 
             allocateWorkspace(n_heads, head_dim, num_splits);
 
@@ -2234,7 +2344,7 @@ namespace llaminar2
             const int batch_size = (m > 0) ? m : 1;
             const int n_heads = (n > 0) ? n : 128;
             const int head_dim = (k > 0) ? k : 128;
-            const int num_splits = DEFAULT_NUM_SPLITS;
+            const int num_splits = MAX_FLASH_DECODE_SPLITS;
 
             // FP16 uses FP32 workspace for numerical stability
             size_t partial_output_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
@@ -2485,7 +2595,8 @@ namespace llaminar2
                 return false;
             }
 
-            const int num_splits = selectFlashDecodeNumSplits(kv_len);
+            const int num_splits =
+                selectFlashDecodeSplitEnvelope(kv_len, n_heads, dev);
 
             allocateWorkspace(n_heads, head_dim, num_splits);
 
@@ -2586,7 +2697,7 @@ namespace llaminar2
             const int batch_size = (m > 0) ? m : 1;
             const int n_heads = (n > 0) ? n : 128;
             const int head_dim = (k > 0) ? k : 128;
-            const int num_splits = DEFAULT_NUM_SPLITS;
+            const int num_splits = MAX_FLASH_DECODE_SPLITS;
 
             // BF16 on MI50 falls back to FP32, so workspace is FP32
             size_t partial_output_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);

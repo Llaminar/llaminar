@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -21,6 +22,7 @@
 #include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
+#include "kernels/attention/AttentionDeviceParams.h"
 #include "tensors/Tensors.h"
 #include "kernels/cpu/CPUKVCache.h"
 #include "backends/DeviceId.h"
@@ -394,7 +396,7 @@ namespace llaminar2
             EXPECT_FALSE(stage.requiresGraphCaptureSegmentBoundaryAfter());
         }
 
-        TEST_F(Test__AttentionComputeStage_DynamicKVLen, ROCmDynamicDecodeAttentionVariantChangesAtSplitBucket)
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, GPUDecodeAttentionLaunchSignatureIsStableAcrossSequenceParallelRegimes)
         {
             AttentionComputeStage::Params params;
             params.Q = Q_.get();
@@ -403,30 +405,53 @@ namespace llaminar2
             params.output = output_.get();
             params.batch_size = 1;
             params.seq_len = 1;
-            params.kv_len = 64;
+            params.kv_len = 32;
             params.n_heads = kNumHeads;
             params.n_kv_heads = kNumKVHeads;
             params.head_dim = kHeadDim;
             params.auto_detect_mode = true;
             params.kv_cache = kv_cache_.get();
             params.layer_idx = 0;
-            params.device_id = DeviceId::rocm(0);
 
-            AttentionComputeStage stage(params);
+            constexpr std::array<int, 13> kPositions{
+                30, 31, 32,
+                62, 63, 64,
+                126, 127, 128,
+                254, 255, 256,
+                512};
+            for (const DeviceId device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+            {
+                params.device_id = device;
+                AttentionComputeStage stage(params);
+                const uint64_t stable_signature =
+                    stage.graphCaptureVariantSignature();
+                EXPECT_EQ(stable_signature, 0u)
+                    << "GPU attention must not request host-selected recapture "
+                       "variants; physical launch geometry is immutable and "
+                       "device parameters select all logical work regimes"
+                    << " device=" << device.toString();
 
-            stage.updateDynamicParams(/*pos_offset=*/62, /*seq_len=*/1);
-            const uint64_t bucket_a = stage.graphCaptureVariantSignature();
-            ASSERT_NE(bucket_a, 0u);
-
-            stage.updateDynamicParams(/*pos_offset=*/63, /*seq_len=*/1);
-            const uint64_t bucket_a_edge = stage.graphCaptureVariantSignature();
-            EXPECT_EQ(bucket_a_edge, bucket_a);
-
-            stage.updateDynamicParams(/*pos_offset=*/64, /*seq_len=*/1);
-            const uint64_t bucket_b = stage.graphCaptureVariantSignature();
-            EXPECT_NE(bucket_b, 0u);
-            EXPECT_NE(bucket_b, bucket_a)
-                << "ROCm split-K decode must recapture when crossing the 64-token launch bucket";
+                for (int query_rows = 1;
+                     query_rows <= attention::kMaxGroupedVerifierAttentionRows;
+                     ++query_rows)
+                {
+                    for (const int position : kPositions)
+                    {
+                        stage.updateDynamicParams(
+                            /*pos_offset=*/position,
+                            /*seq_len=*/query_rows);
+                        EXPECT_EQ(
+                            stage.graphCaptureVariantSignature(),
+                            stable_signature)
+                            << "GPU attention must select grouped/serial and "
+                               "short/long sequence-parallel work inside one "
+                               "captured launch envelope"
+                            << " device=" << device.toString()
+                            << " query_rows=" << query_rows
+                            << " position=" << position;
+                    }
+                }
+            }
         }
 
         TEST_F(Test__AttentionComputeStage_DynamicKVLen, CPUAndROCmPrefillGraphCaptureContractsRemainUnchanged)
@@ -1139,12 +1164,11 @@ namespace llaminar2
             EXPECT_NE(stage_source.find("logical_seq_len <= attention::kMaxGroupedVerifierAttentionRows"),
                       std::string::npos)
                 << "ROCm graph-capture preparation must materialize sixteen device-owned verifier parameter rows.";
-            EXPECT_NE(stage_source.find("native-KV M=2..16 verifier path"),
+            EXPECT_EQ(stage_source.find("AttentionComputeStage::graphCaptureVariantSignature"),
                       std::string::npos)
-                << "ROCm graph replay signatures must document and cover the sixteen-row verifier path.";
-            EXPECT_NE(stage_source.find("params_.seq_len > attention::kMaxGroupedVerifierAttentionRows"),
-                      std::string::npos)
-                << "ROCm graph replay signatures must be keyed for every MTP verifier row up to M=16.";
+                << "Attention must not key graph capture by verifier M or live "
+                   "KV length; the captured physical envelope owns every M=1..16 "
+                   "and short/long sequence-parallel regime.";
 
             const std::string rocm_body = sliceFunction(
                 rocm_kernels,

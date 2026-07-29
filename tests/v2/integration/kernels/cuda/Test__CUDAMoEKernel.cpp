@@ -30,6 +30,7 @@
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/VerifierRowTestInventory.h"
 #include "../moe/MoETransferStateMachineTestModel.h"
+#include "../moe/SmallFloatGroupingTestOracle.h"
 
 #include <algorithm>
 #include <array>
@@ -15722,6 +15723,169 @@ TEST_F(Test__CUDAMoEKernel, SmallFloatGroupingEmitsCompactActiveExperts)
     EXPECT_FALSE(cudaMoE_group_tokens_small_float(
         d_indices, d_weights, d_counts, d_offsets, d_grouped_tokens, d_original_to_grouped, d_original_expert_ids, d_grouped_weights,
         d_active, total_slots, num_experts, top_k, max_active_experts, 0, nullptr));
+
+    cudaFree(d_indices);
+    cudaFree(d_weights);
+    cudaFree(d_counts);
+    cudaFree(d_offsets);
+    cudaFree(d_grouped_tokens);
+    cudaFree(d_original_to_grouped);
+    cudaFree(d_original_expert_ids);
+    cudaFree(d_grouped_weights);
+    cudaFree(d_active);
+#endif
+}
+
+/**
+ * @brief Prove compact CUDA grouping is serial-equivalent and repeatable.
+ *
+ * This regression covers every compact verifier M, every supported top-k that
+ * fits the 64-route planner, and the full 256-expert metadata domain. Twenty
+ * launches per cell expose any scheduling-dependent write order.
+ */
+TEST_F(
+    Test__CUDAMoEKernel,
+    SmallFloatGroupingIsStableAcrossAllCompactVerifierRowsAndTopK)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int kMaxRouteSlots = 64;
+    constexpr int kNumExperts = 256;
+    constexpr int kRepeatCount = 20;
+
+    float *d_indices = nullptr;
+    float *d_weights = nullptr;
+    int *d_counts = nullptr;
+    int *d_offsets = nullptr;
+    int *d_grouped_tokens = nullptr;
+    int *d_original_to_grouped = nullptr;
+    int *d_original_expert_ids = nullptr;
+    float *d_grouped_weights = nullptr;
+    int *d_active = nullptr;
+    ASSERT_EQ(cudaMalloc(&d_indices, kMaxRouteSlots * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_weights, kMaxRouteSlots * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_counts, kNumExperts * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_offsets, kNumExperts * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_grouped_tokens, kMaxRouteSlots * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_original_to_grouped, kMaxRouteSlots * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_original_expert_ids, kMaxRouteSlots * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_grouped_weights, kMaxRouteSlots * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_active, kMaxRouteSlots * sizeof(int)), cudaSuccess);
+
+    for (const auto &test_case : llaminar2::test::smallFloatGroupingCases())
+    {
+        const int total_slots = test_case.verifier_rows * test_case.top_k;
+        SCOPED_TRACE(
+            "M=" + std::to_string(test_case.verifier_rows) +
+            " top_k=" + std::to_string(test_case.top_k));
+
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                d_indices,
+                test_case.routing_indices.data(),
+                static_cast<std::size_t>(total_slots) * sizeof(float),
+                cudaMemcpyHostToDevice,
+                stream_),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                d_weights,
+                test_case.routing_weights.data(),
+                static_cast<std::size_t>(total_slots) * sizeof(float),
+                cudaMemcpyHostToDevice,
+                stream_),
+            cudaSuccess);
+
+        for (int repeat = 0; repeat < kRepeatCount; ++repeat)
+        {
+            SCOPED_TRACE("repeat=" + std::to_string(repeat));
+            ASSERT_TRUE(cudaMoE_group_tokens_small_float(
+                d_indices,
+                d_weights,
+                d_counts,
+                d_offsets,
+                d_grouped_tokens,
+                d_original_to_grouped,
+                d_original_expert_ids,
+                d_grouped_weights,
+                d_active,
+                total_slots,
+                test_case.num_experts,
+                test_case.top_k,
+                test_case.max_active_experts,
+                0,
+                stream_));
+
+            std::vector<int> counts(static_cast<std::size_t>(test_case.num_experts));
+            std::vector<int> offsets(static_cast<std::size_t>(test_case.num_experts));
+            std::vector<int> grouped_tokens(static_cast<std::size_t>(total_slots));
+            std::vector<int> original_to_grouped(static_cast<std::size_t>(total_slots));
+            std::vector<int> original_expert_ids(static_cast<std::size_t>(total_slots));
+            std::vector<float> grouped_weights(static_cast<std::size_t>(total_slots));
+            std::vector<int> active(
+                static_cast<std::size_t>(test_case.max_active_experts));
+
+            ASSERT_EQ(cudaMemcpyAsync(
+                          counts.data(), d_counts,
+                          counts.size() * sizeof(int),
+                          cudaMemcpyDeviceToHost, stream_),
+                      cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(
+                          offsets.data(), d_offsets,
+                          offsets.size() * sizeof(int),
+                          cudaMemcpyDeviceToHost, stream_),
+                      cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(
+                          grouped_tokens.data(), d_grouped_tokens,
+                          grouped_tokens.size() * sizeof(int),
+                          cudaMemcpyDeviceToHost, stream_),
+                      cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(
+                          original_to_grouped.data(), d_original_to_grouped,
+                          original_to_grouped.size() * sizeof(int),
+                          cudaMemcpyDeviceToHost, stream_),
+                      cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(
+                          original_expert_ids.data(), d_original_expert_ids,
+                          original_expert_ids.size() * sizeof(int),
+                          cudaMemcpyDeviceToHost, stream_),
+                      cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(
+                          grouped_weights.data(), d_grouped_weights,
+                          grouped_weights.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost, stream_),
+                      cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(
+                          active.data(), d_active,
+                          active.size() * sizeof(int),
+                          cudaMemcpyDeviceToHost, stream_),
+                      cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+            EXPECT_EQ(counts, test_case.expert_counts);
+            EXPECT_EQ(offsets, test_case.expert_offsets);
+            EXPECT_EQ(grouped_tokens, test_case.grouped_token_indices);
+            EXPECT_EQ(original_to_grouped, test_case.original_to_grouped);
+            EXPECT_EQ(original_expert_ids, test_case.original_expert_ids);
+            EXPECT_EQ(grouped_weights, test_case.grouped_weights);
+            EXPECT_EQ(active, test_case.active_expert_ids);
+        }
+    }
+
+    EXPECT_FALSE(cudaMoE_group_tokens_small_float(
+        d_indices, d_weights, d_counts, d_offsets, d_grouped_tokens,
+        d_original_to_grouped, d_original_expert_ids, d_grouped_weights,
+        d_active,
+        /*total_slots=*/65,
+        kNumExperts,
+        /*top_k=*/1,
+        kMaxRouteSlots,
+        0,
+        stream_));
 
     cudaFree(d_indices);
     cudaFree(d_weights);

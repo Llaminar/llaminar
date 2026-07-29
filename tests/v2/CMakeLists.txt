@@ -6005,6 +6005,22 @@ add_v2_test(V2_Perf_CUDAFlashAttention
     MPI_PROCS 1  # Tests GPU attention locally, no MPI needed
 )
 
+# Production decode graph benchmark. One captured executable spans the complete
+# short/long KV range while device sequence state selects active split planes.
+add_executable(v2_perf_cuda_flash_decode_stable_graph
+    performance/kernels/cuda/attention/Perf__CUDAFlashDecodeStableGraph.cpp
+)
+target_link_libraries(v2_perf_cuda_flash_decode_stable_graph
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_CUDAFlashDecodeStableGraph
+    COMMAND $<TARGET_FILE:v2_perf_cuda_flash_decode_stable_graph>
+    LABELS "V2;Performance;CUDA;Attention;FlashDecode;GraphCapture;SequenceParallel;Qwen36;SingleDevice;LocalTP"
+    MPI_PROCS 1
+)
+
 add_executable(v2_perf_cuda_blockwise_tensorcore_gemm performance/kernels/cuda/gemm/Perf__CUDABlockwiseTensorCoreGemm.cpp)
 target_link_libraries(v2_perf_cuda_blockwise_tensorcore_gemm llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Perf_CUDABlockwiseTensorCoreGemm
@@ -11227,6 +11243,23 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm Flash Attention decode TP scaling benchmarks")
+
+    # Production decode graph benchmark. The physical graph is fixed at cache
+    # capacity and the device activates sequence-parallel work from live state.
+    add_executable(v2_perf_rocm_flash_decode_stable_graph
+        performance/kernels/rocm/Perf__ROCmFlashDecodeStableGraph.cpp
+    )
+    target_link_libraries(v2_perf_rocm_flash_decode_stable_graph
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmFlashDecodeStableGraph
+        COMMAND $<TARGET_FILE:v2_perf_rocm_flash_decode_stable_graph>
+        LABELS "V2;Performance;ROCm;Attention;FlashDecode;GraphCapture;SequenceParallel;Qwen36;SingleDevice;LocalTP"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm stable graph flash-decode benchmarks")
 
     # Performance Test: ROCm Flash Attention Prefill — tile_q, KV type, and TP scaling sweep
     # Measures prefill attention latency across tile_q={16,32,64}, KV types (FP32/FP16/Q8_1),

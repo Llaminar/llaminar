@@ -30,6 +30,7 @@
 #include "cpu/CPUHybridRingKVCache.h"
 #include "HybridKVCacheConfig.h"
 #include "IHybridKVCache.h"
+#include "kvcache/TurboQuantKVMode.h"
 #ifdef HAVE_CUDA
 #include "cuda/kvcache/CUDARingKVCache.h"
 #include "cuda/kvcache/CUDARingKVCacheTQ.h"
@@ -3879,18 +3880,20 @@ namespace llaminar
                         config.precision == llaminar2::ActivationPrecision::TQ8)
                     {
                         const int cuda_device = config.device.cuda_ordinal();
+                        const auto tq_mode =
+                            llaminar2::turboQuantKVModeFromPrecision(config.precision);
                         if (config.is_sharded())
                         {
                             return std::make_unique<llaminar2::CUDARingKVCacheTQ>(
                                 config.num_layers, config.batch_size, config.max_seq_len,
                                 config.n_kv_heads, config.local_n_kv_heads,
                                 config.kv_head_start, config.head_dim,
-                                config.turboquant_ctx, cuda_device);
+                                config.turboquant_ctx, cuda_device, tq_mode);
                         }
                         return std::make_unique<llaminar2::CUDARingKVCacheTQ>(
                             config.num_layers, config.batch_size, config.max_seq_len,
                             config.n_kv_heads, config.head_dim,
-                            config.turboquant_ctx, cuda_device);
+                            config.turboquant_ctx, cuda_device, tq_mode);
                     }
                     return createCUDAKVCache(config);
 #else
@@ -3906,18 +3909,20 @@ namespace llaminar
                         config.precision == llaminar2::ActivationPrecision::TQ8)
                     {
                         const int rocm_device = config.device.rocm_ordinal();
+                        const auto tq_mode =
+                            llaminar2::turboQuantKVModeFromPrecision(config.precision);
                         if (config.is_sharded())
                         {
                             return llaminar2::createShardedROCmRingKVCacheTQ(
                                 config.num_layers, config.batch_size, config.max_seq_len,
                                 config.n_kv_heads, config.local_n_kv_heads,
                                 config.kv_head_start, config.head_dim,
-                                config.turboquant_ctx, rocm_device);
+                                config.turboquant_ctx, rocm_device, tq_mode);
                         }
                         return llaminar2::createROCmRingKVCacheTQ(
                             config.num_layers, config.batch_size, config.max_seq_len,
                             config.n_kv_heads, config.head_dim,
-                            config.turboquant_ctx, rocm_device);
+                            config.turboquant_ctx, rocm_device, tq_mode);
                     }
                     return createROCmKVCache(config);
 #else

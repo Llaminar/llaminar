@@ -8,8 +8,9 @@
 #                            cuBLAS/NCCL headers and shared libraries.
 # MODE=runtime             — shared libraries only. Slim runtime stage.
 # INSTALL_CUDA_PROFILERS=1 — additionally install the CUDA-series-matched
-#                            Nsight Compute package. Development images enable
-#                            this; release builders remain deliberately lean.
+#                            Nsight Compute, Nsight Systems, and CUPTI packages.
+#                            Development images enable this; release builders
+#                            remain deliberately lean.
 #
 # The host driver is injected at container run time via
 # `--gpus=all` + nvidia-container-toolkit; we never install drivers inside
@@ -47,7 +48,9 @@ if [[ "${MODE}" == "full" ]]; then
 
     if [[ "${INSTALL_CUDA_PROFILERS}" == "1" ]]; then
         apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
-            cuda-nsight-compute-13-0
+            cuda-cupti-13-0 \
+            cuda-nsight-compute-13-0 \
+            cuda-nsight-systems-13-0
     fi
 else
     # Runtime libraries only. These are the minimum a dynamically-linked

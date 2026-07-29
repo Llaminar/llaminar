@@ -85,6 +85,8 @@ RUN if [ "$INSTALL_CUDA" = "true" ]; then \
         INSTALL_CUDA_PROFILERS=1 MODE=full /tmp/install-scripts/install-cuda.sh; \
         command -v ncu >/dev/null; \
         ncu --version; \
+        command -v nsys >/dev/null; \
+        nsys --version; \
     else \
         echo "Skipping CUDA installation"; \
     fi

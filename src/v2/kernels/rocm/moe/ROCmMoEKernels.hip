@@ -30,6 +30,7 @@ namespace
 {
     constexpr int kDeviceMoEMaxExperts = 256;
     constexpr int kDeviceMoEMaxTopK = 16;
+    constexpr int kDeviceMoESmallGroupMaxSlots = 64;
     constexpr int kDeviceMoEMaxParticipants = 8;
     constexpr int kGateLogitsExpertsPerBlock = 4;
     constexpr int kGateLogitsGroupedThreads = 256;
@@ -14233,6 +14234,19 @@ __global__ void rocm_moe_scatter_tokens_kernel(
     }
 }
 
+/**
+ * @brief Group a compact verifier route table in stable expert-major order.
+ *
+ * One 256-thread block owns every route and expert in this bounded operation.
+ * Each expert thread computes its own exact count and exclusive offset, while
+ * each route thread computes its rank among earlier routes to the same expert.
+ * Unique destinations eliminate the atomic write-head race that previously
+ * made grouped-row order scheduling-dependent.
+ *
+ * This is intentionally the same algorithm as CUDA. Stable expert-major route
+ * order is required for grouped verifier rows to remain byte-identical to
+ * serial decode on every GPU backend.
+ */
 __global__ void rocm_moe_group_tokens_small_float_kernel(
     const float *__restrict__ routing_indices,
     const float *__restrict__ routing_weights,
@@ -14248,18 +14262,11 @@ __global__ void rocm_moe_group_tokens_small_float_kernel(
     int top_k,
     int max_active_experts)
 {
-    __shared__ int counts[kDeviceMoEMaxExperts];
-    __shared__ int offsets[kDeviceMoEMaxExperts];
-    __shared__ int write_heads[kDeviceMoEMaxExperts];
+    __shared__ int shared_route_experts[kDeviceMoESmallGroupMaxSlots];
+    __shared__ int shared_expert_counts[kDeviceMoEMaxExperts];
 
     const int tid = threadIdx.x;
-    if (tid < num_experts)
-    {
-        counts[tid] = 0;
-        offsets[tid] = 0;
-        write_heads[tid] = 0;
-    }
-    __syncthreads();
+    shared_expert_counts[tid] = 0;
 
     if (tid < total_slots)
     {
@@ -14274,48 +14281,71 @@ __global__ void rocm_moe_group_tokens_small_float_kernel(
          */
         original_expert_ids[tid] = -1;
         grouped_weights[tid] = 0.0f;
-        const int expert_id = static_cast<int>(routing_indices[tid]);
-        original_expert_ids[tid] =
-            (expert_id >= 0 && expert_id < num_experts) ? expert_id : -1;
-        if (expert_id >= 0 && expert_id < num_experts)
-            atomicAdd(&counts[expert_id], 1);
+
+        const int expert = static_cast<int>(routing_indices[tid]);
+        const int valid_expert =
+            (expert >= 0 && expert < num_experts) ? expert : -1;
+        shared_route_experts[tid] = valid_expert;
+        original_expert_ids[tid] = valid_expert;
     }
+    if (tid < max_active_experts)
+        active_expert_ids[tid] = -1;
     __syncthreads();
 
-    if (tid == 0)
-    {
-        int running = 0;
-        int active = 0;
-        for (int expert = 0; expert < num_experts; ++expert)
-        {
-            offsets[expert] = running;
-            const int count = counts[expert];
-            if (count > 0 && active < max_active_experts)
-                active_expert_ids[active++] = expert;
-            running += count;
-        }
-        for (int slot = active; slot < max_active_experts; ++slot)
-            active_expert_ids[slot] = -1;
-    }
-    __syncthreads();
-
+    /*
+     * Route-slot count is deliberately tiny. One expert per lane replaces
+     * contended atomics with deterministic comparisons against shared route
+     * ids and gives the two GPU backends the same publication contract.
+     */
     if (tid < num_experts)
     {
-        expert_counts[tid] = counts[tid];
-        expert_offsets[tid] = offsets[tid];
+        int count = 0;
+        for (int slot = 0; slot < total_slots; ++slot)
+            count += shared_route_experts[slot] == tid ? 1 : 0;
+        shared_expert_counts[tid] = count;
     }
+    __syncthreads();
+
+    /*
+     * Independent prefixes avoid a serial lane and need only immutable shared
+     * counts. At this bounded size the regular integer work costs less than a
+     * separate scan launch or a barrier-heavy in-place block scan.
+     */
+    if (tid < num_experts)
+    {
+        int offset = 0;
+        int active_rank = 0;
+        for (int expert = 0; expert < tid; ++expert)
+        {
+            const int count = shared_expert_counts[expert];
+            offset += count;
+            active_rank += count > 0 ? 1 : 0;
+        }
+
+        const int count = shared_expert_counts[tid];
+        expert_counts[tid] = count;
+        expert_offsets[tid] = offset;
+        if (count > 0 && active_rank < max_active_experts)
+            active_expert_ids[active_rank] = tid;
+    }
+    __syncthreads();
 
     if (tid < total_slots)
     {
-        const int expert_id = static_cast<int>(routing_indices[tid]);
-        if (expert_id >= 0 && expert_id < num_experts)
-        {
-            const int local = atomicAdd(&write_heads[expert_id], 1);
-            const int dest = offsets[expert_id] + local;
-            grouped_token_indices[dest] = tid / top_k;
-            original_to_grouped[tid] = dest;
-            grouped_weights[dest] = routing_weights[tid];
-        }
+        const int expert = shared_route_experts[tid];
+        if (expert < 0 || expert >= num_experts)
+            return;
+
+        int stable_local_rank = 0;
+        for (int previous_slot = 0; previous_slot < tid; ++previous_slot)
+            stable_local_rank +=
+                shared_route_experts[previous_slot] == expert ? 1 : 0;
+
+        const int destination =
+            expert_offsets[expert] + stable_local_rank;
+        grouped_token_indices[destination] = tid / top_k;
+        original_to_grouped[tid] = destination;
+        grouped_weights[destination] = routing_weights[tid];
     }
 }
 
@@ -15629,9 +15659,10 @@ bool hipMoE_group_tokens_small_float(
         !grouped_token_indices || !original_to_grouped ||
         !original_expert_ids ||
         !grouped_weights || !active_expert_ids ||
-        total_slots <= 0 || total_slots > 64 ||
+        total_slots <= 0 || total_slots > kDeviceMoESmallGroupMaxSlots ||
         num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
         top_k <= 0 || top_k > kDeviceMoEMaxTopK ||
+        total_slots % top_k != 0 ||
         max_active_experts <= 0 || max_active_experts > total_slots ||
         max_active_experts > num_experts)
     {

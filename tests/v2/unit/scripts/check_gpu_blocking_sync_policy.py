@@ -159,10 +159,6 @@ CATEGORY_REASONS = {
         "Initialization, reset, loader drain, resource destruction, or final "
         "release boundary outside steady-state graph execution."
     ),
-    "startup_autotune": (
-        "One-time startup measurement needed to select a persistent kernel "
-        "configuration."
-    ),
 }
 
 
@@ -387,10 +383,6 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/loaders/gpu_pipeline/WeightVRAMPool.cpp", "WeightVRAMPool::releaseStaging", "backend_device", 1),
         ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::downloadFull", "backend_sync_copy", 1),
         ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::uploadFull", "backend_sync_copy", 1),
-    ),
-    *reviewed(
-        "startup_autotune",
-        ("src/v2/kernels/rocm/attention/ROCmFlashAttentionKernels.hip", "launch_decode", "raw_event", 1),
     ),
 )
 

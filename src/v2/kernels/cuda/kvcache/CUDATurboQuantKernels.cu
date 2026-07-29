@@ -288,7 +288,7 @@ namespace llaminar2
 
         // Rotation: out[tid] = Σ_j Π[tid][j] * scaled_input[j]
         // Each thread computes one output element via dot product with one row of Π
-        __shared__ float s_scaled[128]; // max head_dim = 128
+        __shared__ float s_scaled[D]; // max head_dim = 128
         s_scaled[tid] = scaled;
         __syncthreads();
 
@@ -381,7 +381,7 @@ namespace llaminar2
         float scaled = x * s_combined_scale;
 
         // Rotation
-        __shared__ float s_scaled[128];
+        __shared__ float s_scaled[D];
         s_scaled[tid] = scaled;
         __syncthreads();
 
@@ -405,7 +405,7 @@ namespace llaminar2
         // TQ4 packing: 3 low bits go to mse_indices (packed 8→3 bytes),
         // 1 high bit goes to high_bits (packed 8→1 byte)
         // idx is 0-15, so low3 = idx & 0x7, high1 = idx >> 3
-        __shared__ uint8_t s_indices[128]; // full 4-bit indices
+        __shared__ uint8_t s_indices[D]; // full 4-bit indices
         s_indices[tid] = static_cast<uint8_t>(idx);
         __syncthreads();
 
@@ -454,7 +454,7 @@ namespace llaminar2
     // Writes quantized blocks directly to the ring buffer position, eliminating
     // the temp buffer + D2D memcpy. For decode where num_tokens=1.
 
-    template <int D>
+    template <int D, bool VUsesTQ8>
     __global__ void tq_quantize_fused_ring_kernel(
         const float *__restrict__ d_K_input,   // position-major or verifier head-major rows
         const float *__restrict__ d_V_input,   // position-major or verifier head-major rows
@@ -517,7 +517,7 @@ namespace llaminar2
         float scaled = x * s_combined_scale;
 
         // Rotation: out[tid] = Σ_j Π[tid][j] * scaled[j]
-        __shared__ float s_scaled[128];
+        __shared__ float s_scaled[D];
         s_scaled[tid] = scaled;
         __syncthreads();
 
@@ -526,7 +526,7 @@ namespace llaminar2
         for (int j = 0; j < D; ++j)
             rotated += rot_row[j] * s_scaled[j];
 
-        if (phase == 0)
+        if (phase == 0 || VUsesTQ8)
         {
             // ---- TQ8: 8-bit binary search + write to ring ----
             int idx = 0;
@@ -545,8 +545,10 @@ namespace llaminar2
 #undef TQ8_GPU_BSEARCH_F
 
             constexpr size_t block_size = sizeof(TQ8Block<D>);
-            uint8_t *block_ptr = d_K_ring +
-                                 (static_cast<size_t>(ring_pos) * n_kv_heads + head) * block_size;
+            uint8_t *ring = phase == 0 ? d_K_ring : d_V_ring;
+            uint8_t *block_ptr = ring +
+                                 (static_cast<size_t>(ring_pos) * n_kv_heads + head) *
+                                     block_size;
 
             if (tid == 0)
             {
@@ -571,7 +573,7 @@ namespace llaminar2
 #undef TQ4_GPU_BSEARCH_F
 
             // Store full index to shared memory for packing
-            __shared__ uint8_t s_indices[128];
+            __shared__ uint8_t s_indices[D];
             s_indices[tid] = static_cast<uint8_t>(idx);
             __syncthreads();
 
@@ -711,7 +713,7 @@ namespace llaminar2
         float centroid_val = d_TQ8_CENTROIDS[idx] * inv_scale;
 
         // Inverse rotation: out[tid] = Σ_j Πᵀ[tid][j] * centroid[j]
-        __shared__ float s_centroid[128];
+        __shared__ float s_centroid[D];
         s_centroid[tid] = centroid_val;
         __syncthreads();
 
@@ -847,7 +849,7 @@ namespace llaminar2
         float centroid_val = d_TQ4_CENTROIDS[full_idx] * inv_scale;
 
         // Inverse rotation
-        __shared__ float s_centroid[128];
+        __shared__ float s_centroid[D];
         s_centroid[tid] = centroid_val;
         __syncthreads();
 
@@ -2058,6 +2060,7 @@ namespace llaminar2
         int ring_head, int max_seq_len,
         int verifier_rows, int n_kv_heads, int head_dim,
         bool k_head_major, bool v_head_major,
+        TurboQuantKVMode mode,
         cudaStream_t stream)
     {
         if (!d_K_input || !d_V_input || !d_rotations || !d_K_ring || !d_V_ring ||
@@ -2071,19 +2074,48 @@ namespace llaminar2
         const dim3 grid(n_kv_heads, 2, verifier_rows);
         if (head_dim == 64)
         {
-            tq_quantize_fused_ring_kernel<64><<<grid, dim3(64), 0, stream>>>(
-                d_K_input, d_V_input, d_rotations,
-                static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
-                ring_head, nullptr, nullptr, max_seq_len, verifier_rows, n_kv_heads,
-                k_head_major, v_head_major);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                tq_quantize_fused_ring_kernel<64, true><<<grid, dim3(64), 0, stream>>>(
+                    d_K_input, d_V_input, d_rotations,
+                    static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                    ring_head, nullptr, nullptr, max_seq_len, verifier_rows, n_kv_heads,
+                    k_head_major, v_head_major);
+            else
+                tq_quantize_fused_ring_kernel<64, false><<<grid, dim3(64), 0, stream>>>(
+                    d_K_input, d_V_input, d_rotations,
+                    static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                    ring_head, nullptr, nullptr, max_seq_len, verifier_rows, n_kv_heads,
+                    k_head_major, v_head_major);
         }
         else if (head_dim == 128)
         {
-            tq_quantize_fused_ring_kernel<128><<<grid, dim3(128), 0, stream>>>(
-                d_K_input, d_V_input, d_rotations,
-                static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
-                ring_head, nullptr, nullptr, max_seq_len, verifier_rows, n_kv_heads,
-                k_head_major, v_head_major);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                tq_quantize_fused_ring_kernel<128, true><<<grid, dim3(128), 0, stream>>>(
+                    d_K_input, d_V_input, d_rotations,
+                    static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                    ring_head, nullptr, nullptr, max_seq_len, verifier_rows, n_kv_heads,
+                    k_head_major, v_head_major);
+            else
+                tq_quantize_fused_ring_kernel<128, false><<<grid, dim3(128), 0, stream>>>(
+                    d_K_input, d_V_input, d_rotations,
+                    static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                    ring_head, nullptr, nullptr, max_seq_len, verifier_rows, n_kv_heads,
+                    k_head_major, v_head_major);
+        }
+        else if (head_dim == 256)
+        {
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                tq_quantize_fused_ring_kernel<256, true><<<grid, dim3(256), 0, stream>>>(
+                    d_K_input, d_V_input, d_rotations,
+                    static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                    ring_head, nullptr, nullptr, max_seq_len, verifier_rows, n_kv_heads,
+                    k_head_major, v_head_major);
+            else
+                tq_quantize_fused_ring_kernel<256, false><<<grid, dim3(256), 0, stream>>>(
+                    d_K_input, d_V_input, d_rotations,
+                    static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                    ring_head, nullptr, nullptr, max_seq_len, verifier_rows, n_kv_heads,
+                    k_head_major, v_head_major);
         }
         else
         {
@@ -2099,6 +2131,7 @@ namespace llaminar2
         const int *d_ring_head, const int *d_row_count, int max_seq_len,
         int verifier_rows, int n_kv_heads, int head_dim,
         bool k_head_major, bool v_head_major,
+        TurboQuantKVMode mode,
         cudaStream_t stream)
     {
         if (!d_ring_head || !d_K_input || !d_V_input || !d_rotations ||
@@ -2112,19 +2145,48 @@ namespace llaminar2
         const dim3 grid(n_kv_heads, 2, verifier_rows);
         if (head_dim == 64)
         {
-            tq_quantize_fused_ring_kernel<64><<<grid, dim3(64), 0, stream>>>(
-                d_K_input, d_V_input, d_rotations,
-                static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
-                0, d_ring_head, d_row_count, max_seq_len, verifier_rows, n_kv_heads,
-                k_head_major, v_head_major);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                tq_quantize_fused_ring_kernel<64, true><<<grid, dim3(64), 0, stream>>>(
+                    d_K_input, d_V_input, d_rotations,
+                    static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                    0, d_ring_head, d_row_count, max_seq_len, verifier_rows, n_kv_heads,
+                    k_head_major, v_head_major);
+            else
+                tq_quantize_fused_ring_kernel<64, false><<<grid, dim3(64), 0, stream>>>(
+                    d_K_input, d_V_input, d_rotations,
+                    static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                    0, d_ring_head, d_row_count, max_seq_len, verifier_rows, n_kv_heads,
+                    k_head_major, v_head_major);
         }
         else if (head_dim == 128)
         {
-            tq_quantize_fused_ring_kernel<128><<<grid, dim3(128), 0, stream>>>(
-                d_K_input, d_V_input, d_rotations,
-                static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
-                0, d_ring_head, d_row_count, max_seq_len, verifier_rows, n_kv_heads,
-                k_head_major, v_head_major);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                tq_quantize_fused_ring_kernel<128, true><<<grid, dim3(128), 0, stream>>>(
+                    d_K_input, d_V_input, d_rotations,
+                    static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                    0, d_ring_head, d_row_count, max_seq_len, verifier_rows, n_kv_heads,
+                    k_head_major, v_head_major);
+            else
+                tq_quantize_fused_ring_kernel<128, false><<<grid, dim3(128), 0, stream>>>(
+                    d_K_input, d_V_input, d_rotations,
+                    static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                    0, d_ring_head, d_row_count, max_seq_len, verifier_rows, n_kv_heads,
+                    k_head_major, v_head_major);
+        }
+        else if (head_dim == 256)
+        {
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                tq_quantize_fused_ring_kernel<256, true><<<grid, dim3(256), 0, stream>>>(
+                    d_K_input, d_V_input, d_rotations,
+                    static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                    0, d_ring_head, d_row_count, max_seq_len, verifier_rows, n_kv_heads,
+                    k_head_major, v_head_major);
+            else
+                tq_quantize_fused_ring_kernel<256, false><<<grid, dim3(256), 0, stream>>>(
+                    d_K_input, d_V_input, d_rotations,
+                    static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                    0, d_ring_head, d_row_count, max_seq_len, verifier_rows, n_kv_heads,
+                    k_head_major, v_head_major);
         }
         else
         {
@@ -2341,6 +2403,7 @@ namespace llaminar2
         int tail, int count, int max_seq_len,
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start, int rope_dim,
+        TurboQuantKVMode mode,
         cudaStream_t stream)
     {
         if (count <= 0)
@@ -2357,9 +2420,14 @@ namespace llaminar2
                 static_cast<const uint8_t *>(d_K_cache), d_K_rotations, d_K_out,
                 count, n_kv_heads, rope_theta, position_start, rope_dim,
                 max_seq_len, tail);
-            tq4_dequantize_tiled_kernel<64, TILE, __half><<<grid, block, 0, stream>>>(
-                static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
-                count, n_kv_heads, max_seq_len, tail);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                tq8_dequantize_tiled_kernel<64, TILE, __half><<<grid, block, 0, stream>>>(
+                    static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
+                    count, n_kv_heads, 0.0f, 0, 0, max_seq_len, tail);
+            else
+                tq4_dequantize_tiled_kernel<64, TILE, __half><<<grid, block, 0, stream>>>(
+                    static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
+                    count, n_kv_heads, max_seq_len, tail);
         }
         else if (head_dim == 128)
         {
@@ -2369,9 +2437,31 @@ namespace llaminar2
                 static_cast<const uint8_t *>(d_K_cache), d_K_rotations, d_K_out,
                 count, n_kv_heads, rope_theta, position_start, rope_dim,
                 max_seq_len, tail);
-            tq4_dequantize_tiled_kernel<128, TILE, __half><<<grid, block, 0, stream>>>(
-                static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
-                count, n_kv_heads, max_seq_len, tail);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                tq8_dequantize_tiled_kernel<128, TILE, __half><<<grid, block, 0, stream>>>(
+                    static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
+                    count, n_kv_heads, 0.0f, 0, 0, max_seq_len, tail);
+            else
+                tq4_dequantize_tiled_kernel<128, TILE, __half><<<grid, block, 0, stream>>>(
+                    static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
+                    count, n_kv_heads, max_seq_len, tail);
+        }
+        else if (head_dim == 256)
+        {
+            const dim3 grid(n_kv_heads, (count + TILE - 1) / TILE);
+            const dim3 block(256);
+            tq8_dequantize_tiled_kernel<256, TILE, __half><<<grid, block, 0, stream>>>(
+                static_cast<const uint8_t *>(d_K_cache), d_K_rotations, d_K_out,
+                count, n_kv_heads, rope_theta, position_start, rope_dim,
+                max_seq_len, tail);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                tq8_dequantize_tiled_kernel<256, TILE, __half><<<grid, block, 0, stream>>>(
+                    static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
+                    count, n_kv_heads, 0.0f, 0, 0, max_seq_len, tail);
+            else
+                tq4_dequantize_tiled_kernel<256, TILE, __half><<<grid, block, 0, stream>>>(
+                    static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
+                    count, n_kv_heads, max_seq_len, tail);
         }
         else
         {
@@ -2398,6 +2488,7 @@ namespace llaminar2
         float rope_theta,
         int position_start,
         int rope_dim,
+        TurboQuantKVMode mode,
         cudaStream_t stream)
     {
         if (!d_K_out || !d_V_out || !d_K_entry_table || !d_V_entry_table ||
@@ -2423,11 +2514,18 @@ namespace llaminar2
                     d_K_out, d_K_entry_table, d_heads, d_counts, d_rotations,
                     entry_offset, request_count, max_kv_len, max_seq_len,
                     n_kv_heads, rope_theta, position_start, rope_dim);
-            tq4_batched_ring_dequant_fp16_device_state_kernel<64, tile>
-                <<<grid, dim3(64), 0, stream>>>(
-                    d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
-                    entry_offset, request_count, max_kv_len, max_seq_len,
-                    n_kv_heads);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                tq8_batched_ring_dequant_fp16_device_state_kernel<64, tile>
+                    <<<grid, dim3(64), 0, stream>>>(
+                        d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                        entry_offset, request_count, max_kv_len, max_seq_len,
+                        n_kv_heads, 0.0f, 0, 0);
+            else
+                tq4_batched_ring_dequant_fp16_device_state_kernel<64, tile>
+                    <<<grid, dim3(64), 0, stream>>>(
+                        d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                        entry_offset, request_count, max_kv_len, max_seq_len,
+                        n_kv_heads);
         }
         else if (head_dim == 128)
         {
@@ -2436,11 +2534,38 @@ namespace llaminar2
                     d_K_out, d_K_entry_table, d_heads, d_counts, d_rotations,
                     entry_offset, request_count, max_kv_len, max_seq_len,
                     n_kv_heads, rope_theta, position_start, rope_dim);
-            tq4_batched_ring_dequant_fp16_device_state_kernel<128, tile>
-                <<<grid, dim3(128), 0, stream>>>(
-                    d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                tq8_batched_ring_dequant_fp16_device_state_kernel<128, tile>
+                    <<<grid, dim3(128), 0, stream>>>(
+                        d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                        entry_offset, request_count, max_kv_len, max_seq_len,
+                        n_kv_heads, 0.0f, 0, 0);
+            else
+                tq4_batched_ring_dequant_fp16_device_state_kernel<128, tile>
+                    <<<grid, dim3(128), 0, stream>>>(
+                        d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                        entry_offset, request_count, max_kv_len, max_seq_len,
+                        n_kv_heads);
+        }
+        else if (head_dim == 256)
+        {
+            tq8_batched_ring_dequant_fp16_device_state_kernel<256, tile>
+                <<<grid, dim3(256), 0, stream>>>(
+                    d_K_out, d_K_entry_table, d_heads, d_counts, d_rotations,
                     entry_offset, request_count, max_kv_len, max_seq_len,
-                    n_kv_heads);
+                    n_kv_heads, rope_theta, position_start, rope_dim);
+            if (mode == TurboQuantKVMode::TQ8_K_TQ8_V)
+                tq8_batched_ring_dequant_fp16_device_state_kernel<256, tile>
+                    <<<grid, dim3(256), 0, stream>>>(
+                        d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                        entry_offset, request_count, max_kv_len, max_seq_len,
+                        n_kv_heads, 0.0f, 0, 0);
+            else
+                tq4_batched_ring_dequant_fp16_device_state_kernel<256, tile>
+                    <<<grid, dim3(256), 0, stream>>>(
+                        d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                        entry_offset, request_count, max_kv_len, max_seq_len,
+                        n_kv_heads);
         }
         else
         {

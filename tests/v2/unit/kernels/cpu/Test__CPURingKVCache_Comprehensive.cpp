@@ -1331,22 +1331,28 @@ TEST_F(Test__CPURingKVCache_Comprehensive, HeadMajor_GetKvConverted_NoWrap)
 
 TEST_F(Test__CPURingKVCache_Comprehensive, Factory_CreateCPURingKVCache_AllPrecisions)
 {
+    constexpr int kHeadDim = 64;
     auto mpi = testMPI();
-    auto check = [&](ActivationPrecision p)
+    auto check = [&](ActivationPrecision requested,
+                     ActivationPrecision expected_k,
+                     ActivationPrecision expected_v)
     {
-        auto cache = createCPURingKVCache(p, mpi, 1, 1, 8, 2, 4, DeviceId::cpu());
-        ASSERT_NE(cache, nullptr) << "Factory failed for precision " << static_cast<int>(p);
-        EXPECT_EQ(cache->k_precision(), p);
+        auto cache = createCPURingKVCache(
+            requested, mpi, 1, 1, 8, 2, kHeadDim, DeviceId::cpu());
+        ASSERT_NE(cache, nullptr)
+            << "Factory failed for precision " << static_cast<int>(requested);
+        EXPECT_EQ(cache->k_precision(), expected_k);
+        EXPECT_EQ(cache->v_precision(), expected_v);
         EXPECT_EQ(cache->max_seq_len(), 8);
     };
 
-    check(ActivationPrecision::FP32);
-    check(ActivationPrecision::FP16);
-    check(ActivationPrecision::BF16);
-    check(ActivationPrecision::Q8_1);
-    check(ActivationPrecision::Q16_1);
-    check(ActivationPrecision::TQ4);
-    check(ActivationPrecision::TQ8);
+    check(ActivationPrecision::FP32, ActivationPrecision::FP32, ActivationPrecision::FP32);
+    check(ActivationPrecision::FP16, ActivationPrecision::FP16, ActivationPrecision::FP16);
+    check(ActivationPrecision::BF16, ActivationPrecision::BF16, ActivationPrecision::BF16);
+    check(ActivationPrecision::Q8_1, ActivationPrecision::Q8_1, ActivationPrecision::Q8_1);
+    check(ActivationPrecision::Q16_1, ActivationPrecision::Q16_1, ActivationPrecision::Q16_1);
+    check(ActivationPrecision::TQ4, ActivationPrecision::TQ8, ActivationPrecision::TQ4);
+    check(ActivationPrecision::TQ8, ActivationPrecision::TQ8, ActivationPrecision::TQ8);
 }
 
 TEST_F(Test__CPURingKVCache_Comprehensive, Factory_CreateShardedCPURingKVCache)

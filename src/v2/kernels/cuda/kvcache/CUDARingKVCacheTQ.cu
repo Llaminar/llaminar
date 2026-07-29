@@ -6,6 +6,7 @@
 
 #include "CUDARingKVCacheTQ.h"
 #include "CUDATurboQuantKernels.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
@@ -15,6 +16,7 @@
 #include "../../../utils/PerfStatsCollector.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <stdexcept>
@@ -166,10 +168,11 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
         const TurboQuantContext *tq_ctx,
-        int device_id)
+        int device_id,
+        TurboQuantKVMode mode)
         : CUDARingKVCacheTQ(n_layers, batch_size, max_seq_len,
                             n_kv_heads, n_kv_heads, 0,
-                            head_dim, tq_ctx, device_id)
+                            head_dim, tq_ctx, device_id, mode)
     {
     }
 
@@ -177,11 +180,13 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim, const TurboQuantContext *tq_ctx,
-        int device_id)
+        int device_id,
+        TurboQuantKVMode mode)
         : CUDARingKVCacheBase(n_layers, batch_size, max_seq_len,
                               n_kv_heads, head_dim, local_n_kv_heads * head_dim, device_id),
           local_n_kv_heads_(local_n_kv_heads),
           kv_head_start_(kv_head_start),
+          mode_(mode),
           tq_ctx_(tq_ctx)
     {
         if (local_n_kv_heads <= 0 || local_n_kv_heads > n_kv_heads ||
@@ -207,23 +212,35 @@ namespace llaminar2
         if (head_dim == 64)
         {
             k_block_size_ = sizeof(TQ8Block<64>);
-            v_block_size_ = sizeof(TQ4Block<64>);
+            v_block_size_ = mode_ == TurboQuantKVMode::TQ8_K_TQ8_V
+                                ? sizeof(TQ8Block<64>)
+                                : sizeof(TQ4Block<64>);
         }
         else if (head_dim == 128)
         {
             k_block_size_ = sizeof(TQ8Block<128>);
-            v_block_size_ = sizeof(TQ4Block<128>);
+            v_block_size_ = mode_ == TurboQuantKVMode::TQ8_K_TQ8_V
+                                ? sizeof(TQ8Block<128>)
+                                : sizeof(TQ4Block<128>);
+        }
+        else if (head_dim == 256)
+        {
+            k_block_size_ = sizeof(TQ8Block<256>);
+            v_block_size_ = mode_ == TurboQuantKVMode::TQ8_K_TQ8_V
+                                ? sizeof(TQ8Block<256>)
+                                : sizeof(TQ4Block<256>);
         }
         else
         {
             LOG_ERROR("CUDARingKVCacheTQ: unsupported head_dim=" << head_dim);
-            throw std::runtime_error("CUDARingKVCacheTQ: head_dim must be 64 or 128");
+            throw std::runtime_error("CUDARingKVCacheTQ: head_dim must be 64, 128, or 256");
         }
 
         k_pos_bytes_ = static_cast<size_t>(local_n_kv_heads_) * k_block_size_;
         v_pos_bytes_ = static_cast<size_t>(local_n_kv_heads_) * v_block_size_;
 
-        LOG_DEBUG("CUDARingKVCacheTQ: K block=" << k_block_size_ << "B, V block=" << v_block_size_
+        LOG_DEBUG("CUDARingKVCacheTQ: mode=" << turboQuantKVModeName(mode_)
+                                                << " K block=" << k_block_size_ << "B, V block=" << v_block_size_
                                                 << "B, per-position: K=" << k_pos_bytes_ << "B V=" << v_pos_bytes_ << "B"
                                                 << " (vs FP16: " << (local_n_kv_heads_ * head_dim * 2 * 2) << "B)");
 
@@ -281,41 +298,18 @@ namespace llaminar2
                 "CUDARingKVCacheTQ: failed to publish resident batched entry topology");
         }
 
-        // Allocate per-layer FP16 scratch buffers (enables incremental dequant + FP16 flash attention)
+        // Create per-layer wrappers now; graph planning supplies their shared
+        // K/V conversion addresses before any read or capture.
         {
-            // Scalar reads use the first request span. Grouped reads use every
-            // request span in-place, so one allocation supports both paths.
-            const size_t scratch_bytes =
-                static_cast<size_t>(batch_size) * max_seq_len * kv_dim_ *
-                sizeof(__half);
             layer_scratch_.resize(n_layers);
-            auto *const backend = getCUDABackend();
-            if (!backend)
-            {
-                throw std::runtime_error(
-                    "CUDARingKVCacheTQ: CUDA backend unavailable during persistent scratch allocation");
-            }
             for (int l = 0; l < n_layers; ++l)
-            {
-                layer_scratch_[l].d_K = static_cast<__half *>(
-                    backend->allocate(scratch_bytes, device_id_));
-                layer_scratch_[l].d_V = static_cast<__half *>(
-                    backend->allocate(scratch_bytes, device_id_));
-                if (!layer_scratch_[l].d_K ||
-                    !layer_scratch_[l].d_V)
-                {
-                    throw std::runtime_error(
-                        "CUDARingKVCacheTQ: failed to allocate persistent FP16 layer scratch");
-                }
                 layer_scratch_[l].invalidate();
-            }
 
             const size_t total_tq_bytes = static_cast<size_t>(n_layers) * batch_size *
                                           max_seq_len * (k_pos_bytes_ + v_pos_bytes_);
-            const size_t total_scratch_bytes = static_cast<size_t>(n_layers) * 2 * scratch_bytes;
             LOG_DEBUG("CUDARingKVCacheTQ VRAM: TQ caches="
-                      << (total_tq_bytes / 1024) << "KB, per-layer FP16 scratch="
-                      << (total_scratch_bytes / (1024 * 1024)) << "MB (" << n_layers << " layers)");
+                      << (total_tq_bytes / 1024)
+                      << "KB, conversion scratch=graph workspace");
         }
 
         // Canonical device head/count and append-count mailboxes are allocated
@@ -350,8 +344,6 @@ namespace llaminar2
         for (const auto &layer : entries_)
             for (const auto &entry : layer)
                 owns_device_storage = owns_device_storage || entry.d_K || entry.d_V;
-        for (const auto &scratch : layer_scratch_)
-            owns_device_storage = owns_device_storage || scratch.d_K || scratch.d_V;
         if (owns_device_storage && !backend)
         {
             LOG_ERROR("[CUDARingKVCacheTQ] CUDA backend unavailable during cache teardown");
@@ -380,14 +372,12 @@ namespace llaminar2
             {
                 scratch.k_view.reset();
                 scratch.v_view.reset();
-                if (scratch.d_K)
-                    backend->free(scratch.d_K, device_id_);
-                if (scratch.d_V)
-                    backend->free(scratch.d_V, device_id_);
                 scratch.d_K = nullptr;
                 scratch.d_V = nullptr;
             }
             layer_scratch_.clear();
+            workspace_ = nullptr;
+            scratch_capacity_bytes_ = 0;
 
             cuda_tq_free_rotations(rotations_);
         }
@@ -396,6 +386,82 @@ namespace llaminar2
             LOG_ERROR("[CUDARingKVCacheTQ] CUDA backend threw during cache teardown");
             std::terminate();
         }
+    }
+
+    WorkspaceRequirements CUDARingKVCacheTQ::getWorkspaceRequirements(
+        int m, int n, int k) const
+    {
+        (void)k;
+        const bool has_token_hint = n > 0;
+        const int hinted_batch =
+            has_token_hint ? n : ((m > 0) ? m : batch_size_);
+        const int scratch_tokens =
+            has_token_hint ? std::max(m, max_seq_len_) : max_seq_len_;
+        const size_t rows =
+            static_cast<size_t>(std::max(hinted_batch, batch_size_)) *
+            static_cast<size_t>(std::max(1, scratch_tokens));
+        const size_t bytes =
+            rows * static_cast<size_t>(kv_dim_) * sizeof(__half);
+
+        WorkspaceRequirements requirements;
+        requirements.buffers.emplace_back(
+            KVCacheWorkspaceBuffers::CONV_SCRATCH_K, bytes, 256, true);
+        requirements.buffers.emplace_back(
+            KVCacheWorkspaceBuffers::CONV_SCRATCH_V, bytes, 256, true);
+        return requirements;
+    }
+
+    void CUDARingKVCacheTQ::bindWorkspace(
+        DeviceWorkspaceManager *workspace)
+    {
+        if (workspace_ == workspace)
+            return;
+        if (isGraphCaptureActive())
+        {
+            throw std::runtime_error(
+                "CUDARingKVCacheTQ workspace ownership cannot change during CUDA graph capture");
+        }
+        if (workspace && !workspace->isAllocated())
+        {
+            throw std::invalid_argument(
+                "CUDARingKVCacheTQ requires a fully allocated workspace");
+        }
+
+        void *scratch_k = nullptr;
+        void *scratch_v = nullptr;
+        size_t capacity = 0;
+        if (workspace)
+        {
+            scratch_k =
+                workspace->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_K);
+            scratch_v =
+                workspace->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+            const size_t k_capacity =
+                workspace->getBufferSize(KVCacheWorkspaceBuffers::CONV_SCRATCH_K);
+            const size_t v_capacity =
+                workspace->getBufferSize(KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+            const size_t required =
+                static_cast<size_t>(batch_size_) * max_seq_len_ * kv_dim_ *
+                sizeof(__half);
+            if (!scratch_k || !scratch_v ||
+                k_capacity < required || v_capacity < required)
+            {
+                throw std::runtime_error(
+                    "CUDARingKVCacheTQ workspace lacks full-horizon FP16 K/V conversion storage");
+            }
+            capacity = std::min(k_capacity, v_capacity);
+        }
+
+        batched_k_view_.reset();
+        batched_v_view_.reset();
+        for (auto &scratch : layer_scratch_)
+        {
+            scratch.invalidate();
+            scratch.d_K = static_cast<__half *>(scratch_k);
+            scratch.d_V = static_cast<__half *>(scratch_v);
+        }
+        workspace_ = workspace;
+        scratch_capacity_bytes_ = capacity;
     }
 
     bool CUDARingKVCacheTQ::publishBatchedEntryTables(cudaStream_t stream)
@@ -546,7 +612,10 @@ namespace llaminar2
 
         const bool prepared_tq =
             K->native_type() == TensorType::TQ8 &&
-            V->native_type() == TensorType::TQ4;
+            V->native_type() ==
+                (mode_ == TurboQuantKVMode::TQ8_K_TQ8_V
+                     ? TensorType::TQ8
+                     : TensorType::TQ4);
         if (prepared_tq)
         {
             if (!K->gpu_data_ptr() || !V->gpu_data_ptr() ||
@@ -600,7 +669,7 @@ namespace llaminar2
             d_k, d_v, d_rotations, entry.d_K, entry.d_V,
             &d_head_params_[index], d_append_count,
             max_seq_len_, num_tokens,
-            local_n_kv_heads_, head_dim_, false, false, stream);
+            local_n_kv_heads_, head_dim_, false, false, mode_, stream);
         if (ok)
         {
             cuda_kv_sequence_state_advance_dynamic(
@@ -632,7 +701,10 @@ namespace llaminar2
             V->native_type() == TensorType::FP32;
         const bool prepared_tq_sources =
             K->native_type() == TensorType::TQ8 &&
-            V->native_type() == TensorType::TQ4;
+            V->native_type() ==
+                (mode_ == TurboQuantKVMode::TQ8_K_TQ8_V
+                     ? TensorType::TQ8
+                     : TensorType::TQ4);
         if (!fp32_sources && !prepared_tq_sources)
         {
             LOG_ERROR("[CUDARingKVCacheTQ] Grouped verifier publication requires device-resident FP32/FP32 or prepared TQ8/TQ4 K/V; got K="
@@ -715,7 +787,8 @@ namespace llaminar2
                 d_rotations, entry.d_K, entry.d_V,
                 &d_head_params_[index], /*d_row_count=*/nullptr,
                 max_seq_len_, verifier_rows,
-                local_n_kv_heads_, head_dim_, k_head_major, v_head_major, stream);
+                local_n_kv_heads_, head_dim_, k_head_major, v_head_major,
+                mode_, stream);
         }
         if (ok)
         {
@@ -735,7 +808,7 @@ namespace llaminar2
             1.0,
             "verifier",
             "cuda",
-            {{"cache_format", "TQ8/TQ4"},
+            {{"cache_format", turboQuantKVModeName(mode_)},
              {"source_k_format", K->dtype_name()},
              {"source_v_format", V->dtype_name()},
              {"verifier_rows", std::to_string(verifier_rows)},
@@ -1023,9 +1096,12 @@ namespace llaminar2
         int layer, int seq_idx, float rope_theta, int position_start,
         int rope_dim, cudaStream_t stream, int *out_count) const
     {
-        if (!out_count || isGraphCaptureActive())
+        const size_t required =
+            static_cast<size_t>(max_seq_len_) * kv_dim_ * sizeof(__half);
+        if (!out_count || isGraphCaptureActive() || !workspace_ ||
+            scratch_capacity_bytes_ < required)
         {
-            LOG_ERROR("[CUDARingKVCacheTQ::dequant_to_scratch] Scalar observation is unavailable during graph capture");
+            LOG_ERROR("[CUDARingKVCacheTQ::dequant_to_scratch] Scalar observation requires bound full-horizon workspace outside graph capture");
             return false;
         }
 
@@ -1056,6 +1132,7 @@ namespace llaminar2
             tail, state.cached_tokens, max_seq_len_,
             local_n_kv_heads_, head_dim_,
             rope_theta, position_start, rope_dim,
+            mode_,
             stream);
     }
 
@@ -1191,7 +1268,10 @@ namespace llaminar2
             !gpu_stream ||
             !d_head_params_ || !d_count_params_ ||
             !d_batched_k_entry_table_ || !d_batched_v_entry_table_ ||
-            !rotations_.d_rotations)
+            !rotations_.d_rotations || !workspace_ ||
+            scratch_capacity_bytes_ <
+                static_cast<size_t>(request_count) * max_seq_len_ * kv_dim_ *
+                    sizeof(__half))
         {
             LOG_ERROR("[CUDARingKVCacheTQ::get_kv_batched_device_view] Invalid resident gather contract"
                       << " layer=" << layer
@@ -1224,6 +1304,7 @@ namespace llaminar2
                 /*rope_theta=*/0.0f,
                 /*position_start=*/0,
                 /*rope_dim=*/0,
+                mode_,
                 stream))
         {
             LOG_ERROR("[CUDARingKVCacheTQ::get_kv_batched_device_view] Grouped TQ dequant launch failed");
@@ -1290,7 +1371,10 @@ namespace llaminar2
             (effective_rope_dim % 2) != 0 ||
             !d_head_params_ || !d_count_params_ ||
             !d_batched_k_entry_table_ || !d_batched_v_entry_table_ ||
-            !rotations_.d_rotations)
+            !rotations_.d_rotations || !workspace_ ||
+            scratch_capacity_bytes_ <
+                static_cast<size_t>(request_count) * max_seq_len_ * kv_dim_ *
+                    sizeof(__half))
         {
             LOG_ERROR("[CUDARingKVCacheTQ::get_kv_batched_converted_device_view] Invalid grouped conversion contract"
                       << " layer=" << layer
@@ -1327,6 +1411,7 @@ namespace llaminar2
                 read.rope_theta,
                 read.position_start,
                 effective_rope_dim,
+                mode_,
                 stream))
         {
             LOG_ERROR("[CUDARingKVCacheTQ::get_kv_batched_converted_device_view] Grouped TQ conversion/RoPE launch failed");

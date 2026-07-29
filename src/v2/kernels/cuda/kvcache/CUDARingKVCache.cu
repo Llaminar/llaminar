@@ -818,10 +818,39 @@ namespace llaminar2
         dst[idx] = __float2half_rn(to_float_device(src[idx]));
     }
 
-    template <typename SrcT>
-    __global__ void ring_append_convert_to_fp16_kernel(
-        __half *__restrict__ d_K_cache,
-        __half *__restrict__ d_V_cache,
+    /**
+     * @brief Convert a producer value to the cache's native floating format.
+     *
+     * The ring cache owns this conversion and the device sequence metadata.
+     * Fusing both responsibilities into one launch keeps publication resident
+     * on the producer stream and legal inside a reusable CUDA graph.
+     */
+    template <typename DstT>
+    __device__ __forceinline__ DstT kv_cache_from_float(float value);
+
+    template <>
+    __device__ __forceinline__ float kv_cache_from_float<float>(float value)
+    {
+        return value;
+    }
+
+    template <>
+    __device__ __forceinline__ __half kv_cache_from_float<__half>(float value)
+    {
+        return __float2half_rn(value);
+    }
+
+    template <>
+    __device__ __forceinline__ __nv_bfloat16
+    kv_cache_from_float<__nv_bfloat16>(float value)
+    {
+        return __float2bfloat16_rn(value);
+    }
+
+    template <typename DstT, typename SrcT>
+    __global__ void ring_append_convert_kernel(
+        DstT *__restrict__ d_K_cache,
+        DstT *__restrict__ d_V_cache,
         const SrcT *__restrict__ d_K_new,
         const SrcT *__restrict__ d_V_new,
         const int *__restrict__ d_head,
@@ -844,13 +873,16 @@ namespace llaminar2
         const int dst_offset = dst_pos * kv_dim + elem_idx;
         const int src_offset = token_idx * kv_dim + elem_idx;
 
-        d_K_cache[dst_offset] = __float2half_rn(to_float_device(d_K_new[src_offset]));
-        d_V_cache[dst_offset] = __float2half_rn(to_float_device(d_V_new[src_offset]));
+        d_K_cache[dst_offset] =
+            kv_cache_from_float<DstT>(to_float_device(d_K_new[src_offset]));
+        d_V_cache[dst_offset] =
+            kv_cache_from_float<DstT>(to_float_device(d_V_new[src_offset]));
     }
 
-    __global__ void ring_append_q8_1_to_fp16_kernel(
-        __half *__restrict__ d_K_cache,
-        __half *__restrict__ d_V_cache,
+    template <typename DstT>
+    __global__ void ring_append_q8_1_convert_kernel(
+        DstT *__restrict__ d_K_cache,
+        DstT *__restrict__ d_V_cache,
         const Q8_1Block *__restrict__ d_K_new,
         const Q8_1Block *__restrict__ d_V_new,
         const int *__restrict__ d_head,
@@ -880,8 +912,10 @@ namespace llaminar2
         const Q8_1Block &v_block = d_V_new[src_offset];
         const float k_scale = __half2float(__ushort_as_half(k_block.d));
         const float v_scale = __half2float(__ushort_as_half(v_block.d));
-        d_K_cache[dst_offset] = __float2half_rn(k_scale * static_cast<float>(k_block.qs[lane]));
-        d_V_cache[dst_offset] = __float2half_rn(v_scale * static_cast<float>(v_block.qs[lane]));
+        d_K_cache[dst_offset] = kv_cache_from_float<DstT>(
+            k_scale * static_cast<float>(k_block.qs[lane]));
+        d_V_cache[dst_offset] = kv_cache_from_float<DstT>(
+            v_scale * static_cast<float>(v_block.qs[lane]));
     }
 
     template <typename SrcT>
@@ -1075,8 +1109,9 @@ namespace llaminar2
         return cudaGetLastError() == cudaSuccess;
     }
 
-    extern "C" bool cuda_ring_append_converted_fp16(
-        __half *d_K_cache, __half *d_V_cache,
+    template <typename DstT>
+    bool launch_ring_append_converted(
+        DstT *d_K_cache, DstT *d_V_cache,
         const void *d_K_new, const void *d_V_new,
         TensorType src_type,
         const int *d_head,
@@ -1097,21 +1132,21 @@ namespace llaminar2
         switch (src_type)
         {
         case TensorType::FP32:
-            ring_append_convert_to_fp16_kernel<float><<<grid, block, 0, stream>>>(
+            ring_append_convert_kernel<DstT, float><<<grid, block, 0, stream>>>(
                 d_K_cache, d_V_cache,
                                static_cast<const float *>(d_K_new),
                                static_cast<const float *>(d_V_new),
                                d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
             break;
         case TensorType::FP16:
-            ring_append_kernel_dynamic<__half><<<grid, block, 0, stream>>>(
+            ring_append_convert_kernel<DstT, __half><<<grid, block, 0, stream>>>(
                 d_K_cache, d_V_cache,
                 static_cast<const __half *>(d_K_new),
                 static_cast<const __half *>(d_V_new),
                 d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
             break;
         case TensorType::BF16:
-            ring_append_convert_to_fp16_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+            ring_append_convert_kernel<DstT, __nv_bfloat16><<<grid, block, 0, stream>>>(
                 d_K_cache, d_V_cache,
                                static_cast<const __nv_bfloat16 *>(d_K_new),
                                static_cast<const __nv_bfloat16 *>(d_V_new),
@@ -1120,7 +1155,7 @@ namespace llaminar2
         case TensorType::Q8_1:
         {
             const int blocks_per_row = (kv_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-            ring_append_q8_1_to_fp16_kernel<<<grid, block, 0, stream>>>(
+            ring_append_q8_1_convert_kernel<DstT><<<grid, block, 0, stream>>>(
                 d_K_cache, d_V_cache,
                                static_cast<const Q8_1Block *>(d_K_new),
                                static_cast<const Q8_1Block *>(d_V_new),
@@ -1132,6 +1167,54 @@ namespace llaminar2
         }
 
         return cudaGetLastError() == cudaSuccess;
+    }
+
+    extern "C" bool cuda_ring_append_converted_fp32(
+        float *d_K_cache, float *d_V_cache,
+        const void *d_K_new, const void *d_V_new,
+        TensorType src_type,
+        const int *d_head,
+        const int *d_append_count,
+        int max_seq_len,
+        int kv_dim,
+        int num_tokens,
+        cudaStream_t stream)
+    {
+        return launch_ring_append_converted(
+            d_K_cache, d_V_cache, d_K_new, d_V_new, src_type,
+            d_head, d_append_count, max_seq_len, kv_dim, num_tokens, stream);
+    }
+
+    extern "C" bool cuda_ring_append_converted_fp16(
+        __half *d_K_cache, __half *d_V_cache,
+        const void *d_K_new, const void *d_V_new,
+        TensorType src_type,
+        const int *d_head,
+        const int *d_append_count,
+        int max_seq_len,
+        int kv_dim,
+        int num_tokens,
+        cudaStream_t stream)
+    {
+        return launch_ring_append_converted(
+            d_K_cache, d_V_cache, d_K_new, d_V_new, src_type,
+            d_head, d_append_count, max_seq_len, kv_dim, num_tokens, stream);
+    }
+
+    extern "C" bool cuda_ring_append_converted_bf16(
+        __nv_bfloat16 *d_K_cache, __nv_bfloat16 *d_V_cache,
+        const void *d_K_new, const void *d_V_new,
+        TensorType src_type,
+        const int *d_head,
+        const int *d_append_count,
+        int max_seq_len,
+        int kv_dim,
+        int num_tokens,
+        cudaStream_t stream)
+    {
+        return launch_ring_append_converted(
+            d_K_cache, d_V_cache, d_K_new, d_V_new, src_type,
+            d_head, d_append_count, max_seq_len, kv_dim, num_tokens, stream);
     }
 
     // =========================================================================
@@ -1899,8 +1982,15 @@ namespace llaminar2
         int *, int *, int, int, cudaStream_t);
     extern "C" void cuda_kv_sequence_state_advance_dynamic(
         int *, int *, const int *, int, int, cudaStream_t);
+    extern "C" bool cuda_ring_append_converted_fp32(
+        float *, float *, const void *, const void *, TensorType,
+        const int *, const int *, int, int, int, cudaStream_t);
     extern "C" bool cuda_ring_append_converted_fp16(
         __half *, __half *, const void *, const void *, TensorType,
+        const int *, const int *, int, int, int, cudaStream_t);
+    extern "C" bool cuda_ring_append_converted_bf16(
+        __nv_bfloat16 *, __nv_bfloat16 *,
+        const void *, const void *, TensorType,
         const int *, const int *, int, int, int, cudaStream_t);
 
     template <ActivationPrecision Precision>
@@ -2236,7 +2326,10 @@ namespace llaminar2
         TensorType src_type,
         int num_tokens, cudaStream_t stream)
     {
-        if constexpr (Precision != ActivationPrecision::FP16)
+        if constexpr (
+            Precision != ActivationPrecision::FP32 &&
+            Precision != ActivationPrecision::FP16 &&
+            Precision != ActivationPrecision::BF16)
         {
             (void)layer;
             (void)seq_idx;
@@ -2245,7 +2338,7 @@ namespace llaminar2
             (void)src_type;
             (void)num_tokens;
             (void)stream;
-            LOG_ERROR("[CUDARingKVCache::appendConvertedWithStream] Converted append is only implemented for FP16 cache storage");
+            LOG_ERROR("[CUDARingKVCache::appendConvertedWithStream] Converted append requires floating cache storage");
             return false;
         }
         else
@@ -2280,11 +2373,30 @@ namespace llaminar2
             const int *d_append_count =
                 deviceDynamicAppendCountPtr(layer, seq_idx);
 
-            if (!cuda_ring_append_converted_fp16(
-                    entry.d_K, entry.d_V,
-                    d_k_src, d_v_src, src_type,
+            bool launch_ok = false;
+            if constexpr (Precision == ActivationPrecision::FP32)
+            {
+                launch_ok = cuda_ring_append_converted_fp32(
+                    entry.d_K, entry.d_V, d_k_src, d_v_src, src_type,
                     d_head, d_append_count,
-                    max_seq_len_, kv_dim_, num_tokens, stream))
+                    max_seq_len_, kv_dim_, num_tokens, stream);
+            }
+            else if constexpr (Precision == ActivationPrecision::FP16)
+            {
+                launch_ok = cuda_ring_append_converted_fp16(
+                    entry.d_K, entry.d_V, d_k_src, d_v_src, src_type,
+                    d_head, d_append_count,
+                    max_seq_len_, kv_dim_, num_tokens, stream);
+            }
+            else if constexpr (Precision == ActivationPrecision::BF16)
+            {
+                launch_ok = cuda_ring_append_converted_bf16(
+                    entry.d_K, entry.d_V, d_k_src, d_v_src, src_type,
+                    d_head, d_append_count,
+                    max_seq_len_, kv_dim_, num_tokens, stream);
+            }
+
+            if (!launch_ok)
             {
                 LOG_ERROR("[CUDARingKVCache::appendConvertedWithStream] Fused converted append launch failed");
                 return false;

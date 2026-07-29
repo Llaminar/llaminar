@@ -20,6 +20,40 @@ The golden rule of this codebase: **isolated kernel speedups do not always trans
 to full-model speedups.** Always confirm a win on the real `benchmark` subcommand, and
 always re-run parity before trusting it.
 
+## Production hot-path invariants
+
+CUDA kernel tuning must preserve the production execution architecture, not
+trade architecture for an isolated microbenchmark win:
+
+- **No dynamic allocation or deallocation.** Hot-path kernels and launch
+  bridges consume persistent workspace bindings. `cudaMalloc`,
+  `cudaMallocAsync`, `cudaFree`, container growth, or hidden scratch allocation
+  belongs in explicit initialization/workspace infrastructure only.
+- **No host transfer.** Do not insert H2D/D2H copies, host-visible mirrors, or
+  host polling into execution. Deliberate RAM/disk KV-cache tier movement is a
+  transfer-service operation at an explicit lifecycle boundary, not kernel
+  plumbing.
+- **No stream or device synchronization.** `cudaStreamSynchronize`,
+  `cudaDeviceSynchronize`, blocking copies, and event synchronization on the
+  host are forbidden in the hot path. They are permitted only in explicitly
+  scoped test/profiler result collection or terminal result surfacing.
+- **No order-dependent atomics in batch-invariant paths.** Grouped verifier,
+  deterministic decode, and batch-invariant prefill kernels must give every
+  output a unique deterministic writer. An atomic is acceptable only when its
+  value is provably independent of inter-thread order, bitwise equivalence is
+  covered by the all-format/M-totality sweep, and profiling proves it is
+  economical.
+- **Use explicit producer/consumer events.** A producer launches on an explicit
+  non-null stream and publishes completion by recording an event on that exact
+  stream. A consumer on another stream waits for that event before reading.
+  Never publish a write on a guessed/default stream, transition coherence
+  manually after a blocking sync, or replace the dependency with a global
+  barrier.
+- **Remain graph-capturable end to end.** Persistent buffers, launches, event
+  record/wait edges, and collectives must be capturable. Homogeneous GPU
+  inference requires one complete captured graph; segmented execution is not a
+  tuning fallback.
+
 ---
 
 ## Step 0: Establish the target and baseline

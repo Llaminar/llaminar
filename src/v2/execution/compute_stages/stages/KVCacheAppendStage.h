@@ -332,7 +332,8 @@ namespace llaminar2
         std::unique_ptr<Q8_1Tensor> q8_v_scratch_;
         std::shared_ptr<TQ4Tensor> tq4_k_scratch_;
         std::shared_ptr<TQ4Tensor> tq4_v_scratch_;
-        std::shared_ptr<TQ8Tensor> tq8_k_scratch_; ///< For split TQ (TQ8 K + TQ4 V)
+        std::shared_ptr<TQ8Tensor> tq8_k_scratch_; ///< TQ8 K for both public TurboQuant modes.
+        std::shared_ptr<TQ8Tensor> tq8_v_scratch_; ///< TQ8 V for symmetric TQ8-K/TQ8-V.
 
         /// Workspace for kv_rotation: holds FP32 copy for in-place rotation
         /// before Q16_1 quantization. Lazy-allocated, reused across calls.

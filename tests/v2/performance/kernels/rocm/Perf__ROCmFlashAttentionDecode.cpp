@@ -152,11 +152,11 @@ namespace
         }
 
         // =========================================================================
-        // Core benchmark: runs flash decoding with auto split-K selection
+        // Core diagnostic benchmark: runs one explicit physical split envelope
         // =========================================================================
         DecodeResult benchmarkDecode(
             int n_heads, int n_kv_heads, int head_dim, int kv_len,
-            int forced_splits = 0) // 0 = auto
+            int forced_splits = -1)
         {
             DecodeResult result{};
 #ifndef HAVE_ROCM
@@ -201,14 +201,25 @@ namespace
             // device_params is a GPU-dereferenced pointer in the kernel.
             // Pass nullptr so the kernel uses the kv_len argument directly.
 
-            // Warmup (also triggers autotuning)
+            /*
+             * This legacy diagnostic invokes the C launcher directly rather
+             * than the graph-captured production wrapper. Choose the same
+             * capacity-derived physical envelope explicitly; zero no longer
+             * means online autotuning.
+             */
+            const int stable_splits =
+                forced_splits > 0
+                    ? forced_splits
+                    : (kv_len <= 64 ? 1 : (kv_len < 128 ? 2 : (kv_len < 256 ? 4 : 8)));
+
+            // Warmup
             for (int i = 0; i < WARMUP_ITERS; ++i)
             {
                 int rc = hipFlashAttn_decode_fp32(
                     d_Q, d_K, d_V, d_O,
                     d_O_partial, d_m_partial, d_l_partial,
                     batch_size, kv_len, n_heads, n_kv_heads, head_dim,
-                    forced_splits, nullptr, nullptr);
+                    stable_splits, nullptr, nullptr);
                 if (rc != 0)
                 {
                     result.success = false;
@@ -235,7 +246,7 @@ namespace
                         d_Q, d_K, d_V, d_O,
                         d_O_partial, d_m_partial, d_l_partial,
                         batch_size, kv_len, n_heads, n_kv_heads, head_dim,
-                        forced_splits, nullptr, nullptr);
+                        stable_splits, nullptr, nullptr);
                     if (rc != 0)
                     {
                         result.success = false;
@@ -545,10 +556,7 @@ namespace
                 }
 
                 char best_cell[32];
-                if (best_splits == 0)
-                    snprintf(best_cell, sizeof(best_cell), "auto");
-                else
-                    snprintf(best_cell, sizeof(best_cell), "s=%d", best_splits);
+                snprintf(best_cell, sizeof(best_cell), "s=%d", best_splits);
                 table << best_cell;
 
                 table << fort::endr;
@@ -600,7 +608,7 @@ namespace
             kQwen7B,
             /*tp_degree=*/2,
             /*kv_lengths=*/{128, 256, 512, 1024, 2048, 4096},
-            /*split_counts=*/{0, 1, 2, 4, 8, 16, 32});
+                        /*split_counts=*/{1, 2, 4, 8, 16, 32});
     }
 
     // ---------------------------------------------------------------------------
@@ -612,7 +620,7 @@ namespace
             kQwen7B,
             /*tp_degree=*/4,
             /*kv_lengths=*/{128, 256, 512, 1024, 2048, 4096},
-            /*split_counts=*/{0, 1, 2, 4, 8, 16, 32});
+            /*split_counts=*/{1, 2, 4, 8, 16, 32});
     }
 
     // ---------------------------------------------------------------------------
@@ -624,7 +632,7 @@ namespace
             kQwen05B,
             /*tp_degree=*/2,
             /*kv_lengths=*/{128, 256, 512, 1024, 2048, 4096},
-            /*split_counts=*/{0, 1, 2, 4, 8, 16, 32});
+            /*split_counts=*/{1, 2, 4, 8, 16, 32});
     }
 
     // ---------------------------------------------------------------------------
@@ -645,7 +653,7 @@ namespace
             kQwen14B,
             /*tp_degree=*/2,
             /*kv_lengths=*/{128, 256, 512, 1024, 2048, 4096},
-            /*split_counts=*/{0, 1, 2, 4, 8, 16, 32});
+            /*split_counts=*/{1, 2, 4, 8, 16, 32});
     }
 
     TEST_F(ROCmFlashAttentionDecodePerf, Qwen14B_TP4_SplitKSweep)
@@ -654,7 +662,7 @@ namespace
             kQwen14B,
             /*tp_degree=*/4,
             /*kv_lengths=*/{128, 256, 512, 1024, 2048, 4096},
-            /*split_counts=*/{0, 1, 2, 4, 8, 16, 32});
+            /*split_counts=*/{1, 2, 4, 8, 16, 32});
     }
 
 } // anonymous namespace

@@ -55,6 +55,7 @@
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../moe/MoETransferStateMachineTestModel.h"
+#include "../moe/SmallFloatGroupingTestOracle.h"
 
 #include <vector>
 #include <array>
@@ -17832,6 +17833,168 @@ TEST(Test__ROCmMoEKernel, SmallFloatGrouping_RejectsNullStream)
         /*max_active_experts=*/8,
         /*device_idx=*/0,
         /*stream=*/nullptr));
+}
+
+/**
+ * @brief Prove compact ROCm grouping is serial-equivalent and repeatable.
+ *
+ * This is the same oracle matrix as CUDA: complete compact verifier M/top-k
+ * coverage, a 256-expert metadata domain, and twenty launches per cell to
+ * reject scheduling-dependent grouped order.
+ */
+TEST(
+    Test__ROCmMoEKernel,
+    SmallFloatGrouping_AllCompactVerifierRowsAndTopKAreStable)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int kMaxRouteSlots = 64;
+    constexpr int kNumExperts = 256;
+    constexpr int kRepeatCount = 20;
+
+    float *d_indices = nullptr;
+    float *d_weights = nullptr;
+    int *d_counts = nullptr;
+    int *d_offsets = nullptr;
+    int *d_grouped_tokens = nullptr;
+    int *d_original_to_grouped = nullptr;
+    int *d_original_expert_ids = nullptr;
+    float *d_grouped_weights = nullptr;
+    int *d_active = nullptr;
+    ASSERT_EQ(hipMalloc(&d_indices, kMaxRouteSlots * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_weights, kMaxRouteSlots * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_counts, kNumExperts * sizeof(int)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_offsets, kNumExperts * sizeof(int)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_grouped_tokens, kMaxRouteSlots * sizeof(int)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_original_to_grouped, kMaxRouteSlots * sizeof(int)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_original_expert_ids, kMaxRouteSlots * sizeof(int)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_grouped_weights, kMaxRouteSlots * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_active, kMaxRouteSlots * sizeof(int)), hipSuccess);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+    for (const auto &test_case : llaminar2::test::smallFloatGroupingCases())
+    {
+        const int total_slots = test_case.verifier_rows * test_case.top_k;
+        SCOPED_TRACE(
+            "M=" + std::to_string(test_case.verifier_rows) +
+            " top_k=" + std::to_string(test_case.top_k));
+
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                d_indices,
+                test_case.routing_indices.data(),
+                static_cast<std::size_t>(total_slots) * sizeof(float),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                d_weights,
+                test_case.routing_weights.data(),
+                static_cast<std::size_t>(total_slots) * sizeof(float),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+
+        for (int repeat = 0; repeat < kRepeatCount; ++repeat)
+        {
+            SCOPED_TRACE("repeat=" + std::to_string(repeat));
+            ASSERT_TRUE(hipMoE_group_tokens_small_float(
+                d_indices,
+                d_weights,
+                d_counts,
+                d_offsets,
+                d_grouped_tokens,
+                d_original_to_grouped,
+                d_original_expert_ids,
+                d_grouped_weights,
+                d_active,
+                total_slots,
+                test_case.num_experts,
+                test_case.top_k,
+                test_case.max_active_experts,
+                0,
+                stream));
+
+            std::vector<int> counts(static_cast<std::size_t>(test_case.num_experts));
+            std::vector<int> offsets(static_cast<std::size_t>(test_case.num_experts));
+            std::vector<int> grouped_tokens(static_cast<std::size_t>(total_slots));
+            std::vector<int> original_to_grouped(static_cast<std::size_t>(total_slots));
+            std::vector<int> original_expert_ids(static_cast<std::size_t>(total_slots));
+            std::vector<float> grouped_weights(static_cast<std::size_t>(total_slots));
+            std::vector<int> active(
+                static_cast<std::size_t>(test_case.max_active_experts));
+
+            ASSERT_EQ(hipMemcpyAsync(
+                          counts.data(), d_counts,
+                          counts.size() * sizeof(int),
+                          hipMemcpyDeviceToHost, stream),
+                      hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(
+                          offsets.data(), d_offsets,
+                          offsets.size() * sizeof(int),
+                          hipMemcpyDeviceToHost, stream),
+                      hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(
+                          grouped_tokens.data(), d_grouped_tokens,
+                          grouped_tokens.size() * sizeof(int),
+                          hipMemcpyDeviceToHost, stream),
+                      hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(
+                          original_to_grouped.data(), d_original_to_grouped,
+                          original_to_grouped.size() * sizeof(int),
+                          hipMemcpyDeviceToHost, stream),
+                      hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(
+                          original_expert_ids.data(), d_original_expert_ids,
+                          original_expert_ids.size() * sizeof(int),
+                          hipMemcpyDeviceToHost, stream),
+                      hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(
+                          grouped_weights.data(), d_grouped_weights,
+                          grouped_weights.size() * sizeof(float),
+                          hipMemcpyDeviceToHost, stream),
+                      hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(
+                          active.data(), d_active,
+                          active.size() * sizeof(int),
+                          hipMemcpyDeviceToHost, stream),
+                      hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+            EXPECT_EQ(counts, test_case.expert_counts);
+            EXPECT_EQ(offsets, test_case.expert_offsets);
+            EXPECT_EQ(grouped_tokens, test_case.grouped_token_indices);
+            EXPECT_EQ(original_to_grouped, test_case.original_to_grouped);
+            EXPECT_EQ(original_expert_ids, test_case.original_expert_ids);
+            EXPECT_EQ(grouped_weights, test_case.grouped_weights);
+            EXPECT_EQ(active, test_case.active_expert_ids);
+        }
+    }
+
+    EXPECT_FALSE(hipMoE_group_tokens_small_float(
+        d_indices, d_weights, d_counts, d_offsets, d_grouped_tokens,
+        d_original_to_grouped, d_original_expert_ids, d_grouped_weights,
+        d_active,
+        /*total_slots=*/65,
+        kNumExperts,
+        /*top_k=*/1,
+        kMaxRouteSlots,
+        0,
+        stream));
+
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+    ASSERT_EQ(hipFree(d_indices), hipSuccess);
+    ASSERT_EQ(hipFree(d_weights), hipSuccess);
+    ASSERT_EQ(hipFree(d_counts), hipSuccess);
+    ASSERT_EQ(hipFree(d_offsets), hipSuccess);
+    ASSERT_EQ(hipFree(d_grouped_tokens), hipSuccess);
+    ASSERT_EQ(hipFree(d_original_to_grouped), hipSuccess);
+    ASSERT_EQ(hipFree(d_original_expert_ids), hipSuccess);
+    ASSERT_EQ(hipFree(d_grouped_weights), hipSuccess);
+    ASSERT_EQ(hipFree(d_active), hipSuccess);
 }
 
 TEST(Test__ROCmMoEKernel, VerifierRowsBF16RouteUsesDecodeEquivalentRouter)
