@@ -1,14 +1,7 @@
 # Llaminar v2 - Clean greenfield implementation
 cmake_minimum_required(VERSION 3.18)
 
-# Define custom build types BEFORE project() so they're recognized
-# Define custom build type: E2ERelease (Release + Snapshots for E2E testing)
-# Usage: cmake -DCMAKE_BUILD_TYPE=E2ERelease
-set(CMAKE_CXX_FLAGS_E2ERELEASE "-O3 -DNDEBUG" CACHE STRING "Flags for E2E Release builds")
-set(CMAKE_C_FLAGS_E2ERELEASE "-O3 -DNDEBUG" CACHE STRING "Flags for E2E Release builds")
-set(CMAKE_EXE_LINKER_FLAGS_E2ERELEASE "" CACHE STRING "Linker flags for E2E Release builds")
-mark_as_advanced(CMAKE_CXX_FLAGS_E2ERELEASE CMAKE_C_FLAGS_E2ERELEASE CMAKE_EXE_LINKER_FLAGS_E2ERELEASE)
-
+# Define custom build types BEFORE project() so they're recognized.
 # Define custom build type: Integration (Release + Snapshots + Debug symbols + Assertions)
 # Usage: cmake -DCMAKE_BUILD_TYPE=Integration
 # This enables optimized code with snapshot capture, backtraces for debugging, AND assertions.
@@ -16,11 +9,30 @@ mark_as_advanced(CMAKE_CXX_FLAGS_E2ERELEASE CMAKE_C_FLAGS_E2ERELEASE CMAKE_EXE_L
 # keeps our custom assertions active for integration testing.
 set(CMAKE_CXX_FLAGS_INTEGRATION "-O3 -g -DNDEBUG -DLLAMINAR_ENABLE_ASSERTIONS" CACHE STRING "Flags for Integration builds (Release + debug symbols + assertions)")
 set(CMAKE_C_FLAGS_INTEGRATION "-O3 -g -DNDEBUG -DLLAMINAR_ENABLE_ASSERTIONS" CACHE STRING "Flags for Integration builds (Release + debug symbols + assertions)")
+if(NOT DEFINED CMAKE_CUDA_FLAGS_INTEGRATION OR CMAKE_CUDA_FLAGS_INTEGRATION STREQUAL "")
+    set(CMAKE_CUDA_FLAGS_INTEGRATION "-O3 -g -DNDEBUG -DLLAMINAR_ENABLE_ASSERTIONS" CACHE STRING "CUDA flags for Integration builds (Release + debug symbols + assertions)" FORCE)
+endif()
+if(NOT DEFINED CMAKE_HIP_FLAGS_INTEGRATION OR CMAKE_HIP_FLAGS_INTEGRATION STREQUAL "")
+    set(CMAKE_HIP_FLAGS_INTEGRATION "-O3 -g -DNDEBUG -DLLAMINAR_ENABLE_ASSERTIONS" CACHE STRING "HIP flags for Integration builds (Release + debug symbols + assertions)" FORCE)
+endif()
 set(CMAKE_EXE_LINKER_FLAGS_INTEGRATION "" CACHE STRING "Linker flags for Integration builds")
-mark_as_advanced(CMAKE_CXX_FLAGS_INTEGRATION CMAKE_C_FLAGS_INTEGRATION CMAKE_EXE_LINKER_FLAGS_INTEGRATION)
+mark_as_advanced(
+    CMAKE_CXX_FLAGS_INTEGRATION
+    CMAKE_C_FLAGS_INTEGRATION
+    CMAKE_CUDA_FLAGS_INTEGRATION
+    CMAKE_HIP_FLAGS_INTEGRATION
+    CMAKE_EXE_LINKER_FLAGS_INTEGRATION)
 
-# Add custom build types to valid build types
-set(CMAKE_CONFIGURATION_TYPES "Debug;Release;E2ERelease;Integration" CACHE STRING "" FORCE)
+# Keep the supported configuration set closed. In particular, arbitrary
+# single-config names must fail during configuration instead of silently
+# inheriting empty compiler flags.
+set(LLAMINAR_SUPPORTED_BUILD_TYPES Debug Release Integration)
+set(CMAKE_CONFIGURATION_TYPES "${LLAMINAR_SUPPORTED_BUILD_TYPES}" CACHE STRING "" FORCE)
+if(CMAKE_BUILD_TYPE AND NOT CMAKE_BUILD_TYPE IN_LIST LLAMINAR_SUPPORTED_BUILD_TYPES)
+    message(FATAL_ERROR
+        "Unsupported CMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}'. "
+        "Choose Debug, Release, or Integration.")
+endif()
 
 # Project declaration - MUST come after custom build type definitions
 # The build type flags are picked up by the compiler setup during project()
@@ -1771,15 +1783,11 @@ target_include_directories(llaminar2_core PRIVATE
 
 # Enable pipeline snapshot capture (for parity testing and debugging)
 # - Debug builds: Always enabled (development/debugging)
-# - E2ERelease builds: Always enabled (optimized E2E parity testing)
 # - Integration builds: Always enabled (Release + debug symbols + snapshots)
 # - Release builds: Disabled by default (performance), enable with -DENABLE_SNAPSHOTS=ON
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
     target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
     message(STATUS "V2: Pipeline snapshot capture enabled (Debug build)")
-elseif(CMAKE_BUILD_TYPE MATCHES "E2ERelease")
-    target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
-    message(STATUS "V2: Pipeline snapshot capture enabled (E2ERelease build - optimized with snapshots for E2E testing)")
 elseif(CMAKE_BUILD_TYPE MATCHES "Integration")
     target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
     message(STATUS "V2: Pipeline snapshot capture enabled (Integration build - optimized with debug symbols and snapshots)")

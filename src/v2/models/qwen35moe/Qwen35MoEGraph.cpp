@@ -1655,9 +1655,9 @@ namespace llaminar2
         return Qwen35Graph::buildMTPGraph(depth_idx, bindings, input, output);
     }
 
-    void Qwen35MoEGraph::resetState()
+    void Qwen35MoEGraph::resetState(void *execution_stream)
     {
-        Qwen35Graph::resetState();
+        Qwen35Graph::resetState(execution_stream);
         prefix_runtime_device_rehydration_pending_ = false;
 
         if (config_.moe.decode_histogram)
@@ -1667,11 +1667,25 @@ namespace llaminar2
         {
             (void)key;
             if (table)
-                table->restoreInitialRuntimeState();
+                table->restoreInitialRuntimeState(execution_stream);
+        }
+
+        /*
+         * Runtime-table placement and transfer-directory occupancy are one
+         * publication transaction. The baseline table never references a
+         * rolling transfer slot, so retire every directory occupant on the
+         * same reset stream before RequestStateResetReady can be recorded.
+         */
+        for (auto &[key, directory] : moe_transfer_slot_directories_)
+        {
+            (void)key;
+            if (directory)
+                directory->resetRequestPublications(execution_stream);
         }
     }
 
-    void Qwen35MoEGraph::resetPrefixCacheRuntimeStateWithoutSnapshot()
+    void Qwen35MoEGraph::resetPrefixCacheRuntimeStateWithoutSnapshot(
+        void *execution_stream)
     {
         /*
          * Prefix restore without a model-runtime payload means the matched
@@ -1685,7 +1699,7 @@ namespace llaminar2
          * so graph construction does not silently rebuild ownership by relying
          * on stale dynamic placement.
          */
-        Qwen35Graph::resetState();
+        Qwen35Graph::resetState(execution_stream);
         prefix_runtime_device_rehydration_pending_ = false;
 
         if (config_.moe.decode_histogram)
@@ -1710,7 +1724,13 @@ namespace llaminar2
         {
             (void)key;
             if (table)
-                table->resetDecodeRuntimeState();
+                table->resetDecodeRuntimeState(execution_stream);
+        }
+        for (auto &[key, directory] : moe_transfer_slot_directories_)
+        {
+            (void)key;
+            if (directory)
+                directory->resetRequestPublications(execution_stream);
         }
     }
 
@@ -2649,6 +2669,7 @@ namespace llaminar2
             env.moe_rebalance.llep_prefill_min_routed_rows;
         const bool llep_prefill_cost_gate_passed =
             !llep_prefill_requested ||
+            grouped_main_verifier_layer ||
             llep_prefill_min_routed_rows == 0ULL ||
             llep_prefill_routed_rows >= llep_prefill_min_routed_rows;
         const bool llep_prefill_enabled =
@@ -2671,6 +2692,7 @@ namespace llaminar2
                 config_.tp_device_idx);
         if (llep_prefill_enabled &&
             require_full_llep_prefill_transfer &&
+            !grouped_main_verifier_layer &&
             !llep_prefill_transport_supported)
         {
             throw std::runtime_error(
@@ -2700,9 +2722,23 @@ namespace llaminar2
                 *local_tp_ctx,
                 device,
                 config_.tp_device_idx);
-        const bool prefill_llep_transfer_candidate =
+        /*
+         * Current-batch migration is an amortized long-prefill policy. Grouped
+         * MTP verifier rows instead split work only across the active bank's
+         * resident participants; importing a multi-megabyte expert payload for
+         * a handful of speculative rows is categorically uneconomical.
+         *
+         * Prefix restore remains an independent transport transaction. A
+         * verifier graph may therefore own compact transport resources for
+         * prefix rehydration while its current-batch assignment mode remains
+         * resident-only.
+         */
+        const bool current_batch_llep_transfer_candidate =
             (require_full_llep_prefill_transfer &&
-             llep_prefill_transport_supported) ||
+             llep_prefill_transport_supported &&
+             !grouped_main_verifier_layer);
+        const bool prefill_llep_transfer_candidate =
+            current_batch_llep_transfer_candidate ||
             prefix_runtime_rehydration_transport_supported;
         const bool graph_rebalance_transport_candidate =
             device_side_graph_rebalance_candidate ||
@@ -3231,6 +3267,106 @@ namespace llaminar2
                 return false;
             return graphRebalanceUsesTransferSlots();
         };
+        auto graphRebalanceTransferDirectoryKey =
+            [&](uint32_t transfer_slot_count) -> std::string
+        {
+            if (!graph_rebalance_transfer_profile.has_value())
+            {
+                throw std::logic_error(
+                    "Qwen35 MoE cannot identify a transfer directory without "
+                    "a NativeVNNI format profile");
+            }
+
+            /*
+             * This key identifies physical storage, not only a logical TP
+             * domain. graphRebalanceDomainKey() already includes the exact
+             * DeviceId and participant. Keeping all remaining allocation
+             * discriminators in this one builder prevents prefill and decode
+             * maintenance from silently inventing different cache identities.
+             */
+            std::ostringstream key;
+            key << graphRebalanceDomainKey()
+                << ":slots=" << transfer_slot_count;
+            for (const auto &spec :
+                 graph_rebalance_transfer_profile->allocation_specs)
+            {
+                key << ':' << spec.label
+                    << '=' << spec.N << 'x' << spec.K
+                    << ":cb" << static_cast<int>(spec.codebook_id)
+                    << ":pb" << spec.payload_bytes_per_block
+                    << ":asym" << (spec.is_asymmetric ? 1 : 0)
+                    << ":emins" << (spec.has_emins ? 1 : 0);
+            }
+            key << ":wire="
+                << graph_rebalance_transfer_profile->max_wire_payload_bytes;
+            return key.str();
+        };
+        auto getOrCreateGraphRebalanceTransferDirectory =
+            [&](const DeviceMoERebalanceConfig &rebalance_config,
+                uint32_t transfer_slot_count,
+                const char *context)
+            -> std::pair<
+                std::string,
+                std::shared_ptr<DeviceMoETransferSlotDirectory>>
+        {
+            if (!graph_rebalance_transfer_profile.has_value())
+            {
+                throw std::logic_error(
+                    "Qwen35 MoE transfer-directory creation requires a "
+                    "NativeVNNI format profile");
+            }
+
+            IBackend *backend = getBackendFor(device);
+            const int gpu_ordinal = gpuOrdinalForGraphDevice(device);
+            if (!backend || gpu_ordinal < 0)
+            {
+                throw std::runtime_error(
+                    "Qwen35 MoE could not resolve the transfer-directory "
+                    "backend for " +
+                    device.to_string() +
+                    (context ? std::string(" (") + context + ")"
+                             : std::string{}));
+            }
+
+            const std::string transfer_key =
+                graphRebalanceTransferDirectoryKey(transfer_slot_count);
+            auto existing =
+                moe_transfer_slot_directories_.find(transfer_key);
+            if (existing == moe_transfer_slot_directories_.end())
+            {
+                auto directory = DeviceMoETransferSlotDirectory::create(
+                    backend,
+                    device,
+                    gpu_ordinal,
+                    rebalance_config.participant_id,
+                    transfer_slot_count,
+                    *graph_rebalance_transfer_profile,
+                    gpuDirectRebalanceVramSafetyMarginBytes());
+                existing =
+                    moe_transfer_slot_directories_
+                        .emplace(transfer_key, std::move(directory))
+                        .first;
+            }
+            if (!existing->second)
+            {
+                throw std::logic_error(
+                    "Qwen35 MoE transfer-directory cache contains a null "
+                    "physical owner for " +
+                    transfer_key);
+            }
+
+            /*
+             * A permissive peer-memory topology can make an ownership mistake
+             * numerically invisible while turning each expert GEMV into
+             * fine-grained PCIe traffic. Treat reuse across a physical owner
+             * boundary as a fatal graph-construction error.
+             */
+            existing->second->requirePhysicalOwner(
+                device,
+                gpu_ordinal,
+                rebalance_config.participant_id);
+            return {transfer_key, existing->second};
+        };
         auto ensureGraphRebalanceTransferBindingOnly =
             [&](const char *context) -> const GraphSideRebalanceBinding *
         {
@@ -3275,35 +3411,18 @@ namespace llaminar2
                     (context ? std::string(" (") + context + ")" : std::string{}));
             }
 
-            IBackend *backend = getBackendFor(device);
-            const int gpu_ordinal = gpuOrdinalForGraphDevice(device);
-            if (!backend || gpu_ordinal < 0)
-            {
-                throw std::runtime_error(
-                    "Qwen35 MoE graph-side transfer binding could not resolve backend for " +
-                    device.to_string());
-            }
-
-            const uint32_t effective_layer_wave_count =
-                rebalance_config.layer_wave_count == 0u
-                    ? std::max<uint32_t>(
-                          1u,
-                          rebalance_config.layer_window_count == 0u
-                              ? rebalance_config.num_layers
-                              : rebalance_config.layer_window_count)
-                    : rebalance_config.layer_wave_count;
-            const uint64_t hot_cache_slots =
-                static_cast<uint64_t>(std::max<uint32_t>(
-                    1u,
-                    rebalance_config.max_hot_replicas_per_participant)) *
-                static_cast<uint64_t>(effective_layer_wave_count);
+            const uint64_t persistent_active_slots =
+                DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(
+                    rebalance_config);
             const uint64_t prefill_llep_slots =
                 prefill_llep_transfer_candidate
                     ? static_cast<uint64_t>(
                           std::max(1, env.moe_rebalance.device_rebalance_compact_payload_slots))
                     : 1ULL;
             const uint64_t requested_transfer_slots =
-                std::max<uint64_t>(hot_cache_slots, prefill_llep_slots);
+                std::max<uint64_t>(
+                    persistent_active_slots,
+                    prefill_llep_slots);
             const auto transfer_capacity =
                 DeviceMoETransferSlotDirectory::planBufferedCapacity(
                     requested_transfer_slots,
@@ -3311,35 +3430,16 @@ namespace llaminar2
                         std::max(1, env.moe_rebalance.gpu_direct_transfer_wave_experts)),
                     static_cast<uint32_t>(
                         std::max(1, env.moe_rebalance.gpu_direct_transfer_buffers)));
+            rebalance_config.active_transfer_slot_capacity =
+                transfer_capacity.active_slots;
+            rebalance_config.transfer_slot_directory_capacity =
+                transfer_capacity.total_slots;
             const uint32_t transfer_slot_count = transfer_capacity.total_slots;
-
-            std::ostringstream transfer_key_builder;
-            transfer_key_builder << graphRebalanceDomainKey()
-                                 << ":slots=" << transfer_slot_count;
-            for (const auto &spec : graph_rebalance_transfer_profile->allocation_specs)
-            {
-                transfer_key_builder << ':' << spec.label
-                                     << '=' << spec.N << 'x' << spec.K
-                                     << ":cb" << static_cast<int>(spec.codebook_id)
-                                     << ":pb" << spec.payload_bytes_per_block
-                                     << ":asym" << (spec.is_asymmetric ? 1 : 0)
-                                     << ":emins" << (spec.has_emins ? 1 : 0);
-            }
-            transfer_key_builder
-                << ":wire=" << graph_rebalance_transfer_profile->max_wire_payload_bytes;
-            const std::string transfer_key = transfer_key_builder.str();
-            auto &transfer_directory = moe_transfer_slot_directories_[transfer_key];
-            if (!transfer_directory)
-            {
-                transfer_directory = DeviceMoETransferSlotDirectory::create(
-                    backend,
-                    device,
-                    gpu_ordinal,
-                    rebalance_config.participant_id,
+            auto [transfer_key, transfer_directory] =
+                getOrCreateGraphRebalanceTransferDirectory(
+                    rebalance_config,
                     transfer_slot_count,
-                    *graph_rebalance_transfer_profile,
-                    gpuDirectRebalanceVramSafetyMarginBytes());
-            }
+                    context);
 
             const std::string rebalance_workspace = graphRebalanceWorkspaceName();
             /*
@@ -3808,28 +3908,9 @@ namespace llaminar2
                             (context ? std::string(" (") + context + ")" : std::string{}));
                     }
 
-                    IBackend *backend = getBackendFor(device);
-                    const int gpu_ordinal = gpuOrdinalForGraphDevice(device);
-                    if (!backend || gpu_ordinal < 0)
-                    {
-                        throw std::runtime_error(
-                            "Qwen35 MoE graph-side rebalance could not resolve backend for " +
-                            device.to_string());
-                    }
-
-                    const uint32_t effective_layer_wave_count =
-                        rebalance_config.layer_wave_count == 0u
-                            ? std::max<uint32_t>(
-                                  1u,
-                                  rebalance_config.layer_window_count == 0u
-                                      ? rebalance_config.num_layers
-                                      : rebalance_config.layer_window_count)
-                            : rebalance_config.layer_wave_count;
                     const uint64_t requested_transfer_slots =
-                        static_cast<uint64_t>(std::max<uint32_t>(
-                            1u,
-                            rebalance_config.max_hot_replicas_per_participant)) *
-                        static_cast<uint64_t>(effective_layer_wave_count);
+                        DeviceMoETransferSlotDirectory::
+                            persistentActiveSlotDemand(rebalance_config);
                     const auto transfer_capacity =
                         DeviceMoETransferSlotDirectory::planBufferedCapacity(
                             requested_transfer_slots,
@@ -3841,38 +3922,20 @@ namespace llaminar2
                                 std::max(
                                     1,
                                     env.moe_rebalance.gpu_direct_transfer_buffers)));
+                    rebalance_config.active_transfer_slot_capacity =
+                        transfer_capacity.active_slots;
+                    rebalance_config.transfer_slot_directory_capacity =
+                        transfer_capacity.total_slots;
                     const uint32_t transfer_slot_count =
                         transfer_capacity.total_slots;
-
-                    std::ostringstream transfer_key_builder;
-                    transfer_key_builder << domain_key
-                                         << ":slots=" << transfer_slot_count;
-                    for (const auto &spec : graph_rebalance_transfer_profile->allocation_specs)
-                    {
-                        transfer_key_builder << ':' << spec.label
-                                             << '=' << spec.N << 'x' << spec.K
-                                             << ":cb" << static_cast<int>(spec.codebook_id)
-                                             << ":pb" << spec.payload_bytes_per_block
-                                             << ":asym" << (spec.is_asymmetric ? 1 : 0)
-                                             << ":emins" << (spec.has_emins ? 1 : 0);
-                    }
-                    transfer_key_builder
-                        << ":wire=" << graph_rebalance_transfer_profile->max_wire_payload_bytes;
-                    transfer_key = transfer_key_builder.str();
-
-                    auto &transfer_directory =
-                        moe_transfer_slot_directories_[transfer_key];
-                    if (!transfer_directory)
-                    {
-                        transfer_directory = DeviceMoETransferSlotDirectory::create(
-                            backend,
-                            device,
-                            gpu_ordinal,
-                            rebalance_config.participant_id,
+                    auto directory_result =
+                        getOrCreateGraphRebalanceTransferDirectory(
+                            rebalance_config,
                             transfer_slot_count,
-                            *graph_rebalance_transfer_profile,
-                            gpuDirectRebalanceVramSafetyMarginBytes());
-                    }
+                            context);
+                    transfer_key = std::move(directory_result.first);
+                    auto transfer_directory =
+                        std::move(directory_result.second);
 
                     local_transfer_slots = transfer_directory->deviceEntries();
                     local_transfer_slot_count = transfer_directory->slotCount();
@@ -4361,8 +4424,11 @@ namespace llaminar2
                     prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident)
                 {
                     expert_params.prefill_llep_tp_ctx = local_tp_ctx;
-                    expert_params.prefill_llep_require_transfer_backing =
-                        require_full_llep_prefill_transfer;
+                    expert_params.prefill_llep_assignment_mode =
+                        current_batch_llep_transfer_candidate
+                            ? PrefillLLEPAssignmentMode::
+                                  TransferBackedCurrentBatch
+                            : PrefillLLEPAssignmentMode::ResidentOnly;
                 }
 
                 if (config_.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned)
@@ -4600,8 +4666,11 @@ namespace llaminar2
                     prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident)
                 {
                     expert_params.prefill_llep_tp_ctx = local_tp_ctx;
-                    expert_params.prefill_llep_require_transfer_backing =
-                        require_full_llep_prefill_transfer;
+                    expert_params.prefill_llep_assignment_mode =
+                        current_batch_llep_transfer_candidate
+                            ? PrefillLLEPAssignmentMode::
+                                  TransferBackedCurrentBatch
+                            : PrefillLLEPAssignmentMode::ResidentOnly;
                 }
                 const std::string domain_name = local_tp_fast_tier ? local_tp_fast_tier->domain : std::string{};
                 if (!prepareExpertParams(
@@ -5169,8 +5238,11 @@ namespace llaminar2
                     prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident)
                 {
                     expert_params.prefill_llep_tp_ctx = local_tp_ctx;
-                    expert_params.prefill_llep_require_transfer_backing =
-                        require_full_llep_prefill_transfer;
+                    expert_params.prefill_llep_assignment_mode =
+                        current_batch_llep_transfer_candidate
+                            ? PrefillLLEPAssignmentMode::
+                                  TransferBackedCurrentBatch
+                            : PrefillLLEPAssignmentMode::ResidentOnly;
                 }
                 if (!prepareExpertParams(expert_params, device))
                 {

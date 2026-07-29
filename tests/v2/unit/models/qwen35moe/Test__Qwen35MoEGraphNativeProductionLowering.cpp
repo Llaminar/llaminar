@@ -793,10 +793,88 @@ namespace llaminar2::test
         EXPECT_TRUE(expert_stage->hasPrefillLLEPTPContextForTesting())
             << "LLEP prefill must carry its LocalTP context so full "
                "current-batch row exchange can use grouped NCCL/RCCL collectives.";
+        EXPECT_EQ(
+            expert_stage->prefillLLEPAssignmentModeForTesting(),
+            PrefillLLEPAssignmentMode::TransferBackedCurrentBatch);
         EXPECT_TRUE(expert_stage->hasTransferBackedPrefillLLEPForTesting())
             << "LLEP prefill must carry compact transfer-slot backing; "
                "otherwise foreign current-batch spans silently collapse back to resident-only routing.";
         EXPECT_TRUE(expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting());
+    }
+
+    /**
+     * @brief Prove grouped verifier rows cannot inherit long-prefill migration.
+     *
+     * The production LLEP movement probe deliberately sets the routed-row
+     * threshold to zero and requests full compact transport. That environment
+     * must still leave MTP verifier rows resident-only: moving an expert payload
+     * in every MoE layer for a three-row verifier batch is not an economical
+     * grouped implementation. Prefix rehydration has a separate graph-build
+     * flag and is therefore unaffected by this current-batch policy assertion.
+     */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         LocalTPGroupedVerifierUsesResidentOnlyLLEPAssignment)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
+            {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
+        });
+        auto plan = makeLocalTPApportionedHotPlan();
+        ASSERT_FALSE(plan->domains.empty());
+        plan->domains[0].routed_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
+
+        GraphConfig config = makeConfig(plan);
+        config.default_device = DeviceId::rocm(0);
+        config.compute_all_position_logits = true;
+        config.moe.routed_assignment_policy =
+            RoutedExpertAssignmentPolicy::LeastLoadedResident;
+
+        MockLocalTPContext tp_ctx;
+        tp_ctx.setDevices(
+            {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+        tp_ctx.setBackend(CollectiveBackendType::RCCL);
+        tp_ctx.setRawAllgatherGraphCaptureSupported(true);
+        config.tp_ctx = &tp_ctx;
+        config.tp_device_idx = 0;
+
+        TensorArena weight_arena;
+        auto layer = makeLayerWeights(weight_arena);
+        TensorArena activation_arena;
+        auto buffers = makeActivationBuffers(activation_arena);
+
+        auto model_ctx =
+            makeTestingModelContextWithHotDomainExperts(config.n_layers);
+        Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        ComputeGraph graph = graph_builder.buildFFNGraph(
+            layer,
+            buffers,
+            /*layer_idx=*/0,
+            /*seq_len=*/3,
+            kBatchSize,
+            DeviceId::rocm(0));
+
+        const auto *expert_node =
+            graph.getNode("layer0_moe_expert_ffn_overlay_fast");
+        ASSERT_NE(expert_node, nullptr);
+        const auto *expert_stage =
+            dynamic_cast<const MoEExpertComputeStage *>(
+                expert_node->stage.get());
+        ASSERT_NE(expert_stage, nullptr);
+
+        EXPECT_EQ(
+            expert_stage->routedExpertAssignmentPolicyForTesting(),
+            RoutedExpertAssignmentPolicy::LeastLoadedResident);
+        EXPECT_TRUE(expert_stage->usesRuntimePrefillGroupingForTesting());
+        EXPECT_TRUE(expert_stage->hasPrefillLLEPTPContextForTesting());
+        EXPECT_EQ(
+            expert_stage->prefillLLEPAssignmentModeForTesting(),
+            PrefillLLEPAssignmentMode::ResidentOnly);
+        EXPECT_FALSE(expert_stage->hasTransferBackedPrefillLLEPForTesting())
+            << "Grouped verifier rows must never execute current-batch expert "
+               "payload transport, even when long-prefill full mode is enabled.";
+        EXPECT_TRUE(
+            expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting());
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,

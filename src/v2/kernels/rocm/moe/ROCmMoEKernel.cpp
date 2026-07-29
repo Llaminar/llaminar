@@ -6732,7 +6732,7 @@ namespace llaminar2
             descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable,
             /*allow_router_q8_reuse=*/true,
             descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable
-                ? "runtime"
+                ? "runtime_compact_table"
                 : "runtime_static_table");
     }
 
@@ -6803,6 +6803,76 @@ namespace llaminar2
             !ensureGroupedPrefillScratchCapacity(top_k, d_model, intermediate))
         {
             return false;
+        }
+
+        /*
+         * Runtime placement changes descriptor values while the graph-owned
+         * workspace identity remains stable.  Materialize the active device
+         * bank into compact projection tables before launching decode GEMVs.
+         *
+         * The former runtime kernels indexed the full DeviceMoELayerRuntime
+         * object from every output lane.  That structure contains two complete
+         * 256-expert banks plus routing and histogram state, so a single
+         * transfer-backed expert forced every decode projection through a
+         * cache-hostile descriptor walk.  LLEP consequently made otherwise
+         * ordinary Qwen 3.6 layers tens of milliseconds slower.
+         *
+         * This publication is a device-to-device kernel on the exact producer
+         * stream.  It is graph capturable, performs no allocation or host
+         * transfer, and feeds the same compact table kernels used by immutable
+         * placement.  Therefore mutable and immutable placement differ only in
+         * where the table values are published, not in GEMV arithmetic.
+         */
+        const DeviceNativeVNNIMatrixDesc *decode_gate_descs =
+            gateup_table.device_gate_descs;
+        const DeviceNativeVNNIMatrixDesc *decode_up_descs =
+            gateup_table.device_up_descs;
+        const DeviceNativeVNNIMatrixDesc *decode_down_descs =
+            down_table.device_descs;
+        if (use_runtime_descriptors)
+        {
+            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            if (!bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                    gateup_table.workspace_slot,
+                    gateup_table.num_experts,
+                    &runtime_gate_descs,
+                    "ROCm runtime decode gate descriptors") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,
+                    gateup_table.workspace_slot,
+                    gateup_table.num_experts,
+                    &runtime_up_descs,
+                    "ROCm runtime decode up descriptors") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                    down_table.workspace_slot,
+                    down_table.num_experts,
+                    &runtime_down_descs,
+                    "ROCm runtime decode down descriptors"))
+            {
+                LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
+                          "failed to bind graph-owned runtime descriptor slots");
+                return false;
+            }
+            if (!hipMoE_materialize_runtime_prefill_descriptor_tables(
+                    runtime_layer,
+                    runtime_gate_descs,
+                    runtime_up_descs,
+                    runtime_down_descs,
+                    gateup_table.num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
+                          "failed to materialize compact runtime descriptor tables");
+                return false;
+            }
+            decode_gate_descs = runtime_gate_descs;
+            decode_up_descs = runtime_up_descs;
+            decode_down_descs = runtime_down_descs;
         }
 
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
@@ -6919,45 +6989,26 @@ namespace llaminar2
         bool swiglu_prequantized = false;
         if (use_gateup_swiglu_quant_fused)
         {
-            gateup_ok = use_runtime_descriptors
-                            ? rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_runtime_kpart(
-                                  d_hidden,
-                                  runtime_layer,
-                                  d_expert_ids,
-                                  gateup_hidden_int8,
-                                  gateup_hidden_scales,
-                                  reuse_router_q8_hidden,
-                                  d_grouped_gateup_gate_partials_,
-                                  d_grouped_gateup_up_partials_,
-                                  d_grouped_swiglu_int8_,
-                                  d_grouped_swiglu_scales_,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  gateup_table.num_experts,
-                                  gateup_table.codebook_id,
-                                  gateup_k_partitions,
-                                  device_ordinal_,
-                                  stream)
-                            : rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart(
-                                  d_hidden,
-                                  gateup_table.device_gate_descs,
-                                  gateup_table.device_up_descs,
-                                  d_expert_ids,
-                                  gateup_hidden_int8,
-                                  gateup_hidden_scales,
-                                  reuse_router_q8_hidden,
-                                  d_grouped_gateup_gate_partials_,
-                                  d_grouped_gateup_up_partials_,
-                                  d_grouped_swiglu_int8_,
-                                  d_grouped_swiglu_scales_,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  gateup_table.codebook_id,
-                                  gateup_k_partitions,
-                                  device_ordinal_,
-                                  stream);
+            gateup_ok =
+                rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart(
+                    d_hidden,
+                    decode_gate_descs,
+                    decode_up_descs,
+                    d_expert_ids,
+                    gateup_hidden_int8,
+                    gateup_hidden_scales,
+                    reuse_router_q8_hidden,
+                    d_grouped_gateup_gate_partials_,
+                    d_grouped_gateup_up_partials_,
+                    d_grouped_swiglu_int8_,
+                    d_grouped_swiglu_scales_,
+                    top_k,
+                    intermediate,
+                    d_model,
+                    gateup_table.codebook_id,
+                    gateup_k_partitions,
+                    device_ordinal_,
+                    stream);
             swiglu_prequantized = gateup_ok;
             if (!gateup_ok)
             {
@@ -6969,45 +7020,26 @@ namespace llaminar2
 
         if (!gateup_ok && use_gateup_kpart)
         {
-            gateup_ok = use_runtime_descriptors
-                            ? rocmMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
-                                  d_hidden,
-                                  runtime_layer,
-                                  d_expert_ids,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  gateup_hidden_int8,
-                                  gateup_hidden_scales,
-                                  reuse_router_q8_hidden,
-                                  d_grouped_gateup_gate_partials_,
-                                  d_grouped_gateup_up_partials_,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  gateup_table.num_experts,
-                                  gateup_table.codebook_id,
-                                  gateup_k_partitions,
-                                  device_ordinal_,
-                                  stream)
-                            : rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                                  d_hidden,
-                                  gateup_table.device_gate_descs,
-                                  gateup_table.device_up_descs,
-                                  d_expert_ids,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  gateup_hidden_int8,
-                                  gateup_hidden_scales,
-                                  reuse_router_q8_hidden,
-                                  d_grouped_gateup_gate_partials_,
-                                  d_grouped_gateup_up_partials_,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  gateup_table.codebook_id,
-                                  gateup_k_partitions,
-                                  device_ordinal_,
-                                  stream);
+            gateup_ok =
+                rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+                    d_hidden,
+                    decode_gate_descs,
+                    decode_up_descs,
+                    d_expert_ids,
+                    d_gate_ptrs,
+                    d_up_ptrs,
+                    gateup_hidden_int8,
+                    gateup_hidden_scales,
+                    reuse_router_q8_hidden,
+                    d_grouped_gateup_gate_partials_,
+                    d_grouped_gateup_up_partials_,
+                    top_k,
+                    intermediate,
+                    d_model,
+                    gateup_table.codebook_id,
+                    gateup_k_partitions,
+                    device_ordinal_,
+                    stream);
             if (!gateup_ok)
             {
                 LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
@@ -7018,39 +7050,22 @@ namespace llaminar2
 
         if (!gateup_ok && !use_gateup_kpart)
         {
-            gateup_ok = use_runtime_descriptors
-                            ? rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
-                                  d_hidden,
-                                  runtime_layer,
-                                  d_expert_ids,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  gateup_hidden_int8,
-                                  gateup_hidden_scales,
-                                  reuse_router_q8_hidden,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  gateup_table.num_experts,
-                                  gateup_table.codebook_id,
-                                  device_ordinal_,
-                                  stream)
-                            : rocmMoE_grouped_gate_up_native_vnni_decode_table(
-                                  d_hidden,
-                                  gateup_table.device_gate_descs,
-                                  gateup_table.device_up_descs,
-                                  d_expert_ids,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  gateup_hidden_int8,
-                                  gateup_hidden_scales,
-                                  reuse_router_q8_hidden,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  gateup_table.codebook_id,
-                                  device_ordinal_,
-                                  stream);
+            gateup_ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
+                d_hidden,
+                decode_gate_descs,
+                decode_up_descs,
+                d_expert_ids,
+                d_gate_ptrs,
+                d_up_ptrs,
+                gateup_hidden_int8,
+                gateup_hidden_scales,
+                reuse_router_q8_hidden,
+                top_k,
+                intermediate,
+                d_model,
+                gateup_table.codebook_id,
+                device_ordinal_,
+                stream);
         }
         if (!gateup_ok)
             return false;
@@ -7065,73 +7080,39 @@ namespace llaminar2
             return false;
         }
 
-        const bool down_ok = use_runtime_descriptors
-                                 ? (use_parallel_down
-                                        ? rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime_parallel(
-                                              d_down_gate_ptrs,
-                                              d_down_up_ptrs,
-                                              runtime_layer,
-                                              d_expert_ids,
-                                              d_weights,
-                                              d_grouped_swiglu_int8_,
-                                              d_grouped_swiglu_scales_,
-                                              swiglu_prequantized,
-                                              d_output,
-                                              top_k,
-                                              d_model,
-                                              intermediate,
-                                              down_table.num_experts,
-                                              down_table.codebook_id,
-                                              device_ordinal_,
-                                              stream)
-                                        : rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime(
-                                              d_down_gate_ptrs,
-                                              d_down_up_ptrs,
-                                              runtime_layer,
-                                              d_expert_ids,
-                                              d_weights,
-                                              d_grouped_swiglu_int8_,
-                                              d_grouped_swiglu_scales_,
-                                              d_output,
-                                              top_k,
-                                              d_model,
-                                              intermediate,
-                                              down_table.num_experts,
-                                              down_table.codebook_id,
-                                              device_ordinal_,
-                                              stream))
-                                 : (use_parallel_down
-                                        ? rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
-                                              d_down_gate_ptrs,
-                                              d_down_up_ptrs,
-                                              down_table.device_descs,
-                                              d_expert_ids,
-                                              d_weights,
-                                              d_grouped_swiglu_int8_,
-                                              d_grouped_swiglu_scales_,
-                                              swiglu_prequantized,
-                                              d_output,
-                                              top_k,
-                                              d_model,
-                                              intermediate,
-                                              down_table.codebook_id,
-                                              device_ordinal_,
-                                              stream)
-                                        : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
-                                              d_down_gate_ptrs,
-                                              d_down_up_ptrs,
-                                              down_table.device_descs,
-                                              d_expert_ids,
-                                              d_weights,
-                                              d_grouped_swiglu_int8_,
-                                              d_grouped_swiglu_scales_,
-                                              d_output,
-                                              top_k,
-                                              d_model,
-                                              intermediate,
-                                              down_table.codebook_id,
-                                              device_ordinal_,
-                                              stream));
+        const bool down_ok =
+            use_parallel_down
+                ? rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
+                      d_down_gate_ptrs,
+                      d_down_up_ptrs,
+                      decode_down_descs,
+                      d_expert_ids,
+                      d_weights,
+                      d_grouped_swiglu_int8_,
+                      d_grouped_swiglu_scales_,
+                      swiglu_prequantized,
+                      d_output,
+                      top_k,
+                      d_model,
+                      intermediate,
+                      down_table.codebook_id,
+                      device_ordinal_,
+                      stream)
+                : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+                      d_down_gate_ptrs,
+                      d_down_up_ptrs,
+                      decode_down_descs,
+                      d_expert_ids,
+                      d_weights,
+                      d_grouped_swiglu_int8_,
+                      d_grouped_swiglu_scales_,
+                      d_output,
+                      top_k,
+                      d_model,
+                      intermediate,
+                      down_table.codebook_id,
+                      device_ordinal_,
+                      stream);
         if (!down_ok)
             return false;
 

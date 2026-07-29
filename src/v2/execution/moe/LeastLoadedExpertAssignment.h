@@ -523,9 +523,17 @@ namespace llaminar2::least_loaded_ep
         if (source_participant == destination_participant)
             return true;
 
-        for (uint32_t i = 0; i < status.weight_transfer_count; ++i)
+        /*
+         * Transfers are emitted while visiting each expert exactly once in
+         * canonical sorted order.  Entries for one expert are consequently a
+         * contiguous suffix.  Walking that suffix backwards avoids an O(T^2)
+         * scan across unrelated experts without changing duplicate semantics.
+         */
+        for (uint32_t i = status.weight_transfer_count; i > 0u; --i)
         {
-            const auto &transfer = transfers[i];
+            const auto &transfer = transfers[i - 1u];
+            if (transfer.expert != expert)
+                break;
             if (transfer.expert == expert &&
                 transfer.source_participant == source_participant &&
                 transfer.destination_participant == destination_participant)
@@ -574,9 +582,11 @@ namespace llaminar2::least_loaded_ep
             return true;
         if (!transfers)
             return false;
-        for (uint32_t i = 0; i < status.weight_transfer_count; ++i)
+        for (uint32_t i = status.weight_transfer_count; i > 0u; --i)
         {
-            const auto &transfer = transfers[i];
+            const auto &transfer = transfers[i - 1u];
+            if (transfer.expert != expert)
+                break;
             if (transfer.expert == expert &&
                 transfer.source_participant == source_participant &&
                 transfer.destination_participant == destination_participant)
@@ -1251,7 +1261,8 @@ namespace llaminar2::least_loaded_ep
         LeastLoadedExpertWeightTransfer *transfers,
         uint32_t transfer_capacity,
         LeastLoadedExpertAssignmentStatus *status_out,
-        const uint32_t *expert_resident_participant_masks = nullptr) noexcept
+        const uint32_t *expert_resident_participant_masks = nullptr,
+        bool workspace_experts_are_sorted = false) noexcept
     {
         LeastLoadedExpertAssignmentStatus status{};
         if (status_out)
@@ -1337,10 +1348,19 @@ namespace llaminar2::least_loaded_ep
                        ? config.max_weight_transfers
                        : transfer_capacity);
 
-        sortExpertsByLoadDescending(
-            expert_loads,
-            config.expert_count,
-            workspace.sorted_experts);
+        /*
+         * GPU planners may populate this deterministic order cooperatively
+         * before entering the inherently ordered assignment pass.  Host
+         * callers retain the compact scalar sort, while GPU callers avoid
+         * repeating an O(E^2) insertion sort on a single device lane.
+         */
+        if (!workspace_experts_are_sorted)
+        {
+            sortExpertsByLoadDescending(
+                expert_loads,
+                config.expert_count,
+                workspace.sorted_experts);
+        }
 
         for (uint32_t order = 0; order < config.expert_count; ++order)
         {

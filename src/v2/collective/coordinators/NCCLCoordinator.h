@@ -75,7 +75,10 @@ namespace llaminar2
          * @brief Initialize the coordinator with CUDA device ordinals
          *
          * Spawns the coordinator thread, creates per-device streams and events,
-         * and initializes NCCL communicators using ncclCommInitAll.
+         * and initializes one configured NCCL rank per device. Because every
+         * participant is inside this process, communicator construction selects
+         * NCCL's Socket network module while preserving CUDA P2P and shared
+         * memory as higher-priority local transports.
          *
          * @param device_ordinals CUDA device ordinals (e.g., {0, 1} for GPUs 0 and 1)
          * @return true if initialization succeeded

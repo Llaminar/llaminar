@@ -28,6 +28,7 @@
 #include "../../moe/DeviceMoERebalanceController.h"
 
 #include <memory>
+#include <cstdint>
 #include <string>
 #include <stdexcept>
 #include <vector>
@@ -46,6 +47,43 @@ namespace llaminar2
     class GpuExpertTransferStagingPool;
     class ILocalTPContext;
     class DeviceMoERebalanceTransferState;
+
+    /**
+     * @brief Select how a grouped LLEP invocation assigns the current batch.
+     *
+     * This policy is deliberately independent of the physical transport mode.
+     * A stage can own compact NCCL/RCCL transport resources because a prefix
+     * restore must rehydrate persistent expert payloads while still assigning
+     * the current grouped verifier batch exclusively across experts that are
+     * already resident.
+     *
+     * Grouped verifier rows always use @ref ResidentOnly. Moving an expert
+     * payload for a handful of speculative rows costs far more than executing
+     * those rows on an existing owner or replica, and it would place a payload
+     * collective in every MoE layer of every verifier replay. Long prefill may
+     * select @ref TransferBackedCurrentBatch after its routed-row economy gate
+     * has passed.
+     */
+    enum class PrefillLLEPAssignmentMode : uint8_t
+    {
+        /**
+         * Split rows only across the active bank's resident participant mask.
+         *
+         * This mode never creates or consumes a current-batch weight-transfer
+         * plan. Prefix-runtime rehydration, when requested, is a separate
+         * transaction that completes before this assignment begins.
+         */
+        ResidentOnly = 0,
+
+        /**
+         * Plan missing arrivals, execute compact payload collectives, publish
+         * the resulting runtime bank, and then apply the assignment spans.
+         *
+         * Graph construction may select this only for an amortizable long
+         * prefill in a homogeneous graph-capturable LocalTP domain.
+         */
+        TransferBackedCurrentBatch = 1,
+    };
 
     /**
      * @brief Unified MoE FFN stage (router + expert execution + combine)
@@ -232,7 +270,16 @@ namespace llaminar2
             uint32_t prefill_llep_payload_slot_capacity = 0;
             DeviceMoERebalanceTransferMode prefill_llep_transfer_mode =
                 DeviceMoERebalanceTransferMode::ResidentOnly;
-            bool prefill_llep_require_transfer_backing = false;
+            /**
+             * @brief Current-batch LLEP assignment policy fixed at graph build.
+             *
+             * Do not infer this policy from whether transport pointers happen
+             * to be bound. Prefix restore legitimately binds those pointers to
+             * a resident-only verifier stage, so pointer presence is not proof
+             * that current-batch expert migration is legal.
+             */
+            PrefillLLEPAssignmentMode prefill_llep_assignment_mode =
+                PrefillLLEPAssignmentMode::ResidentOnly;
             /**
              * @brief Prepend exact prefix-placement payload reconstruction.
              *
@@ -340,6 +387,10 @@ namespace llaminar2
         bool hasMoERuntimeTableForTesting() const { return params_.moe_runtime_table != nullptr; }
         bool hasPrefillLLEPTPContextForTesting() const { return params_.prefill_llep_tp_ctx != nullptr; }
         bool hasTransferBackedPrefillLLEPForTesting() const { return hasTransferBackedPrefillLLEP(); }
+        PrefillLLEPAssignmentMode prefillLLEPAssignmentModeForTesting() const noexcept
+        {
+            return params_.prefill_llep_assignment_mode;
+        }
         const std::string &prefillLLEPWorkspaceNameForTesting() const
         {
             return params_.prefill_llep_workspace_name;
@@ -524,7 +575,8 @@ namespace llaminar2
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
         bool needsGraphLaunchPreparation() const override
         {
-            return hasTransferBackedPrefillLLEP();
+            return requestsTransferBackedCurrentBatchPrefillLLEP() ||
+                   params_.prefix_runtime_device_rehydration;
         }
         /**
          * @brief Drop per-request fused decode warmup state.
@@ -913,6 +965,8 @@ namespace llaminar2
         TensorBase *effectiveSafeCompositeSharedGateInput() const;
         bool executeSafeCombinedSharedVerifierComposite(IMoEKernel *kernel) const;
         bool executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens);
+        bool requestsTransferBackedCurrentBatchPrefillLLEP() const noexcept;
+        bool hasValidCompactLLEPTransferBinding() const;
         bool hasTransferBackedPrefillLLEP() const;
         bool executeTransferBackedPrefillLLEPMovement(
             IMoEKernel *kernel,

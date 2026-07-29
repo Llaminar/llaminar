@@ -2693,7 +2693,7 @@ namespace llaminar2
      *
      * @code
      *   LLAMINAR_ROCM_TRACE_COHERENCE=1 \
-     *   ./build_v2_e2e_release/llaminar2 -m model.gguf -p "test"
+     *   ./build_v2_release/llaminar2 -m model.gguf -p "test"
      * @endcode
      */
     struct ROCmConfig

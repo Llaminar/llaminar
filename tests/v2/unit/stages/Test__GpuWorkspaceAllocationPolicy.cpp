@@ -1597,9 +1597,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CompositeMoEStagesPublishConditionalCol
         "bool MoEExpertComputeStage::isCollectiveStage() const",
         "bool MoEExpertComputeStage::isGraphCapturable() const");
     EXPECT_NE(
-        expert_contract.find("hasTransferBackedPrefillLLEP()"),
+        expert_contract.find(
+            "requestsTransferBackedCurrentBatchPrefillLLEP()"),
         std::string::npos)
-        << "Only the full transfer-backed LLEP instance embeds raw collectives.";
+        << "The typed graph-build request must classify transfer-backed LLEP "
+           "as collective before runtime binding validation.";
 
     EXPECT_NE(
         rebalance_header.find("bool isCollectiveStage() const override;"),
@@ -7641,12 +7643,13 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GpuMoERebalanceProjectionRequiresPhysic
             "__device__ __forceinline__ bool rebalance_transfer_slot_ready(");
         const auto compact_source_entry_ready =
             removeAsciiWhitespace(stripCommentsAndStringLiterals(source_entry_ready));
-        const auto copy_status = sliceBetween(
+        const auto apply_transaction_gate = sliceBetween(
             source,
-            "__device__ __forceinline__ bool rebalance_copy_status_ok(",
-            "__device__ __forceinline__ uint32_t rebalance_expected_payload_arrivals(");
-        const auto compact_copy_status =
-            removeAsciiWhitespace(stripCommentsAndStringLiterals(copy_status));
+            "__device__ __forceinline__ bool rebalance_apply_transaction_blocked(",
+            "__device__ __forceinline__ bool rebalance_config_ok(");
+        const auto compact_apply_transaction_gate =
+            removeAsciiWhitespace(
+                stripCommentsAndStringLiterals(apply_transaction_gate));
 
         EXPECT_EQ(compact.find("runtime_participant_bit(candidate_desc.owner_participant)"),
                   std::string::npos)
@@ -7738,9 +7741,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GpuMoERebalanceProjectionRequiresPhysic
         EXPECT_EQ(compact_materialize.find("resident_mask|=llaminar2::moe_rebalance_policy::participantBit(transfer_source)"),
                   std::string::npos)
             << backend << " materialization must not manufacture source residency.";
-        EXPECT_NE(compact_copy_status.find("status.missing_source_descriptors==0u"),
+        EXPECT_NE(
+            compact_apply_transaction_gate.find(
+                "status->missing_source_descriptors!=0u"),
                   std::string::npos)
-            << backend << " transfer publication must reject source-side pack failures.";
+            << backend << " transaction preflight must block all bank mutation "
+                          "after a source-side pack failure.";
     }
 }
 

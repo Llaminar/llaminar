@@ -22,6 +22,7 @@
 
 #ifdef HAVE_NCCL
 #include "../backends/NCCLDynamicLoader.h"
+#include "../backends/NCCLNetworkPolicy.h"
 // Use the dynamically loaded NCCL types and functions
 namespace nccl = llaminar2::nccl_dynamic;
 #endif
@@ -571,24 +572,85 @@ namespace llaminar2
             LOG_TRACE("[NCCLCoordinator] Created stream and event for device " << device_ordinals_[i]);
         }
 
-        // Step 2: Generate NCCL unique ID
-        // Step 2: Initialize NCCL communicators using ncclCommInitAll.
-        // This is the correct API for single-process multi-GPU initialization.
-        // The GroupStart/CommInitRank/GroupEnd pattern has a shared memory race
-        // condition in NCCL's topology exchange layer that can cause failures
-        // with multiple GPUs (threads race to attach to /dev/shm segments).
-        std::vector<nccl::ncclComm_t> nccl_comms(num_devices_);
-        nccl::ncclResult_t r = nccl::ncclCommInitAll(nccl_comms.data(), num_devices_, device_ordinals_.data());
-        if (r != nccl::ncclSuccess)
+        // Step 2: Create the shared communicator identity. Each rank below
+        // receives this exact value, which lets NCCL construct one clique.
+        nccl::ncclUniqueId unique_id{};
+        const nccl::ncclResult_t id_result = nccl::ncclGetUniqueId(&unique_id);
+        if (id_result != nccl::ncclSuccess)
         {
-            last_error_ = std::string("ncclCommInitAll failed: ") + nccl::ncclGetErrorString(r);
+            last_error_ = std::string("ncclGetUniqueId failed: ") +
+                          nccl::ncclGetErrorString(id_result);
             LOG_ERROR("[NCCLCoordinator] " << last_error_);
             cleanupOnThread();
             return;
         }
+
+        // Step 3: Initialize all ranks concurrently. Blocking rank
+        // initialization is a clique operation: launching one host thread per
+        // rank allows every participant to rendezvous without the global
+        // environment mutation required by ncclCommInitAll.
+        //
+        // netName configures only NCCL's network module. NCCL still evaluates
+        // CUDA P2P first and shared memory second, so enabling P2P on this host
+        // in the future requires no code change.
+        constexpr std::string_view network_module =
+            ncclNetworkModuleName(NCCLNetworkModule::Socket);
+        std::vector<nccl::ncclResult_t> init_results(
+            num_devices_,
+            nccl::ncclInternalError);
+        std::vector<std::string> cuda_errors(num_devices_);
+        std::vector<std::thread> init_threads;
+        init_threads.reserve(num_devices_);
+
         for (int i = 0; i < num_devices_; ++i)
         {
-            comms_[i] = static_cast<void *>(nccl_comms[i]);
+            init_threads.emplace_back([&, i]()
+                                      {
+                const cudaError_t set_device_result =
+                    cudaSetDevice(device_ordinals_[i]);
+                if (set_device_result != cudaSuccess)
+                {
+                    cuda_errors[i] = cudaGetErrorString(set_device_result);
+                    return;
+                }
+
+                nccl::ncclComm_t comm = nullptr;
+                init_results[i] = nccl::ncclCommInitRankWithNetwork(
+                    &comm,
+                    num_devices_,
+                    unique_id,
+                    i,
+                    network_module.data());
+                if (init_results[i] == nccl::ncclSuccess)
+                {
+                    comms_[i] = static_cast<void *>(comm);
+                } });
+        }
+
+        for (std::thread &thread : init_threads)
+        {
+            thread.join();
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!cuda_errors[i].empty())
+            {
+                last_error_ = "cudaSetDevice failed for NCCL rank " +
+                              std::to_string(i) + ": " + cuda_errors[i];
+                LOG_ERROR("[NCCLCoordinator] " << last_error_);
+                cleanupOnThread();
+                return;
+            }
+            if (init_results[i] != nccl::ncclSuccess)
+            {
+                last_error_ = "ncclCommInitRankConfig failed for NCCL rank " +
+                              std::to_string(i) + ": " +
+                              nccl::ncclGetErrorString(init_results[i]);
+                LOG_ERROR("[NCCLCoordinator] " << last_error_);
+                cleanupOnThread();
+                return;
+            }
             LOG_TRACE("[NCCLCoordinator] Initialized NCCL comm for device " << device_ordinals_[i]);
         }
 

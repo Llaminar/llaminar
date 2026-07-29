@@ -341,16 +341,13 @@ function(add_v2_test TEST_NAME)
         list(APPEND MPI_CMD --oversubscribe)
     endif()
     
-    # Integration tests use build_v2_integration (Release + snapshots + debug symbols)
-    # E2E tests use build_v2_e2e_release
-    # Unit tests use current build (Debug or whatever is configured)
+    # Integration tests use build_v2_integration (Release + snapshots + debug symbols).
+    # Every other test uses the current build. Server E2E tests are registered
+    # only by Release configurations below, so they exercise deployable code.
     set(USE_INTEGRATION_BUILD FALSE)
-    set(USE_E2E_BUILD FALSE)
     if(CMAKE_BUILD_TYPE MATCHES "Debug")
         if("${ARG_LABELS}" MATCHES "Integration")
             set(USE_INTEGRATION_BUILD TRUE)
-        elseif("${ARG_LABELS}" MATCHES "E2E")
-            set(USE_E2E_BUILD TRUE)
         endif()
     endif()
     
@@ -366,21 +363,6 @@ function(add_v2_test TEST_NAME)
             set(EXECUTABLE_PATH "${INTEGRATION_BUILD_DIR}/tests/v2/${TARGET_NAME}")
         else()
             set(EXECUTABLE_PATH "${INTEGRATION_BUILD_DIR}/tests/v2/${EXECUTABLE_NAME}")
-        endif()
-        
-        list(REMOVE_AT ARG_COMMAND 0)
-        set(FINAL_COMMAND ${EXECUTABLE_PATH} ${ARG_COMMAND})
-    elseif(USE_E2E_BUILD)
-        # Use E2E Release build (build_v2_e2e_release)
-        set(E2E_BUILD_DIR "${CMAKE_SOURCE_DIR}/../../build_v2_e2e_release")
-        list(GET ARG_COMMAND 0 EXECUTABLE_TARGET)
-        get_filename_component(EXECUTABLE_NAME ${EXECUTABLE_TARGET} NAME)
-        
-        if(EXECUTABLE_TARGET MATCHES "\\$<TARGET_FILE:")
-            string(REGEX REPLACE ".*TARGET_FILE:([^>]+)>.*" "\\1" TARGET_NAME "${EXECUTABLE_TARGET}")
-            set(EXECUTABLE_PATH "${E2E_BUILD_DIR}/tests/v2/${TARGET_NAME}")
-        else()
-            set(EXECUTABLE_PATH "${E2E_BUILD_DIR}/tests/v2/${EXECUTABLE_NAME}")
         endif()
         
         list(REMOVE_AT ARG_COMMAND 0)
@@ -565,9 +547,6 @@ find_package(GTest REQUIRED)
 # CRITICAL: Must match core library definition to avoid ODR violations!
 # We also set a CMake variable for conditional test registration.
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
-    add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
-    set(ENABLE_PIPELINE_SNAPSHOTS TRUE)
-elseif(CMAKE_BUILD_TYPE MATCHES "E2ERelease")
     add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
     set(ENABLE_PIPELINE_SNAPSHOTS TRUE)
 elseif(CMAKE_BUILD_TYPE MATCHES "Integration")
@@ -1969,6 +1948,29 @@ add_test(NAME V2_Unit_ServerGraphCapturePerfPolicy
 )
 set_tests_properties(V2_Unit_ServerGraphCapturePerfPolicy PROPERTIES
     LABELS "V2;Unit;E2E;Server;GPU;GraphCapture;PerfStats;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_AcceleratorBuildTypeFlags
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_accelerator_build_type_flags.py
+            --repo-root ${CMAKE_SOURCE_DIR}/../..
+            --compile-commands ${CMAKE_BINARY_DIR}/compile_commands.json
+            --build-dir ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(V2_Unit_AcceleratorBuildTypeFlags PROPERTIES
+    LABELS "V2;Unit;BuildSystem;CUDA;ROCm;Performance;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_ServerE2EUsesRelease
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_server_e2e_release_contract.py
+            --repo-root ${CMAKE_SOURCE_DIR}/../..
+            --build-dir ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(V2_Unit_ServerE2EUsesRelease PROPERTIES
+    LABELS "V2;Unit;BuildSystem;E2E;Server;Release;Regression"
     TIMEOUT 30
 )
 
@@ -5733,6 +5735,20 @@ add_v2_test(V2_Integration_CUDAMoEKernel
     LABELS "V2;Integration;CUDA;MoE;Routing;Gather;Scatter;SwiGLU;KernelFactory"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CUDA_MoETransferStateMachine
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.DeviceRebalance*:Test__CUDAMoERequestReset.RepeatedRequestResetRestoresImmutableTransferDirectoryBaseline
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MoE;TransferStateMachine;LLEP;DeviceResident;GraphNative;Regression"
+    MPI_PROCS 1
+    TIMEOUT 180
+)
+if(TEST V2_Integration_CUDA_MoETransferStateMachine)
+    set_tests_properties(
+        V2_Integration_CUDA_MoETransferStateMachine
+        PROPERTIES
+            ENVIRONMENT_MODIFICATION "LLAMINAR_LOG_LEVEL=set:ERROR")
+endif()
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_MoEExpertPaths
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
             --gtest_filter=Test__CUDAMoEKernel.Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraphBucket:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAndCaptures:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentMatchesSerialDecodeRouter:Test__CUDAMoEKernel.VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAndCapture:Test__CUDAMoEKernel.SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows:Test__CUDAMoEKernel.SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllreduce:Test__CUDAMoEKernel.LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerialRows:Test__CUDAMoEKernel.SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode:Test__CUDAMoEKernel.SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatchDecodeAndCapture:Test__CUDAMoEKernel.SharedExpertVerifierPrefillQwen36AllNativeFormatsRuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedAndMaskedLocalTPVerifierPrefill_AllNativeFormats_RuntimeMMatchRowDecode:Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows:Test__CUDAMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
@@ -10474,7 +10490,7 @@ find_package(ZLIB)
 if(ZLIB_FOUND)
     get_filename_component(WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     
-    if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR CMAKE_BUILD_TYPE MATCHES "Integration" OR ENABLE_SNAPSHOTS)
+    if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "Integration" OR ENABLE_SNAPSHOTS)
     else()
         message(STATUS "V2: Integration parity tests disabled (snapshots not available in Release build)")
         message(STATUS "     Use -DCMAKE_BUILD_TYPE=Integration or -DENABLE_SNAPSHOTS=ON to enable")
@@ -12129,6 +12145,20 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;MoE;Routing;Gather;Scatter;gfx906"
         MPI_PROCS 1
     )
+    add_v2_test(V2_Integration_ROCm_MoETransferStateMachine
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+                --gtest_filter=Test__ROCmMoEKernel.DeviceRebalance*:Test__ROCmMoEKernel.RepeatedRequestResetRestoresImmutableTransferDirectoryBaseline
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MoE;TransferStateMachine;LLEP;DeviceResident;GraphNative;Regression"
+        MPI_PROCS 1
+        TIMEOUT 180
+    )
+    if(TEST V2_Integration_ROCm_MoETransferStateMachine)
+        set_tests_properties(
+            V2_Integration_ROCm_MoETransferStateMachine
+            PROPERTIES
+                ENVIRONMENT_MODIFICATION "LLAMINAR_LOG_LEVEL=set:ERROR")
+    endif()
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_MoEExpertPaths
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
                 --gtest_filter=Test__ROCmMoEKernel.SoftmaxTopKQwen36ActiveRowsAreByteExactAcrossPaddedGraphBucket:Test__ROCmMoEKernel.VerifierRowsBF16RouteUsesDecodeEquivalentRouter:Test__ROCmMoEKernel.VerifierRowsRouteUsesDecodeEquivalentRouterAndMatchesHostReference:Test__ROCmMoEKernel.VerifierRowsRouteMatchesSerialDecodeRouter:Test__ROCmMoEKernel.SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows:Test__ROCmMoEKernel.SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllreduce:Test__ROCmMoEKernel.LocalTPRCCLVerifierRowAllreduceRuntimeMMatchesSerialRows:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFormats_RuntimeMMatchSerialStageDecode:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchSerialStageDecode:Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowByRowDecode:Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchesRowByRowDecode:Test__ROCmMoEKernel.GroupedPrefillMaskedTopK8MatchesRowDecode:Test__ROCmMoEKernel.RoutedOnlyGroupedPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowDecode:Test__ROCmMoEKernel.MaskedLocalTPGroupedPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowDecode:Test__ROCmMoEKernel.RoutedOnlyGroupedPrefill_Qwen36ShapeRuntimeMBoundariesMatchRowDecode:Test__ROCmMoEKernel.MaskedLocalTPGroupedPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMBoundariesMatchRowDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_RuntimeMBoundariesMatchRuntimeDecode:Test__ROCmMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36Layer3RealWeights_M3MatchesRuntimeDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36Layer27RealWeights_M3MatchesRuntimeDecode
@@ -13240,7 +13270,7 @@ endif()
 # Shell-based tests that spin up llaminar2 --serve and test via curl.
 # Bypasses mpirun wrapper since the script manages its own server processes.
 
-if(NOT V2_PERF_TESTS_ONLY)
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
 add_test(
     NAME V2_E2E_Server_MultiTurn
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/server/test_server_e2e.sh
@@ -13252,6 +13282,8 @@ set_tests_properties(V2_E2E_Server_MultiTurn PROPERTIES
     ENVIRONMENT "LLAMINAR_LOG_LEVEL=WARN"
 )
 message(STATUS "V2 Tests: Added E2E Server multi-turn integration tests")
+else()
+message(STATUS "V2 Tests: Server E2E test omitted; configure Release to test the deployable binary")
 endif()
 
 # =============================================================================

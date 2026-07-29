@@ -84,7 +84,7 @@ namespace llaminar2
         GraphResolverConfig getResolverConfig(int seq_len) const override;
 
         /// Reset MoE runtime state between independent inference sessions.
-        void resetState() override;
+        void resetState(void *execution_stream = nullptr) override;
 
         /**
          * @brief Restore the pre-decode MoE runtime boundary for a prefix hit without a payload.
@@ -100,7 +100,8 @@ namespace llaminar2
          * helpers so suffix prefill observes the same model-runtime baseline as
          * an uncached split prefill from the same token boundary.
          */
-        void resetPrefixCacheRuntimeStateWithoutSnapshot() override;
+        void resetPrefixCacheRuntimeStateWithoutSnapshot(
+            void *execution_stream = nullptr) override;
 
         /// Append active MoE runtime placement state to prefix-cache fingerprints.
         void appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const override;

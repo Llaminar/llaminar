@@ -1219,6 +1219,45 @@ namespace llaminar2
             appendJsonNumberField(out, controller_first, "last_error_expected_arrivals", controller_state.last_error_expected_arrivals);
             appendJsonNumberField(out, controller_first, "last_error_copied_arrivals", controller_state.last_error_copied_arrivals);
             appendJsonNumberField(out, controller_first, "last_error_copy_status_code", controller_state.last_error_copy_status_code);
+            appendJsonNumberField(out,
+                                  controller_first,
+                                  "last_error_copy_failure_flags",
+                                  controller_state.last_error_copy_failure_flags);
+            appendJsonNumberField(out,
+                                  controller_first,
+                                  "last_error_copy_plan_entries_seen",
+                                  controller_state.last_error_copy_plan_entries_seen);
+            appendJsonNumberField(
+                out,
+                controller_first,
+                "last_error_copy_skipped_wrong_destination",
+                controller_state
+                    .last_error_copy_skipped_wrong_destination);
+            appendJsonNumberField(
+                out,
+                controller_first,
+                "last_error_missing_destination_slot",
+                controller_state.last_error_missing_destination_slot);
+            appendJsonNumberField(
+                out,
+                controller_first,
+                "last_error_missing_destination_layer",
+                controller_state.last_error_missing_destination_layer);
+            appendJsonNumberField(
+                out,
+                controller_first,
+                "last_error_missing_destination_expert",
+                controller_state.last_error_missing_destination_expert);
+            appendJsonNumberField(
+                out,
+                controller_first,
+                "last_error_missing_destination_source",
+                controller_state.last_error_missing_destination_source);
+            appendJsonNumberField(
+                out,
+                controller_first,
+                "last_error_local_transfer_slot_count",
+                controller_state.last_error_local_transfer_slot_count);
             const uint32_t controller_error_participant =
                 controller_state.last_error_wave_index < 2u
                     ? controller_state
@@ -1250,6 +1289,18 @@ namespace llaminar2
             bool copy_first = true;
             appendJsonNumberField(out, copy_first, "valid", valid_copy_status ? 1u : 0u);
             appendJsonNumberField(out, copy_first, "status_code", copy_status.status_code);
+            appendJsonNumberField(out,
+                                  copy_first,
+                                  "transaction_wave_index",
+                                  copy_status.transaction_wave_index);
+            appendJsonNumberField(out,
+                                  copy_first,
+                                  "transaction_epoch",
+                                  copy_status.transaction_epoch);
+            appendJsonNumberField(out,
+                                  copy_first,
+                                  "transaction_command_count",
+                                  copy_status.transaction_command_count);
             appendJsonNumberField(out, copy_first, "plan_entries_seen", copy_status.plan_entries_seen);
             appendJsonNumberField(out, copy_first, "applied_arrivals", copy_status.applied_arrivals);
             appendJsonNumberField(out, copy_first, "copied_arrivals", copy_status.copied_arrivals);
@@ -5985,6 +6036,24 @@ namespace llaminar2
                 controller_state.last_error_copied_arrivals;
             outcome->controller_last_error_copy_status_code =
                 controller_state.last_error_copy_status_code;
+            outcome->controller_last_error_copy_failure_flags =
+                controller_state.last_error_copy_failure_flags;
+            outcome->controller_last_error_copy_plan_entries_seen =
+                controller_state.last_error_copy_plan_entries_seen;
+            outcome
+                ->controller_last_error_copy_skipped_wrong_destination =
+                controller_state
+                    .last_error_copy_skipped_wrong_destination;
+            outcome->controller_last_error_missing_destination_slot =
+                controller_state.last_error_missing_destination_slot;
+            outcome->controller_last_error_missing_destination_layer =
+                controller_state.last_error_missing_destination_layer;
+            outcome->controller_last_error_missing_destination_expert =
+                controller_state.last_error_missing_destination_expert;
+            outcome->controller_last_error_missing_destination_source =
+                controller_state.last_error_missing_destination_source;
+            outcome->controller_last_error_local_transfer_slot_count =
+                controller_state.last_error_local_transfer_slot_count;
             const uint32_t controller_wave_count =
                 std::min<uint32_t>(controller_state.wave_count, 2u);
             for (uint32_t wave_index = 0;
@@ -6007,6 +6076,18 @@ namespace llaminar2
                 }
             }
             outcome->copy_status_code = copy_status.status_code;
+            outcome->copy_transaction_wave_index =
+                copy_status.transaction_wave_index;
+            outcome->copy_transaction_epoch =
+                copy_status.transaction_epoch;
+            outcome->copy_transaction_command_count =
+                copy_status.transaction_command_count;
+            outcome->copy_plan_entries_seen =
+                copy_status.plan_entries_seen;
+            outcome->copy_copied_arrivals =
+                copy_status.copied_arrivals;
+            outcome->copy_skipped_wrong_destination =
+                copy_status.skipped_wrong_destination;
             outcome->copy_invalid_plan_entries =
                 copy_status.invalid_plan_entries;
             outcome->copy_missing_source_descriptors =
@@ -6048,6 +6129,40 @@ namespace llaminar2
                 apply_status_valid ? apply_status.applied_arrivals : 0u;
             outcome->prefill_active_transfer_slot_experts =
                 status.prefill_active_transfer_slot_experts;
+            outcome->prefill_unique_transfer_slot_claims =
+                status.prefill_unique_transfer_slot_claims;
+            outcome->prefill_duplicate_transfer_slot_claims =
+                status.prefill_duplicate_transfer_slot_claims;
+            outcome->prefill_invalid_transfer_slot_claims =
+                status.prefill_invalid_transfer_slot_claims;
+            outcome->prefill_max_transfer_slot =
+                status.prefill_max_transfer_slot;
+            outcome->prefill_max_transfer_slot_layer =
+                status.prefill_max_transfer_slot_layer;
+            outcome->prefill_max_transfer_slot_expert =
+                status.prefill_max_transfer_slot_expert;
+            outcome->prefill_first_duplicate_transfer_slot =
+                status.prefill_first_duplicate_transfer_slot;
+            outcome->prefill_first_duplicate_layer =
+                status.prefill_first_duplicate_layer;
+            outcome->prefill_first_duplicate_expert =
+                status.prefill_first_duplicate_expert;
+            outcome->prefill_first_invalid_transfer_slot =
+                status.prefill_first_invalid_transfer_slot;
+            outcome->prefill_first_invalid_layer =
+                status.prefill_first_invalid_layer;
+            outcome->prefill_first_invalid_expert =
+                status.prefill_first_invalid_expert;
+            outcome->prefill_first_invalid_reasons =
+                status.prefill_first_invalid_reasons;
+            outcome->prefill_first_invalid_flags =
+                status.prefill_first_invalid_flags;
+            outcome->prefill_first_invalid_resident_mask =
+                status.prefill_first_invalid_resident_mask;
+            outcome->prefill_first_invalid_owner =
+                status.prefill_first_invalid_owner;
+            outcome->local_transfer_slot_count =
+                params.local_transfer_slot_count;
             outcome->payload_bucket_slots = status.payload_bucket_slots;
             outcome->payload_source_participant_mask =
                 status.payload_source_participant_mask;
@@ -6276,6 +6391,39 @@ namespace llaminar2
                  status.llep_weight_transfer_count);
         emit_u32("device_rebalance_prefill_active_transfer_slot_experts",
                  status.prefill_active_transfer_slot_experts);
+        emit_u32("device_rebalance_prefill_unique_transfer_slot_claims",
+                 status.prefill_unique_transfer_slot_claims);
+        emit_u32("device_rebalance_prefill_duplicate_transfer_slot_claims",
+                 status.prefill_duplicate_transfer_slot_claims);
+        emit_u32("device_rebalance_prefill_invalid_transfer_slot_claims",
+                 status.prefill_invalid_transfer_slot_claims);
+        emit_u32("device_rebalance_prefill_max_transfer_slot",
+                 status.prefill_max_transfer_slot);
+        emit_u32("device_rebalance_prefill_max_transfer_slot_layer",
+                 status.prefill_max_transfer_slot_layer);
+        emit_u32("device_rebalance_prefill_max_transfer_slot_expert",
+                 status.prefill_max_transfer_slot_expert);
+        emit_u32("device_rebalance_prefill_first_duplicate_transfer_slot",
+                 status.prefill_first_duplicate_transfer_slot);
+        emit_u32("device_rebalance_prefill_first_duplicate_layer",
+                 status.prefill_first_duplicate_layer);
+        emit_u32("device_rebalance_prefill_first_duplicate_expert",
+                 status.prefill_first_duplicate_expert);
+        emit_u32("device_rebalance_prefill_first_invalid_transfer_slot",
+                 status.prefill_first_invalid_transfer_slot);
+        emit_u32("device_rebalance_prefill_first_invalid_layer",
+                 status.prefill_first_invalid_layer);
+        emit_u32("device_rebalance_prefill_first_invalid_expert",
+                 status.prefill_first_invalid_expert);
+        emit_u32("device_rebalance_prefill_first_invalid_reasons",
+                 status.prefill_first_invalid_reasons);
+        emit_u32("device_rebalance_prefill_first_invalid_flags",
+                 status.prefill_first_invalid_flags);
+        emit_u32("device_rebalance_prefill_first_invalid_resident_mask",
+                 status.prefill_first_invalid_resident_mask);
+        emit_u32("device_rebalance_prefill_first_invalid_owner",
+                 static_cast<uint32_t>(
+                     status.prefill_first_invalid_owner));
         emit_u32("device_rebalance_llep_standard_ep_selected",
                  status.llep_standard_ep_selected);
         emit_u32("device_rebalance_llep_skipped_balanced",
@@ -6767,6 +6915,12 @@ namespace llaminar2
         if (publication_contract.copy_status)
         {
             emit_u32("device_rebalance_copy_status_valid", valid_copy_status ? 1u : 0u);
+            emit_u32("device_rebalance_copy_transaction_wave_index",
+                     copy_status.transaction_wave_index);
+            emit_u32("device_rebalance_copy_transaction_epoch",
+                     copy_status.transaction_epoch);
+            emit_u32("device_rebalance_copy_transaction_command_count",
+                     copy_status.transaction_command_count);
             emit_u32("device_rebalance_copy_plan_entries_seen", copy_status.plan_entries_seen);
             emit_u32("device_rebalance_copy_copied_arrivals", copy_status.copied_arrivals);
             emit_u32("device_rebalance_copy_required_local_arrivals",
@@ -6801,6 +6955,29 @@ namespace llaminar2
                  controller_state.last_error_copied_arrivals);
         emit_u32("device_rebalance_controller_last_error_copy_status_code",
                  controller_state.last_error_copy_status_code);
+        emit_u32("device_rebalance_controller_last_error_copy_failure_flags",
+                 controller_state.last_error_copy_failure_flags);
+        emit_u32("device_rebalance_controller_last_error_copy_plan_entries_seen",
+                 controller_state.last_error_copy_plan_entries_seen);
+        emit_u32(
+            "device_rebalance_controller_last_error_copy_skipped_wrong_destination",
+            controller_state
+                .last_error_copy_skipped_wrong_destination);
+        emit_u32(
+            "device_rebalance_controller_last_error_missing_destination_slot",
+            controller_state.last_error_missing_destination_slot);
+        emit_u32(
+            "device_rebalance_controller_last_error_missing_destination_layer",
+            controller_state.last_error_missing_destination_layer);
+        emit_u32(
+            "device_rebalance_controller_last_error_missing_destination_expert",
+            controller_state.last_error_missing_destination_expert);
+        emit_u32(
+            "device_rebalance_controller_last_error_missing_destination_source",
+            controller_state.last_error_missing_destination_source);
+        emit_u32(
+            "device_rebalance_controller_last_error_local_transfer_slot_count",
+            controller_state.last_error_local_transfer_slot_count);
 
         for (uint32_t i = 0; i < command_buffer_count; ++i)
         {
@@ -7060,6 +7237,44 @@ namespace llaminar2
                     << " capacity_limited_candidates="
                     << outcome.capacity_limited_candidates
                     << " payload_bucket_overflow=" << outcome.payload_bucket_overflow
+                    << " transfer_slot_active_claims="
+                    << outcome.prefill_active_transfer_slot_experts
+                    << " transfer_slot_unique_claims="
+                    << outcome.prefill_unique_transfer_slot_claims
+                    << " transfer_slot_duplicate_claims="
+                    << outcome.prefill_duplicate_transfer_slot_claims
+                    << " transfer_slot_invalid_claims="
+                    << outcome.prefill_invalid_transfer_slot_claims
+                    << " transfer_slot_max="
+                    << outcome.prefill_max_transfer_slot
+                    << " transfer_slot_max_layer="
+                    << outcome.prefill_max_transfer_slot_layer
+                    << " transfer_slot_max_expert="
+                    << outcome.prefill_max_transfer_slot_expert
+                    << " transfer_slot_capacity="
+                    << outcome.local_transfer_slot_count
+                    << " transfer_slot_first_duplicate="
+                    << outcome.prefill_first_duplicate_transfer_slot
+                    << " transfer_slot_first_duplicate_layer="
+                    << outcome.prefill_first_duplicate_layer
+                    << " transfer_slot_first_duplicate_expert="
+                    << outcome.prefill_first_duplicate_expert
+                    << " transfer_slot_first_invalid="
+                    << outcome.prefill_first_invalid_transfer_slot
+                    << " transfer_slot_first_invalid_layer="
+                    << outcome.prefill_first_invalid_layer
+                    << " transfer_slot_first_invalid_expert="
+                    << outcome.prefill_first_invalid_expert
+                    << " transfer_slot_first_invalid_reasons="
+                    << outcome.prefill_first_invalid_reasons
+                    << " transfer_slot_first_invalid_flags=0x"
+                    << std::hex
+                    << outcome.prefill_first_invalid_flags
+                    << " transfer_slot_first_invalid_resident_mask=0x"
+                    << outcome.prefill_first_invalid_resident_mask
+                    << std::dec
+                    << " transfer_slot_first_invalid_owner="
+                    << outcome.prefill_first_invalid_owner
                     << " controller_valid=" << outcome.controller_valid
                     << " controller_error=" << outcome.controller_last_error_code
                     << " controller_error_waves=" << outcome.controller_error_waves
@@ -7075,9 +7290,42 @@ namespace llaminar2
                     << outcome.controller_last_error_copied_arrivals
                     << " controller_error_copy_status="
                     << outcome.controller_last_error_copy_status_code
+                    << " controller_error_copy_flags="
+                    << outcome.controller_last_error_copy_failure_flags
+                    << " controller_error_copy_plan_seen="
+                    << outcome.controller_last_error_copy_plan_entries_seen
+                    << " controller_error_copy_skipped_wrong_destination="
+                    << outcome
+                           .controller_last_error_copy_skipped_wrong_destination
+                    << " controller_error_missing_destination_slot="
+                    << outcome
+                           .controller_last_error_missing_destination_slot
+                    << " controller_error_missing_destination_layer="
+                    << outcome
+                           .controller_last_error_missing_destination_layer
+                    << " controller_error_missing_destination_expert="
+                    << outcome
+                           .controller_last_error_missing_destination_expert
+                    << " controller_error_missing_destination_source="
+                    << outcome
+                           .controller_last_error_missing_destination_source
+                    << " controller_error_local_transfer_slot_count="
+                    << outcome
+                           .controller_last_error_local_transfer_slot_count
                     << " copy_present=" << outcome.copy_status_present
                     << " copy_valid=" << outcome.copy_status_valid
                     << " copy_status=" << outcome.copy_status_code
+                    << " copy_transaction_wave="
+                    << outcome.copy_transaction_wave_index
+                    << " copy_transaction_epoch="
+                    << outcome.copy_transaction_epoch
+                    << " copy_transaction_command_count="
+                    << outcome.copy_transaction_command_count
+                    << " copy_plan_seen=" << outcome.copy_plan_entries_seen
+                    << " copy_copied_arrivals="
+                    << outcome.copy_copied_arrivals
+                    << " copy_skipped_wrong_destination="
+                    << outcome.copy_skipped_wrong_destination
                     << " copy_invalid_plan=" << outcome.copy_invalid_plan_entries
                     << " copy_missing_source=" << outcome.copy_missing_source_descriptors
                     << " copy_missing_destination=" << outcome.copy_missing_destination_slots
@@ -12326,8 +12574,23 @@ namespace llaminar2
              (draft_condition_token_stride != 1 || device_position_offset != 0)) ||
             (prepare_device_condition_tokens_from_speculative_outcome &&
              position_ids_device_override != nullptr);
+        /*
+         * A captured sidecar must never bind the caller's sliding source
+         * pointer. Shifted prefill advances `position_ids_device_override`
+         * through the prefill input one group at a time, so using that pointer
+         * as graph identity rebuilt the same M-row graph for every group.
+         *
+         * Stage all device-owned position rows into the persistent sidecar
+         * arena instead. The source may move; the captured consumer address
+         * does not. Token and position rows are prepared by one backend launch,
+         * preserving device ownership without adding a host observation.
+         */
+        const bool stage_device_position_rows =
+            position_ids_device_override != nullptr &&
+            (external_device_condition_tokens ||
+             prepare_device_condition_tokens_from_speculative_outcome);
         const void *effective_position_ids_device =
-            compose_batched_device_inputs
+            stage_device_position_rows
                 ? mtp_sidecar_position_ids_dev_
                 : position_ids_device_override;
         const bool use_device_position_ids =
@@ -12355,6 +12618,13 @@ namespace llaminar2
         if (state_.device_id.is_gpu() && !use_device_condition_tokens)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP sidecars require a device-owned condition-token source");
+            return false;
+        }
+        if (state_.device_id.is_gpu() &&
+            stage_device_position_rows &&
+            !mtp_sidecar_position_ids_dev_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP sidecars require persistent device position storage");
             return false;
         }
         if (external_device_condition_tokens &&
@@ -12734,24 +13004,65 @@ namespace llaminar2
         const bool sidecar_moe_epoch_sensitive = mtp_moe_sidecar && !kv_cache_only;
         const uint64_t sidecar_moe_epoch_key =
             sidecar_moe_epoch_sensitive ? current_moe_placement_epoch : 0;
-        const bool needs_graph_rebuild =
-            !sidecar_cache.valid ||
-            !sidecar_cache.graph ||
-            sidecar_cache.terminal_hidden != terminal_hidden ||
+        const bool missing_cached_graph =
+            !sidecar_cache.valid || !sidecar_cache.graph;
+        const bool terminal_hidden_binding_changed =
+            sidecar_cache.terminal_hidden != terminal_hidden;
+        const bool graph_shape_changed =
             sidecar_cache.seq_len != token_count ||
             sidecar_cache.batch_size != request_batch ||
-            sidecar_cache.first_seq_idx != first_seq_idx ||
+            sidecar_cache.first_seq_idx != first_seq_idx;
+        const bool token_binding_changed =
             sidecar_cache.uses_device_token_ids != use_device_condition_tokens ||
-            sidecar_cache.uses_device_position_ids != use_device_position_ids ||
             sidecar_cache.condition_token_slot != condition_token_slot ||
-            sidecar_cache.condition_token_device != condition_token_device ||
-            sidecar_cache.position_ids_device != effective_position_ids_device ||
+            sidecar_cache.condition_token_device != condition_token_device;
+        const bool position_binding_changed =
+            sidecar_cache.uses_device_position_ids != use_device_position_ids ||
+            sidecar_cache.position_ids_device != effective_position_ids_device;
+        const bool moe_binding_changed =
             sidecar_cache.moe_epoch_sensitive != sidecar_moe_epoch_sensitive ||
             sidecar_cache.moe_placement_epoch != sidecar_moe_epoch_key;
+        const bool needs_graph_rebuild =
+            missing_cached_graph ||
+            terminal_hidden_binding_changed ||
+            graph_shape_changed ||
+            token_binding_changed ||
+            position_binding_changed ||
+            moe_binding_changed;
 
         const bool rebuilt_graph = needs_graph_rebuild;
         if (needs_graph_rebuild)
         {
+            std::string rebuild_reasons;
+            const auto append_rebuild_reason =
+                [&](bool active, const char *reason)
+            {
+                if (!active)
+                    return;
+                if (!rebuild_reasons.empty())
+                    rebuild_reasons += ",";
+                rebuild_reasons += reason;
+            };
+            append_rebuild_reason(missing_cached_graph, "missing_graph");
+            append_rebuild_reason(
+                terminal_hidden_binding_changed,
+                "terminal_hidden_binding");
+            append_rebuild_reason(graph_shape_changed, "graph_shape");
+            append_rebuild_reason(token_binding_changed, "token_binding");
+            append_rebuild_reason(
+                position_binding_changed,
+                "position_binding");
+            append_rebuild_reason(moe_binding_changed, "moe_binding");
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "sidecar_graph_rebuild_reasons",
+                1.0,
+                phase,
+                device_key,
+                {{"context", sidecar_context},
+                 {"reasons", rebuild_reasons},
+                 {"seq_len", std::to_string(token_count)}});
+
             sidecar_cache.invalidate();
             sidecar_cache.token_id =
                 use_device_condition_tokens ? -1 : draft_condition_tokens[0];
@@ -13051,42 +13362,67 @@ namespace llaminar2
                          {"position_offset", std::to_string(device_position_offset)}});
                 }
             }
+            else if (external_device_condition_tokens &&
+                     position_ids_device_override)
+            {
+                /*
+                 * Request-major proposal inputs expose one strided token per
+                 * request and one base position per request. Shifted-prefill
+                 * inputs instead expose contiguous token/position rows. Both
+                 * layouts are normalized by the same allocation-free backend
+                 * primitive; only the source geometry differs.
+                 */
+                const int preparation_rows =
+                    compose_batched_device_inputs
+                        ? request_batch
+                        : total_rows;
+                const int preparation_token_stride =
+                    compose_batched_device_inputs
+                        ? draft_condition_token_stride
+                        : 1;
+                const int preparation_position_offset =
+                    compose_batched_device_inputs
+                        ? device_position_offset
+                        : 0;
+                staged_tokens_ok =
+                    backend->enqueuePrepareMTPBatchedSidecarInputs(
+                        draft_condition_tokens_device,
+                        preparation_token_stride,
+                        position_ids_device_override,
+                        preparation_position_offset,
+                        preparation_rows,
+                        state_.device_id.gpu_ordinal(),
+                        sidecar_dynamic_stream,
+                        condition_token_device,
+                        mtp_sidecar_position_ids_dev_);
+                if (staged_tokens_ok)
+                {
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "device_resident_sidecar_input_normalizations",
+                        static_cast<double>(preparation_rows),
+                        phase,
+                        device_key,
+                        {{"layout",
+                          compose_batched_device_inputs
+                              ? "request_major"
+                              : "contiguous_rows"},
+                         {"rows", std::to_string(preparation_rows)}});
+                }
+            }
             else if (external_device_condition_tokens)
             {
-                if (compose_batched_device_inputs)
-                {
-                    /*
-                     * A request-major proposal matrix exposes one depth as a
-                     * strided column. Gather that column and derive depth-local
-                     * positions together so the next graph sees two stable,
-                     * contiguous arena pointers without any host observation.
-                     */
-                    staged_tokens_ok =
-                        backend->enqueuePrepareMTPBatchedSidecarInputs(
-                            draft_condition_tokens_device,
-                            draft_condition_token_stride,
-                            position_ids_device_override,
-                            device_position_offset,
-                            request_batch,
-                            state_.device_id.gpu_ordinal(),
-                            sidecar_dynamic_stream,
-                            condition_token_device,
-                            mtp_sidecar_position_ids_dev_);
-                }
-                else
-                {
-                    /*
-                     * Contiguous resident mailbox tokens still copy into the
-                     * role-owned condition slot because graph capture records
-                     * the destination pointer, not the publication mailbox.
-                     */
-                    staged_tokens_ok = backend->deviceCopyAsync(
-                        condition_token_device,
-                        draft_condition_tokens_device,
-                        staged_token_bytes,
-                        state_.device_id.gpu_ordinal(),
-                        sidecar_dynamic_stream);
-                }
+                /*
+                 * A token-only sidecar still copies into its role-owned slot
+                 * because graph capture records the destination pointer, not
+                 * the producer mailbox.
+                 */
+                staged_tokens_ok = backend->deviceCopyAsync(
+                    condition_token_device,
+                    draft_condition_tokens_device,
+                    staged_token_bytes,
+                    state_.device_id.gpu_ordinal(),
+                    sidecar_dynamic_stream);
             }
             if (!staged_tokens_ok)
             {

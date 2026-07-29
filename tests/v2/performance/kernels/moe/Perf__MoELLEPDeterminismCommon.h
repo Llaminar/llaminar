@@ -409,6 +409,43 @@ namespace llaminar2::test::moe_llep_perf
         return config;
     }
 
+    /**
+     * @brief Build the production-sized decode-maintenance policy used by LLEP.
+     *
+     * Decode maintenance intentionally plans a small rolling layer wave instead
+     * of revisiting every model layer after each histogram window.  This helper
+     * keeps the performance test aligned with Qwen3.6 serving defaults while
+     * leaving the model layer count explicit for future geometries.
+     *
+     * @param shape Expert and participant geometry under test.
+     * @param num_layers Number of routed MoE layers in the model.
+     * @param layer_wave_count Number of consecutive layers planned per replay.
+     * @return Device planner configuration matching the production LLEP lane.
+     */
+    inline DeviceMoERebalanceConfig llepMaintenanceConfig(
+        const Shape &shape,
+        uint32_t num_layers,
+        uint32_t layer_wave_count = 4u)
+    {
+        auto config = rebalanceConfig(shape);
+        config.num_layers = num_layers;
+        config.flags =
+            static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals) |
+            static_cast<uint32_t>(DeviceMoERebalanceFlags::DeferRuntimeApply) |
+            static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
+        config.max_hot_replicas_per_participant = 0;
+        config.layer_window_start = num_layers > 1u ? 1u : 0u;
+        config.layer_window_count =
+            num_layers > config.layer_window_start
+                ? num_layers - config.layer_window_start
+                : 1u;
+        config.layer_wave_count =
+            std::min(std::max(1u, layer_wave_count), config.layer_window_count);
+        config.routed_assignment_policy =
+            kDeviceMoERebalanceAssignmentLeastLoadedResident;
+        return config;
+    }
+
     inline void installSkewedDynamicHistogram(DeviceMoELayerRuntime &runtime,
                                               const Shape &shape)
     {

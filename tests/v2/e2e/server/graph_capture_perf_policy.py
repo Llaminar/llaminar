@@ -216,6 +216,7 @@ def _incomplete_graph_contexts(
     """
 
     phase_counts: dict[tuple[str, str], dict[str, float]] = {}
+    sidecar_path_counts: dict[tuple[str, str, str], dict[str, float]] = {}
     executable_contexts: set[tuple[str, str]] = set()
 
     for record in records:
@@ -232,6 +233,13 @@ def _incomplete_graph_contexts(
             if phase in {"warmup", "capture", "replay"}:
                 counts = phase_counts.setdefault(key, {})
                 counts[phase] = counts.get(phase, 0.0) + _record_value(record)
+        elif name == "sidecar_graph_capture_path":
+            seq_len = str(tags.get("seq_len", ""))
+            path = str(tags.get("path", ""))
+            if seq_len and path:
+                sidecar_key = (device, context, seq_len)
+                counts = sidecar_path_counts.setdefault(sidecar_key, {})
+                counts[path] = counts.get(path, 0.0) + _record_value(record)
         elif (
             name == "full_graph_capture_executable_nodes"
             and tags.get("source") == "full_graph_capture"
@@ -255,6 +263,25 @@ def _incomplete_graph_contexts(
             reasons.append("missing replay after repeated execution")
         if reasons:
             label = f"{device or 'unknown'}:{context}"
+            incomplete.append(f"{label} ({'; '.join(reasons)})")
+
+    for key, counts in sorted(sidecar_path_counts.items()):
+        device, context, seq_len = key
+        total = sum(counts.values())
+        rebuild_count = counts.get("plain_after_build", 0.0)
+        replay_count = counts.get("full_graph", 0.0)
+        reasons = []
+        if rebuild_count > 1.0:
+            reasons.append(
+                f"rebuilt graph {rebuild_count:g} times for one stable shape"
+            )
+        if total >= 3.0 and replay_count <= 0.0:
+            reasons.append("missing full-graph replay after repeated execution")
+        if reasons:
+            label = (
+                f"{device or 'unknown'}:{context}"
+                f"[seq_len={seq_len}]"
+            )
             incomplete.append(f"{label} ({'; '.join(reasons)})")
 
     return tuple(incomplete)

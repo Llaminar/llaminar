@@ -446,7 +446,7 @@ namespace llaminar2
         }                                                                                                                  \
     } while (0)
 
-// LOG_TRACE: Compiled out in Release/E2ERelease/Integration (NDEBUG) builds.
+// LOG_TRACE: Compiled out in Release/Integration (NDEBUG) builds.
 // Only active in Debug builds. TRACE generates extremely verbose output that
 // can materially slow down even the shouldLog() branch prediction.
 #if defined(NDEBUG)

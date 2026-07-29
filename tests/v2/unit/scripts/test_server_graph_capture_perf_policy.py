@@ -456,6 +456,107 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         result = validate_graph_capture_policy(records, "rocm:0", "")
         self.assertIn("missing capture", result.error or "")
 
+    def test_repeated_mtp_sidecar_rebuilds_fail(self) -> None:
+        """A sliding source pointer must not masquerade as graph progress."""
+
+        records = [
+            counter(
+                "full_graph_plan_graphs",
+                tags={"type": "capturable"},
+            ),
+            counter(
+                "full_graph_capture_executable_nodes",
+                value=17.0,
+                tags={
+                    "context": "mtp_shifted_prefill",
+                    "source": "full_graph_capture",
+                    "type": "captured_executable",
+                },
+            ),
+            counter(
+                "sidecar_graph_capture_path",
+                value=32.0,
+                domain="mtp",
+                tags={
+                    "context": "mtp_shifted_prefill",
+                    "path": "plain_after_build",
+                    "seq_len": "3",
+                },
+            ),
+            counter(
+                "sidecar_graph_capture_path",
+                value=64.0,
+                domain="mtp",
+                tags={
+                    "context": "mtp_shifted_prefill",
+                    "path": "full_graph",
+                    "seq_len": "3",
+                },
+            ),
+        ]
+        result = validate_graph_capture_policy(
+            records,
+            "tp",
+            "--tp-devices cuda:0,cuda:1",
+        )
+        self.assertIn("rebuilt graph 32 times", result.error or "")
+        self.assertEqual(len(result.incomplete_contexts), 1)
+
+    def test_mtp_sidecar_allows_one_build_before_full_graph_replay(self) -> None:
+        """One ordinary build is the capture lifecycle, not a fallback."""
+
+        records = [
+            counter(
+                "full_graph_plan_graphs",
+                tags={"type": "capturable"},
+            ),
+            counter(
+                "full_graph_capture_executable_nodes",
+                value=17.0,
+                tags={
+                    "context": "mtp_shifted_prefill",
+                    "source": "full_graph_capture",
+                    "type": "captured_executable",
+                },
+            ),
+            counter(
+                "sidecar_graph_capture_path",
+                domain="mtp",
+                tags={
+                    "context": "mtp_shifted_prefill",
+                    "path": "plain_after_build",
+                    "seq_len": "3",
+                },
+            ),
+            counter(
+                "sidecar_graph_capture_path",
+                value=2.0,
+                domain="mtp",
+                tags={
+                    "context": "mtp_shifted_prefill",
+                    "path": "plain",
+                    "seq_len": "3",
+                },
+            ),
+            counter(
+                "sidecar_graph_capture_path",
+                value=64.0,
+                domain="mtp",
+                tags={
+                    "context": "mtp_shifted_prefill",
+                    "path": "full_graph",
+                    "seq_len": "3",
+                },
+            ),
+        ]
+        result = validate_graph_capture_policy(
+            records,
+            "tp",
+            "--tp-devices cuda:0,cuda:1",
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual(result.incomplete_contexts, ())
+
     def test_full_graph_plan_without_instantiated_nodes_fails(self) -> None:
         records = [
             counter(

@@ -68,6 +68,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -2746,6 +2747,33 @@ namespace llaminar2
         class RequestStateResetTransaction final
         {
         public:
+            /**
+             * @brief Ordered phases of one device-owned request reset.
+             *
+             * The phase is diagnostic state only; device ordering remains
+             * expressed by the explicit stream and timeline events. Keeping
+             * this typed list beside the transaction makes every reset owner
+             * visible when a fatal exception crosses the boundary.
+             */
+            enum class Phase : uint8_t
+            {
+                Constructed,
+                DrainMaintenanceDiagnostics,
+                JoinPriorProducers,
+                ResetReplaySessions,
+                ResetMaintenanceGraph,
+                ClearDeferredPublications,
+                ResetCommittedKVAndGDN,
+                ResetShiftedMTP,
+                ResetMTPHistory,
+                ResetLogicalSequence,
+                ResetKernelDynamicState,
+                ResetModelRuntime,
+                PublishResetReady,
+                FinalizeSessionMetadata,
+                Completed,
+            };
+
             RequestStateResetTransaction(
                 IKVCache::StateResetBoundary boundary,
                 void *execution_stream,
@@ -2768,10 +2796,78 @@ namespace llaminar2
                 }
             }
 
-            ~RequestStateResetTransaction()
+            /**
+             * @brief Enforce publication and preserve the original fatal diagnostic.
+             *
+             * An exception raised while resetting one of the device-owned state
+             * participants unwinds through this guard before it reaches the
+             * request handler.  Calling `std::terminate()` without first naming
+             * that exception hides the operation that violated the transaction.
+             * The reset remains unconditionally fatal, but the active exception
+             * is surfaced before termination so production E2E failures identify
+             * the actual owner instead of reporting only an unpublished event.
+             */
+            ~RequestStateResetTransaction() noexcept
             {
-                if (publication_required_ && !published_)
+                if (publication_required_ && (!published_ || !completed_))
+                {
+                    const int active_exceptions = std::uncaught_exceptions();
+                    if (active_exceptions > 0)
+                    {
+                        try
+                        {
+                            const std::exception_ptr active =
+                                std::current_exception();
+                            if (active)
+                                std::rethrow_exception(active);
+                            std::fprintf(
+                                stderr,
+                                "[FATAL] GPU request-state reset aborted before "
+                                "transaction completion: phase=%s published=%s "
+                                "exception=<active exception unavailable outside "
+                                "catch> active_exceptions=%d\n",
+                                phaseName(phase_),
+                                published_ ? "true" : "false",
+                                active_exceptions);
+                        }
+                        catch (const std::exception &error)
+                        {
+                            std::fprintf(
+                                stderr,
+                                "[FATAL] GPU request-state reset aborted before "
+                                "transaction completion: phase=%s published=%s "
+                                "exception=%s "
+                                "active_exceptions=%d\n",
+                                phaseName(phase_),
+                                published_ ? "true" : "false",
+                                error.what(),
+                                active_exceptions);
+                        }
+                        catch (...)
+                        {
+                            std::fprintf(
+                                stderr,
+                                "[FATAL] GPU request-state reset aborted before "
+                                "transaction completion: phase=%s published=%s "
+                                "exception=<non-standard> "
+                                "active_exceptions=%d\n",
+                                phaseName(phase_),
+                                published_ ? "true" : "false",
+                                active_exceptions);
+                        }
+                    }
+                    else
+                    {
+                        std::fprintf(
+                            stderr,
+                            "[FATAL] GPU request-state reset exited without "
+                            "transaction completion: phase=%s published=%s\n",
+                            phaseName(phase_),
+                            published_ ? "true" : "false");
+                    }
+                    std::fflush(stderr);
                     std::terminate();
+                }
             }
 
             RequestStateResetTransaction(
@@ -2800,10 +2896,80 @@ namespace llaminar2
                 published_ = true;
             }
 
+            /**
+             * @brief Enter the next named reset phase.
+             *
+             * @param phase Phase whose work is about to begin.
+             */
+            void enter(Phase phase)
+            {
+                if (completed_ || phase == Phase::Constructed)
+                    std::terminate();
+                phase_ = phase;
+            }
+
+            /**
+             * @brief Commit the complete reset transaction.
+             *
+             * Completion is distinct from event publication because graph and
+             * model-runtime metadata still cross the same request boundary
+             * after device zeroing has been published.
+             */
+            void markCompleted()
+            {
+                if (completed_ ||
+                    (publication_required_ && !published_))
+                {
+                    std::terminate();
+                }
+                phase_ = Phase::Completed;
+                completed_ = true;
+            }
+
         private:
+            static const char *phaseName(Phase phase)
+            {
+                switch (phase)
+                {
+                case Phase::Constructed:
+                    return "constructed";
+                case Phase::DrainMaintenanceDiagnostics:
+                    return "drain_maintenance_diagnostics";
+                case Phase::JoinPriorProducers:
+                    return "join_prior_producers";
+                case Phase::ResetReplaySessions:
+                    return "reset_replay_sessions";
+                case Phase::ResetMaintenanceGraph:
+                    return "reset_maintenance_graph";
+                case Phase::ClearDeferredPublications:
+                    return "clear_deferred_publications";
+                case Phase::ResetCommittedKVAndGDN:
+                    return "reset_committed_kv_and_gdn";
+                case Phase::ResetShiftedMTP:
+                    return "reset_shifted_mtp";
+                case Phase::ResetMTPHistory:
+                    return "reset_mtp_history";
+                case Phase::ResetLogicalSequence:
+                    return "reset_logical_sequence";
+                case Phase::PublishResetReady:
+                    return "publish_reset_ready";
+                case Phase::ResetKernelDynamicState:
+                    return "reset_kernel_dynamic_state";
+                case Phase::ResetModelRuntime:
+                    return "reset_model_runtime";
+                case Phase::FinalizeSessionMetadata:
+                    return "finalize_session_metadata";
+                case Phase::Completed:
+                    return "completed";
+                }
+                return "unknown";
+            }
+
             IKVCache::StateResetContext context_;
             bool publication_required_ = false;
             bool published_ = false;
+            bool completed_ = false;
+            Phase phase_ = Phase::Constructed;
         };
 
         /**
@@ -2875,6 +3041,9 @@ namespace llaminar2
                 reset_stream,
                 reset_reason,
                 state_.device_id.is_gpu());
+            reset_transaction.enter(
+                RequestStateResetTransaction::Phase::
+                    DrainMaintenanceDiagnostics);
             {
                 /*
                  * Request reset is not a whole-device ownership boundary.
@@ -2896,12 +3065,49 @@ namespace llaminar2
                     "request_reset",
                     state_.device_id.toString(),
                     {{"reason", reset_reason}});
-                drainCompletedDeviceMoERebalanceMaintenanceDiagnostics(
-                    "request_reset",
-                    reset_reason);
+                try
+                {
+                    drainCompletedDeviceMoERebalanceMaintenanceDiagnostics(
+                        "request_reset",
+                        reset_reason);
+                }
+                catch (const std::exception &error)
+                {
+                    /*
+                     * The transaction destructor intentionally terminates when
+                     * this phase fails, but stack unwinding cannot recover the
+                     * active exception text outside a catch handler. Surface
+                     * the exact maintenance invariant here, then terminate
+                     * before any cache mutation can begin.
+                     */
+                    std::fprintf(
+                        stderr,
+                        "[FATAL] GPU request-state reset maintenance epilogue "
+                        "failed: device=%s reason=%s error=%s\n",
+                        state_.device_id.toString().c_str(),
+                        reset_reason,
+                        error.what());
+                    std::fflush(stderr);
+                    std::terminate();
+                }
+                catch (...)
+                {
+                    std::fprintf(
+                        stderr,
+                        "[FATAL] GPU request-state reset maintenance epilogue "
+                        "failed: device=%s reason=%s "
+                        "error=<non-standard exception>\n",
+                        state_.device_id.toString().c_str(),
+                        reset_reason);
+                    std::fflush(stderr);
+                    std::terminate();
+                }
             }
             if (state_.device_id.is_gpu())
             {
+                reset_transaction.enter(
+                    RequestStateResetTransaction::Phase::
+                        JoinPriorProducers);
                 /*
                  * A surfaced token result does not transfer ownership of every
                  * live-state producer to the host. Accepted-state publication,
@@ -2922,6 +3128,9 @@ namespace llaminar2
                     std::terminate();
                 }
             }
+            reset_transaction.enter(
+                RequestStateResetTransaction::Phase::
+                    ResetReplaySessions);
             for (auto &entry : layer_graph_cache_)
             {
                 entry.resetSessionState();
@@ -2960,6 +3169,9 @@ namespace llaminar2
                 else if (!prefix_restore_resets_model_runtime_owner)
                     cache->resetSessionState();
             }
+            reset_transaction.enter(
+                RequestStateResetTransaction::Phase::
+                    ResetMaintenanceGraph);
             if (preserve_replay_safe_graphs || prefix_restore_boundary)
             {
                 /*
@@ -2992,6 +3204,9 @@ namespace llaminar2
                     DeviceMoERebalanceMaintenanceGraphCache::ResetBoundary::
                         BindingIdentityChanged);
             }
+            reset_transaction.enter(
+                RequestStateResetTransaction::Phase::
+                    ClearDeferredPublications);
             device_moe_rebalance_decode_tokens_seen_ = 0;
             mtp_terminal_hidden_row_select_cache_.invalidate();
             mtp_terminal_hidden_rows_select_cache_.invalidate();
@@ -3026,6 +3241,9 @@ namespace llaminar2
             clearDeviceResidentLogicalSequenceStateMailbox();
             retireDeviceResidentMTPTransaction();
             cache_stats_ = CacheStats{};
+            reset_transaction.enter(
+                RequestStateResetTransaction::Phase::
+                    ResetCommittedKVAndGDN);
             if ((request.reset_kv || request.reset_gdn) &&
                 !state_.resetCommittedKVAndRecurrentState(
                     reset_transaction.cacheContext()))
@@ -3041,6 +3259,9 @@ namespace llaminar2
                 std::fflush(stderr);
                 std::terminate();
             }
+            reset_transaction.enter(
+                RequestStateResetTransaction::Phase::
+                    ResetShiftedMTP);
             if (request.reset_mtp &&
                 !state_.resetMTPShiftedSidecarState(
                     reset_transaction.cacheContext()))
@@ -3049,6 +3270,9 @@ namespace llaminar2
                           << " reason=" << reset_reason);
                 std::terminate();
             }
+            reset_transaction.enter(
+                RequestStateResetTransaction::Phase::
+                    ResetMTPHistory);
             if (request.reset_mtp && state_.device_id.is_gpu())
             {
                 /*
@@ -3067,19 +3291,18 @@ namespace llaminar2
                     std::terminate();
                 }
             }
+            reset_transaction.enter(
+                RequestStateResetTransaction::Phase::
+                    ResetLogicalSequence);
             if (request.reset_logical_sequence)
                 state_.clearLogicalSequenceState();
-            if (state_.device_id.is_gpu())
-            {
-                publishRequestStateResetReady(
-                    reset_transaction.executionStream(),
-                    reset_reason);
-                reset_transaction.markPublished();
-            }
             // NOTE: Do NOT reset arena_ here. Buffer registrations and allocations
             // are expensive and model-specific (e.g., GDN buffers for Qwen3.5).
             // The arena is created once in initializeBuffers() and persists for
             // the lifetime of the orchestrator.
+            reset_transaction.enter(
+                RequestStateResetTransaction::Phase::
+                    ResetKernelDynamicState);
             if (preserve_replay_safe_graphs)
             {
                 /*
@@ -3103,19 +3326,45 @@ namespace llaminar2
             // restore without a snapshot uses a separate hook because an
             // ordinary request-boundary reset may preserve graph-compatible
             // runtime baseline state that would be stale for a restored prefix.
+            reset_transaction.enter(
+                RequestStateResetTransaction::Phase::
+                    ResetModelRuntime);
             if (request.reset_model_runtime && graph_builder_)
             {
                 if (prefix_restore_boundary)
-                    graph_builder_->resetPrefixCacheRuntimeStateWithoutSnapshot();
+                    graph_builder_->resetPrefixCacheRuntimeStateWithoutSnapshot(
+                        reset_transaction.executionStream());
                 else
-                    graph_builder_->resetState();
+                    graph_builder_->resetState(
+                        reset_transaction.executionStream());
             }
+            if (state_.device_id.is_gpu())
+            {
+                /*
+                 * This is the sole publication point for the reset
+                 * transaction. It follows every device mutation, including
+                 * model-owned runtime tables and transfer directories, so the
+                 * next graph inherits the complete boundary through one
+                 * transitive event wait.
+                 */
+                reset_transaction.enter(
+                    RequestStateResetTransaction::Phase::
+                        PublishResetReady);
+                publishRequestStateResetReady(
+                    reset_transaction.executionStream(),
+                    reset_reason);
+                reset_transaction.markPublished();
+            }
+            reset_transaction.enter(
+                RequestStateResetTransaction::Phase::
+                    FinalizeSessionMetadata);
             // Note: host_resident_released_ is NOT reset here —
             // the host data is gone and cannot be re-uploaded.
             device_sampling_counter_ = 0;
             ++session_epoch_;
             recordLivePrefixSessionReset(reset_reason,
                                          preserve_replay_safe_graphs);
+            reset_transaction.markCompleted();
         }
 
         void clear_cache() override
@@ -4416,9 +4665,29 @@ namespace llaminar2
             uint32_t controller_last_error_expected_arrivals = 0;
             uint32_t controller_last_error_copied_arrivals = 0;
             uint32_t controller_last_error_copy_status_code = 0;
+            uint32_t controller_last_error_copy_failure_flags = 0;
+            uint32_t controller_last_error_copy_plan_entries_seen = 0;
+            uint32_t
+                controller_last_error_copy_skipped_wrong_destination = 0;
+            uint32_t controller_last_error_missing_destination_slot =
+                kDeviceMoEInvalidSlot;
+            uint32_t controller_last_error_missing_destination_layer =
+                kDeviceMoEInvalidSlot;
+            uint32_t controller_last_error_missing_destination_expert =
+                kDeviceMoEInvalidSlot;
+            uint32_t controller_last_error_missing_destination_source =
+                kDeviceMoEInvalidSlot;
+            uint32_t controller_last_error_local_transfer_slot_count = 0;
             uint32_t controller_last_error_participant =
                 kDeviceMoEInvalidSlot;
             uint32_t copy_status_code = 0;
+            uint32_t copy_transaction_wave_index =
+                kDeviceMoEInvalidSlot;
+            uint32_t copy_transaction_epoch = 0;
+            uint32_t copy_transaction_command_count = 0;
+            uint32_t copy_plan_entries_seen = 0;
+            uint32_t copy_copied_arrivals = 0;
+            uint32_t copy_skipped_wrong_destination = 0;
             uint32_t copy_invalid_plan_entries = 0;
             uint32_t copy_missing_source_descriptors = 0;
             uint32_t copy_missing_destination_slots = 0;
@@ -4448,6 +4717,26 @@ namespace llaminar2
              * publication occurred before that independent scheduling decision.
              */
             uint32_t prefill_active_transfer_slot_experts = 0;
+            uint32_t prefill_unique_transfer_slot_claims = 0;
+            uint32_t prefill_duplicate_transfer_slot_claims = 0;
+            uint32_t prefill_invalid_transfer_slot_claims = 0;
+            uint32_t prefill_max_transfer_slot = 0;
+            uint32_t prefill_max_transfer_slot_layer = 0;
+            uint32_t prefill_max_transfer_slot_expert = 0;
+            uint32_t prefill_first_duplicate_transfer_slot = 0;
+            uint32_t prefill_first_duplicate_layer = 0;
+            uint32_t prefill_first_duplicate_expert = 0;
+            uint32_t prefill_first_invalid_transfer_slot =
+                kDeviceMoEInvalidSlot;
+            uint32_t prefill_first_invalid_layer =
+                kDeviceMoEInvalidSlot;
+            uint32_t prefill_first_invalid_expert =
+                kDeviceMoEInvalidSlot;
+            uint32_t prefill_first_invalid_reasons = 0;
+            uint32_t prefill_first_invalid_flags = 0;
+            uint32_t prefill_first_invalid_resident_mask = 0;
+            int32_t prefill_first_invalid_owner = -1;
+            uint32_t local_transfer_slot_count = 0;
             uint32_t payload_bucket_slots = 0;
             uint32_t payload_source_participant_mask = 0;
             uint32_t payload_destination_participant_mask = 0;
@@ -4470,7 +4759,15 @@ namespace llaminar2
                             DeviceMoERebalanceStatusCode::WindowNotReady) ||
                     invalid_runtime_layers != 0u ||
                     plan_overflow != 0u ||
-                    payload_bucket_overflow != 0u;
+                    payload_bucket_overflow != 0u ||
+                    prefill_duplicate_transfer_slot_claims != 0u ||
+                    prefill_invalid_transfer_slot_claims != 0u ||
+                    prefill_active_transfer_slot_experts !=
+                        prefill_unique_transfer_slot_claims ||
+                    (prefill_active_transfer_slot_experts != 0u &&
+                     (local_transfer_slot_count == 0u ||
+                      prefill_max_transfer_slot >=
+                          local_transfer_slot_count));
                 const bool copy_error =
                     copy_status_present &&
                     (!copy_status_valid ||

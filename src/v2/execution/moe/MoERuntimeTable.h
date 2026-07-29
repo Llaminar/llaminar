@@ -353,8 +353,22 @@ namespace llaminar2
                                           size_t expert_count,
                                           void *stream = nullptr) override;
         void resetDecodeHistogramCounts(void *stream = nullptr) override;
+        /**
+         * @brief Restore an empty request-local placement using one ordered D2D copy.
+         *
+         * Mirrored GPU tables require an explicit stream. Their empty template
+         * is allocated and populated during model setup, so request reset does
+         * not upload stale host state, allocate a stream, or synchronize.
+         */
         void resetDecodeRuntimeState(void *stream = nullptr) override;
         bool hasInitialRuntimeState() const noexcept;
+        /**
+         * @brief Restore immutable model placement using one ordered D2D copy.
+         *
+         * Mirrored GPU tables require an explicit stream. The baseline keeps
+         * model-lifetime scratch pointers and placement descriptors but clears
+         * all request-local routing and histogram fields.
+         */
         void restoreInitialRuntimeState(void *stream = nullptr);
         void syncRuntimeStateToHost(void *stream = nullptr);
         void restoreRuntimeStateSnapshot(const DeviceMoELayerRuntime *layers,
@@ -405,8 +419,11 @@ namespace llaminar2
         int prefill_token_capacity_ = 0;
         std::vector<DeviceMoELayerRuntime> host_layers_;
         std::vector<DeviceMoELayerRuntime> initial_host_layers_;
+        std::vector<DeviceMoELayerRuntime> empty_host_layers_;
         std::vector<uint8_t> initial_layer_captured_;
         DeviceMoELayerRuntime *device_layers_ = nullptr;
+        DeviceMoELayerRuntime *device_initial_layers_ = nullptr;
+        DeviceMoELayerRuntime *device_empty_layers_ = nullptr;
         void *decode_histogram_producer_stream_ = nullptr;
 
         struct PrefillRouteScratchAllocation
@@ -431,7 +448,7 @@ namespace llaminar2
         void validateLayerIndex(int layer_idx) const;
         void validateUpdate(int layer_idx, const MoEPlacementUpdate &update) const;
         void resetLayer(DeviceMoELayerRuntime &state) const;
-        void captureInitialLayerStateIfNeeded(int layer_idx);
+        void captureInitialLayerStateIfNeeded(int layer_idx, void *stream);
         bool prefillRouteScratchAllocationHasCapacity(const PrefillRouteScratchAllocation &allocation,
                                                       int token_capacity) const;
         void allocateDeviceMirror();
@@ -439,6 +456,7 @@ namespace llaminar2
         void allocatePrefillRouteScratchForLayer(int layer_idx, int token_capacity);
         void releasePrefillRouteScratch() noexcept;
         void uploadLayerState(int layer_idx, void *stream);
+        void uploadResetTemplatesForLayer(int layer_idx, void *stream);
         void uploadAllLayerStates();
     };
 

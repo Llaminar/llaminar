@@ -69,7 +69,10 @@ namespace llaminar2
         GraphSchema getSchema() const override;
 
         /// Reset GDN conv/recurrence state between sessions (no-op: state is in hybrid cache)
-        void resetState() override {};
+        void resetState(void *execution_stream = nullptr) override
+        {
+            (void)execution_stream;
+        }
 
         /// Wire GDN-specific arena buffers after base wiring
         void setArena(BufferArena *arena) override;

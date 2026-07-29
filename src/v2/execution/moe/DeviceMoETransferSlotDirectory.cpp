@@ -163,6 +163,21 @@ namespace llaminar2
         return profile;
     }
 
+    uint64_t DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(
+        const DeviceMoERebalanceConfig &config) noexcept
+    {
+        if (config.num_layers == 0u)
+            return 0u;
+
+        const uint64_t active_lanes_per_layer =
+            static_cast<uint64_t>(
+                std::max<uint32_t>(
+                    1u,
+                    config.max_hot_replicas_per_participant));
+        return static_cast<uint64_t>(config.num_layers) *
+               active_lanes_per_layer;
+    }
+
     DeviceMoETransferSlotDirectory::BufferedCapacity
     DeviceMoETransferSlotDirectory::planBufferedCapacity(
         uint64_t requested_active_slots,
@@ -225,6 +240,13 @@ namespace llaminar2
             throw std::invalid_argument("DeviceMoETransferSlotDirectory requires a GPU device");
         if (device_ordinal < 0)
             throw std::invalid_argument("DeviceMoETransferSlotDirectory requires a GPU device ordinal");
+        if (device.gpu_ordinal() != device_ordinal)
+        {
+            throw std::invalid_argument(
+                "DeviceMoETransferSlotDirectory DeviceId/allocator ordinal mismatch: device=" +
+                device.to_string() + " allocator_ordinal=" +
+                std::to_string(device_ordinal));
+        }
         if (slot_count == 0)
             throw std::invalid_argument("DeviceMoETransferSlotDirectory requires at least one slot");
         auto &specs = format_profile.allocation_specs;
@@ -307,10 +329,20 @@ namespace llaminar2
                 backend->allocate(host_entries.size() * sizeof(host_entries[0]), device_ordinal));
         if (!device_entries)
             throw std::runtime_error("DeviceMoETransferSlotDirectory failed to allocate device directory");
+        DeviceMoEExpertDirectoryEntry *device_baseline_entries =
+            static_cast<DeviceMoEExpertDirectoryEntry *>(
+                backend->allocate(host_entries.size() * sizeof(host_entries[0]), device_ordinal));
+        if (!device_baseline_entries)
+        {
+            backend->free(device_entries, device_ordinal);
+            throw std::runtime_error(
+                "DeviceMoETransferSlotDirectory failed to allocate device baseline directory");
+        }
 
         void *upload_stream = backend->createStream(device_ordinal);
         if (!upload_stream)
         {
+            backend->free(device_baseline_entries, device_ordinal);
             backend->free(device_entries, device_ordinal);
             throw std::runtime_error("DeviceMoETransferSlotDirectory failed to create upload stream");
         }
@@ -323,10 +355,17 @@ namespace llaminar2
                 directory_bytes,
                 device_ordinal,
                 upload_stream) &&
+            backend->deviceCopyAsync(
+                device_baseline_entries,
+                device_entries,
+                directory_bytes,
+                device_ordinal,
+                upload_stream) &&
             backend->synchronizeStream(upload_stream, device_ordinal);
         backend->destroyStream(upload_stream, device_ordinal);
         if (!uploaded)
         {
+            backend->free(device_baseline_entries, device_ordinal);
             backend->free(device_entries, device_ordinal);
             throw std::runtime_error("DeviceMoETransferSlotDirectory failed to upload device directory");
         }
@@ -341,6 +380,7 @@ namespace llaminar2
                 std::move(format_profile.allocation_specs),
                 std::move(orchestrator),
                 device_entries,
+                device_baseline_entries,
                 std::move(host_entries),
                 planned_bytes,
                 format_profile.max_wire_payload_bytes,
@@ -372,6 +412,7 @@ namespace llaminar2
         std::vector<ProjectionSpec> specs,
         std::shared_ptr<LoadOrchestrator> orchestrator,
         DeviceMoEExpertDirectoryEntry *device_entries,
+        DeviceMoEExpertDirectoryEntry *device_baseline_entries,
         std::vector<DeviceMoEExpertDirectoryEntry> host_entries,
         size_t planned_bytes,
         size_t wire_payload_bytes,
@@ -384,6 +425,7 @@ namespace llaminar2
           specs_(std::move(specs)),
           orchestrator_(std::move(orchestrator)),
           device_entries_(device_entries),
+          device_baseline_entries_(device_baseline_entries),
           host_entries_(std::move(host_entries)),
           planned_bytes_(planned_bytes),
           wire_payload_bytes_(wire_payload_bytes),
@@ -393,11 +435,77 @@ namespace llaminar2
 
     DeviceMoETransferSlotDirectory::~DeviceMoETransferSlotDirectory()
     {
+        if (device_baseline_entries_ && backend_)
+        {
+            backend_->free(device_baseline_entries_, device_ordinal_);
+            device_baseline_entries_ = nullptr;
+        }
         if (device_entries_ && backend_)
         {
             backend_->free(device_entries_, device_ordinal_);
             device_entries_ = nullptr;
         }
+    }
+
+    void DeviceMoETransferSlotDirectory::resetRequestPublications(
+        void *stream)
+    {
+        if (!stream)
+        {
+            throw std::invalid_argument(
+                "DeviceMoETransferSlotDirectory request reset requires an explicit stream");
+        }
+        if (!backend_ || !device_entries_ || !device_baseline_entries_ ||
+            slot_count_ == 0u)
+        {
+            throw std::logic_error(
+                "DeviceMoETransferSlotDirectory request reset has incomplete model-lifetime ownership");
+        }
+
+        const size_t bytes =
+            static_cast<size_t>(slot_count_) *
+            sizeof(DeviceMoEExpertDirectoryEntry);
+        /*
+         * The live directory and its immutable baseline are both owned by this
+         * GPU.  Enqueue the reset behind the caller's already-ordered request
+         * boundary work.  The next graph on this stream therefore observes the
+         * restored directory without blocking the host or introducing a
+         * separate coherence state.
+         */
+        if (!backend_->deviceCopyAsync(
+                device_entries_,
+                device_baseline_entries_,
+                bytes,
+                device_ordinal_,
+                stream))
+        {
+            throw std::runtime_error(
+                "DeviceMoETransferSlotDirectory failed to enqueue request-publication reset on " +
+                device_.to_string());
+        }
+    }
+
+    void DeviceMoETransferSlotDirectory::requirePhysicalOwner(
+        DeviceId expected_device,
+        int expected_device_ordinal,
+        uint32_t expected_participant_id) const
+    {
+        if (device_ == expected_device &&
+            device_ordinal_ == expected_device_ordinal &&
+            participant_id_ == expected_participant_id)
+        {
+            return;
+        }
+
+        throw std::logic_error(
+            "DeviceMoETransferSlotDirectory physical-owner mismatch: actual_device=" +
+            device_.to_string() + " actual_ordinal=" +
+            std::to_string(device_ordinal_) + " actual_participant=" +
+            std::to_string(participant_id_) + " expected_device=" +
+            expected_device.to_string() + " expected_ordinal=" +
+            std::to_string(expected_device_ordinal) +
+            " expected_participant=" +
+            std::to_string(expected_participant_id));
     }
 
     bool DeviceMoETransferSlotDirectory::descriptorForSlot(

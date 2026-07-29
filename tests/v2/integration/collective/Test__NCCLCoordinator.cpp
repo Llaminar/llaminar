@@ -72,6 +72,16 @@ protected:
 
     void TearDown() override
     {
+        for (size_t i = 0; i < producer_streams_.size(); ++i)
+        {
+            if (producer_streams_[i] != nullptr)
+            {
+                cudaSetDevice(static_cast<int>(i));
+                cudaStreamDestroy(producer_streams_[i]);
+            }
+        }
+        producer_streams_.clear();
+
         // Synchronize all devices
         for (int i = 0; i < cuda_device_count_; ++i)
         {
@@ -133,7 +143,42 @@ protected:
         copyHostToDevice(device_id, buffer, host_data.data(), count * sizeof(float));
     }
 
+    /**
+     * @brief Register one explicit producer stream for every NCCL participant.
+     *
+     * The coordinator deliberately refuses to infer ownership from the legacy
+     * default stream. These streams model the production graph executors which
+     * publish each device buffer from a known producer stream.
+     *
+     * @param coordinator Coordinator receiving the producer-stream contract.
+     * @param device_ordinals CUDA devices participating in the communicator.
+     * @return true when every stream was created and registered.
+     */
+    bool registerProducerStreams(
+        NCCLCoordinator &coordinator,
+        const std::vector<int> &device_ordinals)
+    {
+        producer_streams_.assign(device_ordinals.size(), nullptr);
+        std::vector<void *> opaque_streams(device_ordinals.size(), nullptr);
+
+        for (size_t i = 0; i < device_ordinals.size(); ++i)
+        {
+            if (cudaSetDevice(device_ordinals[i]) != cudaSuccess)
+                return false;
+            if (cudaStreamCreateWithFlags(
+                    &producer_streams_[i],
+                    cudaStreamNonBlocking) != cudaSuccess)
+                return false;
+            opaque_streams[i] =
+                static_cast<void *>(producer_streams_[i]);
+        }
+
+        coordinator.setComputeStreams(opaque_streams);
+        return true;
+    }
+
     int cuda_device_count_ = 0;
+    std::vector<cudaStream_t> producer_streams_;
 };
 
 // =============================================================================
@@ -229,6 +274,7 @@ TEST_F(Test__NCCLCoordinator, AllreduceSingleGPU)
 
     NCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0}));
 
     constexpr size_t COUNT = 1024;
 
@@ -269,6 +315,7 @@ TEST_F(Test__NCCLCoordinator, AllreduceMultiGPU)
 
     NCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0, 1})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
 
     constexpr size_t COUNT = 1024;
 
@@ -320,6 +367,7 @@ TEST_F(Test__NCCLCoordinator, AllgatherMultiGPU)
 
     NCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0, 1})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
 
     constexpr size_t SEND_COUNT = 512;
     constexpr size_t RECV_COUNT = SEND_COUNT * 2; // 2 devices
@@ -390,6 +438,7 @@ TEST_F(Test__NCCLCoordinator, BroadcastMultiGPU)
 
     NCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0, 1})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
 
     constexpr size_t COUNT = 1024;
 
@@ -442,6 +491,7 @@ TEST_F(Test__NCCLCoordinator, ThreadSafety)
 
     NCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0, 1})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
 
     constexpr size_t COUNT = 1024;
     constexpr int NUM_ITERATIONS = 10;

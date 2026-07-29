@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "DeviceMoERebalanceABI.h"
 #include "DeviceMoERebalancePolicyShared.h"
 #include "MoERuntimeTable.h"
 
@@ -17,7 +18,8 @@
 namespace llaminar2
 {
     inline constexpr uint32_t kDeviceMoERebalanceMagic = 0x4d4f4552u; // "MOER"
-    inline constexpr uint32_t kDeviceMoERebalanceVersion = 3;
+    inline constexpr uint32_t kDeviceMoERebalanceVersion =
+        moe_rebalance_abi::kVersion;
     inline constexpr uint32_t kDeviceMoERebalanceAssignmentStaticOwner = 0;
     inline constexpr uint32_t kDeviceMoERebalanceAssignmentLeastLoadedResident = 1;
 
@@ -230,6 +232,22 @@ namespace llaminar2
         uint32_t last_error_copied_arrivals = 0;
         /// Participant-local copy status code observed at the failure.
         uint32_t last_error_copy_status_code = 0;
+        /// Bitwise DeviceMoERebalanceCopyFailure provenance for first error.
+        uint32_t last_error_copy_failure_flags = 0;
+        /// Plan entries observed by the failing participant's unpack pass.
+        uint32_t last_error_copy_plan_entries_seen = 0;
+        /// Entries the failing participant rejected as another destination.
+        uint32_t last_error_copy_skipped_wrong_destination = 0;
+        /// Destination-array subscript carried by the first failed local lease.
+        uint32_t last_error_missing_destination_slot = kDeviceMoEInvalidSlot;
+        /// Logical layer carried by the first failed local destination lease.
+        uint32_t last_error_missing_destination_layer = kDeviceMoEInvalidSlot;
+        /// Logical expert carried by the first failed local destination lease.
+        uint32_t last_error_missing_destination_expert = kDeviceMoEInvalidSlot;
+        /// Payload source carried by the first failed local destination lease.
+        uint32_t last_error_missing_destination_source = kDeviceMoEInvalidSlot;
+        /// Physical destination-slot capacity observed by the failing participant.
+        uint32_t last_error_local_transfer_slot_count = 0;
         DeviceMoERebalanceWaveProgress waves[2];
     };
 
@@ -298,6 +316,29 @@ namespace llaminar2
         InProgress = 5,
     };
 
+    /**
+     * @brief First-error provenance bits for one participant copy transaction.
+     *
+     * The controller latches these bits before publishing its terminal error
+     * code. Copy-status workspace is reused by later graph replays, so retaining
+     * only an arrival count would destroy the causal distinction between a
+     * malformed transaction, a source-pack failure, a destination-unpack
+     * failure, and a structurally clean arrival shortfall.
+     */
+    enum class DeviceMoERebalanceCopyFailure : uint32_t
+    {
+        None = 0,
+        InvalidStatusRecord = 1u << 0,
+        NonOkStatusCode = 1u << 1,
+        TransactionMismatch = 1u << 2,
+        InvalidPlanEntry = 1u << 3,
+        MissingSourceDescriptor = 1u << 4,
+        MissingDestinationSlot = 1u << 5,
+        DescriptorMismatch = 1u << 6,
+        CopyIncomplete = 1u << 7,
+        ArrivalShortfall = 1u << 8,
+    };
+
     struct DeviceMoERebalanceApplyStatus
     {
         uint32_t magic = kDeviceMoERebalanceMagic;
@@ -316,6 +357,32 @@ namespace llaminar2
         uint32_t post_apply_multi_resident_experts = 0;
         uint32_t required_local_arrivals = 0;
         uint32_t ready_local_arrivals = 0;
+        /**
+         * First destination-local plan that could not name physical storage.
+         *
+         * These fields are participant-local device evidence. The transfer
+         * completion allgather carries them to every controller, which latches
+         * the first failure before reusable copy-status workspace is cleared.
+         */
+        uint32_t first_missing_destination_slot = kDeviceMoEInvalidSlot;
+        uint32_t first_missing_destination_layer = kDeviceMoEInvalidSlot;
+        uint32_t first_missing_destination_expert = kDeviceMoEInvalidSlot;
+        uint32_t first_missing_destination_source = kDeviceMoEInvalidSlot;
+        uint32_t local_transfer_slot_count = 0;
+        /**
+         * Immutable command-buffer wave selected for one copy transaction.
+         *
+         * The controller's `active_wave` is intentionally mutable so a second
+         * command buffer can be planned while the first payload is in flight.
+         * Every copy kernel must therefore consume this ticket instead of
+         * sampling `active_wave` independently. A missing ticket is a fatal
+         * transaction-contract violation, never a request to guess the wave.
+         */
+        uint32_t transaction_wave_index = kDeviceMoEInvalidSlot;
+        /// Command epoch observed when transaction_wave_index was published.
+        uint32_t transaction_epoch = 0;
+        /// Bounded command count covered by this copy transaction.
+        uint32_t transaction_command_count = 0;
     };
 
     constexpr DeviceMoERebalanceFlags operator|(DeviceMoERebalanceFlags lhs,
@@ -407,6 +474,25 @@ namespace llaminar2
         uint32_t dynamic_min_window_activations =
             static_cast<uint32_t>(moe_rebalance_policy::kDefaultDynamicMinWindowActivations);
         uint32_t routed_assignment_policy = kDeviceMoERebalanceAssignmentStaticOwner;
+        /**
+         * @brief Maximum simultaneous durable transfer-backed expert claims.
+         *
+         * This is an occupancy limit, not a physical slot-ID boundary. Device
+         * policy combines it with all-gathered occupancy to ensure that every
+         * ownership swap can retire one old claim before publishing one new
+         * claim. Graph builders derive it from `BufferedCapacity::active_slots`.
+         */
+        uint32_t active_transfer_slot_capacity = kDeviceMoEMaxExperts;
+        /**
+         * @brief Number of addressable entries in the transfer-slot directory.
+         *
+         * Slot roles rotate after an atomic transfer publication: a slot that
+         * staged an arrival becomes durable while the retired occupant's slot
+         * becomes available for a later wave. Consequently this bound includes
+         * both active and staging capacity and comes from
+         * `BufferedCapacity::total_slots`.
+         */
+        uint32_t transfer_slot_directory_capacity = kDeviceMoEMaxExperts;
     };
 
     struct DeviceMoERebalanceStatus
@@ -527,10 +613,57 @@ namespace llaminar2
          * hot-path host access, allocation, or synchronization.
          */
         uint32_t prefill_active_transfer_slot_experts = 0;
+        /**
+         * @brief Number of distinct transfer-slot IDs claimed by active experts.
+         *
+         * Every active transfer-backed expert must own one unique directory
+         * slot. Comparing this field with
+         * @ref prefill_active_transfer_slot_experts therefore detects aliases
+         * without downloading the runtime table or consulting a host mirror.
+         */
+        uint32_t prefill_unique_transfer_slot_claims = 0;
+        /** @brief Active experts that alias a transfer slot already claimed. */
+        uint32_t prefill_duplicate_transfer_slot_claims = 0;
+        /** @brief Active transfer-backed experts carrying an invalid slot ID. */
+        uint32_t prefill_invalid_transfer_slot_claims = 0;
+        /** @brief Largest valid transfer-slot ID observed in the active banks. */
+        uint32_t prefill_max_transfer_slot = 0;
+        /** @brief Layer that published @ref prefill_max_transfer_slot. */
+        uint32_t prefill_max_transfer_slot_layer = 0;
+        /** @brief Expert that published @ref prefill_max_transfer_slot. */
+        uint32_t prefill_max_transfer_slot_expert = 0;
+        /** @brief First aliased slot ID; meaningful when duplicate claims are nonzero. */
+        uint32_t prefill_first_duplicate_transfer_slot = 0;
+        /** @brief Layer of the first later expert observed to alias a slot. */
+        uint32_t prefill_first_duplicate_layer = 0;
+        /** @brief Expert of the first later expert observed to alias a slot. */
+        uint32_t prefill_first_duplicate_expert = 0;
+        /** @brief First invalid slot ID, or kDeviceMoEInvalidSlot when absent. */
+        uint32_t prefill_first_invalid_transfer_slot = kDeviceMoEInvalidSlot;
+        /** @brief Layer that published the first invalid transfer-slot claim. */
+        uint32_t prefill_first_invalid_layer = kDeviceMoEInvalidSlot;
+        /** @brief Expert that published the first invalid transfer-slot claim. */
+        uint32_t prefill_first_invalid_expert = kDeviceMoEInvalidSlot;
+        /** @brief Bitset of moe_rebalance_policy::TransferSlotClaimInvalidReason. */
+        uint32_t prefill_first_invalid_reasons = 0;
+        /** @brief Descriptor flags carried by the first invalid claim. */
+        uint32_t prefill_first_invalid_flags = 0;
+        /** @brief Resident-participant mask carried by the first invalid claim. */
+        uint32_t prefill_first_invalid_resident_mask = 0;
+        /** @brief Authoritative owner carried by the first invalid claim. */
+        int32_t prefill_first_invalid_owner = -1;
     };
 
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceConfig>);
+    static_assert(
+        sizeof(DeviceMoERebalanceConfig) ==
+            moe_rebalance_abi::kConfigBytes,
+        "host rebalance config ABI must match the shared host/device contract");
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceStatus>);
+    static_assert(
+        sizeof(DeviceMoERebalanceStatus) ==
+            moe_rebalance_abi::kStatusBytes,
+        "host rebalance status ABI must match the shared host/device contract");
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceCommandBufferHeader>);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceWaveState>);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceWaveProgress>);
@@ -538,6 +671,165 @@ namespace llaminar2
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
     static_assert(std::is_trivially_copyable_v<DeviceMoEExpertDirectoryEntry>);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceApplyStatus>);
+
+    /**
+     * @brief Device-runtime summary of active transfer-slot ownership.
+     *
+     * The summary is intentionally reducible to a small fixed-width status
+     * object. GPU implementations compute the same fields in their captured
+     * controller kernels, while this host implementation keeps controller
+     * tests and CPU diagnostics ABI-identical.
+     */
+    struct DeviceMoETransferSlotClaimSummary
+    {
+        uint32_t active_claims = 0;
+        uint32_t unique_claims = 0;
+        uint32_t duplicate_claims = 0;
+        uint32_t invalid_claims = 0;
+        uint32_t max_slot = 0;
+        uint32_t max_slot_layer = 0;
+        uint32_t max_slot_expert = 0;
+        uint32_t first_duplicate_slot = 0;
+        uint32_t first_duplicate_layer = 0;
+        uint32_t first_duplicate_expert = 0;
+        uint32_t first_invalid_slot = kDeviceMoEInvalidSlot;
+        uint32_t first_invalid_layer = kDeviceMoEInvalidSlot;
+        uint32_t first_invalid_expert = kDeviceMoEInvalidSlot;
+        uint32_t first_invalid_reasons = 0;
+        uint32_t first_invalid_flags = 0;
+        uint32_t first_invalid_resident_mask = 0;
+        int32_t first_invalid_owner = -1;
+    };
+
+    /**
+     * @brief Audit active placement banks for aliased transfer-slot IDs.
+     *
+     * A transfer directory entry is mutable storage with exactly one current
+     * logical occupant. Two active runtime descriptors may therefore never
+     * publish the same local slot. This scan is O(layers * experts), runs only
+     * in the maintenance controller, and requires no payload access.
+     *
+     * @param runtime_layers Participant-local layer runtime array.
+     * @param config Rebalance geometry and participant identity.
+     * @return Aggregate claim summary with the first duplicate witness.
+     */
+    inline DeviceMoETransferSlotClaimSummary
+    deviceMoETransferSlotClaimSummary(
+        const DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoERebalanceConfig &config) noexcept
+    {
+        DeviceMoETransferSlotClaimSummary summary;
+        if (!runtime_layers ||
+            config.magic != kDeviceMoERebalanceMagic ||
+            config.version != kDeviceMoERebalanceVersion ||
+            config.num_layers == 0u ||
+            config.num_layers > kDeviceMoEMaxExperts ||
+            config.num_experts == 0u ||
+            config.num_experts > kDeviceMoEMaxExperts ||
+            config.participant_count == 0u ||
+            config.participant_count > kDeviceMoEMaxParticipants ||
+            config.participant_id >= config.participant_count)
+            return summary;
+
+        constexpr uint32_t kWordCount =
+            (kDeviceMoEMaxExperts + 31u) / 32u;
+        uint32_t claimed_slots[kWordCount] = {};
+        const uint32_t local_participant_bit =
+            moe_rebalance_policy::participantBit(config.participant_id);
+        const uint32_t valid_flag =
+            toMoEExpertFlags(DeviceMoEExpertFlags::Valid);
+        const uint32_t resident_flag =
+            toMoEExpertFlags(DeviceMoEExpertFlags::Resident);
+        const uint32_t transfer_slot_flag =
+            toMoEExpertFlags(DeviceMoEExpertFlags::TransferSlot);
+
+        for (uint32_t layer = 0; layer < config.num_layers; ++layer)
+        {
+            const auto &runtime = runtime_layers[layer];
+            if (runtime.active_bank > 1u ||
+                runtime.active_epoch == 0u ||
+                runtime.expert_count != config.num_experts ||
+                runtime.participant_id != config.participant_id ||
+                runtime.participant_count != config.participant_count)
+            {
+                continue;
+            }
+
+            const auto &bank = runtime.banks[runtime.active_bank];
+            for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+            {
+                const auto &descriptor = bank.experts[expert];
+                const uint32_t resident_mask =
+                    bank.resident_participant_mask[expert];
+                const auto claim =
+                    moe_rebalance_policy::classifyTransferSlotClaim(
+                        descriptor.flags,
+                        resident_mask,
+                        local_participant_bit,
+                        descriptor.owner_participant,
+                        config.participant_id,
+                        descriptor.local_slot,
+                        kDeviceMoEMaxExperts,
+                        config.transfer_slot_directory_capacity,
+                        valid_flag,
+                        resident_flag,
+                        transfer_slot_flag);
+                if (!claim.claims_storage)
+                    continue;
+
+                ++summary.active_claims;
+                if (!claim.valid())
+                {
+                    if (summary.invalid_claims == 0u)
+                    {
+                        summary.first_invalid_slot =
+                            descriptor.local_slot < 0
+                                ? kDeviceMoEInvalidSlot
+                                : static_cast<uint32_t>(
+                                      descriptor.local_slot);
+                        summary.first_invalid_layer = layer;
+                        summary.first_invalid_expert = expert;
+                        summary.first_invalid_reasons =
+                            claim.invalid_reasons;
+                        summary.first_invalid_flags = descriptor.flags;
+                        summary.first_invalid_resident_mask =
+                            resident_mask;
+                        summary.first_invalid_owner =
+                            descriptor.owner_participant;
+                    }
+                    ++summary.invalid_claims;
+                    continue;
+                }
+
+                const uint32_t slot =
+                    static_cast<uint32_t>(descriptor.local_slot);
+                if (summary.unique_claims == 0u ||
+                    slot > summary.max_slot)
+                {
+                    summary.max_slot = slot;
+                    summary.max_slot_layer = layer;
+                    summary.max_slot_expert = expert;
+                }
+                const uint32_t word = slot / 32u;
+                const uint32_t bit = 1u << (slot % 32u);
+                if ((claimed_slots[word] & bit) != 0u)
+                {
+                    if (summary.duplicate_claims == 0u)
+                    {
+                        summary.first_duplicate_slot = slot;
+                        summary.first_duplicate_layer = layer;
+                        summary.first_duplicate_expert = expert;
+                    }
+                    ++summary.duplicate_claims;
+                    continue;
+                }
+
+                claimed_slots[word] |= bit;
+                ++summary.unique_claims;
+            }
+        }
+        return summary;
+    }
 
     struct DeviceMoERebalanceTransferCostEstimate
     {
@@ -889,6 +1181,14 @@ namespace llaminar2
                config.participant_count <= kDeviceMoEMaxParticipants &&
                config.participant_id < config.participant_count &&
                moe_rebalance_policy::hasValidRootParticipant(config) &&
+               config.active_transfer_slot_capacity > 0 &&
+               config.active_transfer_slot_capacity <=
+                   kDeviceMoEMaxExperts &&
+               config.transfer_slot_directory_capacity > 0 &&
+               config.transfer_slot_directory_capacity <=
+                   kDeviceMoEMaxExperts &&
+               config.active_transfer_slot_capacity <=
+                   config.transfer_slot_directory_capacity &&
                config.window_size_tokens > 0 &&
                config.llep_alpha_numerator > 0 &&
                config.llep_alpha_denominator > 0 &&
@@ -1733,9 +2033,12 @@ namespace llaminar2
             static_cast<uint64_t>(deviceMoEPackedHistogramLayerCount(config)) *
             static_cast<uint64_t>(config.num_experts);
         const uint64_t layer_stride = static_cast<uint64_t>(config.num_experts);
-        return gathered_histograms[static_cast<uint64_t>(participant) * participant_stride +
-                                   static_cast<uint64_t>(wave_layer) * layer_stride +
-                                   static_cast<uint64_t>(expert)];
+        const uint64_t packed =
+            gathered_histograms[
+                static_cast<uint64_t>(participant) * participant_stride +
+                static_cast<uint64_t>(wave_layer) * layer_stride +
+                static_cast<uint64_t>(expert)];
+        return moe_rebalance_policy::collectedStateActivationCount(packed);
     }
 
     inline uint64_t deviceMoEGlobalExpertCount(
@@ -1831,6 +2134,45 @@ namespace llaminar2
                 status->status_code = static_cast<uint32_t>(DeviceMoERebalanceStatusCode::InvalidRuntime);
             return false;
         }
+        const DeviceMoETransferSlotClaimSummary transfer_slot_claims =
+            deviceMoETransferSlotClaimSummary(runtime_layers, config);
+        if (status)
+        {
+            status->prefill_active_transfer_slot_experts =
+                transfer_slot_claims.active_claims;
+            status->prefill_unique_transfer_slot_claims =
+                transfer_slot_claims.unique_claims;
+            status->prefill_duplicate_transfer_slot_claims =
+                transfer_slot_claims.duplicate_claims;
+            status->prefill_invalid_transfer_slot_claims =
+                transfer_slot_claims.invalid_claims;
+            status->prefill_max_transfer_slot =
+                transfer_slot_claims.max_slot;
+            status->prefill_max_transfer_slot_layer =
+                transfer_slot_claims.max_slot_layer;
+            status->prefill_max_transfer_slot_expert =
+                transfer_slot_claims.max_slot_expert;
+            status->prefill_first_duplicate_transfer_slot =
+                transfer_slot_claims.first_duplicate_slot;
+            status->prefill_first_duplicate_layer =
+                transfer_slot_claims.first_duplicate_layer;
+            status->prefill_first_duplicate_expert =
+                transfer_slot_claims.first_duplicate_expert;
+            status->prefill_first_invalid_transfer_slot =
+                transfer_slot_claims.first_invalid_slot;
+            status->prefill_first_invalid_layer =
+                transfer_slot_claims.first_invalid_layer;
+            status->prefill_first_invalid_expert =
+                transfer_slot_claims.first_invalid_expert;
+            status->prefill_first_invalid_reasons =
+                transfer_slot_claims.first_invalid_reasons;
+            status->prefill_first_invalid_flags =
+                transfer_slot_claims.first_invalid_flags;
+            status->prefill_first_invalid_resident_mask =
+                transfer_slot_claims.first_invalid_resident_mask;
+            status->prefill_first_invalid_owner =
+                transfer_slot_claims.first_invalid_owner;
+        }
         if (!gathered_histograms)
         {
             if (status)
@@ -1880,7 +2222,6 @@ namespace llaminar2
         uint64_t post_wave_load_total = 0;
         uint64_t post_wave_load_spread = 0;
         uint32_t hot_cache_active_layers = 0;
-        uint32_t prefill_active_transfer_slot_experts = 0;
         uint32_t last_epoch = 0;
         uint64_t pre_policy_load[kDeviceMoEMaxParticipants] = {};
         uint64_t post_policy_load[kDeviceMoEMaxParticipants] = {};
@@ -1902,17 +2243,6 @@ namespace llaminar2
                 : std::min(config.layer_wave_count, layer_window_count);
         const uint32_t layer_window_start =
             config.num_layers == 0 ? 0 : (config.layer_window_start % config.num_layers);
-
-        /*
-         * Inspect every layer rather than only the rolling maintenance wave.
-         * Prefill placement publication is model-wide, while the maintenance
-         * cursor intentionally sees only a bounded layer slice per replay.
-         */
-        for (uint32_t layer = 0; layer < config.num_layers; ++layer)
-        {
-            prefill_active_transfer_slot_experts +=
-                deviceMoELayerActiveTransferSlotExpertCount(runtime_layers[layer]);
-        }
 
         for (uint32_t window_index = 0; window_index < layer_wave_count; ++window_index)
         {
@@ -2429,8 +2759,6 @@ namespace llaminar2
                 router_hot_cache_selected_expert_slots;
             status->router_hot_cache_replicated_selected_expert_slots =
                 router_hot_cache_replicated_selected_expert_slots;
-            status->prefill_active_transfer_slot_experts =
-                prefill_active_transfer_slot_experts;
             status->last_epoch = last_epoch;
             status->window_ready_slots =
                 deviceMoEClampU64ToU32(

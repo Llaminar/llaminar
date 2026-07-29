@@ -683,6 +683,228 @@ TEST(Perf__MoELLEPDeterminism, ROCm_DynamicMaintenancePackAndControllerDetermini
 #endif
 }
 
+/**
+ * @brief Time the exact Qwen3.6 LLEP decode-maintenance controller geometry.
+ *
+ * This regression deliberately isolates the general LLEP controller from
+ * transfer payload movement.  The serving lane replays the controller on a
+ * dedicated stream while forward graphs execute elsewhere; an accidentally
+ * serialized multi-millisecond planner therefore slows every forward stage,
+ * even when the grouped expert kernels themselves are economical.
+ *
+ * All runtime state, gathered evidence, and output buffers are allocated and
+ * uploaded before the timed region.  The timed region contains controller
+ * launches only, with one event synchronization after the complete batch.
+ */
+TEST(Perf__MoELLEPDeterminism, ROCm_Qwen36LLEPMaintenanceControllerEconomy)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    Shape shape{};
+    shape.participant_count = 2;
+    constexpr uint32_t num_layers = 40u;
+    constexpr uint32_t plan_capacity = 42u;
+    const uint32_t layer_wave_count = static_cast<uint32_t>(
+        std::min(
+            4,
+            envInt("LLAMINAR_MOE_LLEP_MAINT_LAYER_WAVE", 4)));
+    const DeviceMoERebalanceConfig config =
+        llepMaintenanceConfig(shape, num_layers, layer_wave_count);
+    const uint32_t gathered_histogram_count =
+        config.participant_count * config.layer_wave_count * config.num_experts;
+    const int warmups =
+        envInt("LLAMINAR_MOE_LLEP_MAINT_WARMUPS", 2);
+    const int iterations =
+        envInt("LLAMINAR_MOE_LLEP_MAINT_ITERS", 20);
+
+    ROCmHarness harness(shape);
+    harness.prepare(/*all_participants_resident=*/false,
+                    makeSourceZeroTransferRouteExperts(shape),
+                    makeRouteWeights(shape));
+
+    DeviceMoERuntimeTable::Config runtime_config;
+    runtime_config.device_id = harness.device_;
+    runtime_config.num_layers = static_cast<int>(num_layers);
+    runtime_config.num_experts = shape.num_experts;
+    runtime_config.top_k = shape.top_k;
+    runtime_config.mirror_to_device = true;
+    MoERuntimeTable runtime_table(runtime_config);
+    for (uint32_t layer = 0; layer < num_layers; ++layer)
+    {
+        auto runtime = runtime_table.hostLayerState(static_cast<int>(layer));
+        configureRuntimeLayer(
+            runtime,
+            shape,
+            /*all_participants_resident=*/false,
+            /*participant_id=*/0);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                runtime_table.deviceLayerState(static_cast<int>(layer)),
+                &runtime,
+                sizeof(runtime),
+                hipMemcpyHostToDevice,
+                harness.stream_),
+            hipSuccess);
+    }
+
+    std::vector<uint64_t> gathered(
+        static_cast<size_t>(gathered_histogram_count),
+        0ULL);
+    const uint32_t participant_stride =
+        config.layer_wave_count * config.num_experts;
+    for (uint32_t participant = 0;
+         participant < config.participant_count;
+         ++participant)
+    {
+        for (uint32_t wave_layer = 0;
+             wave_layer < config.layer_wave_count;
+             ++wave_layer)
+        {
+            for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+            {
+                const uint32_t owner =
+                    expert % config.participant_count;
+                const uint64_t count =
+                    owner == 0u
+                        ? (expert == 0u ? 4096ULL : 64ULL)
+                        : 1ULL;
+                const size_t index =
+                    static_cast<size_t>(participant) * participant_stride +
+                    static_cast<size_t>(wave_layer) * config.num_experts +
+                    expert;
+                gathered[index] =
+                    moe_rebalance_policy::packCollectedState(
+                        participant == owner ? count : 0ULL,
+                        /*active_transfer_slots=*/0u,
+                        /*physically_resident=*/participant == owner,
+                        /*transfer_backed=*/false);
+            }
+        }
+    }
+
+    uint64_t *d_gathered_histograms = nullptr;
+    DeviceMoERebalancePlanEntry *d_plan = nullptr;
+    uint32_t *d_plan_count = nullptr;
+    DeviceMoERebalanceStatus *d_status = nullptr;
+    DeviceMoERebalanceCommandBufferHeader *d_header = nullptr;
+    DeviceMoERebalanceWaveState *d_wave_state = nullptr;
+    ASSERT_EQ(
+        hipMalloc(
+            &d_gathered_histograms,
+            static_cast<size_t>(gathered_histogram_count) * sizeof(uint64_t)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMalloc(
+            &d_plan,
+            static_cast<size_t>(plan_capacity) *
+                sizeof(DeviceMoERebalancePlanEntry)),
+        hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_plan_count, sizeof(uint32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_status, sizeof(DeviceMoERebalanceStatus)), hipSuccess);
+    ASSERT_EQ(
+        hipMalloc(&d_header, sizeof(DeviceMoERebalanceCommandBufferHeader)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMalloc(&d_wave_state, sizeof(DeviceMoERebalanceWaveState)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            d_gathered_histograms,
+            gathered.data(),
+            gathered.size() * sizeof(uint64_t),
+            hipMemcpyHostToDevice,
+            harness.stream_),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemsetAsync(d_wave_state, 0, sizeof(*d_wave_state), harness.stream_),
+        hipSuccess);
+
+    auto run_controller = [&]()
+    {
+        ASSERT_TRUE(harness.kernel_->runDeviceRebalanceController(
+            harness.launchContext(),
+            runtime_table.deviceLayerState(0),
+            d_gathered_histograms,
+            d_status,
+            config,
+            d_plan,
+            d_plan_count,
+            plan_capacity,
+            plan_capacity,
+            d_header,
+            d_wave_state));
+    };
+
+    for (int i = 0; i < warmups; ++i)
+        run_controller();
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    HipEvents events;
+    ASSERT_EQ(hipEventRecord(events.start, harness.stream_), hipSuccess);
+    for (int i = 0; i < iterations; ++i)
+        run_controller();
+    ASSERT_EQ(hipEventRecord(events.stop, harness.stream_), hipSuccess);
+    ASSERT_EQ(hipEventSynchronize(events.stop), hipSuccess);
+    float elapsed_ms = 0.0f;
+    ASSERT_EQ(
+        hipEventElapsedTime(&elapsed_ms, events.start, events.stop),
+        hipSuccess);
+
+    uint32_t plan_count = 0;
+    DeviceMoERebalanceStatus status{};
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            &plan_count,
+            d_plan_count,
+            sizeof(plan_count),
+            hipMemcpyDeviceToHost,
+            harness.stream_),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            &status,
+            d_status,
+            sizeof(status),
+            hipMemcpyDeviceToHost,
+            harness.stream_),
+        hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+    ASSERT_EQ(
+        status.status_code,
+        static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+    ASSERT_LE(plan_count, plan_capacity);
+    ASSERT_EQ(status.payload_bucket_overflow, 0u);
+
+    const auto plan = harness.copyPlan(d_plan, plan_count);
+    printTiming(
+        "rocm",
+        "qwen36_llep_maintenance_controller",
+        shape,
+        iterations,
+        elapsed_ms * 1000.0f / static_cast<float>(iterations),
+        fnv1a64Plan(plan.data(), plan.size()),
+        status.llep_assignment_span_count,
+        plan_count);
+
+    if (d_wave_state)
+        (void)hipFree(d_wave_state);
+    if (d_header)
+        (void)hipFree(d_header);
+    if (d_status)
+        (void)hipFree(d_status);
+    if (d_plan_count)
+        (void)hipFree(d_plan_count);
+    if (d_plan)
+        (void)hipFree(d_plan);
+    if (d_gathered_histograms)
+        (void)hipFree(d_gathered_histograms);
+#endif
+}
+
 TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
 {
 #ifndef HAVE_ROCM

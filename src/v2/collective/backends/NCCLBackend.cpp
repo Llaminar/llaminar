@@ -11,6 +11,7 @@
  */
 
 #include "NCCLBackend.h"
+#include "NCCLNetworkPolicy.h"
 #include "../coordinators/NCCLCoordinator.h"
 #include "../../utils/Logger.h"
 #include "../../utils/VramBillOfMaterials.h"
@@ -42,8 +43,13 @@ namespace llaminar2
         bool ncclGetUniqueIdWrapper(void *id_out);
 
         // NCCL communicator management
-        bool ncclCommInitRankWrapper(void **comm_out, int nranks, void *unique_id, int rank, std::string &error_out);
-        bool ncclCommInitAllWrapper(void **comms_out, int ndevs, const int *devlist, std::string &error_out);
+        bool ncclCommInitRankWithNetworkWrapper(
+            void **comm_out,
+            int nranks,
+            void *unique_id,
+            int rank,
+            const char *network_module,
+            std::string &error_out);
         void ncclCommDestroyWrapper(void *comm);
         void ncclCommAbortWrapper(void *comm);
 
@@ -100,10 +106,6 @@ namespace llaminar2
         // Pinned (page-locked) host memory for staging
         bool cudaAllocPinnedBuffer(void **ptr, size_t bytes);
         void cudaFreePinnedBuffer(void *ptr);
-
-        // Initialize NCCL communicators for exactly 2 devices (for copy operations)
-        bool ncclCommInitPairWrapper(void **comm_src_out, void **comm_dst_out,
-                                     int src_ordinal, int dst_ordinal, std::string &error_out);
 
         // Device memory copy operations
         bool cudaMemcpySameDevice(void *dst, const void *src, size_t bytes, int device_ordinal);
@@ -258,6 +260,17 @@ namespace llaminar2
             return false;
         }
 
+        const std::string_view network_module = ncclNetworkModuleName(
+            selectNCCLNetworkModule(group.scope));
+        const char *network_module_name = network_module.empty()
+                                              ? nullptr
+                                              : network_module.data();
+        LOG_DEBUG("[NCCLNetworkPolicy] group='" << group.name
+                                               << "' scope="
+                                               << (group.isLocal() ? "local" : (group.isGlobal() ? "global" : "hybrid"))
+                                               << " network_module="
+                                               << (network_module.empty() ? "automatic" : network_module));
+
         int cuda_device_count = 0;
         if (!nccl_backend_detail::cudaGetDeviceCountWrapper(&cuda_device_count))
         {
@@ -324,8 +337,13 @@ namespace llaminar2
             // Use MPI world_size and rank for the communicator
             std::string nccl_error;
             void *comm_ptr = nullptr;
-            if (!nccl_backend_detail::ncclCommInitRankWrapper(&comm_ptr, mpi_ctx_->world_size(),
-                                                              unique_id_buffer.data(), mpi_ctx_->rank(), nccl_error))
+            if (!nccl_backend_detail::ncclCommInitRankWithNetworkWrapper(
+                    &comm_ptr,
+                    mpi_ctx_->world_size(),
+                    unique_id_buffer.data(),
+                    mpi_ctx_->rank(),
+                    network_module_name,
+                    nccl_error))
             {
                 last_error_ = "ncclCommInitRank failed: " + nccl_error;
                 LOG_ERROR(last_error_);
@@ -347,11 +365,27 @@ namespace llaminar2
         {
             // Single GPU - create a trivial communicator
             LOG_DEBUG("NCCLBackend: Single-GPU mode");
+
+            if (!nccl_backend_detail::ncclGetUniqueIdWrapper(unique_id_buffer.data()))
+            {
+                last_error_ = "ncclGetUniqueId failed";
+                LOG_ERROR(last_error_);
+                nccl_backend_detail::cudaDestroyStream(stream_);
+                stream_ = nullptr;
+                return false;
+            }
+
             std::string nccl_error;
             void *comm_ptr = nullptr;
-            if (!nccl_backend_detail::ncclCommInitAllWrapper(&comm_ptr, 1, nullptr, nccl_error))
+            if (!nccl_backend_detail::ncclCommInitRankWithNetworkWrapper(
+                    &comm_ptr,
+                    1,
+                    unique_id_buffer.data(),
+                    0,
+                    network_module_name,
+                    nccl_error))
             {
-                last_error_ = "ncclCommInitAll failed: " + nccl_error;
+                last_error_ = "ncclCommInitRankConfig failed: " + nccl_error;
                 LOG_ERROR(last_error_);
                 nccl_backend_detail::cudaDestroyStream(stream_);
                 stream_ = nullptr;
@@ -2434,10 +2468,18 @@ namespace llaminar2
                                       {
                 nccl_backend_detail::cudaSetDeviceOrdinal(i);
                 void* comm_ptr = nullptr;
-                if (!nccl_backend_detail::ncclCommInitRankWrapper(&comm_ptr, device_count,
-                                                                  unique_id_buffer.data(), i, thread_errors[i]))
+                constexpr std::string_view copy_network_module =
+                    ncclNetworkModuleName(NCCLNetworkModule::Socket);
+                if (!nccl_backend_detail::ncclCommInitRankWithNetworkWrapper(
+                        &comm_ptr,
+                        device_count,
+                        unique_id_buffer.data(),
+                        i,
+                        copy_network_module.data(),
+                        thread_errors[i]))
                 {
-                    LOG_ERROR("ncclCommInitRank failed for copy comm GPU " << i << ": " << thread_errors[i]);
+                    LOG_ERROR("ncclCommInitRankConfig failed for copy comm GPU "
+                              << i << ": " << thread_errors[i]);
                     init_errors++;
                 }
                 else

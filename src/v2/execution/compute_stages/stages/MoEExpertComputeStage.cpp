@@ -712,6 +712,51 @@ namespace llaminar2
                      << " p1=" << participant_load[1]
                      << " p2=" << participant_load[2]
                      << " p3=" << participant_load[3]);
+
+            /*
+             * A transferred expert is useful only when its published runtime
+             * descriptor names the destination participant's stable VRAM slot.
+             * Correct payload bytes can otherwise mask a remote-pointer
+             * publication bug until decode becomes PCIe-bound. Keep the exact
+             * pointer provenance in the opt-in trace so one diagnostic pass can
+             * distinguish transfer cost from post-transfer compute cost.
+             */
+            if (tag &&
+                std::strcmp(tag, "after_llep_transfer_apply") == 0 &&
+                runtime.active_bank <= 1u)
+            {
+                const auto &bank = runtime.banks[runtime.active_bank];
+                for (const auto &transfer : transfers)
+                {
+                    if (transfer.expert >= expert_count)
+                        continue;
+                    const auto &descriptor = bank.experts[transfer.expert];
+                    LOG_INFO("[MoEExpertComputeStage] prefill transfer descriptor trace"
+                             << " device=" << device.to_string()
+                             << " layer=" << layer_idx
+                             << " expert=" << transfer.expert
+                             << " source_participant=" << transfer.source_participant
+                             << " destination_participant=" << transfer.destination_participant
+                             << " runtime_participant=" << runtime.participant_id
+                             << " owner_participant=" << descriptor.owner_participant
+                             << " local_slot=" << descriptor.local_slot
+                             << " flags=" << descriptor.flags
+                             << " resident_mask="
+                             << bank.resident_participant_mask[transfer.expert]
+                             << " local_compute="
+                             << static_cast<uint32_t>(
+                                    bank.local_compute_mask[transfer.expert])
+                             << " gate_payload="
+                             << static_cast<const void *>(descriptor.gate.payload)
+                             << " gate_scales=" << descriptor.gate.scales
+                             << " up_payload="
+                             << static_cast<const void *>(descriptor.up.payload)
+                             << " up_scales=" << descriptor.up.scales
+                             << " down_payload="
+                             << static_cast<const void *>(descriptor.down.payload)
+                             << " down_scales=" << descriptor.down.scales);
+                }
+            }
             return true;
         }
 
@@ -4899,7 +4944,14 @@ namespace llaminar2
         return true;
     }
 
-    bool MoEExpertComputeStage::hasTransferBackedPrefillLLEP() const
+    bool MoEExpertComputeStage::
+        requestsTransferBackedCurrentBatchPrefillLLEP() const noexcept
+    {
+        return params_.prefill_llep_assignment_mode ==
+               PrefillLLEPAssignmentMode::TransferBackedCurrentBatch;
+    }
+
+    bool MoEExpertComputeStage::hasValidCompactLLEPTransferBinding() const
     {
         if (params_.routed_assignment_policy != RoutedExpertAssignmentPolicy::LeastLoadedResident ||
             !params_.prefill_llep_tp_ctx ||
@@ -4909,9 +4961,7 @@ namespace llaminar2
             params_.prefill_llep_payload_slot_bytes == 0 ||
             params_.prefill_llep_payload_slot_capacity == 0 ||
             !params_.prefill_llep_transfer_state ||
-            params_.layer_idx < 0 ||
-            (params_.seq_len <= 1 &&
-             !params_.prefix_runtime_device_rehydration))
+            params_.layer_idx < 0)
         {
             return false;
         }
@@ -4933,6 +4983,13 @@ namespace llaminar2
                params_.prefill_llep_rebalance_config.participant_count;
     }
 
+    bool MoEExpertComputeStage::hasTransferBackedPrefillLLEP() const
+    {
+        return requestsTransferBackedCurrentBatchPrefillLLEP() &&
+               params_.seq_len > 1 &&
+               hasValidCompactLLEPTransferBinding();
+    }
+
     bool MoEExpertComputeStage::executeTransferBackedPrefillLLEPMovement(
         IMoEKernel *kernel,
         DeviceMoERebalanceStatus **transfer_status_out,
@@ -4945,10 +5002,11 @@ namespace llaminar2
             *transfer_status_out = nullptr;
         if (apply_status_out)
             *apply_status_out = nullptr;
-        if (!hasTransferBackedPrefillLLEP())
+        if (!hasValidCompactLLEPTransferBinding())
         {
-            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill requested without a valid compact transfer binding");
-            return false;
+            throw std::logic_error(
+                "MoE compact LLEP payload movement requires a valid graph-owned "
+                "LocalTP transport binding");
         }
         if (!bound_workspace_)
         {
@@ -5507,7 +5565,9 @@ namespace llaminar2
                     static_cast<uint64_t>(std::max(0, top_k));
                 const uint64_t min_routed_rows =
                     moe_env.llep_prefill_min_routed_rows;
-                if (min_routed_rows > 0ULL && routed_rows < min_routed_rows)
+                if (!params_.force_grouped_verifier_prefill_for_decode &&
+                    min_routed_rows > 0ULL &&
+                    routed_rows < min_routed_rows)
                 {
                     PerfStatsCollector::addCounter(
                         "moe_rebalance",
@@ -5525,60 +5585,76 @@ namespace llaminar2
                     return groups_prepared;
                 }
 
-                least_loaded_ep::LeastLoadedExpertAssignmentConfig llep_config;
-                llep_config.expert_count = static_cast<uint32_t>(num_experts);
-                llep_config.participant_count =
-                    runtime_state.participant_count > 0u
-                        ? runtime_state.participant_count
-                        : static_cast<uint32_t>(
-                              std::max(1, params_.participant_count));
-                /*
-                 * Request-local prefill LLEP must use the same policy knobs as
-                 * graph-captured decode maintenance.  Otherwise a parity cell
-                 * can force migration in one phase while the other quietly keeps
-                 * the default owner capacity and balanced-skip behavior.
-                 */
-                llep_config.alpha_numerator =
-                    std::max<uint32_t>(
-                        1u,
-                        params_.prefill_llep_rebalance_config.llep_alpha_numerator);
-                llep_config.alpha_denominator =
-                    std::max<uint32_t>(
-                        1u,
-                        params_.prefill_llep_rebalance_config.llep_alpha_denominator);
-                llep_config.lambda_numerator =
-                    std::max<uint32_t>(
-                        1u,
-                        params_.prefill_llep_rebalance_config.llep_lambda_numerator);
-                llep_config.lambda_denominator =
-                    std::max<uint32_t>(
-                        1u,
-                        params_.prefill_llep_rebalance_config.llep_lambda_denominator);
-                llep_config.enable_balanced_skip =
-                    params_.prefill_llep_rebalance_config.llep_enable_balanced_skip != 0u;
-                llep_config.min_spread_improvement =
-                    static_cast<uint64_t>(
-                        std::max(0, moe_env.device_rebalance_min_load_spread_improvement));
-                llep_config.min_spread_improvement_divisor =
-                    static_cast<uint32_t>(
-                        std::max(0, moe_env.device_rebalance_min_load_spread_improvement_divisor));
-                llep_config.min_spread_improvement_per_transfer =
-                    static_cast<uint64_t>(
-                        std::max(0, moe_env.device_rebalance_min_wave_spread_improvement_per_payload_slot));
-                llep_config.min_foreign_rows_per_transfer =
-                    static_cast<uint64_t>(
-                        std::max(0, moe_env.device_rebalance_min_foreign_rows_per_transfer));
-                if (hasTransferBackedPrefillLLEP())
+                if (requestsTransferBackedCurrentBatchPrefillLLEP())
                 {
+                    if (!hasTransferBackedPrefillLLEP())
+                    {
+                        throw std::logic_error(
+                            "TransferBackedCurrentBatch LLEP assignment requires "
+                            "a valid compact graph-owned transport binding");
+                    }
+
+                    least_loaded_ep::LeastLoadedExpertAssignmentConfig llep_config;
+                    llep_config.expert_count =
+                        static_cast<uint32_t>(num_experts);
+                    llep_config.participant_count =
+                        runtime_state.participant_count > 0u
+                            ? runtime_state.participant_count
+                            : static_cast<uint32_t>(
+                                  std::max(1, params_.participant_count));
                     /*
-                     * The transfer directory is the physical payload working
-                     * set, not merely a per-wave copy budget. An already
-                     * resident non-owner replica still occupies one of these
-                     * slots while its rows execute. Publish the same bound for
-                     * new arrivals and the complete assignment so a plan can
-                     * never require the materializer to truncate, repair, or
-                     * serialize an overcommitted wave.
+                     * Long-prefill LLEP uses the same policy knobs as captured
+                     * decode maintenance. The transfer directory is the
+                     * physical working set, so both new arrivals and the full
+                     * non-owner assignment are bounded by its real capacity.
                      */
+                    llep_config.alpha_numerator =
+                        std::max<uint32_t>(
+                            1u,
+                            params_.prefill_llep_rebalance_config
+                                .llep_alpha_numerator);
+                    llep_config.alpha_denominator =
+                        std::max<uint32_t>(
+                            1u,
+                            params_.prefill_llep_rebalance_config
+                                .llep_alpha_denominator);
+                    llep_config.lambda_numerator =
+                        std::max<uint32_t>(
+                            1u,
+                            params_.prefill_llep_rebalance_config
+                                .llep_lambda_numerator);
+                    llep_config.lambda_denominator =
+                        std::max<uint32_t>(
+                            1u,
+                            params_.prefill_llep_rebalance_config
+                                .llep_lambda_denominator);
+                    llep_config.enable_balanced_skip =
+                        params_.prefill_llep_rebalance_config
+                            .llep_enable_balanced_skip != 0u;
+                    llep_config.min_spread_improvement =
+                        static_cast<uint64_t>(
+                            std::max(
+                                0,
+                                moe_env
+                                    .device_rebalance_min_load_spread_improvement));
+                    llep_config.min_spread_improvement_divisor =
+                        static_cast<uint32_t>(
+                            std::max(
+                                0,
+                                moe_env
+                                    .device_rebalance_min_load_spread_improvement_divisor));
+                    llep_config.min_spread_improvement_per_transfer =
+                        static_cast<uint64_t>(
+                            std::max(
+                                0,
+                                moe_env
+                                    .device_rebalance_min_wave_spread_improvement_per_payload_slot));
+                    llep_config.min_foreign_rows_per_transfer =
+                        static_cast<uint64_t>(
+                            std::max(
+                                0,
+                                moe_env
+                                    .device_rebalance_min_foreign_rows_per_transfer));
                     const uint32_t physical_transfer_slot_capacity =
                         std::min<uint32_t>(
                             params_.prefill_llep_payload_slot_capacity,
@@ -5587,26 +5663,26 @@ namespace llaminar2
                         physical_transfer_slot_capacity;
                     llep_config.max_non_owner_experts_per_participant =
                         physical_transfer_slot_capacity;
-                }
 
-                groups_prepared = kernel->planPrefillRoutesLeastLoadedCurrentBatch(
-                    compute_launch,
-                    moe_runtime_layer_,
-                    seq_len,
-                    seq_len,
-                    num_experts,
-                    top_k,
-                    llep_config);
-                if (!groups_prepared)
-                {
-                    LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
-                              "planPrefillRoutesLeastLoadedCurrentBatch failed");
-                    return false;
-                }
-                if (!trace_runtime_assignment("after_llep_plan"))
-                    return false;
-                if (hasTransferBackedPrefillLLEP())
-                {
+                    groups_prepared =
+                        kernel->planPrefillRoutesLeastLoadedCurrentBatch(
+                            compute_launch,
+                            moe_runtime_layer_,
+                            seq_len,
+                            seq_len,
+                            num_experts,
+                            top_k,
+                            llep_config);
+                    if (!groups_prepared)
+                    {
+                        LOG_ERROR(
+                            "[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                            "planPrefillRoutesLeastLoadedCurrentBatch failed");
+                        return false;
+                    }
+                    if (!trace_runtime_assignment("after_llep_plan"))
+                        return false;
+
                     DeviceMoERebalanceStatus *transfer_status = nullptr;
                     DeviceMoERebalanceApplyStatus *apply_status = nullptr;
                     if (!executeTransferBackedPrefillLLEPMovement(kernel, &transfer_status, &apply_status))
@@ -5646,20 +5722,40 @@ namespace llaminar2
                 }
                 else
                 {
-                    if (params_.prefill_llep_require_transfer_backing)
-                    {
-                        throw std::runtime_error(
-                            "LLEP grouped GPU prefill transfer mode 'full' requires "
-                            "compact transfer-backed current-batch expert movement");
-                    }
+                    /*
+                     * Resident-only is a first-class assignment policy, not a
+                     * failed transfer plan. In particular, MTP verifier rows
+                     * enter this branch even when the graph also owns compact
+                     * transport resources for a preceding prefix-rehydration
+                     * transaction. The backend planner considers only the
+                     * active bank's resident masks, making a missing-payload
+                     * destination structurally unrepresentable.
+                     */
                     groups_prepared =
-                        kernel->assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+                        kernel->assignPrefillRoutesLeastLoadedResident(
                             compute_launch,
                             moe_runtime_layer_,
                             seq_len,
                             seq_len,
                             num_experts,
                             top_k);
+                    if (groups_prepared)
+                    {
+                        PerfStatsCollector::addCounter(
+                            "moe_rebalance",
+                            "device_rebalance_llep_resident_assignment_calls",
+                            1.0,
+                            params_.force_grouped_verifier_prefill_for_decode
+                                ? "verifier"
+                                : "prefill",
+                            params_.device_id.toString(),
+                            {{"stage", "moe_expert_grouped_prefill"},
+                             {"assignment", "resident_only"},
+                             {"current_batch_transport", "none"},
+                             {"layer", std::to_string(params_.layer_idx)},
+                             {"seq_len", std::to_string(seq_len)},
+                             {"top_k", std::to_string(top_k)}});
+                    }
                 }
                 if (!groups_prepared)
                 {
@@ -6207,7 +6303,15 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::isCollectiveStage() const
     {
-        return hasTransferBackedPrefillLLEP();
+        /*
+         * Report the graph-build policy, not whether every pointer in the
+         * binding happens to validate. An invalid transport request must remain
+         * a collective-stage construction error; classifying it as ordinary
+         * compute would permit segmented or unordered execution before the
+         * invariant is diagnosed.
+         */
+        return requestsTransferBackedCurrentBatchPrefillLLEP() ||
+               params_.prefix_runtime_device_rehydration;
     }
 
     bool MoEExpertComputeStage::isGraphCapturable() const
@@ -6341,28 +6445,29 @@ namespace llaminar2
             return false;
         }
         setGPUStream(stream);
-        if (!hasTransferBackedPrefillLLEP())
+        const bool prepare_current_batch =
+            requestsTransferBackedCurrentBatchPrefillLLEP();
+        const bool prepare_prefix_rehydration =
+            params_.prefix_runtime_device_rehydration;
+        if (!prepare_current_batch && !prepare_prefix_rehydration)
             return true;
-        if (!params_.prefill_llep_transfer_state)
+        if (!hasValidCompactLLEPTransferBinding())
         {
-            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP graph preparation requires shared lane state"
-                      << " device=" << params_.device_id.to_string()
-                      << " layer=" << params_.layer_idx
-                      << " workspace=" << params_.prefill_llep_workspace_name);
-            return false;
+            throw std::logic_error(
+                "MoE graph launch requested compact LLEP transport without a "
+                "valid graph-owned LocalTP binding");
         }
-        if (!params_.prefill_llep_transfer_state->prepareForCapture(
+        if (prepare_current_batch &&
+            !params_.prefill_llep_transfer_state->prepareForCapture(
                 params_.device_id,
                 params_.prefill_llep_workspace_name,
                 stream))
         {
-            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP graph preparation could not order its rolling lane"
-                      << " device=" << params_.device_id.to_string()
-                      << " layer=" << params_.layer_idx
-                      << " workspace=" << params_.prefill_llep_workspace_name);
-            return false;
+            throw std::runtime_error(
+                "Transfer-backed current-batch LLEP graph preparation could "
+                "not publish its rolling-lane event ordering");
         }
-        if (params_.prefix_runtime_device_rehydration &&
+        if (prepare_prefix_rehydration &&
             (!params_.prefix_runtime_rehydration_transfer_state ||
              !params_.prefix_runtime_rehydration_transfer_state->
                  prepareForCapture(
@@ -6370,12 +6475,9 @@ namespace llaminar2
                      params_.prefill_llep_workspace_name,
                      stream)))
         {
-            LOG_ERROR("[MoEExpertComputeStage] Prefix-runtime rehydration graph preparation could not establish distinct event ownership"
-                      << " device=" << params_.device_id.to_string()
-                      << " layer=" << params_.layer_idx
-                      << " workspace="
-                      << params_.prefill_llep_workspace_name);
-            return false;
+            throw std::runtime_error(
+                "Prefix-runtime rehydration graph preparation could not "
+                "establish distinct event ownership");
         }
 
         PerfStatsCollector::addCounter(
@@ -6386,6 +6488,10 @@ namespace llaminar2
             params_.device_id.to_string(),
             {{"stage", "moe_expert_grouped_prefill"},
              {"layer", std::to_string(params_.layer_idx)},
+             {"current_batch",
+              prepare_current_batch ? "transfer_backed" : "resident_only"},
+             {"prefix_rehydration",
+              prepare_prefix_rehydration ? "enabled" : "disabled"},
              {"workspace", params_.prefill_llep_workspace_name}});
         return true;
     }
@@ -6564,7 +6670,17 @@ namespace llaminar2
                 rows,
                 /*projection_count=*/2u);
         }
-        if (hasTransferBackedPrefillLLEP())
+        const bool needs_llep_transport_workspace =
+            requestsTransferBackedCurrentBatchPrefillLLEP() ||
+            params_.prefix_runtime_device_rehydration;
+        if (needs_llep_transport_workspace &&
+            !hasValidCompactLLEPTransferBinding())
+        {
+            throw std::logic_error(
+                "MoE compact LLEP transport workspace requested without a "
+                "valid graph-owned LocalTP binding");
+        }
+        if (needs_llep_transport_workspace)
         {
             const auto &config = params_.prefill_llep_rebalance_config;
             const uint32_t captured_payload_slots =

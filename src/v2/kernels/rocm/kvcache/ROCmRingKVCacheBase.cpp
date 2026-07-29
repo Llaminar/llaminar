@@ -369,11 +369,59 @@ namespace llaminar2
             static_cast<size_t>(n_layers_) * static_cast<size_t>(batch_size_);
         const size_t metadata_bytes = entry_count * sizeof(int);
         auto stream = static_cast<hipStream_t>(context.execution_stream);
-        if (hipMemsetAsync(d_head_params_, 0, metadata_bytes, stream) != hipSuccess ||
-            hipMemsetAsync(d_count_params_, 0, metadata_bytes, stream) != hipSuccess)
+
+        /*
+         * Keep the two publications separate even though they share a stream.
+         * A prior asynchronous kernel fault is reported by the next HIP API
+         * that observes it; preserving the exact failing operation tells an
+         * E2E crash whether the head reset itself failed or whether the first
+         * reset succeeded and count publication then failed.  Do not retry or
+         * clear the sticky error: request reset is an ownership boundary and
+         * must fail hard when either canonical metadata bank is not reset.
+         */
+        const hipError_t head_status =
+            hipMemsetAsync(d_head_params_, 0, metadata_bytes, stream);
+        if (head_status != hipSuccess)
         {
-            LOG_ERROR("[ROCmRingKVCacheBase] Failed to enqueue request-state metadata reset"
-                      << " reason=" << context.reason);
+            LOG_ERROR("[ROCmRingKVCacheBase] Failed to enqueue request-state head reset"
+                      << " reason=" << context.reason
+                      << " device=" << device_id_
+                      << " bytes=" << metadata_bytes
+                      << " status=" << hipGetErrorString(head_status));
+            std::fprintf(
+                stderr,
+                "[FATAL] ROCm KV request reset failed: bank=head device=%d "
+                "stream=%p bytes=%zu status=%d (%s) reason=%s\n",
+                device_id_,
+                context.execution_stream,
+                metadata_bytes,
+                static_cast<int>(head_status),
+                hipGetErrorString(head_status),
+                context.reason);
+            std::fflush(stderr);
+            return false;
+        }
+
+        const hipError_t count_status =
+            hipMemsetAsync(d_count_params_, 0, metadata_bytes, stream);
+        if (count_status != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCacheBase] Failed to enqueue request-state count reset"
+                      << " reason=" << context.reason
+                      << " device=" << device_id_
+                      << " bytes=" << metadata_bytes
+                      << " status=" << hipGetErrorString(count_status));
+            std::fprintf(
+                stderr,
+                "[FATAL] ROCm KV request reset failed: bank=count device=%d "
+                "stream=%p bytes=%zu status=%d (%s) reason=%s\n",
+                device_id_,
+                context.execution_stream,
+                metadata_bytes,
+                static_cast<int>(count_status),
+                hipGetErrorString(count_status),
+                context.reason);
+            std::fflush(stderr);
             return false;
         }
 

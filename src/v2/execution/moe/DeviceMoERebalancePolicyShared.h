@@ -31,10 +31,90 @@ namespace llaminar2::moe_rebalance_policy
     constexpr uint32_t kDefaultDynamicMaxPlanEntriesPerWave = 16u;
     constexpr uint64_t kDefaultDynamicMinWindowActivations = 64u;
     constexpr uint32_t kDefaultDeviceMinLoadSpreadImprovementDivisor = 15u;
+    /**
+     * @brief Bit layout for one all-gathered rebalance-state word.
+     *
+     * Routing counts and physical placement evidence must describe the same
+     * controller epoch. Packing them into one fixed-width collective record
+     * makes that relationship structural: the planner cannot accidentally
+     * combine current routing counts with stale host-side slot occupancy.
+     *
+     * Forty-eight count bits are intentionally generous. Even at top-k 16 the
+     * counter can represent more than seventeen trillion routed tokens before
+     * saturation, while the remaining bits carry the participant-wide active
+     * slot count and this expert's exact local storage classification.
+     */
+    constexpr uint64_t kCollectedStateActivationCountMask =
+        (1ULL << 48u) - 1ULL;
+    constexpr uint32_t kCollectedStateActiveSlotCountShift = 48u;
+    constexpr uint64_t kCollectedStateActiveSlotCountMask =
+        0x1ffULL << kCollectedStateActiveSlotCountShift;
+    constexpr uint64_t kCollectedStateTransferBackedBit = 1ULL << 62u;
+    constexpr uint64_t kCollectedStatePhysicallyResidentBit = 1ULL << 63u;
     constexpr float kDefaultDynamicImbalanceThresholdRatio =
         static_cast<float>(kDefaultDynamicImbalanceThresholdPerMille) / 1000.0f;
     constexpr float kDefaultDynamicMinImprovementRatio =
         static_cast<float>(kDefaultDynamicMinImprovementPerMille) / 1000.0f;
+
+    /**
+     * @brief Pack routing and physical storage evidence for one expert.
+     *
+     * @param activation_count Exact participant-local routing count.
+     * @param active_transfer_slots Number of transfer-backed experts currently
+     *        live across this participant's complete managed runtime.
+     * @param physically_resident Whether this participant can source the bytes.
+     * @param transfer_backed Whether the live descriptor consumes transfer storage.
+     * @return One collective word consumed by all backend planners.
+     */
+    LLAMINAR_MOE_REBALANCE_HD uint64_t packCollectedState(
+        uint64_t activation_count,
+        uint32_t active_transfer_slots,
+        bool physically_resident,
+        bool transfer_backed) noexcept
+    {
+        uint64_t packed =
+            activation_count & kCollectedStateActivationCountMask;
+        packed |=
+            (static_cast<uint64_t>(active_transfer_slots > 0x1ffu
+                                       ? 0x1ffu
+                                       : active_transfer_slots)
+             << kCollectedStateActiveSlotCountShift);
+        if (physically_resident)
+            packed |= kCollectedStatePhysicallyResidentBit;
+        if (transfer_backed)
+            packed |= kCollectedStateTransferBackedBit;
+        return packed;
+    }
+
+    /// Return the routing-count component of an all-gathered state word.
+    LLAMINAR_MOE_REBALANCE_HD uint64_t collectedStateActivationCount(
+        uint64_t packed) noexcept
+    {
+        return packed & kCollectedStateActivationCountMask;
+    }
+
+    /// Return the participant-wide active transfer-slot count.
+    LLAMINAR_MOE_REBALANCE_HD uint32_t collectedStateActiveTransferSlots(
+        uint64_t packed) noexcept
+    {
+        return static_cast<uint32_t>(
+            (packed & kCollectedStateActiveSlotCountMask) >>
+            kCollectedStateActiveSlotCountShift);
+    }
+
+    /// Return whether this participant physically stores the expert payload.
+    LLAMINAR_MOE_REBALANCE_HD bool collectedStatePhysicallyResident(
+        uint64_t packed) noexcept
+    {
+        return (packed & kCollectedStatePhysicallyResidentBit) != 0ULL;
+    }
+
+    /// Return whether this participant's expert payload uses transfer storage.
+    LLAMINAR_MOE_REBALANCE_HD bool collectedStateTransferBacked(
+        uint64_t packed) noexcept
+    {
+        return (packed & kCollectedStateTransferBackedBit) != 0ULL;
+    }
 
     struct LoadSpreadDelta
     {
@@ -94,6 +174,139 @@ namespace llaminar2::moe_rebalance_policy
         bool occupied = false;
         bool protected_from_reuse = false;
     };
+
+    /**
+     * @brief Machine-readable reasons that a live transfer-slot claim is invalid.
+     *
+     * A claim audit is part of the transfer state machine, not merely a logging
+     * aid. Keeping its reason bits in this host/device shared policy guarantees
+     * that CPU diagnostics, CUDA maintenance graphs, and ROCm maintenance graphs
+     * classify the same runtime publication identically.
+     */
+    enum TransferSlotClaimInvalidReason : uint32_t
+    {
+        TransferSlotClaimValid = 0u,
+        TransferSlotClaimMissingValidFlag = 1u << 0u,
+        TransferSlotClaimMissingResidentFlag = 1u << 1u,
+        TransferSlotClaimMissingLocalResidency = 1u << 2u,
+        TransferSlotClaimNegativeSlot = 1u << 3u,
+        TransferSlotClaimExceedsCompileTimeCapacity = 1u << 4u,
+        TransferSlotClaimExceedsDirectoryCapacity = 1u << 5u,
+    };
+
+    /**
+     * @brief Classification of one runtime descriptor's physical slot claim.
+     */
+    struct TransferSlotClaim
+    {
+        bool claims_storage = false;
+        uint32_t invalid_reasons = TransferSlotClaimValid;
+
+        LLAMINAR_MOE_REBALANCE_HD bool valid() const noexcept
+        {
+            return claims_storage &&
+                   invalid_reasons == TransferSlotClaimValid;
+        }
+    };
+
+    /**
+     * @brief Classify one descriptor using the canonical physical-liveness rule.
+     *
+     * Current row assignment is intentionally absent from this API. An
+     * authoritative owner can receive zero rows while its transfer allocation
+     * remains the only durable copy. Conversely, a stale TransferSlot bit on a
+     * remote, nonresident descriptor does not consume local storage. All three
+     * backends must use this helper so claim accounting cannot drift by backend.
+     *
+     * @param descriptor_flags Runtime expert descriptor flags.
+     * @param resident_mask Domain-wide physical residency mask.
+     * @param local_participant_bit Bit identifying this participant.
+     * @param owner_participant Authoritative participant in the descriptor.
+     * @param local_participant This runtime table's participant.
+     * @param local_slot Stable transfer-directory slot, or a negative sentinel.
+     * @param compile_time_capacity Maximum slot ID representable by the ABI.
+     * @param directory_capacity Runtime addressable directory capacity.
+     * @param valid_flag Descriptor flag proving the payload descriptor is valid.
+     * @param resident_flag Descriptor flag proving local payload residency.
+     * @param transfer_slot_flag Descriptor flag identifying transfer storage.
+     */
+    LLAMINAR_MOE_REBALANCE_HD TransferSlotClaim classifyTransferSlotClaim(
+        uint32_t descriptor_flags,
+        uint32_t resident_mask,
+        uint32_t local_participant_bit,
+        int32_t owner_participant,
+        uint32_t local_participant,
+        int32_t local_slot,
+        uint32_t compile_time_capacity,
+        uint32_t directory_capacity,
+        uint32_t valid_flag,
+        uint32_t resident_flag,
+        uint32_t transfer_slot_flag) noexcept
+    {
+        TransferSlotClaim claim;
+        const bool local_resident =
+            (resident_mask & local_participant_bit) != 0u;
+        const bool authoritative_local_owner =
+            owner_participant == static_cast<int32_t>(local_participant);
+        claim.claims_storage =
+            (descriptor_flags & transfer_slot_flag) != 0u &&
+            (local_resident || authoritative_local_owner);
+        if (!claim.claims_storage)
+            return claim;
+
+        if ((descriptor_flags & valid_flag) == 0u)
+            claim.invalid_reasons |= TransferSlotClaimMissingValidFlag;
+        if ((descriptor_flags & resident_flag) == 0u)
+            claim.invalid_reasons |= TransferSlotClaimMissingResidentFlag;
+        if (!local_resident)
+            claim.invalid_reasons |= TransferSlotClaimMissingLocalResidency;
+        if (local_slot < 0)
+        {
+            claim.invalid_reasons |= TransferSlotClaimNegativeSlot;
+            return claim;
+        }
+
+        const uint32_t slot = static_cast<uint32_t>(local_slot);
+        if (slot >= compile_time_capacity)
+            claim.invalid_reasons |=
+                TransferSlotClaimExceedsCompileTimeCapacity;
+        if (slot >= directory_capacity)
+            claim.invalid_reasons |=
+                TransferSlotClaimExceedsDirectoryCapacity;
+        return claim;
+    }
+
+    /**
+     * @brief Retire every local pointer and flag for a departed GPU payload.
+     *
+     * Local residency, pointer-bearing matrix descriptors, the stable slot ID,
+     * and execution flags form one publication. Clearing only LocalCompute leaves
+     * a descriptor that can later be mistaken for durable storage. This helper
+     * makes retirement a single host/device operation used by CUDA and ROCm.
+     *
+     * The logical expert ID, authoritative owner, and policy-only flags are
+     * preserved because remote placement metadata remains meaningful after the
+     * local bytes depart.
+     *
+     * @param descriptor Runtime expert descriptor to retire.
+     * @param resident_mask Domain-wide resident mask to update.
+     * @param local_participant_bit Bit identifying this participant.
+     * @param local_payload_flags Valid/resident/compute/replica/transfer flags.
+     */
+    template <typename ExpertDescriptor>
+    LLAMINAR_MOE_REBALANCE_HD void retireLocalPayloadPublication(
+        ExpertDescriptor &descriptor,
+        uint32_t &resident_mask,
+        uint32_t local_participant_bit,
+        uint32_t local_payload_flags) noexcept
+    {
+        resident_mask &= ~local_participant_bit;
+        descriptor.gate = decltype(descriptor.gate){};
+        descriptor.up = decltype(descriptor.up){};
+        descriptor.down = decltype(descriptor.down){};
+        descriptor.local_slot = -1;
+        descriptor.flags &= ~local_payload_flags;
+    }
 
     /**
      * @brief Classify whether a transfer-backed expert occupies a local slot.
@@ -283,6 +496,125 @@ namespace llaminar2::moe_rebalance_policy
         return lhs <= rhs;
     }
 
+    /**
+     * @brief Test whether one ownership move preserves durable slot capacity.
+     *
+     * Ownership and physical storage are intentionally separate from the
+     * current compute assignment. Moving an expert whose source bytes live in
+     * static model storage consumes one new durable transfer slot at the
+     * destination. Moving a transfer-backed expert releases one durable slot
+     * at the source and consumes one at the destination. The destination may
+     * already have transfer-backed storage only when a prior transaction left
+     * a physical replica there, in which case the move does not grow its
+     * working set.
+     *
+     * Callers pass transaction-local occupancy arrays. After accepting a move,
+     * they must call @ref applyOwnershipTransferOccupancy before evaluating the
+     * next candidate. This makes a multi-command captured wave obey the same
+     * bounded-storage invariant as its eventual runtime publication.
+     *
+     * @param participant_active_transfer_slots Current durable claims per participant.
+     * @param expert_transfer_backed_participant_mask Physical transfer-backed copies.
+     * @param expert Logical expert moved by the command.
+     * @param source_participant Current authoritative source participant.
+     * @param destination_participant New authoritative destination participant.
+     * @param participant_count Number of participants in the placement domain.
+     * @param active_transfer_slot_capacity Durable slots available per participant.
+     * @return true only when the resulting destination occupancy is representable.
+     */
+    LLAMINAR_MOE_REBALANCE_HD bool ownershipTransferFitsPersistentCapacity(
+        const uint32_t *participant_active_transfer_slots,
+        const uint32_t *expert_transfer_backed_participant_mask,
+        uint32_t expert,
+        uint32_t source_participant,
+        uint32_t destination_participant,
+        uint32_t participant_count,
+        uint32_t active_transfer_slot_capacity) noexcept
+    {
+        if (!participant_active_transfer_slots ||
+            !expert_transfer_backed_participant_mask ||
+            source_participant >= participant_count ||
+            destination_participant >= participant_count ||
+            source_participant == destination_participant ||
+            active_transfer_slot_capacity == UINT32_MAX)
+        {
+            return active_transfer_slot_capacity == UINT32_MAX &&
+                   source_participant < participant_count &&
+                   destination_participant < participant_count &&
+                   source_participant != destination_participant;
+        }
+
+        for (uint32_t participant = 0;
+             participant < participant_count;
+             ++participant)
+        {
+            if (participant_active_transfer_slots[participant] >
+                active_transfer_slot_capacity)
+            {
+                return false;
+            }
+        }
+
+        const uint32_t transfer_backed_mask =
+            expert_transfer_backed_participant_mask[expert];
+        const bool source_transfer_backed =
+            (transfer_backed_mask & participantBit(source_participant)) != 0u;
+        if (source_transfer_backed &&
+            participant_active_transfer_slots[source_participant] == 0u)
+        {
+            return false;
+        }
+        const bool destination_already_transfer_backed =
+            (transfer_backed_mask & participantBit(destination_participant)) != 0u;
+        const uint32_t destination_growth =
+            destination_already_transfer_backed ? 0u : 1u;
+        if (destination_growth > active_transfer_slot_capacity)
+            return false;
+        return participant_active_transfer_slots[destination_participant] <=
+               active_transfer_slot_capacity - destination_growth;
+    }
+
+    /**
+     * @brief Advance transaction-local storage ownership after one accepted move.
+     *
+     * The helper mutates only planner scratch. Runtime descriptors and transfer
+     * directory entries remain unchanged until the graph-ordered unpack/apply
+     * phases authenticate and publish the command.
+     *
+     * @return false when the supplied state cannot describe the requested move.
+     */
+    LLAMINAR_MOE_REBALANCE_HD bool applyOwnershipTransferOccupancy(
+        uint32_t *participant_active_transfer_slots,
+        uint32_t *expert_transfer_backed_participant_mask,
+        uint32_t expert,
+        uint32_t source_participant,
+        uint32_t destination_participant) noexcept
+    {
+        if (!participant_active_transfer_slots ||
+            !expert_transfer_backed_participant_mask ||
+            source_participant == destination_participant)
+        {
+            return false;
+        }
+
+        const uint32_t source_bit = participantBit(source_participant);
+        const uint32_t destination_bit = participantBit(destination_participant);
+        uint32_t &mask = expert_transfer_backed_participant_mask[expert];
+        if ((mask & source_bit) != 0u)
+        {
+            if (participant_active_transfer_slots[source_participant] == 0u)
+                return false;
+            --participant_active_transfer_slots[source_participant];
+            mask &= ~source_bit;
+        }
+        if ((mask & destination_bit) == 0u)
+        {
+            ++participant_active_transfer_slots[destination_participant];
+            mask |= destination_bit;
+        }
+        return true;
+    }
+
     LLAMINAR_MOE_REBALANCE_HD OwnershipSwapChoice bestDynamicOwnershipSwap(
         const uint64_t *participant_load,
         const uint64_t *expert_counts,
@@ -291,7 +623,10 @@ namespace llaminar2::moe_rebalance_policy
         uint32_t participant_count,
         uint32_t imbalance_threshold_per_mille = kDefaultDynamicImbalanceThresholdPerMille,
         uint32_t min_improvement_per_mille = kDefaultDynamicMinImprovementPerMille,
-        uint64_t min_window_activations = kDefaultDynamicMinWindowActivations) noexcept
+        uint64_t min_window_activations = kDefaultDynamicMinWindowActivations,
+        const uint32_t *expert_transfer_backed_participant_mask = nullptr,
+        const uint32_t *participant_active_transfer_slots = nullptr,
+        uint32_t active_transfer_slot_capacity = UINT32_MAX) noexcept
     {
         OwnershipSwapChoice choice{};
         if (!participant_load ||
@@ -336,6 +671,46 @@ namespace llaminar2::moe_rebalance_policy
             return choice;
         }
 
+        const bool enforce_transfer_capacity =
+            expert_transfer_backed_participant_mask != nullptr &&
+            participant_active_transfer_slots != nullptr &&
+            active_transfer_slot_capacity != UINT32_MAX;
+        if (enforce_transfer_capacity)
+        {
+            for (uint32_t participant = 0;
+                 participant < participant_count;
+                 ++participant)
+            {
+                /*
+                 * A count above the declared active capacity means the
+                 * runtime has already violated its storage contract. Refusing
+                 * to publish another command keeps that invariant fail-closed.
+                 */
+                if (participant_active_transfer_slots[participant] >
+                    active_transfer_slot_capacity)
+                {
+                    return choice;
+                }
+            }
+        }
+
+        /*
+         * Each ownership swap sends one expert in both directions. A
+         * participant already at capacity can accept its incoming payload only
+         * when its outgoing expert is transfer-backed and therefore releases a
+         * durable slot in this exact wave. Filtering candidates here lets the
+         * policy select the best physically executable pair instead of
+         * publishing an impossible mathematical winner.
+         */
+        const bool overloaded_requires_transfer_departure =
+            enforce_transfer_capacity &&
+            participant_active_transfer_slots[overloaded] >=
+                active_transfer_slot_capacity;
+        const bool underloaded_requires_transfer_departure =
+            enforce_transfer_capacity &&
+            participant_active_transfer_slots[underloaded] >=
+                active_transfer_slot_capacity;
+
         uint32_t heavy_expert = num_experts;
         uint32_t light_expert = num_experts;
         uint64_t heavy_count = 0;
@@ -346,6 +721,12 @@ namespace llaminar2::moe_rebalance_policy
             const uint64_t count = expert_counts[expert];
             if (owner == static_cast<int32_t>(overloaded))
             {
+                if (overloaded_requires_transfer_departure &&
+                    (expert_transfer_backed_participant_mask[expert] &
+                     participantBit(overloaded)) == 0u)
+                {
+                    continue;
+                }
                 if (heavy_expert == num_experts ||
                     count > heavy_count ||
                     (count == heavy_count && expert < heavy_expert))
@@ -356,6 +737,12 @@ namespace llaminar2::moe_rebalance_policy
             }
             else if (owner == static_cast<int32_t>(underloaded))
             {
+                if (underloaded_requires_transfer_departure &&
+                    (expert_transfer_backed_participant_mask[expert] &
+                     participantBit(underloaded)) == 0u)
+                {
+                    continue;
+                }
                 if (light_expert == num_experts ||
                     count < light_count ||
                     (count == light_count && expert < light_expert))
@@ -423,6 +810,40 @@ namespace llaminar2::moe_rebalance_policy
         choice.improvement = old_spread > new_spread ? old_spread - new_spread : 1u;
         choice.valid = true;
         return choice;
+    }
+
+    /**
+     * @brief Advance transfer-slot occupancy after an accepted ownership swap.
+     *
+     * This updates the controller's transaction-local model only; publication
+     * still occurs later through the normal copy/apply lifecycle. Keeping the
+     * accounting helper shared prevents CUDA and ROCm from selecting different
+     * second swaps within the same captured wave.
+     */
+    LLAMINAR_MOE_REBALANCE_HD bool applyDynamicOwnershipSwapTransferOccupancy(
+        uint32_t *participant_active_transfer_slots,
+        uint32_t *expert_transfer_backed_participant_mask,
+        const OwnershipSwapChoice &choice) noexcept
+    {
+        if (!participant_active_transfer_slots ||
+            !expert_transfer_backed_participant_mask ||
+            !choice.valid)
+        {
+            return false;
+        }
+
+        return applyOwnershipTransferOccupancy(
+                   participant_active_transfer_slots,
+                   expert_transfer_backed_participant_mask,
+                   choice.heavy_expert,
+                   choice.overloaded_participant,
+                   choice.underloaded_participant) &&
+               applyOwnershipTransferOccupancy(
+                   participant_active_transfer_slots,
+                   expert_transfer_backed_participant_mask,
+                   choice.light_expert,
+                   choice.underloaded_participant,
+                   choice.overloaded_participant);
     }
 
     LLAMINAR_MOE_REBALANCE_HD bool applyDynamicOwnershipSwap(

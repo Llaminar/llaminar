@@ -79,6 +79,27 @@ namespace llaminar2
         };
 
         /**
+         * @brief Compute durable transfer-slot demand for the runtime domain.
+         *
+         * Layer windows are scheduling cursors, not storage ownership domains.
+         * Prefill LLEP, prefix rehydration, and rolling decode maintenance all
+         * publish descriptors into the same runtime table and must therefore
+         * resolve one directory with one physical slot identity space. Basing
+         * capacity on `layer_window_start` or `layer_window_count` lets two
+         * graphs for the same table create differently sized directories and
+         * later reinterpret a valid slot ID against the wrong allocation.
+         *
+         * Reserve at least one durable lane for every runtime layer even when
+         * hot-replica caching is disabled, because Dynamic ownership transfer
+         * can retain one remote-origin expert per layer.
+         *
+         * @param config Device rebalance geometry for the complete runtime domain.
+         * @return Number of persistent active slots required before staging.
+         */
+        static uint64_t persistentActiveSlotDemand(
+            const DeviceMoERebalanceConfig &config) noexcept;
+
+        /**
          * @brief Compute capacity for persistent experts plus buffered arrival waves.
          *
          * @param requested_active_slots Maximum number of experts that may remain
@@ -111,11 +132,63 @@ namespace llaminar2
         DeviceMoETransferSlotDirectory &operator=(const DeviceMoETransferSlotDirectory &) = delete;
 
         DeviceMoEExpertDirectoryEntry *deviceEntries() const { return device_entries_; }
+        /**
+         * @brief Return the exact GPU that physically owns every slot allocation.
+         *
+         * The logical rebalance domain is shared by all TP participants, but a
+         * transfer directory is not: its payload pointers are dereferenced by
+         * one participant's local grouped kernels.  Exposing this immutable
+         * identity lets graph caches reject an accidentally shared directory
+         * before a peer-memory pointer reaches captured inference.
+         */
+        DeviceId device() const noexcept { return device_; }
+
+        /**
+         * @brief Return the backend ordinal used for all directory allocations.
+         */
+        int deviceOrdinal() const noexcept { return device_ordinal_; }
+
+        /**
+         * @brief Return the TP participant that owns the directory.
+         */
+        uint32_t participantId() const noexcept { return participant_id_; }
+
+        /**
+         * @brief Require this directory to match one physical graph participant.
+         *
+         * A mismatch is a construction error, not a recoverable cache miss.
+         * Continuing would make grouped decode read expert weights through
+         * peer memory, which is numerically valid on permissive topologies but
+         * catastrophically uneconomical and invalid for graph ownership.
+         *
+         * @throws std::logic_error when any physical owner field differs.
+         */
+        void requirePhysicalOwner(
+            DeviceId expected_device,
+            int expected_device_ordinal,
+            uint32_t expected_participant_id) const;
+
         uint32_t slotCount() const { return slot_count_; }
         const std::vector<DeviceMoEExpertDirectoryEntry> &hostEntriesForTest() const { return host_entries_; }
         size_t plannedBytes() const { return planned_bytes_; }
         size_t wirePayloadBytes() const { return wire_payload_bytes_; }
         size_t slotStorageCapacityBytes() const { return slot_storage_capacity_bytes_; }
+        /**
+         * @brief Retire every request-owned logical occupant on an explicit stream.
+         *
+         * The directory's payload allocations and descriptor pointers are
+         * model-lifetime state, while `(layer, expert, generation, residency)`
+         * are request-owned publications. Model setup stores one immutable
+         * device baseline containing the former and no logical occupants.
+         * Request reset restores that baseline with a single D2D copy, after
+         * prior maintenance and inference producers have joined the reset
+         * stream. No host mirror, allocation, synchronization, or payload-byte
+         * clearing occurs in this path.
+         *
+         * @throws std::invalid_argument for a null stream.
+         * @throws std::runtime_error when the backend rejects the D2D enqueue.
+         */
+        void resetRequestPublications(void *stream);
         /**
          * @brief Materialize the live payload descriptor owned by a transfer slot.
          *
@@ -144,6 +217,7 @@ namespace llaminar2
             std::vector<ProjectionSpec> specs,
             std::shared_ptr<LoadOrchestrator> orchestrator,
             DeviceMoEExpertDirectoryEntry *device_entries,
+            DeviceMoEExpertDirectoryEntry *device_baseline_entries,
             std::vector<DeviceMoEExpertDirectoryEntry> host_entries,
             size_t planned_bytes,
             size_t wire_payload_bytes,
@@ -159,6 +233,7 @@ namespace llaminar2
         std::vector<ProjectionSpec> specs_;
         std::shared_ptr<LoadOrchestrator> orchestrator_;
         DeviceMoEExpertDirectoryEntry *device_entries_ = nullptr;
+        DeviceMoEExpertDirectoryEntry *device_baseline_entries_ = nullptr;
         std::vector<DeviceMoEExpertDirectoryEntry> host_entries_;
         size_t planned_bytes_ = 0;
         size_t wire_payload_bytes_ = 0;

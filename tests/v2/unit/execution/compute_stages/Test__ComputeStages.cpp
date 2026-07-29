@@ -726,6 +726,51 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromS
 }
 
 /**
+ * @brief Prove scheduling windows never alter domain slot identity.
+ *
+ * Prefill starts at layer zero while decode maintenance starts after the first
+ * routed layer. Both graphs publish into one runtime table, so they must derive
+ * the same directory capacity despite their different scheduling windows.
+ */
+TEST_F(ComputeStagesTest, MoEDeviceRebalancePersistentSlotsCoverRuntimeDomain)
+{
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 40;
+    config.layer_window_start = 1;
+    config.layer_window_count = 39;
+    config.layer_wave_count = 4;
+    config.max_hot_replicas_per_participant = 0;
+
+    EXPECT_EQ(
+        DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(config),
+        40u)
+        << "Dynamic ownership needs one durable lane per runtime layer even "
+           "when the maintenance cursor skips layer zero";
+
+    config.max_hot_replicas_per_participant = 2;
+    EXPECT_EQ(
+        DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(config),
+        80u);
+
+    config.layer_window_count = 0;
+    EXPECT_EQ(
+        DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(config),
+        80u)
+        << "A zero scheduling window must not change persistent storage";
+
+    config.layer_window_start = config.num_layers;
+    EXPECT_EQ(
+        DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(config),
+        80u)
+        << "An exhausted scheduling cursor still shares the live domain directory";
+
+    config.num_layers = 0;
+    EXPECT_EQ(
+        DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(config),
+        0u);
+}
+
+/**
  * @brief Prove persistent cache occupancy cannot consume arrival-wave storage.
  *
  * Qwen3.6-35B has forty routed MoE layers. The failing CUDA2/ROCm2 E2E case

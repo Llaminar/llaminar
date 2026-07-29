@@ -1158,12 +1158,15 @@ namespace llaminar2
          * The source descriptor buffer is produced by
          * packDeviceRebalanceSourceDescriptors().  This method packs only the
          * entries where this participant is the source into the local payload
-         * lane indexed by the command's source-local compact payload slot for
-         * the active command wave.  NCCL/RCCL allgather then moves these staging
-         * slots; the destination unpacks locally.  Device kernels must not read
-         * peer device pointers directly.  Implementations initialize `status`
-         * for the whole transfer wave here; the matching unpack call appends
-         * destination-side counters to the same record.
+         * lane indexed by the command's source-local compact payload slot.
+         * Before reading any command, the implementation must select exactly
+         * one root-projected nonempty wave and publish its immutable
+         * wave/epoch/count ticket in `status`. NCCL/RCCL allgather then moves
+         * these staging slots; the destination unpacks locally. Device kernels
+         * must not read peer device pointers directly or resample the mutable
+         * controller cursor after the ticket is published. The matching unpack
+         * and transfer-completion publisher append counters to this same record
+         * and consume only the ticketed wave.
          */
         virtual bool packDeviceRebalanceCompactPayloads(
             const MoEKernelLaunchContext &launch,
@@ -1227,9 +1230,12 @@ namespace llaminar2
          * @brief Unpack gathered expert payload slots into local transfer slots.
          *
          * This call intentionally preserves the `status` record written by the
-         * preceding pack call.  Source-side pack errors and destination-side
-         * unpack errors are published as one transfer-wave status so the graph
-         * controller can fail the wave before apply observes incomplete payloads.
+         * preceding pack call and consumes its immutable wave/epoch/count
+         * ticket. Source-side pack errors and destination-side unpack errors
+         * are published as one transfer-wave status so the graph controller can
+         * fail the wave before apply observes incomplete payloads. Sampling
+         * `controller_state->active_wave` here is forbidden because planning may
+         * already have advanced that cursor for the next overlapped transaction.
          */
         virtual bool unpackDeviceRebalanceCollectivePayloads(
             const MoEKernelLaunchContext &launch,

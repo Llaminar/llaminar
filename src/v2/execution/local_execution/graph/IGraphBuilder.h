@@ -699,11 +699,22 @@ namespace llaminar2
          * Called by typed inference-state reset when a completed request gives
          * ownership of model-local runtime state back to the graph builder.
          * Implementations may preserve graph-replay-compatible baseline state
-         * here, such as descriptor tables captured by warm decode graphs.
+         * here, such as descriptor tables captured by warm decode graphs. GPU
+         * implementations must enqueue every device mutation on
+         * @p execution_stream; the request-reset transaction publishes its
+         * readiness event on that same stream only after this method returns.
+         * A GPU builder must reject a null stream instead of creating an
+         * private stream or synchronizing the device.
+         *
+         * @param execution_stream Explicit request-reset stream for GPU
+         *        mutation, or nullptr for a CPU-only builder.
          * Prefix restore uses resetPrefixCacheRuntimeStateWithoutSnapshot()
          * instead when the cache block has no model-runtime payload.
          */
-        virtual void resetState() {}
+        virtual void resetState(void *execution_stream = nullptr)
+        {
+            (void)execution_stream;
+        }
 
         /**
          * @brief Reset model runtime state for prefix restore without a payload.
@@ -715,11 +726,17 @@ namespace llaminar2
          * This is intentionally distinct from resetState(): resetState() may
          * keep graph-replay-compatible baseline state, while this boundary must
          * not resurrect dynamic MoE placement, LLEP transfer slots, histograms,
-         * or other request-local state from a previous request.
+         * or other request-local state from a previous request. GPU
+         * implementations obey the same explicit-stream contract as
+         * resetState().
+         *
+         * @param execution_stream Explicit request-reset stream for GPU
+         *        mutation, or nullptr for a CPU-only builder.
          */
-        virtual void resetPrefixCacheRuntimeStateWithoutSnapshot()
+        virtual void resetPrefixCacheRuntimeStateWithoutSnapshot(
+            void *execution_stream = nullptr)
         {
-            resetState();
+            resetState(execution_stream);
         }
 
         // =====================================================================

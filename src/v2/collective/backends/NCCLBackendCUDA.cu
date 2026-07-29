@@ -121,77 +121,43 @@ namespace llaminar2
         // NCCL Communicator Management
         // =========================================================================
 
-        bool ncclCommInitRankWrapper(void **comm_out, int nranks, void *unique_id, int rank, std::string &error_out)
+        /**
+         * @brief Initialize a communicator rank with an explicit network module.
+         *
+         * The network module controls only NCCL's network transport. CUDA P2P
+         * and shared-memory transports remain available and are still selected
+         * by NCCL before the configured network fallback where topology permits.
+         */
+        bool ncclCommInitRankWithNetworkWrapper(
+            void **comm_out,
+            int nranks,
+            void *unique_id,
+            int rank,
+            const char *network_module,
+            std::string &error_out)
         {
-            // Ensure NCCL is loaded
             if (!nccl::isLoaded() && !nccl::load())
             {
                 error_out = nccl::getLastError();
                 *comm_out = nullptr;
                 return false;
             }
-            nccl::ncclComm_t comm;
-            nccl::ncclResult_t r = nccl::ncclCommInitRank(&comm, nranks, *static_cast<nccl::ncclUniqueId *>(unique_id), rank);
+
+            nccl::ncclComm_t comm = nullptr;
+            const nccl::ncclResult_t r = nccl::ncclCommInitRankWithNetwork(
+                &comm,
+                nranks,
+                *static_cast<nccl::ncclUniqueId *>(unique_id),
+                rank,
+                network_module);
             if (r != nccl::ncclSuccess)
             {
                 error_out = nccl::ncclGetErrorString(r);
                 *comm_out = nullptr;
                 return false;
             }
+
             *comm_out = static_cast<void *>(comm);
-            return true;
-        }
-
-        bool ncclCommInitAllWrapper(void **comms_out, int ndevs, const int *devlist, std::string &error_out)
-        {
-            // Ensure NCCL is loaded
-            if (!nccl::isLoaded() && !nccl::load())
-            {
-                error_out = nccl::getLastError();
-                *comms_out = nullptr;
-                return false;
-            }
-            nccl::ncclComm_t *comms = new nccl::ncclComm_t[ndevs];
-            nccl::ncclResult_t r = nccl::ncclCommInitAll(comms, ndevs, devlist);
-            if (r != nccl::ncclSuccess)
-            {
-                error_out = nccl::ncclGetErrorString(r);
-                delete[] comms;
-                *comms_out = nullptr;
-                return false;
-            }
-            // For single device, just return the first comm
-            *comms_out = static_cast<void *>(comms[0]);
-            delete[] comms;
-            return true;
-        }
-
-        /// Initialize NCCL communicators for exactly 2 devices (for copy operations)
-        /// Returns both communicators so we can use ncclSend from rank 0 and ncclRecv on rank 1
-        bool ncclCommInitPairWrapper(void **comm_src_out, void **comm_dst_out,
-                                     int src_ordinal, int dst_ordinal, std::string &error_out)
-        {
-            // Ensure NCCL is loaded
-            if (!nccl::isLoaded() && !nccl::load())
-            {
-                error_out = nccl::getLastError();
-                *comm_src_out = nullptr;
-                *comm_dst_out = nullptr;
-                return false;
-            }
-
-            int devlist[2] = {src_ordinal, dst_ordinal};
-            nccl::ncclComm_t comms[2];
-            nccl::ncclResult_t r = nccl::ncclCommInitAll(comms, 2, devlist);
-            if (r != nccl::ncclSuccess)
-            {
-                error_out = nccl::ncclGetErrorString(r);
-                *comm_src_out = nullptr;
-                *comm_dst_out = nullptr;
-                return false;
-            }
-            *comm_src_out = static_cast<void *>(comms[0]); // rank 0 = src
-            *comm_dst_out = static_cast<void *>(comms[1]); // rank 1 = dst
             return true;
         }
 

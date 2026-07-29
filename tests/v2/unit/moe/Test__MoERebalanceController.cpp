@@ -141,7 +141,10 @@ TEST(Test__MoERebalanceController,
      DevicePlanAbiCarriesAuthenticatedTransferSlotLease)
 {
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
-    EXPECT_EQ(kDeviceMoERebalanceVersion, 3u);
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 8u);
+    EXPECT_EQ(
+        sizeof(DeviceMoERebalanceConfig),
+        moe_rebalance_abi::kConfigBytes);
 
     const DeviceMoERebalancePlanEntry plan{};
     EXPECT_EQ(plan.destination_slot, kDeviceMoEInvalidSlot);
@@ -149,6 +152,220 @@ TEST(Test__MoERebalanceController,
     EXPECT_EQ(plan.destination_previous_layer, kDeviceMoEInvalidSlot);
     EXPECT_EQ(plan.destination_previous_expert, kDeviceMoEInvalidSlot);
     EXPECT_EQ(plan.destination_generation, 0u);
+}
+
+/**
+ * @brief Prove active transfer-backed descriptors have unique physical slots.
+ *
+ * The maintenance controller exports this summary at request boundaries. The
+ * regression deliberately gives two layers the same physical slot so a future
+ * allocator change cannot silently restore the stale-runtime alias that made
+ * prefill-published experts unsafe for later decode.
+ */
+TEST(Test__MoERebalanceController,
+     TransferSlotClaimSummaryReportsCrossLayerAlias)
+{
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 2;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 0;
+    config.participant_count = 2;
+
+    std::array<DeviceMoELayerRuntime, 2> runtime_layers{
+        makeDeviceRuntimeLayerForLoadStats(),
+        makeDeviceRuntimeLayerForLoadStats()};
+
+    constexpr uint32_t transfer_flags =
+        toMoEExpertFlags(DeviceMoEExpertFlags::Valid) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::Resident) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::LocalCompute) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::TransferSlot);
+    auto publish_transfer_claim =
+        [&](uint32_t layer, uint32_t expert, int32_t slot)
+    {
+        auto &bank = runtime_layers[layer].banks[0];
+        bank.experts[expert].local_slot = slot;
+        bank.experts[expert].flags = transfer_flags;
+        bank.local_compute_mask[expert] = 1u;
+        bank.resident_participant_mask[expert] = 0b01u;
+    };
+
+    publish_transfer_claim(/*layer=*/0, /*expert=*/0, /*slot=*/3);
+    publish_transfer_claim(/*layer=*/1, /*expert=*/2, /*slot=*/3);
+
+    auto summary =
+        deviceMoETransferSlotClaimSummary(runtime_layers.data(), config);
+    EXPECT_EQ(summary.active_claims, 2u);
+    EXPECT_EQ(summary.unique_claims, 1u);
+    EXPECT_EQ(summary.duplicate_claims, 1u);
+    EXPECT_EQ(summary.invalid_claims, 0u);
+    EXPECT_EQ(summary.max_slot, 3u);
+    EXPECT_EQ(summary.max_slot_layer, 0u);
+    EXPECT_EQ(summary.max_slot_expert, 0u);
+    EXPECT_EQ(summary.first_duplicate_slot, 3u);
+    EXPECT_EQ(summary.first_duplicate_layer, 1u);
+    EXPECT_EQ(summary.first_duplicate_expert, 2u);
+
+    /*
+     * Physical storage remains live even when the current grouped assignment
+     * gives the expert no rows. Claim accounting must not use LocalCompute as a
+     * proxy for transfer-slot occupancy.
+     */
+    auto &idle_claim =
+        runtime_layers[1].banks[0].experts[2];
+    idle_claim.flags &=
+        ~toMoEExpertFlags(DeviceMoEExpertFlags::LocalCompute);
+    runtime_layers[1].banks[0].local_compute_mask[2] = 0u;
+    publish_transfer_claim(/*layer=*/1, /*expert=*/2, /*slot=*/4);
+    idle_claim.flags &=
+        ~toMoEExpertFlags(DeviceMoEExpertFlags::LocalCompute);
+    runtime_layers[1].banks[0].local_compute_mask[2] = 0u;
+    summary = deviceMoETransferSlotClaimSummary(runtime_layers.data(), config);
+    EXPECT_EQ(summary.active_claims, 2u);
+    EXPECT_EQ(summary.unique_claims, 2u);
+    EXPECT_EQ(summary.duplicate_claims, 0u);
+    EXPECT_EQ(summary.invalid_claims, 0u);
+    EXPECT_EQ(summary.max_slot, 4u);
+    EXPECT_EQ(summary.max_slot_layer, 1u);
+    EXPECT_EQ(summary.max_slot_expert, 2u);
+
+    publish_transfer_claim(/*layer=*/1, /*expert=*/2, /*slot=*/-1);
+    summary = deviceMoETransferSlotClaimSummary(runtime_layers.data(), config);
+    EXPECT_EQ(summary.active_claims, 2u);
+    EXPECT_EQ(summary.unique_claims, 1u);
+    EXPECT_EQ(summary.duplicate_claims, 0u);
+    EXPECT_EQ(summary.invalid_claims, 1u);
+    EXPECT_EQ(summary.first_invalid_slot, kDeviceMoEInvalidSlot);
+    EXPECT_EQ(summary.first_invalid_layer, 1u);
+    EXPECT_EQ(summary.first_invalid_expert, 2u);
+    EXPECT_NE(
+        summary.first_invalid_reasons &
+            moe_rebalance_policy::TransferSlotClaimNegativeSlot,
+        0u);
+    EXPECT_EQ(summary.first_invalid_resident_mask, 0b01u);
+
+    publish_transfer_claim(/*layer=*/1, /*expert=*/2, /*slot=*/4);
+    config.active_transfer_slot_capacity = 4u;
+    config.transfer_slot_directory_capacity = 4u;
+    summary = deviceMoETransferSlotClaimSummary(
+        runtime_layers.data(),
+        config);
+    EXPECT_EQ(summary.invalid_claims, 1u);
+    EXPECT_EQ(summary.first_invalid_slot, 4u);
+    EXPECT_NE(
+        summary.first_invalid_reasons &
+            moe_rebalance_policy::
+                TransferSlotClaimExceedsDirectoryCapacity,
+        0u);
+}
+
+/**
+ * @brief Prove directory addressability is independent of active occupancy.
+ *
+ * A directory with one durable claim and one staging entry may publish its
+ * next durable resident into slot 1 after retiring slot 0. The resulting one
+ * active claim is valid even though its physical index is equal to the active
+ * claim capacity. Slot 2 remains invalid because it is outside the directory.
+ */
+TEST(Test__MoERebalanceController,
+     TransferSlotClaimSummaryAcceptsPromotedStagingOriginSlot)
+{
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 0;
+    config.participant_count = 2;
+    config.window_size_tokens = 1;
+    config.active_transfer_slot_capacity = 1;
+    config.transfer_slot_directory_capacity = 2;
+    ASSERT_TRUE(validateDeviceMoERebalanceConfig(config));
+
+    auto runtime = makeDeviceRuntimeLayerForLoadStats();
+    auto &bank = runtime.banks[runtime.active_bank];
+    auto &descriptor = bank.experts[2];
+    descriptor.local_slot = 1;
+    descriptor.owner_participant = 1;
+    descriptor.flags =
+        toMoEExpertFlags(DeviceMoEExpertFlags::Valid) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::Resident) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::TransferSlot);
+    bank.resident_participant_mask[2] = 0b11u;
+
+    auto summary =
+        deviceMoETransferSlotClaimSummary(&runtime, config);
+    EXPECT_EQ(summary.active_claims, 1u);
+    EXPECT_EQ(summary.unique_claims, 1u);
+    EXPECT_EQ(summary.invalid_claims, 0u);
+    EXPECT_EQ(summary.max_slot, 1u);
+
+    descriptor.local_slot = 2;
+    summary = deviceMoETransferSlotClaimSummary(&runtime, config);
+    EXPECT_EQ(summary.active_claims, 1u);
+    EXPECT_EQ(summary.unique_claims, 0u);
+    EXPECT_EQ(summary.invalid_claims, 1u);
+    EXPECT_NE(
+        summary.first_invalid_reasons &
+            moe_rebalance_policy::
+                TransferSlotClaimExceedsDirectoryCapacity,
+        0u);
+
+    config.active_transfer_slot_capacity = 2;
+    config.transfer_slot_directory_capacity = 1;
+    EXPECT_FALSE(validateDeviceMoERebalanceConfig(config));
+}
+
+/**
+ * @brief Prove payload retirement clears every pointer-bearing publication.
+ */
+TEST(Test__MoERebalanceController,
+     LocalPayloadRetirementIsOneAtomicStateTransition)
+{
+    DeviceMoEExpertDescriptor descriptor;
+    descriptor.gate.payload =
+        reinterpret_cast<const uint8_t *>(0x1000u);
+    descriptor.up.payload =
+        reinterpret_cast<const uint8_t *>(0x2000u);
+    descriptor.down.payload =
+        reinterpret_cast<const uint8_t *>(0x3000u);
+    descriptor.logical_expert_id = 17;
+    descriptor.owner_participant = 1;
+    descriptor.local_slot = 9;
+    descriptor.flags =
+        toMoEExpertFlags(DeviceMoEExpertFlags::Valid) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::Resident) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::Replicated) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::LocalCompute) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::TransferSlot) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::PreferredOwner);
+    uint32_t resident_mask = 0b11u;
+    constexpr uint32_t local_payload_flags =
+        toMoEExpertFlags(DeviceMoEExpertFlags::Valid) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::Resident) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::Replicated) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::LocalCompute) |
+        toMoEExpertFlags(DeviceMoEExpertFlags::TransferSlot);
+
+    moe_rebalance_policy::retireLocalPayloadPublication(
+        descriptor,
+        resident_mask,
+        /*local_participant_bit=*/0b01u,
+        local_payload_flags);
+
+    EXPECT_EQ(resident_mask, 0b10u);
+    EXPECT_EQ(descriptor.gate.payload, nullptr);
+    EXPECT_EQ(descriptor.up.payload, nullptr);
+    EXPECT_EQ(descriptor.down.payload, nullptr);
+    EXPECT_EQ(descriptor.local_slot, -1);
+    EXPECT_EQ(descriptor.logical_expert_id, 17);
+    EXPECT_EQ(descriptor.owner_participant, 1);
+    EXPECT_EQ(
+        descriptor.flags & local_payload_flags,
+        0u);
+    EXPECT_TRUE(hasMoEExpertFlag(
+        descriptor.flags,
+        DeviceMoEExpertFlags::PreferredOwner));
 }
 
 TEST(Test__MoERebalanceController, DeviceSideProjectedLoadSpreadTracksReplicaBenefit)
@@ -641,6 +858,136 @@ TEST(Test__MoERebalanceController, SharedDynamicPolicyChoosesPairedOwnershipSwap
     EXPECT_EQ(participant_load[1], 79u);
     EXPECT_EQ(expert_owner[0], 1);
     EXPECT_EQ(expert_owner[2], 0);
+}
+
+TEST(Test__MoERebalanceController, SharedDynamicPolicyChoosesCapacityReleasingSwap)
+{
+    uint64_t participant_load[2] = {100u, 10u};
+    uint64_t expert_counts[4] = {70u, 30u, 1u, 9u};
+    int32_t expert_owner[4] = {0, 0, 1, 1};
+    uint32_t transfer_backed_mask[4] = {
+        0u,
+        moe_rebalance_policy::participantBit(0),
+        0u,
+        moe_rebalance_policy::participantBit(1),
+    };
+    uint32_t active_transfer_slots[2] = {1u, 1u};
+
+    const auto choice = moe_rebalance_policy::bestDynamicOwnershipSwap(
+        participant_load,
+        expert_counts,
+        expert_owner,
+        /*num_experts=*/4,
+        /*participant_count=*/2,
+        /*imbalance_threshold_per_mille=*/1300,
+        /*min_improvement_per_mille=*/50,
+        /*min_window_activations=*/64,
+        transfer_backed_mask,
+        active_transfer_slots,
+        /*active_transfer_slot_capacity=*/1);
+
+    ASSERT_TRUE(choice.valid);
+    EXPECT_EQ(choice.heavy_expert, 1u)
+        << "A full overloaded participant must send transfer-backed storage.";
+    EXPECT_EQ(choice.light_expert, 3u)
+        << "A full underloaded participant must also release its transfer slot.";
+
+    ASSERT_TRUE(
+        moe_rebalance_policy::applyDynamicOwnershipSwapTransferOccupancy(
+            active_transfer_slots,
+            transfer_backed_mask,
+            choice));
+    EXPECT_EQ(active_transfer_slots[0], 1u);
+    EXPECT_EQ(active_transfer_slots[1], 1u);
+    EXPECT_EQ(
+        transfer_backed_mask[1],
+        moe_rebalance_policy::participantBit(1));
+    EXPECT_EQ(
+        transfer_backed_mask[3],
+        moe_rebalance_policy::participantBit(0));
+}
+
+TEST(Test__MoERebalanceController, CollectedStatePreservesCountAndPhysicalEvidence)
+{
+    const uint64_t packed = moe_rebalance_policy::packCollectedState(
+        123456789u,
+        39u,
+        /*physically_resident=*/true,
+        /*transfer_backed=*/true);
+
+    EXPECT_EQ(
+        moe_rebalance_policy::collectedStateActivationCount(packed),
+        123456789u);
+    EXPECT_EQ(
+        moe_rebalance_policy::collectedStateActiveTransferSlots(packed),
+        39u);
+    EXPECT_TRUE(
+        moe_rebalance_policy::collectedStatePhysicallyResident(packed));
+    EXPECT_TRUE(
+        moe_rebalance_policy::collectedStateTransferBacked(packed));
+}
+
+/**
+ * @brief Prove that a static source cannot grow an already-full destination.
+ *
+ * Static model storage is not counted in the transfer-slot occupancy vector.
+ * Moving its ownership therefore needs one new durable destination slot. The
+ * planner must reject that move before publishing a transaction when the
+ * destination has no remaining durable capacity.
+ */
+TEST(Test__MoERebalanceController,
+     OwnershipTransferRejectsStaticSourceWhenDestinationCapacityIsFull)
+{
+    const uint32_t active_transfer_slots[2] = {0u, 1u};
+    const uint32_t transfer_backed_masks[2] = {0u, 0u};
+
+    EXPECT_FALSE(
+        moe_rebalance_policy::ownershipTransferFitsPersistentCapacity(
+            active_transfer_slots,
+            transfer_backed_masks,
+            /*expert=*/0u,
+            /*source_participant=*/0u,
+            /*destination_participant=*/1u,
+            /*participant_count=*/2u,
+            /*active_transfer_slot_capacity=*/1u));
+}
+
+/**
+ * @brief Prove that moving transfer-backed ownership preserves bounded storage.
+ *
+ * A transfer-backed source releases one durable claim in the same immutable
+ * ownership transaction that installs the destination claim. The planner's
+ * scratch accounting must model both sides so later commands in the captured
+ * wave observe the projected occupancy rather than stale pre-wave counts.
+ */
+TEST(Test__MoERebalanceController,
+     OwnershipTransferMovesDurableOccupancyBetweenParticipants)
+{
+    uint32_t active_transfer_slots[2] = {1u, 0u};
+    uint32_t transfer_backed_masks[1] = {
+        moe_rebalance_policy::participantBit(0u)};
+
+    ASSERT_TRUE(
+        moe_rebalance_policy::ownershipTransferFitsPersistentCapacity(
+            active_transfer_slots,
+            transfer_backed_masks,
+            /*expert=*/0u,
+            /*source_participant=*/0u,
+            /*destination_participant=*/1u,
+            /*participant_count=*/2u,
+            /*active_transfer_slot_capacity=*/1u));
+    ASSERT_TRUE(moe_rebalance_policy::applyOwnershipTransferOccupancy(
+        active_transfer_slots,
+        transfer_backed_masks,
+        /*expert=*/0u,
+        /*source_participant=*/0u,
+        /*destination_participant=*/1u));
+
+    EXPECT_EQ(active_transfer_slots[0], 0u);
+    EXPECT_EQ(active_transfer_slots[1], 1u);
+    EXPECT_EQ(
+        transfer_backed_masks[0],
+        moe_rebalance_policy::participantBit(1u));
 }
 
 TEST(Test__MoERebalanceController, HostApplyRefreshesMultiResidentVisibility)

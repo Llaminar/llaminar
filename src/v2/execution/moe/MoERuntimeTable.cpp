@@ -110,6 +110,41 @@ namespace llaminar2
                 throw std::runtime_error(what + ": backend H2D copy failed on " + device.to_string());
         }
 
+        /**
+         * @brief Enqueue a device-owned runtime-table restore.
+         *
+         * Both endpoints are immutable/model-lifetime GPU allocations.  This
+         * helper deliberately accepts only an explicit producer stream and
+         * returns after enqueueing the copy.  Consumers inherit ordering from
+         * that stream or from its published event; no host synchronization is
+         * part of the request lifecycle.
+         */
+        void copyMirrorToMirrorAsync(
+            DeviceId device,
+            void *dst,
+            const void *src,
+            size_t bytes,
+            void *stream,
+            const std::string &what)
+        {
+            if (!stream)
+            {
+                throw std::invalid_argument(
+                    what + ": device-owned runtime reset requires an explicit stream");
+            }
+            IBackend *backend = mirrorBackend(device, what);
+            if (!backend->deviceCopyAsync(
+                    dst,
+                    src,
+                    bytes,
+                    device.toKernelDeviceIndex(),
+                    stream))
+            {
+                throw std::runtime_error(
+                    what + ": backend D2D copy failed on " + device.to_string());
+            }
+        }
+
         void copyMirrorToHost(DeviceId device, void *dst, const void *src,
                               size_t bytes, void *stream, const std::string &what)
         {
@@ -439,7 +474,8 @@ namespace llaminar2
         host_layers_.resize(static_cast<size_t>(num_layers_));
         for (auto &state : host_layers_)
             resetLayer(state);
-        initial_host_layers_.resize(host_layers_.size());
+        empty_host_layers_ = host_layers_;
+        initial_host_layers_ = empty_host_layers_;
         initial_layer_captured_.assign(host_layers_.size(), 0u);
 
         if (mirror_to_device_)
@@ -836,6 +872,30 @@ namespace llaminar2
 
     void DeviceMoERuntimeTable::resetDecodeRuntimeState(void *stream)
     {
+        if (mirror_to_device_)
+        {
+            if (!stream)
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] GPU decode runtime reset requires an explicit stream");
+            }
+            /*
+             * Do not manufacture a "coherent" host mirror here.  The reset
+             * transaction is device-owned and the immutable device baseline is
+             * its sole source of truth.  Any later diagnostic that genuinely
+             * needs a host snapshot must request an explicit, ordered readback
+             * instead of accidentally consuming this setup-time vector.
+             */
+            copyMirrorToMirrorAsync(
+                device_id_,
+                device_layers_,
+                device_empty_layers_,
+                host_layers_.size() * sizeof(DeviceMoELayerRuntime),
+                stream,
+                "[MoERuntimeTable] device-owned empty runtime reset");
+            return;
+        }
+
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
         {
             auto &state = host_layers_[static_cast<size_t>(layer_idx)];
@@ -854,13 +914,6 @@ namespace llaminar2
             resetLayer(state);
             restoreRuntimeScratchBindings(state, scratch);
         }
-
-        if (!mirror_to_device_)
-            return;
-
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
-            uploadLayerState(layer_idx, stream);
-        synchronizeMirror(device_id_, stream, "[MoERuntimeTable] decode runtime reset sync");
     }
 
     bool DeviceMoERuntimeTable::hasInitialRuntimeState() const noexcept
@@ -873,51 +926,37 @@ namespace llaminar2
 
     void DeviceMoERuntimeTable::restoreInitialRuntimeState(void *stream)
     {
-        void *owned_stream = nullptr;
-        void *active_stream = stream;
-        if (mirror_to_device_ && !active_stream)
+        if (mirror_to_device_)
         {
-            owned_stream = createMirrorStream(device_id_,
-                                              "[MoERuntimeTable] initial runtime restore stream");
-            active_stream = owned_stream;
+            if (!stream)
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] GPU initial runtime restore requires an explicit stream");
+            }
+            /*
+             * Keep host setup templates out of the request lifecycle.  They
+             * populated device_initial_layers_ during model construction, but
+             * they are not a live coherence peer once GPU execution begins.
+             */
+            copyMirrorToMirrorAsync(
+                device_id_,
+                device_layers_,
+                device_initial_layers_,
+                host_layers_.size() * sizeof(DeviceMoELayerRuntime),
+                stream,
+                "[MoERuntimeTable] device-owned initial runtime restore");
+            return;
         }
 
-        try
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
         {
-            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
-            {
-                auto &state = host_layers_[static_cast<size_t>(layer_idx)];
-                const auto scratch = captureRuntimeScratchBindings(state);
-
-                if (initial_layer_captured_[static_cast<size_t>(layer_idx)] != 0u)
-                    state = initial_host_layers_[static_cast<size_t>(layer_idx)];
-                else
-                    resetLayer(state);
-
-                restoreRuntimeScratchBindings(state, scratch);
-                resetPerRequestRuntimeFields(state, num_experts_);
-
-                if (mirror_to_device_)
-                    uploadLayerState(layer_idx, active_stream);
-            }
-
-            if (mirror_to_device_)
-                synchronizeMirror(device_id_, active_stream,
-                                  "[MoERuntimeTable] initial runtime restore sync");
-
-            if (owned_stream)
-            {
-                destroyMirrorStream(device_id_, owned_stream,
-                                    "[MoERuntimeTable] initial runtime restore stream destroy");
-                owned_stream = nullptr;
-            }
-        }
-        catch (...)
-        {
-            if (owned_stream)
-                destroyMirrorStream(device_id_, owned_stream,
-                                    "[MoERuntimeTable] initial runtime restore stream destroy");
-            throw;
+            auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            const auto scratch = captureRuntimeScratchBindings(state);
+            state = initial_layer_captured_[static_cast<size_t>(layer_idx)] != 0u
+                        ? initial_host_layers_[static_cast<size_t>(layer_idx)]
+                        : empty_host_layers_[static_cast<size_t>(layer_idx)];
+            restoreRuntimeScratchBindings(state, scratch);
+            resetPerRequestRuntimeFields(state, num_experts_);
         }
     }
 
@@ -1553,7 +1592,10 @@ namespace llaminar2
         {
             prefill_token_capacity_ = std::max(prefill_token_capacity_, token_capacity);
             for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            {
                 uploadLayerState(layer_idx, stream);
+                uploadResetTemplatesForLayer(layer_idx, stream);
+            }
             synchronizeMirror(device_id_, stream, "[MoERuntimeTable] prefill route scratch upload sync");
         }
     }
@@ -1610,7 +1652,7 @@ namespace llaminar2
 
         state.active_bank = inactive_bank;
         state.active_epoch = epoch;
-        captureInitialLayerStateIfNeeded(layer_idx);
+        captureInitialLayerStateIfNeeded(layer_idx, stream);
 
         if (mirror_to_device_)
             uploadLayerState(layer_idx, stream);
@@ -1696,7 +1738,9 @@ namespace llaminar2
         state.banks[1].expert_count = static_cast<uint32_t>(num_experts_);
     }
 
-    void DeviceMoERuntimeTable::captureInitialLayerStateIfNeeded(int layer_idx)
+    void DeviceMoERuntimeTable::captureInitialLayerStateIfNeeded(
+        int layer_idx,
+        void *stream)
     {
         const auto idx = static_cast<size_t>(layer_idx);
         if (idx >= initial_layer_captured_.size() ||
@@ -1708,6 +1752,8 @@ namespace llaminar2
         initial_host_layers_[idx] = host_layers_[idx];
         resetPerRequestRuntimeFields(initial_host_layers_[idx], num_experts_);
         initial_layer_captured_[idx] = 1u;
+        if (mirror_to_device_)
+            uploadResetTemplatesForLayer(layer_idx, stream);
     }
 
     bool DeviceMoERuntimeTable::prefillRouteScratchAllocationHasCapacity(
@@ -1833,6 +1879,27 @@ namespace llaminar2
         state.reserved_u64[3] = 0;
         state.prefill_token_capacity = allocation.token_capacity;
         state.prefill_route_capacity = allocation.route_capacity;
+
+        /*
+         * Request-reset templates are model-lifetime device state. Refresh
+         * their scratch bindings whenever setup grows the persistent route
+         * workspace, while preserving each template's placement semantics.
+         * This happens only during setup/replanning, never in inference.
+         */
+        const auto scratch = captureRuntimeScratchBindings(state);
+        auto &empty = empty_host_layers_[static_cast<size_t>(layer_idx)];
+        resetLayer(empty);
+        restoreRuntimeScratchBindings(empty, scratch);
+        if (initial_layer_captured_[static_cast<size_t>(layer_idx)] != 0u)
+        {
+            restoreRuntimeScratchBindings(
+                initial_host_layers_[static_cast<size_t>(layer_idx)],
+                scratch);
+        }
+        else
+        {
+            initial_host_layers_[static_cast<size_t>(layer_idx)] = empty;
+        }
     }
 
     void DeviceMoERuntimeTable::releasePrefillRouteScratch() noexcept
@@ -1869,15 +1936,29 @@ namespace llaminar2
     void DeviceMoERuntimeTable::allocateDeviceMirror()
     {
         const size_t bytes = host_layers_.size() * sizeof(DeviceMoELayerRuntime);
-        device_layers_ = static_cast<DeviceMoELayerRuntime *>(
-            allocateMirror(device_id_, bytes, "[MoERuntimeTable] runtime table mirror allocation"));
+        try
+        {
+            device_layers_ = static_cast<DeviceMoELayerRuntime *>(
+                allocateMirror(device_id_, bytes, "[MoERuntimeTable] runtime table mirror allocation"));
+            device_initial_layers_ = static_cast<DeviceMoELayerRuntime *>(
+                allocateMirror(device_id_, bytes, "[MoERuntimeTable] initial runtime template allocation"));
+            device_empty_layers_ = static_cast<DeviceMoELayerRuntime *>(
+                allocateMirror(device_id_, bytes, "[MoERuntimeTable] empty runtime template allocation"));
+        }
+        catch (...)
+        {
+            releaseDeviceMirror();
+            throw;
+        }
     }
 
     void DeviceMoERuntimeTable::releaseDeviceMirror() noexcept
     {
-        if (!device_layers_)
-            return;
+        freeMirror(device_id_, device_empty_layers_, "[MoERuntimeTable] free empty runtime template");
+        freeMirror(device_id_, device_initial_layers_, "[MoERuntimeTable] free initial runtime template");
         freeMirror(device_id_, device_layers_, "[MoERuntimeTable] free runtime table mirror");
+        device_empty_layers_ = nullptr;
+        device_initial_layers_ = nullptr;
         device_layers_ = nullptr;
     }
 
@@ -1887,6 +1968,28 @@ namespace llaminar2
         auto *src = host_layers_.data() + layer_idx;
         copyHostToMirror(device_id_, dst, src, sizeof(DeviceMoELayerRuntime), stream,
                          layerPrefix(layer_idx) + "runtime table upload");
+    }
+
+    void DeviceMoERuntimeTable::uploadResetTemplatesForLayer(
+        int layer_idx,
+        void *stream)
+    {
+        validateLayerIndex(layer_idx);
+        const auto idx = static_cast<size_t>(layer_idx);
+        copyHostToMirror(
+            device_id_,
+            device_initial_layers_ + layer_idx,
+            initial_host_layers_.data() + idx,
+            sizeof(DeviceMoELayerRuntime),
+            stream,
+            layerPrefix(layer_idx) + "initial runtime template upload");
+        copyHostToMirror(
+            device_id_,
+            device_empty_layers_ + layer_idx,
+            empty_host_layers_.data() + idx,
+            sizeof(DeviceMoELayerRuntime),
+            stream,
+            layerPrefix(layer_idx) + "empty runtime template upload");
     }
 
     void DeviceMoERuntimeTable::uploadAllLayerStates()
@@ -1900,6 +2003,20 @@ namespace llaminar2
         {
             copyHostToMirror(device_id_, device_layers_, host_layers_.data(), bytes, init_stream,
                              "[MoERuntimeTable] runtime table initial upload");
+            copyHostToMirror(
+                device_id_,
+                device_initial_layers_,
+                initial_host_layers_.data(),
+                bytes,
+                init_stream,
+                "[MoERuntimeTable] initial runtime templates upload");
+            copyHostToMirror(
+                device_id_,
+                device_empty_layers_,
+                empty_host_layers_.data(),
+                bytes,
+                init_stream,
+                "[MoERuntimeTable] empty runtime templates upload");
             synchronizeMirror(device_id_, init_stream, "[MoERuntimeTable] runtime table initial upload sync");
             destroyMirrorStream(device_id_, init_stream, "[MoERuntimeTable] runtime table initial upload stream destroy");
         }

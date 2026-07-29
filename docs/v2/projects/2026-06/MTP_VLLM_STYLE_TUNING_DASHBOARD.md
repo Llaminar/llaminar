@@ -42,6 +42,16 @@ strict counters prove both.
 CUDA2/ROCm2 Dynamic and LLEP+RAM-prefix cells pass. Architecture estimate:
 LocalTP 96%, ExpertParallel 93%; stochastic/economy matrix refresh remains.
 
+2026-07-29: transfer-slot occupancy is now distinct from directory
+addressability; immutable runtime and directory baselines reset by
+explicit-stream asynchronous D2D. CUDA/ROCm pass all 336 slot rotations,
+promoted staging-origin claims, and repeated resets. Fresh Release CUDA2/ROCm2
+LLEP+MTP+RAM-prefix full-context cells pass `22/22` each with strict full-graph
+PerfStats, 2048-token generation, clean shutdown, and complete VRAM release.
+The complete Integration unit gate passes `589/589`. Architecture estimate:
+LocalTP 97%, ExpertParallel 95%; remote-participant stochastic coverage and
+all-format economy certification remain.
+
 ## Device And Topology Matrix
 
 | Mode | Device / degree | Dense greedy | Dense stoch | MoE greedy | MoE stoch | Status |

@@ -39,7 +39,7 @@
 # contains a parsed size >= LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B (default: 4B).
 #
 # Environment:
-#   LLAMINAR_BINARY     Override binary path
+#   LLAMINAR_BINARY     Override binary path (default: build_v2_release/llaminar2)
 #   LLAMINAR_E2E_CONTAINER_IMAGE Run server from this Docker image instead of
 #                       launching LLAMINAR_BINARY on the host/devcontainer
 #   LLAMINAR_E2E_DOCKER_NETWORK Docker network mode for container server
@@ -90,7 +90,7 @@
 #   LLAMINAR_E2E_LONG_REQUEST_TIMEOUT Long helper request timeout (default: 420)
 #   LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B Minimum parsed model size in billions (default: 4)
 #   LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS Seconds to wait for server startup.
-#                       Default: 300.
+#                       Default: 60.
 #   LLAMINAR_E2E_SHUTDOWN_TIMEOUT Seconds to wait for graceful server shutdown.
 #                       Default: 120 with PerfStats enabled, 15 otherwise.
 #   LLAMINAR_E2E_GPU_RELEASE_TIMEOUT_SECONDS Seconds to poll for GPU VRAM release
@@ -121,7 +121,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 
-BINARY="${LLAMINAR_BINARY:-${REPO_ROOT}/build_v2_integration/llaminar2}"
+BINARY="${LLAMINAR_BINARY:-${REPO_ROOT}/build_v2_release/llaminar2}"
 SERVER_MODE="${LLAMINAR_E2E_SERVER_MODE:-local}"
 CONTAINER_IMAGE="${LLAMINAR_E2E_CONTAINER_IMAGE:-}"
 if [[ -n "$CONTAINER_IMAGE" && "${LLAMINAR_E2E_SERVER_MODE:-}" == "" ]]; then
@@ -402,11 +402,11 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     fi
 fi
 
-STARTUP_TIMEOUT="${LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS:-300}"
-                      # Seconds to wait for server startup. Most models load in
-                      # <10s; large local TP MoE release suites can need
-                      # several minutes for per-backend weight materialization,
-                      # especially on ROCm.
+STARTUP_TIMEOUT="${LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS:-60}"
+                      # Seconds to wait for server startup. A production
+                      # Release server that cannot load and initialize within
+                      # this bound is unhealthy; do not hide stalls behind a
+                      # multi-minute harness timeout.
 REQUEST_TIMEOUT=180   # seconds per curl request
 if [[ -n "${LLAMINAR_E2E_SHUTDOWN_TIMEOUT:-}" ]]; then
     SHUTDOWN_TIMEOUT="${LLAMINAR_E2E_SHUTDOWN_TIMEOUT}"
@@ -2228,6 +2228,35 @@ if is_gpu and is_mtp:
         print("FAIL: GPU MTP case did not preserve replay state at request-boundary clear_cache")
         sys.exit(0)
 
+    # LLEP's grouped verifier consumes only experts that are already resident
+    # on a participant. Migrating an entire expert payload for the current
+    # verifier batch is both unnecessary and catastrophically expensive at
+    # MTP-sized M. Require the production serving graph to publish its typed
+    # resident-only decision so an accidental return to transfer-backed
+    # verifier assignment fails the canonical E2E matrix immediately.
+    if flag_value("--moe-rebalance") == "llep":
+        verifier_assignment_records = [
+            record
+            for record in records
+            if record.get("domain") == "moe_rebalance"
+            and record.get("name") == "device_rebalance_llep_resident_assignment_calls"
+            and record.get("phase") == "verifier"
+        ]
+        if not verifier_assignment_records:
+            print("FAIL: GPU LLEP+MTP case emitted no resident-only verifier assignment evidence")
+            sys.exit(0)
+        for record in verifier_assignment_records:
+            record_tags = record.get("tags") or {}
+            if (
+                record_tags.get("assignment") != "resident_only"
+                or record_tags.get("current_batch_transport") != "none"
+            ):
+                print(
+                    "FAIL: GPU LLEP+MTP verifier selected a transfer-backed "
+                    f"current-batch assignment: {record_tags}"
+                )
+                sys.exit(0)
+
 if require_prefix_rebalance_clear:
     if not is_gpu:
         print("FAIL: prefix-cache rebalance clear probe requires a GPU backend")
@@ -2533,7 +2562,7 @@ if is_docker_mode; then
 else
     if [ ! -x "$BINARY" ]; then
     echo -e "${RED}Error: Binary not found: ${BINARY}${NC}"
-    echo "Build with: cmake --build build_v2_integration --parallel"
+    echo "Build with: cmake --build build_v2_release --parallel --target llaminar2"
     exit 1
     fi
 

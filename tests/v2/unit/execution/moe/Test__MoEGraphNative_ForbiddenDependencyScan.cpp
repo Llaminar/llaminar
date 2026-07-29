@@ -160,6 +160,112 @@ namespace llaminar2::test
 
     } // namespace
 
+    /**
+     * @brief Keep the transfer lifecycle gate symmetric across GPU backends.
+     *
+     * The production defect behind this suite survived because backend-local
+     * one-wave tests covered same-layer slot reuse but not model-wide reuse.
+     * This source contract prevents future test registration edits from
+     * silently dropping either backend, the shared production-shaped model, or
+     * the complete `DeviceRebalance*` lifecycle inventory.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         GPUTransferStateMachineSuitesRemainSymmetricAndComprehensive)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path cuda_test =
+            root /
+            "tests/v2/integration/kernels/cuda/Test__CUDAMoEKernel.cpp";
+        const fs::path rocm_test =
+            root /
+            "tests/v2/integration/kernels/rocm/Test__ROCmMoEKernel.cpp";
+        const fs::path shared_model =
+            root /
+            "tests/v2/integration/kernels/moe/MoETransferStateMachineTestModel.h";
+        const fs::path cmake_file =
+            root / "tests/v2/CMakeLists.txt";
+
+        for (const auto &path :
+             {cuda_test, rocm_test, shared_model, cmake_file})
+        {
+            ASSERT_TRUE(fs::exists(path)) << path;
+        }
+
+        const std::string cuda = readFile(cuda_test);
+        const std::string rocm = readFile(rocm_test);
+        const std::string model = readFile(shared_model);
+        const std::string cmake = readFile(cmake_file);
+        for (const auto *contents :
+             {&cuda, &rocm, &model, &cmake})
+        {
+            ASSERT_FALSE(contents->empty());
+        }
+
+        constexpr const char *kSharedInclude =
+            "#include \"../moe/MoETransferStateMachineTestModel.h\"";
+        constexpr const char *kStressCase =
+            "DeviceRebalanceTransferStateMachineFullCapacityStress";
+        EXPECT_NE(cuda.find(kSharedInclude), std::string::npos);
+        EXPECT_NE(rocm.find(kSharedInclude), std::string::npos);
+        EXPECT_EQ(countOccurrences(cuda, kStressCase), 1u);
+        EXPECT_EQ(countOccurrences(rocm, kStressCase), 1u);
+
+        EXPECT_NE(
+            model.find("kLayerCount = 20"),
+            std::string::npos);
+        EXPECT_NE(
+            model.find("kExpertCount = 128"),
+            std::string::npos);
+        EXPECT_NE(
+            model.find("kTransferSlotCount = 42"),
+            std::string::npos);
+        EXPECT_NE(
+            model.find("kStressRotationCount = 8"),
+            std::string::npos);
+        EXPECT_NE(
+            model.find("kMaxCommandsPerWave = 4"),
+            std::string::npos);
+        EXPECT_NE(
+            model.find("AdversarialWave makeAdversarialWave"),
+            std::string::npos);
+        EXPECT_NE(
+            cuda.find("delay_last_publication"),
+            std::string::npos);
+        EXPECT_NE(
+            rocm.find("delay_last_publication"),
+            std::string::npos);
+        EXPECT_NE(
+            cuda.find("idempotent_replays"),
+            std::string::npos);
+        EXPECT_NE(
+            rocm.find("idempotent_replays"),
+            std::string::npos);
+        EXPECT_NE(
+            model.find("validateSnapshot"),
+            std::string::npos);
+
+        EXPECT_NE(
+            cmake.find(
+                "V2_Integration_CUDA_MoETransferStateMachine"),
+            std::string::npos);
+        EXPECT_NE(
+            cmake.find(
+                "V2_Integration_ROCm_MoETransferStateMachine"),
+            std::string::npos);
+        EXPECT_NE(
+            cmake.find(
+                "Test__CUDAMoEKernel.DeviceRebalance*"),
+            std::string::npos);
+        EXPECT_NE(
+            cmake.find(
+                "Test__ROCmMoEKernel.DeviceRebalance*"),
+            std::string::npos);
+        EXPECT_NE(
+            cmake.find(
+                "RepeatedRequestResetRestoresImmutableTransferDirectoryBaseline"),
+            std::string::npos);
+    }
+
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, GPUExpertTransferDoesNotExposePeerProbeAPI)
     {
         const fs::path root = findRepoRoot();
@@ -2954,9 +3060,7 @@ namespace llaminar2::test
             dgo_header.substr(reset_inference_start, reset_inference_end - reset_inference_start);
         const size_t clear_cache_drain =
             reset_inference_body.find(
-                "drainCompletedDeviceMoERebalanceMaintenanceDiagnostics(\n"
-                "                    \"request_reset\",\n"
-                "                    reset_reason)");
+                "drainCompletedDeviceMoERebalanceMaintenanceDiagnostics(");
         const size_t clear_cache_reset =
             reset_inference_body.find(
                 "device_moe_rebalance_maintenance_graph_.reset(\n"
@@ -2975,6 +3079,12 @@ namespace llaminar2::test
             << "PerfStats must attribute the exact request-boundary device epilogue.";
         ASSERT_NE(clear_cache_drain, std::string::npos)
             << "Request reset should export maintenance diagnostics through the exact stream-owned epilogue.";
+        const std::string clear_cache_drain_call =
+            reset_inference_body.substr(clear_cache_drain, 220);
+        EXPECT_NE(clear_cache_drain_call.find("\"request_reset\""),
+                  std::string::npos);
+        EXPECT_NE(clear_cache_drain_call.find("reset_reason"),
+                  std::string::npos);
         ASSERT_NE(clear_cache_reset, std::string::npos);
         EXPECT_LT(clear_cache_drain, clear_cache_reset);
         EXPECT_NE(dgo.find("epilogue_tags[\"reset\"] = reset_operation;"),
@@ -4106,23 +4216,44 @@ namespace llaminar2::test
     {
         const fs::path root = findRepoRoot();
         const fs::path graph_path = root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
+        const fs::path orchestrator_path =
+            root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h";
+        const fs::path runtime_table_path =
+            root / "src/v2/execution/moe/MoERuntimeTable.cpp";
+        const fs::path directory_path =
+            root / "src/v2/execution/moe/DeviceMoETransferSlotDirectory.cpp";
         ASSERT_TRUE(fs::exists(graph_path)) << graph_path;
+        ASSERT_TRUE(fs::exists(orchestrator_path)) << orchestrator_path;
+        ASSERT_TRUE(fs::exists(runtime_table_path)) << runtime_table_path;
+        ASSERT_TRUE(fs::exists(directory_path)) << directory_path;
 
         const std::string contents = readFile(graph_path);
+        const std::string orchestrator = readFile(orchestrator_path);
+        const std::string runtime_table = readFile(runtime_table_path);
+        const std::string directory = readFile(directory_path);
         ASSERT_FALSE(contents.empty()) << graph_path;
+        ASSERT_FALSE(orchestrator.empty()) << orchestrator_path;
+        ASSERT_FALSE(runtime_table.empty()) << runtime_table_path;
+        ASSERT_FALSE(directory.empty()) << directory_path;
 
-        const size_t reset_start = contents.find("void Qwen35MoEGraph::resetState()");
+        const size_t reset_start =
+            contents.find("void Qwen35MoEGraph::resetState(void *execution_stream)");
         ASSERT_NE(reset_start, std::string::npos);
         const size_t reset_end = contents.find("void Qwen35MoEGraph::resetPrefixCacheRuntimeStateWithoutSnapshot",
                                                reset_start);
         ASSERT_NE(reset_end, std::string::npos);
         const std::string reset_body = contents.substr(reset_start, reset_end - reset_start);
 
-        EXPECT_NE(reset_body.find("restoreInitialRuntimeState()"), std::string::npos)
+        EXPECT_NE(reset_body.find("restoreInitialRuntimeState(execution_stream)"), std::string::npos)
             << "Request-boundary reset must restore canonical MoE placement so "
                "portable prefix blocks replay suffix prefill under the same "
                "logical expert ownership used by an uncached full prefill.";
-        EXPECT_EQ(reset_body.find("resetDecodeRuntimeState()"), std::string::npos)
+        EXPECT_EQ(reset_body.find("restoreInitialRuntimeState()"), std::string::npos)
+            << "GPU model reset must never select an implicit stream.";
+        EXPECT_NE(reset_body.find("resetRequestPublications(execution_stream)"), std::string::npos)
+            << "Runtime placement and transfer-directory occupancy are one "
+               "stream-ordered reset transaction.";
+        EXPECT_EQ(reset_body.find("resetDecodeRuntimeState("), std::string::npos)
             << "Clearing runtime placement banks during session reset makes "
                "the next GPU decode route fall back to host/top-k state or fail "
                "before graph-captured MoE decode can run.";
@@ -4130,6 +4261,61 @@ namespace llaminar2::test
             << "Graph-stable device rebalance bindings must survive ordinary request reset because "
                "the captured decode graph may survive and the maintenance graph still needs the same "
                "runtime-table and transfer-slot pointers.";
+
+        const size_t kernel_reset =
+            orchestrator.find("ResetKernelDynamicState);");
+        const size_t model_reset =
+            orchestrator.find("ResetModelRuntime);", kernel_reset);
+        const size_t publish_reset =
+            orchestrator.find("PublishResetReady);", model_reset);
+        ASSERT_NE(kernel_reset, std::string::npos);
+        ASSERT_NE(model_reset, std::string::npos);
+        ASSERT_NE(publish_reset, std::string::npos);
+        EXPECT_LT(kernel_reset, model_reset);
+        EXPECT_LT(model_reset, publish_reset)
+            << "Reset-ready must be the sole final publication after every "
+               "kernel-owned and model-owned device mutation.";
+        EXPECT_NE(orchestrator.find(
+                      "graph_builder_->resetState(\n"
+                      "                        reset_transaction.executionStream())"),
+                  std::string::npos)
+            << "The graph reset must consume the transaction's exact producer stream.";
+
+        for (const auto &[owner, source] :
+             std::array<std::pair<const char *, const std::string *>, 2>{
+                 std::pair{"runtime table", &runtime_table},
+                 std::pair{"transfer directory", &directory}})
+        {
+            EXPECT_NE(source->find("requires an explicit stream"), std::string::npos)
+                << owner << " must reject null-stream request reset.";
+            EXPECT_NE(source->find("deviceCopyAsync("), std::string::npos)
+                << owner << " must enqueue immutable device-baseline restoration "
+                            "on the request-reset transaction's exact stream.";
+        }
+
+        const size_t runtime_empty_reset =
+            runtime_table.find("void DeviceMoERuntimeTable::resetDecodeRuntimeState(");
+        const size_t runtime_initial_reset =
+            runtime_table.find("void DeviceMoERuntimeTable::restoreInitialRuntimeState(",
+                               runtime_empty_reset);
+        const size_t runtime_reset_end =
+            runtime_table.find("void DeviceMoERuntimeTable::syncRuntimeStateToHost(",
+                               runtime_initial_reset);
+        ASSERT_NE(runtime_empty_reset, std::string::npos);
+        ASSERT_NE(runtime_initial_reset, std::string::npos);
+        ASSERT_NE(runtime_reset_end, std::string::npos);
+        const std::string runtime_reset_bodies =
+            runtime_table.substr(runtime_empty_reset,
+                                 runtime_reset_end - runtime_empty_reset);
+        EXPECT_EQ(runtime_reset_bodies.find("createMirrorStream"), std::string::npos);
+        EXPECT_EQ(runtime_reset_bodies.find("synchronizeMirror"), std::string::npos);
+        EXPECT_EQ(runtime_reset_bodies.find("deviceToDevice("), std::string::npos)
+            << "GPU request reset must not block the host on a legacy synchronous D2D copy.";
+        EXPECT_NE(runtime_reset_bodies.find("copyMirrorToMirrorAsync("), std::string::npos)
+            << "Both canonical runtime-bank restores must use the explicit-stream "
+               "asynchronous D2D helper.";
+        EXPECT_EQ(runtime_reset_bodies.find("host_layers_ ="), std::string::npos)
+            << "GPU reset must not pretend a setup-time host template is a live coherence peer.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, Qwen35MoEDecodeGraphAcceptsLiveDynamicRuntimeBank)
@@ -4850,12 +5036,14 @@ namespace llaminar2::test
         EXPECT_NE(graph.find("collectGraphRebalanceTransferProfile"),
                   std::string::npos)
             << "Prefill LLEP and decode maintenance must share the same model-wide format preflight";
-        EXPECT_NE(graph.find("transfer_key_builder << graphRebalanceDomainKey()"),
+        EXPECT_NE(graph.find("graphRebalanceTransferDirectoryKey"),
                   std::string::npos)
-            << "Persistent transfer storage must be shared at device-domain scope";
-        EXPECT_EQ(graph.find("transfer_key_builder << binding_key"),
+            << "Prefill and maintenance must derive persistent transfer storage "
+               "identity through one device-domain key builder";
+        EXPECT_NE(graph.find("existing->second->requirePhysicalOwner("),
                   std::string::npos)
-            << "A layer-specific binding key allocates one multi-layer transfer directory per layer";
+            << "Every cached transfer directory must prove exact device, ordinal, "
+               "and participant ownership before graph binding";
         EXPECT_NE(
             graph.find(
                 "const std::string transfer_state_key =\n"
@@ -5433,9 +5621,15 @@ namespace llaminar2::test
                 << backend << " must mirror the status ABI field";
             EXPECT_GE(countOccurrences(
                           *source,
-                          "rebalance_active_transfer_slot_expert_count("),
+                          "rebalance_publish_transfer_slot_claim_summary("),
                       3u)
-                << backend << " must populate both controller modes through the shared device predicate";
+                << backend << " must invoke one shared final-state publisher "
+                   "from both the standard and graph-controller kernels.";
+            EXPECT_NE(source->find(
+                          "status->prefill_active_transfer_slot_experts = summary.active_claims;"),
+                      std::string::npos)
+                << backend << " shared publisher must derive active movement "
+                   "from the complete device-resident transfer-slot claim summary.";
             EXPECT_NE(source->find(
                           "prior_status.prefill_active_transfer_slot_experts"),
                       std::string::npos)
@@ -5446,6 +5640,146 @@ namespace llaminar2::test
                       "deviceToHostOnStream(&prefill_active_transfer_slot_experts"),
                   std::string::npos)
             << "Movement evidence must share the request-boundary status copy, not add hot-path D2H";
+    }
+
+    /**
+     * @brief Keep active occupancy distinct from directory addressability.
+     *
+     * Staging slots are spare capacity, not a permanently reserved index range.
+     * Once a transfer is atomically published, any addressable directory slot
+     * may hold a durable claim while the total number of claims remains bounded
+     * by the active capacity. This sanitizer prevents either GPU backend or the
+     * graph builder from collapsing those two independent quantities again.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         TransferSlotCapacityContractSeparatesOccupancyFromAddressability)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path controller_path =
+            root / "src/v2/execution/moe/DeviceMoERebalanceController.h";
+        const fs::path policy_path =
+            root / "src/v2/execution/moe/DeviceMoERebalancePolicyShared.h";
+        const fs::path abi_path =
+            root / "src/v2/execution/moe/DeviceMoERebalanceABI.h";
+        const fs::path graph_path =
+            root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
+        const fs::path cuda_path =
+            root / "src/v2/kernels/cuda/moe/CUDAMoEKernels.cu";
+        const fs::path rocm_path =
+            root / "src/v2/kernels/rocm/moe/ROCmMoEKernels.hip";
+        for (const auto &path :
+             {controller_path,
+              policy_path,
+              abi_path,
+              graph_path,
+              cuda_path,
+              rocm_path})
+        {
+            ASSERT_TRUE(fs::exists(path)) << path;
+        }
+
+        const std::string controller = readFile(controller_path);
+        const std::string policy = readFile(policy_path);
+        const std::string abi = readFile(abi_path);
+        const std::string graph = readFile(graph_path);
+        const std::string cuda = readFile(cuda_path);
+        const std::string rocm = readFile(rocm_path);
+
+        EXPECT_EQ(
+            countOccurrences(
+                controller,
+                "uint32_t active_transfer_slot_capacity"),
+            1u);
+        EXPECT_EQ(
+            countOccurrences(
+                controller,
+                "uint32_t transfer_slot_directory_capacity"),
+            1u);
+        EXPECT_NE(
+            controller.find(
+                "config.active_transfer_slot_capacity <=\n"
+                "                   config.transfer_slot_directory_capacity"),
+            std::string::npos)
+            << "Host validation must reject an active budget larger than its directory";
+        EXPECT_NE(
+            controller.find(
+                "config.transfer_slot_directory_capacity,\n"
+                "                        valid_flag"),
+            std::string::npos)
+            << "Host claim classification must validate physical slot IDs against the directory";
+        EXPECT_NE(
+            policy.find(
+                "TransferSlotClaimExceedsDirectoryCapacity"),
+            std::string::npos);
+        EXPECT_EQ(
+            policy.find(
+                "TransferSlotClaimExceedsPersistentCapacity"),
+            std::string::npos);
+
+        EXPECT_EQ(
+            countOccurrences(
+                graph,
+                "rebalance_config.active_transfer_slot_capacity ="),
+            2u);
+        EXPECT_EQ(
+            countOccurrences(
+                graph,
+                "rebalance_config.transfer_slot_directory_capacity ="),
+            2u);
+        EXPECT_EQ(
+            countOccurrences(graph, "transfer_capacity.active_slots;"),
+            2u);
+        EXPECT_EQ(
+            countOccurrences(graph, "transfer_capacity.total_slots;"),
+            4u)
+            << "Each path uses total slots for both config addressability and directory allocation";
+
+        EXPECT_NE(
+            abi.find("kVersion = 8u"),
+            std::string::npos);
+        EXPECT_NE(
+            abi.find("kConfigBytes = 132u"),
+            std::string::npos);
+
+        for (const auto &[backend, source] :
+             std::array<std::pair<const char *, const std::string *>, 2>{
+                 std::pair{"CUDA", &cuda},
+                 std::pair{"ROCm", &rocm}})
+        {
+            EXPECT_EQ(
+                countOccurrences(
+                    *source,
+                    "uint32_t active_transfer_slot_capacity;"),
+                1u)
+                << backend << " config view must mirror active occupancy";
+            EXPECT_EQ(
+                countOccurrences(
+                    *source,
+                    "uint32_t transfer_slot_directory_capacity;"),
+                1u)
+                << backend << " config view must mirror directory addressability";
+            EXPECT_NE(
+                source->find(
+                    "config.transfer_slot_directory_capacity,\n"
+                    "                            kDeviceMoEFlagValid"),
+                std::string::npos)
+                << backend << " claim classifier must use the directory bound";
+            EXPECT_GE(
+                countOccurrences(
+                    *source,
+                    "config.active_transfer_slot_capacity"),
+                5u)
+                << backend << " planner and final active-count audit must use the occupancy bound";
+            EXPECT_EQ(
+                source->find("persistent_transfer_slot_capacity"),
+                std::string::npos)
+                << backend << " must not restore the overloaded capacity field";
+            EXPECT_NE(
+                source->find(
+                    "moe_rebalance_abi::kConfigBytes"),
+                std::string::npos)
+                << backend << " must compile-time authenticate the config ABI";
+        }
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, CUDALLEPFatalContractsNameTheViolatedInvariant)
@@ -5488,11 +5822,19 @@ namespace llaminar2::test
             root / "src/v2/kernels/cuda/moe/CUDAMoEKernels.cu";
         const fs::path rocm_path =
             root / "src/v2/kernels/rocm/moe/ROCmMoEKernels.hip";
+        const fs::path shared_policy_path =
+            root /
+            "src/v2/execution/moe/DeviceMoERebalancePolicyShared.h";
         ASSERT_TRUE(fs::exists(cuda_path)) << cuda_path;
         ASSERT_TRUE(fs::exists(rocm_path)) << rocm_path;
+        ASSERT_TRUE(fs::exists(shared_policy_path))
+            << shared_policy_path;
 
         const std::string cuda = readFile(cuda_path);
         const std::string rocm = readFile(rocm_path);
+        const std::string shared_policy =
+            readFile(shared_policy_path);
+        ASSERT_FALSE(shared_policy.empty());
         for (const auto &[backend, source] :
              std::array<std::pair<const char *, const std::string *>, 2>{
                  std::pair{"CUDA", &cuda},
@@ -5592,11 +5934,57 @@ namespace llaminar2::test
                       3u)
                 << backend
                 << " every apply entry point must retire the prior logical occupant";
-            EXPECT_NE(source->find("descriptor.local_slot = -1;"),
-                      std::string::npos)
+            EXPECT_GE(
+                countOccurrences(
+                    *source,
+                    "rebalance_retire_local_payload_publication("),
+                3u)
                 << backend
-                << " a retired occupant must stop naming the mutable allocation";
+                << " every ownership and slot-reuse path must delegate one "
+                   "atomic local-payload retirement transition";
+            EXPECT_NE(
+                source->find(
+                    "rebalance_plan_duplicates_prior_local_arrival("),
+                std::string::npos)
+                << backend
+                << " apply must reject duplicate physical-slot and logical-expert keys";
+            EXPECT_NE(
+                source->find(
+                    "rebalance_apply_transaction_blocked(status)"),
+                std::string::npos)
+                << backend
+                << " preflight must gate the entire multi-arrival bank commit";
+            EXPECT_NE(
+                source->find(
+                    "permanent_plan_error"),
+                std::string::npos)
+                << backend
+                << " malformed ready waves must poison instead of retrying forever";
         }
+
+        EXPECT_NE(
+            shared_policy.find(
+                "void retireLocalPayloadPublication("),
+            std::string::npos);
+        EXPECT_NE(
+            shared_policy.find("descriptor.local_slot = -1;"),
+            std::string::npos);
+        EXPECT_NE(
+            shared_policy.find(
+                "descriptor.gate = decltype(descriptor.gate){};"),
+            std::string::npos);
+        EXPECT_NE(
+            shared_policy.find(
+                "descriptor.up = decltype(descriptor.up){};"),
+            std::string::npos);
+        EXPECT_NE(
+            shared_policy.find(
+                "descriptor.down = decltype(descriptor.down){};"),
+            std::string::npos);
+        EXPECT_NE(
+            shared_policy.find(
+                "descriptor.flags &= ~local_payload_flags;"),
+            std::string::npos);
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, CompactSourceDescriptorKernelsUseProjectedCommandBuffers)
@@ -5856,15 +6244,29 @@ namespace llaminar2::test
                   std::string::npos)
             << "Prefill LLEP cost-gate skips must report why standard AE was selected.";
 
-        EXPECT_NE(stage.find("assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers"),
+        EXPECT_NE(stage.find("assignPrefillRoutesLeastLoadedResident"),
                   std::string::npos)
-            << "Resident-only prefill LLEP must use the guarded no-transfer apply kernel.";
+            << "Resident-only LLEP must use the planner whose candidate set is "
+               "limited to the active runtime bank's resident masks.";
+        EXPECT_EQ(stage.find("assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers"),
+                  std::string::npos)
+            << "Production resident-only LLEP must not first create a potentially "
+               "foreign transfer plan and then conditionally decline to apply it.";
         EXPECT_NE(stage.find("assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers"),
                   std::string::npos)
             << "Full transfer-backed prefill LLEP must use the after-transfer apply kernel.";
-        EXPECT_NE(stage.find("prefill_llep_require_transfer_backing"),
+        EXPECT_NE(stage.find("requestsTransferBackedCurrentBatchPrefillLLEP"),
                   std::string::npos)
-            << "Full mode must fail hard when transfer backing is unavailable.";
+            << "Current-batch migration must be selected by an explicit typed "
+               "graph-build policy, not inferred from nullable transport pointers.";
+        EXPECT_NE(graph.find("const bool current_batch_llep_transfer_candidate"),
+                  std::string::npos)
+            << "The graph must name current-batch migration independently from "
+               "prefix-runtime payload rehydration.";
+        EXPECT_NE(graph.find("!grouped_main_verifier_layer"),
+                  std::string::npos)
+            << "Grouped verifier rows must be structurally excluded from "
+               "current-batch expert payload migration.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
@@ -6321,7 +6723,9 @@ namespace llaminar2::test
             << "MoE prefix restore without a runtime payload must have its own "
                "model-runtime reset boundary instead of reusing request reset.";
         const size_t prefix_reset_start =
-            graph.find("void Qwen35MoEGraph::resetPrefixCacheRuntimeStateWithoutSnapshot()");
+            graph.find(
+                "void Qwen35MoEGraph::resetPrefixCacheRuntimeStateWithoutSnapshot(\n"
+                "        void *execution_stream)");
         ASSERT_NE(prefix_reset_start, std::string::npos);
         const size_t prefix_reset_end =
             graph.find("ILocalTPContext *Qwen35MoEGraph::maintenanceTPContextForDomain",
@@ -6329,11 +6733,18 @@ namespace llaminar2::test
         ASSERT_NE(prefix_reset_end, std::string::npos);
         const std::string prefix_reset_body =
             graph.substr(prefix_reset_start, prefix_reset_end - prefix_reset_start);
-        EXPECT_NE(prefix_reset_body.find("resetDecodeRuntimeState()"),
+        EXPECT_NE(prefix_reset_body.find("resetDecodeRuntimeState(execution_stream)"),
                   std::string::npos)
             << "No-payload prefix restore must return MoE placement tables to "
                "the empty pre-decode baseline that split prefill observes.";
-        EXPECT_EQ(prefix_reset_body.find("restoreInitialRuntimeState()"),
+        EXPECT_EQ(prefix_reset_body.find("resetDecodeRuntimeState();"),
+                  std::string::npos)
+            << "GPU prefix reset must never select an implicit stream.";
+        EXPECT_NE(prefix_reset_body.find("resetRequestPublications(execution_stream)"),
+                  std::string::npos)
+            << "Prefix reset must retire every transient transfer-slot "
+               "publication on the same transaction stream.";
+        EXPECT_EQ(prefix_reset_body.find("restoreInitialRuntimeState("),
                   std::string::npos)
             << "No-payload prefix restore must not restore the first decode bank "
                "as an initial state; split prefill has no active decode bank.";
