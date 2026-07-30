@@ -9,6 +9,7 @@
 #include "../../../tensors/TensorClasses.h"
 #include "../../../backends/ComputeBackend.h"
 #include "../../../backends/BackendManager.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include <cstring>
@@ -339,7 +340,18 @@ namespace llaminar2
 
         // Use backend's deviceToHost for the transfer
         int device_ordinal = src_device.gpu_ordinal();
-        return backend->deviceToHost(dst, src, bytes, device_ordinal);
+        void *const stream =
+            GPUDeviceContextPool::instance()
+                .getContext(src_device)
+                .defaultStream();
+        if (!stream)
+        {
+            throw std::runtime_error(
+                "CrossDomainTransfer::transferGpuToCpuImpl requires an "
+                "explicit source stream");
+        }
+        return backend->deviceToHost(
+            dst, src, bytes, device_ordinal, stream);
     }
 
     bool CrossDomainTransfer::transferCpuToGpuImpl(
@@ -371,7 +383,18 @@ namespace llaminar2
 
         // Use backend's hostToDevice for the transfer
         int device_ordinal = dst_device.gpu_ordinal();
-        return backend->hostToDevice(dst, src, bytes, device_ordinal);
+        void *const stream =
+            GPUDeviceContextPool::instance()
+                .getContext(dst_device)
+                .defaultStream();
+        if (!stream)
+        {
+            throw std::runtime_error(
+                "CrossDomainTransfer::transferCpuToGpuImpl requires an "
+                "explicit destination stream");
+        }
+        return backend->hostToDevice(
+            dst, src, bytes, device_ordinal, stream);
     }
 
     std::unique_ptr<TensorBase> CrossDomainTransfer::allocateCpuTensor(

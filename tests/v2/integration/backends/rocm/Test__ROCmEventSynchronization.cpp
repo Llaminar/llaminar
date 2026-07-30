@@ -106,6 +106,9 @@ TEST_F(Test__ROCmEventSynchronization, EventCreateAndDestroy)
  */
 TEST_F(Test__ROCmEventSynchronization, EventRecordAndWait)
 {
+    llaminar2::test::ScopedGPUStream producer_stream(DeviceId::rocm(device_id_));
+    const auto stream = static_cast<hipStream_t>(producer_stream.get());
+
     // Create an event
     void *event = backend_->createEvent(device_id_);
     ASSERT_NE(event, nullptr);
@@ -116,11 +119,11 @@ TEST_F(Test__ROCmEventSynchronization, EventRecordAndWait)
     ASSERT_NE(d_ptr, nullptr);
 
     // Do some GPU work (trivial but requires kernel launch)
-    hipError_t err = hipMemsetAsync(d_ptr, 0, bytes, 0);
+    hipError_t err = hipMemsetAsync(d_ptr, 0, bytes, stream);
     ASSERT_EQ(err, hipSuccess);
 
     // Record event after the work
-    bool recorded = backend_->recordEvent(event, device_id_);
+    bool recorded = backend_->recordEvent(event, device_id_, producer_stream.get());
     ASSERT_TRUE(recorded) << "Failed to record event";
 
     // Wait for the event
@@ -189,6 +192,9 @@ TEST_F(Test__ROCmEventSynchronization,
  */
 TEST_F(Test__ROCmEventSynchronization, EventSyncIsEventSpecific_NotStreamWide)
 {
+    llaminar2::test::ScopedGPUStream producer_stream(DeviceId::rocm(device_id_));
+    const auto stream = static_cast<hipStream_t>(producer_stream.get());
+
     // Create events
     void *event_quick = backend_->createEvent(device_id_);
     void *event_slow = backend_->createEvent(device_id_);
@@ -215,16 +221,16 @@ TEST_F(Test__ROCmEventSynchronization, EventSyncIsEventSpecific_NotStreamWide)
     }
 
     // Step 1: Launch quick operation and record event
-    (void)hipMemsetAsync(d_small, 0, small_bytes, 0);
-    backend_->recordEvent(event_quick, device_id_);
+    (void)hipMemsetAsync(d_small, 0, small_bytes, stream);
+    backend_->recordEvent(event_quick, device_id_, producer_stream.get());
 
     // Step 2: Launch slow operation (will still be running when we wait on quick event)
     // Use multiple iterations to ensure it takes time
     for (int i = 0; i < 10; ++i)
     {
-        (void)hipMemsetAsync(d_large, i, large_bytes, 0);
+        (void)hipMemsetAsync(d_large, i, large_bytes, stream);
     }
-    backend_->recordEvent(event_slow, device_id_);
+    backend_->recordEvent(event_slow, device_id_, producer_stream.get());
 
     // Step 3: Measure time to wait on the QUICK event
     auto start = std::chrono::high_resolution_clock::now();
@@ -285,13 +291,17 @@ TEST_F(Test__ROCmEventSynchronization, MappedTensorCoherenceUsesEvents)
     // Queue some slow work AFTER the tensor was marked dirty
     // If ensureOnHost uses stream sync, it will wait for this slow work
     // If it uses event sync, it will return quickly
+    llaminar2::test::ScopedGPUStream unrelated_stream(rocm_device);
+    const auto unrelated_hip_stream =
+        static_cast<hipStream_t>(unrelated_stream.get());
     const size_t slow_bytes = 256 * 1024 * 1024;
     void *d_slow = backend_->allocate(slow_bytes, device_id_);
     if (d_slow)
     {
         for (int i = 0; i < 10; ++i)
         {
-            (void)hipMemsetAsync(d_slow, i, slow_bytes, 0);
+            (void)hipMemsetAsync(
+                d_slow, i, slow_bytes, unrelated_hip_stream);
         }
     }
 
@@ -305,7 +315,8 @@ TEST_F(Test__ROCmEventSynchronization, MappedTensorCoherenceUsesEvents)
     // Clean up slow work buffer
     if (d_slow)
     {
-        (void)hipDeviceSynchronize();
+        ASSERT_TRUE(
+            backend_->synchronizeStream(unrelated_stream.get(), device_id_));
         backend_->free(d_slow, device_id_);
     }
 
@@ -329,6 +340,9 @@ TEST_F(Test__ROCmEventSynchronization, MappedTensorCoherenceUsesEvents)
  */
 TEST_F(Test__ROCmEventSynchronization, MultipleEventsIndependentSync)
 {
+    llaminar2::test::ScopedGPUStream producer_stream(DeviceId::rocm(device_id_));
+    const auto stream = static_cast<hipStream_t>(producer_stream.get());
+
     constexpr int NUM_EVENTS = 5;
     std::vector<void *> events(NUM_EVENTS);
     std::vector<void *> buffers(NUM_EVENTS);
@@ -355,8 +369,9 @@ TEST_F(Test__ROCmEventSynchronization, MultipleEventsIndependentSync)
         }
 
         // Launch work and record event
-        (void)hipMemsetAsync(buffers[i], i, bytes_per_op, 0);
-        backend_->recordEvent(events[i], device_id_);
+        (void)hipMemsetAsync(buffers[i], i, bytes_per_op, stream);
+        backend_->recordEvent(
+            events[i], device_id_, producer_stream.get());
     }
 
     // Wait on events in ORDER (each should complete quickly after the previous)

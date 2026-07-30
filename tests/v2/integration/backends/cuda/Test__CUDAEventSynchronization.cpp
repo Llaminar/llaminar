@@ -106,6 +106,9 @@ TEST_F(Test__CUDAEventSynchronization, EventCreateAndDestroy)
  */
 TEST_F(Test__CUDAEventSynchronization, EventRecordAndWait)
 {
+    llaminar2::test::ScopedGPUStream producer_stream(DeviceId::cuda(device_id_));
+    const auto stream = static_cast<cudaStream_t>(producer_stream.get());
+
     // Create an event
     void *event = backend_->createEvent(device_id_);
     ASSERT_NE(event, nullptr);
@@ -116,11 +119,11 @@ TEST_F(Test__CUDAEventSynchronization, EventRecordAndWait)
     ASSERT_NE(d_ptr, nullptr);
 
     // Do some GPU work (trivial but requires kernel launch)
-    cudaError_t err = cudaMemsetAsync(d_ptr, 0, bytes, 0);
+    cudaError_t err = cudaMemsetAsync(d_ptr, 0, bytes, stream);
     ASSERT_EQ(err, cudaSuccess);
 
     // Record event after the work
-    bool recorded = backend_->recordEvent(event, device_id_);
+    bool recorded = backend_->recordEvent(event, device_id_, producer_stream.get());
     ASSERT_TRUE(recorded) << "Failed to record event";
 
     // Wait for the event
@@ -190,6 +193,9 @@ TEST_F(Test__CUDAEventSynchronization,
  */
 TEST_F(Test__CUDAEventSynchronization, EventSyncIsEventSpecific_NotStreamWide)
 {
+    llaminar2::test::ScopedGPUStream producer_stream(DeviceId::cuda(device_id_));
+    const auto stream = static_cast<cudaStream_t>(producer_stream.get());
+
     // Create events
     void *event_quick = backend_->createEvent(device_id_);
     void *event_slow = backend_->createEvent(device_id_);
@@ -216,16 +222,16 @@ TEST_F(Test__CUDAEventSynchronization, EventSyncIsEventSpecific_NotStreamWide)
     }
 
     // Step 1: Launch quick operation and record event
-    cudaMemsetAsync(d_small, 0, small_bytes, 0);
-    backend_->recordEvent(event_quick, device_id_);
+    cudaMemsetAsync(d_small, 0, small_bytes, stream);
+    backend_->recordEvent(event_quick, device_id_, producer_stream.get());
 
     // Step 2: Launch slow operation (will still be running when we wait on quick event)
     // Use multiple iterations to ensure it takes time
     for (int i = 0; i < 10; ++i)
     {
-        cudaMemsetAsync(d_large, i, large_bytes, 0);
+        cudaMemsetAsync(d_large, i, large_bytes, stream);
     }
-    backend_->recordEvent(event_slow, device_id_);
+    backend_->recordEvent(event_slow, device_id_, producer_stream.get());
 
     // Step 3: Measure time to wait on the QUICK event
     auto start = std::chrono::high_resolution_clock::now();
@@ -286,13 +292,17 @@ TEST_F(Test__CUDAEventSynchronization, MappedTensorCoherenceUsesEvents)
     // Queue some slow work AFTER the tensor was marked dirty
     // If ensureOnHost uses device sync, it will wait for this slow work
     // If it uses event sync, it will return quickly
+    llaminar2::test::ScopedGPUStream unrelated_stream(cuda_device);
+    const auto unrelated_cuda_stream =
+        static_cast<cudaStream_t>(unrelated_stream.get());
     const size_t slow_bytes = 256 * 1024 * 1024;
     void *d_slow = backend_->allocate(slow_bytes, device_id_);
     if (d_slow)
     {
         for (int i = 0; i < 10; ++i)
         {
-            cudaMemsetAsync(d_slow, i, slow_bytes, 0);
+            cudaMemsetAsync(
+                d_slow, i, slow_bytes, unrelated_cuda_stream);
         }
     }
 
@@ -308,7 +318,8 @@ TEST_F(Test__CUDAEventSynchronization, MappedTensorCoherenceUsesEvents)
     // Cleanup - need to wait for slow work before freeing
     if (d_slow)
     {
-        cudaDeviceSynchronize();
+        ASSERT_TRUE(
+            backend_->synchronizeStream(unrelated_stream.get(), device_id_));
         backend_->free(d_slow, device_id_);
     }
 
@@ -331,6 +342,9 @@ TEST_F(Test__CUDAEventSynchronization, MappedTensorCoherenceUsesEvents)
  */
 TEST_F(Test__CUDAEventSynchronization, MultipleEventsIndependentSync)
 {
+    llaminar2::test::ScopedGPUStream producer_stream(DeviceId::cuda(device_id_));
+    const auto stream = static_cast<cudaStream_t>(producer_stream.get());
+
     const int num_events = 5;
     std::vector<void *> events(num_events);
     std::vector<void *> buffers(num_events);
@@ -360,8 +374,9 @@ TEST_F(Test__CUDAEventSynchronization, MultipleEventsIndependentSync)
     // Queue operations and record events
     for (int i = 0; i < num_events; ++i)
     {
-        cudaMemsetAsync(buffers[i], i, bytes_per_op, 0);
-        backend_->recordEvent(events[i], device_id_);
+        cudaMemsetAsync(buffers[i], i, bytes_per_op, stream);
+        backend_->recordEvent(
+            events[i], device_id_, producer_stream.get());
     }
 
     // Wait on events in REVERSE order - should still work correctly

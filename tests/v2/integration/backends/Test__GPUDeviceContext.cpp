@@ -1,6 +1,6 @@
 /**
  * @file Test__GPUDeviceContext.cpp
- * @brief Unit tests for GPU Device Context infrastructure
+ * @brief Integration tests for GPU Device Context infrastructure
  *
  * Tests:
  * - IWorkerGPUContext interface via concrete implementations
@@ -30,6 +30,7 @@
 #include <chrono>
 #include <future>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -454,9 +455,8 @@ TEST(Test__NvidiaDeviceContext, DefaultStream)
     ctx.submitAndWait([&]()
                       { default_stream = ctx.defaultStream(); });
 
-    // Default stream should be available (may or may not be nullptr depending on CUDA semantics)
-    // The key is that it shouldn't throw
-    (void)default_stream;
+    EXPECT_NE(default_stream, nullptr)
+        << "The context-owned execution stream must never be CUDA's implicit default stream";
 }
 
 TEST(Test__NvidiaDeviceContext, EventCreationAndDestruction)
@@ -481,15 +481,17 @@ TEST(Test__NvidiaDeviceContext, EventRecordAndSynchronize)
 
     auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(0);
 
-    void *event = nullptr;
     ctx.submitAndWait([&]()
                       {
-        event = ctx.createEvent();
-        ctx.recordEvent(event, nullptr);  // Record on default stream
-        ctx.synchronizeEvent(event);       // Wait for event
-        ctx.destroyEvent(event); });
-
-    // Success if no exceptions thrown
+        void *stream = ctx.createStream();
+        void *event = ctx.createEvent();
+        ASSERT_NE(stream, nullptr);
+        ASSERT_NE(event, nullptr);
+        EXPECT_THROW(ctx.recordEvent(event, nullptr), std::invalid_argument);
+        ctx.recordEvent(event, stream);
+        ctx.synchronizeEvent(event);
+        ctx.destroyEvent(event);
+        ctx.destroyStream(stream); });
 }
 
 TEST(Test__NvidiaDeviceContext, EventQueryCheckedReportsCompletion)
@@ -815,7 +817,8 @@ TEST(Test__AMDDeviceContext, DefaultStream)
     ctx.submitAndWait([&]()
                       { default_stream = ctx.defaultStream(); });
 
-    (void)default_stream;
+    EXPECT_NE(default_stream, nullptr)
+        << "The context-owned execution stream must never be HIP's implicit default stream";
 }
 
 TEST(Test__AMDDeviceContext, EventCreationAndDestruction)
@@ -840,13 +843,17 @@ TEST(Test__AMDDeviceContext, EventRecordAndSynchronize)
 
     auto &ctx = GPUDeviceContextPool::instance().getAMDContext(0);
 
-    void *event = nullptr;
     ctx.submitAndWait([&]()
                       {
-        event = ctx.createEvent();
-        ctx.recordEvent(event, nullptr);
+        void *stream = ctx.createStream();
+        void *event = ctx.createEvent();
+        ASSERT_NE(stream, nullptr);
+        ASSERT_NE(event, nullptr);
+        EXPECT_THROW(ctx.recordEvent(event, nullptr), std::invalid_argument);
+        ctx.recordEvent(event, stream);
         ctx.synchronizeEvent(event);
-        ctx.destroyEvent(event); });
+        ctx.destroyEvent(event);
+        ctx.destroyStream(stream); });
 }
 
 TEST(Test__AMDDeviceContext, EventQueryCheckedReportsCompletion)

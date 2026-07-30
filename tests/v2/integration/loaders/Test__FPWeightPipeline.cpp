@@ -1,6 +1,6 @@
 /**
  * @file Test__FPWeightPipeline.cpp
- * @brief Unit tests for floating-point weight pipeline support
+ * @brief GPU integration tests for floating-point weight pipeline support
  *
  * Tests the RAW_FP passthrough path through the GPU weight loading pipeline:
  * - WeightVRAMPool::planRawWeight() allocation
@@ -174,6 +174,7 @@ class Test__FPDeviceLoadPipeline : public ::testing::Test
 {
   protected:
     IBackend* backend_ = nullptr;
+    void* verification_stream_ = nullptr;
     RepackKernels kernels_{};
 
     void SetUp() override
@@ -200,6 +201,16 @@ class Test__FPDeviceLoadPipeline : public ::testing::Test
             GTEST_SKIP() << "No GPU backend available (need HAVE_ROCM or HAVE_CUDA)";
         }
         backend_->setDevice(0);
+        verification_stream_ = backend_->createStream(0);
+        ASSERT_NE(verification_stream_, nullptr);
+    }
+
+    void TearDown() override
+    {
+        if (backend_ && verification_stream_)
+            backend_->destroyStream(verification_stream_, 0);
+        verification_stream_ = nullptr;
+        backend_ = nullptr;
     }
 };
 
@@ -248,7 +259,12 @@ TEST_F(Test__FPDeviceLoadPipeline, RAW_FP_SingleWeight_ByteForByteParity)
     EXPECT_EQ(slot->d_native_vnni_scales, nullptr);
 
     std::vector<float> gpu_data(N * K);
-    backend_->deviceToHost(gpu_data.data(), slot->d_native_vnni_payload, raw_bytes, 0);
+    ASSERT_TRUE(backend_->deviceToHost(
+        gpu_data.data(),
+        slot->d_native_vnni_payload,
+        raw_bytes,
+        0,
+        verification_stream_));
     EXPECT_EQ(gpu_data, host_data) << "FP32 byte-for-byte parity failed";
 
     pinned.release();
@@ -302,7 +318,12 @@ TEST_F(Test__FPDeviceLoadPipeline, RAW_FP_FP16Weight_ByteForByteParity)
     ASSERT_TRUE(slot.has_value());
 
     std::vector<uint16_t> gpu_data(N * K);
-    backend_->deviceToHost(gpu_data.data(), slot->d_native_vnni_payload, raw_bytes, 0);
+    ASSERT_TRUE(backend_->deviceToHost(
+        gpu_data.data(),
+        slot->d_native_vnni_payload,
+        raw_bytes,
+        0,
+        verification_stream_));
     EXPECT_EQ(gpu_data, host_data) << "FP16 byte-for-byte parity failed";
 
     pinned.release();
@@ -366,7 +387,12 @@ TEST_F(Test__FPDeviceLoadPipeline, RAW_FP_MixedWithQuantized)
 
     // Verify FP data
     std::vector<float> gpu_data(N * K);
-    backend_->deviceToHost(gpu_data.data(), fp_slot->d_native_vnni_payload, fp_raw_bytes, 0);
+    ASSERT_TRUE(backend_->deviceToHost(
+        gpu_data.data(),
+        fp_slot->d_native_vnni_payload,
+        fp_raw_bytes,
+        0,
+        verification_stream_));
     EXPECT_EQ(gpu_data, fp_data);
 
     pinned.release();
@@ -430,7 +456,12 @@ TEST_F(Test__FPDeviceLoadPipeline, RAW_FP_MultipleWeights_StreamReuse)
         ASSERT_TRUE(slot.has_value()) << "Missing slot for fp_w" << w;
 
         std::vector<float> gpu_data(N * K);
-        backend_->deviceToHost(gpu_data.data(), slot->d_native_vnni_payload, raw_bytes, 0);
+        ASSERT_TRUE(backend_->deviceToHost(
+            gpu_data.data(),
+            slot->d_native_vnni_payload,
+            raw_bytes,
+            0,
+            verification_stream_));
         EXPECT_EQ(gpu_data, all_data[w]) << "Data mismatch for fp_w" << w;
     }
 
@@ -493,8 +524,18 @@ TEST_F(Test__FPDeviceLoadPipeline, LoadOrchestrator_EndToEnd_RawFP)
     ASSERT_TRUE(slot_v.has_value());
 
     std::vector<float> gpu_q(N * K), gpu_v(N * K);
-    backend_->deviceToHost(gpu_q.data(), slot_q->d_native_vnni_payload, raw_bytes, 0);
-    backend_->deviceToHost(gpu_v.data(), slot_v->d_native_vnni_payload, raw_bytes, 0);
+    ASSERT_TRUE(backend_->deviceToHost(
+        gpu_q.data(),
+        slot_q->d_native_vnni_payload,
+        raw_bytes,
+        0,
+        verification_stream_));
+    ASSERT_TRUE(backend_->deviceToHost(
+        gpu_v.data(),
+        slot_v->d_native_vnni_payload,
+        raw_bytes,
+        0,
+        verification_stream_));
 
     EXPECT_EQ(gpu_q, data_q);
     EXPECT_EQ(gpu_v, data_v);
@@ -538,7 +579,12 @@ TEST_F(Test__FPDeviceLoadPipeline, LoadOrchestrator_ChunkedRawFPParity)
     ASSERT_TRUE(slot.has_value());
 
     std::vector<float> gpu_data(static_cast<size_t>(N) * K);
-    backend_->deviceToHost(gpu_data.data(), slot->d_native_vnni_payload, raw_bytes, 0);
+    ASSERT_TRUE(backend_->deviceToHost(
+        gpu_data.data(),
+        slot->d_native_vnni_payload,
+        raw_bytes,
+        0,
+        verification_stream_));
     EXPECT_EQ(gpu_data, host_data);
 
     orch.release();

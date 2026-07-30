@@ -6,6 +6,7 @@
 
 #include "KernelFactory.h"
 #include "../backends/BackendManager.h"
+#include "../backends/GPUDeviceContextPool.h"
 #include "../planning/KVCacheMemoryEstimator.h"
 #include "cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "cpu/gemm/CPUPackedWeights.h"
@@ -3545,13 +3546,27 @@ namespace llaminar
                 const auto *raw_base = static_cast<const uint8_t *>(tensor->raw_data());
 
                 bool upload_ok = true;
+                void *setup_stream = nullptr;
+                if (target_device.is_gpu())
+                {
+                    setup_stream = llaminar2::GPUDeviceContextPool::instance()
+                                       .getContext(target_device)
+                                       .defaultStream();
+                    if (!setup_stream)
+                    {
+                        backend->free(weights->device_data, target_device.ordinal);
+                        weights->device_data = nullptr;
+                        throw std::runtime_error(
+                            "prepareEmbeddingHandleLocal: target GPU has no explicit setup stream");
+                    }
+                }
                 for (size_t row = 0; row < shard_rows; row += rows_per_chunk)
                 {
                     const size_t row_count = std::min(rows_per_chunk, shard_rows - row);
                     auto repacked = llaminar2::repackEmbeddingToQ8(tensor, d_model, row, row_count);
                     auto *dst = static_cast<uint8_t *>(weights->device_data) + row * bytes_per_row;
                     if (!backend->hostToDevice(dst, repacked.data.data(), repacked.byte_size,
-                                               target_device.ordinal))
+                                               target_device.ordinal, setup_stream))
                     {
                         upload_ok = false;
                         break;

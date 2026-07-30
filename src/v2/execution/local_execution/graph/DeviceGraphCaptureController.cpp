@@ -1621,7 +1621,8 @@ namespace llaminar2
                                 graph_outputs[s].count = std::min<size_t>(8, out.rows * out.cols);
                                 graph_outputs[s].has_gpu_ptr =
                                     ctx->copyToHost(graph_outputs[s].values, gpu_ptr,
-                                                    graph_outputs[s].count * sizeof(float));
+                                                    graph_outputs[s].count * sizeof(float),
+                                                    capture_stream);
                             }
                         }
                     }
@@ -1674,7 +1675,8 @@ namespace llaminar2
                                 direct_outputs[s].count = std::min<size_t>(8, out.rows * out.cols);
                                 direct_outputs[s].has_gpu_ptr =
                                     ctx->copyToHost(direct_outputs[s].values, gpu_ptr,
-                                                    direct_outputs[s].count * sizeof(float));
+                                                    direct_outputs[s].count * sizeof(float),
+                                                    default_stream);
                             }
                         }
                     }

@@ -193,7 +193,8 @@ namespace llaminar2
          * @param bytes Number of bytes to copy
          * @return true on success
          */
-        virtual bool copyToDevice(void *dst, const void *src, size_t bytes) = 0;
+        virtual bool copyToDevice(
+            void *dst, const void *src, size_t bytes, void *stream) = 0;
 
         /**
          * @brief Copy data from device to host
@@ -206,7 +207,8 @@ namespace llaminar2
          * @param bytes Number of bytes to copy
          * @return true on success
          */
-        virtual bool copyToHost(void *dst, const void *src, size_t bytes) = 0;
+        virtual bool copyToHost(
+            void *dst, const void *src, size_t bytes, void *stream) = 0;
 
         /**
          * @brief Copy data between devices (or same device)
@@ -217,8 +219,13 @@ namespace llaminar2
          * @param src_ctx Source device context (can be this for same-device)
          * @return true on success
          */
-        virtual bool copyFromDevice(void *dst, const void *src, size_t bytes,
-                                    IDeviceContext *src_ctx) = 0;
+        virtual bool copyFromDevice(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            IDeviceContext *src_ctx,
+            void *source_stream,
+            void *destination_stream) = 0;
 
         // =========================================================================
         // Parallel Execution (CPU-specific, overridden in CPUDeviceContext)
@@ -312,10 +319,17 @@ namespace llaminar2
         size_t totalMemory() const override;
 
         // Transfers (memcpy for CPU)
-        bool copyToDevice(void *dst, const void *src, size_t bytes) override;
-        bool copyToHost(void *dst, const void *src, size_t bytes) override;
-        bool copyFromDevice(void *dst, const void *src, size_t bytes,
-                            IDeviceContext *src_ctx) override;
+        bool copyToDevice(
+            void *dst, const void *src, size_t bytes, void *stream) override;
+        bool copyToHost(
+            void *dst, const void *src, size_t bytes, void *stream) override;
+        bool copyFromDevice(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            IDeviceContext *src_ctx,
+            void *source_stream,
+            void *destination_stream) override;
 
         // Parallel execution
         void runParallel(std::function<void(int, int)> work) override;
@@ -415,10 +429,17 @@ namespace llaminar2
         size_t totalMemory() const override;
 
         // Transfers
-        bool copyToDevice(void *dst, const void *src, size_t bytes) override;
-        bool copyToHost(void *dst, const void *src, size_t bytes) override;
-        bool copyFromDevice(void *dst, const void *src, size_t bytes,
-                            IDeviceContext *src_ctx) override;
+        bool copyToDevice(
+            void *dst, const void *src, size_t bytes, void *stream) override;
+        bool copyToHost(
+            void *dst, const void *src, size_t bytes, void *stream) override;
+        bool copyFromDevice(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            IDeviceContext *src_ctx,
+            void *source_stream,
+            void *destination_stream) override;
     };
 #endif
 
@@ -454,10 +475,17 @@ namespace llaminar2
         size_t totalMemory() const override;
 
         // Transfers
-        bool copyToDevice(void *dst, const void *src, size_t bytes) override;
-        bool copyToHost(void *dst, const void *src, size_t bytes) override;
-        bool copyFromDevice(void *dst, const void *src, size_t bytes,
-                            IDeviceContext *src_ctx) override;
+        bool copyToDevice(
+            void *dst, const void *src, size_t bytes, void *stream) override;
+        bool copyToHost(
+            void *dst, const void *src, size_t bytes, void *stream) override;
+        bool copyFromDevice(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            IDeviceContext *src_ctx,
+            void *source_stream,
+            void *destination_stream) override;
     };
 #endif // HAVE_ROCM
 

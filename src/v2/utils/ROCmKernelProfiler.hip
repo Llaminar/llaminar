@@ -9,6 +9,7 @@
 #include "ROCmKernelProfiler.h"
 #include <hip/hip_runtime.h>
 #include <cstdio>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -21,6 +22,10 @@ namespace llaminar2
         : type_(type), enabled_(ROCmKernelProfiler::isEnabled()),
           start_event_(nullptr), stop_event_(nullptr), stream_(stream)
     {
+        if (!stream_)
+            throw std::invalid_argument(
+                "ScopedROCmKernelTimer requires the exact non-null kernel stream");
+
         if (enabled_)
         {
             // Skip event timing if the stream is currently in graph capture mode.
@@ -155,6 +160,10 @@ namespace llaminar2
 
     void ManualROCmKernelTimer::begin(hipStream_t stream)
     {
+        if (!stream)
+            throw std::invalid_argument(
+                "ManualROCmKernelTimer::begin requires the exact non-null kernel stream");
+
         if (enabled_)
         {
             // Skip if the stream is in graph capture mode — event timing is
@@ -217,4 +226,3 @@ namespace llaminar2
     }
 
 } // namespace llaminar2
-

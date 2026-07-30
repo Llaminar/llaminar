@@ -11,7 +11,6 @@
 #pragma once
 
 #include "../IBackend.h"
-#include <future>
 #include <memory>
 #include <cstdint>
 #include <vector>
@@ -44,9 +43,9 @@ namespace llaminar2
         ~ROCmBackend() override;
 
         // Memory transfer operations (see IBackend documentation)
-        bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
-        bool deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
-        bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
+        bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream) override;
+        bool deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id, void *stream) override;
+        bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream) override;
         bool synchronize(int device_id) override;
         bool streamSynchronize(int device_id) override;
         bool setDevice(int device_id) override;
@@ -57,11 +56,11 @@ namespace llaminar2
 
         // GPU-side argmax for greedy sampling
         bool argmaxF32(const void *data_device, int n, int device_id,
-                       float *out_value, int *out_index, void *stream = nullptr,
+                       float *out_value, int *out_index, void *stream,
                        void *partial_vals = nullptr, void *partial_idxs = nullptr,
                        int partial_capacity = 0) override;
         bool argmaxF32BatchedRows(const void *data_device, int rows, int cols, int device_id,
-                                  float *out_values, int *out_indices, void *stream = nullptr,
+                                  float *out_values, int *out_indices, void *stream,
                                   void *partial_vals = nullptr, void *partial_idxs = nullptr,
                                   int partial_capacity = 0) override;
         bool enqueueArgmaxF32BatchedRowsDevice(
@@ -110,12 +109,12 @@ namespace llaminar2
 
         // GPU-side top-k selection for sampling
         bool topKF32(const void *data_device, int n, int k, int device_id,
-                     float *out_values, int *out_indices, void *stream = nullptr) override;
+                     float *out_values, int *out_indices, void *stream) override;
         bool sampleTopKTopPF32(const void *data_device, int n,
                                int top_k, float top_p, float temperature,
                                uint64_t rng_seed, uint64_t rng_offset,
                                int device_id, int *out_token,
-                               void *stream = nullptr) override;
+                               void *stream) override;
         bool enqueueSampleTopKTopPF32Device(const void *data_device, int n,
                                             int top_k, float top_p, float temperature,
                                             uint64_t rng_seed, uint64_t rng_offset,
@@ -522,7 +521,7 @@ namespace llaminar2
                                     const int *token_ids_host,
                                     const float *penalties_host,
                                     int num_penalties, int vocab_size,
-                                    int device_id, void *stream = nullptr) override;
+                                    int device_id, void *stream) override;
         bool enqueueLogitPenaltiesF32Device(void *logits_device,
                                             const void *token_ids_device,
                                             const void *penalties_device,
@@ -533,7 +532,7 @@ namespace llaminar2
         void *createEvent(int device_id) override;
         void *createTimingEvent(int device_id) override;
         void destroyEvent(void *event, int device_id) override;
-        bool recordEvent(void *event, int device_id, void *stream = nullptr) override;
+        bool recordEvent(void *event, int device_id, void *stream) override;
         bool waitForEvent(void *event, int device_id) override;
         bool eventElapsedTimeMs(
             void *start_event,
@@ -544,19 +543,19 @@ namespace llaminar2
         // Memory allocation operations
         void *allocate(size_t bytes, int device_id) override;
         void free(void *ptr, int device_id) override;
-        bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream = nullptr) override;
+        bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream) override;
         /**
          * @brief Enqueue an in-device copy on an explicit ROCm stream.
          *
          * This is the non-synchronizing copy path used by graph-friendly hot
          * loops such as MTP sidecar token chaining. Callers must pass an
-         * explicit stream or have a device context whose default stream can be
-         * resolved; the implementation deliberately refuses HIP's null stream.
+         * explicit stream; the implementation deliberately refuses HIP's null
+         * stream.
          */
         bool deviceCopyAsync(void *dst, const void *src, size_t bytes,
-                             int device_id, void *stream = nullptr) override;
+                             int device_id, void *stream) override;
         bool vectorAddInplace(void *output, const void *input, size_t count,
-                      int element_size, int device_id, void *stream = nullptr) override;
+                      int element_size, int device_id, void *stream) override;
 
         // Zero-copy mapped memory operations
         void *allocateMapped(size_t bytes, int device_id, void **device_ptr) override;
@@ -603,15 +602,6 @@ namespace llaminar2
         void *allocatePinned(size_t bytes, int device_id) override;
         void freePinned(void *ptr, int device_id) override;
 
-        // ==== Async operations (submitted via AMDDeviceContext worker) ====
-
-        std::future<bool> deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id) override;
-        std::future<bool> hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id) override;
-        std::future<bool> synchronizeAsync(int device_id) override;
-        std::future<void *> allocateAsync(size_t bytes, int device_id) override;
-        std::future<void> freeAsync(void *ptr, int device_id) override;
-        std::future<bool> memsetAsync(void *ptr, int value, size_t bytes, int device_id) override;
-
         // ==== Extended operations (not in IBackend) ====
 
         /**
@@ -634,7 +624,7 @@ namespace llaminar2
          * @param device_id Device to use for the copy
          * @return true on success
          */
-        bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
+        bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream) override;
 
         /**
          * @brief Register IO memory with HIP using hipHostRegisterIoMemory flag

@@ -17,7 +17,6 @@
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include "../utils/PerfStatsCollector.h"
-#include <array>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -503,194 +502,6 @@ namespace llaminar2
         return nullptr;
     }
 
-#ifdef HAVE_ROCM
-    static uint64_t fnv1a64(const uint8_t *data, size_t length)
-    {
-        constexpr uint64_t FNV_OFFSET_BASIS = 1469598103934665603ull;
-        constexpr uint64_t FNV_PRIME = 1099511628211ull;
-        uint64_t hash = FNV_OFFSET_BASIS;
-        for (size_t i = 0; i < length; ++i)
-        {
-            hash ^= static_cast<uint64_t>(data[i]);
-            hash *= FNV_PRIME;
-        }
-        return hash;
-    }
-
-    static bool validateRocmAllreducePointerForSlot(const std::string &stage_name,
-                                                    const char *phase,
-                                                    int slot,
-                                                    DeviceId expected_device,
-                                                    TensorBase *tensor,
-                                                    void *ptr,
-                                                    uint64_t *watch_checksum_out = nullptr,
-                                                    size_t *watch_sample_bytes_out = nullptr,
-                                                    size_t *watch_sample_offset_out = nullptr)
-    {
-        if (watch_checksum_out)
-            *watch_checksum_out = 0;
-        if (watch_sample_bytes_out)
-            *watch_sample_bytes_out = 0;
-        if (watch_sample_offset_out)
-            *watch_sample_offset_out = 0;
-
-        if (!expected_device.is_rocm())
-        {
-            return true;
-        }
-
-        auto *backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(expected_device));
-        if (!backend)
-        {
-            LOG_ERROR("[LOCALTP_ROCM_PTR_VALIDATE_FAIL] missing ROCm backend for slot=" << slot
-                                                                                        << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                                                                                        << " expected_device=" << expected_device.toString());
-            return false;
-        }
-
-        const int expected_ordinal = expected_device.rocm_ordinal();
-        backend->setDevice(expected_ordinal);
-
-        bool is_device_ptr = false;
-        bool is_host_ptr = false;
-        bool is_managed = false;
-        int attr_device = -1;
-        if (!backend->queryPointerAttributes(ptr, is_device_ptr, is_host_ptr, is_managed, attr_device))
-        {
-            LOG_ERROR("[LOCALTP_ROCM_PTR_VALIDATE_FAIL] hip attribute query failed"
-                      << " slot=" << slot
-                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                      << " ptr=" << ptr
-                      << " expected_device=" << expected_ordinal
-                      << " tensor=" << static_cast<void *>(tensor)
-                      << " tensor_device="
-                      << (tensor && tensor->current_device().has_value() ? tensor->current_device()->toString() : "none"));
-            ROCmBackend::dumpRecentPointerEvents(128);
-            return false;
-        }
-
-        if (!is_device_ptr || attr_device != expected_ordinal)
-        {
-            LOG_ERROR("[LOCALTP_ROCM_PTR_VALIDATE_FAIL] hip attribute mismatch"
-                      << " slot=" << slot
-                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                      << " ptr=" << ptr
-                      << " expected_device=" << expected_ordinal
-                      << " attr_device=" << attr_device
-                      << " is_device_ptr=" << (is_device_ptr ? 1 : 0)
-                      << " is_host_ptr=" << (is_host_ptr ? 1 : 0)
-                      << " is_managed=" << (is_managed ? 1 : 0)
-                      << " tensor=" << static_cast<void *>(tensor)
-                      << " tensor_device="
-                      << (tensor && tensor->current_device().has_value() ? tensor->current_device()->toString() : "none"));
-            ROCmBackend::dumpRecentPointerEvents(128);
-            return false;
-        }
-
-        ROCmPointerOwnerInfo owner;
-        if (!ROCmBackend::queryPointerOwner(ptr, owner))
-        {
-            LOG_ERROR("[LOCALTP_ROCM_PTR_VALIDATE_FAIL] owner lookup failed"
-                      << " slot=" << slot
-                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                      << " ptr=" << ptr
-                      << " expected_device=" << expected_ordinal
-                      << " tensor=" << static_cast<void *>(tensor));
-            ROCmBackend::dumpRecentPointerEvents(128);
-            return false;
-        }
-
-        if (owner.device_id != expected_ordinal)
-        {
-            LOG_ERROR("[LOCALTP_ROCM_PTR_VALIDATE_FAIL] owner mismatch"
-                      << " slot=" << slot
-                      << " phase=" << (phase ? phase : "(unknown)")
-                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                      << " ptr=" << ptr
-                      << " expected_device=" << expected_ordinal
-                      << " owner_device=" << owner.device_id
-                      << " owner_base=" << owner.base_ptr
-                      << " owner_bytes=" << owner.size_bytes
-                      << " owner_seq=" << owner.sequence
-                      << " owner_thread=" << owner.thread_hash
-                      << " tensor=" << static_cast<void *>(tensor)
-                      << " tensor_device="
-                      << (tensor && tensor->current_device().has_value() ? tensor->current_device()->toString() : "none"));
-            ROCmBackend::dumpRecentPointerEvents(128);
-            return false;
-        }
-
-        const auto &validation = debugEnv().validation;
-        if (validation.trace_local_tp_pointer)
-        {
-            const uintptr_t watch = static_cast<uintptr_t>(validation.trace_local_tp_pointer_address);
-            const uintptr_t begin = reinterpret_cast<uintptr_t>(owner.base_ptr);
-            const uintptr_t end = begin + owner.size_bytes;
-            if (watch >= begin && watch < end)
-            {
-                const size_t offset = static_cast<size_t>(watch - begin);
-                constexpr size_t WATCH_SAMPLE_MAX_BYTES = 256;
-                const size_t available = owner.size_bytes > offset ? (owner.size_bytes - offset) : 0;
-                const size_t sample_bytes = std::min(WATCH_SAMPLE_MAX_BYTES, available);
-
-                uint64_t checksum = 0;
-                bool checksum_ready = false;
-                if (sample_bytes > 0)
-                {
-                    std::array<uint8_t, WATCH_SAMPLE_MAX_BYTES> sample{};
-                    const uint8_t *sample_src = reinterpret_cast<const uint8_t *>(owner.base_ptr) + offset;
-                    if (backend->deviceToHost(sample.data(), const_cast<uint8_t *>(sample_src), sample_bytes, expected_ordinal))
-                    {
-                        checksum = fnv1a64(sample.data(), sample_bytes);
-                        checksum_ready = true;
-                    }
-                    else
-                    {
-                        LOG_WARN("[LOCALTP_PTR_WATCH_COPY_FAIL]"
-                                 << " phase=" << (phase ? phase : "(unknown)")
-                                 << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                                 << " slot=" << slot
-                                 << " watch=" << reinterpret_cast<const void *>(watch)
-                                 << " owner_base=" << owner.base_ptr
-                                 << " sample_offset=" << offset
-                                 << " sample_bytes=" << sample_bytes
-                                 << " copy_error=deviceToHost_failed");
-                    }
-                }
-
-                if (checksum_ready)
-                {
-                    if (watch_checksum_out)
-                        *watch_checksum_out = checksum;
-                    if (watch_sample_bytes_out)
-                        *watch_sample_bytes_out = sample_bytes;
-                    if (watch_sample_offset_out)
-                        *watch_sample_offset_out = offset;
-                }
-
-                LOG_WARN("[LOCALTP_PTR_WATCH_HIT]"
-                         << " phase=" << (phase ? phase : "(unknown)")
-                         << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                         << " slot=" << slot
-                         << " watch=" << reinterpret_cast<const void *>(watch)
-                         << " buffer_ptr=" << ptr
-                         << " expected_device=" << expected_device.toString()
-                         << " owner_device=" << owner.device_id
-                         << " owner_base=" << owner.base_ptr
-                         << " owner_bytes=" << owner.size_bytes
-                         << " owner_seq=" << owner.sequence
-                         << " offset=" << offset
-                         << " sample_bytes=" << sample_bytes
-                         << " checksum=" << (checksum_ready ? std::to_string(checksum) : std::string("n/a"))
-                         << " tensor=" << static_cast<void *>(tensor)
-                         << " tensor_name=" << (tensor && !tensor->debugName().empty() ? tensor->debugName() : "(unnamed)"));
-            }
-        }
-
-        return true;
-    }
-#endif
-
     // =========================================================================
     // Construction
     // =========================================================================
@@ -944,7 +755,8 @@ namespace llaminar2
         if (backend_ == CollectiveBackendType::HOST && degree() > 1)
         {
             lock.unlock();
-            return allreduceCpuBarrier(tensor, stage_name, effective_count);
+            return allreduceCpuBarrier(
+                tensor, stage_name, effective_count, nullptr);
         }
 
         // ================================================================
@@ -1009,39 +821,13 @@ namespace llaminar2
 
         const size_t effective_count = (count > 0) ? count : tensor->numel();
 
-        // HOST collectives are host-staged by definition (including mixed CPU/GPU TP).
-        // Synchronize the producer stream and go directly to the CPU barrier path.
+        // HOST collectives are host-staged by definition, including the
+        // deliberately heterogeneous CPU/GPU case. Carry the exact producer
+        // stream into the barrier so staging and publication remain ordered.
         if (backend_ == CollectiveBackendType::HOST)
         {
-            auto tensor_device = tensor->current_device();
-            if (stream && tensor_device.has_value())
-            {
-#ifdef HAVE_CUDA
-                if (tensor_device->is_cuda())
-                {
-                    cudaError_t err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
-                    if (err != cudaSuccess)
-                    {
-                        LOG_ERROR("LocalTPContext::allreduceOnStream: cudaStreamSynchronize failed for HOST fallback: "
-                                  << cudaGetErrorString(err));
-                        return false;
-                    }
-                }
-#endif
-#ifdef HAVE_ROCM
-                if (tensor_device->is_rocm())
-                {
-                    auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(*tensor_device));
-                    if (rocm_backend && !rocm_backend->synchronize(tensor_device->toKernelDeviceIndex()))
-                    {
-                        LOG_ERROR("LocalTPContext::allreduceOnStream: ROCm synchronize failed for HOST fallback on "
-                                  << tensor_device->toString());
-                        return false;
-                    }
-                }
-#endif
-            }
-            return allreduce(tensor, stage_name, effective_count);
+            return allreduceCpuBarrier(
+                tensor, stage_name, effective_count, stream);
         }
 
         // Determine device index from tensor placement
@@ -1491,8 +1277,20 @@ namespace llaminar2
     // 3. Broadcast result to all participants
     // =========================================================================
 
-    bool LocalTPContext::allreduceCpuBarrier(TensorBase *tensor, const std::string &stage_name, size_t count)
+    bool LocalTPContext::allreduceCpuBarrier(
+        TensorBase *tensor,
+        const std::string &stage_name,
+        size_t count,
+        void *producer_stream)
     {
+        const auto arrival_device = tensor ? tensor->current_device() : std::nullopt;
+        if (arrival_device && arrival_device->is_gpu() && !producer_stream)
+        {
+            throw std::invalid_argument(
+                "LocalTPContext::allreduceCpuBarrier requires the exact "
+                "producer stream for a GPU participant");
+        }
+
         const int num_participants = degree();
 
         std::unique_lock<std::mutex> lock(barrier_mutex_);
@@ -1503,6 +1301,8 @@ namespace llaminar2
         {
             barrier_tensors_.clear();
             barrier_tensors_.resize(num_participants, nullptr);
+            barrier_producer_streams_.clear();
+            barrier_producer_streams_.resize(num_participants, nullptr);
             barrier_element_count_ = count;
             barrier_stage_name_ = stage_name;
             LOG_DEBUG("LocalTPContext::allreduceCpuBarrier: First arrival, "
@@ -1519,6 +1319,7 @@ namespace llaminar2
             barrier_count_.store(0);
             barrier_generation_.fetch_add(1);
             barrier_tensors_.clear();
+            barrier_producer_streams_.clear();
             barrier_stage_name_.clear();
             barrier_element_count_ = 0;
 
@@ -1529,6 +1330,7 @@ namespace llaminar2
 
         // Use arrival_order for slot assignment (sum is commutative, order doesn't matter)
         barrier_tensors_[arrival_order] = tensor;
+        barrier_producer_streams_[arrival_order] = producer_stream;
 
         if (arrival_order + 1 < num_participants)
         {
@@ -1552,6 +1354,7 @@ namespace llaminar2
                 barrier_count_.store(0);
                 barrier_generation_.fetch_add(1);
                 barrier_tensors_.clear();
+                barrier_producer_streams_.clear();
                 barrier_stage_name_.clear();
                 barrier_element_count_ = 0;
 
@@ -1592,7 +1395,7 @@ namespace llaminar2
             }
         }
 
-        auto copy_to_host = [&](TensorBase *tb, float *dst) -> bool
+        auto copy_to_host = [&](int slot, TensorBase *tb, float *dst) -> bool
         {
             if (!tb || !dst)
                 return false;
@@ -1603,7 +1406,15 @@ namespace llaminar2
                 IBackend *backend = getBackendForDevice(*dev);
                 if (!backend)
                     return false;
-                return backend->deviceToHost(dst, tb->gpu_data_ptr(), bytes, dev->gpu_ordinal());
+                void *const stream = barrier_producer_streams_.at(slot);
+                if (!stream)
+                {
+                    throw std::runtime_error(
+                        "LocalTPContext::allreduceCpuBarrier lost a GPU "
+                        "participant's producer stream");
+                }
+                return backend->deviceToHost(
+                    dst, tb->gpu_data_ptr(), bytes, dev->gpu_ordinal(), stream);
             }
 
             const float *src = tb->data();
@@ -1613,7 +1424,7 @@ namespace llaminar2
             return true;
         };
 
-        auto copy_from_host = [&](TensorBase *tb, const float *src) -> bool
+        auto copy_from_host = [&](int slot, TensorBase *tb, const float *src) -> bool
         {
             if (!tb || !src)
                 return false;
@@ -1624,16 +1435,17 @@ namespace llaminar2
                 IBackend *backend = getBackendForDevice(*dev);
                 if (!backend)
                     return false;
-                if (!backend->hostToDevice(tb->gpu_data_ptr(), src, bytes, dev->gpu_ordinal()))
+                void *const stream = barrier_producer_streams_.at(slot);
+                if (!stream)
+                {
+                    throw std::runtime_error(
+                        "LocalTPContext::allreduceCpuBarrier lost a GPU "
+                        "participant's publication stream");
+                }
+                if (!backend->hostToDevice(
+                        tb->gpu_data_ptr(), src, bytes, dev->gpu_ordinal(), stream))
                     return false;
-                /*
-                 * This is the deliberately heterogeneous branch of the CPU
-                 * barrier collective. The synchronous H2D copy above is its
-                 * host ownership boundary; publish a fresh device completion
-                 * event afterward so downstream GPU work consumes an explicit
-                 * dependency instead of eventless authority.
-                 */
-                TransferEngine::publishCompletedDeviceWrite(tb, *dev);
+                TransferEngine::publishDeviceWrite(tb, *dev, stream);
                 return true;
             }
 
@@ -1647,11 +1459,12 @@ namespace llaminar2
         std::vector<float> accum(effective_count, 0.0f);
         std::vector<float> temp(effective_count, 0.0f);
 
-        if (!copy_to_host(barrier_tensors_[0], accum.data()))
+        if (!copy_to_host(0, barrier_tensors_[0], accum.data()))
         {
             LOG_ERROR("LocalTPContext::allreduceCpuBarrier: failed to stage slot 0 to host");
             barrier_result_ = false;
             barrier_count_.store(0);
+            barrier_producer_streams_.clear();
             barrier_generation_.fetch_add(1);
             lock.unlock();
             barrier_cv_.notify_all();
@@ -1661,11 +1474,12 @@ namespace llaminar2
         // Sum contributions from all other tensors
         for (int i = 1; i < num_participants; ++i)
         {
-            if (!copy_to_host(barrier_tensors_[i], temp.data()))
+            if (!copy_to_host(i, barrier_tensors_[i], temp.data()))
             {
                 LOG_ERROR("LocalTPContext::allreduceCpuBarrier: failed to stage slot " << i << " to host");
                 barrier_result_ = false;
                 barrier_count_.store(0);
+                barrier_producer_streams_.clear();
                 barrier_generation_.fetch_add(1);
                 lock.unlock();
                 barrier_cv_.notify_all();
@@ -1678,11 +1492,12 @@ namespace llaminar2
         // Copy reduced result to all other tensors
         for (int i = 0; i < num_participants; ++i)
         {
-            if (!copy_from_host(barrier_tensors_[i], accum.data()))
+            if (!copy_from_host(i, barrier_tensors_[i], accum.data()))
             {
                 LOG_ERROR("LocalTPContext::allreduceCpuBarrier: failed to write reduced data to slot " << i);
                 barrier_result_ = false;
                 barrier_count_.store(0);
+                barrier_producer_streams_.clear();
                 barrier_generation_.fetch_add(1);
                 lock.unlock();
                 barrier_cv_.notify_all();
@@ -1693,6 +1508,7 @@ namespace llaminar2
         // Cleanup and release waiters
         barrier_result_ = true;
         barrier_tensors_.clear();
+        barrier_producer_streams_.clear();
         barrier_stage_name_.clear();
         barrier_element_count_ = 0;
         barrier_count_.store(0);

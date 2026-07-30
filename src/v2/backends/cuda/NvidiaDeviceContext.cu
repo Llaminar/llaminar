@@ -545,25 +545,26 @@ namespace llaminar2
 
     void NvidiaDeviceContext::recordEvent(void *event, void *stream)
     {
-        if (event == nullptr)
-        {
-            LOG_WARN("[NvidiaDeviceContext] recordEvent called with null event");
-            return;
-        }
+        if (!event)
+            throw std::invalid_argument("NvidiaDeviceContext::recordEvent requires a non-null event");
+        if (!stream)
+            throw std::invalid_argument(
+                "NvidiaDeviceContext::recordEvent requires the exact non-null producer stream");
 
         cudaEvent_t cuda_event = static_cast<cudaEvent_t>(event);
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : default_stream_;
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
         CUDA_CHECK_VOID(cudaEventRecord(cuda_event, cuda_stream));
     }
 
     bool NvidiaDeviceContext::recordEventChecked(void *event, void *stream)
     {
-        if (!event || !stream)
-        {
-            LOG_ERROR("[NvidiaDeviceContext] recordEventChecked requires non-null event and stream");
-            return false;
-        }
+        if (!event)
+            throw std::invalid_argument(
+                "NvidiaDeviceContext::recordEventChecked requires a non-null event");
+        if (!stream)
+            throw std::invalid_argument(
+                "NvidiaDeviceContext::recordEventChecked requires the exact non-null producer stream");
 
         cudaError_t set_err = cudaSetDevice(device_ordinal_);
         if (set_err != cudaSuccess)
@@ -587,14 +588,14 @@ namespace llaminar2
 
     void NvidiaDeviceContext::waitEvent(void *event, void *stream)
     {
-        if (event == nullptr)
-        {
-            LOG_WARN("[NvidiaDeviceContext] waitEvent called with null event");
-            return;
-        }
+        if (!event)
+            throw std::invalid_argument("NvidiaDeviceContext::waitEvent requires a non-null event");
+        if (!stream)
+            throw std::invalid_argument(
+                "NvidiaDeviceContext::waitEvent requires the exact non-null consumer stream");
 
         cudaEvent_t cuda_event = static_cast<cudaEvent_t>(event);
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : default_stream_;
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
         // Make the stream wait for the event (GPU-side wait, not CPU blocking)
         CUDA_CHECK_VOID(cudaStreamWaitEvent(cuda_stream, cuda_event, 0));
@@ -602,11 +603,12 @@ namespace llaminar2
 
     bool NvidiaDeviceContext::waitEventChecked(void *event, void *stream)
     {
-        if (!event || !stream)
-        {
-            LOG_ERROR("[NvidiaDeviceContext] waitEventChecked requires non-null event and stream");
-            return false;
-        }
+        if (!event)
+            throw std::invalid_argument(
+                "NvidiaDeviceContext::waitEventChecked requires a non-null event");
+        if (!stream)
+            throw std::invalid_argument(
+                "NvidiaDeviceContext::waitEventChecked requires the exact non-null consumer stream");
 
         cudaError_t set_err = cudaSetDevice(device_ordinal_);
         if (set_err != cudaSuccess)

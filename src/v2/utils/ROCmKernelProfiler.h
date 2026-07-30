@@ -1096,9 +1096,9 @@ namespace llaminar2
         /**
          * @brief Construct timer and record start event
          * @param type Kernel type for profiling categorization
-         * @param stream HIP stream (nullptr = default stream)
+         * @param stream Exact HIP producer stream. Must not be null.
          */
-        ScopedROCmKernelTimer(ROCmKernelType type, hipStream_t stream = nullptr);
+        ScopedROCmKernelTimer(ROCmKernelType type, hipStream_t stream);
 
         /**
          * @brief Record stop event, synchronize, and record elapsed time
@@ -1128,9 +1128,9 @@ namespace llaminar2
 
         /**
          * @brief Record start event
-         * @param stream HIP stream (nullptr = default stream)
+         * @param stream Exact HIP producer stream. Must not be null.
          */
-        void begin(hipStream_t stream = nullptr);
+        void begin(hipStream_t stream);
 
         /**
          * @brief Record stop event, synchronize, and record elapsed time
@@ -1157,29 +1157,10 @@ namespace llaminar2
 // ============================================================================
 
 /**
- * @brief Scoped ROCm kernel profiling (RAII-based, synchronous)
- *
- * Usage:
- *   {
- *       ROCM_KERNEL_PROFILE_SCOPE(ROCmKernelType::FLASH_ATTN_DECODE);
- *       hipLaunchKernelGGL(...);
- *   } // Timer synchronizes and records here
- */
-#define ROCM_KERNEL_PROFILE_SCOPE(kernel_type) \
-    ::llaminar2::ScopedROCmKernelTimer _rocm_timer_##__LINE__(kernel_type)
-
-/**
  * @brief Scoped ROCm kernel profiling with stream
  */
 #define ROCM_KERNEL_PROFILE_SCOPE_STREAM(kernel_type, stream) \
     ::llaminar2::ScopedROCmKernelTimer _rocm_timer_##__LINE__(kernel_type, stream)
-
-/**
- * @brief Manual ROCm kernel profiling begin
- */
-#define ROCM_KERNEL_PROFILE_BEGIN(timer_name)      \
-    ::llaminar2::ManualROCmKernelTimer timer_name; \
-    timer_name.begin()
 
 #define ROCM_KERNEL_PROFILE_BEGIN_STREAM(timer_name, stream) \
     ::llaminar2::ManualROCmKernelTimer timer_name;           \

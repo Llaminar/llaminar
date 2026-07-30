@@ -347,9 +347,6 @@ namespace llaminar2
                 return false;
             }
 
-            // Ensure GPU kernels complete before staging
-            MPIStager::synchronizeDevice(tensor_device.gpu_ordinal());
-
             // Stage GPU→Host
             std::vector<float> host_buffer = MPIStager::toHost(tensor_base);
 
@@ -432,12 +429,6 @@ namespace llaminar2
             {
                 LOG_ERROR("CollectiveContext: Buffers are not TensorBase, cannot stage for MPI");
                 return false;
-            }
-
-            // Sync input device if on GPU
-            if (input_on_gpu)
-            {
-                MPIStager::synchronizeDevice(tensor_device.gpu_ordinal());
             }
 
             // Stage input GPU→Host
@@ -659,12 +650,6 @@ namespace llaminar2
                 return false;
             }
 
-            // Sync input device if on GPU
-            if (input_on_gpu)
-            {
-                MPIStager::synchronizeDevice(tensor_device.gpu_ordinal());
-            }
-
             // Stage input GPU→Host
             std::vector<float> host_send = input_on_gpu ? MPIStager::toHost(input_base)
                                                         : std::vector<float>(input_base->data(), input_base->data() + input_base->numel());
@@ -764,9 +749,6 @@ namespace llaminar2
                 LOG_ERROR("CollectiveContext: Buffer is not TensorBase, cannot stage for MPI");
                 return false;
             }
-
-            // Ensure GPU kernels complete before staging
-            MPIStager::synchronizeDevice(tensor_device.gpu_ordinal());
 
             // Stage GPU→Host (root has data, others will receive)
             std::vector<float> host_buffer = MPIStager::toHost(tensor_base);

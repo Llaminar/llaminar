@@ -6,6 +6,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 namespace llaminar2
@@ -233,10 +234,10 @@ namespace llaminar2
         /**
          * @brief Record an event on a stream
          * @param event Event handle to record
-         * @param stream Stream to record on (nullptr = default stream)
+         * @param stream Exact producer stream. Must not be null.
          * @thread_safety Must be called from worker thread (within submitted work)
          */
-        virtual void recordEvent(void *event, void *stream = nullptr) = 0;
+        virtual void recordEvent(void *event, void *stream) = 0;
 
         /**
          * @brief Record an event on a stream and report launch status.
@@ -246,10 +247,12 @@ namespace llaminar2
          * of only logging. Implementations should not silently fall back to the
          * default/null stream.
          */
-        virtual bool recordEventChecked(void *event, void *stream = nullptr)
+        virtual bool recordEventChecked(void *event, void *stream)
         {
-            if (!event || !stream)
-                return false;
+            if (!event)
+                throw std::invalid_argument("IWorkerGPUContext::recordEventChecked requires a non-null event");
+            if (!stream)
+                throw std::invalid_argument("IWorkerGPUContext::recordEventChecked requires the exact non-null producer stream");
             recordEvent(event, stream);
             return true;
         }
@@ -257,12 +260,12 @@ namespace llaminar2
         /**
          * @brief Make a stream wait for an event
          * @param event Event handle to wait for
-         * @param stream Stream that should wait (nullptr = default stream)
+         * @param stream Exact consumer stream. Must not be null.
          * @thread_safety Must be called from worker thread (within submitted work)
          *
          * @note This is a GPU-side wait, not a CPU-side wait
          */
-        virtual void waitEvent(void *event, void *stream = nullptr) = 0;
+        virtual void waitEvent(void *event, void *stream) = 0;
 
         /**
          * @brief Make a stream wait for an event and report launch status.
@@ -270,10 +273,12 @@ namespace llaminar2
          * Use this for required graph-captured stream edges. A false result
          * means the dependency was not queued and callers should fail fast.
          */
-        virtual bool waitEventChecked(void *event, void *stream = nullptr)
+        virtual bool waitEventChecked(void *event, void *stream)
         {
-            if (!event || !stream)
-                return false;
+            if (!event)
+                throw std::invalid_argument("IWorkerGPUContext::waitEventChecked requires a non-null event");
+            if (!stream)
+                throw std::invalid_argument("IWorkerGPUContext::waitEventChecked requires the exact non-null consumer stream");
             waitEvent(event, stream);
             return true;
         }

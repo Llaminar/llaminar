@@ -3,8 +3,8 @@
  * @brief Device manager and compute context interfaces (LEGACY)
  *
  * ⚠️ DEPRECATION NOTICE (Phase 3 - October 2025):
- * GPU contexts (CUDAComputeContext, ROCmComputeContext, VulkanComputeContext) have been
- * disabled and replaced with IBackend architecture (see backends/IBackend.h).
+ * GPU contexts were removed and replaced with the IBackend architecture
+ * (see backends/IBackend.h).
  *
  * CPU device enumeration (DeviceManager) is still functional and used by Main.cpp.
  * Full removal is deferred until V2 has a production-ready device manager.
@@ -105,7 +105,7 @@ namespace llaminar2
     /**
      * @brief Abstract compute context interface
      *
-     * Implementations: CPUComputeContext, CUDAComputeContext, ROCmComputeContext, VulkanComputeContext
+     * The surviving implementation is CPUComputeContext. GPU execution uses IBackend.
      */
     class ComputeContext
     {
@@ -169,101 +169,6 @@ namespace llaminar2
         struct Impl;
         std::unique_ptr<Impl> pimpl_;
     };
-
-    // ============================================================================
-    // GPU Compute Contexts (DEPRECATED - Phase 3)
-    // ============================================================================
-    // These classes are DEPRECATED as of Phase 3. Use IBackend interface instead:
-    //   - src/v2/backends/IBackend.h (abstract interface)
-    //   - src/v2/backends/cuda/CUDABackend.{h,cu} (CUDA implementation)
-    //   - src/v2/backends/rocm/ROCmBackend.{h,cpp} (ROCm implementation)
-    //
-    // The code below is kept for Main.cpp device enumeration compatibility but
-    // should NOT be extended. It will be removed in Phase 4.
-    // ============================================================================
-
-#if 0 // DISABLED: GPU contexts moved to IBackend (Phase 3)
-
-#ifdef HAVE_CUDA
-/**
- * @brief CUDA compute context (DEPRECATED - use CUDABackend)
- */
-class CUDAComputeContext : public ComputeContext
-{
-public:
-    CUDAComputeContext() = default;
-
-    void *allocate(size_t bytes) override;
-    void free(void *ptr) override;
-    void copy_to_device(void *dst, const void *src, size_t bytes) override;
-    void copy_from_device(void *dst, const void *src, size_t bytes) override;
-    void synchronize() override;
-
-    ComputeBackendType backend_type() const override { return ComputeBackendType::GPU_CUDA; }
-    bool supports_bf16() const override { return true; } // CUDA_R_16BF
-    bool supports_fp16() const override { return true; }
-    bool supports_int8() const override { return true; }
-
-    // Public members for device management
-    int device_id = 0;
-    cudaStream_t stream = nullptr;
-    cublasHandle_t cublas_handle = nullptr;
-};
-#endif
-
-#ifdef HAVE_ROCM
-/**
- * @brief ROCm compute context (DEPRECATED - use ROCmBackend)
- */
-class ROCmComputeContext : public ComputeContext
-{
-public:
-    ROCmComputeContext() = default;
-
-    void *allocate(size_t bytes) override;
-    void free(void *ptr) override;
-    void copy_to_device(void *dst, const void *src, size_t bytes) override;
-    void copy_from_device(void *dst, const void *src, size_t bytes) override;
-    void synchronize() override;
-
-    ComputeBackendType backend_type() const override { return ComputeBackendType::GPU_ROCM; }
-    bool supports_bf16() const override { return true; }
-    bool supports_fp16() const override { return true; }
-    bool supports_int8() const override { return true; }
-    // Public members for device management
-    int device_id = 0;
-    hipStream_t stream = nullptr;
-    hipblasHandle_t hipblas_handle = nullptr;
-};
-#endif
-
-#ifdef HAVE_VULKAN
-/**
- * @brief Vulkan compute context (DEPRECATED - will use IBackend)
- */
-class VulkanComputeContext : public ComputeContext
-{
-public:
-    VulkanComputeContext() = default;
-
-    void *allocate(size_t bytes) override;
-    void free(void *ptr) override;
-    void copy_to_device(void *dst, const void *src, size_t bytes) override;
-    void copy_from_device(void *dst, const void *src, size_t bytes) override;
-    void synchronize() override;
-
-    ComputeBackendType backend_type() const override { return ComputeBackendType::GPU_VULKAN; }
-    bool supports_bf16() const override { return false; } // Depends on extension
-    bool supports_fp16() const override { return true; }
-    bool supports_int8() const override { return true; }
-
-    // Public members for device management
-    int device_id = 0;
-    // TODO: VkDevice, VkQueue, VkCommandPool, etc.
-};
-#endif
-
-#endif // #if 0 - GPU contexts disabled (Phase 3)
 
     /**
      * @brief Device manager singleton

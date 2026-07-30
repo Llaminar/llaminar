@@ -9,9 +9,7 @@
  */
 
 #include "ROCmBackend.h"
-#include "AMDDeviceContext.h"
 #include "HipDeviceGuard.h"
-#include "backends/GPUDeviceContextPool.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
@@ -22,7 +20,6 @@
 #include <sstream>
 #include <cstring>
 #include <dlfcn.h> // For HSA runtime loading
-#include <future>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -215,26 +212,22 @@ namespace llaminar2
     // Stream Resolution Helper
     // ====================================================================
 
-    /// Resolve a HIP stream for the given device. When the caller passes
-    /// nullptr we look up the device context's default (non-blocking) stream
-    /// so that NO operation ever runs on the null HIP stream.
-    static hipStream_t resolveStream(int device_id, void *stream)
+    /**
+     * @brief Convert an opaque execution stream after enforcing explicit ownership.
+     *
+     * HIP's null stream discards the graph's producer/consumer relationship.
+     * Every executable backend API therefore fails at this common boundary
+     * before it can enqueue work with ambiguous ordering.
+     */
+    static hipStream_t requireExplicitStream(void *stream, const char *operation)
     {
-        if (stream)
-            return static_cast<hipStream_t>(stream);
-
-        try
+        if (!stream)
         {
-            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id);
-            void *def = ctx.defaultStream();
-            if (def)
-                return static_cast<hipStream_t>(def);
+            throw std::invalid_argument(
+                std::string(operation ? operation : "ROCmBackend operation") +
+                " requires an explicit non-null HIP stream");
         }
-        catch (...)
-        {
-            // Context not yet initialised (early weight load, tests).
-        }
-        return nullptr; // absolute fallback
+        return static_cast<hipStream_t>(stream);
     }
 
     // ====================================================================
@@ -276,11 +269,13 @@ namespace llaminar2
             return false;
         }
 
-        hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost,
-                                        resolveStream(device_id, stream));
+        hipStream_t operation_stream =
+            requireExplicitStream(stream, "ROCmBackend::deviceToHost");
+        hipError_t err = hipMemcpyAsync(
+            dst, src, bytes, hipMemcpyDeviceToHost, operation_stream);
         if (err != hipSuccess)
             return false;
-        err = hipStreamSynchronize(resolveStream(device_id, stream));
+        err = hipStreamSynchronize(operation_stream);
         return (err == hipSuccess);
     }
 
@@ -292,7 +287,8 @@ namespace llaminar2
         {
             return false;
         }
-        hipStream_t s = resolveStream(device_id, stream);
+        hipStream_t s =
+            requireExplicitStream(stream, "ROCmBackend::deviceToHostFast");
         hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost, s);
         if (err != hipSuccess)
             return false;
@@ -391,7 +387,7 @@ namespace llaminar2
 
         // Launch kernel on device's managed stream
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
-        hipStream_t s = resolveStream(device_id, stream);
+        hipStream_t s = requireExplicitStream(stream, "ROCmBackend::argmaxF32");
         // Pass the caller-supplied partial scratch through to the kernel wrapper.
         // The scratch is mandatory (arena-owned); the wrapper fails loud if it is
         // missing or undersized — there is no single-block fallback.
@@ -463,7 +459,8 @@ namespace llaminar2
         }
 
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
-        hipStream_t s = resolveStream(device_id, stream);
+        hipStream_t s =
+            requireExplicitStream(stream, "ROCmBackend::argmaxF32BatchedRows");
         {
             PerfStatsCollector::ScopedTimer timer(
                 "backend", "rocm_argmax_f32_batched_rows_launch", "decode");
@@ -1064,7 +1061,7 @@ namespace llaminar2
 
         // Launch kernel
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
-        hipStream_t s = resolveStream(device_id, stream);
+        hipStream_t s = requireExplicitStream(stream, "ROCmBackend::topKF32");
         if (!rocmOps_topk_f32(
                 static_cast<const float *>(data_device), n, k,
                 static_cast<float *>(bufs.values_ptr),
@@ -2565,9 +2562,8 @@ namespace llaminar2
             return false;
 
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
-        hipStream_t s = resolveStream(device_id, stream);
-        if (!s)
-            return false;
+        hipStream_t s =
+            requireExplicitStream(stream, "ROCmBackend::applyLogitPenaltiesF32");
 
         if (bufs.publication_valid &&
             bufs.producer_stream != stream)
@@ -2665,7 +2661,7 @@ namespace llaminar2
             return false;
         }
 
-        hipStream_t s = resolveStream(device_id, stream);
+        hipStream_t s = requireExplicitStream(stream, "ROCmBackend::hostToDevice");
         hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice, s);
         if (err != hipSuccess)
             return false;
@@ -2801,8 +2797,8 @@ namespace llaminar2
         }
 
         hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
-        hipStream_t hip_stream = reinterpret_cast<hipStream_t>(stream); // nullptr = default stream
-        if (hip_stream)
+        hipStream_t hip_stream =
+            requireExplicitStream(stream, "ROCmBackend::recordEvent");
         {
             hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
             if (hipStreamIsCapturing(hip_stream, &capture_status) == hipSuccess &&
@@ -3239,7 +3235,11 @@ namespace llaminar2
             return false;
         }
 
-        err = hipMemsetAsync(ptr, value, bytes, resolveStream(device_id, stream));
+        err = hipMemsetAsync(
+            ptr,
+            value,
+            bytes,
+            requireExplicitStream(stream, "ROCmBackend::memset"));
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmBackend] hipMemsetAsync failed: " << hipGetErrorString(err));
@@ -3275,7 +3275,7 @@ namespace llaminar2
             static_cast<const float *>(input),
             count,
             device_id,
-            stream ? stream : resolveStream(device_id, nullptr));
+            requireExplicitStream(stream, "ROCmBackend::vectorAddInplace"));
     }
 
     // ====================================================================
@@ -3489,10 +3489,12 @@ namespace llaminar2
 
     bool ROCmBackend::synchronizeStream(void *stream, int device_id)
     {
+        hipStream_t hip_stream =
+            requireExplicitStream(stream, "ROCmBackend::synchronizeStream");
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
             return false;
-        err = hipStreamSynchronize(static_cast<hipStream_t>(stream));
+        err = hipStreamSynchronize(hip_stream);
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmBackend::synchronizeStream] failed: " << hipGetErrorString(err));
@@ -3503,8 +3505,9 @@ namespace llaminar2
 
     bool ROCmBackend::streamWaitEvent(void *stream, void *event, int device_id)
     {
-        if (!stream || !event ||
-            device_id < 0 || device_id >= device_count_)
+        hipStream_t hip_stream =
+            requireExplicitStream(stream, "ROCmBackend::streamWaitEvent");
+        if (!event || device_id < 0 || device_id >= device_count_)
         {
             LOG_ERROR("[ROCmBackend::streamWaitEvent] invalid event-wait ownership"
                       << " device=" << device_id
@@ -3528,7 +3531,7 @@ namespace llaminar2
             return false;
         }
         err = hipStreamWaitEvent(
-            static_cast<hipStream_t>(stream),
+            hip_stream,
             static_cast<hipEvent_t>(event), 0);
         if (err != hipSuccess)
         {
@@ -3545,20 +3548,17 @@ namespace llaminar2
     bool ROCmBackend::hostToDeviceOnStream(void *dst, const void *src, size_t bytes,
                                             int device_id, void *stream)
     {
+        hipStream_t hip_stream =
+            requireExplicitStream(stream, "ROCmBackend::hostToDeviceOnStream");
         if (device_id >= device_count_ || device_id < 0)
             return false;
-        if (!stream)
-        {
-            LOG_ERROR("[ROCmBackend::hostToDeviceOnStream] refused to use HIP null stream");
-            return false;
-        }
 
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
             return false;
 
         err = hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice,
-                             static_cast<hipStream_t>(stream));
+                             hip_stream);
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmBackend::hostToDeviceOnStream] failed: " << hipGetErrorString(err));
@@ -3570,20 +3570,17 @@ namespace llaminar2
     bool ROCmBackend::deviceToHostOnStream(void *dst, const void *src, size_t bytes,
                                             int device_id, void *stream)
     {
+        hipStream_t hip_stream =
+            requireExplicitStream(stream, "ROCmBackend::deviceToHostOnStream");
         if (device_id >= device_count_ || device_id < 0)
             return false;
-        if (!stream)
-        {
-            LOG_ERROR("[ROCmBackend::deviceToHostOnStream] refused to use HIP null stream");
-            return false;
-        }
 
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
             return false;
 
         err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost,
-                             static_cast<hipStream_t>(stream));
+                             hip_stream);
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmBackend::deviceToHostOnStream] failed: " << hipGetErrorString(err));
@@ -3669,167 +3666,6 @@ namespace llaminar2
     }
 
     // ====================================================================
-    // Async Operations (via AMDDeviceContext worker thread)
-    // ====================================================================
-
-    std::future<bool> ROCmBackend::deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id)
-    {
-        try
-        {
-            AMDDeviceContext &ctx = static_cast<AMDDeviceContext &>(
-                GPUDeviceContextPool::instance().getAMDContext(device_id));
-
-            auto promise = std::make_shared<std::promise<bool>>();
-            auto future = promise->get_future();
-
-            ctx.submitAsync([this, dst, src, bytes, device_id, promise]()
-                            {
-                bool result = deviceToHost(dst, src, bytes, device_id);
-                promise->set_value(result); });
-
-            return future;
-        }
-        catch (...)
-        {
-            // Fall back to synchronous execution
-            std::promise<bool> promise;
-            promise.set_value(deviceToHost(dst, src, bytes, device_id));
-            return promise.get_future();
-        }
-    }
-
-    std::future<bool> ROCmBackend::hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id)
-    {
-        try
-        {
-            AMDDeviceContext &ctx = static_cast<AMDDeviceContext &>(
-                GPUDeviceContextPool::instance().getAMDContext(device_id));
-
-            auto promise = std::make_shared<std::promise<bool>>();
-            auto future = promise->get_future();
-
-            ctx.submitAsync([this, dst, src, bytes, device_id, promise]()
-                            {
-                bool result = hostToDevice(dst, src, bytes, device_id);
-                promise->set_value(result); });
-
-            return future;
-        }
-        catch (...)
-        {
-            // Fall back to synchronous execution
-            std::promise<bool> promise;
-            promise.set_value(hostToDevice(dst, src, bytes, device_id));
-            return promise.get_future();
-        }
-    }
-
-    std::future<bool> ROCmBackend::synchronizeAsync(int device_id)
-    {
-        try
-        {
-            AMDDeviceContext &ctx = static_cast<AMDDeviceContext &>(
-                GPUDeviceContextPool::instance().getAMDContext(device_id));
-
-            auto promise = std::make_shared<std::promise<bool>>();
-            auto future = promise->get_future();
-
-            ctx.submitAsync([this, device_id, promise]()
-                            {
-                bool result = synchronize(device_id);
-                promise->set_value(result); });
-
-            return future;
-        }
-        catch (...)
-        {
-            // Fall back to synchronous execution
-            std::promise<bool> promise;
-            promise.set_value(synchronize(device_id));
-            return promise.get_future();
-        }
-    }
-
-    std::future<void *> ROCmBackend::allocateAsync(size_t bytes, int device_id)
-    {
-        try
-        {
-            AMDDeviceContext &ctx = static_cast<AMDDeviceContext &>(
-                GPUDeviceContextPool::instance().getAMDContext(device_id));
-
-            auto promise = std::make_shared<std::promise<void *>>();
-            auto future = promise->get_future();
-
-            ctx.submitAsync([this, bytes, device_id, promise]()
-                            {
-                void* result = allocate(bytes, device_id);
-                promise->set_value(result); });
-
-            return future;
-        }
-        catch (...)
-        {
-            // Fall back to synchronous execution
-            std::promise<void *> promise;
-            promise.set_value(allocate(bytes, device_id));
-            return promise.get_future();
-        }
-    }
-
-    std::future<void> ROCmBackend::freeAsync(void *ptr, int device_id)
-    {
-        try
-        {
-            AMDDeviceContext &ctx = static_cast<AMDDeviceContext &>(
-                GPUDeviceContextPool::instance().getAMDContext(device_id));
-
-            auto promise = std::make_shared<std::promise<void>>();
-            auto future = promise->get_future();
-
-            ctx.submitAsync([this, ptr, device_id, promise]()
-                            {
-                free(ptr, device_id);
-                promise->set_value(); });
-
-            return future;
-        }
-        catch (...)
-        {
-            // Fall back to synchronous execution
-            free(ptr, device_id);
-            std::promise<void> promise;
-            promise.set_value();
-            return promise.get_future();
-        }
-    }
-
-    std::future<bool> ROCmBackend::memsetAsync(void *ptr, int value, size_t bytes, int device_id)
-    {
-        try
-        {
-            AMDDeviceContext &ctx = static_cast<AMDDeviceContext &>(
-                GPUDeviceContextPool::instance().getAMDContext(device_id));
-
-            auto promise = std::make_shared<std::promise<bool>>();
-            auto future = promise->get_future();
-
-            ctx.submitAsync([this, ptr, value, bytes, device_id, promise]()
-                            {
-                bool result = memset(ptr, value, bytes, device_id);
-                promise->set_value(result); });
-
-            return future;
-        }
-        catch (...)
-        {
-            // Fall back to synchronous execution
-            std::promise<bool> promise;
-            promise.set_value(memset(ptr, value, bytes, device_id));
-            return promise.get_future();
-        }
-    }
-
-    // ====================================================================
     // Extended Operations
     // ====================================================================
 
@@ -3873,7 +3709,7 @@ namespace llaminar2
             return false;
         }
 
-        hipStream_t s = resolveStream(device_id, stream);
+        hipStream_t s = requireExplicitStream(stream, "ROCmBackend::deviceToDevice");
         hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, s);
         if (err != hipSuccess)
             return false;
@@ -3909,12 +3745,8 @@ namespace llaminar2
             return false;
         }
 
-        hipStream_t s = resolveStream(device_id, stream);
-        if (!s)
-        {
-            LOG_ERROR("[ROCmBackend::deviceCopyAsync] refused to use HIP null stream");
-            return false;
-        }
+        hipStream_t s =
+            requireExplicitStream(stream, "ROCmBackend::deviceCopyAsync");
 
         /*
          * The MTP sidecar path copies tiny INT32 token slots between arena

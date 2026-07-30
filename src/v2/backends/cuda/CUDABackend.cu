@@ -9,15 +9,12 @@
  */
 
 #include "CUDABackend.h"
-#include "../GPUDeviceContextPool.h"
-#include "NvidiaDeviceContext.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
 #include <cuda_runtime.h>
-#include <future>
 #include <memory>
 #include <stdexcept>
 #include <sstream>
@@ -107,23 +104,23 @@ namespace llaminar2
     // Stream Resolution Helper
     // ====================================================================
 
-    /// Resolve a CUDA stream for the given device.
-    ///
-    /// Returns the caller-provided stream if non-null, otherwise nullptr
-    /// (legacy default stream). The pool's non-blocking default stream is
-    /// NOT used as a fallback because non-blocking streams have different
-    /// synchronization semantics: cudaFree and cudaHostUnregister do NOT
-    /// implicitly synchronize with non-blocking streams, causing silent
-    /// data corruption when tensors are destroyed and GPU memory is reused
-    /// by subsequent operations (e.g., weight repack pipelines).
-    ///
-    /// Callers that need the pool's stream (e.g., DeviceGraphExecutor)
-    /// should pass it explicitly via the stream parameter.
-    static cudaStream_t resolveStream(int device_id, void *stream)
+    /**
+     * @brief Convert an opaque execution stream after enforcing explicit ownership.
+     *
+     * CUDA's null stream is process-global scheduling state, not a harmless
+     * default. Accepting it here would erase the producer/consumer ordering
+     * expressed by the graph. Every executable backend API therefore fails at
+     * this common boundary before it can enqueue work ambiguously.
+     */
+    static cudaStream_t requireExplicitStream(void *stream, const char *operation)
     {
-        if (stream)
-            return static_cast<cudaStream_t>(stream);
-        return nullptr; // Use legacy default stream
+        if (!stream)
+        {
+            throw std::invalid_argument(
+                std::string(operation ? operation : "CUDABackend operation") +
+                " requires an explicit non-null CUDA stream");
+        }
+        return static_cast<cudaStream_t>(stream);
     }
 
     // ====================================================================
@@ -143,7 +140,7 @@ namespace llaminar2
             return false;
         }
 
-        cudaStream_t s = resolveStream(device_id, stream);
+        cudaStream_t s = requireExplicitStream(stream, "CUDABackend::deviceToHost");
         cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, s);
         if (err != cudaSuccess)
             return false;
@@ -164,7 +161,7 @@ namespace llaminar2
             return false;
         }
 
-        cudaStream_t s = resolveStream(device_id, stream);
+        cudaStream_t s = requireExplicitStream(stream, "CUDABackend::hostToDevice");
         cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, s);
         if (err != cudaSuccess)
             return false;
@@ -186,7 +183,7 @@ namespace llaminar2
         }
 
         // Same-GPU VRAM copy: both src and dst are device pointers on device_id.
-        cudaStream_t s = resolveStream(device_id, stream);
+        cudaStream_t s = requireExplicitStream(stream, "CUDABackend::deviceToDevice");
         cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s);
         if (err != cudaSuccess)
         {
@@ -317,8 +314,8 @@ namespace llaminar2
         }
 
         cudaEvent_t cuda_event = reinterpret_cast<cudaEvent_t>(event);
-        cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream); // nullptr = default stream
-        if (cuda_stream)
+        cudaStream_t cuda_stream =
+            requireExplicitStream(stream, "CUDABackend::recordEvent");
         {
             cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
             if (cudaStreamIsCapturing(cuda_stream, &capture_status) == cudaSuccess &&
@@ -537,7 +534,11 @@ namespace llaminar2
             return false;
         }
 
-        err = cudaMemsetAsync(ptr, value, bytes, resolveStream(device_id, stream));
+        err = cudaMemsetAsync(
+            ptr,
+            value,
+            bytes,
+            requireExplicitStream(stream, "CUDABackend::memset"));
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDABackend] cudaMemsetAsync failed: " << cudaGetErrorString(err));
@@ -1243,7 +1244,7 @@ namespace llaminar2
         }
 
         CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
-        cudaStream_t s = resolveStream(device_id, stream);
+        cudaStream_t s = requireExplicitStream(stream, "CUDABackend::argmaxF32");
         // Pass the caller-supplied partial scratch through to the kernel wrapper.
         // The scratch is mandatory (arena-owned); the wrapper fails loud if it is
         // missing or undersized — there is no single-block fallback.
@@ -1317,7 +1318,8 @@ namespace llaminar2
         }
 
         CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
-        cudaStream_t s = resolveStream(device_id, stream);
+        cudaStream_t s =
+            requireExplicitStream(stream, "CUDABackend::argmaxF32BatchedRows");
         {
             PerfStatsCollector::ScopedTimer timer(
                 "backend", "cuda_argmax_f32_batched_rows_launch", "decode");
@@ -1549,7 +1551,7 @@ namespace llaminar2
         }
 
         CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
-        cudaStream_t s = resolveStream(device_id, stream);
+        cudaStream_t s = requireExplicitStream(stream, "CUDABackend::topKF32");
         if (!cudaOps_topk_f32(
                 static_cast<const float *>(data_device), n, k,
                 static_cast<float *>(bufs.values_ptr),
@@ -3050,9 +3052,8 @@ namespace llaminar2
             return false;
 
         CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
-        cudaStream_t s = resolveStream(device_id, stream);
-        if (!s)
-            return false;
+        cudaStream_t s =
+            requireExplicitStream(stream, "CUDABackend::applyLogitPenaltiesF32");
 
         /*
          * The penalty slot may follow main, sidecar, or verifier logits. Queue
@@ -3120,198 +3121,6 @@ namespace llaminar2
     }
 
     // ====================================================================
-    // Async Operations (Route through NvidiaDeviceContext worker thread)
-    // ====================================================================
-
-    std::future<bool> CUDABackend::deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id)
-    {
-        if (device_id >= device_count_ || device_id < 0)
-        {
-            std::promise<bool> p;
-            p.set_value(false);
-            return p.get_future();
-        }
-
-        try
-        {
-            NvidiaDeviceContext &ctx = static_cast<NvidiaDeviceContext &>(
-                GPUDeviceContextPool::instance().getNvidiaContext(device_id));
-            auto promise = std::make_shared<std::promise<bool>>();
-            auto future = promise->get_future();
-            ctx.submitAsync([this, dst, src, bytes, device_id, promise]()
-                            {
-                cudaStream_t ws = resolveStream(device_id, nullptr);
-                cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, ws);
-                if (err == cudaSuccess) err = cudaStreamSynchronize(ws);
-                promise->set_value(err == cudaSuccess); });
-            return future;
-        }
-        catch (...)
-        {
-            std::promise<bool> p;
-            p.set_exception(std::current_exception());
-            return p.get_future();
-        }
-    }
-
-    std::future<bool> CUDABackend::hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id)
-    {
-        if (device_id >= device_count_ || device_id < 0)
-        {
-            std::promise<bool> p;
-            p.set_value(false);
-            return p.get_future();
-        }
-
-        try
-        {
-            NvidiaDeviceContext &ctx = static_cast<NvidiaDeviceContext &>(
-                GPUDeviceContextPool::instance().getNvidiaContext(device_id));
-            auto promise = std::make_shared<std::promise<bool>>();
-            auto future = promise->get_future();
-            ctx.submitAsync([this, dst, src, bytes, device_id, promise]()
-                            {
-                cudaStream_t ws = resolveStream(device_id, nullptr);
-                cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, ws);
-                if (err == cudaSuccess) err = cudaStreamSynchronize(ws);
-                promise->set_value(err == cudaSuccess); });
-            return future;
-        }
-        catch (...)
-        {
-            std::promise<bool> p;
-            p.set_exception(std::current_exception());
-            return p.get_future();
-        }
-    }
-
-    std::future<bool> CUDABackend::synchronizeAsync(int device_id)
-    {
-        if (device_id >= device_count_ || device_id < 0)
-        {
-            std::promise<bool> p;
-            p.set_value(false);
-            return p.get_future();
-        }
-
-        try
-        {
-            NvidiaDeviceContext &ctx = static_cast<NvidiaDeviceContext &>(
-                GPUDeviceContextPool::instance().getNvidiaContext(device_id));
-            auto promise = std::make_shared<std::promise<bool>>();
-            auto future = promise->get_future();
-            ctx.submitAsync([promise]()
-                            {
-                cudaError_t err = cudaDeviceSynchronize();
-                promise->set_value(err == cudaSuccess); });
-            return future;
-        }
-        catch (...)
-        {
-            std::promise<bool> p;
-            p.set_exception(std::current_exception());
-            return p.get_future();
-        }
-    }
-
-    std::future<void *> CUDABackend::allocateAsync(size_t bytes, int device_id)
-    {
-        if (device_id >= device_count_ || device_id < 0)
-        {
-            std::promise<void *> p;
-            p.set_value(nullptr);
-            return p.get_future();
-        }
-
-        try
-        {
-            NvidiaDeviceContext &ctx = static_cast<NvidiaDeviceContext &>(
-                GPUDeviceContextPool::instance().getNvidiaContext(device_id));
-            auto promise = std::make_shared<std::promise<void *>>();
-            auto future = promise->get_future();
-            ctx.submitAsync([bytes, promise]()
-                            {
-                void *ptr = nullptr;
-                cudaError_t err = cudaMalloc(&ptr, bytes);
-                promise->set_value(err == cudaSuccess ? ptr : nullptr); });
-            return future;
-        }
-        catch (...)
-        {
-            std::promise<void *> p;
-            p.set_exception(std::current_exception());
-            return p.get_future();
-        }
-    }
-
-    std::future<void> CUDABackend::freeAsync(void *ptr, int device_id)
-    {
-        if (ptr == nullptr || device_id >= device_count_ || device_id < 0)
-        {
-            std::promise<void> p;
-            p.set_value();
-            return p.get_future();
-        }
-
-        try
-        {
-            NvidiaDeviceContext &ctx = static_cast<NvidiaDeviceContext &>(
-                GPUDeviceContextPool::instance().getNvidiaContext(device_id));
-            auto promise = std::make_shared<std::promise<void>>();
-            auto future = promise->get_future();
-            ctx.submitAsync([ptr, promise]()
-                            {
-                CUDA_WARN_IF_FAIL(cudaFree(ptr)); // async free; no return path to caller
-                promise->set_value(); });
-            return future;
-        }
-        catch (...)
-        {
-            std::promise<void> p;
-            p.set_exception(std::current_exception());
-            return p.get_future();
-        }
-    }
-
-    std::future<bool> CUDABackend::memsetAsync(void *ptr, int value, size_t bytes, int device_id)
-    {
-        if (ptr == nullptr || bytes == 0)
-        {
-            std::promise<bool> p;
-            p.set_value(true);
-            return p.get_future();
-        }
-
-        if (device_id >= device_count_ || device_id < 0)
-        {
-            std::promise<bool> p;
-            p.set_value(false);
-            return p.get_future();
-        }
-
-        try
-        {
-            NvidiaDeviceContext &ctx = static_cast<NvidiaDeviceContext &>(
-                GPUDeviceContextPool::instance().getNvidiaContext(device_id));
-            auto promise = std::make_shared<std::promise<bool>>();
-            auto future = promise->get_future();
-            ctx.submitAsync([this, ptr, value, bytes, device_id, promise]()
-                            {
-                cudaStream_t ws = resolveStream(device_id, nullptr);
-                cudaError_t err = cudaMemsetAsync(ptr, value, bytes, ws);
-                if (err == cudaSuccess) err = cudaStreamSynchronize(ws);
-                promise->set_value(err == cudaSuccess); });
-            return future;
-        }
-        catch (...)
-        {
-            std::promise<bool> p;
-            p.set_exception(std::current_exception());
-            return p.get_future();
-        }
-    }
-
-    // ====================================================================
     // Stream Management
     // ====================================================================
 
@@ -3346,10 +3155,12 @@ namespace llaminar2
 
     bool CUDABackend::synchronizeStream(void *stream, int device_id)
     {
+        cudaStream_t cuda_stream =
+            requireExplicitStream(stream, "CUDABackend::synchronizeStream");
         cudaError_t err = cudaSetDevice(device_id);
         if (err != cudaSuccess)
             return false;
-        err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+        err = cudaStreamSynchronize(cuda_stream);
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDABackend::synchronizeStream] failed: " << cudaGetErrorString(err));
@@ -3360,8 +3171,9 @@ namespace llaminar2
 
     bool CUDABackend::streamWaitEvent(void *stream, void *event, int device_id)
     {
-        if (!stream || !event ||
-            device_id < 0 || device_id >= device_count_)
+        cudaStream_t cuda_stream =
+            requireExplicitStream(stream, "CUDABackend::streamWaitEvent");
+        if (!event || device_id < 0 || device_id >= device_count_)
         {
             LOG_ERROR("[CUDABackend::streamWaitEvent] invalid event-wait ownership"
                       << " device=" << device_id
@@ -3386,7 +3198,7 @@ namespace llaminar2
             return false;
         }
         err = cudaStreamWaitEvent(
-            static_cast<cudaStream_t>(stream),
+            cuda_stream,
             static_cast<cudaEvent_t>(event), 0);
         if (err != cudaSuccess)
         {
@@ -3403,18 +3215,15 @@ namespace llaminar2
     bool CUDABackend::hostToDeviceOnStream(void *dst, const void *src, size_t bytes,
                                            int device_id, void *stream)
     {
+        cudaStream_t cuda_stream =
+            requireExplicitStream(stream, "CUDABackend::hostToDeviceOnStream");
         if (device_id >= device_count_ || device_id < 0)
             return false;
-        if (!stream)
-        {
-            LOG_ERROR("[CUDABackend::hostToDeviceOnStream] refused to use CUDA null stream");
-            return false;
-        }
         if (!setDevice(device_id))
             return false;
 
         cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice,
-                                          static_cast<cudaStream_t>(stream));
+                                          cuda_stream);
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDABackend::hostToDeviceOnStream] failed: " << cudaGetErrorString(err));
@@ -3426,18 +3235,15 @@ namespace llaminar2
     bool CUDABackend::deviceToHostOnStream(void *dst, const void *src, size_t bytes,
                                            int device_id, void *stream)
     {
+        cudaStream_t cuda_stream =
+            requireExplicitStream(stream, "CUDABackend::deviceToHostOnStream");
         if (device_id >= device_count_ || device_id < 0)
             return false;
-        if (!stream)
-        {
-            LOG_ERROR("[CUDABackend::deviceToHostOnStream] refused to use CUDA null stream");
-            return false;
-        }
         if (!setDevice(device_id))
             return false;
 
         cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost,
-                                          static_cast<cudaStream_t>(stream));
+                                          cuda_stream);
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDABackend::deviceToHostOnStream] failed: " << cudaGetErrorString(err));
@@ -3478,17 +3284,14 @@ namespace llaminar2
     bool CUDABackend::deviceCopyAsync(void *dst, const void *src, size_t bytes,
                                       int device_id, void *stream)
     {
+        cudaStream_t cuda_stream =
+            requireExplicitStream(stream, "CUDABackend::deviceCopyAsync");
         if (bytes == 0)
             return true;
         if (!dst || !src)
         {
             LOG_ERROR("[CUDABackend::deviceCopyAsync] null pointer for non-empty copy"
                       << " dst=" << dst << " src=" << src << " bytes=" << bytes);
-            return false;
-        }
-        if (!stream)
-        {
-            LOG_ERROR("[CUDABackend::deviceCopyAsync] refused to use CUDA null stream");
             return false;
         }
         cudaError_t err = cudaSetDevice(device_id);
@@ -3499,7 +3302,7 @@ namespace llaminar2
             return false;
         }
         err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice,
-                              static_cast<cudaStream_t>(stream));
+                              cuda_stream);
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDABackend::deviceCopyAsync] failed: " << cudaGetErrorString(err));
@@ -3515,6 +3318,8 @@ namespace llaminar2
     bool CUDABackend::vectorAddInplace(void *output, const void *input, size_t count,
                                        int element_size, int device_id, void *stream)
     {
+        cudaStream_t cuda_stream =
+            requireExplicitStream(stream, "CUDABackend::vectorAddInplace");
         cudaError_t err = cudaSetDevice(device_id);
         if (err != cudaSuccess)
         {
@@ -3522,9 +3327,6 @@ namespace llaminar2
                       << cudaGetErrorString(err));
             return false;
         }
-
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-
         switch (element_size)
         {
         case 4: // FP32 or INT32

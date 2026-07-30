@@ -17,6 +17,7 @@
 
 #include "ROCmWeightPacker.h"
 #include "backends/BackendManager.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "ROCmQuantisedGemmKernel.h"
 #include "tensors/TensorClasses.h"   // IINT8Unpackable (for packVnniBlock, requantizeRowToInt8)
 #include "tensors/VnniPackContext.h" // VnniPackContext, vnniLinearIdx, etc.
@@ -31,6 +32,7 @@
 #include <vector>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -384,6 +386,16 @@ namespace llaminar2
             LOG_ERROR("[MoEBatchPackedWeightsROCm::uploadToDevice] ROCm backend unavailable");
             return false;
         }
+        void *const setup_stream =
+            GPUDeviceContextPool::instance()
+                .getAMDContext(rocm_device_id)
+                .defaultStream();
+        if (!setup_stream)
+        {
+            throw std::runtime_error(
+                "MoEBatchPackedWeightsROCm::uploadToDevice requires an "
+                "explicit setup stream");
+        }
 
         auto uploadBuffer = [&](const void *host_data, size_t bytes, void **d_ptr) -> bool
         {
@@ -393,7 +405,12 @@ namespace llaminar2
             *d_ptr = backend->allocate(bytes, rocm_device_id);
             if (!*d_ptr)
                 return false;
-            if (!backend->hostToDevice(*d_ptr, host_data, bytes, rocm_device_id))
+            if (!backend->hostToDevice(
+                    *d_ptr,
+                    host_data,
+                    bytes,
+                    rocm_device_id,
+                    setup_stream))
             {
                 backend->free(*d_ptr, rocm_device_id);
                 *d_ptr = nullptr;

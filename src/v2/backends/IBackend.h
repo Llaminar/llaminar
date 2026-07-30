@@ -21,7 +21,6 @@
 #include "DeviceType.h"
 #include <cstddef>
 #include <cstdint>
-#include <future>
 #include <string>
 
 namespace llaminar2
@@ -46,7 +45,7 @@ namespace llaminar2
      * #endif
      *
      * if (backend) {
-     *     backend->deviceToHost(device_ptr, host_ptr, bytes, device_id);
+     *     backend->deviceToHost(host_ptr, device_ptr, bytes, device_id, stream);
      *     backend->synchronize(device_id);
      * }
      * ```
@@ -74,11 +73,11 @@ namespace llaminar2
          * - ROCm: hipMemcpyAsync on stream, then hipStreamSynchronize
          * - CPU: memcpy(dst, src, bytes)
          *
-         * @param stream Opaque GPU stream handle. When nullptr, backends
-         *               auto-resolve to the device context's default stream
-         *               (never the null CUDA/HIP stream).
+         * @param stream Exact producer stream for GPU backends. GPU
+         *               implementations reject nullptr. CPU callers pass
+         *               nullptr explicitly because CPU execution is synchronous.
          */
-        virtual bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) = 0;
+        virtual bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream) = 0;
 
         /**
          * @brief Fast D2H copy — skips pointer validation for hot paths
@@ -91,26 +90,10 @@ namespace llaminar2
          * Default implementation delegates to deviceToHost().
          * ROCm override skips hipPointerGetAttributes() + HipDeviceSaveRestore (~30-60µs savings).
          */
-        virtual bool deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr)
+        virtual bool deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id, void *stream)
         {
             return deviceToHost(dst, src, bytes, device_id, stream);
         }
-
-        /**
-         * @brief Async variant of deviceToHost() - returns immediately
-         *
-         * @param dst Host destination pointer (must be pre-allocated)
-         * @param src Device source pointer
-         * @param bytes Number of bytes to copy
-         * @param device_id GPU device ID (0-based)
-         * @return Future that resolves to true on success, false on error
-         *
-         * **Semantics**:
-         * - Submits copy request to device worker thread
-         * - Returns immediately without blocking
-         * - Call future.get() to wait for completion and get result
-         */
-        virtual std::future<bool> deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id) = 0;
 
         /**
          * @brief Copy data from host to device
@@ -126,11 +109,11 @@ namespace llaminar2
          * - ROCm: hipMemcpyAsync on stream, then hipStreamSynchronize
          * - CPU: memcpy(dst, src, bytes)
          *
-         * @param stream Opaque GPU stream handle. When nullptr, backends
-         *               auto-resolve to the device context's default stream
-         *               (never the null CUDA/HIP stream).
+         * @param stream Exact consumer stream for GPU backends. GPU
+         *               implementations reject nullptr. CPU callers pass
+         *               nullptr explicitly because CPU execution is synchronous.
          */
-        virtual bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) = 0;
+        virtual bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream) = 0;
 
         /**
          * @brief Copy data between two device pointers on the same device
@@ -149,10 +132,10 @@ namespace llaminar2
          * Used for device-to-device tensor transfers where both src and dst
          * are in the same GPU's VRAM (standard device memory pointers).
          *
-         * @param stream Opaque GPU stream handle. When nullptr, backends
-         *               auto-resolve to the device context's default stream.
+         * @param stream Exact operation stream for GPU backends. GPU
+         *               implementations reject nullptr.
          */
-        virtual bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr)
+        virtual bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)
         {
             // Default implementation: not supported
             (void)dst;
@@ -162,22 +145,6 @@ namespace llaminar2
             (void)stream;
             return false;
         }
-
-        /**
-         * @brief Async variant of hostToDevice() - returns immediately
-         *
-         * @param dst Device destination pointer (must be pre-allocated)
-         * @param src Host source pointer
-         * @param bytes Number of bytes to copy
-         * @param device_id GPU device ID (0-based)
-         * @return Future that resolves to true on success, false on error
-         *
-         * **Semantics**:
-         * - Submits copy request to device worker thread
-         * - Returns immediately without blocking
-         * - Call future.get() to wait for completion and get result
-         */
-        virtual std::future<bool> hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id) = 0;
 
         /**
          * @brief Synchronize all operations on a device
@@ -191,19 +158,6 @@ namespace llaminar2
          * - CPU: no-op (always synchronous)
          */
         virtual bool synchronize(int device_id) = 0;
-
-        /**
-         * @brief Async variant of synchronize() - returns immediately
-         *
-         * @param device_id GPU device ID (0-based)
-         * @return Future that resolves to true on success, false on error
-         *
-         * **Semantics**:
-         * - Submits sync request to device worker thread
-         * - Returns immediately without blocking
-         * - Call future.get() to wait for completion and get result
-         */
-        virtual std::future<bool> synchronizeAsync(int device_id) = 0;
 
         /**
          * @brief Synchronize the default stream on a device
@@ -278,7 +232,8 @@ namespace llaminar2
          *
          * @param event Opaque event handle from createEvent()
          * @param device_id GPU device ID (0-based)
-         * @param stream Opaque stream handle (nullptr = default stream)
+         * @param stream Exact operation stream for GPU backends. GPU
+         *               implementations reject nullptr.
          * @return true on success, false on error
          *
          * **Semantics**:
@@ -286,7 +241,7 @@ namespace llaminar2
          * - ROCm: hipEventRecord(event, stream)
          * - CPU: no-op (returns true)
          */
-        virtual bool recordEvent(void *event, int device_id, void *stream = nullptr) = 0;
+        virtual bool recordEvent(void *event, int device_id, void *stream) = 0;
 
         /**
          * @brief Wait for an event to complete
@@ -368,20 +323,6 @@ namespace llaminar2
         virtual void *allocate(size_t bytes, int device_id) = 0;
 
         /**
-         * @brief Async variant of allocate() - returns immediately
-         *
-         * @param bytes Number of bytes to allocate
-         * @param device_id GPU device ID (0-based)
-         * @return Future that resolves to the allocated pointer (nullptr on failure)
-         *
-         * **Semantics**:
-         * - Submits allocation request to device worker thread
-         * - Returns immediately without blocking
-         * - Call future.get() to wait for completion and get result
-         */
-        virtual std::future<void *> allocateAsync(size_t bytes, int device_id) = 0;
-
-        /**
          * @brief Free device memory
          *
          * @param ptr Device pointer to free (may be nullptr)
@@ -395,20 +336,6 @@ namespace llaminar2
          * **Thread Safety**: Caller must ensure device is set before calling
          */
         virtual void free(void *ptr, int device_id) = 0;
-
-        /**
-         * @brief Async variant of free() - returns immediately
-         *
-         * @param ptr Device pointer to free (may be nullptr)
-         * @param device_id GPU device ID (0-based)
-         * @return Future that completes when free is done
-         *
-         * **Semantics**:
-         * - Submits free request to device worker thread
-         * - Returns immediately without blocking
-         * - Call future.wait() to wait for completion
-         */
-        virtual std::future<void> freeAsync(void *ptr, int device_id) = 0;
 
         /**
          * @brief Set device memory to a byte value
@@ -431,26 +358,10 @@ namespace llaminar2
          *
          * **Thread Safety**: Caller must ensure device is set before calling
          *
-         * @param stream Opaque GPU stream handle. When nullptr, backends
-         *               auto-resolve to the device context's default stream.
+         * @param stream Exact operation stream for GPU backends. GPU
+         *               implementations reject nullptr.
          */
-        virtual bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream = nullptr) = 0;
-
-        /**
-         * @brief Async variant of memset() - returns immediately
-         *
-         * @param ptr Device pointer to fill
-         * @param value Byte value to set (0-255)
-         * @param bytes Number of bytes to set
-         * @param device_id GPU device ID (0-based)
-         * @return Future that resolves to true on success, false on error
-         *
-         * **Semantics**:
-         * - Submits memset request to device worker thread
-         * - Returns immediately without blocking
-         * - Call future.get() to wait for completion and get result
-         */
-        virtual std::future<bool> memsetAsync(void *ptr, int value, size_t bytes, int device_id) = 0;
+        virtual bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream) = 0;
 
         // ====================================================================
         // Zero-Copy Mapped Memory Operations (GPU writes directly to host)
@@ -619,7 +530,7 @@ namespace llaminar2
          * @return true if executed on device, false if not supported (caller should fall back)
          */
         virtual bool argmaxF32(const void *data_device, int n, int device_id,
-                               float *out_value, int *out_index, void *stream = nullptr,
+                               float *out_value, int *out_index, void *stream,
                                void *partial_vals = nullptr, void *partial_idxs = nullptr,
                                int partial_capacity = 0)
         {
@@ -654,7 +565,7 @@ namespace llaminar2
          * @return true if every row was sampled on device.
          */
         virtual bool argmaxF32BatchedRows(const void *data_device, int rows, int cols, int device_id,
-                                          float *out_values, int *out_indices, void *stream = nullptr,
+                                          float *out_values, int *out_indices, void *stream,
                                           void *partial_vals = nullptr, void *partial_idxs = nullptr,
                                           int partial_capacity = 0)
         {
@@ -830,7 +741,7 @@ namespace llaminar2
          * @return true if executed on device, false if not supported
          */
         virtual bool topKF32(const void *data_device, int n, int k, int device_id,
-                             float *out_values, int *out_indices, void *stream = nullptr)
+                             float *out_values, int *out_indices, void *stream)
         {
             (void)data_device;
             (void)n;
@@ -864,7 +775,7 @@ namespace llaminar2
                                        int top_k, float top_p, float temperature,
                                        uint64_t rng_seed, uint64_t rng_offset,
                                        int device_id, int *out_token,
-                                       void *stream = nullptr)
+                                       void *stream)
         {
             (void)data_device;
             (void)n;
@@ -2262,7 +2173,7 @@ namespace llaminar2
                                             const int *token_ids_host,
                                             const float *penalties_host,
                                             int num_penalties, int vocab_size,
-                                            int device_id, void *stream = nullptr)
+                                            int device_id, void *stream)
         {
             (void)logits_device;
             (void)token_ids_host;
@@ -2541,7 +2452,8 @@ namespace llaminar2
          * @param src Device source pointer
          * @param bytes Number of bytes to copy
          * @param device_id GPU device ID (0-based)
-         * @param stream Opaque stream handle (nullptr = default stream)
+         * @param stream Exact operation stream for GPU backends. GPU
+         *               implementations reject nullptr.
          * @return true on success, false on error
          *
          * **Semantics**:
@@ -2550,7 +2462,7 @@ namespace llaminar2
          * - CPU: memcpy(dst, src, bytes)
          */
         virtual bool deviceCopyAsync(void *dst, const void *src, size_t bytes,
-                                     int device_id, void *stream = nullptr)
+                                     int device_id, void *stream)
         {
             (void)dst;
             (void)src;
@@ -2575,7 +2487,8 @@ namespace llaminar2
          * @param count Number of elements
          * @param element_size Size of each element in bytes (4=FP32, 2=FP16/BF16, 1=INT8)
          * @param device_id GPU device ID (0-based)
-         * @param stream Opaque stream handle (nullptr = synchronous on default stream)
+         * @param stream Exact operation stream for GPU backends. GPU
+         *               implementations reject nullptr.
          * @return true on success, false if not supported or error
          *
          * The element_size parameter determines the data type:
@@ -2589,7 +2502,7 @@ namespace llaminar2
          * - CPU: Scalar loop
          */
         virtual bool vectorAddInplace(void *output, const void *input, size_t count,
-                                      int element_size, int device_id, void *stream = nullptr)
+                                      int element_size, int device_id, void *stream)
         {
             (void)output;
             (void)input;

@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "backends/BackendManager.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
 #include "collective/BackendRouter.h"
 #include "collective/ICollectiveBackend.h"
@@ -78,6 +79,38 @@ namespace llaminar2
                     " resolved a non-canonical transfer-storage owner");
             }
             return owner;
+        }
+
+        /**
+         * @brief Resolve the persistent stream owned by a GPU transfer context.
+         *
+         * Backend APIs deliberately reject null streams. Tensor-aware transfer
+         * operations choose their stream here, before touching a backend, so
+         * setup, staging, and publication all name one stable owner.
+         */
+        void *requireTransferStream(
+            DeviceId device,
+            const char *operation)
+        {
+            if (!device.is_gpu())
+            {
+                throw std::invalid_argument(
+                    std::string(operation) +
+                    " requires a GPU transfer endpoint");
+            }
+
+            void *const stream =
+                GPUDeviceContextPool::instance()
+                    .getContext(device)
+                    .defaultStream();
+            if (!stream)
+            {
+                throw std::runtime_error(
+                    std::string(operation) +
+                    " could not resolve a non-null transfer stream for " +
+                    device.toString());
+            }
+            return stream;
         }
 
         /**
@@ -756,7 +789,12 @@ namespace llaminar2
                     tensor->secondary_device_buffers_.erase(
                         TensorBase::packDeviceId(target_device));
                 }
-                publishCompletedDeviceWrite(tensor, target_device);
+                publishDeviceWrite(
+                    tensor,
+                    target_device,
+                    requireTransferStream(
+                        target_device,
+                        "TransferEngine::transferActivation publication"));
             }
             else
             {
@@ -854,7 +892,16 @@ namespace llaminar2
             if (!src_ptr)
                 return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
                                             "source has no device buffer on " + dst_device.toString());
-            if (!backend->deviceToDevice(dst_ptr, src_ptr, bytes, dst_device.gpu_ordinal()))
+            void *const destination_stream =
+                requireTransferStream(
+                    dst_device,
+                    "TransferEngine::copyActivation same-device copy");
+            if (!backend->deviceToDevice(
+                    dst_ptr,
+                    src_ptr,
+                    bytes,
+                    dst_device.gpu_ordinal(),
+                    destination_stream))
                 return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
                                             "deviceToDevice failed on " + dst_device.toString());
             result = TransferResult::ok(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND);
@@ -896,7 +943,16 @@ namespace llaminar2
                 if (!src_host || !src_dev || !src_backend)
                     return TransferResult::fail(TransferMethod::HOST_STAGED,
                                                 "missing src host/device buffer or backend for staged copy");
-                if (!src_backend->deviceToHost(src_host, src_dev, bytes, src_device.gpu_ordinal()))
+                void *const source_stream =
+                    requireTransferStream(
+                        src_device,
+                        "TransferEngine::copyActivation staged D2H");
+                if (!src_backend->deviceToHost(
+                        src_host,
+                        src_dev,
+                        bytes,
+                        src_device.gpu_ordinal(),
+                        source_stream))
                     return TransferResult::fail(TransferMethod::HOST_STAGED,
                                                 "D2H step failed in copyActivation");
                 host_src = src_host;
@@ -910,7 +966,16 @@ namespace llaminar2
             if (!dst_backend || !host_src)
                 return TransferResult::fail(TransferMethod::HOST_TO_DEVICE,
                                             "missing dst backend or host src in copyActivation");
-            if (!dst_backend->hostToDevice(dst_ptr, host_src, bytes, dst_device.gpu_ordinal()))
+            void *const destination_stream =
+                requireTransferStream(
+                    dst_device,
+                    "TransferEngine::copyActivation staged H2D");
+            if (!dst_backend->hostToDevice(
+                    dst_ptr,
+                    host_src,
+                    bytes,
+                    dst_device.gpu_ordinal(),
+                    destination_stream))
                 return TransferResult::fail(TransferMethod::HOST_TO_DEVICE,
                                             "H2D step failed in copyActivation");
             result = TransferResult::ok(src_on_gpu ? TransferMethod::HOST_STAGED
@@ -940,7 +1005,12 @@ namespace llaminar2
          * contract regardless of whether the bytes arrived via intra-device,
          * peer, or deliberately heterogeneous host-staged transport.
          */
-        publishCompletedDeviceWrite(dst, dst_device);
+        publishDeviceWrite(
+            dst,
+            dst_device,
+            requireTransferStream(
+                dst_device,
+                "TransferEngine::copyActivation publication"));
 
         return result;
     }
@@ -961,8 +1031,14 @@ namespace llaminar2
             return TransferResult::fail(req.method,
                                         "no backend for device " + req.target_device.toString());
 
-        bool ok = backend->hostToDevice(req.target_ptr, req.source.host_ptr,
-                                        req.source.size_bytes, req.target_device.ordinal);
+        bool ok = backend->hostToDevice(
+            req.target_ptr,
+            req.source.host_ptr,
+            req.source.size_bytes,
+            req.target_device.ordinal,
+            requireTransferStream(
+                req.target_device,
+                "TransferEngine::executeHostToDevice"));
         if (!ok)
             return TransferResult::fail(req.method, "hostToDevice failed");
 
@@ -981,8 +1057,14 @@ namespace llaminar2
             return TransferResult::fail(req.method,
                                         "no backend for source device " + req.source.device.toString());
 
-        bool ok = backend->deviceToHost(req.source.host_ptr, req.source.device_ptr,
-                                        req.source.size_bytes, req.source.device.ordinal);
+        bool ok = backend->deviceToHost(
+            req.source.host_ptr,
+            req.source.device_ptr,
+            req.source.size_bytes,
+            req.source.device.ordinal,
+            requireTransferStream(
+                req.source.device,
+                "TransferEngine::executeDeviceToHost"));
         if (!ok)
             return TransferResult::fail(req.method, "deviceToHost failed");
 
@@ -1057,7 +1139,10 @@ namespace llaminar2
         // Step 1: D2H
         bool d2h = src_backend->deviceToHost(
             req.source.host_ptr, req.source.device_ptr,
-            req.source.size_bytes, req.source.device.ordinal);
+            req.source.size_bytes, req.source.device.ordinal,
+            requireTransferStream(
+                req.source.device,
+                "TransferEngine::executeHostStaged source"));
         if (!d2h)
             return TransferResult::fail(req.method, "D2H step of host staged failed");
 
@@ -1069,7 +1154,10 @@ namespace llaminar2
 
         bool h2d = dst_backend->hostToDevice(
             req.target_ptr, req.source.host_ptr,
-            req.source.size_bytes, req.target_device.ordinal);
+            req.source.size_bytes, req.target_device.ordinal,
+            requireTransferStream(
+                req.target_device,
+                "TransferEngine::executeHostStaged destination"));
         if (!h2d)
             return TransferResult::fail(req.method, "H2D step of host staged failed");
 
@@ -1352,8 +1440,19 @@ namespace llaminar2
                 }
             }
 
+            void *const upload_stream =
+                stream
+                    ? stream
+                    : requireTransferStream(
+                          target_device,
+                          "TransferEngine::uploadFull");
             auto h2d_start = std::chrono::high_resolution_clock::now();
-            bool h2d_ok = target_backend->hostToDevice(tensor->gpu_data_ptr_, src, bytes, backend_device_id, stream);
+            bool h2d_ok = target_backend->hostToDevice(
+                tensor->gpu_data_ptr_,
+                src,
+                bytes,
+                backend_device_id,
+                upload_stream);
             auto h2d_end = std::chrono::high_resolution_clock::now();
             auto h2d_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(h2d_end - h2d_start).count();
             auto h2d_us = h2d_ns / 1000;
@@ -1568,8 +1667,19 @@ namespace llaminar2
                       << " device=" << tensor->gpu_device_->toString()
                       << " backend_device_id=" << backend_device_id);
 
+            void *const download_stream =
+                stream
+                    ? stream
+                    : requireTransferStream(
+                          *tensor->gpu_device_,
+                          "TransferEngine::downloadFull");
             auto d2h_start = std::chrono::high_resolution_clock::now();
-            bool d2h_ok = backend->deviceToHost(dst, tensor->gpu_data_ptr_, bytes, backend_device_id, stream);
+            bool d2h_ok = backend->deviceToHost(
+                dst,
+                tensor->gpu_data_ptr_,
+                bytes,
+                backend_device_id,
+                download_stream);
             auto d2h_end = std::chrono::high_resolution_clock::now();
             auto d2h_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(d2h_end - d2h_start).count();
 

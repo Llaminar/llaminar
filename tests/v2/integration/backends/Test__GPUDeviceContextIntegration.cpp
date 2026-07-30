@@ -38,6 +38,7 @@
 #include "backends/IWorkerGPUContext.h"
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
+#include "../../utils/ScopedGPUStream.h"
 
 #include <thread>
 #include <vector>
@@ -45,8 +46,91 @@
 #include <atomic>
 #include <future>
 #include <cstring>
+#include <stdexcept>
 
 using namespace llaminar2;
+
+namespace
+{
+/**
+ * @brief Registers every GPU context factory linked into this test executable.
+ *
+ * GPUDeviceContextPool intentionally does not infer linked backends on first
+ * query. Registering the factories once in the global test environment keeps
+ * every test independent of execution order: an availability check always
+ * describes the machine, rather than whether an earlier test happened to
+ * initialize a factory.
+ */
+class GPUDeviceContextFactoryEnvironment final : public ::testing::Environment
+{
+public:
+    void SetUp() override
+    {
+#ifdef HAVE_CUDA
+        ensureNvidiaFactoryRegistered();
+#endif
+#ifdef HAVE_ROCM
+        ensureAMDFactoryRegistered();
+#endif
+    }
+};
+
+[[maybe_unused]] ::testing::Environment *const gpu_factory_environment =
+    ::testing::AddGlobalTestEnvironment(
+        new GPUDeviceContextFactoryEnvironment());
+
+/**
+ * @brief Proves that an executable GPU backend cannot adopt an implicit stream.
+ *
+ * Every operation receives otherwise-valid storage and event handles so the
+ * observed exception specifically certifies the stream ownership boundary.
+ * CUDA and ROCm invoke this same probe to keep their contracts symmetric.
+ */
+void expectNullExecutionStreamsRejected(IBackend *backend, int device_id)
+{
+    ASSERT_NE(backend, nullptr);
+
+    constexpr size_t bytes = sizeof(uint32_t);
+    uint32_t host_source = 0x12345678u;
+    uint32_t host_destination = 0u;
+    void *device_source = backend->allocate(bytes, device_id);
+    void *device_destination = backend->allocate(bytes, device_id);
+    void *event = backend->createEvent(device_id);
+    ASSERT_NE(device_source, nullptr);
+    ASSERT_NE(device_destination, nullptr);
+    ASSERT_NE(event, nullptr);
+
+    EXPECT_THROW(
+        backend->hostToDevice(
+            device_source, &host_source, bytes, device_id, nullptr),
+        std::invalid_argument);
+    EXPECT_THROW(
+        backend->deviceToHost(
+            &host_destination, device_source, bytes, device_id, nullptr),
+        std::invalid_argument);
+    EXPECT_THROW(
+        backend->deviceToDevice(
+            device_destination, device_source, bytes, device_id, nullptr),
+        std::invalid_argument);
+    EXPECT_THROW(
+        backend->memset(
+            device_destination, 0, bytes, device_id, nullptr),
+        std::invalid_argument);
+    EXPECT_THROW(
+        backend->recordEvent(event, device_id, nullptr),
+        std::invalid_argument);
+    EXPECT_THROW(
+        backend->streamWaitEvent(nullptr, event, device_id),
+        std::invalid_argument);
+    EXPECT_THROW(
+        backend->synchronizeStream(nullptr, device_id),
+        std::invalid_argument);
+
+    backend->destroyEvent(event, device_id);
+    backend->free(device_destination, device_id);
+    backend->free(device_source, device_id);
+}
+} // namespace
 
 // ===========================================================================
 // CUDA Integration Tests (via IWorkerGPUContext API)
@@ -92,21 +176,31 @@ TEST(Test__NvidiaDeviceContextIntegration, MemoryAllocationViaBackend)
 
     constexpr size_t SIZE = 1024 * sizeof(float);
     int device_id = 0;
+    test::ScopedGPUStream stream(DeviceId::cuda(device_id));
 
     // Allocate through backend
     void *d_ptr = backend->allocate(SIZE, device_id);
     ASSERT_NE(d_ptr, nullptr) << "Device allocation failed";
 
     // Set memory to verify it's accessible
-    bool memset_ok = backend->memset(d_ptr, 0, SIZE, device_id);
+    bool memset_ok = backend->memset(
+        d_ptr, 0, SIZE, device_id, stream.get());
     EXPECT_TRUE(memset_ok) << "Device memset failed";
 
     // Synchronize to ensure operation completed
-    bool sync_ok = backend->synchronize(device_id);
+    bool sync_ok = backend->synchronizeStream(stream.get(), device_id);
     EXPECT_TRUE(sync_ok) << "Device synchronize failed";
 
     // Free through backend
     backend->free(d_ptr, device_id);
+}
+
+TEST(Test__NvidiaDeviceContextIntegration, NullExecutionStreamsFailHard)
+{
+    if (!GPUDeviceContextPool::instance().hasNvidiaSupport())
+        GTEST_SKIP() << "CUDA not available";
+
+    expectNullExecutionStreamsRejected(getCUDABackend(), 0);
 }
 
 /**
@@ -126,6 +220,7 @@ TEST(Test__NvidiaDeviceContextIntegration, HostDeviceTransferViaBackend)
 
     constexpr size_t N = 1024;
     int device_id = 0;
+    test::ScopedGPUStream stream(DeviceId::cuda(device_id));
 
     std::vector<float> h_src(N);
     std::vector<float> h_dst(N, 0.0f);
@@ -138,15 +233,17 @@ TEST(Test__NvidiaDeviceContextIntegration, HostDeviceTransferViaBackend)
     ASSERT_NE(d_ptr, nullptr) << "Device allocation failed";
 
     // H2D transfer
-    bool h2d_ok = backend->hostToDevice(d_ptr, h_src.data(), N * sizeof(float), device_id);
+    bool h2d_ok = backend->hostToDevice(
+        d_ptr, h_src.data(), N * sizeof(float), device_id, stream.get());
     ASSERT_TRUE(h2d_ok) << "H2D transfer failed";
 
     // D2H transfer
-    bool d2h_ok = backend->deviceToHost(h_dst.data(), d_ptr, N * sizeof(float), device_id);
+    bool d2h_ok = backend->deviceToHost(
+        h_dst.data(), d_ptr, N * sizeof(float), device_id, stream.get());
     ASSERT_TRUE(d2h_ok) << "D2H transfer failed";
 
     // Synchronize
-    backend->synchronize(device_id);
+    ASSERT_TRUE(backend->synchronizeStream(stream.get(), device_id));
 
     // Verify data integrity
     EXPECT_EQ(h_src, h_dst) << "Data mismatch after round-trip transfer";
@@ -440,21 +537,31 @@ TEST(Test__AMDDeviceContextIntegration, MemoryAllocationViaBackend)
 
     constexpr size_t SIZE = 1024 * sizeof(float);
     int device_id = 0;
+    test::ScopedGPUStream stream(DeviceId::rocm(device_id));
 
     // Allocate through backend
     void *d_ptr = backend->allocate(SIZE, device_id);
     ASSERT_NE(d_ptr, nullptr) << "Device allocation failed";
 
     // Set memory to verify it's accessible
-    bool memset_ok = backend->memset(d_ptr, 0, SIZE, device_id);
+    bool memset_ok = backend->memset(
+        d_ptr, 0, SIZE, device_id, stream.get());
     EXPECT_TRUE(memset_ok) << "Device memset failed";
 
     // Synchronize to ensure operation completed
-    bool sync_ok = backend->synchronize(device_id);
+    bool sync_ok = backend->synchronizeStream(stream.get(), device_id);
     EXPECT_TRUE(sync_ok) << "Device synchronize failed";
 
     // Free through backend
     backend->free(d_ptr, device_id);
+}
+
+TEST(Test__AMDDeviceContextIntegration, NullExecutionStreamsFailHard)
+{
+    if (!GPUDeviceContextPool::instance().hasAMDSupport())
+        GTEST_SKIP() << "ROCm not available";
+
+    expectNullExecutionStreamsRejected(getROCmBackend(), 0);
 }
 
 /**
@@ -474,6 +581,7 @@ TEST(Test__AMDDeviceContextIntegration, HostDeviceTransferViaBackend)
 
     constexpr size_t N = 1024;
     int device_id = 0;
+    test::ScopedGPUStream stream(DeviceId::rocm(device_id));
 
     std::vector<float> h_src(N);
     std::vector<float> h_dst(N, 0.0f);
@@ -486,15 +594,17 @@ TEST(Test__AMDDeviceContextIntegration, HostDeviceTransferViaBackend)
     ASSERT_NE(d_ptr, nullptr) << "Device allocation failed";
 
     // H2D transfer
-    bool h2d_ok = backend->hostToDevice(d_ptr, h_src.data(), N * sizeof(float), device_id);
+    bool h2d_ok = backend->hostToDevice(
+        d_ptr, h_src.data(), N * sizeof(float), device_id, stream.get());
     ASSERT_TRUE(h2d_ok) << "H2D transfer failed";
 
     // D2H transfer
-    bool d2h_ok = backend->deviceToHost(h_dst.data(), d_ptr, N * sizeof(float), device_id);
+    bool d2h_ok = backend->deviceToHost(
+        h_dst.data(), d_ptr, N * sizeof(float), device_id, stream.get());
     ASSERT_TRUE(d2h_ok) << "D2H transfer failed";
 
     // Synchronize
-    backend->synchronize(device_id);
+    ASSERT_TRUE(backend->synchronizeStream(stream.get(), device_id));
 
     // Verify data integrity
     EXPECT_EQ(h_src, h_dst) << "Data mismatch after round-trip transfer";

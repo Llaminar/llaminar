@@ -1,6 +1,6 @@
 /**
  * @file Test__DeviceLoadPipeline.cpp
- * @brief Integration tests for DeviceLoadPipeline: pipelined H2D + GPU repack
+ * @brief GPU integration tests for DeviceLoadPipeline: pipelined H2D + GPU repack
  *
  * Tests the complete pipeline: host blocks → pinned staging → H2D async →
  * GPU repack → final VNNI layout in WeightVRAMPool slots.
@@ -24,6 +24,7 @@
 #include "loaders/gpu_pipeline/RepackFormat.h"
 #include "backends/BackendManager.h"
 #include "tensors/BlockStructures.h"
+#include "../../utils/ScopedGPUStream.h"
 
 #ifdef HAVE_ROCM
 #include "kernels/rocm/repack/VnniRepackKernels.h"
@@ -656,6 +657,7 @@ TEST(Test__DeviceLoadPipelineCUDA, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
     if (!backend)
         GTEST_SKIP() << "CUDA backend unavailable";
     backend->setDevice(0);
+    test::ScopedGPUStream verification_stream(DeviceId::cuda(0));
 
     const int N = 64;
     const int K = 128;
@@ -690,9 +692,11 @@ TEST(Test__DeviceLoadPipelineCUDA, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
     std::vector<uint8_t> actual_payload(expected_payload.size());
     std::vector<uint16_t> actual_scales(expected_scales.size());
     ASSERT_TRUE(backend->deviceToHost(actual_payload.data(), slot->d_native_vnni_payload,
-                                      actual_payload.size(), 0));
+                                      actual_payload.size(), 0,
+                                      verification_stream.get()));
     ASSERT_TRUE(backend->deviceToHost(actual_scales.data(), slot->d_native_vnni_scales,
-                                      actual_scales.size() * sizeof(uint16_t), 0));
+                                      actual_scales.size() * sizeof(uint16_t), 0,
+                                      verification_stream.get()));
     EXPECT_EQ(actual_payload, expected_payload);
     EXPECT_EQ(actual_scales, expected_scales);
     orch.release();

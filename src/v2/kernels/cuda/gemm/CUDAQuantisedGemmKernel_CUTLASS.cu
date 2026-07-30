@@ -19,6 +19,7 @@
 #include <algorithm>
 
 #include "backends/BackendManager.h"
+#include "backends/GPUDeviceContextPool.h"
 
 // =========================================================================
 // CUDA Error Checking Macros
@@ -340,7 +341,23 @@ extern "C"
         *d_dst = backend->allocate(bytes, cuda_device_id);
         if (!*d_dst)
             return false;
-        if (!backend->hostToDevice(*d_dst, h_src, bytes, cuda_device_id))
+        void *const setup_stream =
+            llaminar2::GPUDeviceContextPool::instance()
+                .getNvidiaContext(cuda_device_id)
+                .defaultStream();
+        if (!setup_stream)
+        {
+            backend->free(*d_dst, cuda_device_id);
+            *d_dst = nullptr;
+            throw std::runtime_error(
+                "[CUDAQuantGemm] Packed-weight upload has no explicit setup stream");
+        }
+        if (!backend->hostToDevice(
+                *d_dst,
+                h_src,
+                bytes,
+                cuda_device_id,
+                setup_stream))
         {
             backend->free(*d_dst, cuda_device_id);
             *d_dst = nullptr;

@@ -367,6 +367,13 @@ namespace llaminar2
         /// Key: arrival order (0, 1, ...), Value: tensor pointer
         std::vector<TensorBase *> barrier_tensors_;
 
+        /// Exact producer stream paired with each barrier tensor.
+        ///
+        /// CPU participants publish nullptr. GPU participants are accepted only
+        /// by the deliberately heterogeneous HOST collective and must publish
+        /// the non-null stream that produced their tensor.
+        std::vector<void *> barrier_producer_streams_;
+
         /// Tensor being reduced (set by first arrival, used by executor) [DEPRECATED: use barrier_tensors_]
         TensorBase *barrier_tensor_{nullptr};
 
@@ -572,7 +579,11 @@ namespace llaminar2
          * @param count Number of elements to reduce (0 = use tensor->numel())
          * @return true on success (same result for all participants)
          */
-        bool allreduceCpuBarrier(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
+        bool allreduceCpuBarrier(
+            TensorBase *tensor,
+            const std::string &stage_name = "",
+            size_t count = 0,
+            void *producer_stream = nullptr);
 
         /**
          * @brief Barrier-synchronized allgather for CPU-only TP

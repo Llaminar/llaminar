@@ -90,9 +90,9 @@ namespace
                     device_id_))
                 << "Failed to prepare persistent logit-penalty workspace on "
                 << backend_name;
-            penalty_stream_ = backend_->createStream(device_id_);
-            ASSERT_NE(penalty_stream_, nullptr)
-                << "Failed to create the explicit sparse logit-penalty stream on "
+            stream_ = backend_->createStream(device_id_);
+            ASSERT_NE(stream_, nullptr)
+                << "Failed to create the fixture's explicit GPU stream on "
                 << backend_name;
 
             // Standard logits (5 tokens) — token 2 has highest logit (3.0)
@@ -114,14 +114,72 @@ namespace
                     backend_->free(argmax_partial_vals_, device_id_);
                 if (argmax_partial_idxs_)
                     backend_->free(argmax_partial_idxs_, device_id_);
-                if (penalty_stream_)
-                    backend_->destroyStream(penalty_stream_, device_id_);
+                if (stream_)
+                    backend_->destroyStream(stream_, device_id_);
             }
             argmax_partial_vals_ = nullptr;
             argmax_partial_idxs_ = nullptr;
             argmax_partial_capacity_ = 0;
-            penalty_stream_ = nullptr;
+            stream_ = nullptr;
             backend_ = nullptr;
+        }
+
+        /**
+         * @brief Enqueues a fixture-owned H2D transfer on an explicit stream.
+         *
+         * Tests which do not create a narrower graph-capture stream use the
+         * fixture stream. Tests with a dedicated producer stream pass it via
+         * the overload below so transfer ordering remains local and visible.
+         */
+        bool copyHostToDevice(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            int device_id)
+        {
+            return backend_->hostToDevice(
+                dst, src, bytes, device_id, stream_);
+        }
+
+        /**
+         * @brief Enqueues H2D transfer on the caller's exact producer stream.
+         */
+        bool copyHostToDevice(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            int device_id,
+            void *stream)
+        {
+            return backend_->hostToDevice(
+                dst, src, bytes, device_id, stream);
+        }
+
+        /**
+         * @brief Copies device results through the fixture's ordered stream.
+         */
+        bool copyDeviceToHost(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            int device_id)
+        {
+            return backend_->deviceToHost(
+                dst, src, bytes, device_id, stream_);
+        }
+
+        /**
+         * @brief Copies device results through the exact consumer stream.
+         */
+        bool copyDeviceToHost(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            int device_id,
+            void *stream)
+        {
+            return backend_->deviceToHost(
+                dst, src, bytes, device_id, stream);
         }
 
         // ------------------------------------------------------------------
@@ -135,7 +193,7 @@ namespace
             if (!d_ptr)
                 return nullptr;
 
-            bool ok = backend_->hostToDevice(d_ptr, logits.data(), bytes, device_id_);
+            bool ok = copyHostToDevice(d_ptr, logits.data(), bytes, device_id_);
             EXPECT_TRUE(ok) << "H2D transfer failed";
             if (!ok)
             {
@@ -162,9 +220,20 @@ namespace
         // that contract: a persistent scratch pair is allocated lazily on first
         // use and reused across calls, then freed in TearDown.
         // ------------------------------------------------------------------
+        bool argmaxF32(
+            void *d_ptr,
+            int n,
+            int device_id,
+            float *out_value,
+            int *out_index)
+        {
+            return argmaxF32(
+                d_ptr, n, device_id, out_value, out_index, stream_);
+        }
+
         bool argmaxF32(void *d_ptr, int n, int device_id,
                        float *out_value, int *out_index,
-                       void *stream = nullptr)
+                       void *stream)
         {
             if (!argmax_partial_vals_)
             {
@@ -196,15 +265,52 @@ namespace
                                                   device_id,
                                                   out_values,
                                                   out_indices,
-                                                  nullptr,
+                                                  stream_,
                                                   argmax_partial_vals_,
                                                   argmax_partial_idxs_,
                                                   argmax_partial_capacity_);
         }
 
+        bool topKF32(
+            const void *data_device,
+            int n,
+            int k,
+            int device_id,
+            float *out_values,
+            int *out_indices)
+        {
+            return topKF32(
+                data_device,
+                n,
+                k,
+                device_id,
+                out_values,
+                out_indices,
+                stream_);
+        }
+
+        bool topKF32(
+            const void *data_device,
+            int n,
+            int k,
+            int device_id,
+            float *out_values,
+            int *out_indices,
+            void *stream)
+        {
+            return backend_->topKF32(
+                data_device,
+                n,
+                k,
+                device_id,
+                out_values,
+                out_indices,
+                stream);
+        }
+
         IBackend *backend_ = nullptr;
         int device_id_ = 0;
-        void *penalty_stream_ = nullptr;
+        void *stream_ = nullptr;
 
         // Persistent argmax partial-reduction scratch (allocated on first use).
         void *argmax_partial_vals_ = nullptr;
@@ -266,13 +372,13 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_proposals,
                     proposal_matrix.data(),
                     proposal_matrix.size() * sizeof(int32_t),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_base_positions,
                     base_positions.data(),
                     base_positions.size() * sizeof(int32_t),
@@ -298,9 +404,9 @@ namespace
 
         std::array<int32_t, request_count> conditions{};
         std::array<int32_t, request_count> positions{};
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             conditions.data(), d_conditions, sizeof(conditions), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             positions.data(), d_positions, sizeof(positions), device_id_));
         EXPECT_EQ(conditions,
                   (std::array<int32_t, request_count>{102, 202, 302, 402}));
@@ -369,7 +475,7 @@ namespace
 
                 for (size_t replay = 0; replay < live_positions.size(); ++replay)
                 {
-                    ASSERT_TRUE(backend_->hostToDevice(
+                    ASSERT_TRUE(copyHostToDevice(
                         d_live_positions,
                         live_positions[replay].data(),
                         request_count * sizeof(int32_t),
@@ -377,7 +483,7 @@ namespace
                         stream));
                     ASSERT_TRUE(capture->launch());
                     ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         observed[replay].data(),
                         d_verifier_positions,
                         total_rows * sizeof(int32_t),
@@ -476,13 +582,13 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target_token,
                     &target_token,
                     sizeof(target_token),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_token,
                     &draft_token,
                     sizeof(draft_token),
@@ -517,7 +623,7 @@ namespace
 
                 for (size_t replay = 0; replay < live_positions.size(); ++replay)
                 {
-                    ASSERT_TRUE(backend_->hostToDevice(
+                    ASSERT_TRUE(copyHostToDevice(
                         d_live_position,
                         &live_positions[replay],
                         sizeof(live_positions[replay]),
@@ -526,22 +632,22 @@ namespace
                     ASSERT_TRUE(capture->launch());
                     ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         &observed_target_tokens[replay],
                         d_target_condition,
                         sizeof(int32_t),
                         device_id_));
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         &observed_target_positions[replay],
                         d_target_position,
                         sizeof(int32_t),
                         device_id_));
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         &observed_draft_tokens[replay],
                         d_draft_condition,
                         sizeof(int32_t),
                         device_id_));
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         &observed_draft_positions[replay],
                         d_draft_position,
                         sizeof(int32_t),
@@ -656,15 +762,15 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_meta, meta.data(), sizeof(meta), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_output_tokens,
                     output_tokens.data(),
                     sizeof(output_tokens),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_base_positions,
                     base_positions.data(),
                     sizeof(base_positions),
@@ -702,12 +808,12 @@ namespace
 
         std::array<int32_t, request_count * row_count> prepared_tokens{};
         std::array<int32_t, request_count * row_count> prepared_positions{};
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             prepared_tokens.data(),
             d_prepared_tokens,
             sizeof(prepared_tokens),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             prepared_positions.data(),
             d_prepared_positions,
             sizeof(prepared_positions),
@@ -766,13 +872,13 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_samples,
                     sampled_tokens.data(),
                     sampled_tokens.size() * sizeof(int32_t),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target,
                     prompt_lengths.data(),
                     prompt_lengths.size() * sizeof(int32_t),
@@ -802,7 +908,7 @@ namespace
         auto read = [&](void *device_row)
         {
             std::array<int32_t, request_count> host{};
-            EXPECT_TRUE(backend_->deviceToHost(
+            EXPECT_TRUE(copyDeviceToHost(
                 host.data(), device_row, sizeof(host), device_id_));
             return host;
         };
@@ -887,13 +993,13 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_token_ids,
                     token_ids.data(),
                     sizeof(token_ids),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_probabilities,
                     probabilities.data(),
                     sizeof(probabilities),
@@ -936,7 +1042,7 @@ namespace
 
                 for (size_t replay = 0; replay < position_rows.size(); ++replay)
                 {
-                    ASSERT_TRUE(backend_->hostToDevice(
+                    ASSERT_TRUE(copyHostToDevice(
                         d_target,
                         position_rows[replay].data(),
                         sizeof(position_rows[replay]),
@@ -945,49 +1051,49 @@ namespace
                     ASSERT_TRUE(capture->launch());
                     ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         sampled_results[replay].data(),
                         d_samples,
                         sizeof(sampled_results[replay]),
                         device_id_,
                         stream));
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         base_results[replay].data(),
                         d_base,
                         sizeof(base_results[replay]),
                         device_id_,
                         stream));
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         target_results[replay].data(),
                         d_target,
                         sizeof(target_results[replay]),
                         device_id_,
                         stream));
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         accepted_results[replay].data(),
                         d_accepted,
                         sizeof(accepted_results[replay]),
                         device_id_,
                         stream));
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         next_results[replay].data(),
                         d_next,
                         sizeof(next_results[replay]),
                         device_id_,
                         stream));
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         all_accepted_results[replay].data(),
                         d_all_accepted,
                         sizeof(all_accepted_results[replay]),
                         device_id_,
                         stream));
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         stopped_results[replay].data(),
                         d_stopped,
                         sizeof(stopped_results[replay]),
                         device_id_,
                         stream));
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         ok_results[replay].data(),
                         d_ok,
                         sizeof(ok_results[replay]),
@@ -1570,19 +1676,19 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits,
                     logits.data(),
                     logits.size() * sizeof(float),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_values,
                     initial_values.data(),
                     initial_values.size() * sizeof(float),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_indices,
                     initial_indices.data(),
                     initial_indices.size() * sizeof(int),
@@ -1617,12 +1723,12 @@ namespace
 
         std::array<float, output_span> values{};
         std::array<int, output_span> indices{};
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             values.data(),
             d_values,
             values.size() * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             indices.data(),
             d_indices,
             indices.size() * sizeof(int),
@@ -1729,13 +1835,13 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits,
                     logits.data(),
                     logits.size() * sizeof(float),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens,
                     draft_tokens,
                     sizeof(draft_tokens),
@@ -1815,12 +1921,12 @@ namespace
 
         int gpu_tokens[kSpeculativeBatchMaxOutputTokens] = {};
         int gpu_meta[kSpeculativeBatchMetaCount] = {};
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             gpu_tokens,
             d_output_tokens,
             sizeof(gpu_tokens),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             gpu_meta,
             d_output_meta,
             sizeof(gpu_meta),
@@ -2073,19 +2179,19 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits,
                     logits.data(),
                     logits.size() * sizeof(float),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens,
                     draft_tokens.data(),
                     draft_tokens.size() * sizeof(int),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_counts,
                     initial_counts.data(),
                     initial_counts.size() * sizeof(int),
@@ -2161,27 +2267,27 @@ namespace
             std::vector<int> actual_counts(
                 static_cast<size_t>(vocab_size),
                 -1);
-            ASSERT_TRUE(backend_->deviceToHost(
+            ASSERT_TRUE(copyDeviceToHost(
                 actual_values.data(),
                 d_argmax_values,
                 actual_values.size() * sizeof(float),
                 device_id_));
-            ASSERT_TRUE(backend_->deviceToHost(
+            ASSERT_TRUE(copyDeviceToHost(
                 actual_indices.data(),
                 d_argmax_indices,
                 actual_indices.size() * sizeof(int),
                 device_id_));
-            ASSERT_TRUE(backend_->deviceToHost(
+            ASSERT_TRUE(copyDeviceToHost(
                 actual_output_tokens.data(),
                 d_output_tokens,
                 actual_output_tokens.size() * sizeof(int),
                 device_id_));
-            ASSERT_TRUE(backend_->deviceToHost(
+            ASSERT_TRUE(copyDeviceToHost(
                 actual_output_meta.data(),
                 d_output_meta,
                 actual_output_meta.size() * sizeof(int),
                 device_id_));
-            ASSERT_TRUE(backend_->deviceToHost(
+            ASSERT_TRUE(copyDeviceToHost(
                 actual_counts.data(),
                 d_counts,
                 actual_counts.size() * sizeof(int),
@@ -2331,13 +2437,13 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits,
                     logits.data(),
                     logits.size() * sizeof(float),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens,
                     draft_tokens,
                     sizeof(draft_tokens),
@@ -2384,17 +2490,17 @@ namespace
         int gpu_indices[rows] = {};
         int gpu_tokens[kSpeculativeBatchMaxOutputTokens] = {};
         int gpu_meta[kSpeculativeBatchMetaCount] = {};
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             gpu_indices,
             d_argmax_indices,
             sizeof(gpu_indices),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             gpu_tokens,
             d_output_tokens,
             sizeof(gpu_tokens),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             gpu_meta,
             d_output_meta,
             sizeof(gpu_meta),
@@ -2414,7 +2520,7 @@ namespace
     {
         using namespace sampling_math;
 
-        constexpr int request_count = 3;
+        constexpr int request_count = 4;
         constexpr int padded_state_rows_per_request = 4;
         constexpr int max_state_commit_rows = 3;
         constexpr int meta_stride = kSpeculativeBatchMetaCount;
@@ -2422,7 +2528,8 @@ namespace
         std::array<int, request_count * meta_stride> meta{};
         std::array<int, request_count * kSpeculativeBatchMaxOutputTokens>
             output_tokens{};
-        std::array<int, request_count> base_cached_tokens = {100, 200, 300};
+        std::array<int, request_count> base_cached_tokens = {
+            100, 200, 300, 400};
 
         const int accept_rows[] = {11, 12};
         const int accept_flags[] = {1, 1};
@@ -2457,6 +2564,9 @@ namespace
         meta[2 * meta_stride + kSpecBatchMetaOk] = 1;
         meta[2 * meta_stride + kSpecBatchMetaTargetVerifierStateCommitCount] =
             max_state_commit_rows + 1;
+        meta[3 * meta_stride + kSpecBatchMetaOk] = 1;
+        meta[3 * meta_stride + kSpecBatchMetaTargetVerifierStateCommitCount] =
+            padded_state_rows_per_request + 1;
 
         void *d_meta = backend_->allocate(meta.size() * sizeof(int), device_id_);
         void *d_base = backend_->allocate(base_cached_tokens.size() * sizeof(int), device_id_);
@@ -2507,19 +2617,19 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_meta,
                     meta.data(),
                     meta.size() * sizeof(int),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_base,
                     base_cached_tokens.data(),
                     base_cached_tokens.size() * sizeof(int),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_output_tokens,
                     output_tokens.data(),
                     output_tokens.size() * sizeof(int),
@@ -2593,25 +2703,25 @@ namespace
         std::array<int, request_count> next_condition_tokens{};
         std::array<int, request_count> all_drafts_accepted{};
         std::array<int, request_count> stopped{};
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             restore_rows.data(), d_restore_rows,
             restore_rows.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             target_cached_tokens.data(), d_target_cached_tokens,
             target_cached_tokens.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             accepted_state_counts.data(), d_accepted_state_counts,
             accepted_state_counts.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             ok.data(), d_ok,
             ok.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             next_condition_tokens.data(), d_next_condition_tokens,
             next_condition_tokens.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             all_drafts_accepted.data(), d_all_drafts_accepted,
             all_drafts_accepted.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             stopped.data(), d_stopped,
             stopped.size() * sizeof(int), device_id_));
 
@@ -2633,13 +2743,21 @@ namespace
         EXPECT_EQ(all_drafts_accepted[1], 0);
         EXPECT_EQ(stopped[1], 0);
 
-        EXPECT_EQ(ok[2], 0);
-        EXPECT_EQ(accepted_state_counts[2], 0);
-        EXPECT_EQ(restore_rows[2], -1);
-        EXPECT_EQ(target_cached_tokens[2], 300);
+        EXPECT_EQ(ok[2], 1);
+        EXPECT_EQ(accepted_state_counts[2], max_state_commit_rows);
+        EXPECT_EQ(restore_rows[2], 10);
+        EXPECT_EQ(target_cached_tokens[2], 303);
         EXPECT_EQ(next_condition_tokens[2], -1);
         EXPECT_EQ(all_drafts_accepted[2], 0);
         EXPECT_EQ(stopped[2], 0);
+
+        EXPECT_EQ(ok[3], 0);
+        EXPECT_EQ(accepted_state_counts[3], 0);
+        EXPECT_EQ(restore_rows[3], -1);
+        EXPECT_EQ(target_cached_tokens[3], 400);
+        EXPECT_EQ(next_condition_tokens[3], -1);
+        EXPECT_EQ(all_drafts_accepted[3], 0);
+        EXPECT_EQ(stopped[3], 0);
     }
 
     // =========================================================================
@@ -2654,7 +2772,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(standard_logits_.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(standard_logits_.size()),
                                     1, device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok) << "topKF32 not supported on " << GetParam();
 
@@ -2672,7 +2790,7 @@ namespace
 
         std::vector<float> values(2);
         std::vector<int> indices(2);
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(standard_logits_.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(standard_logits_.size()),
                                     2, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
@@ -2693,7 +2811,7 @@ namespace
 
         std::vector<float> values(3);
         std::vector<int> indices(3);
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(standard_logits_.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(standard_logits_.size()),
                                     3, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
@@ -2716,7 +2834,7 @@ namespace
 
         std::vector<float> values(n);
         std::vector<int> indices(n);
-        bool ok = backend_->topKF32(d_ptr, n, n, device_id_, values.data(), indices.data());
+        bool ok = topKF32(d_ptr, n, n, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
         // Should be sorted descending: 3.0, 2.0, 1.5, 1.0, 0.5
@@ -2745,7 +2863,7 @@ namespace
         const int k = 5;
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(logits.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(logits.size()),
                                     k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
@@ -2773,7 +2891,7 @@ namespace
 
         std::vector<float> values(3);
         std::vector<int> indices(3);
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(peaked_logits_.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(peaked_logits_.size()),
                                     3, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
@@ -2795,7 +2913,7 @@ namespace
 
         std::vector<float> values(3);
         std::vector<int> indices(3);
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(negative.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(negative.size()),
                                     3, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
@@ -2818,7 +2936,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->topKF32(d_ptr, 1, 1, device_id_, &out_value, &out_index);
+        bool ok = topKF32(d_ptr, 1, 1, device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(out_index, 0);
@@ -2836,7 +2954,7 @@ namespace
         const int k = 3;
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(uniform_logits_.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(uniform_logits_.size()),
                                     k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
@@ -2859,7 +2977,7 @@ namespace
         const int k = 2;
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(zeros.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(zeros.size()),
                                     k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
@@ -2885,7 +3003,7 @@ namespace
         const int k = 3;
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(large.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(large.size()),
                                     k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
@@ -2910,7 +3028,7 @@ namespace
         const int k = 2;
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(small.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(small.size()),
                                     k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
@@ -2932,7 +3050,7 @@ namespace
         const int k = 2;
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(mixed.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(mixed.size()),
                                     k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
@@ -2961,7 +3079,7 @@ namespace
         const int k = 3;
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        bool ok = backend_->topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
+        bool ok = topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(indices[0], 100);
@@ -2991,7 +3109,7 @@ namespace
         const int k = 5;
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        bool ok = backend_->topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
+        bool ok = topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
         // Verify correct ranking
@@ -3029,7 +3147,7 @@ namespace
 
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        bool ok = backend_->topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
+        bool ok = topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
         // Verify descending order
@@ -3069,7 +3187,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->topKF32(d_ptr, n, 1, device_id_, &out_value, &out_index);
+        bool ok = topKF32(d_ptr, n, 1, device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(out_index, n - 1);
@@ -3090,7 +3208,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->topKF32(d_ptr, n, 1, device_id_, &out_value, &out_index);
+        bool ok = topKF32(d_ptr, n, 1, device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(out_index, 0);
@@ -3109,7 +3227,7 @@ namespace
         const int k = 4;
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(dups.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(dups.size()),
                                     k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
@@ -3147,7 +3265,7 @@ namespace
 
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        bool ok = backend_->topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
+        bool ok = topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
         // Top element should be index 0 with value 1000
@@ -3185,7 +3303,7 @@ namespace
 
         float topk_value = 0.0f;
         int topk_index = -1;
-        bool ok2 = backend_->topKF32(d_ptr, static_cast<int>(standard_logits_.size()),
+        bool ok2 = topKF32(d_ptr, static_cast<int>(standard_logits_.size()),
                                      1, device_id_, &topk_value, &topk_index);
 
         if (ok1 && ok2)
@@ -3211,7 +3329,7 @@ namespace
         int argmax_index = -1, topk_index = -1;
 
         bool ok1 = argmaxF32(d_ptr, n, device_id_, &argmax_value, &argmax_index);
-        bool ok2 = backend_->topKF32(d_ptr, n, 1, device_id_, &topk_value, &topk_index);
+        bool ok2 = topKF32(d_ptr, n, 1, device_id_, &topk_value, &topk_index);
 
         if (ok1 && ok2)
         {
@@ -3235,7 +3353,7 @@ namespace
         int n = static_cast<int>(standard_logits_.size());
         std::vector<float> values(n);
         std::vector<int> indices(n);
-        bool ok = backend_->topKF32(d_ptr, n, n, device_id_, values.data(), indices.data());
+        bool ok = topKF32(d_ptr, n, n, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
         // Each returned (index, value) pair should match the original logits
@@ -3260,7 +3378,7 @@ namespace
         const int k = 5;
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        bool ok = backend_->topKF32(d_ptr, static_cast<int>(logits.size()),
+        bool ok = topKF32(d_ptr, static_cast<int>(logits.size()),
                                     k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
@@ -3303,7 +3421,7 @@ namespace
         const int k = 3;
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        ok = backend_->topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
+        ok = topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(indices[0], 50000);
@@ -3374,7 +3492,7 @@ namespace
         const int k = 5;
         std::vector<float> values(k);
         std::vector<int> indices(k);
-        ok = backend_->topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
+        ok = topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
         std::set<int> expected_top5 = {256, 8159, 100160, 72363, 105797};
@@ -3431,7 +3549,7 @@ namespace
 
             std::vector<float> values(k);
             std::vector<int> indices(k);
-            bool ok = backend_->topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
+            bool ok = topKF32(d_ptr, n, k, device_id_, values.data(), indices.data());
             ASSERT_TRUE(ok) << "Iteration " << iter;
 
             // Top-1 should always be the highest planted peak
@@ -3451,7 +3569,7 @@ namespace
     // ------------------------------------------------------------------
     static std::vector<float> downloadLogits(IBackend *backend, void *d_ptr,
                                              int count, int device_id,
-                                             void *stream = nullptr)
+                                             void *stream)
     {
         std::vector<float> result(count);
         bool ok = backend->deviceToHost(result.data(), d_ptr,
@@ -3860,12 +3978,12 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            1, static_cast<int>(logits.size()), device_id_, penalty_stream_);
+            1, static_cast<int>(logits.size()), device_id_, stream_);
         ASSERT_TRUE(ok) << "applyLogitPenaltiesF32 not supported on " << GetParam();
 
         auto result = downloadLogits(backend_, d_ptr,
                                      static_cast<int>(logits.size()), device_id_,
-                                     penalty_stream_);
+                                     stream_);
 
         // Token 2: 5.0 - 3.0 = 2.0
         EXPECT_FLOAT_EQ(result[0], 1.0f) << "Unpenalized tokens should be unchanged";
@@ -3888,12 +4006,12 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            3, static_cast<int>(logits.size()), device_id_, penalty_stream_);
+            3, static_cast<int>(logits.size()), device_id_, stream_);
         ASSERT_TRUE(ok);
 
         auto result = downloadLogits(backend_, d_ptr,
                                      static_cast<int>(logits.size()), device_id_,
-                                     penalty_stream_);
+                                     stream_);
 
         EXPECT_FLOAT_EQ(result[0], 9.0f);  // 10 - 1
         EXPECT_FLOAT_EQ(result[1], 20.0f); // unchanged
@@ -3915,13 +4033,14 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, nullptr, nullptr, 0,
-            static_cast<int>(logits.size()), device_id_, penalty_stream_);
+            static_cast<int>(logits.size()), device_id_, stream_);
         // Backends early-return false for num_penalties <= 0
         EXPECT_FALSE(ok) << "Zero penalties → backend returns false (no-op)";
 
         // Logits should still be unchanged
         auto result = downloadLogits(backend_, d_ptr,
-                                     static_cast<int>(logits.size()), device_id_);
+                                     static_cast<int>(logits.size()), device_id_,
+                                     stream_);
         EXPECT_FLOAT_EQ(result[0], 1.0f);
         EXPECT_FLOAT_EQ(result[1], 2.0f);
         EXPECT_FLOAT_EQ(result[2], 3.0f);
@@ -3941,12 +4060,12 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            3, static_cast<int>(logits.size()), device_id_, penalty_stream_);
+            3, static_cast<int>(logits.size()), device_id_, stream_);
         ASSERT_TRUE(ok);
 
         auto result = downloadLogits(backend_, d_ptr,
                                      static_cast<int>(logits.size()), device_id_,
-                                     penalty_stream_);
+                                     stream_);
 
         EXPECT_FLOAT_EQ(result[0], 5.0f) << "OOB tokens should not corrupt logits";
         EXPECT_FLOAT_EQ(result[1], 3.0f) << "Valid token should be penalized: 5.0 - 2.0";
@@ -3967,12 +4086,12 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            1, static_cast<int>(logits.size()), device_id_, penalty_stream_);
+            1, static_cast<int>(logits.size()), device_id_, stream_);
         ASSERT_TRUE(ok);
 
         auto result = downloadLogits(backend_, d_ptr,
                                      static_cast<int>(logits.size()), device_id_,
-                                     penalty_stream_);
+                                     stream_);
 
         EXPECT_FLOAT_EQ(result[0], 0.0f);
         EXPECT_FLOAT_EQ(result[1], 5.0f) << "Negative penalty should boost: 0.0 - (-5.0) = 5.0";
@@ -4001,12 +4120,12 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            1, static_cast<int>(logits.size()), device_id_, penalty_stream_);
+            1, static_cast<int>(logits.size()), device_id_, stream_);
         ASSERT_TRUE(ok);
 
         // After penalty, argmax should shift to token 1
         argmaxF32(d_ptr, static_cast<int>(logits.size()),
-                            device_id_, &val, &idx, penalty_stream_);
+                            device_id_, &val, &idx, stream_);
         EXPECT_EQ(idx, 1) << "After penalty, argmax should shift to token 1 (9.5 > 8.0)";
         EXPECT_FLOAT_EQ(val, 9.5f);
 
@@ -4031,14 +4150,14 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            3, vocab_size, device_id_, penalty_stream_);
+            3, vocab_size, device_id_, stream_);
         ASSERT_TRUE(ok);
 
         // Verify via argmax — token 42 should now win (9.0 - 1.0 = 8.0 > 10.0 - 5.0 = 5.0)
         // token 1000: 8.0 - 0.5 = 7.5
         float val = 0;
         int idx = -1;
-        argmaxF32(d_ptr, vocab_size, device_id_, &val, &idx, penalty_stream_);
+        argmaxF32(d_ptr, vocab_size, device_id_, &val, &idx, stream_);
         EXPECT_EQ(idx, 42) << "After penalties, token 42 (8.0) should beat token 0 (5.0)";
 
         freeDevice(d_ptr);
@@ -4063,11 +4182,11 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            num_penalties, vocab_size, device_id_, penalty_stream_);
+            num_penalties, vocab_size, device_id_, stream_);
         ASSERT_TRUE(ok);
 
         auto result = downloadLogits(
-            backend_, d_ptr, vocab_size, device_id_, penalty_stream_);
+            backend_, d_ptr, vocab_size, device_id_, stream_);
 
         // First 256 tokens should be 0.5, rest should be 1.0
         for (int i = 0; i < num_penalties; ++i)
@@ -4105,11 +4224,11 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            2, vocab_size, device_id_, penalty_stream_);
+            2, vocab_size, device_id_, stream_);
         ASSERT_TRUE(ok);
 
         auto result = downloadLogits(
-            backend_, d_ptr, vocab_size, device_id_, penalty_stream_);
+            backend_, d_ptr, vocab_size, device_id_, stream_);
 
         EXPECT_NEAR(result[2], 10.0f - dry_3, 0.001f)
             << "Token 2 should have DRY penalty for repeat_len=3";
@@ -4136,15 +4255,15 @@ namespace
 
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalties.data(),
-            2, static_cast<int>(logits.size()), device_id_, penalty_stream_);
+            2, static_cast<int>(logits.size()), device_id_, stream_);
         ASSERT_TRUE(ok);
 
         // topK=3: should now be [2(8.0), 3(7.0), 4(6.0)] instead of [0,1,2]
         std::vector<float> values(3);
         std::vector<int> indices(3);
-        ok = backend_->topKF32(d_ptr, static_cast<int>(logits.size()),
+        ok = topKF32(d_ptr, static_cast<int>(logits.size()),
                                3, device_id_, values.data(), indices.data(),
-                               penalty_stream_);
+                               stream_);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(indices[0], 2) << "After penalty, token 2 (8.0) should be top-1";
@@ -4182,7 +4301,8 @@ namespace
         size_t bytes = logits.size() * sizeof(float);
         void *d_ptr = backend->allocate(bytes, device_id);
         EXPECT_NE(d_ptr, nullptr);
-        bool ok = backend->hostToDevice(d_ptr, logits.data(), bytes, device_id);
+        bool ok = backend->hostToDevice(
+            d_ptr, logits.data(), bytes, device_id, stream);
         EXPECT_TRUE(ok);
 
         if (!penalties.empty())
@@ -4247,11 +4367,11 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits, logits.data(), logits.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_token_ids, token_ids.data(), token_ids.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_penalties, penalty_vals.data(), penalty_vals.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
@@ -4285,7 +4405,8 @@ namespace
         }
 
         auto result = downloadLogits(
-            backend_, d_logits, static_cast<int>(logits.size()), device_id_);
+            backend_, d_logits, static_cast<int>(logits.size()), device_id_,
+            stream_);
         cleanup();
 
         ASSERT_EQ(result.size(), expected.size());
@@ -4331,7 +4452,7 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits, logits.data(), logits.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
                 EXPECT_FALSE(backend_->enqueueSampleTopKTopPF32Device(
@@ -4380,7 +4501,7 @@ namespace
         }
 
         int actual = -1;
-        ASSERT_TRUE(backend_->deviceToHost(&actual, d_token, sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&actual, d_token, sizeof(int), device_id_));
         cleanup();
 
         EXPECT_EQ(actual, expected)
@@ -4431,7 +4552,7 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits, logits.data(), logits.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
@@ -4468,8 +4589,8 @@ namespace
 
         std::vector<int> gpu_ids(top_k, -1);
         std::vector<float> gpu_probs(top_k, 0.0f);
-        ASSERT_TRUE(backend_->deviceToHost(gpu_ids.data(), d_token_ids, top_k * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(gpu_probs.data(), d_probs, top_k * sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(gpu_ids.data(), d_token_ids, top_k * sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(gpu_probs.data(), d_probs, top_k * sizeof(float), device_id_));
         cleanup();
 
         for (int i = 0; i < top_k; ++i)
@@ -4571,7 +4692,7 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits, logits.data(), logits.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
@@ -4614,9 +4735,9 @@ namespace
 
         std::vector<int> gpu_ids(static_cast<size_t>(rows * out_stride), -1);
         std::vector<float> gpu_probs(static_cast<size_t>(rows * out_stride), 0.0f);
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             gpu_ids.data(), d_token_ids, gpu_ids.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             gpu_probs.data(), d_probs, gpu_probs.size() * sizeof(float), device_id_));
         cleanup();
 
@@ -4727,7 +4848,7 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits, logits.data(), logits.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
@@ -4787,11 +4908,11 @@ namespace
         int sample_token = -1;
         float sample_probability = 0.0f;
         int direct_token = -1;
-        ASSERT_TRUE(backend_->deviceToHost(gpu_ids.data(), d_token_ids, top_k * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(gpu_probs.data(), d_probs, top_k * sizeof(float), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&sample_token, d_sample_token, sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&sample_probability, d_sample_probability, sizeof(float), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&direct_token, d_direct_token, sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(gpu_ids.data(), d_token_ids, top_k * sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(gpu_probs.data(), d_probs, top_k * sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&sample_token, d_sample_token, sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&sample_probability, d_sample_probability, sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&direct_token, d_direct_token, sizeof(int), device_id_));
         cleanup();
 
         for (int i = 0; i < top_k; ++i)
@@ -4895,7 +5016,7 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits,
                     logits.data(),
                     logits.size() * sizeof(float),
@@ -4934,7 +5055,7 @@ namespace
                         << "replay=" << replay;
 
                     int sample_token = -1;
-                    ASSERT_TRUE(backend_->deviceToHost(
+                    ASSERT_TRUE(copyDeviceToHost(
                         &sample_token, d_sample_token, sizeof(int), device_id_))
                         << "replay=" << replay;
                     EXPECT_EQ(sample_token, expected_sample)
@@ -4957,9 +5078,9 @@ namespace
 
         std::vector<int> gpu_ids(top_k, -1);
         std::vector<float> gpu_probs(top_k, 0.0f);
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             gpu_ids.data(), d_token_ids, top_k * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             gpu_probs.data(), d_probs, top_k * sizeof(float), device_id_));
         cleanup();
 
@@ -5069,7 +5190,7 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits,
                     logits.data(),
                     logits.size() * sizeof(float),
@@ -5151,13 +5272,13 @@ namespace
             std::vector<float> gpu_probs(top_k, 0.0f);
             int sample_token = -1;
             int direct_token = -1;
-            ASSERT_TRUE(backend_->deviceToHost(
+            ASSERT_TRUE(copyDeviceToHost(
                 gpu_ids.data(), d_token_ids, top_k * sizeof(int), device_id_));
-            ASSERT_TRUE(backend_->deviceToHost(
+            ASSERT_TRUE(copyDeviceToHost(
                 gpu_probs.data(), d_probs, top_k * sizeof(float), device_id_));
-            ASSERT_TRUE(backend_->deviceToHost(
+            ASSERT_TRUE(copyDeviceToHost(
                 &sample_token, d_sample_token, sizeof(int), device_id_));
-            ASSERT_TRUE(backend_->deviceToHost(
+            ASSERT_TRUE(copyDeviceToHost(
                 &direct_token, d_direct_token, sizeof(int), device_id_));
 
             for (int i = 0; i < top_k; ++i)
@@ -5320,7 +5441,7 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits,
                     logits.data(),
                     logits.size() * sizeof(float),
@@ -5397,17 +5518,17 @@ namespace
         std::vector<float> gpu_processed(static_cast<size_t>(row_count) * out_stride, 0.0f);
         std::array<int, row_count> gpu_samples{};
         std::array<float, row_count> gpu_sample_probs{};
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             gpu_processed.data(),
             d_processed,
             gpu_processed.size() * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             gpu_samples.data(),
             d_samples,
             gpu_samples.size() * sizeof(int),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             gpu_sample_probs.data(),
             d_sample_probs,
             gpu_sample_probs.size() * sizeof(float),
@@ -5583,13 +5704,13 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target, target_rows.data(),
                     target_rows.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft, draft_rows.data(),
                     draft_rows.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens, draft_tokens.data(),
                     draft_tokens.size() * sizeof(int), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -5634,11 +5755,11 @@ namespace
         std::vector<int> tokens(static_cast<size_t>(row_count));
         std::vector<int> accepted(static_cast<size_t>(row_count));
         std::vector<float> accept_probs(static_cast<size_t>(row_count));
-        ASSERT_TRUE(backend_->deviceToHost(tokens.data(), d_tokens,
+        ASSERT_TRUE(copyDeviceToHost(tokens.data(), d_tokens,
                                            tokens.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(accepted.data(), d_accepted,
+        ASSERT_TRUE(copyDeviceToHost(accepted.data(), d_accepted,
                                            accepted.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(accept_probs.data(), d_accept_probs,
+        ASSERT_TRUE(copyDeviceToHost(accept_probs.data(), d_accept_probs,
                                            accept_probs.size() * sizeof(float), device_id_));
 
         cleanup();
@@ -5706,7 +5827,7 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits, logits.data(), logits.size() * sizeof(float),
                     device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -5741,7 +5862,7 @@ namespace
         }
 
         std::vector<float> actual(expected.size(), -1.0f);
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             actual.data(), d_probs, actual.size() * sizeof(float), device_id_));
         cleanup();
 
@@ -5804,7 +5925,7 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_logits, logits.data(), logits.size() * sizeof(float),
                     device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -5859,17 +5980,17 @@ namespace
         std::vector<float> actual_probs(expected_probs.size(), -1.0f);
         int actual_token = -1;
         float actual_probability = -1.0f;
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             actual_probs.data(),
             d_probs,
             actual_probs.size() * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             &actual_token,
             d_token,
             sizeof(int),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             &actual_probability,
             d_probability,
             sizeof(float),
@@ -6053,10 +6174,10 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target, target_logits.data(),
                     target_logits.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_raw, draft_raw_logits.data(),
                     draft_raw_logits.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -6108,42 +6229,42 @@ namespace
 
                 ASSERT_TRUE(capture->launch());
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     first_tokens.data(), d_tokens,
                     first_tokens.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     first_accepted.data(), d_accepted,
                     first_accepted.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     first_accept_probs.data(), d_accept_probs,
                     first_accept_probs.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     actual_draft_logits.data(), d_draft_logits,
                     actual_draft_logits.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     actual_draft_tokens.data(), d_draft_tokens,
                     actual_draft_tokens.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     actual_draft_token_probs.data(), d_draft_token_probs,
                     actual_draft_token_probs.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
                 const std::array<int, row_count> sentinel_tokens = {-1, -1, -1};
                 const std::array<int, row_count> sentinel_accepted = {-7, -7, -7};
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_tokens, sentinel_tokens.data(),
                     sentinel_tokens.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_accepted, sentinel_accepted.data(),
                     sentinel_accepted.size() * sizeof(int), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
                 ASSERT_TRUE(capture->launch());
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     second_tokens.data(), d_tokens,
                     second_tokens.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     second_accepted.data(), d_accepted,
                     second_accepted.size() * sizeof(int), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -6270,7 +6391,7 @@ namespace
         }
 
         std::vector<float> actual(expected.size(), -1.0f);
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             actual.data(), d_samples, actual.size() * sizeof(float), device_id_));
         cleanup();
 
@@ -6444,13 +6565,13 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target, target_logits.data(),
                     target_logits.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft, draft_probs.data(),
                     draft_probs.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens, draft_tokens.data(),
                     draft_tokens.size() * sizeof(int), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -6479,13 +6600,13 @@ namespace
 
                 ASSERT_TRUE(capture->launch());
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     first_tokens.data(), d_tokens,
                     first_tokens.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     first_accepted.data(), d_accepted,
                     first_accepted.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     first_accept_probs.data(), d_accept_probs,
                     first_accept_probs.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -6493,26 +6614,26 @@ namespace
                 const std::array<int, row_count> sentinel_tokens = {-1, -1, -1};
                 const std::array<int, row_count> sentinel_accepted = {-7, -7, -7};
                 const std::array<float, row_count> sentinel_probs = {-1.0f, -1.0f, -1.0f};
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_tokens, sentinel_tokens.data(),
                     sentinel_tokens.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_accepted, sentinel_accepted.data(),
                     sentinel_accepted.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_accept_probs, sentinel_probs.data(),
                     sentinel_probs.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
                 ASSERT_TRUE(capture->launch());
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     second_tokens.data(), d_tokens,
                     second_tokens.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     second_accepted.data(), d_accepted,
                     second_accepted.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     second_accept_probs.data(), d_accept_probs,
                     second_accept_probs.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -6676,10 +6797,10 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target, target_logits.data(),
                     target_logits.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens, draft_tokens.data(),
                     draft_tokens.size() * sizeof(int), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -6751,36 +6872,36 @@ namespace
 
                 ASSERT_TRUE(capture->launch());
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     first_tokens.data(), d_tokens,
                     first_tokens.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     first_accepted.data(), d_accepted,
                     first_accepted.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     first_accept_probs.data(), d_accept_probs,
                     first_accept_probs.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
                 const std::array<int, row_count> sentinel_tokens = {-1, -1, -1};
                 const std::array<int, row_count> sentinel_accepted = {-7, -7, -7};
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_tokens, sentinel_tokens.data(),
                     sentinel_tokens.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_accepted, sentinel_accepted.data(),
                     sentinel_accepted.size() * sizeof(int), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
                 ASSERT_TRUE(capture->launch());
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     second_tokens.data(), d_tokens,
                     second_tokens.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     second_accepted.data(), d_accepted,
                     second_accepted.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->deviceToHost(
+                ASSERT_TRUE(copyDeviceToHost(
                     second_accept_probs.data(), d_accept_probs,
                     second_accept_probs.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -6949,16 +7070,16 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target, target_rows.data(),
                     target_rows.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft, draft_rows.data(),
                     draft_rows.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_inverse, inverse_rows.data(),
                     inverse_rows.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens, draft_tokens.data(),
                     draft_tokens.size() * sizeof(int), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -7003,11 +7124,11 @@ namespace
         std::vector<int> tokens(static_cast<size_t>(row_count));
         std::vector<int> accepted(static_cast<size_t>(row_count));
         std::vector<float> accept_probs(static_cast<size_t>(row_count));
-        ASSERT_TRUE(backend_->deviceToHost(tokens.data(), d_tokens,
+        ASSERT_TRUE(copyDeviceToHost(tokens.data(), d_tokens,
                                            tokens.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(accepted.data(), d_accepted,
+        ASSERT_TRUE(copyDeviceToHost(accepted.data(), d_accepted,
                                            accepted.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(accept_probs.data(), d_accept_probs,
+        ASSERT_TRUE(copyDeviceToHost(accept_probs.data(), d_accept_probs,
                                            accept_probs.size() * sizeof(float), device_id_));
 
         cleanup();
@@ -7076,13 +7197,13 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target, target.data(), target.size() * sizeof(float),
                     device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_inverse, inverse_samples.data(),
                     inverse_samples.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens, draft_tokens.data(),
                     draft_tokens.size() * sizeof(int), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -7129,9 +7250,9 @@ namespace
 
         std::array<int, row_count> tokens{};
         std::array<int, row_count> accepted{};
-        ASSERT_TRUE(backend_->deviceToHost(tokens.data(), d_tokens,
+        ASSERT_TRUE(copyDeviceToHost(tokens.data(), d_tokens,
                                            tokens.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(accepted.data(), d_accepted,
+        ASSERT_TRUE(copyDeviceToHost(accepted.data(), d_accepted,
                                            accepted.size() * sizeof(int), device_id_));
         cleanup();
 
@@ -7251,20 +7372,20 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target, target_rows.data(),
                     target_rows.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft, draft_rows.data(),
                     draft_rows.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens, draft_tokens.data(),
                     draft_tokens.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_token_probs, draft_token_probabilities.data(),
                     draft_token_probabilities.size() * sizeof(float),
                     device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_bonus, bonus_row.data(),
                     bonus_row.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -7334,12 +7455,12 @@ namespace
         std::array<int, sampling_math::kSpeculativeBatchMaxOutputTokens> output_tokens{};
         std::array<int, sampling_math::kSpeculativeBatchMetaCount> output_meta{};
         int bonus_token = -1;
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             &bonus_token, d_bonus_token, sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             output_tokens.data(), d_output_tokens,
             output_tokens.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             output_meta.data(), d_output_meta,
             output_meta.size() * sizeof(int), device_id_));
 
@@ -7421,16 +7542,16 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
                 int stale_bonus_token = 12345;
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_bonus, bonus_row.data(),
                     bonus_row.size() * sizeof(float), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_verify_tokens, verify_tokens.data(),
                     verify_tokens.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_verify_accepted, verify_accepted.data(),
                     verify_accepted.size() * sizeof(int), device_id_, stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_bonus_token, &stale_bonus_token, sizeof(int),
                     device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -7482,12 +7603,12 @@ namespace
         int bonus_token = 0;
         std::array<int, sampling_math::kSpeculativeBatchMaxOutputTokens> output_tokens{};
         std::array<int, sampling_math::kSpeculativeBatchMetaCount> output_meta{};
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             &bonus_token, d_bonus_token, sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             output_tokens.data(), d_output_tokens,
             output_tokens.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             output_meta.data(), d_output_meta,
             output_meta.size() * sizeof(int), device_id_));
 
@@ -7674,25 +7795,25 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target_ids,
                     target_ids.data(),
                     target_ids.size() * sizeof(int),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target_probs,
                     target_probs.data(),
                     target_probs.size() * sizeof(float),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens,
                     draft_tokens,
                     sizeof(draft_tokens),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_resident_base_position,
                     &resident_base_position,
                     sizeof(resident_base_position),
@@ -7883,82 +8004,82 @@ namespace
         int resident_bonus_token = -1;
         float resident_bonus_probability = -1.0f;
 
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             out_tokens.data(),
             d_out_tokens,
             row_count * sizeof(int),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             out_accepted.data(),
             d_out_accepted,
             row_count * sizeof(int),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             out_accept_probabilities.data(),
             d_out_accept_probability,
             row_count * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             out_accept_thresholds.data(),
             d_out_accept_threshold,
             row_count * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             seeded_out_tokens.data(),
             d_seeded_out_tokens,
             row_count * sizeof(int),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             seeded_out_accepted.data(),
             d_seeded_out_accepted,
             row_count * sizeof(int),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             seeded_out_accept_probabilities.data(),
             d_seeded_out_accept_probability,
             row_count * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             seeded_out_accept_thresholds.data(),
             d_seeded_out_accept_threshold,
             row_count * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             resident_out_tokens.data(),
             d_resident_out_tokens,
             row_count * sizeof(int),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             resident_out_accepted.data(),
             d_resident_out_accepted,
             row_count * sizeof(int),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             resident_out_accept_probabilities.data(),
             d_resident_out_accept_probability,
             row_count * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             resident_out_accept_thresholds.data(),
             d_resident_out_accept_threshold,
             row_count * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             &seeded_bonus_token,
             d_seeded_bonus_token,
             sizeof(seeded_bonus_token),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             &seeded_bonus_probability,
             d_seeded_bonus_probability,
             sizeof(seeded_bonus_probability),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             &resident_bonus_token,
             d_resident_bonus_token,
             sizeof(resident_bonus_token),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             &resident_bonus_probability,
             d_resident_bonus_probability,
             sizeof(resident_bonus_probability),
@@ -8122,25 +8243,25 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target_ids,
                     target_ids.data(),
                     target_ids.size() * sizeof(int),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target_probs,
                     target_probs.data(),
                     target_probs.size() * sizeof(float),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens,
                     draft_tokens.data(),
                     draft_tokens.size() * sizeof(int),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_base_position,
                     &base_position,
                     sizeof(base_position),
@@ -8425,37 +8546,37 @@ namespace
             {
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target_logits,
                     target_logits.data(),
                     target_logits.size() * sizeof(float),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_bonus_logits,
                     bonus_logits.data(),
                     sizeof(bonus_logits),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens,
                     draft_tokens.data(),
                     draft_tokens.size() * sizeof(int),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_bonus_verify_tokens,
                     bonus_verify_tokens.data(),
                     bonus_verify_tokens.size() * sizeof(int),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_bonus_verify_accepted,
                     bonus_verify_accepted.data(),
                     bonus_verify_accepted.size() * sizeof(int),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_resident_base_position,
                     &resident_base_position,
                     sizeof(resident_base_position),
@@ -8585,48 +8706,48 @@ namespace
         int resident_bonus_token = -1;
         float resident_bonus_probability = -1.0f;
 
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             scalar_tokens.data(), d_scalar_tokens,
             scalar_tokens.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             scalar_accepted.data(), d_scalar_accepted,
             scalar_accepted.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             scalar_accept_probabilities.data(),
             d_scalar_accept_probabilities,
             scalar_accept_probabilities.size() * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             scalar_accept_thresholds.data(),
             d_scalar_accept_thresholds,
             scalar_accept_thresholds.size() * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             resident_tokens.data(), d_resident_tokens,
             resident_tokens.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             resident_accepted.data(), d_resident_accepted,
             resident_accepted.size() * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             resident_accept_probabilities.data(),
             d_resident_accept_probabilities,
             resident_accept_probabilities.size() * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             resident_accept_thresholds.data(),
             d_resident_accept_thresholds,
             resident_accept_thresholds.size() * sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             &scalar_bonus_token, d_scalar_bonus_token, sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             &scalar_bonus_probability,
             d_scalar_bonus_probability,
             sizeof(float),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             &resident_bonus_token, d_resident_bonus_token, sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             &resident_bonus_probability,
             d_resident_bonus_probability,
             sizeof(float),
@@ -8762,19 +8883,19 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target_ids,
                     target_ids.data(),
                     target_ids.size() * sizeof(int),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target_probs,
                     target_probs.data(),
                     target_probs.size() * sizeof(float),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens,
                     draft_tokens,
                     sizeof(draft_tokens),
@@ -8840,12 +8961,12 @@ namespace
 
         std::array<int, sampling_math::kSpeculativeBatchMaxOutputTokens> output_tokens{};
         std::array<int, sampling_math::kSpeculativeBatchMetaCount> output_meta{};
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             output_tokens.data(),
             d_output_tokens,
             output_tokens.size() * sizeof(int),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             output_meta.data(),
             d_output_meta,
             output_meta.size() * sizeof(int),
@@ -9001,25 +9122,25 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target_ids,
                     target_ids.data(),
                     target_ids.size() * sizeof(int),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target_probs,
                     target_probs.data(),
                     target_probs.size() * sizeof(float),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_tokens,
                     draft_tokens.data(),
                     draft_tokens.size() * sizeof(int),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_verifier_base_position,
                     &verifier_base_position,
                     sizeof(verifier_base_position),
@@ -9108,17 +9229,17 @@ namespace
         std::array<int, row_count + 1> verify_tokens{};
         std::array<int, kSpeculativeBatchMaxOutputTokens> output_tokens{};
         std::array<int, kSpeculativeBatchMetaCount> output_meta{};
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             verify_tokens.data(),
             d_verify_tokens,
             verify_tokens.size() * sizeof(int),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             output_tokens.data(),
             d_output_tokens,
             output_tokens.size() * sizeof(int),
             device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(
+        ASSERT_TRUE(copyDeviceToHost(
             output_meta.data(),
             d_output_meta,
             output_meta.size() * sizeof(int),
@@ -9383,19 +9504,19 @@ namespace
                 void *stream = ctx.defaultStream();
                 ASSERT_NE(stream, nullptr);
 
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_target_logits,
                     target_logits.data(),
                     target_logits.size() * sizeof(float),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_accept_logits,
                     draft_accept_logits.data(),
                     draft_accept_logits.size() * sizeof(float),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_draft_reject_logits,
                     draft_reject_logits.data(),
                     draft_reject_logits.size() * sizeof(float),
@@ -9403,13 +9524,13 @@ namespace
                     stream));
                 // Device-token verifier regression setup: sampled MTP draft
                 // tokens must already live in device scratch before capture.
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_batch_sampled_draft_tokens,
                     batch_draft_tokens,
                     sizeof(batch_draft_tokens),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->hostToDevice(
+                ASSERT_TRUE(copyHostToDevice(
                     d_batch_sampled_draft_probabilities,
                     batch_draft_token_probabilities,
                     sizeof(batch_draft_token_probabilities),
@@ -9716,29 +9837,29 @@ namespace
         std::vector<float> batch_device_token_accept_probabilities(2, -1.0f);
         std::vector<float> batch_device_token_accept_threshold_results(2, -1.0f);
 
-        ASSERT_TRUE(backend_->deviceToHost(target_ids.data(), d_target_ids, top_k * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(target_probs.data(), d_target_probs, top_k * sizeof(float), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&accept_token, d_accept_token, sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&accept_flag, d_accept_flag, sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&accept_probability, d_accept_probability, sizeof(float), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&accept_threshold, d_accept_threshold, sizeof(float), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&reject_token, d_reject_token, sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&reject_flag, d_reject_flag, sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&reject_probability, d_reject_probability, sizeof(float), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&reject_threshold, d_reject_threshold, sizeof(float), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&threshold_sample_token, d_threshold_sample_token, sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&threshold_verify_token, d_threshold_verify_token, sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&threshold_verify_flag, d_threshold_verify_flag, sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&threshold_verify_probability, d_threshold_verify_probability, sizeof(float), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(&threshold_verify_threshold, d_threshold_verify_threshold, sizeof(float), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(batch_verify_tokens.data(), d_batch_verify_tokens, 2 * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(batch_accept_flags.data(), d_batch_accept_flags, 2 * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(batch_accept_probabilities.data(), d_batch_accept_probabilities, 2 * sizeof(float), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(batch_accept_threshold_results.data(), d_batch_accept_thresholds, 2 * sizeof(float), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(batch_device_token_verify_tokens.data(), d_batch_device_token_verify_tokens, 2 * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(batch_device_token_accept_flags.data(), d_batch_device_token_accept_flags, 2 * sizeof(int), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(batch_device_token_accept_probabilities.data(), d_batch_device_token_accept_probabilities, 2 * sizeof(float), device_id_));
-        ASSERT_TRUE(backend_->deviceToHost(batch_device_token_accept_threshold_results.data(), d_batch_device_token_accept_thresholds, 2 * sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(target_ids.data(), d_target_ids, top_k * sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(target_probs.data(), d_target_probs, top_k * sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&accept_token, d_accept_token, sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&accept_flag, d_accept_flag, sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&accept_probability, d_accept_probability, sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&accept_threshold, d_accept_threshold, sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&reject_token, d_reject_token, sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&reject_flag, d_reject_flag, sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&reject_probability, d_reject_probability, sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&reject_threshold, d_reject_threshold, sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&threshold_sample_token, d_threshold_sample_token, sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&threshold_verify_token, d_threshold_verify_token, sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&threshold_verify_flag, d_threshold_verify_flag, sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&threshold_verify_probability, d_threshold_verify_probability, sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(&threshold_verify_threshold, d_threshold_verify_threshold, sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(batch_verify_tokens.data(), d_batch_verify_tokens, 2 * sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(batch_accept_flags.data(), d_batch_accept_flags, 2 * sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(batch_accept_probabilities.data(), d_batch_accept_probabilities, 2 * sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(batch_accept_threshold_results.data(), d_batch_accept_thresholds, 2 * sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(batch_device_token_verify_tokens.data(), d_batch_device_token_verify_tokens, 2 * sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(batch_device_token_accept_flags.data(), d_batch_device_token_accept_flags, 2 * sizeof(int), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(batch_device_token_accept_probabilities.data(), d_batch_device_token_accept_probabilities, 2 * sizeof(float), device_id_));
+        ASSERT_TRUE(copyDeviceToHost(batch_device_token_accept_threshold_results.data(), d_batch_device_token_accept_thresholds, 2 * sizeof(float), device_id_));
 
         cleanup();
 
@@ -9829,7 +9950,7 @@ namespace
         applyCpuPenalties(cpu_result, penalties);
 
         auto gpu_result = applyGpuPenalties(
-            backend_, device_id_, logits, penalties, penalty_stream_);
+            backend_, device_id_, logits, penalties, stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -9864,7 +9985,7 @@ namespace
         applyCpuPenalties(cpu_result, penalties);
 
         auto gpu_result = applyGpuPenalties(
-            backend_, device_id_, logits, penalties, penalty_stream_);
+            backend_, device_id_, logits, penalties, stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -9904,7 +10025,7 @@ namespace
         applyCpuPenalties(cpu_result, penalties);
 
         auto gpu_result = applyGpuPenalties(
-            backend_, device_id_, logits, penalties, penalty_stream_);
+            backend_, device_id_, logits, penalties, stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -9945,7 +10066,7 @@ namespace
         applyCpuPenalties(cpu_result, penalties);
 
         auto gpu_result = applyGpuPenalties(
-            backend_, device_id_, logits, penalties, penalty_stream_);
+            backend_, device_id_, logits, penalties, stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -9985,7 +10106,7 @@ namespace
         applyCpuPenalties(cpu_result, penalties);
 
         auto gpu_result = applyGpuPenalties(
-            backend_, device_id_, logits, penalties, penalty_stream_);
+            backend_, device_id_, logits, penalties, stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -10030,7 +10151,7 @@ namespace
         applyCpuPenalties(cpu_result, penalties);
 
         auto gpu_result = applyGpuPenalties(
-            backend_, device_id_, logits, penalties, penalty_stream_);
+            backend_, device_id_, logits, penalties, stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -10061,7 +10182,7 @@ namespace
         applyCpuPenalties(cpu_result, penalties);
 
         auto gpu_result = applyGpuPenalties(
-            backend_, device_id_, logits, penalties, penalty_stream_);
+            backend_, device_id_, logits, penalties, stream_);
 
         for (int i = 0; i < vocab_size; ++i)
         {
@@ -10122,14 +10243,14 @@ namespace
         bool ok = backend_->applyLogitPenaltiesF32(
             d_ptr, token_ids.data(), penalty_vals.data(),
             static_cast<int>(penalties.size()), vocab_size, device_id_,
-            penalty_stream_);
+            stream_);
         ASSERT_TRUE(ok);
 
         float gpu_val = 0;
         int gpu_argmax = -1;
         ok = argmaxF32(
             d_ptr, vocab_size, device_id_, &gpu_val, &gpu_argmax,
-            penalty_stream_);
+            stream_);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(gpu_argmax, cpu_argmax)
@@ -10179,7 +10300,7 @@ namespace
         applyCpuPenalties(cpu_result, penalties);
 
         auto gpu_result = applyGpuPenalties(
-            backend_, device_id_, logits, penalties, penalty_stream_);
+            backend_, device_id_, logits, penalties, stream_);
 
         // Spot-check penalized tokens
         for (const auto &p : penalties)

@@ -93,19 +93,6 @@ namespace llaminar2
          */
         static bool requiresStaging(const TensorBase *tensor);
 
-        /**
-         * @brief Synchronize device before MPI operation
-         *
-         * @param device_id GPU device ID (-1 for CPU)
-         *
-         * **Purpose**: Ensure all device kernels complete before staging
-         * **Behavior**:
-         * - If device_id < 0: No-op
-         * - If HAVE_CUDA: cudaDeviceSynchronize()
-         * - If HAVE_ROCM: hipDeviceSynchronize()
-         */
-        static void synchronizeDevice(int device_id);
-
         // ====================================================================
         // Typed staging variants (for future BF16, INT8, etc.)
         // ====================================================================
@@ -139,7 +126,11 @@ namespace llaminar2
          * @param count Number of floats
          * @param device_id GPU device ID
          */
-        static void deviceToHost(float *dst, const float *src, size_t count, int device_id);
+        static void deviceToHost(
+            float *dst,
+            const float *src,
+            size_t count,
+            DeviceId device);
 
         /**
          * @brief Host→GPU memcpy implementation
@@ -149,7 +140,11 @@ namespace llaminar2
          * @param count Number of floats
          * @param device_id GPU device ID
          */
-        static void hostToDevice(float *dst, const float *src, size_t count, int device_id);
+        static void hostToDevice(
+            float *dst,
+            const float *src,
+            size_t count,
+            DeviceId device);
     };
 
 } // namespace llaminar2

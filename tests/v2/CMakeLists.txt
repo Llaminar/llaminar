@@ -7805,7 +7805,7 @@ add_v2_test(V2_Unit_DeviceRegistry
 # Tests IGPUDeviceContext interface, NvidiaDeviceContext, AMDDeviceContext, GPUDeviceContextPool singleton
 add_v2_gpu_backend_test(
     v2_test_gpu_device_context
-    unit/backends/Test__GPUDeviceContext.cpp
+    integration/backends/Test__GPUDeviceContext.cpp
     V2_Integration_GPUDeviceContext
     V2 Integration Backends GPUDeviceContext WorkerThread Streams Events
 )
@@ -14368,43 +14368,43 @@ if(HAVE_CUDA OR HAVE_ROCM)
 endif()
 
 # GPU Weight Loading Pipeline - Phase 3 Pipeline Integration
-add_executable(v2_test_device_load_pipeline unit/Test__DeviceLoadPipeline.cpp)
-target_include_directories(v2_test_device_load_pipeline PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(v2_test_device_load_pipeline
+add_executable(v2_integration_device_load_pipeline integration/loaders/Test__DeviceLoadPipeline.cpp)
+target_include_directories(v2_integration_device_load_pipeline PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_integration_device_load_pipeline
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
 if(HAVE_ROCM AND NOT LLAMINAR_SHARED_CORE)
-    target_link_libraries(v2_test_device_load_pipeline rocm_backend)
+    target_link_libraries(v2_integration_device_load_pipeline rocm_backend)
 endif()
 if(HAVE_ROCM)
-    target_compile_definitions(v2_test_device_load_pipeline PRIVATE __HIP_PLATFORM_AMD__=1)
-    target_link_libraries(v2_test_device_load_pipeline hip::host)
+    target_compile_definitions(v2_integration_device_load_pipeline PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_link_libraries(v2_integration_device_load_pipeline hip::host)
 endif()
-add_v2_test(V2_Unit_DeviceLoadPipeline
-    COMMAND $<TARGET_FILE:v2_test_device_load_pipeline>
-    LABELS "V2;Unit;WeightLoading;GpuPipeline;ROCm;HIP"
+add_v2_test(V2_Integration_DeviceLoadPipeline
+    COMMAND $<TARGET_FILE:v2_integration_device_load_pipeline>
+    LABELS "V2;Integration;WeightLoading;GpuPipeline;CUDA;ROCm;HIP"
     MPI_PROCS 1
 )
 
-# GPU Weight Loading Pipeline - FP Weight Pipeline Unit Tests
-add_executable(v2_test_fp_weight_pipeline unit/Test__FPWeightPipeline.cpp)
-target_include_directories(v2_test_fp_weight_pipeline PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(v2_test_fp_weight_pipeline
+# GPU Weight Loading Pipeline - FP Weight Pipeline Integration Tests
+add_executable(v2_integration_fp_weight_pipeline integration/loaders/Test__FPWeightPipeline.cpp)
+target_include_directories(v2_integration_fp_weight_pipeline PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_integration_fp_weight_pipeline
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
 if(HAVE_ROCM AND NOT LLAMINAR_SHARED_CORE)
-    target_link_libraries(v2_test_fp_weight_pipeline rocm_backend)
+    target_link_libraries(v2_integration_fp_weight_pipeline rocm_backend)
 endif()
 if(HAVE_ROCM)
-    target_compile_definitions(v2_test_fp_weight_pipeline PRIVATE __HIP_PLATFORM_AMD__=1)
-    target_link_libraries(v2_test_fp_weight_pipeline hip::host)
+    target_compile_definitions(v2_integration_fp_weight_pipeline PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_link_libraries(v2_integration_fp_weight_pipeline hip::host)
 endif()
-add_v2_test(V2_Unit_FPWeightPipeline
-    COMMAND $<TARGET_FILE:v2_test_fp_weight_pipeline>
-    LABELS "V2;Unit;WeightLoading;GpuPipeline;FP"
+add_v2_test(V2_Integration_FPWeightPipeline
+    COMMAND $<TARGET_FILE:v2_integration_fp_weight_pipeline>
+    LABELS "V2;Integration;WeightLoading;GpuPipeline;FP;CUDA;ROCm"
     MPI_PROCS 1
 )

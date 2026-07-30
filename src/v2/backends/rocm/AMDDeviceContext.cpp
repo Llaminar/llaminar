@@ -562,25 +562,26 @@ namespace llaminar2
 
     void AMDDeviceContext::recordEvent(void *event, void *stream)
     {
-        if (event == nullptr)
-        {
-            LOG_WARN("[AMDDeviceContext] recordEvent called with null event");
-            return;
-        }
+        if (!event)
+            throw std::invalid_argument("AMDDeviceContext::recordEvent requires a non-null event");
+        if (!stream)
+            throw std::invalid_argument(
+                "AMDDeviceContext::recordEvent requires the exact non-null producer stream");
 
         hipEvent_t hip_event = static_cast<hipEvent_t>(event);
-        hipStream_t hip_stream = stream ? static_cast<hipStream_t>(stream) : default_stream_;
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
 
         HIP_CHECK_VOID(hipEventRecord(hip_event, hip_stream));
     }
 
     bool AMDDeviceContext::recordEventChecked(void *event, void *stream)
     {
-        if (!event || !stream)
-        {
-            LOG_ERROR("[AMDDeviceContext] recordEventChecked requires non-null event and stream");
-            return false;
-        }
+        if (!event)
+            throw std::invalid_argument(
+                "AMDDeviceContext::recordEventChecked requires a non-null event");
+        if (!stream)
+            throw std::invalid_argument(
+                "AMDDeviceContext::recordEventChecked requires the exact non-null producer stream");
 
         if (!setAMDDeviceForResource(device_ordinal_, "recordEventChecked"))
             return false;
@@ -599,14 +600,14 @@ namespace llaminar2
 
     void AMDDeviceContext::waitEvent(void *event, void *stream)
     {
-        if (event == nullptr)
-        {
-            LOG_WARN("[AMDDeviceContext] waitEvent called with null event");
-            return;
-        }
+        if (!event)
+            throw std::invalid_argument("AMDDeviceContext::waitEvent requires a non-null event");
+        if (!stream)
+            throw std::invalid_argument(
+                "AMDDeviceContext::waitEvent requires the exact non-null consumer stream");
 
         hipEvent_t hip_event = static_cast<hipEvent_t>(event);
-        hipStream_t hip_stream = stream ? static_cast<hipStream_t>(stream) : default_stream_;
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
 
         // Make the stream wait for the event (GPU-side wait, not CPU blocking)
         HIP_CHECK_VOID(hipStreamWaitEvent(hip_stream, hip_event, 0));
@@ -614,11 +615,12 @@ namespace llaminar2
 
     bool AMDDeviceContext::waitEventChecked(void *event, void *stream)
     {
-        if (!event || !stream)
-        {
-            LOG_ERROR("[AMDDeviceContext] waitEventChecked requires non-null event and stream");
-            return false;
-        }
+        if (!event)
+            throw std::invalid_argument(
+                "AMDDeviceContext::waitEventChecked requires a non-null event");
+        if (!stream)
+            throw std::invalid_argument(
+                "AMDDeviceContext::waitEventChecked requires the exact non-null consumer stream");
 
         if (!setAMDDeviceForResource(device_ordinal_, "waitEventChecked"))
             return false;

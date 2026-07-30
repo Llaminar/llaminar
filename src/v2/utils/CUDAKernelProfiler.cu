@@ -9,6 +9,7 @@
 #include "CUDAKernelProfiler.h"
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -21,6 +22,10 @@ namespace llaminar2
         : type_(type), enabled_(CUDAKernelProfiler::isEnabled()),
           start_event_(nullptr), stop_event_(nullptr), stream_(stream)
     {
+        if (!stream_)
+            throw std::invalid_argument(
+                "ScopedCUDAKernelTimer requires the exact non-null kernel stream");
+
         if (enabled_)
         {
             // Skip event timing if the stream is currently in graph capture mode.
@@ -153,6 +158,10 @@ namespace llaminar2
 
     void ManualCUDAKernelTimer::begin(cudaStream_t stream)
     {
+        if (!stream)
+            throw std::invalid_argument(
+                "ManualCUDAKernelTimer::begin requires the exact non-null kernel stream");
+
         if (enabled_ && !started_)
         {
             // Skip if the stream is in graph capture mode — event timing is

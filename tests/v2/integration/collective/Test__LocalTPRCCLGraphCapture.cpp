@@ -199,6 +199,7 @@ namespace
      *
      * @param backend ROCm backend used to copy device memory back to the host.
      * @param device ROCm ordinal that owns @p device_buffer.
+     * @param stream Exact consumer stream ordered after the captured graph.
      * @param device_buffer Device pointer containing two rank-major shards.
      * @param shard_count Number of FP32 elements in each rank-local shard.
      * @param first_value Expected value for rank 0's shard.
@@ -208,6 +209,7 @@ namespace
     void expectGatheredFloatShards(
         IBackend *backend,
         int device,
+        void *stream,
         const float *device_buffer,
         size_t shard_count,
         float first_value,
@@ -215,6 +217,7 @@ namespace
         const char *label)
     {
         ASSERT_NE(backend, nullptr);
+        ASSERT_NE(stream, nullptr);
         ASSERT_NE(device_buffer, nullptr);
 
         std::vector<float> host(shard_count * 2);
@@ -222,7 +225,8 @@ namespace
             host.data(),
             device_buffer,
             host.size() * sizeof(float),
-            device));
+            device,
+            stream));
         for (size_t i = 0; i < shard_count; ++i)
         {
             ASSERT_FLOAT_EQ(host[i], first_value)
@@ -1671,12 +1675,14 @@ TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_OnStreamGraphCapture_Comple
         data0.data(),
         recv0->gpu_data_ptr(),
         data0.size() * sizeof(float),
-        0));
+        0,
+        resources0.capture_stream));
     ASSERT_TRUE(rocm_backend->deviceToHost(
         data1.data(),
         recv1->gpu_data_ptr(),
         data1.size() * sizeof(float),
-        1));
+        1,
+        resources1.capture_stream));
     for (size_t i = 0; i < count; ++i)
     {
         ASSERT_FLOAT_EQ(data0[i], 1.0f) << "ROCm graph capture:0 first shard mismatch at index " << i;
@@ -1693,22 +1699,26 @@ TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_OnStreamGraphCapture_Comple
         i32_data0.data(),
         recv_i32_0,
         i32_data0.size() * sizeof(int32_t),
-        0));
+        0,
+        resources0.capture_stream));
     ASSERT_TRUE(rocm_backend->deviceToHost(
         i32_data1.data(),
         recv_i32_1,
         i32_data1.size() * sizeof(int32_t),
-        1));
+        1,
+        resources1.capture_stream));
     ASSERT_TRUE(rocm_backend->deviceToHost(
         i8_data0.data(),
         recv_i8_0,
         i8_data0.size() * sizeof(int8_t),
-        0));
+        0,
+        resources0.capture_stream));
     ASSERT_TRUE(rocm_backend->deviceToHost(
         i8_data1.data(),
         recv_i8_1,
         i8_data1.size() * sizeof(int8_t),
-        1));
+        1,
+        resources1.capture_stream));
     for (size_t i = 0; i < int32_count; ++i)
     {
         ASSERT_EQ(i32_data0[i], 11) << "ROCm graph capture:0 int32 first shard mismatch at index " << i;
@@ -1925,6 +1935,7 @@ TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_GraphCapturedLargeBackToBac
     expectGatheredFloatShards(
         rocm_backend,
         0,
+        resources0.capture_stream,
         recv_k0,
         shard_count,
         1.0f,
@@ -1933,6 +1944,7 @@ TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_GraphCapturedLargeBackToBac
     expectGatheredFloatShards(
         rocm_backend,
         1,
+        resources1.capture_stream,
         recv_k1,
         shard_count,
         1.0f,
@@ -1941,6 +1953,7 @@ TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_GraphCapturedLargeBackToBac
     expectGatheredFloatShards(
         rocm_backend,
         0,
+        resources0.capture_stream,
         recv_v0,
         shard_count,
         3.0f,
@@ -1949,6 +1962,7 @@ TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_GraphCapturedLargeBackToBac
     expectGatheredFloatShards(
         rocm_backend,
         1,
+        resources1.capture_stream,
         recv_v1,
         shard_count,
         3.0f,
@@ -2036,12 +2050,14 @@ TEST(Test__LocalTPRCCLGraphCapture, RCCLGroupedP2PMaintenanceGraph_AuxiliaryStre
         recv_host0.data(),
         recv0,
         recv_host0.size() * sizeof(int8_t),
-        0));
+        0,
+        aux_graph.capture_stream0));
     ASSERT_TRUE(rocm_backend->deviceToHost(
         recv_host1.data(),
         recv1,
         recv_host1.size() * sizeof(int8_t),
-        1));
+        1,
+        aux_graph.capture_stream1));
     for (size_t i = 0; i < recv_host0.size(); i += 4096)
     {
         EXPECT_EQ(recv_host0[i], 5) << "device0 recv mismatch at byte " << i;

@@ -1951,6 +1951,14 @@ namespace llaminar2
         }
 
         const size_t table_bytes = entry_count * sizeof(DataT *);
+        IWorkerGPUContext &setup_context =
+            device_ctx_
+                ? *device_ctx_
+                : GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+        void *const setup_stream = setup_context.defaultStream();
+        requireGPUExecutionStream(
+            setup_stream,
+            "CUDARingKVCache::initializeBatchedEntryPointerTables");
         d_batched_k_entry_table_ =
             static_cast<DataT **>(backend->allocate(table_bytes, device_id_));
         d_batched_v_entry_table_ =
@@ -1961,12 +1969,14 @@ namespace llaminar2
                 d_batched_k_entry_table_,
                 h_k_table.data(),
                 table_bytes,
-                device_id_) ||
+                device_id_,
+                setup_stream) ||
             !backend->hostToDevice(
                 d_batched_v_entry_table_,
                 h_v_table.data(),
                 table_bytes,
-                device_id_))
+                device_id_,
+                setup_stream))
         {
             releaseBatchedEntryPointerTables();
             throw std::runtime_error(

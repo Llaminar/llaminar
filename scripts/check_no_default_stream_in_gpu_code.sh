@@ -18,6 +18,8 @@
 #      with nullptr or literal 0 as stream argument
 #   4. Default parameter "hipStream_t ... = 0" or "cudaStream_t ... = nullptr"
 #      in function/method signatures (allows callers to accidentally omit stream)
+#   5. Backend/context API parameters such as "void *stream = nullptr"
+#      which erase producer ownership at the public interface boundary
 #
 # Files with known violations are tracked in the allowlist below. The goal is
 # to shrink this list over time — never add to it without a strong reason.
@@ -38,6 +40,20 @@ scan_dirs=(
     "src/v2/execution"
     "src/v2/backends/cuda"
     "src/v2/backends/rocm"
+)
+
+# Public GPU API contracts where a nullable stream default is never valid.
+# Nullable stream *state* remains legitimate before binding, so Pattern 5
+# parses parameter context rather than blindly matching member initializers.
+explicit_stream_contract_files=(
+    "src/v2/backends/IBackend.h"
+    "src/v2/backends/IWorkerGPUContext.h"
+    "src/v2/backends/cuda/CUDABackend.h"
+    "src/v2/backends/cuda/NvidiaDeviceContext.h"
+    "src/v2/backends/rocm/ROCmBackend.h"
+    "src/v2/backends/rocm/AMDDeviceContext.h"
+    "src/v2/utils/CUDAKernelProfiler.h"
+    "src/v2/utils/ROCmKernelProfiler.h"
 )
 
 # --- Known violations (legacy code to be fixed) ---
@@ -177,10 +193,103 @@ is_default_param_violation()
 }
 
 # ==========================================================================
+# Pattern 5: Opaque public stream parameter with a nullptr default
+#   Bad:  bool copy(..., void *stream = nullptr);
+#   Good: bool copy(..., void *stream);
+#   Good: void *producer_stream_ = nullptr;  (unbound lifecycle state)
+#
+# The parser locates each candidate and checks whether it sits inside an open
+# parameter list since the preceding declaration/body delimiter. This keeps
+# nullable lifecycle state legal while making omission impossible at API call
+# sites.
+# ==========================================================================
+check_void_stream_default_parameter()
+{
+    local file="$1"
+    LC_ALL=C perl -0777 -e '
+        use strict;
+        use warnings;
+
+        my $file = shift @ARGV;
+        open my $fh, "<", $file or die "cannot open $file: $!";
+        local $/;
+        my $source = <$fh>;
+        close $fh;
+
+        # Preserve newlines while erasing comments so diagnostics retain the
+        # original source line and commented examples cannot trigger the gate.
+        $source =~ s{
+            /\*.*?\*/
+        }{
+            my $comment = $&;
+            $comment =~ s/[^\n]/ /g;
+            $comment;
+        }gsex;
+        $source =~ s{//[^\n]*}{ }g;
+
+        while ($source =~ /\bvoid\s*\*\s*\w*stream\w*\s*=\s*nullptr/g)
+        {
+            my $match_start = $-[0];
+            my $prefix = substr($source, 0, $match_start);
+            my $boundary = -1;
+            for my $delimiter (";", "{", "}")
+            {
+                my $candidate = rindex($prefix, $delimiter);
+                $boundary = $candidate if $candidate > $boundary;
+            }
+
+            my $context = substr(
+                $source,
+                $boundary + 1,
+                $match_start - $boundary - 1);
+            my $open_count = ($context =~ tr/(//);
+            my $close_count = ($context =~ tr/)//);
+            next unless $open_count > $close_count;
+
+            my $line = 1 + (substr($source, 0, $match_start) =~ tr/\n//);
+            my $matched = substr($source, $match_start, $+[0] - $match_start);
+            $matched =~ s/\s+/ /g;
+            print "${line}:${matched}\n";
+        }
+    ' "$file"
+}
+
+verify_void_stream_parameter_parser()
+{
+    local fixture
+    fixture="$(mktemp)"
+    trap 'rm -f "${fixture}"' RETURN
+
+    cat >"${fixture}" <<'EOF'
+struct ContractProbe
+{
+    void *producer_stream_ = nullptr;
+    virtual bool good(void *stream) = 0;
+    virtual bool bad(
+        int device,
+        void *producer_stream = nullptr) = 0;
+};
+EOF
+
+    local hits
+    hits="$(check_void_stream_default_parameter "${fixture}")"
+    if [[ "$(printf '%s\n' "${hits}" | grep -c 'producer_stream = nullptr')" -ne 1 ]]; then
+        echo "Internal error: opaque stream-parameter parser self-test failed." >&2
+        echo "Observed: ${hits:-<none>}" >&2
+        exit 2
+    fi
+
+    rm -f "${fixture}"
+    trap - RETURN
+}
+
+# ==========================================================================
 # Scan
 # ==========================================================================
 violations=()
 declare -A seen_exception_files=()
+
+verify_void_stream_parameter_parser
 
 for dir in "${scan_dirs[@]}"; do
     abs_dir="${repo_root}/${dir}"
@@ -245,6 +354,23 @@ for dir in "${scan_dirs[@]}"; do
     done < <(find "$abs_dir" -type f \( -name '*.cu' -o -name '*.hip' -o -name '*.cpp' -o -name '*.h' \) -print0)
 done
 
+# Public API contracts must not let callers omit a GPU stream.
+for rel_path in "${explicit_stream_contract_files[@]}"; do
+    file="${repo_root}/${rel_path}"
+    if [[ ! -f "${file}" ]]; then
+        echo "Explicit-stream contract file is missing: ${rel_path}" >&2
+        exit 2
+    fi
+
+    p5_hits="$(check_void_stream_default_parameter "${file}" || true)"
+    if [[ -n "${p5_hits}" ]]; then
+        while IFS= read -r hit; do
+            [[ -z "${hit}" ]] && continue
+            violations+=("${rel_path}:${hit}")
+        done <<< "${p5_hits}"
+    fi
+done
+
 # Check for stale exception entries
 stale_exceptions=()
 for allowed in "${allowed_exception_files[@]}"; do
@@ -285,5 +411,5 @@ if (( ${#stale_exceptions[@]} > 0 )); then
     exit 1
 fi
 
-echo "✓ No default-stream usage in GPU code (checked ${#scan_dirs[@]} directories)"
+echo "✓ No default-stream usage in GPU code (checked ${#scan_dirs[@]} directories and ${#explicit_stream_contract_files[@]} API contracts)"
 exit 0
