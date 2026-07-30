@@ -183,6 +183,7 @@ namespace llaminar2
     {
         GeneralLiveStateMutation,
         MTPCorrectionReplayBoundary,
+        PrefixCheckpointRestore,
         RequestBoundaryStateReset,
     };
 
@@ -239,7 +240,10 @@ namespace llaminar2
         ForwardReplayStateMutationKind mutation,
         ForwardReplayStateCacheClass cache_class)
     {
-        if (mutation == ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary &&
+        if ((mutation ==
+                 ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary ||
+             mutation ==
+                 ForwardReplayStateMutationKind::PrefixCheckpointRestore) &&
             cache_class != ForwardReplayStateCacheClass::OrdinaryDecode)
         {
             return ForwardReplayStateAction::PreserveReplayStateAndRebindStreams;
@@ -259,7 +263,10 @@ namespace llaminar2
         ForwardReplayStateMutationKind mutation,
         const ForwardGraphSignature &signature)
     {
-        if ((mutation == ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary ||
+        if ((mutation ==
+                 ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary ||
+             mutation ==
+                 ForwardReplayStateMutationKind::PrefixCheckpointRestore ||
              mutation == ForwardReplayStateMutationKind::RequestBoundaryStateReset) &&
             isLiveStateVersionedReplayCache(signature))
         {
@@ -486,6 +493,14 @@ namespace llaminar2
 
         /// GPU graph capture/replay for eliminating per-kernel launch overhead
         std::unique_ptr<IGPUGraphCapture> gpu_graph;
+
+        /**
+         * GPU snapshot descriptors and stable D2D destinations owned by this
+         * exact graph geometry. Stage names repeat across cache entries, so this
+         * state must never live in a process-wide executor map.
+         */
+        DeviceGraphExecutor::GraphSnapshotManifest snapshot_manifest;
+        uint64_t snapshot_configuration_epoch = 0;
 
         /// Cached GPU graph replay plan. A fully capturable graph is replayed as
         /// one unit; non-capturable stages and manual boundaries split it.
@@ -738,6 +753,8 @@ namespace llaminar2
             prefill_capture_stream.reset();
             bucketed_prefill_last_access_tick = 0;
             graph.reset();
+            snapshot_manifest.clear();
+            snapshot_configuration_epoch = 0;
             valid = false;
             workspace_generation = 0;
             token_ids.clear();

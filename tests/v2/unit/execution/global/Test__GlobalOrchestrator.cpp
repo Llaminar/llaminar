@@ -80,13 +80,13 @@ namespace llaminar2::test
             return snapshot;
         }
 
-        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override
+        PrefixStateSnapshot captureLivePrefixCheckpoint(
+            const PrefixCheckpointCaptureRequest &request) const override
         {
-            (void)seq_idx;
             PrefixStateSnapshot snapshot;
-            snapshot.valid = capture_ok_;
+            snapshot.valid = capture_ok_ && request.valid();
             snapshot.logical_checkpoint = true;
-            snapshot.cached_tokens = get_position();
+            snapshot.cached_tokens = request.logical_cached_tokens;
             return snapshot;
         }
 

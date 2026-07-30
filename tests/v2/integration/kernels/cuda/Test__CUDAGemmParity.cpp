@@ -3519,6 +3519,7 @@ TEST_F(Test__CUDAGemmParity, Q6_K_Qwen36MoEGDNOutLocalTP_RuntimeMMatchesSerialDe
 TEST_F(Test__CUDAGemmParity, LocalTPWoAllQuantizedFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
 {
     SKIP_IF_NO_CUDA();
+    ScopedEnv perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
     int cuda_devices = 0;
     ASSERT_EQ(cudaGetDeviceCount(&cuda_devices), cudaSuccess);
     if (cuda_devices < 2)
@@ -3552,6 +3553,7 @@ TEST_F(Test__CUDAGemmParity, LocalTPWoAllQuantizedFormatsGroupedVerifierRowsMatc
 TEST_F(Test__CUDAGemmParity, LocalTPWoFloatingPointFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
 {
     SKIP_IF_NO_CUDA();
+    ScopedEnv perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
     int cuda_devices = 0;
     ASSERT_EQ(cudaGetDeviceCount(&cuda_devices), cudaSuccess);
     if (cuda_devices < 2)
@@ -3587,6 +3589,7 @@ TEST_F(Test__CUDAGemmParity, LocalTPWoFloatingPointFormatsGroupedVerifierRowsMat
 TEST_F(Test__CUDAGemmParity, ReplicatedWoAllQuantizedFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
 {
     SKIP_IF_NO_CUDA();
+    ScopedEnv perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
 
     const DeviceId device = DeviceId::cuda(0);
 
@@ -3616,6 +3619,7 @@ TEST_F(Test__CUDAGemmParity, ReplicatedWoAllQuantizedFormatsGroupedVerifierRowsM
 TEST_F(Test__CUDAGemmParity, ReplicatedWoFloatingPointFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
 {
     SKIP_IF_NO_CUDA();
+    ScopedEnv perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
 
     const DeviceId device = DeviceId::cuda(0);
 

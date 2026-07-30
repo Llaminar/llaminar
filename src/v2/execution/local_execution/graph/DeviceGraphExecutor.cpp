@@ -650,8 +650,47 @@ namespace llaminar2
         return runStages(graph, ctx, StageRunPolicy::full());
     }
 
+    bool DeviceGraphExecutor::executeWithSnapshotManifest(
+        ComputeGraph &graph,
+        IDeviceContext *ctx,
+        GraphSnapshotManifest &snapshot_manifest)
+    {
+        if (!ctx)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Null device context");
+            return false;
+        }
+        if (graph.size() == 0)
+            return true;
+
+        graph.reset();
+        switch (config_.mode)
+        {
+        case ExecutionMode::SEQUENTIAL:
+        case ExecutionMode::PARALLEL:
+            return runStages(
+                graph,
+                ctx,
+                StageRunPolicy::full(),
+                nullptr,
+                &snapshot_manifest);
+        case ExecutionMode::PIPELINED:
+            LOG_WARN("[DeviceGraphExecutor] Pipelined mode not yet implemented, using sequential");
+            return runStages(
+                graph,
+                ctx,
+                StageRunPolicy::full(),
+                nullptr,
+                &snapshot_manifest);
+        default:
+            LOG_ERROR("[DeviceGraphExecutor] Unknown execution mode");
+            return false;
+        }
+    }
+
     bool DeviceGraphExecutor::executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx,
-                                                const std::unordered_set<std::string> *collective_nodes)
+                                                const std::unordered_set<std::string> *collective_nodes,
+                                                GraphSnapshotManifest *snapshot_manifest)
     {
         StageRunPolicy policy = StageRunPolicy::fastDecode();
         /*
@@ -662,7 +701,12 @@ namespace llaminar2
          * overwrite early values such as EMBEDDING with a later residual.
          */
         policy.snapshot_callback = config_.snapshot_callback != nullptr;
-        return runStages(graph, ctx, policy, collective_nodes);
+        return runStages(
+            graph,
+            ctx,
+            policy,
+            collective_nodes,
+            snapshot_manifest);
     }
 
     bool DeviceGraphExecutor::prepareInputsForGraphCapture(
@@ -757,7 +801,8 @@ namespace llaminar2
         ComputeGraph &graph,
         IDeviceContext *ctx,
         void *producer_stream,
-        const char *context)
+        const char *context,
+        GraphSnapshotManifest *snapshot_manifest)
     {
         if (!config_.snapshot_callback)
             return true;
@@ -792,7 +837,14 @@ namespace llaminar2
             if (!target_device.is_valid())
                 target_device = fallback_device;
 
-            if (!prepareGraphSnapshotCopies(*node, target_device, producer_stream))
+            GraphSnapshotManifest &manifest =
+                snapshot_manifest ? *snapshot_manifest
+                                  : transient_snapshot_manifest_;
+            if (!prepareGraphSnapshotCopies(
+                    *node,
+                    target_device,
+                    producer_stream,
+                    manifest))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Failed to prepare graph snapshots for stage '"
                           << name << "'"
@@ -812,32 +864,37 @@ namespace llaminar2
     bool DeviceGraphExecutor::prepareGraphSnapshotCopies(
         ComputeNode &node,
         DeviceId target_device,
-        void *producer_stream)
+        void *producer_stream,
+        GraphSnapshotManifest &snapshot_manifest)
     {
         return prepareOrRecordGraphSnapshotCopies(
             node,
             target_device,
             producer_stream,
-            /*record_device_copy=*/false);
+            /*record_device_copy=*/false,
+            snapshot_manifest);
     }
 
     bool DeviceGraphExecutor::captureGraphSnapshotCopies(
         ComputeNode &node,
         DeviceId target_device,
-        void *producer_stream)
+        void *producer_stream,
+        GraphSnapshotManifest &snapshot_manifest)
     {
         return prepareOrRecordGraphSnapshotCopies(
             node,
             target_device,
             producer_stream,
-            /*record_device_copy=*/true);
+            /*record_device_copy=*/true,
+            snapshot_manifest);
     }
 
     bool DeviceGraphExecutor::prepareOrRecordGraphSnapshotCopies(
         ComputeNode &node,
         DeviceId target_device,
         void *producer_stream,
-        bool record_device_copy)
+        bool record_device_copy,
+        GraphSnapshotManifest &snapshot_manifest)
     {
         if (!config_.snapshot_callback || !node.stage)
             return true;
@@ -865,8 +922,8 @@ namespace llaminar2
              * dump metadata here can expose a pre-execution projection tensor
              * instead of the cache/workspace view selected by production.
              */
-            const auto warmed = graph_snapshot_copies_.find(node.name);
-            if (warmed != graph_snapshot_copies_.end() &&
+            const auto warmed = snapshot_manifest.stage_copies.find(node.name);
+            if (warmed != snapshot_manifest.stage_copies.end() &&
                 !warmed->second.outputs.empty())
             {
                 for (const auto &copy : warmed->second.outputs)
@@ -884,7 +941,7 @@ namespace llaminar2
                 return true;
             }
 
-            if (graph_snapshot_outputless_stages_.contains(node.name))
+            if (snapshot_manifest.outputless_stages.contains(node.name))
                 return true;
 
             LOG_ERROR("[DeviceGraphExecutor] GPU snapshot stage '"
@@ -906,7 +963,7 @@ namespace llaminar2
         {
             if (capture_active)
             {
-                if (graph_snapshot_outputless_stages_.contains(node.name))
+                if (snapshot_manifest.outputless_stages.contains(node.name))
                     return true;
 
                 LOG_ERROR("[DeviceGraphExecutor] GPU snapshot stage '"
@@ -923,15 +980,15 @@ namespace llaminar2
              */
             if (record_device_copy)
             {
-                graph_snapshot_copies_.erase(node.name);
-                graph_snapshot_outputless_stages_.insert(node.name);
+                snapshot_manifest.stage_copies.erase(node.name);
+                snapshot_manifest.outputless_stages.insert(node.name);
             }
             return true;
         }
 
-        graph_snapshot_outputless_stages_.erase(node.name);
+        snapshot_manifest.outputless_stages.erase(node.name);
 
-        auto &stage_copies = graph_snapshot_copies_[node.name];
+        auto &stage_copies = snapshot_manifest.stage_copies[node.name];
         if (stage_copies.outputs.size() != graph_output_indices.size())
         {
             if (isGraphCaptureActive())
@@ -1202,7 +1259,8 @@ namespace llaminar2
 
     bool DeviceGraphExecutor::publishGraphSnapshotCopies(
         const std::string &stage_name,
-        void *producer_stream)
+        void *producer_stream,
+        GraphSnapshotManifest &snapshot_manifest)
     {
         if (!config_.snapshot_callback)
             return true;
@@ -1218,11 +1276,11 @@ namespace llaminar2
         if (!shouldCaptureSnapshotStage(stage_name))
             return true;
 
-        if (graph_snapshot_outputless_stages_.contains(stage_name))
+        if (snapshot_manifest.outputless_stages.contains(stage_name))
             return true;
 
-        auto it = graph_snapshot_copies_.find(stage_name);
-        if (it == graph_snapshot_copies_.end())
+        auto it = snapshot_manifest.stage_copies.find(stage_name);
+        if (it == snapshot_manifest.stage_copies.end())
         {
             LOG_ERROR("[DeviceGraphExecutor] GPU snapshot stage '" << stage_name
                                                                    << "' has no graph-stable snapshot manifest");
@@ -1286,7 +1344,8 @@ namespace llaminar2
     bool DeviceGraphExecutor::publishSnapshotsAfterGraphExecution(
         ComputeGraph &graph,
         void *producer_stream_override,
-        const char *context)
+        const char *context,
+        GraphSnapshotManifest *snapshot_manifest)
     {
         if (!config_.snapshot_callback)
             return true;
@@ -1328,7 +1387,13 @@ namespace llaminar2
                      * resolve a different cache view, logical row count, or
                      * arena alias than the source pointer baked into the graph.
                      */
-                    if (!publishGraphSnapshotCopies(name, producer_stream))
+                    GraphSnapshotManifest &manifest =
+                        snapshot_manifest ? *snapshot_manifest
+                                          : transient_snapshot_manifest_;
+                    if (!publishGraphSnapshotCopies(
+                            name,
+                            producer_stream,
+                            manifest))
                         return false;
                 }
                 else
@@ -1708,7 +1773,8 @@ namespace llaminar2
         ComputeGraph &graph,
         IDeviceContext *ctx,
         const StageRunPolicy &policy,
-        const std::unordered_set<std::string> *collective_nodes)
+        const std::unordered_set<std::string> *collective_nodes,
+        GraphSnapshotManifest *snapshot_manifest)
     {
         // Set GPU device once for the entire pass
         DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
@@ -1814,7 +1880,12 @@ namespace llaminar2
             bool stage_ok = false;
             try
             {
-                stage_ok = runStage(*node, ctx, policy, is_coll);
+                stage_ok = runStage(
+                    *node,
+                    ctx,
+                    policy,
+                    is_coll,
+                    snapshot_manifest);
             }
             catch (const std::exception &e)
             {
@@ -1930,7 +2001,8 @@ namespace llaminar2
         ComputeNode &node,
         IDeviceContext *ctx,
         const StageRunPolicy &policy,
-        bool is_collective)
+        bool is_collective,
+        GraphSnapshotManifest *snapshot_manifest)
     {
         if (!node.stage)
         {
@@ -2042,10 +2114,14 @@ namespace llaminar2
                     DeviceId snapshot_device = target_device;
                     if (!snapshot_device.is_valid() && ctx)
                         snapshot_device = ctx->deviceId();
+                    GraphSnapshotManifest &manifest =
+                        snapshot_manifest ? *snapshot_manifest
+                                          : transient_snapshot_manifest_;
                     if (!captureGraphSnapshotCopies(
                             node,
                             snapshot_device,
-                            node.stage->gpuStream()))
+                            node.stage->gpuStream(),
+                            manifest))
                     {
                         ok = false;
                     }
@@ -2053,7 +2129,8 @@ namespace llaminar2
                              !isGraphCaptureActive() &&
                              !publishGraphSnapshotCopies(
                                  node.name,
-                                 node.stage->gpuStream()))
+                                 node.stage->gpuStream(),
+                                 manifest))
                     {
                         ok = false;
                     }
@@ -2469,7 +2546,14 @@ namespace llaminar2
             DeviceId snapshot_device = target_device;
             if (!snapshot_device.is_valid() && ctx)
                 snapshot_device = ctx->deviceId();
-            if (!captureGraphSnapshotCopies(node, snapshot_device, node.stage->gpuStream()))
+            GraphSnapshotManifest &manifest =
+                snapshot_manifest ? *snapshot_manifest
+                                  : transient_snapshot_manifest_;
+            if (!captureGraphSnapshotCopies(
+                    node,
+                    snapshot_device,
+                    node.stage->gpuStream(),
+                    manifest))
                 success = false;
         }
 
@@ -2558,17 +2642,22 @@ namespace llaminar2
             const bool graph_capture_active = isGraphCaptureActive();
             if (snapshot_device.is_gpu())
             {
+                GraphSnapshotManifest &manifest =
+                    snapshot_manifest ? *snapshot_manifest
+                                      : transient_snapshot_manifest_;
                 if (!captureGraphSnapshotCopies(
                         node,
                         snapshot_device,
-                        node.stage->gpuStream()))
+                        node.stage->gpuStream(),
+                        manifest))
                 {
                     success = false;
                 }
                 else if (!graph_capture_active &&
                          !publishGraphSnapshotCopies(
                              node.name,
-                             node.stage->gpuStream()))
+                             node.stage->gpuStream(),
+                             manifest))
                 {
                     success = false;
                 }

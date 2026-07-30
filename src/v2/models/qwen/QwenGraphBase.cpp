@@ -217,7 +217,15 @@ namespace llaminar2
                 layout.compute_all_positions =
                     config.compute_all_position_logits ||
                     config.live_mtp_request_batch_condition;
-                layout.use_prefill_replay_row_offset = true;
+                /*
+                 * A full-identity verifier bypasses the compact row-copy stage,
+                 * but its normalized activation still begins at physical row
+                 * zero. It must therefore retain the verifier's no-offset
+                 * semantics rather than inheriting bucketed-prefill replay
+                 * offsets merely because both use NORMALIZED.
+                 */
+                layout.use_prefill_replay_row_offset =
+                    !config.compute_row_indexed_logits;
                 return layout;
             }
 
@@ -301,6 +309,48 @@ namespace llaminar2
                 }
             }
             return selected_rows;
+        }
+
+        /**
+         * @brief Test whether row-indexed logits already form the dense input.
+         *
+         * The empty row list has the established meaning `[0, row_count)`.
+         * An explicit list is a dense identity cover only when it has one entry
+         * for every physical activation row and each entry names that same row.
+         * Malformed explicit lists deliberately return false so the ordinary
+         * resolver emits its detailed fatal validation error.
+         *
+         * @param config Graph policy carrying an optional explicit row list.
+         * @param row_count Number of compact logits requested by the verifier.
+         * @param total_tokens Number of physical rows in the activation tensor.
+         * @return True when LM head can consume the activation without copying.
+         */
+        bool rowIndexedLogitsCoverFullPhysicalInput(
+            const GraphConfig &config,
+            int row_count,
+            int total_tokens)
+        {
+            if (row_count <= 0 || row_count != total_tokens)
+                return false;
+
+            if (config.row_indexed_logits_selected_rows.empty())
+                return true;
+            if (static_cast<int>(
+                    config.row_indexed_logits_selected_rows.size()) !=
+                total_tokens)
+            {
+                return false;
+            }
+
+            for (int row = 0; row < total_tokens; ++row)
+            {
+                if (config.row_indexed_logits_selected_rows[
+                        static_cast<size_t>(row)] != row)
+                {
+                    return false;
+                }
+            }
+            return true;
         }
     }
 
@@ -1118,6 +1168,18 @@ namespace llaminar2
                 return final_norm_output;
 
             const int row_count = config_.row_indexed_logits_row_count;
+            if (rowIndexedLogitsCoverFullPhysicalInput(
+                    config_,
+                    row_count,
+                    total_tokens))
+            {
+                /*
+                 * The verifier requests the complete physical activation in
+                 * native order. Feed it directly to LM head: a row-copy stage
+                 * and its device index publication would be pure overhead.
+                 */
+                return final_norm_output;
+            }
             TensorBase *scratch_rows = buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
             if (!scratch_rows)
             {
@@ -2687,63 +2749,86 @@ namespace llaminar2
         if (config_.compute_all_position_logits && config_.compute_row_indexed_logits)
         {
             const int row_count = config_.row_indexed_logits_row_count;
-            TensorBase *scratch_rows = buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
-            if (!scratch_rows)
+            if (rowIndexedLogitsCoverFullPhysicalInput(
+                    config_,
+                    row_count,
+                    total_tokens))
             {
-                LOG_ERROR("[QwenGraphBase] Standalone row-indexed verifier requires lm_head_input_rows scratch buffer");
-                throw std::runtime_error("standalone row-indexed verifier scratch buffer missing");
+                /*
+                 * Standalone verifier LM-head graphs obey the same layout
+                 * contract as full model graphs. The existing dense defaults
+                 * below already project every row from HIDDEN_STATE.
+                 */
+                lm_head_seq_len = total_tokens;
+                lm_head_compute_all_positions = true;
+                lm_head_use_prefill_row_offset = false;
             }
-            const int scratch_row_capacity =
-                scratch_rows ? static_cast<int>(scratch_rows->rows()) : 0;
-            if (row_count <= 0 ||
-                row_count > total_tokens ||
-                row_count > scratch_row_capacity)
+            else
             {
-                LOG_ERROR("[QwenGraphBase] Standalone LM-head graph row-indexed verifier requires "
-                          << "1..min(scratch_rows,total_tokens) rows, got "
-                          << row_count << " for total_tokens=" << total_tokens
-                          << " scratch_rows=" << scratch_row_capacity);
-                throw std::runtime_error("invalid standalone row-indexed all-position logits row count");
+                TensorBase *scratch_rows =
+                    buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
+                if (!scratch_rows)
+                {
+                    LOG_ERROR("[QwenGraphBase] Standalone row-indexed verifier requires lm_head_input_rows scratch buffer");
+                    throw std::runtime_error("standalone row-indexed verifier scratch buffer missing");
+                }
+                const int scratch_row_capacity =
+                    scratch_rows ? static_cast<int>(scratch_rows->rows()) : 0;
+                if (row_count <= 0 ||
+                    row_count > total_tokens ||
+                    row_count > scratch_row_capacity)
+                {
+                    LOG_ERROR("[QwenGraphBase] Standalone LM-head graph row-indexed verifier requires "
+                              << "1..min(scratch_rows,total_tokens) rows, got "
+                              << row_count << " for total_tokens=" << total_tokens
+                              << " scratch_rows=" << scratch_row_capacity);
+                    throw std::runtime_error("invalid standalone row-indexed all-position logits row count");
+                }
+
+                std::vector<int> selected_rows = resolveRowIndexedLogitRows(
+                    config_,
+                    row_count,
+                    total_tokens,
+                    "standalone LM-head row-select");
+
+                HiddenStateRowsSelectStage::Params row_params;
+                row_params.input = hidden_states;
+                row_params.output = scratch_rows;
+                row_params.seq_len = total_tokens;
+                row_params.d_model = config_.d_model;
+                row_params.selected_row_count = row_count;
+                row_params.selected_row_indices = std::move(selected_rows);
+                row_params.device_id = device;
+                row_params.input_buffer_id = BufferId::HIDDEN_STATE;
+                row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
+                if (device.is_gpu())
+                {
+                    row_params.device_row_index_source =
+                        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                            ExternalDeviceIndices;
+                    row_params.workspace_buffer_name =
+                        MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
+                }
+
+                graph.addNode(
+                    "lm_head_rows_select",
+                    ComputeStageFactory::createHiddenStateRowsSelect(row_params),
+                    device);
+                graph.addDependency(
+                    "lm_head_rows_select",
+                    lm_head_dependency);
+
+                /*
+                 * Compact verifier rows are a new dense matrix. The LM head
+                 * projects every compact row starting at row zero.
+                 */
+                lm_head_input = scratch_rows;
+                lm_head_dependency = "lm_head_rows_select";
+                lm_head_seq_len = row_count;
+                lm_head_input_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
+                lm_head_compute_all_positions = true;
+                lm_head_use_prefill_row_offset = false;
             }
-
-            std::vector<int> selected_rows = resolveRowIndexedLogitRows(
-                config_,
-                row_count,
-                total_tokens,
-                "standalone LM-head row-select");
-
-            HiddenStateRowsSelectStage::Params row_params;
-            row_params.input = hidden_states;
-            row_params.output = scratch_rows;
-            row_params.seq_len = total_tokens;
-            row_params.d_model = config_.d_model;
-            row_params.selected_row_count = row_count;
-            row_params.selected_row_indices = std::move(selected_rows);
-            row_params.device_id = device;
-            row_params.input_buffer_id = BufferId::HIDDEN_STATE;
-            row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
-            if (device.is_gpu())
-            {
-                row_params.device_row_index_source =
-                    HiddenStateRowsSelectStage::DeviceRowIndexSource::
-                        ExternalDeviceIndices;
-                row_params.workspace_buffer_name =
-                    MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
-            }
-
-            graph.addNode("lm_head_rows_select",
-                          ComputeStageFactory::createHiddenStateRowsSelect(row_params),
-                          device);
-            graph.addDependency("lm_head_rows_select", lm_head_dependency);
-
-            // Compact verifier rows are a new dense matrix. The LM head should
-            // project every compact row starting at row zero.
-            lm_head_input = scratch_rows;
-            lm_head_dependency = "lm_head_rows_select";
-            lm_head_seq_len = row_count;
-            lm_head_input_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
-            lm_head_compute_all_positions = true;
-            lm_head_use_prefill_row_offset = false;
         }
 
         // LM Head projection

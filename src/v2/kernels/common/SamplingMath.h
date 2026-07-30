@@ -774,12 +774,16 @@ namespace llaminar2::sampling_math
      *
      * - kSpecBatchMetaAcceptedSpeculativePrefix counts accepted MTP draft rows.
      * - kSpecBatchMetaTargetVerifierStateCommitCount counts verifier input
-     *   rows whose target-model state may be published. This includes row zero,
-     *   the first main-model token.
+     *   rows whose target-model state is mathematically valid. This includes row
+     *   zero, the first main-model token.
      *
-     * Accepted-state publication must use the second count. Keeping this tiny
-     * helper shared between CPU tests and GPU kernels prevents CUDA, ROCm, and
-     * CPU from drifting on the off-by-one boundary after a rejection.
+     * Accepted-state publication starts from the second count, then clamps it to
+     * @p max_state_commit_rows. The clamp represents the serial-visible response
+     * boundary: a terminal all-accepted verifier row can be valid speculative
+     * evidence while its input token must remain the pending condition token.
+     * Keeping this tiny helper shared between CPU tests and GPU kernels prevents
+     * CUDA, ROCm, and CPU from drifting on rejection and response-budget
+     * boundaries.
      */
     LLAMINAR_SAMPLING_HD void derive_speculative_publication_metadata(
         const int *meta,
@@ -830,13 +834,17 @@ namespace llaminar2::sampling_math
         if (request_meta[kSpecBatchMetaOk] == 0)
             return;
 
-        const int accepted_state_count =
+        const int verifier_state_count =
             request_meta[kSpecBatchMetaTargetVerifierStateCommitCount];
-        if (accepted_state_count < 0 ||
-            accepted_state_count > max_state_commit_rows)
+        if (verifier_state_count < 0 ||
+            verifier_state_count > padded_state_rows_per_request)
         {
             return;
         }
+        const int accepted_state_count =
+            verifier_state_count < max_state_commit_rows
+                ? verifier_state_count
+                : max_state_commit_rows;
 
         if (out_accepted_state_count)
             *out_accepted_state_count = accepted_state_count;
@@ -855,13 +863,30 @@ namespace llaminar2::sampling_math
                 request_meta[kSpecBatchMetaReadyToken];
             const bool sampled_terminal =
                 request_meta[kSpecBatchMetaSampledTerminal] != 0;
-            if (sampled_terminal && ready_token >= 0)
+            const int output_count =
+                request_meta[kSpecBatchMetaOutputCount];
+            const bool publication_clipped =
+                accepted_state_count < verifier_state_count;
+            if (publication_clipped &&
+                accepted_state_count >= 0 &&
+                accepted_state_count < output_count &&
+                accepted_state_count < output_token_stride)
+            {
+                /*
+                 * The first verifier output beyond the published state prefix is
+                 * the exact serial condition token.  A sampled terminal token is
+                 * one generation farther ahead and must not cross this boundary.
+                 */
+                *out_next_condition_token =
+                    output_tokens[static_cast<size_t>(request_index) *
+                                      static_cast<size_t>(output_token_stride) +
+                                  static_cast<size_t>(accepted_state_count)];
+            }
+            else if (sampled_terminal && ready_token >= 0)
             {
                 *out_next_condition_token = ready_token;
             }
 
-            const int output_count =
-                request_meta[kSpecBatchMetaOutputCount];
             if (*out_next_condition_token < 0 &&
                 output_count > 0 && output_count <= output_token_stride)
             {

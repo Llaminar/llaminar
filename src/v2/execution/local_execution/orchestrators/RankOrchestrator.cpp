@@ -7107,6 +7107,38 @@ namespace llaminar2
         return true;
     }
 
+    bool RankOrchestrator::configureMTPRequestStopTokens(
+        const std::vector<int32_t> &stop_tokens)
+    {
+        auto configure_runners =
+            [&stop_tokens](
+                std::vector<std::unique_ptr<IInferenceRunner>> &runners,
+                const char *group)
+        {
+            for (size_t i = 0; i < runners.size(); ++i)
+            {
+                if (!runners[i])
+                {
+                    throw std::logic_error(
+                        std::string{"Cannot configure MTP request stop tokens "
+                                    "on a null "} +
+                        group + " participant");
+                }
+                if (!runners[i]->configureMTPRequestStopTokens(stop_tokens))
+                {
+                    throw std::runtime_error(
+                        std::string{"MTP request stop-token configuration was "
+                                    "rejected by "} +
+                        group + " participant " + std::to_string(i));
+                }
+            }
+        };
+
+        configure_runners(device_runners_, "device");
+        configure_runners(pp_stage_runners_, "pipeline");
+        return true;
+    }
+
     bool RankOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
         const int32_t *draft_tokens,
         int draft_token_count,
@@ -13078,7 +13110,8 @@ namespace llaminar2
         return aggregate;
     }
 
-    PrefixStateSnapshot RankOrchestrator::captureLivePrefixCheckpoint(int seq_idx) const
+    PrefixStateSnapshot RankOrchestrator::captureLivePrefixCheckpoint(
+        const PrefixCheckpointCaptureRequest &request) const
     {
         PrefixStateSnapshot aggregate;
         bool saw_runner = false;
@@ -13100,7 +13133,8 @@ namespace llaminar2
                     continue;
 
                 saw_runner = true;
-                PrefixStateSnapshot child = runner->captureLivePrefixCheckpoint(seq_idx);
+                PrefixStateSnapshot child =
+                    runner->captureLivePrefixCheckpoint(request);
                 if (!child.valid)
                 {
                     rank_orchestrator_detail::recordRankPrefixSnapshotFailure(
@@ -13254,31 +13288,44 @@ namespace llaminar2
         snapshot.positions = {snapshot.current_position};
         snapshot.sequence_lengths = current_sequence_lengths_;
 
-        const bool use_resident_child_logical_state =
-            pp_stage_runners_.empty() &&
-            deviceResidentLogicalSequenceState().valid();
-        std::optional<int> resident_child_position;
-        std::vector<int> resident_child_positions;
-        std::vector<int> resident_child_sequence_lengths;
-        auto adopt_resident_child_logical_state =
+        const bool use_authoritative_child_logical_state =
+            pp_stage_runners_.empty() && !device_runners_.empty();
+        std::optional<int> authoritative_child_position;
+        std::vector<int> authoritative_child_positions;
+        std::vector<int> authoritative_child_sequence_lengths;
+        auto adopt_authoritative_child_logical_state =
             [&](const PrefixRuntimeStateSnapshot &child)
         {
-            if (!use_resident_child_logical_state)
+            /*
+             * A child probe is already a host-visible observation boundary. On
+             * GPU it materializes either the live logical-state mailbox or the
+             * canonical cache-owned sequence count after mailbox retirement.
+             * Requiring a currently live mailbox again at rank scope would
+             * discard that proven child truth immediately after restore and
+             * revive the rank's scheduler-only host cursor.
+             *
+             * Pipeline stages may legitimately own different positions, so
+             * only symmetric non-PP participants participate in this equality
+             * contract. Empty mock/uninitialized probes carry no authority.
+             */
+            if (!use_authoritative_child_logical_state ||
+                !child.initialized)
                 return;
-            if (!resident_child_position.has_value())
+            if (!authoritative_child_position.has_value())
             {
-                resident_child_position = child.current_position;
-                resident_child_positions = child.positions;
-                resident_child_sequence_lengths = child.sequence_lengths;
+                authoritative_child_position = child.current_position;
+                authoritative_child_positions = child.positions;
+                authoritative_child_sequence_lengths =
+                    child.sequence_lengths;
                 return;
             }
-            if (*resident_child_position != child.current_position ||
-                resident_child_positions != child.positions ||
-                resident_child_sequence_lengths != child.sequence_lengths)
+            if (*authoritative_child_position != child.current_position ||
+                authoritative_child_positions != child.positions ||
+                authoritative_child_sequence_lengths != child.sequence_lengths)
             {
                 throw std::runtime_error(
                     "Rank prefix-state diagnostics observed divergent "
-                    "device-resident logical metadata across LocalTP participants");
+                    "canonical logical metadata across LocalTP participants");
             }
         };
 
@@ -13404,7 +13451,7 @@ namespace llaminar2
             {
                 const PrefixRuntimeStateSnapshot child =
                     runner->prefixStateProbe();
-                adopt_resident_child_logical_state(child);
+                adopt_authoritative_child_logical_state(child);
                 merge_child(child);
                 saw_child = true;
             }
@@ -13422,19 +13469,20 @@ namespace llaminar2
         {
             snapshot.initialized = false;
         }
-        if (resident_child_position.has_value())
+        if (authoritative_child_position.has_value())
         {
             /*
-             * The rank host cursor is only a scheduler/response shadow.  Once
-             * LocalTP children publish a resident logical-state mailbox,
-             * diagnostics must report that mailbox and must never let the
-             * verifier graph's temporary padded row count masquerade as live
-             * sequence state.
+             * The rank host cursor is only a scheduler/response shadow. Child
+             * probes own canonical sequence truth across both active mailbox
+             * and post-restore cache-count lifecycles, so rank diagnostics must
+             * never substitute the shadow merely because an outcome mailbox
+             * was retired.
              */
-            snapshot.current_position = *resident_child_position;
-            snapshot.positions = std::move(resident_child_positions);
+            snapshot.current_position = *authoritative_child_position;
+            snapshot.positions =
+                std::move(authoritative_child_positions);
             snapshot.sequence_lengths =
-                std::move(resident_child_sequence_lengths);
+                std::move(authoritative_child_sequence_lengths);
         }
         if (snapshot.prefix_cache_bypassed)
         {

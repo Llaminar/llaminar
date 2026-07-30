@@ -164,6 +164,60 @@ namespace llaminar2
     {
     public:
         /**
+         * @brief One immutable, graph-owned GPU snapshot output descriptor.
+         *
+         * The graph owner's warmup finalizes both this descriptor and its stable
+         * destination storage. The same owner then consumes it during capture
+         * and replay publication. Identically named stages in another graph
+         * geometry therefore cannot overwrite it.
+         */
+        struct GraphSnapshotOutputCopy
+        {
+            std::string name;
+            std::string dtype;
+            size_t rows = 0;
+            size_t cols = 0;
+            size_t element_size = sizeof(float);
+            size_t byte_size = 0;
+            size_t storage_bytes = 0;
+            DeviceId device = DeviceId::invalid();
+            const void *source_ptr = nullptr;
+            /**
+             * True after a real stage execution recorded this descriptor and
+             * its point-in-time D2D copy. Allocation-only pre-capture passes
+             * may inspect stage metadata, but must not replace a warmed source
+             * with a pre-execution fallback view.
+             */
+            bool descriptor_finalized = false;
+            std::unique_ptr<FP32Tensor> storage;
+        };
+
+        /** @brief Snapshot slots owned by one stage in one forward graph. */
+        struct GraphSnapshotStageCopies
+        {
+            std::vector<GraphSnapshotOutputCopy> outputs;
+        };
+
+        /**
+         * @brief Complete GPU snapshot manifest owned by one forward graph.
+         *
+         * Stage names are unique only inside a ComputeGraph; they are not
+         * process-wide identities. ForwardGraphCache stores this object beside
+         * the executable whose captured D2D nodes write these slots.
+         */
+        struct GraphSnapshotManifest
+        {
+            std::unordered_map<std::string, GraphSnapshotStageCopies> stage_copies;
+            std::unordered_set<std::string> outputless_stages;
+
+            void clear()
+            {
+                stage_copies.clear();
+                outputless_stages.clear();
+            }
+        };
+
+        /**
          * @brief Construct with configuration
          * @param config Executor configuration
          */
@@ -208,8 +262,28 @@ namespace llaminar2
         /**
          * @brief Set snapshot callback for debugging
          */
-        void setSnapshotCallback(StageSnapshotCallback callback) override { config_.snapshot_callback = std::move(callback); }
-        void setSnapshotStageFilter(StageSnapshotFilter filter) { config_.snapshot_stage_filter = std::move(filter); }
+        void setSnapshotCallback(StageSnapshotCallback callback) override
+        {
+            config_.snapshot_callback = std::move(callback);
+            advanceSnapshotConfigurationEpoch();
+        }
+        void setSnapshotStageFilter(StageSnapshotFilter filter)
+        {
+            config_.snapshot_stage_filter = std::move(filter);
+            advanceSnapshotConfigurationEpoch();
+        }
+        /**
+         * @brief Current graph identity epoch for diagnostic snapshot nodes.
+         *
+         * Snapshot callback/filter changes alter captured graph topology because
+         * selected GPU stages gain or lose D2D copy nodes. Cached executables
+         * compare this epoch before launch and re-enter their normal warmup and
+         * capture lifecycle when it changes.
+         */
+        uint64_t snapshotConfigurationEpoch() const noexcept
+        {
+            return snapshot_configuration_epoch_;
+        }
 
         void setStageFailureCallback(StageFailureCallback callback) { config_.stage_failure_callback = std::move(callback); }
         void setCancellationCallback(ExecutionCancellationCallback callback) { config_.cancellation_requested = std::move(callback); }
@@ -346,7 +420,19 @@ namespace llaminar2
         const StageTimeline &stageTimeline() const { return stage_timeline_; }
 
         bool executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx,
-                               const std::unordered_set<std::string> *collective_nodes = nullptr);
+                               const std::unordered_set<std::string> *collective_nodes = nullptr,
+                               GraphSnapshotManifest *snapshot_manifest = nullptr);
+
+        /**
+         * @brief Execute an eager graph against its explicit snapshot owner.
+         *
+         * Cached graph construction uses this boundary so warmup descriptors
+         * remain attached to the exact graph that will later capture them.
+         */
+        bool executeWithSnapshotManifest(
+            ComputeGraph &graph,
+            IDeviceContext *ctx,
+            GraphSnapshotManifest &snapshot_manifest);
 
         /**
          * @brief Publish snapshot callbacks from an already-executed graph.
@@ -374,7 +460,8 @@ namespace llaminar2
         bool publishSnapshotsAfterGraphExecution(
             ComputeGraph &graph,
             void *producer_stream_override = nullptr,
-            const char *context = nullptr);
+            const char *context = nullptr,
+            GraphSnapshotManifest *snapshot_manifest = nullptr);
 
         /**
          * @brief Publish the terminal captured mutable state row from a graph.
@@ -439,7 +526,8 @@ namespace llaminar2
             ComputeGraph &graph,
             IDeviceContext *ctx,
             void *producer_stream,
-            const char *context = nullptr);
+            const char *context = nullptr,
+            GraphSnapshotManifest *snapshot_manifest = nullptr);
 
         /**
          * @brief Join every arena input to the exact stream before graph capture.
@@ -557,11 +645,18 @@ namespace llaminar2
             };
 
             std::vector<GraphSegment> segments;       ///< Ordered segments
+            /**
+             * Snapshot descriptors and destinations captured by these exact
+             * replay units. Cached decode callers cannot omit this owner because
+             * it is an intrinsic part of the segment cache lifecycle.
+             */
+            GraphSnapshotManifest snapshot_manifest;
             bool initialized = false;                 ///< Whether segments have been built
             bool needs_capture = false;               ///< True after warmup, before capture
             uint64_t decode_step = 0;                 ///< Monotonic segmented-execution step counter
             uint64_t capture_variant_signature = 0;   ///< Stage-reported launch-topology variant for this cache
             uint64_t variant_recapture_count = 0;     ///< Resets caused by launch-topology variant changes
+            uint64_t snapshot_configuration_epoch = 0; ///< Executor snapshot topology represented by this cache
             std::string perf_context;                 ///< Optional structured stats tag for the replay caller
             void *capture_stream = nullptr;           ///< Locally-created blocking stream for capture/replay
             void *sync_event = nullptr;               ///< Cached event for GPU-side inter-stream sync
@@ -578,11 +673,13 @@ namespace llaminar2
             // Move-only (non-copyable due to stream/event ownership)
             GraphSegmentCache(GraphSegmentCache &&other) noexcept
                 : segments(std::move(other.segments)),
+                  snapshot_manifest(std::move(other.snapshot_manifest)),
                   initialized(other.initialized),
                   needs_capture(other.needs_capture),
                   decode_step(other.decode_step),
                   capture_variant_signature(other.capture_variant_signature),
                   variant_recapture_count(other.variant_recapture_count),
+                  snapshot_configuration_epoch(other.snapshot_configuration_epoch),
                   perf_context(std::move(other.perf_context)),
                   capture_stream(other.capture_stream),
                   sync_event(other.sync_event),
@@ -597,6 +694,7 @@ namespace llaminar2
                 other.capture_context_from_pool = false;
                 other.capture_variant_signature = 0;
                 other.variant_recapture_count = 0;
+                other.snapshot_configuration_epoch = 0;
             }
             GraphSegmentCache &operator=(GraphSegmentCache &&other) noexcept
             {
@@ -604,11 +702,13 @@ namespace llaminar2
                 {
                     reset(StreamResetPolicy::Destroy);
                     segments = std::move(other.segments);
+                    snapshot_manifest = std::move(other.snapshot_manifest);
                     initialized = other.initialized;
                     needs_capture = other.needs_capture;
                     decode_step = other.decode_step;
                     capture_variant_signature = other.capture_variant_signature;
                     variant_recapture_count = other.variant_recapture_count;
+                    snapshot_configuration_epoch = other.snapshot_configuration_epoch;
                     perf_context = std::move(other.perf_context);
                     capture_stream = other.capture_stream;
                     sync_event = other.sync_event;
@@ -622,6 +722,7 @@ namespace llaminar2
                     other.capture_context_from_pool = false;
                     other.capture_variant_signature = 0;
                     other.variant_recapture_count = 0;
+                    other.snapshot_configuration_epoch = 0;
                 }
                 return *this;
             }
@@ -638,7 +739,11 @@ namespace llaminar2
                 capture_variant_signature = 0;
                 destroySyncEvent();
                 if (stream_policy == StreamResetPolicy::Destroy)
+                {
+                    snapshot_manifest.clear();
+                    snapshot_configuration_epoch = 0;
                     destroyCaptureStream();
+                }
             }
 
             /// Create a local blocking stream for graph capture via the GPU context.
@@ -801,6 +906,14 @@ namespace llaminar2
         StageTimeline stage_timeline_;                 ///< GPU event-based per-stage timeline profiler
         bool stage_timeline_info_populated_ = false;   ///< True after first setStageInfo pass (names never change)
         bool weights_session_cohered_ = false;         ///< True after first forward completes weight coherence for all nodes
+        uint64_t snapshot_configuration_epoch_ = 1;   ///< Monotonic snapshot graph-topology identity
+
+        void advanceSnapshotConfigurationEpoch() noexcept
+        {
+            ++snapshot_configuration_epoch_;
+            if (snapshot_configuration_epoch_ == 0)
+                snapshot_configuration_epoch_ = 1;
+        }
 
         // =====================================================================
         // Unified stage runner (replaces divergent paths)
@@ -823,7 +936,8 @@ namespace llaminar2
         bool runStages(ComputeGraph &graph,
                        IDeviceContext *ctx,
                        const StageRunPolicy &policy,
-                       const std::unordered_set<std::string> *collective_nodes = nullptr);
+                       const std::unordered_set<std::string> *collective_nodes = nullptr,
+                       GraphSnapshotManifest *snapshot_manifest = nullptr);
 
         bool cancellationRequested(const std::string &node_name) const;
         void notifyStageFailure(const std::string &node_name, const std::string &reason) const;
@@ -856,45 +970,14 @@ namespace llaminar2
         bool runStage(ComputeNode &node,
                       IDeviceContext *ctx,
                       const StageRunPolicy &policy,
-                      bool is_collective);
-
-        struct GraphSnapshotOutputCopy
-        {
-            std::string name;
-            std::string dtype;
-            size_t rows = 0;
-            size_t cols = 0;
-            size_t element_size = sizeof(float);
-            size_t byte_size = 0;
-            size_t storage_bytes = 0;
-            DeviceId device = DeviceId::invalid();
-            const void *source_ptr = nullptr;
-            /**
-             * True after a real stage execution recorded this descriptor and
-             * its point-in-time D2D copy. Allocation-only pre-capture passes
-             * may inspect stage metadata, but must not replace a warmed source
-             * with a pre-execution fallback view.
-             */
-            bool descriptor_finalized = false;
-            std::unique_ptr<FP32Tensor> storage;
-        };
-
-        struct GraphSnapshotStageCopies
-        {
-            std::vector<GraphSnapshotOutputCopy> outputs;
-        };
-
-        /**
-         * GPU stages observed after real execution with no tensor-backed
-         * snapshot outputs. This is a finalized manifest state, distinct from
-         * an unknown stage that skipped warmup and must hard-fail preparation.
-         */
-        std::unordered_set<std::string> graph_snapshot_outputless_stages_;
+                      bool is_collective,
+                      GraphSnapshotManifest *snapshot_manifest = nullptr);
 
         bool prepareOrRecordGraphSnapshotCopies(ComputeNode &node,
                                                 DeviceId target_device,
                                                 void *producer_stream,
-                                                bool record_device_copy);
+                                                bool record_device_copy,
+                                                GraphSnapshotManifest &snapshot_manifest);
         bool shouldCaptureSnapshotStage(const std::string &node_name) const;
 
         /**
@@ -909,7 +992,8 @@ namespace llaminar2
          */
         bool prepareGraphSnapshotCopies(ComputeNode &node,
                                         DeviceId target_device,
-                                        void *producer_stream);
+                                        void *producer_stream,
+                                        GraphSnapshotManifest &snapshot_manifest);
 
         /**
          * @brief Enqueue point-in-time device copies for graph-captured snapshots.
@@ -925,7 +1009,8 @@ namespace llaminar2
          */
         bool captureGraphSnapshotCopies(ComputeNode &node,
                                         DeviceId target_device,
-                                        void *producer_stream);
+                                        void *producer_stream,
+                                        GraphSnapshotManifest &snapshot_manifest);
 
         /**
          * @brief Publish one GPU stage from its immutable graph snapshot slots.
@@ -938,7 +1023,8 @@ namespace llaminar2
          * It deliberately never calls getDumpInfo() on the live stage.
          */
         bool publishGraphSnapshotCopies(const std::string &stage_name,
-                                        void *producer_stream);
+                                        void *producer_stream,
+                                        GraphSnapshotManifest &snapshot_manifest);
 
         // =====================================================================
         // Legacy internal helpers (now delegate to runStages/runStage)
@@ -971,7 +1057,13 @@ namespace llaminar2
         // Workspace management
         std::vector<float> temp_buffer_;
         size_t temp_buffer_size_ = 0;
-        std::unordered_map<std::string, GraphSnapshotStageCopies> graph_snapshot_copies_;
+        /**
+         * Snapshot owner for uncached eager diagnostics only.
+         *
+         * Every cached forward graph passes its ForwardGraphCache-owned manifest
+         * explicitly. This transient state is never a cached executable owner.
+         */
+        GraphSnapshotManifest transient_snapshot_manifest_;
 
         float *getTemporaryBuffer(size_t elements);
     };

@@ -449,6 +449,9 @@ TEST(Test__CUDARingKVCache, DeviceResidentSequenceStatePublicationRemainsDeviceO
     device_request.target_cached_tokens_device = d_target;
     device_request.accepted_state_counts_device = d_accepted;
     device_request.publication_ok_flags_device = d_ok;
+    device_request.basis =
+        IKVCache::DeviceSequenceStatePublicationBasis::
+            CurrentVisibleWindow;
     device_request.stream = stream.opaque();
     std::string device_error;
     ASSERT_TRUE(cache->publishSequenceStateFromDeviceMetadata(device_request, &device_error))
@@ -487,6 +490,166 @@ TEST(Test__CUDARingKVCache, DeviceResidentSequenceStatePublicationRemainsDeviceO
     cudaFree(d_ok);
     cudaFree(d_accepted);
     cudaFree(d_target);
+    cudaFree(d_V);
+    cudaFree(d_K);
+}
+
+/**
+ * @brief Captured-base publication commits every cache layer, not only layer zero.
+ *
+ * The MTP verifier mutates all attention-layer rings before acceptance is known.
+ * Publication therefore owns a two-dimensional request/layer commit and must
+ * derive every canonical pair from one immutable checkpoint. A multi-layer
+ * fixture makes incomplete launch geometry observable.
+ */
+TEST(Test__CUDARingKVCache, CapturedBasePublicationCommitsEveryLayer)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    constexpr int n_layers = 4;
+    constexpr int batch_size = 1;
+    constexpr int max_seq_len = 16;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 16;
+    constexpr int kv_dim = n_kv_heads * head_dim;
+    constexpr int base_tokens = 6;
+    constexpr int verifier_rows = 2;
+    constexpr int accepted_rows = 1;
+    constexpr int target_tokens = base_tokens + accepted_rows;
+
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::FP32,
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ASSERT_NE(cache, nullptr);
+    ScopedCudaStream stream;
+
+    auto h_K = generateRandomFP32(base_tokens * kv_dim, 20260730);
+    auto h_V = generateRandomFP32(base_tokens * kv_dim, 20260731);
+    float *d_K = nullptr;
+    float *d_V = nullptr;
+    ASSERT_EQ(
+        cudaMalloc(&d_K, base_tokens * kv_dim * sizeof(float)),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMalloc(&d_V, base_tokens * kv_dim * sizeof(float)),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            d_K, h_K.data(), base_tokens * kv_dim * sizeof(float),
+            cudaMemcpyHostToDevice, stream.stream()),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            d_V, h_V.data(), base_tokens * kv_dim * sizeof(float),
+            cudaMemcpyHostToDevice, stream.stream()),
+        cudaSuccess);
+    for (int layer = 0; layer < n_layers; ++layer)
+    {
+        ASSERT_TRUE(cache->append(
+            layer, 0, d_K, d_V, base_tokens, stream.stream()));
+    }
+
+    const size_t checkpoint_bytes =
+        cache->deviceSequenceStateCheckpointBytes();
+    ASSERT_EQ(
+        checkpoint_bytes,
+        static_cast<size_t>(2 * n_layers) * sizeof(int32_t));
+    int32_t *d_checkpoint = nullptr;
+    ASSERT_EQ(cudaMalloc(&d_checkpoint, checkpoint_bytes), cudaSuccess);
+    std::string checkpoint_error;
+    ASSERT_TRUE(cache->captureDeviceSequenceStateCheckpoint(
+        0,
+        d_checkpoint,
+        checkpoint_bytes,
+        stream.opaque(),
+        &checkpoint_error))
+        << checkpoint_error;
+
+    for (int layer = 0; layer < n_layers; ++layer)
+    {
+        ASSERT_TRUE(cache->append(
+            layer, 0, d_K, d_V, verifier_rows, stream.stream()));
+    }
+
+    int32_t *d_target = nullptr;
+    int32_t *d_accepted = nullptr;
+    int32_t *d_ok = nullptr;
+    const int32_t h_target = target_tokens;
+    const int32_t h_accepted = accepted_rows;
+    const int32_t h_ok = 1;
+    ASSERT_EQ(cudaMalloc(&d_target, sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_accepted, sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_ok, sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            d_target, &h_target, sizeof(int32_t),
+            cudaMemcpyHostToDevice, stream.stream()),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            d_accepted, &h_accepted, sizeof(int32_t),
+            cudaMemcpyHostToDevice, stream.stream()),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            d_ok, &h_ok, sizeof(int32_t),
+            cudaMemcpyHostToDevice, stream.stream()),
+        cudaSuccess);
+
+    IKVCache::DeviceSequenceStatePublicationRequest request;
+    request.request_count = 1;
+    request.first_seq_idx = 0;
+    request.target_cached_tokens_device = d_target;
+    request.accepted_state_counts_device = d_accepted;
+    request.publication_ok_flags_device = d_ok;
+    request.basis =
+        IKVCache::DeviceSequenceStatePublicationBasis::CapturedBase;
+    request.base_sequence_state_checkpoint_device = d_checkpoint;
+    request.base_sequence_state_checkpoint_bytes = checkpoint_bytes;
+    request.stream = stream.opaque();
+    std::string publication_error;
+    ASSERT_TRUE(cache->publishSequenceStateFromDeviceMetadata(
+        request, &publication_error))
+        << publication_error;
+
+    std::array<int, n_layers> heads{};
+    std::array<int, n_layers> counts{};
+    for (int layer = 0; layer < n_layers; ++layer)
+    {
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                &heads[static_cast<size_t>(layer)],
+                cache->deviceRingHeadPtr(layer, 0),
+                sizeof(int),
+                cudaMemcpyDeviceToHost,
+                stream.stream()),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                &counts[static_cast<size_t>(layer)],
+                cache->deviceCachedTokenCountPtr(layer, 0),
+                sizeof(int),
+                cudaMemcpyDeviceToHost,
+                stream.stream()),
+            cudaSuccess);
+    }
+    stream.synchronize();
+
+    for (int layer = 0; layer < n_layers; ++layer)
+    {
+        EXPECT_EQ(heads[static_cast<size_t>(layer)], target_tokens)
+            << "layer=" << layer;
+        EXPECT_EQ(counts[static_cast<size_t>(layer)], target_tokens)
+            << "layer=" << layer;
+    }
+
+    cudaFree(d_ok);
+    cudaFree(d_accepted);
+    cudaFree(d_target);
+    cudaFree(d_checkpoint);
     cudaFree(d_V);
     cudaFree(d_K);
 }

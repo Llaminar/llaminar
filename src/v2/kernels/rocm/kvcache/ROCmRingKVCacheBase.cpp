@@ -44,6 +44,7 @@ namespace llaminar2
         const int32_t *target_cached_tokens,
         const int32_t *accepted_state_counts,
         const int32_t *publication_ok_flags,
+        const int *base_sequence_state_checkpoint,
         int n_layers,
         int batch_size,
         int first_seq_idx,
@@ -779,6 +780,25 @@ namespace llaminar2
             }
             return false;
         }
+        const bool captured_base =
+            request.basis ==
+            DeviceSequenceStatePublicationBasis::CapturedBase;
+        const size_t required_checkpoint_bytes =
+            deviceSequenceStateCheckpointBytes();
+        if (captured_base &&
+            (request.request_count != 1 ||
+             request.base_sequence_state_checkpoint_device == nullptr ||
+             request.base_sequence_state_checkpoint_bytes <
+                 required_checkpoint_bytes))
+        {
+            if (error)
+            {
+                *error =
+                    "ROCm KV captured-base publication requires one complete "
+                    "pre-verifier device sequence-state checkpoint";
+            }
+            return false;
+        }
         if (!activateOwningDevice(
                 "device sequence-state publication",
                 error))
@@ -792,6 +812,10 @@ namespace llaminar2
             request.target_cached_tokens_device,
             request.accepted_state_counts_device,
             request.publication_ok_flags_device,
+            captured_base
+                ? static_cast<const int *>(
+                      request.base_sequence_state_checkpoint_device)
+                : nullptr,
             n_layers_,
             batch_size_,
             request.first_seq_idx,

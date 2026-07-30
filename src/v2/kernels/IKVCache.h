@@ -287,23 +287,38 @@ namespace llaminar2
         };
 
         /**
+         * @brief Defines which immutable state anchors a sequence publication.
+         *
+         * Accepted verifier publication cannot reconstruct the pre-verifier
+         * ring tail from mutable post-verifier head/count values: padded or
+         * dynamically counted graph rows may advance those two values by
+         * different amounts. @ref CapturedBase requires an opaque checkpoint
+         * captured before verifier execution and advances each layer from that
+         * exact base by the accepted-state count.
+         *
+         * @ref CurrentVisibleWindow is the narrower truncation operation used
+         * when the caller intentionally preserves the currently visible ring
+         * tail, such as shifted-cache suffix publication. Naming that policy
+         * explicitly prevents a main verifier publication from silently
+         * adopting the ambiguous legacy behavior.
+         */
+        enum class DeviceSequenceStatePublicationBasis
+        {
+            CapturedBase,
+            CurrentVisibleWindow,
+        };
+
+        /**
          * @brief Device-resident sequence-state publication request.
          *
          * vLLM-style MTP publication derives accepted verifier rows and target
-         * cache lengths in GPU memory.  A cache implementation may consume this
-         * request to update its device-side sequence metadata without first
-         * copying accepted counts back to the CPU.
+         * cache lengths in GPU memory. Captured-base publication additionally
+         * requires one backend-opaque pre-verifier sequence checkpoint.
+         * Checkpoint allocations need not be contiguous, so this form names
+         * exactly one sequence; callers publish request batches with one
+         * stream-ordered request per sequence.
          *
-         * Long-context ring caches must treat @p target_cached_tokens_device as
-         * the target valid-token count.  Publication must preserve the live
-         * ring tail and move the head to `tail + target_cached_tokens`, matching
-         * truncateSequence() semantics after a verifier graph has written
-         * temporary rows.  @p accepted_state_counts_device records how many
-         * verifier rows were accepted for validation/accounting; it is not a
-         * reliable source of ring-head position because the live device head may
-         * already include rejected verifier rows.
-         *
-         * The stream is mandatory for GPU implementations.  Work enqueued by
+         * The stream is mandatory for GPU implementations. Work enqueued by
          * this call must be ordered after the verifier outcome producer and
          * before any graph replay that consumes the updated KV state.
          */
@@ -314,11 +329,23 @@ namespace llaminar2
             const int32_t *target_cached_tokens_device = nullptr;
             const int32_t *accepted_state_counts_device = nullptr;
             const int32_t *publication_ok_flags_device = nullptr;
+            DeviceSequenceStatePublicationBasis basis =
+                DeviceSequenceStatePublicationBasis::CapturedBase;
+            const void *base_sequence_state_checkpoint_device = nullptr;
+            size_t base_sequence_state_checkpoint_bytes = 0;
             void *stream = nullptr;
 
             bool valid() const
             {
-                return request_count > 0 &&
+                const bool checkpoint_contract_valid =
+                    basis ==
+                            DeviceSequenceStatePublicationBasis::
+                                CurrentVisibleWindow ||
+                        (request_count == 1 &&
+                         base_sequence_state_checkpoint_device != nullptr &&
+                         base_sequence_state_checkpoint_bytes > 0);
+                return checkpoint_contract_valid &&
+                       request_count > 0 &&
                        first_seq_idx >= 0 &&
                        target_cached_tokens_device != nullptr &&
                        accepted_state_counts_device != nullptr &&

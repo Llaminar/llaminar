@@ -1915,19 +1915,16 @@ TEST_F(Test__DeviceGraphOrchestrator, HarvestPrefixWaitsForLiveGraphProducersBef
     const std::string graph_fence_body =
         source.substr(graph_fence_pos, graph_fence_end - graph_fence_pos);
 
-    const auto accepted_publication_wait_pos =
-        fence_body.find("waitForPendingAcceptedSpecPublicationReadyForObservation");
-    const auto mutation_wait_pos =
-        fence_body.find("waitForPendingLivePrefixMutationReadyForObservation");
+    const auto published_state_join_pos =
+        fence_body.find("joinPublishedLiveStateHandoffs");
     const auto producer_wait_pos =
         fence_body.find("waitForPendingLiveGraphProducersForObservation");
     const auto mailbox_wait_pos =
         fence_body.find("waitForDeviceResidentLogicalSequenceStateMailboxForObservation");
 
-    ASSERT_NE(accepted_publication_wait_pos, std::string::npos)
-        << "Harvest must observe any accepted-spec publication before it copies cache payloads.";
-    ASSERT_NE(mutation_wait_pos, std::string::npos)
-        << "Harvest must observe prior live-prefix restore/truncate mutations.";
+    ASSERT_NE(published_state_join_pos, std::string::npos)
+        << "Harvest must join accepted publication and prefix mutation through "
+           "the central typed role API.";
     ASSERT_NE(producer_wait_pos, std::string::npos)
         << "Harvest must wait for graph producer streams before exporting GDN/KV payloads.";
     ASSERT_NE(mailbox_wait_pos, std::string::npos)
@@ -1941,8 +1938,7 @@ TEST_F(Test__DeviceGraphOrchestrator, HarvestPrefixWaitsForLiveGraphProducersBef
     EXPECT_EQ(graph_fence_body.find("insertStreamDependency"), std::string::npos);
     EXPECT_EQ(graph_fence_body.find("synchronizeStream"), std::string::npos);
     EXPECT_EQ(graph_fence_body.find("synchronizeDevice"), std::string::npos);
-    EXPECT_LT(accepted_publication_wait_pos, mutation_wait_pos);
-    EXPECT_LT(mutation_wait_pos, producer_wait_pos);
+    EXPECT_LT(published_state_join_pos, producer_wait_pos);
     EXPECT_LT(producer_wait_pos, mailbox_wait_pos);
 }
 
@@ -1990,8 +1986,7 @@ TEST_F(Test__DeviceGraphOrchestrator, RequestResetJoinNamesEveryRequiredDeviceTi
 
     for (const char *dependency : {
              "\"LivePrefixCheckpointReady\"",
-             "\"AcceptedSpecPublicationReady\"",
-             "\"LivePrefixMutationReady\"",
+             "\"PublishedLiveStateHandoffs\"",
              "\"LiveGraphProducersReady\"",
              "\"MTPTransactionReady\"",
              "\"LogicalSequenceStateReady\""})
@@ -2002,6 +1997,81 @@ TEST_F(Test__DeviceGraphOrchestrator, RequestResetJoinNamesEveryRequiredDeviceTi
 
     EXPECT_NE(source.find("[FATAL] Device timeline join failed:"), std::string::npos)
         << "Fatal reset diagnostics must bypass buffered log-file teardown.";
+}
+
+/**
+ * @brief Keep request-constant stop controls out of verifier replay.
+ *
+ * A verifier transaction may change its penalty policy, but stop tokens belong
+ * to the request. GPU request admission or prefix restore must publish that
+ * fixed control row after consuming request reset, and the verifier may only
+ * validate and consume it. This source contract prevents a future optimization
+ * from quietly restoring one H2D and one coherence publication per MTP step.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, MTPStopControlsArePublishedOnlyAtRequestBoundary)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto verifier_pos =
+        source.find("bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(");
+    const auto configure_pos =
+        source.find("bool DeviceGraphOrchestrator::configureMTPRequestStopTokens(", verifier_pos);
+    ASSERT_NE(verifier_pos, std::string::npos);
+    ASSERT_NE(configure_pos, std::string::npos);
+    const std::string verifier_body =
+        source.substr(verifier_pos, configure_pos - verifier_pos);
+
+    EXPECT_EQ(verifier_body.find("transaction.stop_tokens"), std::string::npos);
+    EXPECT_EQ(
+        verifier_body.find("BufferId::MTP_VERIFIER_STOP_TOKENS"),
+        std::string::npos);
+    EXPECT_EQ(
+        verifier_body.find("graph_owned_greedy_control_uploads"),
+        std::string::npos);
+    EXPECT_NE(
+        verifier_body.find(
+            "graph_owned_greedy_penalty_policy_publications"),
+        std::string::npos)
+        << "Only transaction-varying penalty policy may be published beside "
+           "verifier replay.";
+
+    const auto admission_pos =
+        source.find("bool DeviceGraphOrchestrator::admitRequestInputsOnDevice(");
+    const auto publication_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::publishMTPRequestStopTokensOnDevice(",
+            admission_pos);
+    ASSERT_NE(admission_pos, std::string::npos);
+    ASSERT_NE(publication_pos, std::string::npos);
+    const std::string admission_body =
+        source.substr(admission_pos, publication_pos - admission_pos);
+    const auto reset_wait_pos =
+        admission_body.find("waitForPendingRequestStateReset(");
+    const auto stop_publish_pos =
+        admission_body.find("publishMTPRequestStopTokensOnDevice(");
+    const auto admission_event_pos =
+        admission_body.find("DeviceTimelinePoint::RequestInputAdmission");
+    ASSERT_NE(reset_wait_pos, std::string::npos);
+    ASSERT_NE(stop_publish_pos, std::string::npos);
+    ASSERT_NE(admission_event_pos, std::string::npos);
+    EXPECT_LT(reset_wait_pos, stop_publish_pos);
+    EXPECT_LT(stop_publish_pos, admission_event_pos);
+
+    const auto prefix_pos =
+        source.find("bool DeviceGraphOrchestrator::populatePrefix(");
+    ASSERT_NE(prefix_pos, std::string::npos);
+    const std::string prefix_body =
+        source.substr(prefix_pos, admission_pos - prefix_pos);
+    const auto prefix_reset_wait_pos =
+        prefix_body.find("waitForPendingRequestStateReset(");
+    const auto prefix_stop_publish_pos =
+        prefix_body.find("publishMTPRequestStopTokensOnDevice(");
+    ASSERT_NE(prefix_reset_wait_pos, std::string::npos);
+    ASSERT_NE(prefix_stop_publish_pos, std::string::npos);
+    EXPECT_LT(prefix_reset_wait_pos, prefix_stop_publish_pos);
 }
 
 /**
@@ -2159,7 +2229,7 @@ TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixPublishesLiveStateMutationBo
     const std::string populate_body =
         source.substr(populate_pos, terminal_restore_pos - populate_pos);
     const auto wait_mutation_pos =
-        populate_body.find("waitForPendingLivePrefixMutationReady");
+        populate_body.find("joinPublishedLiveStateHandoffs");
     const auto wait_graph_pos =
         populate_body.find("waitForPendingLiveGraphProducersBeforePrefixMutation");
     const auto typed_reset_pos =
@@ -2321,7 +2391,7 @@ TEST_F(
             prepare_pos);
     const auto consume_pos =
         source.find(
-            "bool DeviceGraphOrchestrator::waitForPendingLivePrefixMutationReady",
+            "bool DeviceGraphOrchestrator::joinPublishedLiveStateHandoffs",
             record_pos);
     ASSERT_NE(prepare_pos, std::string::npos);
     ASSERT_NE(record_pos, std::string::npos);

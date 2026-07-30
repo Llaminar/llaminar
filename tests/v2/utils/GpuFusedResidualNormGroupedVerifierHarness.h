@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -238,8 +239,13 @@ namespace llaminar2::test::gpu_fused_residual_norm_verifier
             input.get(), residual.get(), gamma.get(), norm_output.get(),
             device, rows, cols);
         PerfStatsCollector::reset();
-        EXPECT_FALSE(stage.execute(context))
-            << format_label << " production stage accepted a default stream";
+        EXPECT_THROW(
+            {
+                (void)stage.execute(context);
+            },
+            std::logic_error)
+            << format_label
+            << " production stage did not fail hard for an unbound GPU stream";
 
         const std::string metric = std::string("kernel.") + counter_name;
         EXPECT_TRUE(PerfStatsCollector::snapshot({metric}).empty())

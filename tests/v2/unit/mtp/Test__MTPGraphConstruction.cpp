@@ -2451,6 +2451,38 @@ TEST(Test__MTPGraphConstruction, AllPositionLMHeadUsesVerifierLogitsContract)
     EXPECT_FALSE(contractWrites(contract, BufferId::LOGITS));
 }
 
+TEST(Test__MTPGraphConstruction, FullPhysicalVerifierRowsBypassLMHeadRowSelect)
+{
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.compute_all_position_logits = true;
+    fixture.config.compute_row_indexed_logits = true;
+    fixture.config.row_indexed_logits_row_count = 3;
+    fixture.config.row_indexed_logits_selected_rows = {0, 1, 2};
+
+    QwenStandardGraph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    auto hidden = TestTensorFactory::createFP32(
+        {3, static_cast<size_t>(fixture.config.d_model)});
+    auto logits = TestTensorFactory::createFP32(
+        {3, static_cast<size_t>(fixture.config.vocab_size)});
+
+    ComputeGraph graph = graph_builder.buildLMHeadGraph(
+        hidden.get(),
+        logits.get(),
+        /*total_tokens=*/3,
+        DeviceId::cpu());
+
+    EXPECT_EQ(graph.getNode("lm_head_rows_select"), nullptr)
+        << "a complete identity row cover must feed LM head directly";
+    const auto *lm_head = graph.getNode("lm_head");
+    ASSERT_NE(lm_head, nullptr);
+    const auto contract = lm_head->stage->bufferContract();
+    EXPECT_TRUE(contractReads(contract, BufferId::HIDDEN_STATE));
+    EXPECT_FALSE(contractReads(contract, BufferId::LM_HEAD_INPUT_ROWS));
+    EXPECT_TRUE(contractWrites(contract, BufferId::ALL_POSITION_LOGITS));
+}
+
 TEST(Test__MTPGraphConstruction, ColumnParallelAllPositionLMHeadUsesVerifierShardContracts)
 {
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
@@ -4969,7 +5001,12 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
     const std::vector<int> prefix_tokens = {1, 2, 3};
     ASSERT_NE(orchestrator.forward(prefix_tokens.data(), static_cast<int>(prefix_tokens.size()), 1), nullptr);
 
-    PrefixStateSnapshot checkpoint = orchestrator.captureLivePrefixCheckpoint();
+    PrefixStateSnapshot checkpoint =
+        orchestrator.captureLivePrefixCheckpoint(
+            PrefixCheckpointCaptureRequest{
+                .sequence_index = 0,
+                .logical_cached_tokens =
+                    static_cast<int>(prefix_tokens.size())});
     ASSERT_TRUE(checkpoint.valid);
     EXPECT_TRUE(checkpoint.logical_checkpoint);
     ASSERT_EQ(checkpoint.blocks.size(), 1u);
@@ -5071,7 +5108,11 @@ TEST(Test__MTPGraphConstruction, CPUReplayObservationsTrackLiveStateEpochAcrossR
             << "CPU replay-cache identities must not be marked stale by GPU epoch logic.";
     }
 
-    PrefixStateSnapshot checkpoint = orchestrator.captureLivePrefixCheckpoint();
+    PrefixStateSnapshot checkpoint =
+        orchestrator.captureLivePrefixCheckpoint(
+            PrefixCheckpointCaptureRequest{
+                .sequence_index = 0,
+                .logical_cached_tokens = 1});
     ASSERT_TRUE(checkpoint.valid);
     ASSERT_TRUE(orchestrator.restoreLivePrefixState(checkpoint));
     EXPECT_GT(orchestrator.forwardReplayLiveStateEpoch(), epoch_after_decode);
@@ -5495,8 +5536,8 @@ TEST(Test__MTPGraphConstruction, GPUStochasticRequestBatchScratchScalesWithConfi
     EXPECT_THAT(shape_for(BufferId::STOCHASTIC_BATCH_OUTPUT_META),
                 ::testing::ElementsAre(size_t{2}, size_t{10}));
     EXPECT_THAT(shape_for(BufferId::MTP_LOGICAL_SEQUENCE_STATE),
-                ::testing::ElementsAre(size_t{6}, size_t{2}))
-        << "Published request state must have stable arena rows outside graph workspace.";
+                ::testing::ElementsAre(size_t{7}, size_t{2}))
+        << "Published request state and its initialization scratch must have stable arena rows outside graph workspace.";
 }
 
 TEST(Test__MTPGraphConstruction, GreedyBatchTransactionExecutorRunsOnCPUVerifierGraph)

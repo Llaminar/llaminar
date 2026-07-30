@@ -891,6 +891,59 @@ namespace llaminar2
     }
 
     ForwardExecutionEngine::ReplayStateResetSummary
+    ForwardExecutionEngine::rebindCapturedReplayStateAfterPrefixRestore(
+        uint64_t live_state_epoch)
+    {
+        ReplayStateResetSummary summary;
+        for (auto &[signature, cache] : cache_)
+        {
+            const ForwardReplayStateCacheClass cache_class =
+                classifyForwardReplayStateCache(signature);
+            const ForwardReplayStateAction action =
+                chooseForwardReplayStateAction(
+                    ForwardReplayStateMutationKind::PrefixCheckpointRestore,
+                    signature);
+            if (action == ForwardReplayStateAction::ResetReplayState)
+            {
+                cache.resetReplayState();
+                ++summary.reset_replay_state;
+                if (cache_class ==
+                        ForwardReplayStateCacheClass::OrdinaryDecode ||
+                    cache_class ==
+                        ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode)
+                {
+                    ++summary.ordinary_decode_reset;
+                }
+                continue;
+            }
+
+            /*
+             * Prefix restore also retires request-local token, position, and
+             * sequence-length metadata from the discarded timeline.  Reset that
+             * metadata through the captured-replay-preserving stage API: this
+             * keeps the graph executable and stable buffers, but guarantees that
+             * the next invocation republishes every dynamic row before replay.
+             * The restore producer event still owns all device writes, and the
+             * epoch stamp prevents the cache from being mistaken for an
+             * unversioned capture.
+             */
+            cache.resetSessionStatePreservingGraphReplay();
+            cache.markReplayStateSafeForLiveEpoch(live_state_epoch);
+            ++summary.preserved_for_stream_rebind;
+            if (cache_class ==
+                ForwardReplayStateCacheClass::AllPositionVerifier)
+            {
+                ++summary.all_position_verifier_preserved;
+            }
+            else
+            {
+                ++summary.other_preserved;
+            }
+        }
+        return summary;
+    }
+
+    ForwardExecutionEngine::ReplayStateResetSummary
     ForwardExecutionEngine::resetAllPositionVerifierReplayState()
     {
         ReplayStateResetSummary summary;
@@ -2190,25 +2243,6 @@ namespace llaminar2
             used_graph_replay &&
             executed_deferred_main_decode_sync &&
             forward_cache.segment_cache.capture_stream != nullptr;
-        if (all_position_verifier_sync_deferred)
-        {
-            host.setPendingAllPositionVerifierStream(
-                forward_cache.segment_cache.capture_stream);
-        }
-        else if (requested_deferred_all_position_sync)
-        {
-            host.setPendingAllPositionVerifierStream(nullptr);
-        }
-        if (main_decode_sync_deferred)
-        {
-            host.setPendingMainDecodeStream(
-                forward_cache.segment_cache.capture_stream);
-        }
-        else if (requested_deferred_main_decode_sync)
-        {
-            host.setPendingMainDecodeStream(nullptr);
-        }
-
         if (success)
         {
             /*
@@ -2235,6 +2269,31 @@ namespace llaminar2
                           << " decode=" << is_decode
                           << " replay=" << used_graph_replay);
                 return false;
+            }
+
+            /*
+             * Grouped verifier state is always consumed asynchronously by a
+             * sampler, accepted-state publisher, or diagnostic observer. Publish
+             * its completion edge for every successful GPU invocation, including
+             * warmup and first capture. Whether the caller also requests a
+             * host-facing logits boundary is independent of this device-state
+             * ownership contract.
+             */
+            if (is_decode &&
+                input.device.is_gpu() &&
+                host.computeAllPositionLogitsEnabled())
+            {
+                host.setPendingAllPositionVerifierStream(
+                    output.execution.stream);
+            }
+            if (main_decode_sync_deferred)
+            {
+                host.setPendingMainDecodeStream(
+                    output.execution.stream);
+            }
+            else if (requested_deferred_main_decode_sync)
+            {
+                host.setPendingMainDecodeStream(nullptr);
             }
         }
 
@@ -2360,6 +2419,31 @@ namespace llaminar2
         }
 
         auto &cache = *forward_cache.prefill_graph_cache;
+        const uint64_t snapshot_configuration_epoch =
+            executor_.snapshotConfigurationEpoch();
+        if (forward_cache.snapshot_configuration_epoch !=
+            snapshot_configuration_epoch)
+        {
+            /*
+             * Selected GPU snapshot stages become captured D2D nodes. Retire
+             * prefill executables recorded under another callback/filter
+             * topology before choosing the current key's phase. The stable
+             * ComputeGraph and prepared weights remain reusable; the cache
+             * simply performs its normal warmup/capture lifecycle again.
+             */
+            cache.invalidateAll();
+            forward_cache.snapshot_manifest.clear();
+            forward_cache.snapshot_configuration_epoch =
+                snapshot_configuration_epoch;
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "prefill_snapshot_configuration_rewarm",
+                1.0,
+                "prefill",
+                input.device.toString(),
+                {{"snapshot_epoch",
+                  std::to_string(snapshot_configuration_epoch)}});
+        }
 
         PrefillGraphCacheKey key = makePrefillGraphKey(input, host);
 
@@ -2636,7 +2720,8 @@ namespace llaminar2
             if (!executor_.publishSnapshotsAfterGraphExecution(
                     *forward_cache.graph,
                     stream,
-                    "prefill_graph_replay"))
+                    "prefill_graph_replay",
+                    &forward_cache.snapshot_manifest))
             {
                 return false;
             }
@@ -2703,7 +2788,8 @@ namespace llaminar2
                     *forward_cache.graph,
                     ctx,
                     stream,
-                    "prefill_graph_capture"))
+                    "prefill_graph_capture",
+                    &forward_cache.snapshot_manifest))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph snapshot preparation failed for seq_len="
                           << input.seq_len);
@@ -2758,7 +2844,8 @@ namespace llaminar2
                         return executor_.executeFastDecode(
                             *forward_cache.graph,
                             ctx,
-                            &forward_cache.collective_nodes);
+                            &forward_cache.collective_nodes,
+                            &forward_cache.snapshot_manifest);
                     }))
             {
                 LOG_ERROR(
@@ -2817,7 +2904,8 @@ namespace llaminar2
             if (!executor_.publishSnapshotsAfterGraphExecution(
                     *forward_cache.graph,
                     stream,
-                    "prefill_graph_capture_launch"))
+                    "prefill_graph_capture_launch",
+                    &forward_cache.snapshot_manifest))
             {
                 return false;
             }
@@ -2939,7 +3027,10 @@ namespace llaminar2
 
         // Execute normally to warm up lazy allocations.
         bool exec_success = executor_.executeFastDecode(
-            *forward_cache.graph, ctx, &forward_cache.collective_nodes);
+            *forward_cache.graph,
+            ctx,
+            &forward_cache.collective_nodes,
+            &forward_cache.snapshot_manifest);
 
         if (!exec_success)
             return false;
@@ -2954,7 +3045,8 @@ namespace llaminar2
         if (!executor_.publishSnapshotsAfterGraphExecution(
                 *forward_cache.graph,
                 nullptr,
-                "prefill_graph_warmup"))
+                "prefill_graph_warmup",
+                &forward_cache.snapshot_manifest))
         {
             return false;
         }
@@ -3401,7 +3493,13 @@ namespace llaminar2
                 return false;
             }
 
-            success = executor_.execute(graph, ctx);
+            success =
+                build_cache
+                    ? executor_.executeWithSnapshotManifest(
+                          graph,
+                          ctx,
+                          build_cache->snapshot_manifest)
+                    : executor_.execute(graph, ctx);
         }
 
         DeviceId producer_device = effective_input.device;
@@ -3452,18 +3550,21 @@ namespace llaminar2
                     !all_position_verifier &&
                     host.shouldDeferMainDecodeFinalSync();
 
-                if ((defer_all_position_verifier || defer_main_decode) &&
+                if ((all_position_verifier || defer_main_decode) &&
                     !execution_stream_used)
                 {
-                    LOG_ERROR("[ForwardExecutionEngine] GPU cache-miss decode requested a device logits handoff without an explicit producer stream on "
+                    LOG_ERROR("[ForwardExecutionEngine] GPU cache-miss decode requires an explicit producer stream for its device-state handoff on "
                               << producer_device.toString());
                     return false;
                 }
 
-                if (defer_all_position_verifier)
+                if (all_position_verifier)
                 {
                     host.setPendingAllPositionVerifierStream(
                         execution_stream_used);
+                }
+                if (defer_all_position_verifier)
+                {
                     deferred_all_position_verifier_sync = true;
                 }
                 if (defer_main_decode)
@@ -3536,6 +3637,8 @@ namespace llaminar2
             build_cache->graph = std::make_unique<ComputeGraph>(std::move(graph));
             build_cache->output = output;
             build_cache->workspace_generation = workspace_generation;
+            build_cache->snapshot_configuration_epoch =
+                executor_.snapshotConfigurationEpoch();
 
             // Pre-compute collective node set for fast decode intercept and
             // padded-prefill safety checks on later same-bucket cache hits.

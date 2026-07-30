@@ -376,6 +376,15 @@ namespace llaminar2
             return fail("MTP decode-equivalent catch-up received no draft tokens");
         if (!sample_after_forward)
             return fail("MTP decode-equivalent catch-up received no sampler callback");
+        const bool device_owned_tokens = runner.primaryDeviceId().is_gpu();
+        if (device_owned_tokens &&
+            (!request.device_target_sample_slot.has_value() ||
+             *request.device_target_sample_slot < 0))
+        {
+            return fail(
+                "GPU MTP decode-equivalent catch-up requires a device-owned "
+                "target-sample slot");
+        }
 
         auto forward_one_and_sample = [&](int32_t token) -> int32_t
         {
@@ -418,11 +427,22 @@ namespace llaminar2
                     "decode",
                     {},
                     {{"implementation", implementation}});
-                ok = runner.commitMTPShiftedRowFromCurrentTerminalHidden(
-                    token,
-                    token_index,
-                    request.allow_speculative_discard,
-                    request.base_sidecar_position);
+                if (device_owned_tokens)
+                {
+                    ok = runner.commitMTPShiftedRowFromDeviceTargetSample(
+                        *request.device_target_sample_slot,
+                        token_index,
+                        request.allow_speculative_discard,
+                        request.base_sidecar_position);
+                }
+                else
+                {
+                    ok = runner.commitMTPShiftedRowFromCurrentTerminalHidden(
+                        token,
+                        token_index,
+                        request.allow_speculative_discard,
+                        request.base_sidecar_position);
+                }
             }
             if (ok)
                 ++result.shifted_commit_count;

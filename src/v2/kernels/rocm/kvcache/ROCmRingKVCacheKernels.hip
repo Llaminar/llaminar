@@ -515,9 +515,11 @@ namespace llaminar2
         const int32_t *__restrict__ target_cached_tokens,
         const int32_t *__restrict__ accepted_state_counts,
         const int32_t *__restrict__ publication_ok_flags,
+        const int *__restrict__ base_sequence_state_checkpoint,
         int batch_size,
         int first_seq_idx,
         int request_count,
+        int n_layers,
         int max_seq_len)
     {
         const int request_idx = static_cast<int>(blockIdx.x);
@@ -542,6 +544,45 @@ namespace llaminar2
         }
 
         const int entry_idx = layer * batch_size + seq_idx;
+        if (base_sequence_state_checkpoint)
+        {
+            const int base_head =
+                base_sequence_state_checkpoint[layer];
+            const int base_count =
+                base_sequence_state_checkpoint[n_layers + layer];
+            const int64_t unbounded_target_count =
+                static_cast<int64_t>(base_count) +
+                static_cast<int64_t>(accepted_count);
+            const int expected_target_count =
+                unbounded_target_count >=
+                        static_cast<int64_t>(max_seq_len)
+                    ? max_seq_len
+                    : static_cast<int>(
+                          unbounded_target_count);
+            if (base_head < 0 || base_head >= max_seq_len ||
+                base_count < 0 || base_count > max_seq_len ||
+                unbounded_target_count < 0 ||
+                target_count != expected_target_count)
+            {
+                return;
+            }
+
+            /*
+             * The verifier wrote accepted payload rows beginning at the exact
+             * pre-verifier head. Publish that immutable base plus the accepted
+             * row count; never infer a tail from mutable post-verifier state.
+             * Visible count saturates at capacity, but the physical head keeps
+             * moving exactly as serial decode does after the ring becomes full.
+             */
+            d_heads[entry_idx] =
+                static_cast<int>(
+                    (static_cast<int64_t>(base_head) +
+                     static_cast<int64_t>(accepted_count)) %
+                    static_cast<int64_t>(max_seq_len));
+            d_counts[entry_idx] = target_count;
+            return;
+        }
+
         const int old_head = d_heads[entry_idx];
         const int old_count = d_counts[entry_idx];
         if (old_head < 0 || old_head >= max_seq_len ||
@@ -2244,6 +2285,7 @@ namespace llaminar2
         const int32_t *target_cached_tokens,
         const int32_t *accepted_state_counts,
         const int32_t *publication_ok_flags,
+        const int *base_sequence_state_checkpoint,
         int n_layers,
         int batch_size,
         int first_seq_idx,
@@ -2269,9 +2311,11 @@ namespace llaminar2
                            target_cached_tokens,
                            accepted_state_counts,
                            publication_ok_flags,
+                           base_sequence_state_checkpoint,
                            batch_size,
                            first_seq_idx,
                            request_count,
+                           n_layers,
                            max_seq_len);
         return hipGetLastError() == hipSuccess;
     }

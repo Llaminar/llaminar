@@ -4147,6 +4147,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, LocalTPWoAllQuantizedFormatsGroupedVerifierR
 {
     if (rocmDeviceCount() < 2)
         GTEST_SKIP() << "ROCm LocalTP Wo regression requires at least two ROCm devices";
+    ScopedEnv perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
 
     /*
      * Qwen3.6 MoE LocalTP splits the attention output projection along the
@@ -4180,6 +4181,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, LocalTPWoFloatingPointFormatsGroupedVerifier
 {
     if (rocmDeviceCount() < 2)
         GTEST_SKIP() << "ROCm LocalTP Wo regression requires at least two ROCm devices";
+    ScopedEnv perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
 
     /*
      * Floating-point prepared GEMM goes through rocBLAS/hipBLAS-style kernels
@@ -4211,6 +4213,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, ReplicatedWoAllQuantizedFormatsGroupedVerifi
 {
     if (!hasROCmDevice())
         GTEST_SKIP() << "ROCm replicated Wo regression requires a ROCm device";
+    ScopedEnv perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
 
     /*
      * Mirroring the complete attention Wo/MTP verifier projection on every
@@ -4239,6 +4242,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, ReplicatedWoFloatingPointFormatsGroupedVerif
 {
     if (!hasROCmDevice())
         GTEST_SKIP() << "ROCm replicated Wo regression requires a ROCm device";
+    ScopedEnv perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
 
     /*
      * Floating-point mirrored Wo must also use the decode-equivalent grouped

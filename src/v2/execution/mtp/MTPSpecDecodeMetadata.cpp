@@ -654,6 +654,31 @@ namespace llaminar2
             graph_plan.verifier_logit_rows.push_back(*mapped);
         }
 
+        /*
+         * Make the dense identity case a first-class layout rather than asking
+         * graph construction and metadata publication to infer it independently.
+         * This is true only when every physical row is consumed exactly once in
+         * ascending order. A padded request batch therefore remains an explicit
+         * selection even when every logical verifier row is selected.
+         */
+        bool covers_full_physical_input =
+            input_plan.compact_logit_row_count ==
+            graph_plan.total_graph_tokens;
+        for (int row = 0;
+             covers_full_physical_input &&
+             row < graph_plan.total_graph_tokens;
+             ++row)
+        {
+            covers_full_physical_input =
+                graph_plan.verifier_logit_rows[
+                    static_cast<size_t>(row)] == row;
+        }
+        if (covers_full_physical_input)
+        {
+            graph_plan.logit_row_layout =
+                MTPSpecDecodeVerifierLogitRowLayout::FullPhysicalIdentity;
+        }
+
         const int bonus_count = std::min<int>(
             input_plan.request_count,
             static_cast<int>(input_plan.bonus_logit_rows.size()));
@@ -1702,6 +1727,17 @@ namespace llaminar2
             plan.compact_logit_row_count)
         {
             result.error = "MTP verifier graph row plan is undersized";
+            return result;
+        }
+        if (graph_plan.logit_row_layout ==
+            MTPSpecDecodeVerifierLogitRowLayout::FullPhysicalIdentity)
+        {
+            /*
+             * The graph consumes the normalized activation directly. Publishing
+             * an identity index vector would add a host-to-device transfer to
+             * every verifier replay without changing a single source row.
+             */
+            result.ok = true;
             return result;
         }
         if (device.is_gpu())

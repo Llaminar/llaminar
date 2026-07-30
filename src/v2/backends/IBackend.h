@@ -2183,10 +2183,11 @@ namespace llaminar2
          *
          * Production request admission and publication use separate persistent
          * arena rows: the immutable admitted prompt lengths are inputs, while
-         * the six request-lifetime logical-state rows are outputs. Implementations
-         * must nevertheless remain alias-safe for focused kernel tests and must
-         * enqueue on the explicit non-null @p stream without allocation,
-         * synchronization, or a default-stream substitute.
+         * the outputs comprise one base-cache scratch row and six
+         * request-lifetime logical-state rows. Implementations must nevertheless
+         * remain alias-safe for focused kernel tests and must enqueue on the
+         * explicit non-null @p stream without allocation, synchronization, or
+         * a default-stream substitute.
          *
          * @param sampled_tokens_device Contiguous INT32 sampled prefill tokens.
          * @param target_positions_device Device INT32 prompt positions, one per request.

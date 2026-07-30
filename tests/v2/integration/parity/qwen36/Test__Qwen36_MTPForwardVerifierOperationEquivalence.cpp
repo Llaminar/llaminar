@@ -431,6 +431,10 @@ namespace
         ScopedEnvironmentValues operation_diagnostics({
             {"LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_DIAGNOSTIC", "1"},
             {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+            {"LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT", "1"},
+            {"LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT_LAYER", "0"},
+            {"LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT", "1"},
+            {"LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT_LAYER", "0"},
             {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
         });
         const auto test_case = moeBenchmarkPromptCase(backend);
@@ -456,6 +460,89 @@ namespace
         {
             expectRocmMoEVerifierGroupedPrefillPath(verifier_rows);
         }
+        PerfStatsCollector::reset();
+    }
+
+    /**
+     * @brief Reproduce the first production MTP transaction after the benchmark prompt.
+     *
+     * The generic M=1..4 operation matrix advances two reference tokens before
+     * constructing its verifier row. The production depth-one lane reaches its
+     * first accepted two-row transaction after only the first benchmark token:
+     * at that state the serial row is `{248046, 198}` for the checked-in Qwen3.6
+     * MoE fixture. Keeping this distinct state in the focused suite prevents a
+     * benign later continuation from hiding input-dependent grouped arithmetic or
+     * state-publication bugs.
+     */
+    void runMoEFirstProductionTransactionCase(VerifierBackend backend)
+    {
+        ScopedEnvironmentValues operation_diagnostics({
+            {"LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_DIAGNOSTIC", "1"},
+            {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
+        const auto test_case = moeBenchmarkPromptCase(backend);
+        PerfStatsCollector::reset();
+        runMoEMainVerifierGroupedRowsMatchSerialDecode(
+            test_case,
+            /*verifier_row_count=*/2,
+            /*serial_setup_token_count=*/0,
+            /*exercise_shifted_row_maintenance=*/true,
+            /*configured_draft_tokens=*/1,
+            /*mirror_shifted_maintenance_in_serial_oracle=*/false);
+        if (::testing::Test::HasFailure())
+        {
+            if (backend == VerifierBackend::CUDA)
+                printCudaGroupedGemvFailureDiagnostics(/*verifier_rows=*/2);
+            PerfStatsCollector::reset();
+            return;
+        }
+        expectLMHeadGroupedDecodeEquivalentVerifierPrefillPath(
+            /*expected_seq_len=*/2);
+        if (backend == VerifierBackend::CUDA)
+        {
+            expectCudaMoEMTPVerifierFusedPrefillPath(
+                /*expected_seq_len=*/2);
+        }
+        else if (backend == VerifierBackend::ROCm)
+        {
+            expectRocmMoEVerifierGroupedPrefillPath(
+                /*expected_seq_len=*/2);
+        }
+        PerfStatsCollector::reset();
+    }
+
+    /**
+     * @brief Prove the first GPU production transaction publishes serial state.
+     *
+     * This starts directly at the prefill boundary, commits the pending
+     * condition token to the shifted sidecar, executes the real two-row grouped
+     * verifier, and forces a first-draft rejection.  Publication must therefore
+     * select verifier row zero exactly as the production depth-one lane does.
+     * An eight-token continuation then proves that the selected KV,
+     * GDN/short-conv, and terminal-hidden state is bytewise decode-equivalent,
+     * rather than merely producing the same immediate token.
+     */
+    void runMoEFirstProductionPublicationCase(VerifierBackend backend)
+    {
+        ScopedEnvironmentValues publication_diagnostics({
+            {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
+            {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
+        PerfStatsCollector::reset();
+        runMoEMainVerifierAllPositionRowsMatchSerialDecode(
+            moeBenchmarkPromptCase(backend),
+            /*use_row_indexed_logits=*/true,
+            /*use_skip_gather=*/true,
+            /*verify_compact_device_outcome=*/true,
+            /*use_deferred_verifier_sync=*/true,
+            /*verify_published_state_continuation=*/true,
+            /*verifier_row_count=*/2,
+            /*verify_device_resident_publication=*/true,
+            /*expect_grouped_moe_verifier_prefill=*/true,
+            /*force_first_speculative_rejection=*/true,
+            /*serial_setup_token_count=*/0);
         PerfStatsCollector::reset();
     }
 } // namespace
@@ -499,6 +586,34 @@ LLAMINAR_QWEN36_VERIFIER_OPERATION_TESTS(CUDA, CUDA)
 LLAMINAR_QWEN36_VERIFIER_OPERATION_TESTS(ROCm, ROCm)
 
 #undef LLAMINAR_QWEN36_VERIFIER_OPERATION_TESTS
+
+TEST(
+    Qwen36MTPForwardVerifierOperationEquivalence,
+    MoECUDA_M2_FirstProductionTransactionAfterBenchmarkPrompt)
+{
+    runMoEFirstProductionTransactionCase(VerifierBackend::CUDA);
+}
+
+TEST(
+    Qwen36MTPForwardVerifierOperationEquivalence,
+    MoECUDA_M2_FirstProductionPublicationAfterBenchmarkPrompt)
+{
+    runMoEFirstProductionPublicationCase(VerifierBackend::CUDA);
+}
+
+TEST(
+    Qwen36MTPForwardVerifierOperationEquivalence,
+    MoEROCm_M2_FirstProductionTransactionAfterBenchmarkPrompt)
+{
+    runMoEFirstProductionTransactionCase(VerifierBackend::ROCm);
+}
+
+TEST(
+    Qwen36MTPForwardVerifierOperationEquivalence,
+    MoEROCm_M2_FirstProductionPublicationAfterBenchmarkPrompt)
+{
+    runMoEFirstProductionPublicationCase(VerifierBackend::ROCm);
+}
 
 int main(int argc, char **argv)
 {

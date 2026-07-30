@@ -531,7 +531,7 @@ TEST(Test__MTPSpecDecodeMetadata, UploadBatchRejectsGpuNullStream)
     EXPECT_THAT(upload.error, HasSubstr("explicit non-null stream"));
 }
 
-TEST(Test__MTPSpecDecodeMetadata, UploadVerifierInputPlanCopiesCompactRows)
+TEST(Test__MTPSpecDecodeMetadata, UploadVerifierInputPlanSkipsFullPhysicalIdentityRows)
 {
     if (!hasCPUBackend())
     {
@@ -557,6 +557,13 @@ TEST(Test__MTPSpecDecodeMetadata, UploadVerifierInputPlanCopiesCompactRows)
     binding.bindWorkspace(&workspace);
     ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
 
+    const auto &ptrs = binding.devicePointers();
+    ASSERT_NE(ptrs.verifier_logit_rows, nullptr);
+    std::fill_n(
+        ptrs.verifier_logit_rows,
+        plan.compact_logit_row_count,
+        int32_t{-77});
+
     MTPSpecDecodeMetadataUploadResult upload =
         uploadMTPSpecDecodeVerifierInputPlan(
             plan,
@@ -565,13 +572,13 @@ TEST(Test__MTPSpecDecodeMetadata, UploadVerifierInputPlanCopiesCompactRows)
             /*backend=*/nullptr,
             /*stream=*/nullptr);
     ASSERT_TRUE(upload.ok) << upload.error;
-    EXPECT_EQ(upload.bytes_uploaded, 3u * sizeof(int32_t));
+    EXPECT_EQ(upload.bytes_uploaded, 0u);
 
-    const auto &ptrs = binding.devicePointers();
     EXPECT_THAT(std::vector<int32_t>(
                     ptrs.verifier_logit_rows,
                     ptrs.verifier_logit_rows + 3),
-                ElementsAre(0, 1, 2));
+                Each(-77))
+        << "identity verifier rows must not touch the metadata workspace";
 }
 
 TEST(Test__MTPSpecDecodeMetadata, UploadVerifierLogitRowsCopiesDirectGraphRows)
@@ -820,6 +827,34 @@ TEST(Test__MTPSpecDecodeMetadata, MaterializesVerifierGraphRowsForPaddedRequestB
     EXPECT_THAT(graph_plan.sequence_lengths, ElementsAre(2, 3));
     EXPECT_THAT(graph_plan.verifier_logit_rows, ElementsAre(0, 1, 3, 4, 5));
     EXPECT_THAT(graph_plan.bonus_logit_rows, ElementsAre(1, 5));
+    EXPECT_EQ(
+        graph_plan.logit_row_layout,
+        MTPSpecDecodeVerifierLogitRowLayout::ExplicitSelection);
+}
+
+TEST(Test__MTPSpecDecodeMetadata, ClassifiesSingleRequestVerifierRowsAsFullPhysicalIdentity)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeVerifierDraftRequest request;
+    request.request_id = 0;
+    request.draft_tokens = {7, 9, 8};
+
+    const MTPSpecDecodeVerifierInputPlan logical_plan =
+        buildMTPSpecDecodeVerifierInputPlan(shape, {request});
+    ASSERT_TRUE(logical_plan.ok) << logical_plan.error;
+
+    const MTPSpecDecodeVerifierGraphForwardPlan graph_plan =
+        buildMTPSpecDecodeVerifierGraphForwardPlan(logical_plan);
+
+    ASSERT_TRUE(graph_plan.ok) << graph_plan.error;
+    EXPECT_EQ(graph_plan.total_graph_tokens, 3);
+    EXPECT_THAT(graph_plan.verifier_logit_rows, ElementsAre(0, 1, 2));
+    EXPECT_EQ(
+        graph_plan.logit_row_layout,
+        MTPSpecDecodeVerifierLogitRowLayout::FullPhysicalIdentity);
 }
 
 TEST(Test__MTPSpecDecodeMetadata, UploadVerifierInputPlanCopiesPaddedGraphRows)
@@ -1136,6 +1171,69 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesPublicationMetadataFromCompactAcceptAll
     EXPECT_EQ(next_condition_token, meta[kSpecBatchMetaReadyToken])
         << "When every verifier row accepts, the sampled terminal ready token "
            "is the next decode condition.";
+}
+
+TEST(Test__MTPSpecDecodeMetadata, ClipsAcceptAllPublicationAtSerialVisibleResponseBoundary)
+{
+    using namespace sampling_math;
+
+    std::array<int, kSpeculativeBatchMaxRows> row_tokens{760, -1, -1, -1};
+    std::array<int, kSpeculativeBatchMaxRows> row_accepted{1, 0, 0, 0};
+    std::array<int32_t, kSpeculativeBatchMaxOutputTokens> output_tokens{};
+    std::array<int, kSpeculativeBatchMetaCount> meta{};
+
+    summarize_speculative_verify_batch(
+        /*first_token=*/198,
+        row_tokens.data(),
+        row_accepted.data(),
+        /*row_count=*/1,
+        /*stop_tokens=*/nullptr,
+        /*stop_token_count=*/0,
+        /*bonus_ready_token=*/3841,
+        /*has_bonus_ready_token=*/1,
+        output_tokens.data(),
+        kSpeculativeBatchMaxOutputTokens,
+        meta.data());
+
+    ASSERT_EQ(meta[kSpecBatchMetaTargetVerifierStateCommitCount], 2);
+    ASSERT_EQ(meta[kSpecBatchMetaOutputCount], 2);
+    ASSERT_EQ(output_tokens[0], 198);
+    ASSERT_EQ(output_tokens[1], 760);
+
+    int restore_row = -1;
+    int target_cached_tokens = -1;
+    int accepted_state_count = -1;
+    int32_t next_condition_token = -1;
+    int all_drafts_accepted = 0;
+    int stopped = 0;
+    int ok = 0;
+    derive_speculative_publication_metadata(
+        meta.data(),
+        kSpeculativeBatchMetaCount,
+        /*request_index=*/0,
+        /*padded_state_rows_per_request=*/2,
+        /*base_cached_tokens=*/10,
+        /*max_state_commit_rows=*/1,
+        &restore_row,
+        &target_cached_tokens,
+        &accepted_state_count,
+        &ok,
+        output_tokens.data(),
+        kSpeculativeBatchMaxOutputTokens,
+        &next_condition_token,
+        &all_drafts_accepted,
+        &stopped);
+
+    EXPECT_EQ(ok, 1);
+    EXPECT_EQ(accepted_state_count, 1);
+    EXPECT_EQ(restore_row, 0);
+    EXPECT_EQ(target_cached_tokens, 11);
+    EXPECT_EQ(next_condition_token, 760)
+        << "The final visible token stays pending; the farther-ahead sampled "
+           "terminal token must not become the live condition.";
+    EXPECT_EQ(all_drafts_accepted, 1)
+        << "Publication clipping must not rewrite acceptance evidence.";
+    EXPECT_EQ(stopped, 0);
 }
 
 TEST(Test__MTPSpecDecodeMetadata, DerivesPublicationMetadataFromCompactRejectFirstOutcome)

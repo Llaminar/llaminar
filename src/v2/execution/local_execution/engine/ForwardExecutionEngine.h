@@ -781,6 +781,23 @@ namespace llaminar2
             bool preserve_single_token_decode_replay = true);
 
         /**
+         * @brief Rebind replay-safe captures after restoring a live checkpoint.
+         *
+         * A checkpoint restore replaces the contents behind canonical KV,
+         * recurrent-state, token, and position buffers without changing their
+         * addresses.  Single-token decode, all-position verifier, and fixed
+         * prefill captures therefore remain valid after their producer streams
+         * are rebound to the restore event.  Multi-row ordinary decode remains
+         * live-state-versioned and has only its replay state reset.
+         *
+         * @param live_state_epoch Epoch established by the prefix-restore
+         *        mutation. Preserved entries are stamped with this epoch.
+         * @return Counts describing which cache classes were preserved or reset.
+         */
+        ReplayStateResetSummary rebindCapturedReplayStateAfterPrefixRestore(
+            uint64_t live_state_epoch);
+
+        /**
          * @brief Drop captured all-position verifier replay after verifier-input mutation.
          *
          * Shifted MTP KV catch-up mutates an auxiliary cache read only by

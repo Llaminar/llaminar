@@ -139,6 +139,22 @@ public:
         return logits_.data();
     }
 
+    PrefixRuntimeStateSnapshot prefixStateProbe() const override
+    {
+        if (!prefix_probe_position_override_)
+            return {};
+
+        PrefixRuntimeStateSnapshot snapshot;
+        snapshot.initialized = true;
+        snapshot.architecture = config_.architecture;
+        snapshot.execution_path = "mock-device-graph";
+        snapshot.primary_device = device_id_;
+        snapshot.current_position = *prefix_probe_position_override_;
+        snapshot.positions = {*prefix_probe_position_override_};
+        snapshot.sequence_lengths = {*prefix_probe_position_override_};
+        return snapshot;
+    }
+
     bool forwardMTP(int32_t draft_condition_token) override
     {
         forward_mtp_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -1979,16 +1995,16 @@ public:
         return snapshot;
     }
 
-    PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override
+    PrefixStateSnapshot captureLivePrefixCheckpoint(
+        const PrefixCheckpointCaptureRequest &request) const override
     {
-        (void)seq_idx;
         prefix_live_capture_calls_.fetch_add(1, std::memory_order_relaxed);
         PrefixStateSnapshot snapshot;
-        if (!prefix_live_capture_ok_)
+        if (!prefix_live_capture_ok_ || !request.valid())
             return snapshot;
         snapshot.valid = true;
         snapshot.logical_checkpoint = true;
-        snapshot.cached_tokens = position_;
+        snapshot.cached_tokens = request.logical_cached_tokens;
         return snapshot;
     }
 
@@ -2130,6 +2146,10 @@ public:
     void set_all_position_logits_ok(bool ok) { set_all_position_logits_ok_ = ok; }
     void set_mtp_unsupported_reason(std::string reason) { mtp_unsupported_reason_ = std::move(reason); }
     void set_primary_device_id(DeviceId device_id) { device_id_ = device_id; }
+    void set_prefix_probe_position_override(int position)
+    {
+        prefix_probe_position_override_ = position;
+    }
     /**
      * @brief Seed the mock's device-owned pre-verifier sequence position.
      *
@@ -2564,6 +2584,7 @@ private:
     std::shared_ptr<ChainedMTPRendezvous> chained_mtp_rendezvous_;
     PrefixLookupResult prefix_lookup_result_;
     DeviceId device_id_ = DeviceId::cpu();
+    std::optional<int> prefix_probe_position_override_;
     bool prefix_populate_ok_ = true;
     bool prefix_harvest_ok_ = true;
     bool prefix_terminal_restore_ok_ = true;
@@ -6280,6 +6301,8 @@ TEST_F(Test__RankOrchestrator,
     request.outcome = handle;
     request.request_count = 1;
     request.max_draft_tokens = static_cast<int>(draft_tokens.size());
+    request.max_state_commit_rows =
+        materialized.target_verifier_state_commit_count;
     request.publish_mtp_shifted_kv = true;
 
     std::string error;
@@ -6687,6 +6710,8 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomeSamplesOnceAndSta
     request.outcome = handle;
     request.request_count = 1;
     request.max_draft_tokens = 2;
+    request.max_state_commit_rows =
+        materialized.target_verifier_state_commit_count;
     request.publish_mtp_shifted_kv = true;
 
     std::string error;
@@ -7063,6 +7088,56 @@ TEST_F(Test__RankOrchestrator, SpecStateBatchPublicationRunsOnEveryLocalTPChild)
            "only the accepted prefix.";
     EXPECT_THAT(orchestrator->prefixStateProbe().sequence_lengths,
                 ::testing::ElementsAre(81));
+}
+
+/**
+ * @brief Keep canonical child state authoritative after mailbox retirement.
+ *
+ * Prefix restore retires speculative outcome mailboxes because their token and
+ * acceptance fields describe the replaced timeline. Each GPU child can still
+ * observe its restored cache-owned sequence count. The rank's scalar position,
+ * by contrast, is only a scheduler shadow and may temporarily retain the
+ * pre-restore value. This regression makes that disagreement explicit and
+ * proves symmetric LocalTP diagnostics adopt the initialized child probes even
+ * when no resident outcome mailbox is currently live.
+ */
+TEST_F(Test__RankOrchestrator,
+       PrefixStateProbeAdoptsCanonicalChildPositionWithoutLiveMailbox)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_primary_device_id(DeviceId::cuda(0));
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_primary_device_id(DeviceId::cuda(1));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    const int token = 17;
+    ASSERT_TRUE(orchestrator->forward(&token, 597));
+    ASSERT_EQ(orchestrator->get_position(), 597);
+    ASSERT_FALSE(orchestrator->deviceResidentLogicalSequenceState().valid());
+
+    runner0_ptr->set_prefix_probe_position_override(596);
+    runner1_ptr->set_prefix_probe_position_override(596);
+
+    const PrefixRuntimeStateSnapshot snapshot =
+        orchestrator->prefixStateProbe();
+    EXPECT_TRUE(snapshot.initialized);
+    EXPECT_EQ(snapshot.current_position, 596);
+    EXPECT_THAT(snapshot.positions, ::testing::ElementsAre(596));
+    EXPECT_THAT(snapshot.sequence_lengths, ::testing::ElementsAre(596));
+    EXPECT_EQ(orchestrator->get_position(), 597)
+        << "Observation must not mutate the scheduler-owned parent cursor.";
 }
 
 TEST_F(Test__RankOrchestrator, SpecStateBatchPublicationFailureStillAttemptsEveryLocalTPChild)

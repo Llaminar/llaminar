@@ -2013,6 +2013,10 @@ namespace llaminar2
             int request_batch,
             const SamplingParams &params,
             const uint64_t *stochastic_position_seeds = nullptr) override;
+        bool observeDeviceResidentNextConditionTokens(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_count,
+            int32_t *out_tokens) override;
         bool forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_batch,
@@ -2163,6 +2167,8 @@ namespace llaminar2
             const int32_t *stop_tokens,
             int stop_token_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
+        bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens) override;
         bool prepareGreedyAllPositionBatchOutcomeGraph(
             int verifier_token_count,
             const int32_t *stop_tokens,
@@ -3485,7 +3491,8 @@ namespace llaminar2
         bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override;
         bool restorePrefixTerminalState(const PrefixLookupResult &hit) override;
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
-        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override;
+        PrefixStateSnapshot captureLivePrefixCheckpoint(
+            const PrefixCheckpointCaptureRequest &request) const override;
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
         bool requiresMTPDecodeEquivalentVerifierReplay() const override;
@@ -4195,23 +4202,8 @@ namespace llaminar2
         /** Record that accepted spec-state publication has finished queuing live-state writes. */
         bool recordAcceptedSpecPublicationReady(void *producer_stream, const char *producer_name);
 
-        /** Make the next live-state consumer wait for accepted spec-state publication. */
-        bool waitForPendingAcceptedSpecPublicationReady(void *consumer_stream, const char *consumer_name);
-
-        /**
-         * @brief Queue an observation-only wait for accepted-state publication.
-         *
-         * Snapshot and probe helpers are diagnostic consumers: they must observe
-         * GPU publication in order, but they must not consume the pending handoff
-         * because the next real forward/sidecar graph still has to wait on the
-         * same event before reading live state.
-         */
-        bool waitForPendingAcceptedSpecPublicationReadyForObservation(
-            void *consumer_stream,
-            const char *consumer_name) const;
-
         /** Clear accepted-publication ownership when a hard restore/reset replaces live state. */
-        void clearPendingAcceptedSpecPublicationReady();
+        void clearPendingAcceptedSpecPublicationReady() const;
 
         /**
          * @brief Record that a logical prefix checkpoint owns queued GPU payload copies.
@@ -4419,24 +4411,28 @@ namespace llaminar2
             std::vector<std::shared_ptr<void>>
                 retained_device_sources = {});
 
-        /** Consume a pending prefix restore/truncate handoff before live-state reads or writes. */
-        bool waitForPendingLivePrefixMutationReady(
-            void *consumer_stream,
-            const char *consumer_name);
-
         /**
-         * @brief Queue an observation-only wait for a pending prefix mutation.
+         * @brief Join every published live-state event through one typed API.
          *
-         * Probes and checkpoint captures need to observe a completed restore,
-         * but they must not consume the event that the next forward/sidecar
-         * graph still has to wait on.
+         * The caller supplies only its semantic timeline role. This method
+         * validates that role against the declarative device timeline, queues
+         * durable event waits, and decides whether the role observes or consumes
+         * each publication. There are deliberately no lower-level consuming or
+         * observation entry points: callers cannot accidentally steal an event
+         * from the main graph or leave an invalidated timeline live.
+         *
+         * @param consumer_stream Explicit stream that will launch the graph.
+         * @param consumer_role Semantic owner declared in DeviceExecutionTimeline.
+         * @param consumer_name Stable diagnostic label for both event joins.
+         * @return true after every pending dependency is queued.
          */
-        bool waitForPendingLivePrefixMutationReadyForObservation(
+        bool joinPublishedLiveStateHandoffs(
             void *consumer_stream,
+            DeviceTimelineRole consumer_role,
             const char *consumer_name) const;
 
         /** Clear any pending prefix restore/truncate handoff. */
-        void clearPendingLivePrefixMutationReady();
+        void clearPendingLivePrefixMutationReady() const;
 
         /**
          * @brief Shared implementation for compact device-side stochastic sampling.
@@ -5384,6 +5380,21 @@ namespace llaminar2
         };
 
         /**
+         * @brief Whether a main-logits consumer observes or takes a stream handoff.
+         *
+         * Some GPU consumers mutate or inspect logits before a later sampler
+         * completes the transaction. They must retain the role-specific stream
+         * handoff. Terminal samplers take that handoff exactly once. Both modes
+         * still join the durable ForwardGraphOutputReady event, so correctness
+         * never depends on the optional raw-stream fast path being present.
+         */
+        enum class MainLogitsHandoffMode
+        {
+            Observe,
+            Consume,
+        };
+
+        /**
          * @brief Typed host-observation surface for logits publication.
          *
          * The surface determines both the one-shot stream handoff and the
@@ -5456,6 +5467,25 @@ namespace llaminar2
         void *consumePendingLogitsStream(
             PendingLogitsStreamRole role,
             const char *consumer);
+
+        /**
+         * @brief Acquire an ordered stream for a device consumer of main logits.
+         *
+         * This is the only valid device-consumer entry point for main logits.
+         * It resolves the optional same-stream handoff, otherwise selects an
+         * explicit owned stream, and always queues a wait for the durable
+         * ForwardGraphOutputReady publication. The returned stream therefore
+         * cannot observe a previous invocation's logits after graph replay.
+         *
+         * @param consumer Semantic operation name used for diagnostics.
+         * @param mode Whether to retain or consume the one-shot stream handoff.
+         * @return Ordered explicit GPU stream, or nullptr after a fatal
+         *         dependency/publication error.
+         */
+        void *prepareMainLogitsDeviceConsumer(
+            const char *consumer,
+            MainLogitsHandoffMode mode,
+            bool require_main_forward = true);
 
         /**
          * @brief Inspect a pending stream without clearing ownership.
@@ -6294,7 +6324,8 @@ namespace llaminar2
         std::vector<StochasticSampleReadyState> stochastic_draft_sample_ready_;
         PendingShiftedMTPKVReadyState shifted_mtp_kv_ready_;
         PendingAllPositionVerifierStateReadyState all_position_verifier_state_ready_;
-        PendingAcceptedSpecPublicationReadyState accepted_spec_publication_ready_;
+        mutable PendingAcceptedSpecPublicationReadyState
+            accepted_spec_publication_ready_;
         mutable PendingLivePrefixCheckpointReadyState live_prefix_checkpoint_ready_;
         mutable PendingLivePrefixMutationReadyState live_prefix_mutation_ready_;
         mutable std::vector<PendingPrefixPayloadUse>
@@ -6412,8 +6443,11 @@ namespace llaminar2
          * contiguous device block may be replaced when a different graph shape
          * is materialized. Published request state has a longer lifetime: the
          * next verifier, sidecar, scheduler, and KV publication all consume it.
-         * This six-row arena allocation therefore owns the canonical published
-         * values independently of every graph-workspace generation.
+         * This seven-row arena allocation therefore owns one initialization
+         * scratch row plus the six canonical published values independently of
+         * every graph-workspace generation. The scratch row exists because the
+         * initialization primitive also emits a base-cache count, even when the
+         * first scalar sidecar runs before verifier metadata workspace exists.
          *
          * The derive and prefill-initialization kernels write these rows
          * directly. There is deliberately no workspace-to-mailbox replay copy:
@@ -6423,12 +6457,13 @@ namespace llaminar2
         struct DeviceResidentLogicalSequenceStateStorage
         {
             /// Number of distinct INT32 rows in the packed arena allocation.
-            static constexpr size_t kFieldCount = 6;
+            static constexpr size_t kFieldCount = 7;
 
             /// Field order in `BufferId::MTP_LOGICAL_SEQUENCE_STATE`.
             enum class Field : size_t
             {
-                TargetCachedTokens = 0,
+                InitializationBaseCachedTokensScratch = 0,
+                TargetCachedTokens,
                 AcceptedStateCounts,
                 NextConditionTokens,
                 AllDraftsAcceptedFlags,
@@ -6437,6 +6472,7 @@ namespace llaminar2
             };
 
             int request_capacity = 0;
+            int32_t *initialization_base_cached_tokens_scratch_device = nullptr;
             int32_t *target_cached_tokens_device = nullptr;
             int32_t *accepted_state_counts_device = nullptr;
             int32_t *next_condition_tokens_device = nullptr;
@@ -6478,6 +6514,8 @@ namespace llaminar2
                            static_cast<size_t>(field) *
                                static_cast<size_t>(request_capacity);
                 };
+                initialization_base_cached_tokens_scratch_device =
+                    row(Field::InitializationBaseCachedTokensScratch);
                 target_cached_tokens_device = row(Field::TargetCachedTokens);
                 accepted_state_counts_device = row(Field::AcceptedStateCounts);
                 next_condition_tokens_device = row(Field::NextConditionTokens);
@@ -6492,6 +6530,7 @@ namespace llaminar2
             {
                 return request_count > 0 &&
                        request_count <= request_capacity &&
+                       initialization_base_cached_tokens_scratch_device != nullptr &&
                        target_cached_tokens_device != nullptr &&
                        accepted_state_counts_device != nullptr &&
                        next_condition_tokens_device != nullptr &&
@@ -6557,6 +6596,8 @@ namespace llaminar2
                 const DeviceResidentLogicalSequenceStateStorage &other) const
             {
                 return request_capacity == other.request_capacity &&
+                       initialization_base_cached_tokens_scratch_device ==
+                           other.initialization_base_cached_tokens_scratch_device &&
                        target_cached_tokens_device ==
                            other.target_cached_tokens_device &&
                        accepted_state_counts_device ==
@@ -6842,11 +6883,13 @@ namespace llaminar2
         };
 
         /**
-         * @brief Request controls and lifecycle for one graph-owned greedy result.
+         * @brief Transaction-varying controls for one graph-owned greedy result.
          *
-         * The host array is only a durable source for the tiny pre-replay H2D
-         * control upload.  The graph itself captures the arena address in
-         * `mtp_verifier_stop_tokens_dev_` and never captures these host values.
+         * Request-constant stop tokens are intentionally absent. They are
+         * configured through configureMTPRequestStopTokens() and published once
+         * to `mtp_verifier_stop_tokens_dev_` by request admission. This object
+         * owns only values that can legitimately change between verifier
+         * transactions.
          */
         struct GreedyVerifierOutcomeGraphTransaction
         {
@@ -6855,15 +6898,28 @@ namespace llaminar2
             int verifier_token_count = 0;
             int stop_token_count = 0;
             MTPGreedyPenaltyPolicy penalty_policy;
-            std::array<int32_t,
-                       sampling_math::kSpeculativeBatchMaxStopTokens>
-                stop_tokens = {-1, -1, -1, -1, -1, -1, -1, -1};
         };
 
         MTPVerifierOutcomeGraphMode mtp_verifier_outcome_graph_mode_ =
             MTPVerifierOutcomeGraphMode::Disabled;
         GreedyVerifierOutcomeGraphTransaction
             greedy_verifier_outcome_graph_transaction_;
+
+        /**
+         * @brief Host policy staged for the next request admission.
+         *
+         * This fixed-width array is not read by graph execution. It is the
+         * bounded source for one admission-time H2D publication and for strict
+         * API validation that later verifier calls name the same request
+         * policy.
+         */
+        std::array<int32_t,
+                   sampling_math::kSpeculativeBatchMaxStopTokens>
+            mtp_request_stop_tokens_ = {
+                -1, -1, -1, -1, -1, -1, -1, -1};
+        int mtp_request_stop_token_count_ = 0;
+        std::optional<uint64_t>
+            mtp_request_stop_tokens_published_session_epoch_;
 
         /// Runner-owned graph metadata workspace for vLLM-style MTP verification.
         MTPSpecDecodeMetadataWorkspaceBinding mtp_spec_decode_metadata_binding_{
@@ -6883,6 +6939,20 @@ namespace llaminar2
          */
         bool mtp_publication_base_cache_snapshot_ready_ = false;
         int mtp_publication_base_cache_snapshot_request_count_ = 0;
+        /**
+         * @brief Immutable per-request main-KV metadata bases for publication.
+         *
+         * Each checkpoint is persistent VRAM allocated during runner setup.
+         * prepareAllPositionVerifierGraphMetadata() overwrites the matching
+         * checkpoint on the exact verifier stream before graph execution.
+         * Accepted-state publication later derives every layer's head/count
+         * pair from this base, making partially restored ring metadata
+         * structurally impossible.
+         */
+        std::vector<DeviceKVSequenceStateCheckpoint>
+            mtp_publication_main_kv_base_checkpoints_;
+        bool mtp_publication_main_kv_base_checkpoints_ready_ = false;
+        int mtp_publication_main_kv_base_checkpoint_request_count_ = 0;
         /**
          * @brief Scoped internal permission for grouped decode-equivalent publish.
          *
@@ -7120,6 +7190,31 @@ namespace llaminar2
             void *consumer_stream,
             const char *consumer_name) const;
 
+        /**
+         * @brief Publish the first scalar-decode target as resident logical state.
+         *
+         * A normal main-model condition forward advances the canonical KV count
+         * before its target sampler writes `STOCHASTIC_TARGET_SAMPLE_TOKENS`.
+         * The first MTP sidecar already consumes those two device-owned inputs
+         * directly, but every later resident consumer must observe the same
+         * token/position pair through the durable logical-state mailbox. This
+         * helper makes that ownership transition explicit.
+         *
+         * The publication kernel is appended to the exact target-sample
+         * producer stream. It first orders reuse of the single-buffered mailbox
+         * rows after the prior publication event, then initializes all durable
+         * fields from the target slot and the canonical KV count, and finally
+         * records a fresh mailbox event. No host position, allocation, transfer,
+         * default stream, or synchronization is permitted.
+         *
+         * @param target_sample_slot Persistent target-sample row to publish.
+         * @param live_position_device Canonical main-KV count on this device.
+         * @return true after the complete publication has been enqueued.
+         */
+        bool publishDeviceResidentLogicalSequenceStateFromTargetSample(
+            int target_sample_slot,
+            const int32_t *live_position_device);
+
         /// Record an event-fenced view of the arena-owned logical-state rows.
         bool recordDeviceResidentLogicalSequenceStateMailbox(
             int request_count,
@@ -7149,6 +7244,22 @@ namespace llaminar2
             int total_tokens,
             int request_count,
             int padded_seq_len);
+
+        /**
+         * @brief Publish request-constant MTP stop controls on an ordered stream.
+         *
+         * The caller must already own the request boundary: normal prefill uses
+         * RequestAdmissionTransfer after consuming RequestStateResetReady, while
+         * a prefix hit uses PrefixRestoreMutation after the same dependency.
+         * Repeated calls in one session are elided.
+         *
+         * @param producer_stream Explicit stream that owns request publication.
+         * @param producer Human-readable lifecycle owner for diagnostics.
+         * @return True when this session's device buffer is current.
+         */
+        bool publishMTPRequestStopTokensOnDevice(
+            void *producer_stream,
+            const char *producer);
 
         /**
          * @brief Queue the current graph stream behind external request admission.

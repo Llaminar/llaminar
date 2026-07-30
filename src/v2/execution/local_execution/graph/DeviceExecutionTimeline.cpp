@@ -33,6 +33,7 @@ namespace llaminar2
                     .producer = DeviceTimelineRole::RequestStateReset,
                     .consumers = roles({
                         DeviceTimelineRole::RequestStateReset,
+                        DeviceTimelineRole::RequestAdmissionTransfer,
                         DeviceTimelineRole::MainForwardGraph,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::PrefixRestoreMutation,
@@ -104,6 +105,8 @@ namespace llaminar2
                         DeviceTimelineRole::MainForwardGraph,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::PrefixCheckpointArchive,
+                        DeviceTimelineRole::PrefixRestoreMutation,
+                        DeviceTimelineRole::MoERebalanceMaintenance,
                         DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::Diagnostics,
                     }),
@@ -161,6 +164,8 @@ namespace llaminar2
                         DeviceTimelineRole::MainForwardGraph,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::PrefixCheckpointArchive,
+                        DeviceTimelineRole::PrefixRestoreMutation,
+                        DeviceTimelineRole::MoERebalanceMaintenance,
                         DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::Diagnostics,
                     }),
@@ -190,6 +195,7 @@ namespace llaminar2
                     .producer = DeviceTimelineRole::MainForwardGraph,
                     .consumers = roles({
                         DeviceTimelineRole::MTPSidecarGraph,
+                        DeviceTimelineRole::TargetSampler,
                         DeviceTimelineRole::VerifierSummary,
                         DeviceTimelineRole::AcceptedStatePublication,
                         DeviceTimelineRole::PrefixCheckpointArchive,

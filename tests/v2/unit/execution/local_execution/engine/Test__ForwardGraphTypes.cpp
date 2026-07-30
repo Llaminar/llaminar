@@ -787,6 +787,40 @@ TEST(Test__ForwardGraphCache, DefaultState)
     EXPECT_EQ(cache.gpu_stream, nullptr);
     EXPECT_EQ(cache.gpu_ctx, nullptr);
     EXPECT_EQ(cache.gpu_graph_update_failures, 0);
+    EXPECT_TRUE(cache.snapshot_manifest.stage_copies.empty());
+    EXPECT_TRUE(cache.snapshot_manifest.outputless_stages.empty());
+}
+
+/**
+ * @brief Graph snapshot manifests must be isolated by forward-cache identity.
+ *
+ * Grouped verifier and serial decode graphs deliberately reuse stage names such
+ * as `embedding`. A process-wide stage-name map lets warming one geometry
+ * replace the immutable descriptor consumed by another geometry's capture.
+ * Each GraphSegmentCache must therefore own an independent manifest.
+ */
+TEST(Test__ForwardGraphCache, SnapshotManifestsAreOwnedPerGraphGeometry)
+{
+    ForwardGraphCache grouped;
+    ForwardGraphCache serial;
+
+    grouped.segment_cache.snapshot_manifest.outputless_stages.insert("embedding");
+
+    EXPECT_TRUE(
+        grouped.segment_cache.snapshot_manifest.outputless_stages.contains(
+            "embedding"));
+    EXPECT_FALSE(
+        serial.segment_cache.snapshot_manifest.outputless_stages.contains(
+            "embedding"));
+
+    serial.segment_cache.snapshot_manifest.outputless_stages.insert("lm_head");
+    grouped.invalidate();
+
+    EXPECT_TRUE(grouped.segment_cache.snapshot_manifest.outputless_stages.empty());
+    EXPECT_TRUE(
+        serial.segment_cache.snapshot_manifest.outputless_stages.contains(
+            "lm_head"))
+        << "invalidating one graph must not mutate another graph's manifest";
 }
 
 /**
@@ -1649,7 +1683,51 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayPreservesSingleTokenDecodeC
                   ForwardReplayStateMutationKind::GeneralLiveStateMutation,
                   classifyForwardReplayStateCache(all_position_verifier)),
               ForwardReplayStateAction::ResetReplayState)
-        << "Only the MTP correction boundary may preserve verifier replay state.";
+        << "Only typed correction/restore boundaries may preserve verifier replay state.";
+}
+
+TEST(Test__ForwardReplayStatePolicy, PrefixRestorePreservesStableDeviceOwnedGraphClasses)
+{
+    ForwardGraphSignature single_token_decode;
+    single_token_decode.decode = true;
+    single_token_decode.seq_len = 1;
+    single_token_decode.batch_size = 1;
+
+    ForwardGraphSignature multi_token_decode = single_token_decode;
+    multi_token_decode.seq_len = 4;
+
+    ForwardGraphSignature all_position_verifier = multi_token_decode;
+    all_position_verifier.all_position_logits = true;
+
+    ForwardGraphSignature exact_prefill;
+    exact_prefill.decode = false;
+
+    EXPECT_EQ(
+        chooseForwardReplayStateAction(
+            ForwardReplayStateMutationKind::PrefixCheckpointRestore,
+            single_token_decode),
+        ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Restored single-token decode reads stable canonical KV/recurrent "
+           "buffers after waiting for the restore event.";
+    EXPECT_EQ(
+        chooseForwardReplayStateAction(
+            ForwardReplayStateMutationKind::PrefixCheckpointRestore,
+            all_position_verifier),
+        ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Verifier row slots and launch metadata are refreshed before replay.";
+    EXPECT_EQ(
+        chooseForwardReplayStateAction(
+            ForwardReplayStateMutationKind::PrefixCheckpointRestore,
+            exact_prefill),
+        ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Fixed prefill captures consume restored state through stable device "
+           "addresses.";
+    EXPECT_EQ(
+        chooseForwardReplayStateAction(
+            ForwardReplayStateMutationKind::PrefixCheckpointRestore,
+            multi_token_decode),
+        ForwardReplayStateAction::ResetReplayState)
+        << "Multi-token ordinary decode remains explicitly live-state-versioned.";
 }
 
 TEST(Test__ForwardReplayStatePolicy, RequestBoundaryPreservesOnlyReplaySafeDecodeClasses)
@@ -2056,11 +2134,12 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
     DeviceGraphExecutor::GraphSegment segment;
     segment.capturable = true;
     segment.stage_names = {"gemm", "gdn_projection", "lm_head"};
-    segment.capture = std::make_unique<FakeReplayGraphCapture>();
+    int capture_stream = 0;
+    segment.capture =
+        std::make_unique<FakeReplayGraphCapture>(&capture_stream);
 
     FakeReplayGPUContext gpu_ctx;
     bool post_launch_called = false;
-    int capture_stream = 0;
 
     ASSERT_TRUE(DeviceGraphCaptureController::executeCapturedReplaySegmentNormal(
         segment,
@@ -2100,10 +2179,11 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
     DeviceGraphExecutor::GraphSegment segment;
     segment.capturable = true;
     segment.stage_names = {"embedding", "attention", "lm_head"};
-    segment.capture = std::make_unique<FakeReplayGraphCapture>();
+    int capture_stream = 0;
+    segment.capture =
+        std::make_unique<FakeReplayGraphCapture>(&capture_stream);
 
     FakeReplayGPUContext gpu_ctx;
-    int capture_stream = 0;
 
     ASSERT_TRUE(DeviceGraphCaptureController::executeCapturedReplaySegmentNormal(
         segment,
@@ -2142,7 +2222,8 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsRecordFinalCaptureEventFence)
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
     cache.segments.back().stage_names = {"verifier_graph"};
-    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
@@ -2243,7 +2324,8 @@ TEST(Test__GraphSegmentCache, ReplayPhasePreparesGraphLaunchMetadataOnExplicitCa
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
     cache.segments.back().stage_names = {"row_select"};
-    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
@@ -2564,7 +2646,8 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
     cache.segments.back().stage_names = {"captured_decode_graph"};
-    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
 
@@ -2635,7 +2718,8 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
     cache.segments.back().stage_names = {"sidecar_graph"};
-    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
@@ -2723,7 +2807,8 @@ TEST(Test__GraphSegmentCache, CudaDeferredReplayDoesNotSynchronizeCapturedSegmen
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
     cache.segments.back().stage_names = {"maintenance_graph"};
-    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
 
@@ -2784,7 +2869,8 @@ TEST(Test__GraphSegmentCache, CapturedCollectiveReplayDefersFinalFenceWithoutOpt
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
     cache.segments.back().stage_names = {"captured_collective_graph"};
-    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
 
@@ -2843,7 +2929,8 @@ TEST(Test__GraphSegmentCache, CapturedCollectiveReplayCanDeferFinalSyncWithOptIn
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
     cache.segments.back().stage_names = {"captured_collective_graph"};
-    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 

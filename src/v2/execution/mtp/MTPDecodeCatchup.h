@@ -26,6 +26,19 @@ namespace llaminar2
         std::string implementation_name = "shared_stepwise";
 
         /**
+         * Device target-sample slot that owns the condition token consumed by
+         * each stepwise GPU sidecar append.
+         *
+         * The caller must sample every verifier row into this same persistent
+         * slot before returning from `sample_after_forward`. The next shifted
+         * append then consumes the token directly from that slot, preserving
+         * the sampler-to-sidecar producer/consumer relationship without a host
+         * token upload. GPU runners require this field; CPU runners ignore it
+         * and use the scalar token carried by `draft_tokens`.
+         */
+        std::optional<int> device_target_sample_slot;
+
+        /**
          * Optional decode-equivalent verifier base captured before sidecar
          * drafting. Optimized hooks that discover a rejection after a batched
          * verifier attempt must restore this exact base before replaying the

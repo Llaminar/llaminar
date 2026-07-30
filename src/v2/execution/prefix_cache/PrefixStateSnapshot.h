@@ -84,6 +84,34 @@ namespace llaminar2
         PrefixLookupResult clampedTo(int token_count) const;
     };
 
+    /**
+     * @brief Scheduler-owned identity for one live rollback checkpoint.
+     *
+     * A GPU checkpoint archives device-owned KV and recurrent state
+     * asynchronously.  It must not rediscover the logical request cursor from
+     * a host mirror because that mirror may legitimately lag a graph-captured
+     * publication.  The request scheduler already owns the exact transaction
+     * position, so it supplies that immutable control-plane fact alongside the
+     * sequence being archived.
+     *
+     * The fields intentionally have invalid defaults so callers cannot obtain
+     * a meaningful checkpoint by default construction.  Concrete runners must
+     * reject a request unless @ref valid returns true.
+     */
+    struct PrefixCheckpointCaptureRequest
+    {
+        int sequence_index = -1;
+        int logical_cached_tokens = -1;
+
+        /**
+         * @brief Whether the request names a valid sequence cursor.
+         */
+        bool valid() const
+        {
+            return sequence_index >= 0 && logical_cached_tokens >= 0;
+        }
+    };
+
     struct PrefixStateSnapshot
     {
         PrefixStateSnapshot() = default;

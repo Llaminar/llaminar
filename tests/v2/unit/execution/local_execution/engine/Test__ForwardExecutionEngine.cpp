@@ -2137,6 +2137,43 @@ TEST_F(Test__ForwardExecutionEngine, CacheMiss_GPUDecodeDefersLogitsToDeviceCons
     }
 }
 
+/**
+ * @brief Verifier state readiness is mandatory even with host logits timing.
+ *
+ * PerfStats and parity snapshots may request a host-facing logits boundary, but
+ * that observation must not suppress the device event consumed by accepted-state
+ * publication. The first warmup/capture invocation is asynchronous just like a
+ * steady-state replay and therefore publishes the same exact producer stream.
+ */
+TEST_F(
+    Test__ForwardExecutionEngine,
+    CacheMiss_GPUVerifierAlwaysPublishesDeviceStateReadiness)
+{
+    llaminar2::testing::MockDeviceContext gpu_ctx{
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA};
+    auto engine = makeEngine();
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+    host.mock_compute_all_position_logits = true;
+    host.mock_defer_all_position_verifier_sync = false;
+
+    int token = 42;
+    int position = 0;
+    auto input =
+        makeTestInput(1, 1, DeviceId::cuda(0), &token, &position);
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(input, output, host));
+
+    EXPECT_EQ(host.sync_logits_calls, 1)
+        << "The diagnostic host boundary remains independently observable.";
+    EXPECT_EQ(host.pending_all_position_verifier_stream_calls, 1)
+        << "Host observation must never suppress verifier state readiness.";
+    EXPECT_EQ(
+        host.pending_all_position_verifier_stream,
+        llaminar2::testing::sharedMockWorkerGPUContext().defaultStream());
+}
+
 // =========================================================================
 // execute() — Caching Disabled
 // =========================================================================

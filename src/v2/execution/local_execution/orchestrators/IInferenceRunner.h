@@ -281,6 +281,15 @@ namespace llaminar2
         DeviceSpeculativeOutcomeHandle outcome;
         int request_count = 0;
         int max_draft_tokens = 0;
+        /**
+         * @brief Maximum verifier prefix allowed to become serial-visible state.
+         *
+         * This is deliberately separate from @ref max_draft_tokens.  The latter
+         * is verifier graph capacity; this value is the response-boundary commit
+         * limit.  An all-accepted terminal row may be valid speculative evidence
+         * while still being one row beyond the caller-visible serial state.
+         */
+        int max_state_commit_rows = -1;
         bool publish_mtp_shifted_kv = true;
 
         bool valid() const
@@ -289,7 +298,9 @@ namespace llaminar2
                    outcome.mtp_transaction.valid() &&
                    request_count > 0 &&
                    outcome.request_count == request_count &&
-                   max_draft_tokens > 0;
+                   max_draft_tokens > 0 &&
+                   max_state_commit_rows >= 0 &&
+                   max_state_commit_rows <= max_draft_tokens;
         }
     };
 
@@ -1486,7 +1497,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Advance a resident request batch through its serial condition row.
+         * @brief Advance one or more resident requests through their condition row.
          *
          * A grouped MTP transaction begins at the same boundary as scalar
          * decode: the main graph first consumes the last token already returned
@@ -1504,7 +1515,9 @@ namespace llaminar2
          *
          * @param logical_state Live device-owned mailbox before the condition
          *        forward. The handle must cover every request in the batch.
-         * @param request_batch Number of active request rows.
+         * @param request_batch Number of active request rows. A value of one is
+         *        the canonical SingleDevice transaction; larger values use the
+         *        same device-owned contract for continuous request batching.
          * @param params Sampling policy for the newly produced main logits.
          * @param stochastic_position_seeds Optional immutable seed row. It is
          *        required for non-greedy sampling and ignored for greedy
@@ -2315,13 +2328,42 @@ namespace llaminar2
         }
 
         /**
+         * @brief Configure immutable stop-token controls for the next request.
+         *
+         * GPU runners must stage these host values as request policy and publish
+         * them to a persistent device buffer at request admission or prefix
+         * restore. The verifier hot path may validate this policy, but it must
+         * never upload the control row per speculative transaction.
+         *
+         * The default accepts CPU runners, whose sampling policy remains
+         * host-owned. A GPU runner that does not implement explicit request
+         * control publication fails immediately instead of silently reverting
+         * to per-step host involvement.
+         *
+         * @param stop_tokens Request-constant token IDs that terminate serving.
+         * @return True when the runner owns the complete request policy.
+         */
+        virtual bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens)
+        {
+            (void)stop_tokens;
+            if (primaryDeviceId().is_gpu())
+            {
+                throw std::logic_error(
+                    "GPU inference runner does not implement device-owned MTP "
+                    "request stop-token publication");
+            }
+            return true;
+        }
+
+        /**
          * @brief Arm the terminal greedy outcome stage before verifier replay.
          *
-         * GPU implementations copy only the small stop-token control row on the
-         * exact pre-replay stream.  Draft tokens already reside in the verifier
-         * input arena row.  Once armed, failure to execute or consume the
-         * matching graph transaction is fatal; implementations must not enqueue
-         * a post-graph reducer as a substitute.
+         * Stop-token controls must already be device-resident from explicit
+         * request admission. Draft tokens already reside in the verifier input
+         * arena row. Once armed, failure to execute or consume the matching
+         * graph transaction is fatal; implementations must not upload controls
+         * or enqueue a post-graph reducer as a substitute.
          */
         virtual bool prepareGreedyAllPositionBatchOutcomeGraph(
             int verifier_token_count,
@@ -2448,6 +2490,35 @@ namespace llaminar2
         virtual DeviceResidentLogicalSequenceStateHandle deviceResidentLogicalSequenceState() const
         {
             return {};
+        }
+
+        /**
+         * @brief Publish resident next-condition tokens to a host result buffer.
+         *
+         * Device-owned MTP keeps sampled condition tokens in the logical-state
+         * mailbox. Tests and server result surfaces occasionally need those
+         * compact values on the host, but must not rediscover them by sampling
+         * an ambiguous logits tensor. Implementations wait on the mailbox's
+         * readiness event and copy only the requested INT32 result rows.
+         *
+         * This is an explicit result boundary, not an execution input path.
+         * GPU implementations must never adopt the copied values back into
+         * live state or use a device-wide synchronization.
+         *
+         * @param logical_state Current typed mailbox handle.
+         * @param request_count Number of leading request rows to observe.
+         * @param out_tokens Host destination with @p request_count entries.
+         * @return true when the compact result was published successfully.
+         */
+        virtual bool observeDeviceResidentNextConditionTokens(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_count,
+            int32_t *out_tokens)
+        {
+            (void)logical_state;
+            (void)request_count;
+            (void)out_tokens;
+            return false;
         }
 
         /**
@@ -4162,9 +4233,17 @@ namespace llaminar2
             return {};
         }
 
-        virtual PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const
+        /**
+         * @brief Archive live inference state at a scheduler-owned cursor.
+         *
+         * Production rollback is device-resident on GPU.  The caller therefore
+         * supplies the exact logical cursor instead of asking the runner to
+         * infer it from a potentially stale host shadow.
+         */
+        virtual PrefixStateSnapshot captureLivePrefixCheckpoint(
+            const PrefixCheckpointCaptureRequest &request) const
         {
-            (void)seq_idx;
+            (void)request;
             return {};
         }
 

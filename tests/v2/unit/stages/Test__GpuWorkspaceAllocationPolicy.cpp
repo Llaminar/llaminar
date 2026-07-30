@@ -1541,6 +1541,62 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPPendingLogitsStreamsUseOwnershipHelp
         << "Publishing a different stream over an unconsumed logits handoff must hard-fail.";
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, MainLogitsDeviceConsumersJoinDurableForwardEvent)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto helper = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "void *DeviceGraphOrchestrator::prepareMainLogitsDeviceConsumer(",
+        "bool DeviceGraphOrchestrator::waitForPendingLogitsStream(")));
+    const auto greedy = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "int DeviceGraphOrchestrator::sampleGreedyOnDevice()",
+        "int DeviceGraphOrchestrator::sampleOnDevice(")));
+    const auto stochastic = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "int DeviceGraphOrchestrator::sampleOnDeviceAtLogicalPosition(",
+        "bool DeviceGraphOrchestrator::requiresMPICoordinatedDecodeSampling(")));
+    const auto device_target = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::sampleGreedyFromMainLogitsToDeviceTargetSlot(",
+        "int DeviceGraphOrchestrator::sampleGreedyFromAllPositionLogitsOnDevice(")));
+    const auto batched = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::sampleMainLogitsBatchRowsOnDevice(",
+        "bool DeviceGraphOrchestrator::applyPenaltiesOnDevice(")));
+
+    EXPECT_NE(
+        helper.find(
+            "waitForForwardGraphOutputReady(stream,DeviceTimelineRole::TargetSampler,require_main_forward?ForwardGraphOutputKind::MainForward:ForwardGraphOutputKind::Any,consumer_name)"),
+        std::string::npos)
+        << "The common main-logits consumer boundary must join the durable "
+           "forward event on its exact sampler stream.";
+    EXPECT_EQ(helper.find("synchronizeStream"), std::string::npos);
+    EXPECT_EQ(helper.find("synchronizeDevice"), std::string::npos);
+
+    for (const auto *body : {&greedy, &stochastic, &device_target})
+    {
+        EXPECT_NE(
+            body->find("prepareMainLogitsDeviceConsumer("),
+            std::string::npos)
+            << "Every terminal main-logits sampler must use the typed durable rendezvous.";
+        EXPECT_EQ(
+            body->find(
+                "consumePendingLogitsStream(PendingLogitsStreamRole::MainDecode"),
+            std::string::npos)
+            << "A sampler must not bypass the durable rendezvous by consuming "
+               "the optional raw-stream handoff directly.";
+    }
+
+    EXPECT_NE(
+        batched.find(
+            "waitForForwardGraphOutputReady(stream,DeviceTimelineRole::TargetSampler,ForwardGraphOutputKind::Any,"),
+        std::string::npos)
+        << "Request-batched main logits may occupy either graph-declared "
+           "surface, but still require the durable producer event.";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPSidecarGraphCaptureInstallsLocalTPBoundaryHook)
 {
     const auto source =
@@ -1812,6 +1868,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
               std::string::npos)
         << "Direct publication must advance the same request transaction after "
            "mutating canonical shifted-cache counts.";
+    EXPECT_EQ(
+        publish_body.find("prepareLivePrefixMutationReadyEvent("),
+        std::string::npos)
+        << "Accepted-state publication owns AcceptedSpecPublicationReady; it "
+           "must not reserve the independent live-prefix mutation channel.";
+    EXPECT_EQ(
+        publish_body.find("recordLivePrefixMutationReady("),
+        std::string::npos)
+        << "Accepted-state publication must publish exactly one typed lifecycle "
+           "edge instead of impersonating a prefix restore.";
     EXPECT_NE(metadata_body.find("request.outcome.mtp_transaction"),
               std::string::npos)
         << "Publication preflight must consume the child-local outcome lease.";
@@ -3411,16 +3477,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixSnapshotsObserveAcceptedSpecPubli
         "bool DeviceGraphOrchestrator::ensureLiveCheckpointStorage");
     const auto checkpoint_body = sliceBetween(
         source,
-        "PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixCheckpoint(int seq_idx) const",
+        "PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixCheckpoint(",
         "bool DeviceGraphOrchestrator::restoreLivePrefixState");
     const auto live_observation_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::waitForLiveInferenceStateReadyForObservation(",
         "bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(");
-    const auto observation_wait_body = sliceBetween(
+    const auto published_join_body = sliceBetween(
         source,
-        "bool DeviceGraphOrchestrator::waitForPendingAcceptedSpecPublicationReadyForObservation(",
-        "void DeviceGraphOrchestrator::clearPendingAcceptedSpecPublicationReady()");
+        "bool DeviceGraphOrchestrator::joinPublishedLiveStateHandoffs(",
+        "void DeviceGraphOrchestrator::clearPendingLivePrefixMutationReady()");
 
     const auto compact_probe =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(probe_body));
@@ -3430,8 +3496,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixSnapshotsObserveAcceptedSpecPubli
         removeAsciiWhitespace(stripCommentsAndStringLiterals(checkpoint_body));
     const auto compact_live_observation =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(live_observation_body));
-    const auto compact_observation_wait =
-        removeAsciiWhitespace(stripCommentsAndStringLiterals(observation_wait_body));
+    const auto compact_published_join =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(published_join_body));
     const auto compact_header =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(header));
 
@@ -3442,26 +3508,41 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixSnapshotsObserveAcceptedSpecPubli
               std::string::npos)
         << "Host-visible live-state exports must use the shared observation boundary.";
     EXPECT_NE(compact_header.find(
-                  "waitForPendingAcceptedSpecPublicationReadyForObservation("
-                  "void*consumer_stream,constchar*consumer_name)const"),
+                  "joinPublishedLiveStateHandoffs("
+                  "void*consumer_stream,DeviceTimelineRoleconsumer_role,"
+                  "constchar*consumer_name)const"),
               std::string::npos)
-        << "Snapshot/probe observation waits must stay const and non-consuming.";
-    EXPECT_NE(compact_observation_wait.find("accepted_spec_publication_ready_"),
+        << "Published state may only be joined through the typed role API.";
+    EXPECT_EQ(compact_header.find(
+                  "waitForPendingAcceptedSpecPublicationReady("),
               std::string::npos);
-    EXPECT_NE(compact_observation_wait.find("streamWaitEvent("),
-              std::string::npos);
-    EXPECT_EQ(compact_observation_wait.find("ready.valid=false"),
-              std::string::npos)
-        << "Diagnostic snapshot/probe waits must not consume the publication event.";
-    EXPECT_EQ(compact_observation_wait.find("accepted_spec_publication_ready_.valid=false"),
-              std::string::npos)
-        << "Diagnostic observation must leave the real forward handoff intact.";
-
-    EXPECT_NE(compact_live_observation.find(
+    EXPECT_EQ(compact_header.find(
                   "waitForPendingAcceptedSpecPublicationReadyForObservation("),
               std::string::npos);
+    EXPECT_NE(compact_published_join.find("accepted_spec_publication_ready_"),
+              std::string::npos);
+    EXPECT_NE(compact_published_join.find("live_prefix_mutation_ready_"),
+              std::string::npos);
+    EXPECT_NE(compact_published_join.find("enqueuePublishedWait("),
+              std::string::npos)
+        << "Cross-lifetime publications must always lower to durable event waits.";
+    EXPECT_NE(compact_published_join.find(
+                  "caseDeviceTimelineRole::MTPSidecarGraph:"),
+              std::string::npos);
+    EXPECT_NE(compact_published_join.find(
+                  "caseDeviceTimelineRole::PrefixCheckpointArchive:"),
+              std::string::npos);
+    EXPECT_NE(compact_published_join.find(
+                  "caseDeviceTimelineRole::Diagnostics:"),
+              std::string::npos);
+    EXPECT_NE(compact_published_join.find(
+                  "if(consumes_publications){"),
+              std::string::npos)
+        << "Observation roles must not clear ownership publications.";
+
     EXPECT_NE(compact_live_observation.find(
-                  "waitForPendingLivePrefixMutationReadyForObservation("),
+                  "joinPublishedLiveStateHandoffs("
+                  "observation_stream,observation_role,consumer)"),
               std::string::npos);
     EXPECT_NE(compact_live_observation.find(
                   "waitForPendingLiveGraphProducersForObservation("),
@@ -3827,7 +3908,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LiveLogicalCheckpointsUseEventBackedSou
     expectNeedleBefore(
         compact_prepare,
         "waitForPendingLivePrefixCheckpointReady(",
-        "waitForPendingAcceptedSpecPublicationReady(",
+        "joinPublishedLiveStateHandoffs(",
         "Forward replay must wait for async checkpoint source copies before later live-state handoffs.");
 
     expectNeedleBefore(
@@ -3881,7 +3962,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         "bool DeviceGraphOrchestrator::ensureLiveCheckpointStorage");
     const auto checkpoint_body = sliceBetween(
         source,
-        "PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixCheckpoint(int seq_idx) const",
+        "PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixCheckpoint(",
         "bool DeviceGraphOrchestrator::restoreLivePrefixState");
     const auto device_publication_body = sliceBetween(
         source,
@@ -3890,18 +3971,14 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
     const auto record_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::recordLivePrefixMutationReady(",
-        "bool DeviceGraphOrchestrator::waitForPendingLivePrefixMutationReady(");
+        "bool DeviceGraphOrchestrator::joinPublishedLiveStateHandoffs(");
     const auto event_preflight_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::prepareLivePrefixMutationReadyEvent(",
         "bool DeviceGraphOrchestrator::recordLivePrefixMutationReady(");
-    const auto wait_body = sliceBetween(
+    const auto published_join_body = sliceBetween(
         source,
-        "bool DeviceGraphOrchestrator::waitForPendingLivePrefixMutationReady(",
-        "bool DeviceGraphOrchestrator::waitForPendingLivePrefixMutationReadyForObservation(");
-    const auto observation_body = sliceBetween(
-        source,
-        "bool DeviceGraphOrchestrator::waitForPendingLivePrefixMutationReadyForObservation(",
+        "bool DeviceGraphOrchestrator::joinPublishedLiveStateHandoffs(",
         "void DeviceGraphOrchestrator::clearPendingLivePrefixMutationReady()");
     const auto restored_transaction_body = sliceBetween(
         source,
@@ -3940,8 +4017,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
     const auto compact_event_preflight =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(event_preflight_body));
     const auto compact_record = removeAsciiWhitespace(stripCommentsAndStringLiterals(record_body));
-    const auto compact_wait = removeAsciiWhitespace(stripCommentsAndStringLiterals(wait_body));
-    const auto compact_observation = removeAsciiWhitespace(stripCommentsAndStringLiterals(observation_body));
+    const auto compact_published_join =
+        removeAsciiWhitespace(
+            stripCommentsAndStringLiterals(published_join_body));
     const auto compact_restored_transaction =
         removeAsciiWhitespace(
             stripCommentsAndStringLiterals(restored_transaction_body));
@@ -3967,10 +4045,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         compact_header.find(
             "recordLivePrefixMutationReady(void*producer_stream,constchar*producer_name,std::vector<PrefixBlockHandle>retained_payload_sources={},std::vector<std::shared_ptr<void>>retained_device_sources={})"),
               std::string::npos);
-    EXPECT_NE(compact_header.find("waitForPendingLivePrefixMutationReady(void*consumer_stream,constchar*consumer_name)"),
-              std::string::npos);
-    EXPECT_NE(compact_header.find("waitForPendingLivePrefixMutationReadyForObservation(void*consumer_stream,constchar*consumer_name)const"),
-              std::string::npos);
+    EXPECT_NE(
+        compact_header.find(
+            "joinPublishedLiveStateHandoffs(void*consumer_stream,DeviceTimelineRoleconsumer_role,constchar*consumer_name)const"),
+        std::string::npos);
+    EXPECT_EQ(
+        compact_header.find("waitForPendingLivePrefixMutationReady("),
+        std::string::npos);
+    EXPECT_EQ(
+        compact_header.find(
+            "waitForPendingLivePrefixMutationReadyForObservation("),
+        std::string::npos);
     EXPECT_NE(compact_header.find("waitForPendingLiveGraphProducersBeforePrefixMutation(void*mutation_stream,constchar*mutation_name)"),
               std::string::npos);
     EXPECT_NE(compact_header.find(
@@ -3980,19 +4065,57 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
 
     EXPECT_NE(compact_event_preflight.find("backend->createEvent("), std::string::npos)
         << "The completion event must exist before asynchronous restore payload reads begin.";
-    EXPECT_NE(compact_record.find("backend->recordEvent("), std::string::npos);
+    EXPECT_NE(
+        compact_record.find(
+            "DeviceTimelinePoint::LivePrefixMutationReady"),
+        std::string::npos);
+    EXPECT_NE(compact_record.find(".publish("), std::string::npos);
     EXPECT_NE(compact_record.find("live_prefix_mutation_ready_"), std::string::npos);
     EXPECT_NE(compact_record.find("std::terminate()"), std::string::npos)
         << "A submitted restore payload may not outlive its owner when event publication fails.";
-    EXPECT_NE(compact_wait.find("streamWaitEvent("), std::string::npos);
-    EXPECT_NE(compact_wait.find("clearPendingLivePrefixMutationReady();"), std::string::npos);
-    EXPECT_NE(compact_observation.find("streamWaitEvent("), std::string::npos);
-    EXPECT_EQ(compact_observation.find("clearPendingLivePrefixMutationReady();"), std::string::npos)
-        << "Diagnostic snapshot/probe waits must observe restore readiness without consuming it.";
+    EXPECT_NE(
+        compact_published_join.find("enqueuePublishedWait("),
+        std::string::npos);
+    EXPECT_NE(
+        compact_published_join.find(
+            "if(consumes_publications){"),
+        std::string::npos);
+    EXPECT_NE(
+        compact_published_join.find(
+            "clearPendingLivePrefixMutationReady();"),
+        std::string::npos);
+    EXPECT_EQ(
+        compact_published_join.find("producer_stream==consumer_stream"),
+        std::string::npos)
+        << "Durable publication joins must never depend on raw stream identity.";
 
     EXPECT_NE(compact_prepare.find("live_prefix_mutation_ready_.valid"), std::string::npos);
-    EXPECT_NE(compact_prepare.find("waitForPendingLivePrefixMutationReady("), std::string::npos);
-    EXPECT_NE(compact_sidecar.find("waitForPendingLivePrefixMutationReady("), std::string::npos);
+    EXPECT_NE(
+        compact_sidecar.find(
+            "joinPublishedLiveStateHandoffs("
+            "sidecar_dynamic_stream,"
+            "DeviceTimelineRole::MTPSidecarGraph,"),
+        std::string::npos)
+        << "The MTP sidecar must identify its role to the shared join API.";
+    EXPECT_NE(
+        compact_prepare.find(
+            "joinPublishedLiveStateHandoffs("
+            "execution_stream,"
+            "DeviceTimelineRole::MainForwardGraph,"),
+        std::string::npos)
+        << "The main graph must identify its consuming role to the shared join API.";
+    EXPECT_NE(
+        compact_restore.find(
+            "joinPublishedLiveStateHandoffs("
+            "stream,DeviceTimelineRole::PrefixRestoreMutation,"),
+        std::string::npos)
+        << "Prefix restore must consume the old live-state timeline through the typed API.";
+    EXPECT_NE(
+        compact_truncate.find(
+            "joinPublishedLiveStateHandoffs("
+            "stream,DeviceTimelineRole::PrefixRestoreMutation,"),
+        std::string::npos)
+        << "Prefix truncate must consume the old live-state timeline through the typed API.";
     EXPECT_NE(compact_probe.find("waitForLiveInferenceStateReadyForObservation("), std::string::npos);
     EXPECT_NE(compact_payload.find("waitForLiveInferenceStateReadyForObservation("), std::string::npos);
     EXPECT_NE(compact_checkpoint.find("waitForLiveInferenceStateReadyForObservation("), std::string::npos);
@@ -4041,7 +4164,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
 
     expectNeedleBefore(
         compact_restore,
-        "waitForPendingLivePrefixMutationReady(",
+        "joinPublishedLiveStateHandoffs(",
         "state_.kv_cache->truncateSequence(",
         "A restore must wait for any older async prefix mutation before overwriting live state.");
     expectNeedleBefore(
@@ -4076,7 +4199,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         "Payload restore must advance its shifted-cache transaction after recording the restore mutation.");
     expectNeedleBefore(
         compact_truncate,
-        "waitForPendingLivePrefixMutationReady(",
+        "joinPublishedLiveStateHandoffs(",
         "state_.kv_cache->truncateSequence(",
         "Truncate must wait for any older async prefix mutation before mutating live state.");
     expectNeedleBefore(
@@ -4089,31 +4212,25 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         "handleLivePrefixReplayStateAfterMutation(",
         "recordLivePrefixMutationReady(",
         "Truncate readiness must be recorded after the live-state epoch changes.");
-    expectNeedleBefore(
-        compact_device_publication,
-        "handleLivePrefixReplayStateAfterMutation(",
-        "recordLivePrefixMutationReady(",
-        "Device-resident accepted spec-state publication must publish the generic live mutation handoff.");
-    expectNeedleBefore(
-        compact_device_publication,
-        "recordAcceptedSpecPublicationReady(",
-        "recordLivePrefixMutationReady(",
-        "Device-resident publication consumers wait accepted-state readiness before the generic live mutation handoff.");
+    EXPECT_NE(
+        compact_device_publication.find(
+            "recordAcceptedSpecPublicationReady("),
+        std::string::npos);
+    EXPECT_EQ(
+        compact_device_publication.find(
+            "recordLivePrefixMutationReady("),
+        std::string::npos)
+        << "Accepted-state publication and prefix mutation are distinct timeline producers.";
     expectNeedleBefore(
         compact_device_publication,
         "recordDeviceResidentLogicalSequenceStateMailbox(",
-        "recordLivePrefixMutationReady(",
-        "Device-resident publication should record the live mutation after the mailbox event is queued.");
+        "recordAcceptedSpecPublicationReady(",
+        "Accepted-state readiness must be recorded after the logical mailbox publication.");
     expectNeedleBefore(
-        compact_prepare,
-        "waitForPendingAcceptedSpecPublicationReady(",
-        "waitForPendingLivePrefixMutationReady(",
-        "Forward consumers should order accepted publication first, then prefix restore/truncate handoffs.");
-    expectNeedleBefore(
-        compact_sidecar,
-        "waitForPendingAcceptedSpecPublicationReady(",
-        "waitForPendingLivePrefixMutationReady(",
-        "Sidecar consumers should order accepted publication first, then prefix restore/truncate handoffs.");
+        compact_published_join,
+        "DeviceTimelinePoint::AcceptedSpecPublicationReady",
+        "DeviceTimelinePoint::LivePrefixMutationReady",
+        "The shared typed join must queue accepted publication before prefix mutation.");
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, PrefixRestoreClearsDiscardedTimelineTransientHandoffs)
@@ -4766,7 +4883,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ResidentMTPHotPathsUseOnlyPreallocatedE
             },
             {
                 "bool DeviceGraphOrchestrator::recordAcceptedSpecPublicationReady(",
-                "bool DeviceGraphOrchestrator::waitForPendingAcceptedSpecPublicationReady(",
+                "void DeviceGraphOrchestrator::clearPendingAcceptedSpecPublicationReady()",
                 "accepted-state publication",
             },
             {
@@ -5018,11 +5135,14 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
             "publishPreparedArenaGraphInput("
             "BufferId::MTP_VERIFIER_INPUT_TOKENS",
             verifier_token_materialization);
-    ASSERT_NE(stop_control_write, std::string::npos);
-    ASSERT_NE(stop_control_publication, std::string::npos);
+    EXPECT_EQ(stop_control_write, std::string::npos)
+        << "Request-constant stop controls must not be uploaded beside verifier "
+           "replay.";
+    EXPECT_EQ(stop_control_publication, std::string::npos)
+        << "Verifier replay must consume the request-admitted stop-control row "
+           "without republishing its ownership.";
     ASSERT_NE(verifier_token_materialization, std::string::npos);
     ASSERT_NE(verifier_token_publication, std::string::npos);
-    EXPECT_LT(stop_control_write, stop_control_publication);
     EXPECT_LT(
         verifier_token_materialization,
         verifier_token_publication)
@@ -5074,6 +5194,121 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
         rocm_greedy_summary_kernel.find(
             "sampling_math::kSpeculativeBatchMaxStopTokens"),
         std::string::npos);
+}
+
+/**
+ * @brief Keep commit-replay diagnostics on the GPU condition-token lifecycle.
+ *
+ * The replay checker knows the oracle token on the host, but a GPU shifted-row
+ * commit still has to stage it into a persistent device sample slot, publish
+ * readiness on the producer stream, and consume that slot through the normal
+ * device-target commit API. Calling the scalar terminal-hidden helper would
+ * reintroduce a host condition-token source that production GPU sidecars reject.
+ */
+TEST(
+    Test__GpuWorkspaceAllocationPolicy,
+    MTPCommitReplayDiagnosticPublishesGpuConditionTokensThroughDeviceSlots)
+{
+    const auto runner_source = readFile(
+        repoRoot() /
+        "src/v2/execution/runner/OrchestrationRunner.cpp");
+    ASSERT_FALSE(runner_source.empty());
+
+    const auto replay_commit = sliceBetween(
+        runner_source,
+        "auto commit_shifted_replay_row = [&](",
+        "auto forward_replay_token = [&](");
+    const auto compact = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(replay_commit));
+
+    const size_t gpu_branch =
+        compact.find("if(runner_->primaryDeviceId().is_gpu())");
+    const size_t device_stage =
+        compact.find(
+            "stageStochasticTargetTokenForDeviceSampling(",
+            gpu_branch);
+    const size_t device_commit =
+        compact.find(
+            "commitMTPShiftedRowFromDeviceTargetSample(",
+            device_stage);
+    const size_t cpu_branch = compact.find("else{", device_commit);
+    const size_t scalar_commit =
+        compact.find(
+            "commitMTPShiftedRowFromCurrentTerminalHidden(",
+            cpu_branch);
+
+    ASSERT_NE(gpu_branch, std::string::npos);
+    ASSERT_NE(device_stage, std::string::npos);
+    ASSERT_NE(device_commit, std::string::npos);
+    ASSERT_NE(cpu_branch, std::string::npos);
+    ASSERT_NE(scalar_commit, std::string::npos);
+    EXPECT_LT(gpu_branch, device_stage);
+    EXPECT_LT(device_stage, device_commit);
+    EXPECT_LT(device_commit, cpu_branch);
+    EXPECT_LT(cpu_branch, scalar_commit)
+        << "The scalar replay oracle is CPU-only; GPU replay must consume the "
+           "event-published device target slot.";
+}
+
+/**
+ * @brief Keep sidecar-preservation verifier probes on device-owned input rows.
+ *
+ * GPU verifier graphs consume token IDs and logical positions as one published
+ * arena row. The diagnostic must use the same preparation API and pass the
+ * resulting pointer into executeMTPSpecVerifierForward(); invoking the host-token
+ * overload would make a stale diagnostic fail before it can inspect main state.
+ */
+TEST(
+    Test__GpuWorkspaceAllocationPolicy,
+    MTPSidecarPreservationProbeUsesProductionDeviceVerifierInput)
+{
+    const auto runner_source = readFile(
+        repoRoot() /
+        "src/v2/execution/runner/OrchestrationRunner.cpp");
+    ASSERT_FALSE(runner_source.empty());
+
+    const auto preservation_probe = sliceBetween(
+        runner_source,
+        "auto verifier_rows_from_current_state = [&]()",
+        "std::optional<std::vector<int32_t>> sidecar_rows");
+    const auto compact = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(preservation_probe));
+
+    const size_t gpu_branch =
+        compact.find("if(runner_->primaryDeviceId().is_gpu())");
+    const size_t device_first =
+        compact.find(
+            "prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(",
+            gpu_branch);
+    const size_t device_host_first =
+        compact.find(
+            "prepareMTPVerifierInputTokensOnDevice(",
+            device_first);
+    const size_t host_row =
+        compact.find(
+            "prepareMTPVerifierInputTokensOnDeviceFromHostRow(",
+            device_host_first);
+    const size_t bind_forward_options =
+        compact.find(
+            "forward_options.device_token_ids=verifier_input_tokens_device",
+            host_row);
+    const size_t verifier_forward =
+        compact.find(
+            "executeMTPSpecVerifierForward(*runner_,"
+            "verifier_input_plan,forward_options)",
+            bind_forward_options);
+
+    ASSERT_NE(gpu_branch, std::string::npos);
+    ASSERT_NE(device_first, std::string::npos);
+    ASSERT_NE(device_host_first, std::string::npos);
+    ASSERT_NE(host_row, std::string::npos);
+    ASSERT_NE(bind_forward_options, std::string::npos);
+    ASSERT_NE(verifier_forward, std::string::npos);
+    EXPECT_LT(gpu_branch, device_first);
+    EXPECT_LT(device_first, device_host_first);
+    EXPECT_LT(device_host_first, host_row);
+    EXPECT_LT(host_row, bind_forward_options);
+    EXPECT_LT(bind_forward_options, verifier_forward);
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, RequestBatchResidentOutcomePublishesBeforeHostBridge)
@@ -5846,9 +6081,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
     EXPECT_NE(compact_header.find("structDeviceResidentLogicalSequenceStateStorage"),
               std::string::npos)
         << "Published logical state needs an owner whose lifetime is independent of graph workspace.";
-    EXPECT_NE(compact_header.find("staticconstexprsize_tkFieldCount=6"),
+    EXPECT_NE(compact_header.find("staticconstexprsize_tkFieldCount=7"),
               std::string::npos)
-        << "Every request-lifetime logical field must have a dedicated persistent row.";
+        << "Every request-lifetime logical field and the independent initialization scratch must have a dedicated persistent row.";
     EXPECT_NE(compact_header.find("boolbindPublicationOutputs(MTPSpecDecodeMetadataDevicePointers*pointers,intrequest_count)const"),
               std::string::npos)
         << "Publication kernels must be redirected structurally to the persistent arena owner.";
@@ -6294,6 +6529,293 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
     EXPECT_EQ(compact_decode_step.find("runner_->get_position()"),
               std::string::npos)
         << "decodeStep must not bypass the host-mirror freshness guard for MTP planning.";
+}
+
+/**
+ * @brief Keep the scalar target-to-sidecar transition fully device authoritative.
+ *
+ * The condition graph advances canonical main KV state before the first target
+ * token is sampled. The first sidecar historically consumed the new token and
+ * KV count directly while leaving the durable resident mailbox at the prior
+ * position. That split ownership was timing-safe for the sidecar itself but
+ * made later checkpoint and publication consumers observe stale logical state.
+ *
+ * This regression proves that the public target-slot transition performs one
+ * explicit publication transaction before sidecar replay. It also bans every
+ * tempting reconstruction path: host position mirrors, request-admission
+ * lengths, guessed streams, host/device copies, synchronization, and hot-path
+ * allocation.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     ScalarDeviceTargetSidecarRepublishesCanonicalLogicalState)
+{
+    const auto root = repoRoot();
+    const auto header = readFile(
+        root /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    const auto source = readFile(
+        root /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+
+    const auto compact_header =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(header));
+    const auto compact_transition =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "bool DeviceGraphOrchestrator::forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(",
+            "bool DeviceGraphOrchestrator::forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(")));
+    const auto compact_publication =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "bool DeviceGraphOrchestrator::\n"
+            "        publishDeviceResidentLogicalSequenceStateFromTargetSample(",
+            "bool DeviceGraphOrchestrator::recordDeviceResidentLogicalSequenceStateMailbox(")));
+
+    EXPECT_NE(
+        compact_header.find(
+            "boolpublishDeviceResidentLogicalSequenceStateFromTargetSample("
+            "inttarget_sample_slot,constint32_t*live_position_device);"),
+        std::string::npos)
+        << "The target-slot ownership boundary needs one named typed helper.";
+
+    const size_t canonical_count = compact_transition.find(
+        "state_.kv_cache->deviceSequenceCachedTokenCountPtr(");
+    const size_t publication = compact_transition.find(
+        "publishDeviceResidentLogicalSequenceStateFromTargetSample("
+        "target_sample_slot,live_position_device)");
+    const size_t sidecar = compact_transition.find("executeMTPDepth0Batched(");
+    ASSERT_NE(canonical_count, std::string::npos);
+    ASSERT_NE(publication, std::string::npos);
+    ASSERT_NE(sidecar, std::string::npos);
+    EXPECT_LT(canonical_count, publication);
+    EXPECT_LT(publication, sidecar)
+        << "The resident token/position pair must be published before sidecar replay.";
+
+    EXPECT_NE(
+        compact_publication.find(
+            "target_ready.producer_stream"),
+        std::string::npos)
+        << "Publication must append to the exact target sampler stream.";
+    EXPECT_EQ(
+        compact_publication.find("explicitGPUStreamForOperation("),
+        std::string::npos)
+        << "A guessed ambient stream would sever the target producer edge.";
+    const size_t prior_mailbox_wait = compact_publication.find(
+        "waitForDeviceResidentLogicalSequenceStateMailbox("
+        "producer_stream,");
+    const size_t target_wait = compact_publication.find(
+        "waitForRequiredStochasticTargetSampleReady("
+        "target_sample_slot,producer_stream,");
+    const size_t initialize = compact_publication.find(
+        "backend->enqueueInitializeMTPDeviceLogicalState("
+        "target_token_device,live_position_device,");
+    const size_t mailbox_event = compact_publication.find(
+        "recordDeviceResidentLogicalSequenceStateMailbox(");
+    ASSERT_NE(prior_mailbox_wait, std::string::npos);
+    ASSERT_NE(target_wait, std::string::npos);
+    ASSERT_NE(initialize, std::string::npos);
+    ASSERT_NE(mailbox_event, std::string::npos);
+    EXPECT_LT(prior_mailbox_wait, initialize)
+        << "Single-buffered durable rows cannot be overwritten before their prior publication.";
+    EXPECT_LT(target_wait, initialize)
+        << "The publication kernel must consume a proven-ready target sample.";
+    EXPECT_LT(initialize, mailbox_event)
+        << "Mailbox readiness must cover the scratch write and all six durable row writes.";
+    EXPECT_NE(
+        compact_publication.find(
+            "storage.initialization_base_cached_tokens_scratch_device"),
+        std::string::npos)
+        << "First-sidecar publication cannot borrow verifier workspace that does not exist yet.";
+
+    EXPECT_EQ(compact_publication.find("state_.positions"), std::string::npos);
+    EXPECT_EQ(compact_publication.find("request_sequence_lengths_dev_"),
+              std::string::npos);
+    EXPECT_EQ(compact_publication.find("get_position("), std::string::npos);
+    EXPECT_EQ(compact_publication.find("hostToDevice"), std::string::npos);
+    EXPECT_EQ(compact_publication.find("deviceToHost"), std::string::npos);
+    EXPECT_EQ(compact_publication.find("synchronize"), std::string::npos);
+    EXPECT_EQ(compact_publication.find("malloc"), std::string::npos);
+    EXPECT_EQ(compact_publication.find("free("), std::string::npos);
+}
+
+/**
+ * @brief Make post-restore GPU observations read canonical cache metadata.
+ *
+ * Restoring a checkpoint invalidates the prior speculative-outcome mailbox,
+ * but the restored KV sequence count remains device authoritative. This guard
+ * proves that host-visible cache snapshots and diagnostics share one observer:
+ * use the event-fenced mailbox while it is current, otherwise read the
+ * cache-owned count on the already ordered observation stream. GPU callers
+ * must fail closed if neither device source is available; state_.positions is
+ * never a coherence fallback.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     GPUCheckpointObservationUsesCanonicalKVCountWithoutMailbox)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+
+    const auto compact_observer =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "std::optional<int> DeviceGraphOrchestrator::deviceResidentLogicalTokenCountForObservation(",
+            "std::optional<int> DeviceGraphOrchestrator::deviceResidentShiftedMTPKVTokenCountForObservation(")));
+    const auto capture_body = sliceBetween(
+        source,
+        "PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixState(",
+        "bool DeviceGraphOrchestrator::restoreLivePrefixState(");
+    const auto compact_capture =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(capture_body));
+    const auto probe_body = sliceBetween(
+        source,
+        "PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe() const",
+        "void DeviceGraphOrchestrator::disablePrefixCacheForRunner(");
+    const auto compact_probe_fallback =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            probe_body,
+            "else if (state_.device_id.is_gpu() && state_.kv_cache)",
+            "const int sequence_count = state_.batch_size > 0 ? state_.batch_size : 1;")));
+
+    EXPECT_NE(
+        compact_observer.find(
+            "mailbox.live_state_epoch==live_replay_state_epoch_"),
+        std::string::npos);
+    EXPECT_NE(
+        compact_observer.find(
+            "state_.kv_cache->supportsDeviceResidentSequenceStatePublication()"),
+        std::string::npos);
+    EXPECT_NE(
+        compact_observer.find(
+            "state_.kv_cache->deviceSequenceCachedTokenCountPtr(request_index)"),
+        std::string::npos);
+    EXPECT_NE(compact_observer.find("backend->deviceToHostFast("),
+              std::string::npos)
+        << "The scalar transfer belongs only to this explicit host-visible "
+           "observation boundary.";
+    EXPECT_EQ(compact_observer.find("state_.positions"), std::string::npos);
+    EXPECT_EQ(compact_observer.find("get_position("), std::string::npos);
+    EXPECT_EQ(compact_observer.find("synchronize"), std::string::npos);
+
+    EXPECT_NE(
+        compact_capture.find(
+            "if(state_.device_id.is_gpu()){conststd::optional<int>"
+            "resident_tokens=deviceResidentLogicalTokenCountForObservation("),
+        std::string::npos);
+    EXPECT_NE(
+        capture_body.find(
+            "canonical_device_cached_token_observation_failed"),
+        std::string::npos);
+    EXPECT_EQ(
+        compact_capture.find(
+            "intcached_tokens=restorablePrefixCachedTokens("),
+        std::string::npos)
+        << "GPU prefix payload capture must not initialize from a host mirror.";
+
+    EXPECT_NE(
+        compact_probe_fallback.find(
+            "deviceResidentLogicalTokenCountForObservation("),
+        std::string::npos);
+    EXPECT_NE(compact_probe_fallback.find("throwstd::runtime_error("),
+              std::string::npos)
+        << "A missing canonical GPU observer must be fatal.";
+    EXPECT_EQ(compact_probe_fallback.find("state_.positions"),
+              std::string::npos);
+    EXPECT_EQ(compact_probe_fallback.find("state_.sequence_lengths"),
+              std::string::npos);
+}
+
+/**
+ * @brief Prevent rollback capture from rediscovering a GPU logical cursor.
+ *
+ * The request scheduler owns the exact transaction position. The checkpoint
+ * API carries that cursor explicitly through Rank/Global orchestrators into
+ * every device participant, while the participant archives canonical KV
+ * metadata D2D. A host mirror, scalar D2H observation, or stream sync in this
+ * production path would recreate the stale-state failure this contract removes.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     GPURollbackCheckpointRequiresSchedulerOwnedCursor)
+{
+    const auto root = repoRoot();
+    const auto snapshot_header = readFile(
+        root / "src/v2/execution/prefix_cache/PrefixStateSnapshot.h");
+    const auto runner_interface = readFile(
+        root /
+        "src/v2/execution/local_execution/orchestrators/IInferenceRunner.h");
+    const auto orchestrator_source = readFile(
+        root /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto runner_source = readFile(
+        root / "src/v2/execution/runner/OrchestrationRunner.cpp");
+
+    const auto compact_snapshot =
+        removeAsciiWhitespace(
+            stripCommentsAndStringLiterals(snapshot_header));
+    const auto compact_interface =
+        removeAsciiWhitespace(
+            stripCommentsAndStringLiterals(runner_interface));
+    const auto compact_checkpoint =
+        removeAsciiWhitespace(
+            stripCommentsAndStringLiterals(sliceBetween(
+                orchestrator_source,
+                "PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixCheckpoint(",
+                "bool DeviceGraphOrchestrator::restoreLivePrefixState(")));
+    const auto compact_decode =
+        removeAsciiWhitespace(
+            stripCommentsAndStringLiterals(sliceBetween(
+                runner_source,
+                "GenerationResult OrchestrationRunner::decodeStepMTP(",
+                "GenerationResult OrchestrationRunner::decodeStep(")));
+
+    EXPECT_NE(
+        compact_snapshot.find(
+            "structPrefixCheckpointCaptureRequest{intsequence_index=-1;"
+            "intlogical_cached_tokens=-1;"),
+        std::string::npos)
+        << "A default-constructed checkpoint cursor must remain invalid.";
+    EXPECT_NE(
+        compact_interface.find(
+            "captureLivePrefixCheckpoint("
+            "constPrefixCheckpointCaptureRequest&request)const"),
+        std::string::npos);
+    EXPECT_EQ(
+        compact_interface.find(
+            "captureLivePrefixCheckpoint(intseq_idx"),
+        std::string::npos)
+        << "The ambiguous host-position checkpoint API must stay retired.";
+
+    EXPECT_NE(compact_checkpoint.find("if(!request.valid())"),
+              std::string::npos);
+    EXPECT_NE(
+        compact_checkpoint.find(
+            "constintcached_tokens=request.logical_cached_tokens;"),
+        std::string::npos);
+    EXPECT_EQ(compact_checkpoint.find("state_.positions"),
+              std::string::npos);
+    EXPECT_EQ(
+        compact_checkpoint.find(
+            "deviceResidentLogicalTokenCountForObservation("),
+        std::string::npos);
+    EXPECT_EQ(compact_checkpoint.find("deviceToHost"),
+              std::string::npos);
+    EXPECT_EQ(compact_checkpoint.find("synchronizeStream("),
+              std::string::npos);
+    EXPECT_EQ(compact_checkpoint.find("synchronizeDevice("),
+              std::string::npos);
+
+    EXPECT_NE(
+        compact_decode.find(
+            "currentDecodeTransactionPositionForPlanning(context,error)"),
+        std::string::npos);
+    EXPECT_NE(
+        compact_decode.find(
+            "captureLivePrefixCheckpoint(*capture_request)"),
+        std::string::npos);
+    EXPECT_EQ(
+        compact_decode.find("captureLivePrefixCheckpoint()"),
+        std::string::npos)
+        << "Every scalar MTP checkpoint must name its scheduler cursor.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy,
@@ -6889,6 +7411,20 @@ TEST(Test__GpuWorkspaceAllocationPolicy, KVCacheDeviceResidentPublicationContrac
               std::string::npos);
     EXPECT_NE(compact.find("publication_ok_flags_device"),
               std::string::npos);
+    EXPECT_NE(compact.find("enumclassDeviceSequenceStatePublicationBasis"),
+              std::string::npos)
+        << "GPU publication must name the immutable state basis instead of "
+           "inferring ring ownership from a target count.";
+    EXPECT_NE(compact.find("CapturedBase"),
+              std::string::npos);
+    EXPECT_NE(compact.find("CurrentVisibleWindow"),
+              std::string::npos);
+    EXPECT_NE(compact.find("base_sequence_state_checkpoint_device"),
+              std::string::npos);
+    EXPECT_NE(compact.find("base_sequence_state_checkpoint_bytes"),
+              std::string::npos)
+        << "Captured-base publication must carry the opaque pre-verifier "
+           "head/count checkpoint needed to reconstruct wrapped ring state.";
     EXPECT_NE(compact.find("stream!=nullptr"),
               std::string::npos)
         << "GPU sequence-state publication must not be expressible on the "
@@ -6902,9 +7438,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, KVCacheDeviceResidentPublicationContrac
               std::string::npos)
         << "The default IKVCache implementation must hard-fail until a cache "
            "owns device-readable count/head state.";
-    EXPECT_NE(source.find("Long-context ring caches"), std::string::npos)
-        << "The contract should document why target count alone is not enough "
-           "to update wrapped ring-cache heads.";
+    EXPECT_NE(
+        source.find(
+            "cannot reconstruct the pre-verifier"),
+        std::string::npos)
+        << "The contract must document why target count alone cannot recover "
+           "a wrapped ring's immutable pre-verifier state.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, GPUKVLogicalBlockAccessRequiresExplicitStreams)
@@ -7361,10 +7900,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecStatePublicationSeparatesSidecar
     const auto executable_mutation_body =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(mutation_body));
     EXPECT_NE(executable_mutation_body.find(
-                  "constboolpreserve_sidecar_replay=state_.device_id.is_gpu()&&correction_replay_boundary;"),
+                  "constboolpreserve_sidecar_replay=state_.device_id.is_gpu()&&(correction_replay_boundary||reason==LivePrefixMutationReason::PrefixRestore);"),
               std::string::npos)
-        << "Accepted/rejected GPU publication must preserve sidecar captures "
-           "through the mandatory persistent-buffer contract.";
+        << "Accepted/rejected publication and prefix restore must preserve GPU "
+           "sidecar captures through the persistent-buffer contract.";
     EXPECT_EQ(executable_mutation_body.find(
                   "if(state_.device_id.is_gpu()){forward_engine_->resetCapturedReplayState();"),
               std::string::npos)
@@ -7388,10 +7927,18 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecStatePublicationSeparatesSidecar
     EXPECT_EQ(mutation_body.find("reset_until_device_state_indirection_proven"),
               std::string::npos)
         << "The device-state indirection debt was retired by byte-exact CUDA/ROCm lifetime tests.";
-    EXPECT_NE(mutation_body.find("prefix_restore_discard_cached_graphs"),
+    EXPECT_EQ(mutation_body.find("prefix_restore_discard_cached_graphs"),
               std::string::npos)
-        << "Prefix restore is a full live-state replacement and must discard "
-           "cached forward graph objects, not merely reset captured replay.";
+        << "Prefix restore must not destroy graph executables and recapture the "
+           "first continuation token.";
+    EXPECT_NE(executable_mutation_body.find(
+                  "rebindCapturedReplayStateAfterPrefixRestore(live_replay_state_epoch_)"),
+              std::string::npos)
+        << "Prefix restore must use the typed replay policy and explicit stream "
+           "rebind contract.";
+    EXPECT_NE(mutation_body.find("prefix_restore_typed_live_state"),
+              std::string::npos)
+        << "Perf stats must identify typed graph reuse at prefix restore.";
     EXPECT_NE(executable_mutation_body.find("resetMTPSidecarDepth0ReplayState()"),
               std::string::npos)
         << "Replay-unsafe sidecars must recapture instead of reusing stale "
@@ -7407,12 +7954,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecStatePublicationSeparatesSidecar
     EXPECT_NE(mutation_body.find("preserved_for_spec_publication"),
               std::string::npos)
         << "Perf stats must make the sidecar replay preservation explicit.";
-    EXPECT_NE(executable_mutation_body.find(
-                  "if(!preserve_gpu_replay_state&&preserves_correction_graph_replay)"),
+    EXPECT_NE(mutation_body.find("preserved_for_prefix_restore"),
               std::string::npos)
-        << "Correction publication must not globally reset kernel dynamic state "
-           "while verifier/sidecar graph executables are preserved.";
-    EXPECT_NE(mutation_body.find("preserved_for_correction_graph_replay"),
+        << "Perf stats must make prefix-restore sidecar reuse explicit.";
+    EXPECT_NE(executable_mutation_body.find(
+                  "if(!preserve_gpu_replay_state&&preserves_live_graph_replay)"),
+              std::string::npos)
+        << "A typed live-state boundary must not globally reset kernel dynamic "
+           "state while graph executables are preserved.";
+    EXPECT_NE(mutation_body.find("preserved_for_live_state_graph_replay"),
               std::string::npos)
         << "Perf stats must make kernel dynamic-state preservation explicit.";
 }
@@ -9822,6 +10372,71 @@ TEST(Test__GpuWorkspaceAllocationPolicy, OrchestrationSnapshotsExposeTensorParal
     EXPECT_NE(enable_body.find("snapshot_combined_cache_.clear()"), std::string::npos);
     EXPECT_NE(disable_body.find("snapshot_combined_cache_.clear()"), std::string::npos);
     EXPECT_NE(clear_body.find("snapshot_combined_cache_.clear()"), std::string::npos);
+}
+
+/**
+ * @brief Cached GPU graph snapshots must be owned by the captured graph class.
+ *
+ * Stage names such as `embedding` repeat across serial, grouped-verifier, and
+ * prefill graph geometries. A DeviceGraphExecutor-wide map keyed by stage name
+ * therefore lets one graph poison another graph's immutable capture descriptor.
+ * Keep both decode segment caches and monolithic prefill caches as explicit
+ * manifest owners, and forbid the retired executor-wide maps from returning.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy, CachedGraphSnapshotsHavePerGraphOwners)
+{
+    const auto root = repoRoot();
+    const std::string executor_header =
+        readFile(root /
+                 "src/v2/execution/local_execution/graph/DeviceGraphExecutor.h");
+    const std::string forward_types =
+        readFile(root /
+                 "src/v2/execution/local_execution/engine/ForwardGraphTypes.h");
+    const std::string capture_source =
+        readFile(root /
+                 "src/v2/execution/local_execution/graph/"
+                 "DeviceGraphExecutor_GraphCapture.cpp");
+
+    EXPECT_NE(
+        executor_header.find(
+            "GraphSnapshotManifest snapshot_manifest;"),
+        std::string::npos)
+        << "GraphSegmentCache must intrinsically own its decode snapshot manifest.";
+    EXPECT_NE(
+        forward_types.find(
+            "DeviceGraphExecutor::GraphSnapshotManifest snapshot_manifest;"),
+        std::string::npos)
+        << "ForwardGraphCache must own the manifest used by monolithic prefill.";
+
+    EXPECT_EQ(
+        executor_header.find("graph_snapshot_copies_"),
+        std::string::npos)
+        << "The process-wide stage-name snapshot map must remain retired.";
+    EXPECT_EQ(
+        executor_header.find("graph_snapshot_outputless_stages_"),
+        std::string::npos)
+        << "Outputless stage metadata belongs to the same graph-owned manifest.";
+
+    const std::string cached_replay = sliceBetween(
+        capture_source,
+        "bool DeviceGraphExecutor::executeWithCachedGraphReplay(",
+        "} // namespace llaminar2");
+    const std::string compact_cached_replay =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(cached_replay));
+    EXPECT_NE(
+        cached_replay.find("segment_cache.snapshot_manifest"),
+        std::string::npos)
+        << "Cached capture and replay must resolve the manifest from their exact segment cache.";
+    EXPECT_NE(
+        compact_cached_replay.find(
+            "runStages(graph,ctx,warmup_policy,collective_nodes,"
+            "&segment_cache.snapshot_manifest)"),
+        std::string::npos)
+        << "Phase-1 warmup must finalize descriptors in the same manifest that Phase-2 capture consumes.";
+    EXPECT_EQ(
+        cached_replay.find("transient_snapshot_manifest_"),
+        std::string::npos)
+        << "Cached graph execution must never fall through to the uncached eager manifest.";
 }
 
 /**

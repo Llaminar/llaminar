@@ -1275,43 +1275,42 @@ namespace llaminar2
                    static_cast<size_t>(head) * head_bytes;
         };
 
-        // Calculate the destination positions up front from the same state
-        // transition as serial decode.  Data copies use the original positions;
-        // metadata is committed only after every row copy has succeeded.
-        int next_head = entry.head;
-        int next_size = entry.size;
         /*
-         * Destination planning is runtime-sized because speculative depth is a
-         * graph capacity, not a four-row cache ABI. Planning every position
-         * before copying preserves transactional metadata publication: entry
-         * head/size are committed only after all native K/V rows succeed.
+         * Derive every destination from one immutable base state. For rows that
+         * fit before saturation, serial decode writes after the current visible
+         * tail. Every remaining row overwrites the oldest slot and advances the
+         * head. This closed form is the same transition as row-at-a-time decode,
+         * but it needs no runtime-sized destination vector and therefore performs
+         * no allocation or deallocation in the grouped verifier hot path.
+         *
+         * The live entry remains untouched until every native K/V copy has
+         * completed. Publishing head and size together below is therefore the
+         * single transactional metadata commit for the whole grouped operation.
          */
-        std::vector<int> dst_positions(static_cast<size_t>(verifier_rows));
-        for (int row = 0; row < verifier_rows; ++row)
+        const int base_head = entry.head;
+        const int base_size = entry.size;
+        const int rows_before_saturation = max_seq_len_ - base_size;
+        const int overwritten_rows =
+            std::max(0, verifier_rows - rows_before_saturation);
+        const int next_head =
+            (base_head + (overwritten_rows % max_seq_len_)) % max_seq_len_;
+        const int next_size =
+            std::min(max_seq_len_, base_size + verifier_rows);
+
+        if (overwritten_rows > 0 && !wrap_warned_)
         {
-            if (next_size < max_seq_len_)
-            {
-                dst_positions[static_cast<size_t>(row)] =
-                    (next_head + next_size) % max_seq_len_;
-                ++next_size;
-            }
-            else
-            {
-                if (!wrap_warned_)
-                {
-                    LOG_WARN("Context window full (" << max_seq_len_
-                                                     << " tokens). Sliding window is now overwriting oldest tokens. "
-                                                     << "Use -c <size> to increase context length.");
-                    wrap_warned_ = true;
-                }
-                dst_positions[static_cast<size_t>(row)] = next_head;
-                next_head = (next_head + 1) % max_seq_len_;
-            }
+            LOG_WARN("Context window full (" << max_seq_len_
+                                             << " tokens). Sliding window is now overwriting oldest tokens. "
+                                             << "Use -c <size> to increase context length.");
+            wrap_warned_ = true;
         }
 
         for (int row = 0; row < verifier_rows; ++row)
         {
-            const int dst_pos = dst_positions[static_cast<size_t>(row)];
+            const int dst_pos =
+                row < rows_before_saturation
+                    ? (base_head + base_size + row) % max_seq_len_
+                    : (base_head + row - rows_before_saturation) % max_seq_len_;
             if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
             {
                 for (int h = 0; h < local_n_kv_heads_; ++h)

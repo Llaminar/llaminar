@@ -7098,9 +7098,11 @@ namespace llaminar2::test
         ASSERT_NE(post_graph_start, std::string::npos);
         const std::string manifest_publish =
             source.substr(manifest_publish_start, post_graph_start - manifest_publish_start);
-        EXPECT_NE(manifest_publish.find("graph_snapshot_copies_.find(stage_name)"),
-                  std::string::npos)
-            << "GPU publication must resolve the immutable per-stage captured-slot manifest.";
+        EXPECT_NE(
+            manifest_publish.find(
+                "snapshot_manifest.stage_copies.find(stage_name)"),
+            std::string::npos)
+            << "GPU publication must resolve the immutable graph-owned per-stage captured-slot manifest.";
         EXPECT_NE(manifest_publish.find("output.tensor = copy.storage.get()"),
                   std::string::npos)
             << "Published descriptors must refer directly to graph-stable snapshot storage.";
@@ -7156,8 +7158,10 @@ namespace llaminar2::test
         EXPECT_NE(copy_body.find("reached capture preparation before warmup finalized its device manifest"),
                   std::string::npos)
             << "Missing warmup snapshot manifests must hard-fail instead of substituting pre-execution stage tensors.";
-        EXPECT_NE(copy_body.find("graph_snapshot_outputless_stages_.contains(node.name)"),
-                  std::string::npos)
+        EXPECT_NE(
+            copy_body.find(
+                "snapshot_manifest.outputless_stages.contains(node.name)"),
+            std::string::npos)
             << "Warmup-observed outputless stages need an explicit finalized manifest state.";
         EXPECT_NE(copy_body.find("lost all tensor-backed outputs during graph capture"),
                   std::string::npos)

@@ -675,7 +675,8 @@ namespace llaminar2
                 return publishSnapshotsAfterGraphExecution(
                     graph,
                     segment_cache->capture_stream,
-                    "decode_graph_replay");
+                    "decode_graph_replay",
+                    &segment_cache->snapshot_manifest);
             }
 
             const char *mode_name =
@@ -689,7 +690,10 @@ namespace llaminar2
 
         if (!bindGraphStagesForEagerExecution(graph, gpu_stream))
             return false;
-        if (!executeFastDecode(graph, ctx, collective_nodes))
+        if (!executeFastDecode(
+                graph,
+                ctx,
+                collective_nodes))
             return false;
         /*
          * executeFastDecode() publishes eager snapshots at each producer.  A
@@ -723,6 +727,35 @@ namespace llaminar2
         }
 
         const bool has_collective_nodes = (collective_nodes && !collective_nodes->empty());
+
+        /*
+         * Snapshot diagnostics change graph topology: every selected GPU stage
+         * gains a D2D copy node into graph-owned mapped storage. A graph warmed
+         * or captured under another callback/filter configuration cannot be
+         * reused merely because its compute-stage launch signature is unchanged.
+         *
+         * Re-enter Phase 1 explicitly. This is the ordinary capture lifecycle,
+         * not eager recovery after a failed graph launch: the old executable is
+         * retired before any work is submitted under the new topology, warmup
+         * finalizes the new manifest, and the next invocation captures it.
+         */
+        if (segment_cache.snapshot_configuration_epoch !=
+            snapshot_configuration_epoch_)
+        {
+            segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
+            segment_cache.snapshot_manifest.clear();
+            segment_cache.snapshot_configuration_epoch =
+                snapshot_configuration_epoch_;
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "decode_snapshot_configuration_rewarm",
+                1.0,
+                "decode",
+                ctx ? ctx->deviceId().toString() : std::string{},
+                {{"snapshot_epoch",
+                  std::to_string(snapshot_configuration_epoch_)},
+                 {"context", segment_cache.perf_context}});
+        }
 
         const uint64_t current_variant_signature =
             DeviceGraphCaptureController::computeCaptureVariantSignature(graph);
@@ -795,7 +828,11 @@ namespace llaminar2
                 snapshot_device = ctx->deviceId();
 
             void *stream = producer_stream ? producer_stream : node.stage->gpuStream();
-            return captureGraphSnapshotCopies(node, snapshot_device, stream);
+            return captureGraphSnapshotCopies(
+                node,
+                snapshot_device,
+                stream,
+                segment_cache.snapshot_manifest);
         };
 
         auto prepare_graph_snapshot_copies = [&](ComputeNode &node, void *producer_stream) -> bool
@@ -808,7 +845,11 @@ namespace llaminar2
                 snapshot_device = ctx->deviceId();
 
             void *stream = producer_stream ? producer_stream : node.stage->gpuStream();
-            return prepareGraphSnapshotCopies(node, snapshot_device, stream);
+            return prepareGraphSnapshotCopies(
+                node,
+                snapshot_device,
+                stream,
+                segment_cache.snapshot_manifest);
         };
 
         // ===== FAST PATH: Phase 3 (Replay) =====
@@ -992,7 +1033,12 @@ namespace llaminar2
             replay_hooks.cohere_inputs,
             [&](ComputeNode &node)
             {
-                return runStage(node, ctx, capture_phase_policy, is_collective_node(node));
+                return runStage(
+                    node,
+                    ctx,
+                    capture_phase_policy,
+                    is_collective_node(node),
+                    &segment_cache.snapshot_manifest);
             },
             replay_hooks.prepare_snapshot_copies,
             record_graph_snapshot_copies,
@@ -1127,11 +1173,16 @@ namespace llaminar2
             // kernel initialization and workspace allocation complete on the
             // capture stream.  Preserve the capture-stream assignment above:
             // the generic fast-decode entry point intentionally rebinds eager
-            // fallback passes to the worker stream to avoid stale stream
+            // eager passes to the worker stream to avoid stale stream
             // ownership of live device state.
             auto warmup_policy = StageRunPolicy::fastDecode();
             warmup_policy.preserve_gpu_streams = true;
-            return runStages(graph, ctx, warmup_policy, collective_nodes);
+            return runStages(
+                graph,
+                ctx,
+                warmup_policy,
+                collective_nodes,
+                &segment_cache.snapshot_manifest);
         }
 
         // ===== Phase 2: Capture (second call) — record capturable segments =====

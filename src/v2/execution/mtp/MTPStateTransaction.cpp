@@ -35,6 +35,92 @@ namespace llaminar2
         return std::max(0, logical_tokens - 1);
     }
 
+    MTPVisibleStateCommitPlan planMTPVisibleStateCommit(
+        int verifier_input_rows,
+        int emitted_token_start_index,
+        int remaining_output_budget)
+    {
+        MTPVisibleStateCommitPlan plan{
+            .verifier_input_rows = verifier_input_rows,
+            .emitted_token_start_index = emitted_token_start_index,
+            .remaining_output_budget = remaining_output_budget};
+
+        if (verifier_input_rows <= 0)
+        {
+            plan.reason = "visible MTP commit planning requires verifier input rows";
+            return plan;
+        }
+        if (emitted_token_start_index < 0 ||
+            emitted_token_start_index > verifier_input_rows)
+        {
+            plan.reason =
+                "visible MTP commit planning received an invalid emitted-token start";
+            return plan;
+        }
+        if (remaining_output_budget < 0)
+        {
+            plan.reason =
+                "visible MTP commit planning received a negative output budget";
+            return plan;
+        }
+
+        plan.max_state_commit_rows = verifier_input_rows;
+        const int maximum_newly_emitted_tokens =
+            verifier_input_rows - emitted_token_start_index;
+        if (remaining_output_budget > 0 &&
+            remaining_output_budget <= maximum_newly_emitted_tokens)
+        {
+            /*
+             * Serial decode processes every previously emitted condition row and
+             * every newly emitted token except the final visible token.  The
+             * latter remains pending so a later decode step can consume it once.
+             */
+            plan.max_state_commit_rows = std::clamp(
+                remaining_output_budget + emitted_token_start_index - 1,
+                0,
+                verifier_input_rows);
+            plan.response_boundary_clipped =
+                plan.max_state_commit_rows < verifier_input_rows;
+        }
+
+        plan.ok = true;
+        return plan;
+    }
+
+    MTPShiftedReplayRowPlan planMTPShiftedReplayRow(
+        int main_cached_tokens,
+        int shifted_cached_tokens)
+    {
+        if (main_cached_tokens < 0 || shifted_cached_tokens < 0)
+        {
+            return {
+                .ok = false,
+                .reason = "main and shifted cached-token counts must be nonnegative"};
+        }
+        if (shifted_cached_tokens == main_cached_tokens)
+        {
+            return {
+                .ok = true,
+                .action = MTPShiftedReplayRowAction::ReuseResidentRow,
+                .append_position_offset = -1};
+        }
+        if (shifted_cached_tokens + 1 == main_cached_tokens)
+        {
+            return {
+                .ok = true,
+                .action = MTPShiftedReplayRowAction::AppendRow,
+                .append_position_offset = main_cached_tokens};
+        }
+
+        std::ostringstream reason;
+        reason << "shifted MTP replay state must equal main state or trail by one"
+               << ": main=" << main_cached_tokens
+               << " shifted=" << shifted_cached_tokens;
+        return {
+            .ok = false,
+            .reason = reason.str()};
+    }
+
     PrefixStateSnapshot makeLogicalMTPVerifierBaseSnapshot(int cached_tokens)
     {
         PrefixStateSnapshot snapshot;
@@ -151,17 +237,48 @@ namespace llaminar2
             return mismatch("initialized flag mismatch");
         if (!oracle.initialized)
             return MTPStateValidationResult::success();
+        auto format_values = [](const std::vector<int> &values)
+        {
+            std::ostringstream message;
+            message << "[";
+            for (size_t index = 0; index < values.size(); ++index)
+            {
+                if (index > 0)
+                    message << ",";
+                message << values[index];
+            }
+            message << "]";
+            return message.str();
+        };
+
         if (oracle.current_position != candidate.current_position)
-            return mismatch("current position mismatch");
+        {
+            std::ostringstream message;
+            message << "current position mismatch: oracle="
+                    << oracle.current_position
+                    << " candidate=" << candidate.current_position;
+            return mismatch(message.str());
+        }
         if (oracle.positions != candidate.positions)
-            return mismatch("per-sequence position vector mismatch");
+        {
+            return mismatch(
+                "per-sequence position vector mismatch: oracle=" +
+                format_values(oracle.positions) +
+                " candidate=" + format_values(candidate.positions));
+        }
         if (oracle.sequence_lengths != candidate.sequence_lengths)
-            return mismatch("per-sequence length vector mismatch");
-        if (oracle.totalCachedTokens() != candidate.totalCachedTokens())
-            return mismatch("main KV cached token count mismatch");
-        if (options.compare_shifted_mtp_kv &&
-            oracle.totalMTPCachedTokens() != candidate.totalMTPCachedTokens())
-            return mismatch("shifted MTP cached token count mismatch");
+        {
+            return mismatch(
+                "per-sequence length vector mismatch: oracle=" +
+                format_values(oracle.sequence_lengths) +
+                " candidate=" + format_values(candidate.sequence_lengths));
+        }
+        /*
+         * Do not short-circuit on aggregate cached-token totals here. The
+         * per-cache comparison below reports the first divergent layer,
+         * sequence, count, and ring head, which is the actionable ownership
+         * boundary when a device publication updates only part of a cache.
+         */
         if (oracle.has_hidden != candidate.has_hidden)
             return mismatch("terminal hidden availability mismatch");
         if (oracle.has_logits != candidate.has_logits)

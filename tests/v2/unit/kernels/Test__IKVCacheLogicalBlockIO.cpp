@@ -670,12 +670,14 @@ TEST(Test__IKVCacheLogicalBlockIO, Q16HeadMajorGroupedVerifierAppendMatchesSeria
 /**
  * @brief Sweep every CPU KV storage format through grouped verifier publication.
  *
- * Each format is exercised for M=2,3,4, position-major and head-major source
- * tensors, position-major and head-major cache destinations, and both wrapped
- * and non-wrapped ring transitions. The serial witness appends one logical row
- * at a time through ordinary decode; the grouped side uses exactly one
+ * Each format is exercised for every grouped verifier depth M=2..16 plus the
+ * larger M=31 totality probe, position-major and head-major source tensors,
+ * position-major and head-major cache destinations, and both wrapped and
+ * non-wrapped ring transitions. The serial witness appends one logical row at
+ * a time through ordinary decode; the grouped side uses exactly one
  * appendVerifierRowsDecodeEquivalent() call and must publish identical raw
- * cache bytes and ring metadata.
+ * cache bytes and ring metadata. This includes the production TurboQuant
+ * TQ8-K/TQ4-V split as well as symmetric TQ4 and TQ8 storage.
  */
 TEST(Test__IKVCacheLogicalBlockIO, AllCPUFormatsGroupedVerifierAppendRuntimeMMatchesSerialDecodeBytes)
 {

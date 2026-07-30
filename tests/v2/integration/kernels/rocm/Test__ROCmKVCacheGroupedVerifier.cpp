@@ -41,6 +41,352 @@ namespace
     };
 
     /**
+     * @brief HIP resource and ordering adapter for the shared KV lifecycle model.
+     *
+     * Only persistent setup allocation, asynchronous copies, stream events,
+     * graph replay, and the final assertion fence are exposed.  Consequently
+     * the shared stress loop cannot accidentally introduce device-wide
+     * synchronization or per-transaction temporary allocation.
+     */
+    class ROCmKVLifecycleRuntime
+    {
+    public:
+        /** @brief Own one persistent HIP device allocation. */
+        class DeviceBuffer
+        {
+        public:
+            DeviceBuffer() = default;
+
+            explicit DeviceBuffer(size_t bytes)
+                : bytes_(bytes)
+            {
+                if (bytes_ == 0 ||
+                    hipMalloc(&pointer_, bytes_) != hipSuccess)
+                {
+                    pointer_ = nullptr;
+                    bytes_ = 0;
+                }
+            }
+
+            ~DeviceBuffer()
+            {
+                if (pointer_)
+                    (void)hipFree(pointer_);
+            }
+
+            DeviceBuffer(const DeviceBuffer &) = delete;
+            DeviceBuffer &operator=(const DeviceBuffer &) = delete;
+
+            DeviceBuffer(DeviceBuffer &&other) noexcept
+                : pointer_(std::exchange(other.pointer_, nullptr)),
+                  bytes_(std::exchange(other.bytes_, 0))
+            {
+            }
+
+            DeviceBuffer &operator=(DeviceBuffer &&other) noexcept
+            {
+                if (this == &other)
+                    return *this;
+                if (pointer_)
+                    (void)hipFree(pointer_);
+                pointer_ = std::exchange(other.pointer_, nullptr);
+                bytes_ = std::exchange(other.bytes_, 0);
+                return *this;
+            }
+
+            bool valid() const { return pointer_ != nullptr; }
+            void *data() const { return pointer_; }
+            size_t size() const { return bytes_; }
+
+        private:
+            void *pointer_ = nullptr;
+            size_t bytes_ = 0;
+        };
+
+        /** @brief Own one timing-disabled HIP dependency event. */
+        class Event
+        {
+        public:
+            Event()
+            {
+                if (hipEventCreateWithFlags(
+                        &event_,
+                        hipEventDisableTiming) != hipSuccess)
+                {
+                    event_ = nullptr;
+                }
+            }
+
+            ~Event()
+            {
+                if (event_)
+                    (void)hipEventDestroy(event_);
+            }
+
+            Event(const Event &) = delete;
+            Event &operator=(const Event &) = delete;
+
+            Event(Event &&other) noexcept
+                : event_(
+                      std::exchange(
+                          other.event_,
+                          nullptr))
+            {
+            }
+
+            Event &operator=(Event &&other) noexcept
+            {
+                if (this == &other)
+                    return *this;
+                if (event_)
+                    (void)hipEventDestroy(event_);
+                event_ =
+                    std::exchange(
+                        other.event_,
+                        nullptr);
+                return *this;
+            }
+
+            bool valid() const { return event_ != nullptr; }
+            hipEvent_t get() const { return event_; }
+
+        private:
+            hipEvent_t event_ = nullptr;
+        };
+
+        /** @brief Own one captured HIP graph and executable. */
+        class Graph
+        {
+        public:
+            Graph() = default;
+
+            Graph(
+                hipGraph_t graph,
+                hipGraphExec_t executable)
+                : graph_(graph),
+                  executable_(executable)
+            {
+            }
+
+            ~Graph()
+            {
+                if (executable_)
+                    (void)hipGraphExecDestroy(
+                        executable_);
+                if (graph_)
+                    (void)hipGraphDestroy(graph_);
+            }
+
+            Graph(const Graph &) = delete;
+            Graph &operator=(const Graph &) = delete;
+
+            Graph(Graph &&other) noexcept
+                : graph_(
+                      std::exchange(
+                          other.graph_,
+                          nullptr)),
+                  executable_(
+                      std::exchange(
+                          other.executable_,
+                          nullptr))
+            {
+            }
+
+            Graph &operator=(Graph &&other) noexcept
+            {
+                if (this == &other)
+                    return *this;
+                if (executable_)
+                    (void)hipGraphExecDestroy(
+                        executable_);
+                if (graph_)
+                    (void)hipGraphDestroy(graph_);
+                graph_ =
+                    std::exchange(
+                        other.graph_,
+                        nullptr);
+                executable_ =
+                    std::exchange(
+                        other.executable_,
+                        nullptr);
+                return *this;
+            }
+
+            bool valid() const
+            {
+                return graph_ != nullptr &&
+                       executable_ != nullptr;
+            }
+
+            hipGraphExec_t executable() const
+            {
+                return executable_;
+            }
+
+        private:
+            hipGraph_t graph_ = nullptr;
+            hipGraphExec_t executable_ = nullptr;
+        };
+
+        DeviceBuffer allocateDeviceBuffer(size_t bytes)
+        {
+            return DeviceBuffer(bytes);
+        }
+
+        Event createEvent()
+        {
+            return Event();
+        }
+
+        bool copyHostToDeviceAsync(
+            void *destination,
+            const void *source,
+            size_t bytes,
+            void *opaque_stream)
+        {
+            return destination && source && opaque_stream &&
+                   hipMemcpyAsync(
+                       destination,
+                       source,
+                       bytes,
+                       hipMemcpyHostToDevice,
+                       static_cast<hipStream_t>(
+                           opaque_stream)) ==
+                       hipSuccess;
+        }
+
+        bool copyDeviceToHostAsync(
+            void *destination,
+            const void *source,
+            size_t bytes,
+            void *opaque_stream)
+        {
+            return destination && source && opaque_stream &&
+                   hipMemcpyAsync(
+                       destination,
+                       source,
+                       bytes,
+                       hipMemcpyDeviceToHost,
+                       static_cast<hipStream_t>(
+                           opaque_stream)) ==
+                       hipSuccess;
+        }
+
+        bool copyDeviceToDeviceAsync(
+            void *destination,
+            const void *source,
+            size_t bytes,
+            void *opaque_stream)
+        {
+            return destination && source && opaque_stream &&
+                   hipMemcpyAsync(
+                       destination,
+                       source,
+                       bytes,
+                       hipMemcpyDeviceToDevice,
+                       static_cast<hipStream_t>(
+                           opaque_stream)) ==
+                       hipSuccess;
+        }
+
+        bool recordEvent(
+            const Event &event,
+            void *opaque_stream)
+        {
+            return event.valid() && opaque_stream &&
+                   hipEventRecord(
+                       event.get(),
+                       static_cast<hipStream_t>(
+                           opaque_stream)) ==
+                       hipSuccess;
+        }
+
+        bool waitEvent(
+            void *opaque_stream,
+            const Event &event)
+        {
+            return event.valid() && opaque_stream &&
+                   hipStreamWaitEvent(
+                       static_cast<hipStream_t>(
+                           opaque_stream),
+                       event.get(),
+                       0) == hipSuccess;
+        }
+
+        Graph captureGraph(
+            void *opaque_stream,
+            const std::function<bool()> &enqueue)
+        {
+            if (!opaque_stream || !enqueue)
+                return {};
+            const auto stream =
+                static_cast<hipStream_t>(
+                    opaque_stream);
+            if (hipStreamBeginCapture(
+                    stream,
+                    hipStreamCaptureModeGlobal) !=
+                hipSuccess)
+            {
+                return {};
+            }
+
+            bool enqueue_ok = false;
+            {
+                GraphCaptureGuard guard;
+                enqueue_ok = enqueue();
+            }
+            hipGraph_t graph = nullptr;
+            const hipError_t end_status =
+                hipStreamEndCapture(
+                    stream,
+                    &graph);
+            if (!enqueue_ok ||
+                end_status != hipSuccess ||
+                !graph)
+            {
+                if (graph)
+                    (void)hipGraphDestroy(graph);
+                return {};
+            }
+
+            hipGraphExec_t executable = nullptr;
+            if (hipGraphInstantiate(
+                    &executable,
+                    graph,
+                    nullptr,
+                    nullptr,
+                    0) != hipSuccess ||
+                !executable)
+            {
+                (void)hipGraphDestroy(graph);
+                return {};
+            }
+            return Graph(graph, executable);
+        }
+
+        bool launchGraph(
+            const Graph &graph,
+            void *opaque_stream)
+        {
+            return graph.valid() && opaque_stream &&
+                   hipGraphLaunch(
+                       graph.executable(),
+                       static_cast<hipStream_t>(
+                           opaque_stream)) ==
+                       hipSuccess;
+        }
+
+        bool synchronizeStream(void *opaque_stream)
+        {
+            return opaque_stream &&
+                   hipStreamSynchronize(
+                       static_cast<hipStream_t>(
+                           opaque_stream)) ==
+                       hipSuccess;
+        }
+    };
+
+    /**
      * @brief Execute one grouped publication entirely inside a HIP graph.
      *
      * The graph owns both payload publication and canonical device metadata
@@ -265,4 +611,80 @@ TEST(Test__ROCmKVCacheGroupedVerifier,
         releaseDeviceBytes,
         copyDeviceBytesAsync,
         synchronizeStream);
+}
+
+/**
+ * @brief Test the complete captured MTP/main/prefix lifecycle under contention.
+ */
+TEST(Test__ROCmKVCacheGroupedVerifier,
+     AdversarialMultiStreamGraphReusePrefixRestoreMatchesSerialState)
+{
+    int device_count = 0;
+    if (hipGetDeviceCount(&device_count) != hipSuccess ||
+        device_count < 1)
+    {
+        GTEST_SKIP() << "ROCm device unavailable";
+    }
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    ScopedHipStream producer_stream;
+    ScopedHipStream graph_stream;
+    ScopedHipStream observer_stream;
+    ASSERT_NE(producer_stream.get(), nullptr);
+    ASSERT_NE(graph_stream.get(), nullptr);
+    ASSERT_NE(observer_stream.get(), nullptr);
+
+    ROCmKVLifecycleRuntime runtime;
+    runAdversarialKVLifecycleStress(
+        DeviceId::rocm(0),
+        "ROCm",
+        ActivationPrecision::FP32,
+        "FP32",
+        producer_stream.opaque(),
+        graph_stream.opaque(),
+        observer_stream.opaque(),
+        runtime);
+}
+
+/**
+ * @brief Stress both TurboQuant policies through captured MTP publication.
+ *
+ * TQ8-K/TQ4-V and TQ8-K/TQ8-V share canonical sequence metadata but own
+ * different grouped quantization and logical-block paths. This test subjects
+ * both real cache implementations to graph reuse, wraparound, prefix restore,
+ * and explicit producer/consumer event handoffs.
+ */
+TEST(Test__ROCmKVCacheGroupedVerifier,
+     AdversarialTurboQuantMultiStreamGraphReuseMatchesSerialState)
+{
+    int device_count = 0;
+    if (hipGetDeviceCount(&device_count) != hipSuccess ||
+        device_count < 1)
+    {
+        GTEST_SKIP() << "ROCm device unavailable";
+    }
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    ScopedHipStream producer_stream;
+    ScopedHipStream graph_stream;
+    ScopedHipStream observer_stream;
+    ROCmKVLifecycleRuntime runtime;
+
+    for (const auto &[precision, label] :
+         std::array<std::pair<ActivationPrecision, const char *>, 2>{{
+             {ActivationPrecision::TQ4, "TQ8-K/TQ4-V"},
+             {ActivationPrecision::TQ8, "TQ8-K/TQ8-V"},
+         }})
+    {
+        SCOPED_TRACE(label);
+        runAdversarialKVLifecycleStress(
+            DeviceId::rocm(0),
+            "ROCm",
+            precision,
+            label,
+            producer_stream.opaque(),
+            graph_stream.opaque(),
+            observer_stream.opaque(),
+            runtime);
+    }
 }

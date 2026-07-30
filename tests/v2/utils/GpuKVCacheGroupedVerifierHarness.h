@@ -32,9 +32,11 @@
 #include "utils/VerifierRowTestInventory.h"
 
 #include <array>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -55,16 +57,24 @@ namespace llaminar2::test::gpu_kv_verifier
         const char *source_label;
     };
 
+    /** @brief Return whether a precision names either physical TurboQuant policy. */
+    constexpr bool isTurboQuantCachePrecision(ActivationPrecision precision)
+    {
+        return precision == ActivationPrecision::TQ4 ||
+               precision == ActivationPrecision::TQ8;
+    }
+
     /**
      * @brief Complete source-conversion surface advertised by GPU ring caches.
      *
-     * FP32 and BF16 caches accept their native source.  FP16 and Q8_1 caches
+     * FP32 and BF16 caches accept their native source. FP16 and Q8_1 caches
      * additionally expose production conversion kernels for every activation
-     * tensor format.  The asymmetric TurboQuant cache accepts either FP32
-     * projection rows for fused quantize-to-ring publication or already
-     * prepared TQ8 K plus TQ4 V rows for direct device-to-device publication.
+     * tensor format. Each TurboQuant storage policy accepts either FP32
+     * projection rows for fused quantize-to-ring publication or its exact
+     * prepared native pair for direct device-to-device publication:
+     * `TQ4` selects TQ8-K/TQ4-V, while `TQ8` selects TQ8-K/TQ8-V.
      */
-    inline constexpr std::array<FormatCase, 12> kFormatCases = {{
+    inline constexpr std::array<FormatCase, 14> kFormatCases = {{
         {ActivationPrecision::FP32, TensorType::FP32, TensorType::FP32, "FP32", "FP32"},
         {ActivationPrecision::BF16, TensorType::BF16, TensorType::BF16, "BF16", "BF16"},
         {ActivationPrecision::FP16, TensorType::FP32, TensorType::FP32, "FP16", "FP32"},
@@ -75,8 +85,10 @@ namespace llaminar2::test::gpu_kv_verifier
         {ActivationPrecision::Q8_1, TensorType::FP16, TensorType::FP16, "Q8_1", "FP16"},
         {ActivationPrecision::Q8_1, TensorType::BF16, TensorType::BF16, "Q8_1", "BF16"},
         {ActivationPrecision::Q8_1, TensorType::Q8_1, TensorType::Q8_1, "Q8_1", "Q8_1"},
-        {ActivationPrecision::TQ8, TensorType::FP32, TensorType::FP32, "TQ8/TQ4", "FP32"},
-        {ActivationPrecision::TQ8, TensorType::TQ8, TensorType::TQ4, "TQ8/TQ4", "TQ8/TQ4"},
+        {ActivationPrecision::TQ4, TensorType::FP32, TensorType::FP32, "TQ8-K/TQ4-V", "FP32"},
+        {ActivationPrecision::TQ4, TensorType::TQ8, TensorType::TQ4, "TQ8-K/TQ4-V", "TQ8/TQ4"},
+        {ActivationPrecision::TQ8, TensorType::FP32, TensorType::FP32, "TQ8-K/TQ8-V", "FP32"},
+        {ActivationPrecision::TQ8, TensorType::TQ8, TensorType::TQ8, "TQ8-K/TQ8-V", "TQ8"},
     }};
 
     /** @brief One native cache family and a lossless append source for read tests. */
@@ -94,12 +106,13 @@ namespace llaminar2::test::gpu_kv_verifier
      * native types. The other families use their own storage format so the read
      * proof is independent of append-conversion coverage above.
      */
-    inline constexpr std::array<CacheReadFormatCase, 5> kCacheReadFormats = {{
+    inline constexpr std::array<CacheReadFormatCase, 6> kCacheReadFormats = {{
         {ActivationPrecision::FP32, TensorType::FP32, "FP32"},
         {ActivationPrecision::FP16, TensorType::FP16, "FP16"},
         {ActivationPrecision::BF16, TensorType::BF16, "BF16"},
         {ActivationPrecision::Q8_1, TensorType::Q8_1, "Q8_1"},
-        {ActivationPrecision::TQ8, TensorType::FP32, "TQ8/TQ4"},
+        {ActivationPrecision::TQ4, TensorType::FP32, "TQ8-K/TQ4-V"},
+        {ActivationPrecision::TQ8, TensorType::FP32, "TQ8-K/TQ8-V"},
     }};
 
     /** @brief Replicated and LocalTP-sharded factory configurations. */
@@ -280,7 +293,8 @@ namespace llaminar2::test::gpu_kv_verifier
         int max_seq_len,
         int head_dim,
         const TurboQuantContext *tq_context,
-        int batch_size = 1)
+        int batch_size = 1,
+        int n_layers = 1)
     {
         using Factory = llaminar::v2::kernels::KernelFactory;
         using Config = llaminar::v2::kernels::KVCacheConfig;
@@ -288,7 +302,7 @@ namespace llaminar2::test::gpu_kv_verifier
         Config config{
             .precision = precision,
             .device = device,
-            .num_layers = 1,
+            .num_layers = n_layers,
             .batch_size = batch_size,
             .max_seq_len = max_seq_len,
             .n_kv_heads = topology.total_heads,
@@ -316,6 +330,1054 @@ namespace llaminar2::test::gpu_kv_verifier
                 throw std::runtime_error("GPU KV cache rejected its declared workspace");
         }
         return bound;
+    }
+
+    /**
+     * @brief One adversarial grouped-verifier transaction.
+     *
+     * The payload vectors are prepared before any graph replay begins.  The
+     * stress loop therefore performs no host allocation while the simulated
+     * inference lifetime is active.  `accepted_rows` is the serial-visible
+     * state prefix selected by the verifier; rows after that prefix are
+     * physically written by the grouped graph but must remain unreachable.
+     */
+    struct AdversarialKVLifecycleWave
+    {
+        int verifier_rows = 0;
+        int accepted_rows = 0;
+        bool restore_prefix_before = false;
+        bool restore_from_ram = false;
+        bool append_main_decode_after = false;
+        std::vector<float> grouped_k;
+        std::vector<float> grouped_v;
+        std::vector<float> main_k;
+        std::vector<float> main_v;
+    };
+
+    /**
+     * @brief Pure serial model for one canonical ring head/count pair.
+     *
+     * Payload byte equality is proven against a second production cache.  This
+     * tiny model independently proves that both caches expose the state serial
+     * decode requires, so a shared metadata bug cannot make the comparison pass
+     * by coincidence.
+     */
+    struct AdversarialKVRingState
+    {
+        int head = 0;
+        int count = 0;
+
+        void resetToPrefix(int prefix_rows, int capacity)
+        {
+            head = prefix_rows % capacity;
+            count = std::min(prefix_rows, capacity);
+        }
+
+        void advance(int rows, int capacity)
+        {
+            head = (head + rows) % capacity;
+            count = std::min(capacity, count + rows);
+        }
+    };
+
+    /**
+     * @brief Construct four hostile acceptance rotations over the complete M range.
+     *
+     * Every runtime verifier width is exercised with first-row acceptance,
+     * middle rejection, last-row rejection, and all-accepted publication.
+     * Each rotation begins by restoring the same prefix snapshot.  Device-tier
+     * and RAM-tier restores alternate, proving that graph reuse does not retain
+     * stale pre-restore metadata.  Periodic one-row main-graph appends cover the
+     * handoff between speculative and ordinary decode.
+     */
+    inline std::vector<AdversarialKVLifecycleWave>
+    makeAdversarialKVLifecycleWaves(int kv_dim)
+    {
+        constexpr int kMaxVerifierRows =
+            kGroupedVerifierRuntimeRows.back();
+        constexpr int kAcceptanceRotations = 4;
+        std::vector<AdversarialKVLifecycleWave> waves;
+        waves.reserve(
+            kAcceptanceRotations * kGroupedVerifierRuntimeRows.size());
+
+        for (int rotation = 0;
+             rotation < kAcceptanceRotations;
+             ++rotation)
+        {
+            for (size_t m_index = 0;
+                 m_index < kGroupedVerifierRuntimeRows.size();
+                 ++m_index)
+            {
+                const int verifier_rows =
+                    kGroupedVerifierRuntimeRows[m_index];
+                int accepted_rows = 1;
+                switch (rotation)
+                {
+                case 0:
+                    accepted_rows = 1;
+                    break;
+                case 1:
+                    accepted_rows =
+                        std::max(1, verifier_rows / 2);
+                    break;
+                case 2:
+                    accepted_rows =
+                        std::max(1, verifier_rows - 1);
+                    break;
+                default:
+                    accepted_rows = verifier_rows;
+                    break;
+                }
+
+                AdversarialKVLifecycleWave wave{
+                    .verifier_rows = verifier_rows,
+                    .accepted_rows = accepted_rows,
+                    .restore_prefix_before = m_index == 0,
+                    .restore_from_ram = (rotation % 2) != 0,
+                    .append_main_decode_after =
+                        ((rotation *
+                              static_cast<int>(
+                                  kGroupedVerifierRuntimeRows.size()) +
+                          static_cast<int>(m_index)) %
+                         5) == 4,
+                    .grouped_k =
+                        std::vector<float>(
+                            static_cast<size_t>(kMaxVerifierRows) *
+                            static_cast<size_t>(kv_dim)),
+                    .grouped_v =
+                        std::vector<float>(
+                            static_cast<size_t>(kMaxVerifierRows) *
+                            static_cast<size_t>(kv_dim)),
+                    .main_k =
+                        std::vector<float>(
+                            static_cast<size_t>(kv_dim)),
+                    .main_v =
+                        std::vector<float>(
+                            static_cast<size_t>(kv_dim)),
+                };
+
+                const uint32_t wave_number =
+                    static_cast<uint32_t>(waves.size());
+                for (int row = 0;
+                     row < kMaxVerifierRows;
+                     ++row)
+                {
+                    for (int column = 0;
+                         column < kv_dim;
+                         ++column)
+                    {
+                        const size_t index =
+                            static_cast<size_t>(row) * kv_dim +
+                            static_cast<size_t>(column);
+                        const int k_code =
+                            static_cast<int>(
+                                (wave_number * 37u +
+                                 static_cast<uint32_t>(row * 17) +
+                                 static_cast<uint32_t>(column * 3)) %
+                                251u) -
+                            125;
+                        const int v_code =
+                            static_cast<int>(
+                                (wave_number * 53u +
+                                 static_cast<uint32_t>(row * 11) +
+                                 static_cast<uint32_t>(column * 5)) %
+                                241u) -
+                            120;
+                        wave.grouped_k[index] =
+                            static_cast<float>(k_code) / 128.0f;
+                        wave.grouped_v[index] =
+                            static_cast<float>(v_code) / 128.0f;
+                    }
+                }
+                for (int column = 0;
+                     column < kv_dim;
+                     ++column)
+                {
+                    wave.main_k[static_cast<size_t>(column)] =
+                        static_cast<float>(
+                            static_cast<int>(
+                                (wave_number * 29u +
+                                 static_cast<uint32_t>(column * 7)) %
+                                193u) -
+                            96) /
+                        128.0f;
+                    wave.main_v[static_cast<size_t>(column)] =
+                        static_cast<float>(
+                            static_cast<int>(
+                                (wave_number * 31u +
+                                 static_cast<uint32_t>(column * 13)) %
+                                197u) -
+                            98) /
+                        128.0f;
+                }
+                waves.push_back(std::move(wave));
+            }
+        }
+        return waves;
+    }
+
+    /**
+     * @brief Stress graph-reused MTP/main advancement and prefix restoration.
+     *
+     * This is the KV-cache analogue of the adversarial MoE transfer state
+     * machine suite.  It keeps one executable per runtime verifier width alive
+     * for the complete test and drives all executables against the same
+     * multi-layer cache.  The graph body is exactly:
+     *
+     * 1. Capture the immutable pre-verifier device state.
+     * 2. Publish all grouped verifier K/V rows in every layer.
+     * 3. Commit only the accepted serial-visible prefix from device metadata.
+     *
+     * Three explicit streams model production ownership.  A producer stream
+     * uploads persistent input mailboxes and performs prefix/main-graph
+     * mutations.  A graph stream waits on the producer event and launches the
+     * selected captured graph.  An observer stream waits on graph completion
+     * and copies head/count rows only into a persistent device observation
+     * matrix.  The host sees that matrix once, after every wave has completed.
+     *
+     * `Runtime` is a thin backend adapter supplied by the CUDA and ROCm test
+     * translation units.  Its Graph, Event, and DeviceBuffer types are RAII
+     * owners, which makes exceptional test exits release all backend objects.
+     */
+    template <typename Runtime>
+    void runAdversarialKVLifecycleStress(
+        DeviceId device,
+        const char *backend_label,
+        ActivationPrecision cache_precision,
+        const char *cache_label,
+        void *producer_stream,
+        void *graph_stream,
+        void *observer_stream,
+        Runtime &runtime)
+    {
+        constexpr int kLayerCount = 5;
+        constexpr int kBatchSize = 1;
+        constexpr int kCapacity = 23;
+        constexpr int kPrefixRows = 17;
+        constexpr int kKVHeads = 2;
+        /*
+         * TurboQuant's physical block codecs are defined for the production
+         * attention widths 64, 128, and 256. Use the smallest valid width so
+         * this shared lifecycle remains inexpensive while exercising the real
+         * TQ kernels rather than a synthetic test-only geometry.
+         */
+        constexpr int kHeadDim = 64;
+        constexpr int kKVDim = kKVHeads * kHeadDim;
+        constexpr int kMaxVerifierRows =
+            kGroupedVerifierRuntimeRows.back();
+        constexpr CacheTopology kTopology{
+            "replicated",
+            kKVHeads,
+            0,
+            0,
+        };
+
+        ASSERT_NE(producer_stream, nullptr);
+        ASSERT_NE(graph_stream, nullptr);
+        ASSERT_NE(observer_stream, nullptr);
+
+        TurboQuantContext tq_context(kHeadDim, 0xA17E5EEDu);
+        auto grouped = makeBoundCache(
+            device,
+            cache_precision,
+            kTopology,
+            kCapacity,
+            kHeadDim,
+            &tq_context,
+            kBatchSize,
+            kLayerCount);
+        auto serial = makeBoundCache(
+            device,
+            cache_precision,
+            kTopology,
+            kCapacity,
+            kHeadDim,
+            &tq_context,
+            kBatchSize,
+            kLayerCount);
+        ASSERT_TRUE(
+            grouped.cache
+                ->supportsDeviceResidentSequenceStatePublication());
+        ASSERT_EQ(
+            grouped.cache->deviceSequenceStateCheckpointBytes(),
+            static_cast<size_t>(2 * kLayerCount) *
+                sizeof(int32_t));
+
+        auto prefix_k = makeTensor(
+            TensorType::FP32,
+            {kPrefixRows, static_cast<size_t>(kKVDim)},
+            0x13579BDFu,
+            kHeadDim);
+        auto prefix_v = makeTensor(
+            TensorType::FP32,
+            {kPrefixRows, static_cast<size_t>(kKVDim)},
+            0x2468ACE0u,
+            kHeadDim);
+        auto grouped_k = makeTensor(
+            TensorType::FP32,
+            {kMaxVerifierRows, static_cast<size_t>(kKVDim)},
+            0x10203040u,
+            kHeadDim);
+        auto grouped_v = makeTensor(
+            TensorType::FP32,
+            {kMaxVerifierRows, static_cast<size_t>(kKVDim)},
+            0x50607080u,
+            kHeadDim);
+        auto serial_row_k = makeTensor(
+            TensorType::FP32,
+            {1, static_cast<size_t>(kKVDim)},
+            0x11112222u,
+            kHeadDim);
+        auto serial_row_v = makeTensor(
+            TensorType::FP32,
+            {1, static_cast<size_t>(kKVDim)},
+            0x33334444u,
+            kHeadDim);
+        ensureOnDevice(
+            prefix_k.get(), device, producer_stream);
+        ensureOnDevice(
+            prefix_v.get(), device, producer_stream);
+        ensureOnDevice(
+            grouped_k.get(), device, producer_stream);
+        ensureOnDevice(
+            grouped_v.get(), device, producer_stream);
+        ensureOnDevice(
+            serial_row_k.get(), device, producer_stream);
+        ensureOnDevice(
+            serial_row_v.get(), device, producer_stream);
+
+        for (int layer = 0;
+             layer < kLayerCount;
+             ++layer)
+        {
+            ASSERT_TRUE(grouped.cache->appendWithStream(
+                layer,
+                0,
+                prefix_k.get(),
+                prefix_v.get(),
+                kPrefixRows,
+                producer_stream));
+            ASSERT_TRUE(serial.cache->appendWithStream(
+                layer,
+                0,
+                prefix_k.get(),
+                prefix_v.get(),
+                kPrefixRows,
+                producer_stream));
+        }
+        ASSERT_TRUE(runtime.synchronizeStream(producer_stream));
+
+        const auto prefix_layout =
+            grouped.cache->logicalBlockLayout(
+                0,
+                kPrefixRows);
+        ASSERT_GT(prefix_layout.k_bytes, 0u);
+        ASSERT_GT(prefix_layout.v_bytes, 0u);
+
+        struct PrefixLayerSnapshot
+        {
+            typename Runtime::DeviceBuffer device_k;
+            typename Runtime::DeviceBuffer device_v;
+            std::vector<uint8_t> host_k;
+            std::vector<uint8_t> host_v;
+        };
+        std::vector<PrefixLayerSnapshot> prefix_snapshots;
+        prefix_snapshots.reserve(kLayerCount);
+        for (int layer = 0;
+             layer < kLayerCount;
+             ++layer)
+        {
+            PrefixLayerSnapshot snapshot{
+                .device_k =
+                    runtime.allocateDeviceBuffer(
+                        prefix_layout.k_bytes),
+                .device_v =
+                    runtime.allocateDeviceBuffer(
+                        prefix_layout.v_bytes),
+                .host_k =
+                    std::vector<uint8_t>(
+                        prefix_layout.k_bytes),
+                .host_v =
+                    std::vector<uint8_t>(
+                        prefix_layout.v_bytes),
+            };
+            ASSERT_TRUE(snapshot.device_k.valid());
+            ASSERT_TRUE(snapshot.device_v.valid());
+            const IKVCache::KVCacheLogicalBlockDescriptor
+                device_descriptor{
+                    .layer = layer,
+                    .seq_idx = 0,
+                    .logical_token_start = 0,
+                    .token_count = kPrefixRows,
+                    .stream = producer_stream,
+                    .payload_domain =
+                        IKVCache::
+                            KVCacheLogicalBlockPayloadDomain::
+                                Device,
+                };
+            ASSERT_TRUE(grouped.cache->exportLogicalBlock(
+                device_descriptor,
+                snapshot.device_k.data(),
+                snapshot.device_v.data()));
+            ASSERT_TRUE(
+                runtime.copyDeviceToHostAsync(
+                    snapshot.host_k.data(),
+                    snapshot.device_k.data(),
+                    prefix_layout.k_bytes,
+                    producer_stream));
+            ASSERT_TRUE(
+                runtime.copyDeviceToHostAsync(
+                    snapshot.host_v.data(),
+                    snapshot.device_v.data(),
+                    prefix_layout.v_bytes,
+                    producer_stream));
+            prefix_snapshots.push_back(
+                std::move(snapshot));
+        }
+        ASSERT_TRUE(runtime.synchronizeStream(producer_stream));
+
+        auto checkpoint =
+            runtime.allocateDeviceBuffer(
+                grouped.cache
+                    ->deviceSequenceStateCheckpointBytes());
+        auto target_cached_tokens =
+            runtime.allocateDeviceBuffer(sizeof(int32_t));
+        auto accepted_state_rows =
+            runtime.allocateDeviceBuffer(sizeof(int32_t));
+        auto publication_ok =
+            runtime.allocateDeviceBuffer(sizeof(int32_t));
+        ASSERT_TRUE(checkpoint.valid());
+        ASSERT_TRUE(target_cached_tokens.valid());
+        ASSERT_TRUE(accepted_state_rows.valid());
+        ASSERT_TRUE(publication_ok.valid());
+
+        std::vector<typename Runtime::Graph> graphs;
+        graphs.reserve(
+            kGroupedVerifierRuntimeRows.size());
+        for (const int verifier_rows :
+             kGroupedVerifierRuntimeRows)
+        {
+            auto graph = runtime.captureGraph(
+                graph_stream,
+                [&]() -> bool
+                {
+                    std::string checkpoint_error;
+                    if (!grouped.cache
+                             ->captureDeviceSequenceStateCheckpoint(
+                                 0,
+                                 checkpoint.data(),
+                                 checkpoint.size(),
+                                 graph_stream,
+                                 &checkpoint_error))
+                    {
+                        return false;
+                    }
+                    for (int layer = 0;
+                         layer < kLayerCount;
+                         ++layer)
+                    {
+                        if (!grouped.cache
+                                 ->appendVerifierRowsDecodeEquivalent(
+                                     layer,
+                                     0,
+                                     grouped_k.get(),
+                                     grouped_v.get(),
+                                     verifier_rows,
+                                     graph_stream))
+                        {
+                            return false;
+                        }
+                    }
+
+                    IKVCache::
+                        DeviceSequenceStatePublicationRequest
+                            request{
+                                .request_count = 1,
+                                .first_seq_idx = 0,
+                                .target_cached_tokens_device =
+                                    static_cast<const int32_t *>(
+                                        target_cached_tokens
+                                            .data()),
+                                .accepted_state_counts_device =
+                                    static_cast<const int32_t *>(
+                                        accepted_state_rows
+                                            .data()),
+                                .publication_ok_flags_device =
+                                    static_cast<const int32_t *>(
+                                        publication_ok.data()),
+                                .basis =
+                                    IKVCache::
+                                        DeviceSequenceStatePublicationBasis::
+                                            CapturedBase,
+                                .base_sequence_state_checkpoint_device =
+                                    checkpoint.data(),
+                                .base_sequence_state_checkpoint_bytes =
+                                    checkpoint.size(),
+                                .stream = graph_stream,
+                            };
+                    std::string publication_error;
+                    return grouped.cache
+                        ->publishSequenceStateFromDeviceMetadata(
+                            request,
+                            &publication_error);
+                });
+            ASSERT_TRUE(graph.valid())
+                << backend_label
+                << " failed to capture adversarial KV graph M="
+                << verifier_rows;
+            graphs.push_back(std::move(graph));
+        }
+
+        const auto waves =
+            makeAdversarialKVLifecycleWaves(kKVDim);
+        const size_t observation_cells =
+            waves.size() *
+            static_cast<size_t>(kLayerCount);
+        auto observed_heads =
+            runtime.allocateDeviceBuffer(
+                observation_cells * sizeof(int32_t));
+        auto observed_counts =
+            runtime.allocateDeviceBuffer(
+                observation_cells * sizeof(int32_t));
+        ASSERT_TRUE(observed_heads.valid());
+        ASSERT_TRUE(observed_counts.valid());
+
+        std::vector<typename Runtime::Event> producer_ready;
+        std::vector<typename Runtime::Event> graph_done;
+        std::vector<typename Runtime::Event> observation_done;
+        producer_ready.reserve(waves.size());
+        graph_done.reserve(waves.size());
+        observation_done.reserve(waves.size());
+        for (size_t wave_index = 0;
+             wave_index < waves.size();
+             ++wave_index)
+        {
+            producer_ready.push_back(
+                runtime.createEvent());
+            graph_done.push_back(
+                runtime.createEvent());
+            observation_done.push_back(
+                runtime.createEvent());
+            ASSERT_TRUE(
+                producer_ready.back().valid());
+            ASSERT_TRUE(graph_done.back().valid());
+            ASSERT_TRUE(
+                observation_done.back().valid());
+        }
+
+        std::vector<AdversarialKVRingState>
+            expected_after_graph;
+        expected_after_graph.reserve(waves.size());
+        AdversarialKVRingState oracle;
+        oracle.resetToPrefix(
+            kPrefixRows,
+            kCapacity);
+        const int32_t ok_value = 1;
+        const size_t grouped_bytes =
+            static_cast<size_t>(kMaxVerifierRows) *
+            static_cast<size_t>(kKVDim) *
+            sizeof(float);
+        const size_t row_bytes =
+            static_cast<size_t>(kKVDim) *
+            sizeof(float);
+
+        for (size_t wave_index = 0;
+             wave_index < waves.size();
+             ++wave_index)
+        {
+            const auto &wave = waves[wave_index];
+            SCOPED_TRACE(
+                std::string(backend_label) +
+                " cache=" +
+                cache_label +
+                " lifecycle wave=" +
+                std::to_string(wave_index) +
+                " M=" +
+                std::to_string(wave.verifier_rows) +
+                " accepted=" +
+                std::to_string(wave.accepted_rows));
+
+            if (wave.restore_prefix_before)
+            {
+                const IKVCache::StateResetContext
+                    reset_context{
+                        .boundary =
+                            IKVCache::
+                                StateResetBoundary::
+                                    PrefixReplacement,
+                        .execution_stream =
+                            producer_stream,
+                        .reason =
+                            "adversarial-prefix-reuse",
+                    };
+                ASSERT_TRUE(
+                    grouped.cache->resetRequestState(
+                        reset_context));
+                ASSERT_TRUE(
+                    serial.cache->resetRequestState(
+                        reset_context));
+                for (int layer = 0;
+                     layer < kLayerCount;
+                     ++layer)
+                {
+                    const auto &snapshot =
+                        prefix_snapshots[
+                            static_cast<size_t>(
+                                layer)];
+                    const auto domain =
+                        wave.restore_from_ram
+                            ? IKVCache::
+                                  KVCacheLogicalBlockPayloadDomain::
+                                      Host
+                            : IKVCache::
+                                  KVCacheLogicalBlockPayloadDomain::
+                                      Device;
+                    const IKVCache::
+                        KVCacheLogicalBlockDescriptor
+                            descriptor{
+                                .layer = layer,
+                                .seq_idx = 0,
+                                .logical_token_start = 0,
+                                .token_count =
+                                    kPrefixRows,
+                                .stream =
+                                    producer_stream,
+                                .payload_domain =
+                                    domain,
+                            };
+                    void *source_k =
+                        wave.restore_from_ram
+                            ? const_cast<uint8_t *>(
+                                  snapshot.host_k
+                                      .data())
+                            : snapshot.device_k.data();
+                    void *source_v =
+                        wave.restore_from_ram
+                            ? const_cast<uint8_t *>(
+                                  snapshot.host_v
+                                      .data())
+                            : snapshot.device_v.data();
+                    ASSERT_TRUE(
+                        grouped.cache
+                            ->importLogicalBlock(
+                                descriptor,
+                                source_k,
+                                source_v));
+                    ASSERT_TRUE(
+                        serial.cache
+                            ->importLogicalBlock(
+                                descriptor,
+                                source_k,
+                                source_v));
+                }
+                oracle.resetToPrefix(
+                    kPrefixRows,
+                    kCapacity);
+            }
+
+            ASSERT_TRUE(
+                runtime.copyHostToDeviceAsync(
+                    grouped_k->gpu_data_ptr(),
+                    wave.grouped_k.data(),
+                    grouped_bytes,
+                    producer_stream));
+            ASSERT_TRUE(
+                runtime.copyHostToDeviceAsync(
+                    grouped_v->gpu_data_ptr(),
+                    wave.grouped_v.data(),
+                    grouped_bytes,
+                    producer_stream));
+            const int32_t target_count =
+                std::min(
+                    kCapacity,
+                    oracle.count +
+                        wave.accepted_rows);
+            const int32_t accepted_rows =
+                wave.accepted_rows;
+            ASSERT_TRUE(
+                runtime.copyHostToDeviceAsync(
+                    target_cached_tokens.data(),
+                    &target_count,
+                    sizeof(target_count),
+                    producer_stream));
+            ASSERT_TRUE(
+                runtime.copyHostToDeviceAsync(
+                    accepted_state_rows.data(),
+                    &accepted_rows,
+                    sizeof(accepted_rows),
+                    producer_stream));
+            ASSERT_TRUE(
+                runtime.copyHostToDeviceAsync(
+                    publication_ok.data(),
+                    &ok_value,
+                    sizeof(ok_value),
+                    producer_stream));
+            ASSERT_TRUE(runtime.recordEvent(
+                producer_ready[wave_index],
+                producer_stream));
+
+            ASSERT_TRUE(runtime.waitEvent(
+                graph_stream,
+                producer_ready[wave_index]));
+            const auto graph_it =
+                std::find(
+                    kGroupedVerifierRuntimeRows.begin(),
+                    kGroupedVerifierRuntimeRows.end(),
+                    wave.verifier_rows);
+            ASSERT_NE(
+                graph_it,
+                kGroupedVerifierRuntimeRows.end());
+            const size_t graph_index =
+                static_cast<size_t>(
+                    std::distance(
+                        kGroupedVerifierRuntimeRows.begin(),
+                        graph_it));
+            ASSERT_TRUE(runtime.launchGraph(
+                graphs[graph_index],
+                graph_stream));
+            ASSERT_TRUE(runtime.recordEvent(
+                graph_done[wave_index],
+                graph_stream));
+
+            oracle.advance(
+                wave.accepted_rows,
+                kCapacity);
+            expected_after_graph.push_back(oracle);
+
+            ASSERT_TRUE(runtime.waitEvent(
+                observer_stream,
+                graph_done[wave_index]));
+            for (int layer = 0;
+                 layer < kLayerCount;
+                 ++layer)
+            {
+                const size_t cell =
+                    wave_index *
+                        static_cast<size_t>(
+                            kLayerCount) +
+                    static_cast<size_t>(layer);
+                auto *head_destination =
+                    static_cast<uint8_t *>(
+                        observed_heads.data()) +
+                    cell * sizeof(int32_t);
+                auto *count_destination =
+                    static_cast<uint8_t *>(
+                        observed_counts.data()) +
+                    cell * sizeof(int32_t);
+                ASSERT_TRUE(
+                    runtime
+                        .copyDeviceToDeviceAsync(
+                            head_destination,
+                            grouped.cache
+                                ->deviceRingHeadPtr(
+                                    layer,
+                                    0),
+                            sizeof(int32_t),
+                            observer_stream));
+                ASSERT_TRUE(
+                    runtime
+                        .copyDeviceToDeviceAsync(
+                            count_destination,
+                            grouped.cache
+                                ->deviceCachedTokenCountPtr(
+                                    layer,
+                                    0),
+                            sizeof(int32_t),
+                            observer_stream));
+            }
+            ASSERT_TRUE(runtime.recordEvent(
+                observation_done[wave_index],
+                observer_stream));
+
+            ASSERT_TRUE(runtime.waitEvent(
+                producer_stream,
+                observation_done[wave_index]));
+            for (int row = 0;
+                 row < wave.accepted_rows;
+                 ++row)
+            {
+                const auto *row_k =
+                    wave.grouped_k.data() +
+                    static_cast<size_t>(row) *
+                        kKVDim;
+                const auto *row_v =
+                    wave.grouped_v.data() +
+                    static_cast<size_t>(row) *
+                        kKVDim;
+                ASSERT_TRUE(
+                    runtime.copyHostToDeviceAsync(
+                        serial_row_k
+                            ->gpu_data_ptr(),
+                        row_k,
+                        row_bytes,
+                        producer_stream));
+                ASSERT_TRUE(
+                    runtime.copyHostToDeviceAsync(
+                        serial_row_v
+                            ->gpu_data_ptr(),
+                        row_v,
+                        row_bytes,
+                        producer_stream));
+                for (int layer = 0;
+                     layer < kLayerCount;
+                     ++layer)
+                {
+                    ASSERT_TRUE(
+                        serial.cache
+                            ->appendWithStream(
+                                layer,
+                                0,
+                                serial_row_k.get(),
+                                serial_row_v.get(),
+                                1,
+                                producer_stream));
+                }
+            }
+
+            if (wave.append_main_decode_after)
+            {
+                ASSERT_TRUE(
+                    runtime.copyHostToDeviceAsync(
+                        serial_row_k
+                            ->gpu_data_ptr(),
+                        wave.main_k.data(),
+                        row_bytes,
+                        producer_stream));
+                ASSERT_TRUE(
+                    runtime.copyHostToDeviceAsync(
+                        serial_row_v
+                            ->gpu_data_ptr(),
+                        wave.main_v.data(),
+                        row_bytes,
+                        producer_stream));
+                for (int layer = 0;
+                     layer < kLayerCount;
+                     ++layer)
+                {
+                    ASSERT_TRUE(
+                        grouped.cache
+                            ->appendWithStream(
+                                layer,
+                                0,
+                                serial_row_k.get(),
+                                serial_row_v.get(),
+                                1,
+                                producer_stream));
+                    ASSERT_TRUE(
+                        serial.cache
+                            ->appendWithStream(
+                                layer,
+                                0,
+                                serial_row_k.get(),
+                                serial_row_v.get(),
+                                1,
+                                producer_stream));
+                }
+                oracle.advance(1, kCapacity);
+            }
+        }
+
+        auto final_ready = runtime.createEvent();
+        ASSERT_TRUE(final_ready.valid());
+        ASSERT_TRUE(runtime.recordEvent(
+            final_ready,
+            producer_stream));
+        ASSERT_TRUE(runtime.waitEvent(
+            observer_stream,
+            final_ready));
+
+        std::vector<int32_t> host_heads(
+            observation_cells,
+            -1);
+        std::vector<int32_t> host_counts(
+            observation_cells,
+            -1);
+        ASSERT_TRUE(
+            runtime.copyDeviceToHostAsync(
+                host_heads.data(),
+                observed_heads.data(),
+                observation_cells *
+                    sizeof(int32_t),
+                observer_stream));
+        ASSERT_TRUE(
+            runtime.copyDeviceToHostAsync(
+                host_counts.data(),
+                observed_counts.data(),
+                observation_cells *
+                    sizeof(int32_t),
+                observer_stream));
+
+        std::array<int32_t, kLayerCount>
+            final_grouped_heads{};
+        std::array<int32_t, kLayerCount>
+            final_grouped_counts{};
+        std::array<int32_t, kLayerCount>
+            final_serial_heads{};
+        std::array<int32_t, kLayerCount>
+            final_serial_counts{};
+        for (int layer = 0;
+             layer < kLayerCount;
+             ++layer)
+        {
+            ASSERT_TRUE(
+                runtime.copyDeviceToHostAsync(
+                    &final_grouped_heads[
+                        static_cast<size_t>(
+                            layer)],
+                    grouped.cache
+                        ->deviceRingHeadPtr(
+                            layer,
+                            0),
+                    sizeof(int32_t),
+                    observer_stream));
+            ASSERT_TRUE(
+                runtime.copyDeviceToHostAsync(
+                    &final_grouped_counts[
+                        static_cast<size_t>(
+                            layer)],
+                    grouped.cache
+                        ->deviceCachedTokenCountPtr(
+                            layer,
+                            0),
+                    sizeof(int32_t),
+                    observer_stream));
+            ASSERT_TRUE(
+                runtime.copyDeviceToHostAsync(
+                    &final_serial_heads[
+                        static_cast<size_t>(
+                            layer)],
+                    serial.cache
+                        ->deviceRingHeadPtr(
+                            layer,
+                            0),
+                    sizeof(int32_t),
+                    observer_stream));
+            ASSERT_TRUE(
+                runtime.copyDeviceToHostAsync(
+                    &final_serial_counts[
+                        static_cast<size_t>(
+                            layer)],
+                    serial.cache
+                        ->deviceCachedTokenCountPtr(
+                            layer,
+                            0),
+                    sizeof(int32_t),
+                    observer_stream));
+        }
+        ASSERT_TRUE(
+            runtime.synchronizeStream(
+                observer_stream));
+
+        for (size_t wave_index = 0;
+             wave_index < waves.size();
+             ++wave_index)
+        {
+            for (int layer = 0;
+                 layer < kLayerCount;
+                 ++layer)
+            {
+                const size_t cell =
+                    wave_index *
+                        static_cast<size_t>(
+                            kLayerCount) +
+                    static_cast<size_t>(layer);
+                EXPECT_EQ(
+                    host_heads[cell],
+                    expected_after_graph[
+                        wave_index]
+                        .head)
+                    << backend_label
+                    << " cache=" << cache_label
+                    << " wave="
+                    << wave_index
+                    << " layer="
+                    << layer;
+                EXPECT_EQ(
+                    host_counts[cell],
+                    expected_after_graph[
+                        wave_index]
+                        .count)
+                    << backend_label
+                    << " cache=" << cache_label
+                    << " wave="
+                    << wave_index
+                    << " layer="
+                    << layer;
+            }
+        }
+
+        for (int layer = 0;
+             layer < kLayerCount;
+             ++layer)
+        {
+            const size_t index =
+                static_cast<size_t>(layer);
+            EXPECT_EQ(
+                final_grouped_heads[index],
+                oracle.head);
+            EXPECT_EQ(
+                final_grouped_counts[index],
+                oracle.count);
+            EXPECT_EQ(
+                final_serial_heads[index],
+                oracle.head);
+            EXPECT_EQ(
+                final_serial_counts[index],
+                oracle.count);
+
+            const auto final_layout =
+                grouped.cache
+                    ->logicalBlockLayout(
+                        layer,
+                        oracle.count);
+            std::vector<uint8_t> grouped_payload_k(
+                final_layout.k_bytes);
+            std::vector<uint8_t> grouped_payload_v(
+                final_layout.v_bytes);
+            std::vector<uint8_t> serial_payload_k(
+                final_layout.k_bytes);
+            std::vector<uint8_t> serial_payload_v(
+                final_layout.v_bytes);
+            const IKVCache::
+                KVCacheLogicalBlockDescriptor
+                    descriptor{
+                        .layer = layer,
+                        .seq_idx = 0,
+                        .logical_token_start = 0,
+                        .token_count =
+                            oracle.count,
+                        .stream =
+                            observer_stream,
+                        .payload_domain =
+                            IKVCache::
+                                KVCacheLogicalBlockPayloadDomain::
+                                    Host,
+                    };
+            ASSERT_TRUE(
+                grouped.cache->exportLogicalBlock(
+                    descriptor,
+                    grouped_payload_k.data(),
+                    grouped_payload_v.data()));
+            ASSERT_TRUE(
+                serial.cache->exportLogicalBlock(
+                    descriptor,
+                    serial_payload_k.data(),
+                    serial_payload_v.data()));
+            EXPECT_EQ(
+                grouped_payload_k,
+                serial_payload_k)
+                << backend_label
+                << " cache=" << cache_label
+                << " adversarial K payload mismatch layer="
+                << layer;
+            EXPECT_EQ(
+                grouped_payload_v,
+                serial_payload_v)
+                << backend_label
+                << " cache=" << cache_label
+                << " adversarial V payload mismatch layer="
+                << layer;
+        }
     }
 
     /** @brief Stable route key shared by expected and observed counter matrices. */
@@ -407,7 +1469,7 @@ namespace llaminar2::test::gpu_kv_verifier
                             // depth wraps without assigning two source rows to
                             // the same destination slot in one grouped launch.
                             const TensorType history_type =
-                                format.cache_precision == ActivationPrecision::TQ8
+                                isTurboQuantCachePrecision(format.cache_precision)
                                     ? TensorType::FP32
                                     : (format.cache_precision == ActivationPrecision::FP32
                                            ? TensorType::FP32
@@ -663,7 +1725,7 @@ namespace llaminar2::test::gpu_kv_verifier
                         // the device gather must implement the same byte rule as
                         // the host diagnostic oracle. TQ stores quantized bytes,
                         // so its FP32 append source is intentionally left alone.
-                        if (format.cache_precision != ActivationPrecision::TQ8)
+                        if (!isTurboQuantCachePrecision(format.cache_precision))
                         {
                             if (format.append_type == TensorType::FP32)
                             {
@@ -788,7 +1850,7 @@ namespace llaminar2::test::gpu_kv_verifier
                     release_device(restored_k);
                     release_device(restored_v);
 
-                    if (format.cache_precision == ActivationPrecision::TQ8)
+                    if (isTurboQuantCachePrecision(format.cache_precision))
                         ++expected_tq_cells;
                     else
                         ++expected_standard_cells;

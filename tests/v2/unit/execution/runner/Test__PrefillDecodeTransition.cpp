@@ -2112,6 +2112,30 @@ namespace
         }
 
         /**
+         * @brief Stage the request-constant stop policy owned by the mock GPU.
+         *
+         * Production GPU runners publish this row at request admission. The mock
+         * has no backend stream, so it records the same immutable policy and
+         * requires graph-owned verifier preparation to name identical values.
+         */
+        bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens) override
+        {
+            using namespace sampling_math;
+            if (stop_tokens.size() > kSpeculativeBatchMaxStopTokens)
+                return false;
+
+            request_stop_tokens_.fill(-1);
+            std::copy(
+                stop_tokens.begin(),
+                stop_tokens.end(),
+                request_stop_tokens_.begin());
+            request_stop_token_count_ =
+                static_cast<int>(stop_tokens.size());
+            return true;
+        }
+
+        /**
          * @brief Arm one mock graph-owned greedy outcome transaction.
          *
          * The production runner appends the compact reducer to the verifier
@@ -2137,10 +2161,19 @@ namespace
                 stop_token_count < 0 ||
                 stop_token_count > kSpeculativeBatchMaxStopTokens ||
                 (stop_token_count > 0 && !stop_tokens) ||
+                stop_token_count != request_stop_token_count_ ||
                 greedy_outcome_graph_armed_ ||
                 greedy_outcome_graph_produced_)
             {
                 return false;
+            }
+            for (int i = 0; i < stop_token_count; ++i)
+            {
+                if (stop_tokens[i] !=
+                    request_stop_tokens_[static_cast<size_t>(i)])
+                {
+                    return false;
+                }
             }
 
             greedy_outcome_graph_verifier_token_count_ =
@@ -4673,6 +4706,22 @@ namespace
         int flushPendingMTPWorkCount() const { return flush_pending_mtp_work_count_; }
         int restoreCount() const { return restore_count_; }
         int captureCheckpointCount() const { return capture_checkpoint_count_; }
+        const std::vector<PrefixCheckpointCaptureRequest> &
+        capturedCheckpointRequests() const
+        {
+            return captured_checkpoint_requests_;
+        }
+        /**
+         * @brief Deliberately corrupt only the mock's legacy host cursor.
+         *
+         * GPU checkpoint tests use this to prove OrchestrationRunner passes its
+         * scheduler-owned transaction position instead of rediscovering the
+         * cursor through IInferenceRunner::get_position().
+         */
+        void setLegacyHostPositionForTest(int position)
+        {
+            position_ = position;
+        }
         int setAllPositionCount() const { return set_all_position_count_; }
         int setRowIndexedAllPositionCount() const { return set_row_indexed_all_position_count_; }
         int setMTPSpecVerifierPlanCount() const { return set_mtp_spec_verifier_plan_count_; }
@@ -5020,15 +5069,18 @@ namespace
             return snapshot;
         }
 
-        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override
+        PrefixStateSnapshot captureLivePrefixCheckpoint(
+            const PrefixCheckpointCaptureRequest &request) const override
         {
-            (void)seq_idx;
             capture_checkpoint_count_++;
+            captured_checkpoint_requests_.push_back(request);
+            if (!request.valid())
+                return {};
             if (captured_checkpoint_script_index_ < captured_checkpoint_script_.size())
             {
                 PrefixStateSnapshot snapshot =
                     captured_checkpoint_script_[captured_checkpoint_script_index_++];
-                snapshot.cached_tokens = position_;
+                snapshot.cached_tokens = request.logical_cached_tokens;
                 if (snapshot.provenance == PrefixStateProvenance::Unknown)
                     snapshot.provenance = snapshot.logical_checkpoint
                                               ? PrefixStateProvenance::LogicalCheckpoint
@@ -5038,7 +5090,7 @@ namespace
             if (use_captured_snapshot_)
             {
                 PrefixStateSnapshot snapshot = captured_snapshot_;
-                snapshot.cached_tokens = position_;
+                snapshot.cached_tokens = request.logical_cached_tokens;
                 if (snapshot.provenance == PrefixStateProvenance::Unknown)
                     snapshot.provenance = snapshot.logical_checkpoint
                                               ? PrefixStateProvenance::LogicalCheckpoint
@@ -5049,7 +5101,7 @@ namespace
             snapshot.valid = mtp_enabled_;
             snapshot.logical_checkpoint = true;
             snapshot.provenance = PrefixStateProvenance::LogicalCheckpoint;
-            snapshot.cached_tokens = position_;
+            snapshot.cached_tokens = request.logical_cached_tokens;
             snapshot.mtp_cached_tokens = {mtp_shifted_cached_tokens_};
             return snapshot;
         }
@@ -5079,11 +5131,31 @@ namespace
             probe.architecture = architecture();
             probe.execution_path = "graph";
             probe.primary_device = primary_device_;
-            probe.current_position = position_;
-            probe.positions = {position_};
+            const int authoritative_position =
+                prefix_probe_position_override_.value_or(position_);
+            probe.current_position = authoritative_position;
+            probe.positions = {authoritative_position};
             probe.sequence_lengths = sequence_lengths_.empty()
-                                         ? std::vector<int>{position_}
+                                         ? std::vector<int>{authoritative_position}
                                          : sequence_lengths_;
+            /*
+             * The production probe exposes both canonical cache families. The
+             * replay-equivalence oracle compares their exact token-count
+             * relationship to decide whether a shifted row is resident or must
+             * be appended. Omitting the main cache would turn an otherwise valid
+             * test state into the sentinel count -1 and evade that real contract.
+             */
+            PrefixKVCacheProbe main_cache;
+            main_cache.owner = "mock_main";
+            main_cache.device = primary_device_;
+            main_cache.n_layers = 1;
+            PrefixKVLayerProbe main_layer;
+            main_layer.cache_layer = 0;
+            main_layer.global_layer = 0;
+            main_layer.seq_idx = 0;
+            main_layer.cached_tokens = authoritative_position;
+            main_cache.layers.push_back(main_layer);
+            probe.kv_caches.push_back(std::move(main_cache));
             if (mtp_enabled_)
             {
                 PrefixKVCacheProbe mtp_cache;
@@ -5099,6 +5171,11 @@ namespace
                 probe.mtp_kv_caches.push_back(std::move(mtp_cache));
             }
             return probe;
+        }
+
+        void setPrefixProbePositionOverride(int position)
+        {
+            prefix_probe_position_override_ = position;
         }
 
         void requireMTPDecodeEquivalentReplay()
@@ -5734,8 +5811,11 @@ namespace
         int clear_cache_count_{0};
         int restore_count_{0};
         mutable int capture_checkpoint_count_{0};
+        mutable std::vector<PrefixCheckpointCaptureRequest>
+            captured_checkpoint_requests_;
         int set_all_position_count_{0};
         int set_row_indexed_all_position_count_{0};
+        std::optional<int> prefix_probe_position_override_;
         int set_mtp_spec_verifier_plan_count_{0};
         int clear_mtp_spec_verifier_plan_count_{0};
         int commit_mtp_shifted_count_{0};
@@ -5938,6 +6018,9 @@ namespace
         std::array<int32_t,
                    sampling_math::kSpeculativeBatchMaxStopTokens>
             greedy_outcome_graph_stop_tokens_{};
+        std::array<int32_t,
+                   sampling_math::kSpeculativeBatchMaxStopTokens>
+            request_stop_tokens_{};
         MTPGreedyPenaltyPolicy greedy_outcome_graph_penalty_policy_{};
         std::array<int32_t,
                    sampling_math::kSpeculativeBatchMaxOutputTokens *
@@ -5952,6 +6035,7 @@ namespace
         int resident_ready_event_token_{0};
         int greedy_outcome_graph_verifier_token_count_{0};
         int greedy_outcome_graph_stop_token_count_{0};
+        int request_stop_token_count_{0};
         bool greedy_outcome_graph_armed_{false};
         bool greedy_outcome_graph_produced_{false};
         std::shared_ptr<DeviceResidentMTPTransactionState>
@@ -8091,6 +8175,29 @@ namespace
         ASSERT_TRUE(step2.success());
         ASSERT_EQ(step2.tokens.size(), 1u);
         EXPECT_EQ(step2.tokens[0], MockInferenceRunner::DECODE_ARGMAX_TOKEN);
+    }
+
+    /**
+     * @brief Runtime probes preserve the child runner's authoritative position.
+     *
+     * GPU grouped publication deliberately leaves get_position() as a stale
+     * host planning mirror. The concrete device runner resolves the live
+     * position from its resident logical-state mailbox in prefixStateProbe().
+     * The orchestration facade must enrich that probe without replacing its
+     * position with the host mirror.
+     */
+    TEST_F(
+        Test__PrefillDecodeTransition,
+        PrefixStateProbePreservesDeviceAuthoritativeChildPosition)
+    {
+        auto [runner, mock] = createRunner();
+        mock->setPrefixProbePositionOverride(37);
+
+        ASSERT_NE(mock->get_position(), 37);
+        const PrefixRuntimeStateSnapshot probe = runner->prefixStateProbe();
+
+        EXPECT_EQ(probe.current_position, 37);
+        EXPECT_THAT(probe.positions, ElementsAre(37));
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPFirstDecodeAcceptsGreedyDraftAndCommitsVerifierState)
@@ -14302,6 +14409,44 @@ namespace
         EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1);
         EXPECT_THAT(mock->lastForwardTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+    }
+
+    /**
+     * @brief Prove GPU rollback capture consumes the scheduler cursor.
+     *
+     * Graph-captured publication can leave an old host-facing runner position
+     * one transaction ahead or behind the canonical device state.  The request
+     * scheduler still knows that the three-token prompt is the exact rollback
+     * base.  Corrupting only the mock host cursor therefore must not change the
+     * capture request passed into the GPU runner.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           MTPGpuRollbackCheckpointIgnoresStaleRunnerHostPosition)
+    {
+        auto [runner, mock] =
+            createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
+        mock->setPrimaryDevice(DeviceId::cuda(0));
+        mock->enableMTPTokenCoordination(/*hide_local_logits=*/false);
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        mock->setLegacyHostPositionForTest(/*position=*/4);
+
+        runner->setDecodeStepTokenBudget(1);
+        GenerationResult step = runner->decodeStep();
+        runner->setDecodeStepTokenBudget(0);
+
+        ASSERT_TRUE(step.success()) << step.error;
+        ASSERT_EQ(mock->capturedCheckpointRequests().size(), 1u);
+        EXPECT_EQ(
+            mock->capturedCheckpointRequests().front().sequence_index,
+            0);
+        EXPECT_EQ(
+            mock->capturedCheckpointRequests().front().logical_cached_tokens,
+            3)
+            << "The rollback identity must come from the scheduler-owned "
+               "decode transaction, never the runner's stale host cursor.";
     }
 
     /**

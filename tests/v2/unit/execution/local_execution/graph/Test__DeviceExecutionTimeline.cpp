@@ -147,11 +147,12 @@ namespace llaminar2::test
         EXPECT_TRUE(
             reset.to(DeviceTimelineRole::PrefixRestoreMutation)
                 .validForConsumption());
-        EXPECT_FALSE(
+        EXPECT_TRUE(
             reset.to(DeviceTimelineRole::RequestAdmissionTransfer)
                 .validForConsumption())
-            << "Request input admission owns independent buffers and may overlap "
-               "device-state reset; graph execution joins both events.";
+            << "Request admission publishes request-constant GPU controls as well "
+               "as token rows, so it must inherit reset before publishing the "
+               "single transitive admission edge consumed by graph execution.";
 
         const auto prior_forward =
             DeviceEventEdge::at(DeviceTimelinePoint::ForwardGraphOutputReady)
@@ -192,6 +193,92 @@ namespace llaminar2::test
             nullptr))
             << "A durable event never licenses an implicit/default consumer stream.";
         EXPECT_EQ(backend.getEventWaitCount(), 1u);
+    }
+
+    TEST(
+        Test__DeviceExecutionTimeline,
+        PublishedLiveStateEdgesDeclareEveryPermittedOwner)
+    {
+        const std::array<DeviceTimelineRole, 7> permitted = {
+            DeviceTimelineRole::MainForwardGraph,
+            DeviceTimelineRole::MTPSidecarGraph,
+            DeviceTimelineRole::PrefixCheckpointArchive,
+            DeviceTimelineRole::PrefixRestoreMutation,
+            DeviceTimelineRole::MoERebalanceMaintenance,
+            DeviceTimelineRole::RequestStateReset,
+            DeviceTimelineRole::Diagnostics,
+        };
+
+        const auto accepted =
+            DeviceEventEdge::at(
+                DeviceTimelinePoint::AcceptedSpecPublicationReady)
+                .from(DeviceTimelineRole::AcceptedStatePublication);
+        const auto prefix_mutation =
+            DeviceEventEdge::at(
+                DeviceTimelinePoint::LivePrefixMutationReady)
+                .from(DeviceTimelineRole::PrefixRestoreMutation);
+        ASSERT_TRUE(accepted.validForPublication());
+        ASSERT_TRUE(prefix_mutation.validForPublication());
+
+        for (const DeviceTimelineRole role : permitted)
+        {
+            EXPECT_TRUE(accepted.to(role).validForConsumption())
+                << deviceTimelineRoleName(role);
+            EXPECT_TRUE(prefix_mutation.to(role).validForConsumption())
+                << deviceTimelineRoleName(role);
+        }
+
+        for (const DeviceTimelineRole role : {
+                 DeviceTimelineRole::AllPositionVerifier,
+                 DeviceTimelineRole::AcceptedStatePublication,
+                 DeviceTimelineRole::HostResultBridge,
+                 DeviceTimelineRole::HostArchiveBoundary,
+             })
+        {
+            EXPECT_FALSE(accepted.to(role).validForConsumption())
+                << deviceTimelineRoleName(role);
+            EXPECT_FALSE(prefix_mutation.to(role).validForConsumption())
+                << deviceTimelineRoleName(role);
+        }
+
+        EXPECT_FALSE(
+            DeviceEventEdge::at(
+                DeviceTimelinePoint::AcceptedSpecPublicationReady)
+                .from(DeviceTimelineRole::PrefixRestoreMutation)
+                .validForPublication())
+            << "A prefix restore cannot impersonate accepted-state publication.";
+        EXPECT_FALSE(
+            DeviceEventEdge::at(
+                DeviceTimelinePoint::LivePrefixMutationReady)
+                .from(DeviceTimelineRole::AcceptedStatePublication)
+                .validForPublication())
+            << "Accepted-state publication cannot impersonate a prefix mutation.";
+    }
+
+    TEST(Test__DeviceExecutionTimeline, MainLogitsSamplerConsumesDurableForwardPublication)
+    {
+        MockBackend backend(DeviceType::CUDA);
+        void *event = reinterpret_cast<void *>(0xE101);
+        void *sampler_stream = reinterpret_cast<void *>(0xC101);
+
+        const auto sampler_edge =
+            DeviceEventEdge::at(DeviceTimelinePoint::ForwardGraphOutputReady)
+                .from(DeviceTimelineRole::MainForwardGraph)
+                .to(DeviceTimelineRole::TargetSampler);
+        ASSERT_TRUE(sampler_edge.validForConsumption())
+            << "Every main-logits sampler must be ordered after the exact "
+               "forward invocation, including preserved graph replay.";
+        EXPECT_TRUE(sampler_edge.enqueuePublishedWait(
+            backend,
+            DeviceId::cuda(0),
+            event,
+            sampler_stream));
+        EXPECT_EQ(backend.getEventWaitCount(), 1u);
+
+        const auto records = backend.getEventRecordsForStream(sampler_stream);
+        ASSERT_EQ(records.size(), 1u);
+        EXPECT_EQ(records.front().type, MockBackend::EventRecord::WAIT);
+        EXPECT_EQ(records.front().event, event);
     }
 
     TEST(Test__DeviceExecutionTimeline, HostRolesNeverProduceExecutionState)

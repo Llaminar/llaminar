@@ -134,6 +134,29 @@ namespace llaminar2
     };
 
     /**
+     * @brief Physical row layout consumed by the target verifier LM head.
+     *
+     * A single-request verifier commonly projects every physical graph row in
+     * ascending order. In that case the final normalized activation is already
+     * the exact dense LM-head input and neither a row-index workspace upload nor
+     * a row-copy kernel carries useful information. Request-batched verifier
+     * graphs can contain padding gaps, so they retain an explicit row-selection
+     * contract.
+     */
+    enum class MTPSpecDecodeVerifierLogitRowLayout
+    {
+        /**
+         * @brief Project an explicit ordered subset of physical graph rows.
+         */
+        ExplicitSelection,
+
+        /**
+         * @brief Project every physical graph row once, in ascending order.
+         */
+        FullPhysicalIdentity
+    };
+
+    /**
      * @brief Verifier input materialized in graph execution coordinates.
      *
      * `MTPSpecDecodeVerifierInputPlan` stores a compact logical sequence where
@@ -153,6 +176,8 @@ namespace llaminar2
         int request_count = 0;
         int padded_seq_len = 0;
         int total_graph_tokens = 0;
+        MTPSpecDecodeVerifierLogitRowLayout logit_row_layout =
+            MTPSpecDecodeVerifierLogitRowLayout::ExplicitSelection;
 
         std::vector<std::vector<int>> token_batches;
         std::vector<int> sequence_lengths;

@@ -1081,6 +1081,17 @@ namespace llaminar2
             {
                 return false;
             }
+            if (runner_ &&
+                !runner_->configureMTPRequestStopTokens(stop_tokens_))
+            {
+                syncInitStep(false, "configureMTPRequestStopTokens");
+                return setError(
+                    "Inference runner rejected request stop-token policy");
+            }
+            if (!syncInitStep(true, "configureMTPRequestStopTokens"))
+            {
+                return false;
+            }
 
             initialized_ = true;
 
@@ -1449,6 +1460,13 @@ namespace llaminar2
         {
             setError("Empty prompt tokens");
             return false;
+        }
+        if (!runner_ ||
+            !runner_->configureMTPRequestStopTokens(stop_tokens_))
+        {
+            return setError(
+                "Inference runner rejected request stop-token policy at "
+                "request admission");
         }
 
         mtp_bypassed_ = false;
@@ -2551,7 +2569,18 @@ namespace llaminar2
                 "decodeStepBatch() could not materialize MTP checkpoint terminal hidden";
             return batch_result;
         }
-        PrefixStateSnapshot checkpoint = runner_->captureLivePrefixCheckpoint();
+        /*
+         * Request-batched planning_sequence_lengths is the scheduler-owned
+         * logical cursor set.  The current rollback API archives sequence zero;
+         * pass that lane's exact cursor explicitly so a GPU child never consults
+         * a lagging host mirror while sizing the device-resident checkpoint.
+         */
+        PrefixStateSnapshot checkpoint =
+            runner_->captureLivePrefixCheckpoint(
+                PrefixCheckpointCaptureRequest{
+                    .sequence_index = 0,
+                    .logical_cached_tokens =
+                        planning_sequence_lengths.front()});
         if (!checkpoint.valid)
         {
             batch_result.error =
@@ -3449,6 +3478,8 @@ namespace llaminar2
                     tx.scheduled_batch.request_count;
                 publication_request.max_draft_tokens =
                     resident_request_batch_verifier_rows;
+                publication_request.max_state_commit_rows =
+                    resident_request_batch_verifier_rows;
                 publication_request.publish_mtp_shifted_kv =
                     tx.scheduled_batch.requires_shifted_kv_publication;
 
@@ -4128,6 +4159,8 @@ namespace llaminar2
                 publication_request.request_count =
                     tx.scheduled_batch.request_count;
                 publication_request.max_draft_tokens =
+                    resident_request_batch_verifier_rows;
+                publication_request.max_state_commit_rows =
                     resident_request_batch_verifier_rows;
                 publication_request.publish_mtp_shifted_kv =
                     tx.scheduled_batch.requires_shifted_kv_publication;
@@ -4877,6 +4910,20 @@ namespace llaminar2
         PrefixStateSnapshot verifier_base_checkpoint;
         int transaction_base_cached_tokens = -1;
 
+        auto current_checkpoint_capture_request =
+            [&](const char *context,
+                std::string *error)
+            -> std::optional<PrefixCheckpointCaptureRequest>
+        {
+            const std::optional<int> position =
+                currentDecodeTransactionPositionForPlanning(context, error);
+            if (!position)
+                return std::nullopt;
+            return PrefixCheckpointCaptureRequest{
+                .sequence_index = 0,
+                .logical_cached_tokens = *position};
+        };
+
         auto fail_without_checkpoint = [&](const std::string &message) -> GenerationResult
         {
             PerfStatsCollector::addCounter("mtp", "decode_step_failures", 1.0, "decode",
@@ -4914,7 +4961,18 @@ namespace llaminar2
                         "decode");
                     return false;
                 }
-                rollback_checkpoint = runner_->captureLivePrefixCheckpoint();
+                std::string position_error;
+                const auto capture_request =
+                    current_checkpoint_capture_request(
+                        "rollback checkpoint capture",
+                        &position_error);
+                if (!capture_request)
+                {
+                    last_error_ = std::move(position_error);
+                    return false;
+                }
+                rollback_checkpoint =
+                    runner_->captureLivePrefixCheckpoint(*capture_request);
             }
             if (!rollback_checkpoint.valid)
             {
@@ -6046,7 +6104,15 @@ namespace llaminar2
                     return fail_after_checkpoint(
                         "MTP decode could not materialize verifier base terminal hidden");
                 }
-                verifier_base_checkpoint = runner_->captureLivePrefixCheckpoint();
+                std::string position_error;
+                const auto capture_request =
+                    current_checkpoint_capture_request(
+                        "verifier-base checkpoint capture",
+                        &position_error);
+                if (!capture_request)
+                    return fail_after_checkpoint(position_error);
+                verifier_base_checkpoint =
+                    runner_->captureLivePrefixCheckpoint(*capture_request);
             }
             if (!verifier_base_checkpoint.valid)
             {
@@ -7310,7 +7376,15 @@ namespace llaminar2
                         return fail_after_checkpoint(
                             "MTP decode could not materialize post-sidecar terminal hidden");
                     }
-                    sidecar_checkpoints.push_back(runner_->captureLivePrefixCheckpoint());
+                    std::string position_error;
+                    const auto capture_request =
+                        current_checkpoint_capture_request(
+                            "post-sidecar checkpoint capture",
+                            &position_error);
+                    if (!capture_request)
+                        return fail_after_checkpoint(position_error);
+                    sidecar_checkpoints.push_back(
+                        runner_->captureLivePrefixCheckpoint(*capture_request));
                     if (!sidecar_checkpoints.back().valid)
                     {
                         return fail_after_checkpoint("MTP decode could not capture post-sidecar shifted state");
@@ -7480,6 +7554,52 @@ namespace llaminar2
                     verifier_input_plan);
                 if (!verifier_plan_scope.installed())
                     return std::nullopt;
+                const void *verifier_input_tokens_device = nullptr;
+                if (runner_->primaryDeviceId().is_gpu())
+                {
+                    /*
+                     * This diagnostic executes the same verifier graph as the
+                     * production transaction. GPU verifier metadata therefore
+                     * has the same ownership contract: token IDs and their
+                     * position row are composed in persistent runner storage,
+                     * after waiting for the target/draft sample producers.
+                     * Calling the host-token forward entrypoint here leaves the
+                     * position row unpublished and no longer represents a legal
+                     * GPU verifier invocation.
+                     */
+                    const int verifier_token_count =
+                        verifier_input_plan.total_verifier_input_tokens;
+                    const int draft_token_count =
+                        std::max(0, verifier_token_count - 1);
+                    if (use_greedy_device_draft_slots &&
+                        draft_token_count > 0)
+                    {
+                        verifier_input_tokens_device =
+                            first_token == kDeferredMTPFirstTokenShadow
+                                ? runner_
+                                      ->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+                                          /*first_target_sample_slot=*/0,
+                                          /*first_draft_slot=*/0,
+                                          draft_token_count,
+                                          verifier_token_count)
+                                : runner_->prepareMTPVerifierInputTokensOnDevice(
+                                      first_token,
+                                      /*first_draft_slot=*/0,
+                                      draft_token_count,
+                                      verifier_token_count);
+                    }
+                    else
+                    {
+                        verifier_input_tokens_device =
+                            runner_
+                                ->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+                                    draft_tokens.data(),
+                                    verifier_token_count,
+                                    draft_token_count);
+                    }
+                    if (!verifier_input_tokens_device)
+                        return std::nullopt;
+                }
                 if (!runner_->setComputeRowIndexedAllPositionLogits(true, verifier_row_count))
                     return std::nullopt;
                 if (!runner_->setComputeAllPositionLogits(true))
@@ -7487,10 +7607,14 @@ namespace llaminar2
                     runner_->setComputeRowIndexedAllPositionLogits(false, 0);
                     return std::nullopt;
                 }
+                MTPVerifierForwardExecutionOptions forward_options;
+                forward_options.device_token_ids =
+                    verifier_input_tokens_device;
                 const MTPVerifierForwardExecutionResult forward_result =
                     executeMTPSpecVerifierForward(
                         *runner_,
-                        verifier_input_plan);
+                        verifier_input_plan,
+                        forward_options);
                 if (!forward_result.ok)
                 {
                     runner_->setComputeAllPositionLogits(false);
@@ -7883,47 +8007,91 @@ namespace llaminar2
                                                   int token_index,
                                                   const char *context) -> bool
             {
-                auto current_shifted_mtp_tokens = [&]() -> int
+                struct ReplayCacheCounts
                 {
+                    int main = -1;
+                    int shifted = -1;
+                };
+                auto current_replay_cache_counts = [&]() -> ReplayCacheCounts
+                {
+                    ReplayCacheCounts counts;
                     const PrefixRuntimeStateSnapshot probe =
                         runner_->prefixStateProbe();
-                    int max_tokens = -1;
+                    for (const PrefixKVCacheProbe &cache : probe.kv_caches)
+                    {
+                        for (const PrefixKVLayerProbe &layer : cache.layers)
+                        {
+                            if (layer.seq_idx == 0)
+                            {
+                                counts.main =
+                                    std::max(
+                                        counts.main,
+                                        layer.cached_tokens);
+                            }
+                        }
+                    }
                     for (const PrefixKVCacheProbe &cache : probe.mtp_kv_caches)
                     {
                         for (const PrefixKVLayerProbe &layer : cache.layers)
                         {
                             if (layer.seq_idx == 0)
                             {
-                                max_tokens =
-                                    std::max(max_tokens, layer.cached_tokens);
+                                counts.shifted =
+                                    std::max(
+                                        counts.shifted,
+                                        layer.cached_tokens);
                             }
                         }
                     }
-                    return max_tokens;
+                    return counts;
                 };
 
                 /*
-                 * token_index is the committed output/verifier-row index.  It is
-                 * not necessarily the number of shifted MTP KV rows currently
-                 * resident in this replay timeline: MoE/non-reuse paths can
-                 * restore a verifier base where the sidecar's row-zero append has
-                 * intentionally been discarded.  The replay checker runs only
-                 * under LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_CHECK, so it can afford
-                 * to inspect the debug probe and derive a position offset that
-                 * appends exactly one shifted row from the live cache count.
+                 * A verifier base can already contain the speculative shifted
+                 * row for its first replay input.  Re-appending that row advances
+                 * shifted KV one token ahead of grouped publication and changes
+                 * the next MTP condition.  Decide from both canonical cache
+                 * counts: reuse when shifted equals main, append only when it
+                 * trails main by exactly one, and reject every other lifecycle
+                 * shape as an oracle failure.
                  */
-                const int shifted_before = current_shifted_mtp_tokens();
-                if (shifted_before < 0)
+                const ReplayCacheCounts cache_counts =
+                    current_replay_cache_counts();
+                const MTPShiftedReplayRowPlan shifted_plan =
+                    planMTPShiftedReplayRow(
+                        cache_counts.main,
+                        cache_counts.shifted);
+                if (!shifted_plan)
                 {
                     continuation_failure_detail =
-                        std::string("shifted MTP replay commit could not inspect current shifted cache in ") +
+                        std::string("shifted MTP replay lifecycle invalid in ") +
                         context +
-                        " token_index=" + std::to_string(token_index);
+                        " token_index=" + std::to_string(token_index) +
+                        " main_before=" +
+                        std::to_string(cache_counts.main) +
+                        " shifted_before=" +
+                        std::to_string(cache_counts.shifted) +
+                        " reason=" + shifted_plan.reason;
                     return false;
                 }
-                const int shifted_rows_committed_in_this_replay = 0;
+                if (shifted_plan.action ==
+                    MTPShiftedReplayRowAction::ReuseResidentRow)
+                {
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "commit_replay_check_shifted_row_reuses",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"path", path},
+                         {"context", context},
+                         {"token_index", std::to_string(token_index)}});
+                    return true;
+                }
+
+                constexpr int shifted_rows_committed_in_this_replay = 0;
                 const int replay_position_offset =
-                    shifted_before + 1 - shifted_rows_committed_in_this_replay;
+                    shifted_plan.append_position_offset;
                 bool ok = false;
                 {
                     PerfStatsCollector::ScopedTimer timer(
@@ -7943,11 +8111,29 @@ namespace llaminar2
                      * at the base position, which makes the next MTP step
                      * compare a live committed state with a stale replay.
                      */
-                    ok = runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
-                        token,
-                        shifted_rows_committed_in_this_replay,
-                        /*allow_speculative_discard=*/true,
-                        replay_position_offset);
+                    if (runner_->primaryDeviceId().is_gpu())
+                    {
+                        constexpr int kDiagnosticTargetSampleSlot = 0;
+                        ok = runner_
+                                 ->stageStochasticTargetTokenForDeviceSampling(
+                                     token,
+                                     kDiagnosticTargetSampleSlot) &&
+                             runner_
+                                 ->commitMTPShiftedRowFromDeviceTargetSample(
+                                     kDiagnosticTargetSampleSlot,
+                                     shifted_rows_committed_in_this_replay,
+                                     /*allow_speculative_discard=*/true,
+                                     replay_position_offset);
+                    }
+                    else
+                    {
+                        ok = runner_
+                                 ->commitMTPShiftedRowFromCurrentTerminalHidden(
+                                     token,
+                                     shifted_rows_committed_in_this_replay,
+                                     /*allow_speculative_discard=*/true,
+                                     replay_position_offset);
+                    }
                 }
                 if (!ok)
                 {
@@ -7958,7 +8144,10 @@ namespace llaminar2
                         " token=" + std::to_string(token) +
                         " base_sidecar_position=" +
                         std::to_string(base_sidecar_position) +
-                        " shifted_before=" + std::to_string(shifted_before) +
+                        " main_before=" +
+                        std::to_string(cache_counts.main) +
+                        " shifted_before=" +
+                        std::to_string(cache_counts.shifted) +
                         " replay_position_offset=" +
                         std::to_string(replay_position_offset);
                     return false;
@@ -8154,9 +8343,11 @@ namespace llaminar2
                 prepare_committed_ready_state();
             if (!prepared_next_token)
             {
-                return derived_next_token_from_deferred_condition
-                           ? std::string("MTP commit replay check deferred condition forward failed")
-                           : std::string("MTP commit replay check missing expected next token");
+                const std::string summary =
+                    derived_next_token_from_deferred_condition
+                        ? std::string("MTP commit replay check deferred condition forward failed")
+                        : std::string("MTP commit replay check missing expected next token");
+                return summary + continuation_failure_suffix();
             }
             expected_next_token = *prepared_next_token;
 
@@ -8633,6 +8824,37 @@ namespace llaminar2
                   ready_condition_state.has_value() ? "true" : "false"}});
             return std::nullopt;
         };
+
+        const MTPVisibleStateCommitPlan visible_state_commit_plan =
+            planMTPVisibleStateCommit(
+                static_cast<int>(draft_tokens.size()),
+                first_token_is_pending_condition ? 1 : 0,
+                decode_step_token_budget_);
+        if (!visible_state_commit_plan)
+        {
+            return fail_after_checkpoint(
+                std::string("MTP visible-state commit planning failed: ") +
+                visible_state_commit_plan.reason);
+        }
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "visible_state_commit_plans",
+            1.0,
+            "decode",
+            {},
+            {{"verifier_rows",
+              std::to_string(visible_state_commit_plan.verifier_input_rows)},
+             {"max_state_commit_rows",
+              std::to_string(visible_state_commit_plan.max_state_commit_rows)},
+             {"output_budget",
+              std::to_string(
+                  visible_state_commit_plan.remaining_output_budget)},
+             {"pending_condition_input",
+              first_token_is_pending_condition ? "true" : "false"},
+             {"response_boundary_clipped",
+              visible_state_commit_plan.response_boundary_clipped
+                  ? "true"
+                  : "false"}});
 
         if (use_all_position_state_publication_verifier ||
             use_grouped_outcome_host_publication_verifier)
@@ -9328,6 +9550,8 @@ namespace llaminar2
                         publication_request.request_count = 1;
                         publication_request.max_draft_tokens =
                             static_cast<int>(draft_tokens.size());
+                        publication_request.max_state_commit_rows =
+                            visible_state_commit_plan.max_state_commit_rows;
                         publication_request.publish_mtp_shifted_kv = true;
 
                         std::string publication_error;
@@ -9823,6 +10047,8 @@ namespace llaminar2
                         publication_request.request_count = 1;
                         publication_request.max_draft_tokens =
                             static_cast<int>(draft_tokens.size());
+                        publication_request.max_state_commit_rows =
+                            visible_state_commit_plan.max_state_commit_rows;
                         publication_request.publish_mtp_shifted_kv = true;
 
                         std::string publication_error;
@@ -10075,8 +10301,14 @@ namespace llaminar2
             }
 
             MTPSpecStepPlan &mutable_step = step_plans.steps.front();
-            const int accepted_state_count =
+            const int full_outcome_state_count =
                 std::max(0, mutable_step.accepted_count);
+            const int accepted_state_count =
+                state_published_from_device_outcome
+                    ? std::min(
+                          full_outcome_state_count,
+                          visible_state_commit_plan.max_state_commit_rows)
+                    : full_outcome_state_count;
             int shifted_publication_commit_count = 0;
             bool first_shifted_row_available_for_publication =
                 first_shifted_row_available_from_sidecar;
@@ -10302,7 +10534,6 @@ namespace llaminar2
                 catchup.rejected_verified_token;
             const bool stopped_on_output = catchup.stopped_on_output;
             if (!step.requiresCorrectionReplay() &&
-                !all_speculative_accepted &&
                 !stopped_on_output)
             {
                 const int derived_correction_count =
@@ -10333,7 +10564,6 @@ namespace llaminar2
             const int32_t raw_ready_token = catchup.ready_token;
             int32_t ready_token = raw_ready_token;
             const bool has_deferred_correction_condition =
-                !all_speculative_accepted &&
                 !stopped_on_output &&
                 deferred_correction_condition_count > 0;
             if (has_deferred_correction_condition && ready_token >= 0)
@@ -10379,9 +10609,8 @@ namespace llaminar2
             std::optional<DeviceResidentLogicalSequenceStateHandle>
                 ready_condition_resident_state;
 
-            if (!all_speculative_accepted &&
-                !stopped_on_output &&
-                (ready_token < 0 || has_deferred_correction_condition))
+            if (!stopped_on_output &&
+                has_deferred_correction_condition)
             {
                 PerfStatsCollector::addCounter(
                     "mtp",
@@ -11323,6 +11552,8 @@ namespace llaminar2
                 publication_request.request_count = 1;
                 publication_request.max_draft_tokens =
                     static_cast<int>(draft_tokens.size());
+                publication_request.max_state_commit_rows =
+                    visible_state_commit_plan.max_state_commit_rows;
                 publication_request.publish_mtp_shifted_kv = true;
                 PerfStatsCollector::addCounter(
                     "mtp",
@@ -11517,6 +11748,10 @@ namespace llaminar2
                     return fail_after_checkpoint(
                         "Grouped-outcome MTP verifier transaction plan accepted-state count drifted from compact outcome metadata");
                 }
+                const int published_state_commit_count =
+                    std::min(
+                        compact_accepted_state_count,
+                        publication_request.max_state_commit_rows);
 
                 const DeviceResidentLogicalSequenceStateHandle resident_state =
                     runner_->deviceResidentLogicalSequenceState();
@@ -11535,6 +11770,8 @@ namespace llaminar2
                       "grouped_outcome_device_resident_publication"},
                      {"sampling", "stochastic"},
                      {"accepted_state_count",
+                      std::to_string(published_state_commit_count)},
+                     {"full_outcome_state_count",
                       std::to_string(compact_accepted_state_count)},
                      {"state_owner", "device_transaction"}});
 
@@ -11563,7 +11800,7 @@ namespace llaminar2
                 const int newly_emitted_token_count =
                     static_cast<int>(accepted_tokens.size()) -
                     emitted_token_start_index;
-                if (compact_accepted_state_count >
+                if (published_state_commit_count >
                     static_cast<int>(accepted_tokens.size()))
                 {
                     return fail_after_checkpoint(
@@ -11577,21 +11814,21 @@ namespace llaminar2
                     ready_condition_resident_state;
 
                 /*
-                 * After a stochastic rejection the correction token is output
-                 * to the user but not yet part of live model state.  Publish
-                 * only the accepted verifier prefix and carry that correction
-                 * as the next device-resident condition row.
+                 * Every output beyond the serial-visible publication prefix is
+                 * a pending condition row. Rejection creates this shape, and an
+                 * all-accepted verifier creates the same shape when the response
+                 * budget ends before its speculative ready token.
                  */
-                const int deferred_correction_count =
-                    (!all_speculative_accepted && !stopped_on_output)
+                const int deferred_condition_count =
+                    !stopped_on_output
                         ? std::max(
                               0,
                               static_cast<int>(accepted_tokens.size()) -
-                                  compact_accepted_state_count)
+                                  published_state_commit_count)
                         : 0;
-                if (deferred_correction_count == 1)
+                if (deferred_condition_count == 1)
                 {
-                    const int replay_start = compact_accepted_state_count;
+                    const int replay_start = published_state_commit_count;
                     if (replay_start < 0 ||
                         replay_start >=
                             static_cast<int>(accepted_tokens.size()))
@@ -11631,10 +11868,10 @@ namespace llaminar2
                         {{"request_index", "0"},
                          {"replay_start", std::to_string(replay_start)}});
                 }
-                else if (deferred_correction_count > 1)
+                else if (deferred_condition_count > 1)
                 {
                     return fail_after_checkpoint(
-                        "Grouped-outcome MTP pending-condition fast path supports one correction row");
+                        "Grouped-outcome MTP publication left more than one serial-visible condition row");
                 }
                 else if (all_speculative_accepted &&
                          !stopped_on_output &&
@@ -11749,9 +11986,15 @@ namespace llaminar2
                         accepted_tokens;
                     if (!stopped_on_output &&
                         all_speculative_accepted &&
-                        ready_token >= 0)
+                        raw_ready_token >= 0)
                     {
-                        accepted_outcome.bonus_ready_token = ready_token;
+                        /*
+                         * Validate the complete verifier outcome, not the
+                         * response-boundary-clipped continuation state.  The raw
+                         * bonus remains valid acceptance evidence even when the
+                         * final visible output is kept as a pending condition.
+                         */
+                        accepted_outcome.bonus_ready_token = raw_ready_token;
                     }
                     accepted_outcome.accepted_verifier_input_prefix =
                         std::min<int>(
@@ -11776,9 +12019,9 @@ namespace llaminar2
                              "device_batch_outcome_device_resident_publication",
                              draft_tokens,
                              accepted_tokens,
-                             stopped_on_output || ready_token < 0
+                             stopped_on_output || raw_ready_token < 0
                                  ? std::optional<int32_t>{}
-                                 : std::optional<int32_t>{ready_token},
+                                 : std::optional<int32_t>{raw_ready_token},
                              all_speculative_accepted,
                              stopped_on_output,
                              accepted_speculative_prefix))
@@ -11965,8 +12208,10 @@ namespace llaminar2
 	                      mtp_depth_controller_
 	                          ? std::to_string(mtp_depth_controller_->currentDepth())
 	                          : std::string("none")},
-	                     {"accepted_state_count",
-	                      std::to_string(compact_accepted_state_count)},
+		                     {"accepted_state_count",
+		                      std::to_string(published_state_commit_count)},
+                             {"full_outcome_state_count",
+                              std::to_string(compact_accepted_state_count)},
 	                     {"pending_condition_input",
 	                      first_token_is_pending_condition ? "true" : "false"},
 	                     {"next_pending_condition_token",
@@ -12004,7 +12249,7 @@ namespace llaminar2
                         /*is_complete=*/stopped_on_output,
                         PrefixStateProvenance::VerifierPrefillRowsDecodeEquivalent,
                         /*state_advanced=*/true,
-                        compact_accepted_state_count,
+                        published_state_commit_count,
                         emitted_token_start_index,
                         next_pending_condition_token,
                         next_pending_condition_resident_state,
@@ -12390,6 +12635,8 @@ namespace llaminar2
                 publication_request.request_count = 1;
                 publication_request.max_draft_tokens =
                     static_cast<int>(draft_tokens.size());
+                publication_request.max_state_commit_rows =
+                    visible_state_commit_plan.max_state_commit_rows;
                 publication_request.publish_mtp_shifted_kv = true;
 
                 std::string publication_error;
@@ -12566,8 +12813,12 @@ namespace llaminar2
                         "Grouped-outcome greedy MTP verifier step-plan failed: missing single-request step");
                 }
                 const MTPSpecStepPlan &step = step_plans.steps.front();
-                const int accepted_state_count =
+                const int full_outcome_state_count =
                     std::max(0, step.accepted_count);
+                const int accepted_state_count =
+                    std::min(
+                        full_outcome_state_count,
+                        publication_request.max_state_commit_rows);
 
                 const DeviceResidentLogicalSequenceStateHandle resident_state =
                     runner_->deviceResidentLogicalSequenceState();
@@ -12587,6 +12838,8 @@ namespace llaminar2
                      {"sampling", "greedy"},
                      {"accepted_state_count",
                       std::to_string(accepted_state_count)},
+                     {"full_outcome_state_count",
+                      std::to_string(full_outcome_state_count)},
                      {"state_owner", "device_transaction"}});
 
                 const std::vector<int32_t> accepted_tokens =
@@ -12627,14 +12880,14 @@ namespace llaminar2
                 std::optional<DeviceResidentLogicalSequenceStateHandle>
                     ready_condition_resident_state;
 
-                const int deferred_correction_count =
-                    (!all_speculative_accepted && !stopped_on_output)
+                const int deferred_condition_count =
+                    !stopped_on_output
                         ? std::max(
                               0,
                               static_cast<int>(accepted_tokens.size()) -
                                   accepted_state_count)
                         : 0;
-                if (deferred_correction_count == 1)
+                if (deferred_condition_count == 1)
                 {
                     const int replay_start = accepted_state_count;
                     if (replay_start < 0 ||
@@ -12678,10 +12931,10 @@ namespace llaminar2
                         ready_token = -1;
                     }
                 }
-                else if (deferred_correction_count > 1)
+                else if (deferred_condition_count > 1)
                 {
                     return fail_after_checkpoint(
-                        "Grouped-outcome greedy MTP pending-condition fast path supports one correction row");
+                        "Grouped-outcome greedy MTP publication left more than one serial-visible condition row");
                 }
                 else if (all_speculative_accepted &&
                          !stopped_on_output &&
@@ -12719,9 +12972,9 @@ namespace llaminar2
                         accepted_tokens;
                     if (!stopped_on_output &&
                         all_speculative_accepted &&
-                        ready_token >= 0)
+                        raw_ready_token >= 0)
                     {
-                        accepted_outcome.bonus_ready_token = ready_token;
+                        accepted_outcome.bonus_ready_token = raw_ready_token;
                     }
                     accepted_outcome.accepted_verifier_input_prefix =
                         std::min<int>(
@@ -12746,9 +12999,9 @@ namespace llaminar2
                              "device_batch_outcome_device_resident_publication",
                              draft_tokens,
                              accepted_tokens,
-                             stopped_on_output || ready_token < 0
+                             stopped_on_output || raw_ready_token < 0
                                  ? std::optional<int32_t>{}
-                                 : std::optional<int32_t>{ready_token},
+                                 : std::optional<int32_t>{raw_ready_token},
                              all_speculative_accepted,
                              stopped_on_output,
                              accepted_speculative_prefix))
@@ -12851,8 +13104,10 @@ namespace llaminar2
                      {"output_tokens", std::to_string(newly_emitted_token_count)},
                      {"ready_token", std::to_string(ready_token)},
                      {"raw_ready_token", std::to_string(raw_ready_token)},
-                     {"accepted_state_count",
-                      std::to_string(accepted_state_count)},
+	                     {"accepted_state_count",
+	                      std::to_string(accepted_state_count)},
+                         {"full_outcome_state_count",
+                          std::to_string(full_outcome_state_count)},
                      {"pending_condition_input",
                       first_token_is_pending_condition ? "true" : "false"},
                      {"next_pending_condition_token",
@@ -13887,7 +14142,15 @@ namespace llaminar2
                                                       : PrefixRuntimeStateSnapshot{};
         snapshot.initialized = initialized_;
         snapshot.prefill_logits_ready = prefill_logits_ready_;
-        snapshot.current_position = currentPosition();
+        /*
+         * The child probe owns the meaning of live position. GPU runners read
+         * it from the device-resident logical-state mailbox, while
+         * get_position() is only a host planning mirror and is intentionally
+         * allowed to lag accepted grouped publication. Overwriting the child
+         * result here made a preserved sidecar appear to move main state
+         * backwards and, more seriously, taught diagnostics to trust stale
+         * host state over the device owner.
+         */
         const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
         snapshot.mtp_config_enabled = mtp.enabled;
         snapshot.mtp_bypassed = mtp_bypassed_;
@@ -14005,6 +14268,12 @@ namespace llaminar2
     void OrchestrationRunner::setStopTokens(const std::vector<int32_t> &stop_tokens)
     {
         stop_tokens_ = stop_tokens;
+        if (runner_ &&
+            !runner_->configureMTPRequestStopTokens(stop_tokens_))
+        {
+            throw std::runtime_error(
+                "Inference runner rejected request stop-token policy");
+        }
     }
 
     // =========================================================================

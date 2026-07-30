@@ -789,6 +789,8 @@ namespace llaminar2
             const int32_t *stop_tokens,
             int stop_token_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
+        bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens) override;
         bool prepareGreedyAllPositionBatchOutcomeGraph(
             int verifier_token_count,
             const int32_t *stop_tokens,
@@ -1068,7 +1070,8 @@ namespace llaminar2
         bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override;
         bool restorePrefixTerminalState(const PrefixLookupResult &hit) override;
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
-        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override;
+        PrefixStateSnapshot captureLivePrefixCheckpoint(
+            const PrefixCheckpointCaptureRequest &request) const override;
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
 

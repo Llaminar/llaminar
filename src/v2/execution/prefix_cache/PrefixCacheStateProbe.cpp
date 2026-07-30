@@ -15,6 +15,7 @@
 #include "kernels/IKVCache.h"
 #include "tensors/TensorKernels.h"
 #include "utils/DebugEnv.h"
+#include "utils/FNV1a.h"
 
 #include <algorithm>
 #include <cctype>
@@ -29,16 +30,6 @@ namespace llaminar2
 {
     namespace
     {
-        constexpr uint64_t kFnvOffset = 14695981039346656037ull;
-        constexpr uint64_t kFnvPrime = 1099511628211ull;
-
-        uint64_t fnvUpdate(uint64_t hash, unsigned char byte)
-        {
-            hash ^= static_cast<uint64_t>(byte);
-            hash *= kFnvPrime;
-            return hash;
-        }
-
         uint64_t hashFloatVector(const std::vector<float> &values)
         {
             return hashFloatBufferForPrefixProbe(values.data(), values.size());
@@ -629,18 +620,7 @@ namespace llaminar2
 
     uint64_t hashByteBufferForPrefixProbe(const void *values, size_t bytes)
     {
-        uint64_t hash = kFnvOffset;
-        if (!values || bytes == 0)
-        {
-            return hash;
-        }
-
-        const auto *raw = static_cast<const unsigned char *>(values);
-        for (size_t i = 0; i < bytes; ++i)
-        {
-            hash = fnvUpdate(hash, raw[i]);
-        }
-        return hash;
+        return fnv1a64(values, bytes);
     }
 
     bool floatBufferAllZeroForPrefixProbe(const float *values, size_t count)

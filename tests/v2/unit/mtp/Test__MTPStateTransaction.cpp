@@ -2,6 +2,10 @@
 
 #include "execution/mtp/MTPStateTransaction.h"
 
+#include <algorithm>
+#include <utility>
+#include <vector>
+
 namespace llaminar2
 {
 namespace
@@ -88,6 +92,49 @@ TEST(Test__MTPStateTransaction, ExpectedShiftedTokensLagMainByOne)
     EXPECT_EQ(expectedShiftedMTPTokens(1), 0);
     EXPECT_EQ(expectedShiftedMTPTokens(2), 1);
     EXPECT_EQ(expectedShiftedMTPTokens(9), 8);
+}
+
+TEST(Test__MTPStateTransaction,
+     ShiftedReplayReusesVerifierBaseRowThenAppendsAfterMainAdvances)
+{
+    const MTPShiftedReplayRowPlan base =
+        planMTPShiftedReplayRow(
+            /*main_cached_tokens=*/596,
+            /*shifted_cached_tokens=*/596);
+    ASSERT_TRUE(base) << base.reason;
+    EXPECT_EQ(
+        base.action,
+        MTPShiftedReplayRowAction::ReuseResidentRow);
+    EXPECT_EQ(base.append_position_offset, -1);
+
+    const MTPShiftedReplayRowPlan after_main_advance =
+        planMTPShiftedReplayRow(
+            /*main_cached_tokens=*/597,
+            /*shifted_cached_tokens=*/596);
+    ASSERT_TRUE(after_main_advance) << after_main_advance.reason;
+    EXPECT_EQ(
+        after_main_advance.action,
+        MTPShiftedReplayRowAction::AppendRow);
+    EXPECT_EQ(after_main_advance.append_position_offset, 597);
+}
+
+TEST(Test__MTPStateTransaction,
+     ShiftedReplayRejectsAmbiguousOrCorruptLifecycleShapes)
+{
+    for (const auto [main_tokens, shifted_tokens] :
+         std::vector<std::pair<int, int>>{
+             {-1, 0},
+             {0, -1},
+             {598, 596},
+             {596, 597}})
+    {
+        const MTPShiftedReplayRowPlan plan =
+            planMTPShiftedReplayRow(main_tokens, shifted_tokens);
+        EXPECT_FALSE(plan)
+            << "main=" << main_tokens
+            << " shifted=" << shifted_tokens;
+        EXPECT_FALSE(plan.reason.empty());
+    }
 }
 
 TEST(Test__MTPStateTransaction, LogicalVerifierBaseSnapshotCarriesDecodeEquivalentTokenCounts)
@@ -272,7 +319,10 @@ TEST(Test__MTPStateTransaction, RuntimeSnapshotSerialOracleCanIgnoreMainKVPayloa
     candidate.kv_caches.front().layers.front().cached_tokens -= 1;
     result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
     ASSERT_FALSE(result);
-    EXPECT_NE(result.reason.find("main KV cached token count"), std::string::npos);
+    EXPECT_NE(
+        result.reason.find("main KV layer metadata mismatch"),
+        std::string::npos)
+        << result.reason;
 }
 
 TEST(Test__MTPStateTransaction, RuntimeSnapshotEquivalenceRejectsGDNHashDrift)
@@ -344,6 +394,66 @@ TEST(Test__MTPStateTransaction, RuntimeSnapshotCanUseToleranceAwareGDNValues)
     result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
     ASSERT_FALSE(result);
     EXPECT_NE(result.reason.find("GDN recurrence value mismatch"), std::string::npos);
+}
+
+TEST(Test__MTPStateTransaction, VisibleCommitPlanIsTotalAcrossMTPDepthAndResponseBudget)
+{
+    /*
+     * Exercise every production MTP verifier width (depths 1..15 produce
+     * verifier widths 2..16), both ordinary and previously-emitted condition
+     * rows, and budgets on both sides of the transaction width.  This is the
+     * pure state-machine oracle used by CUDA, ROCm, and CPU publication.
+     */
+    for (int verifier_rows = 1; verifier_rows <= 16; ++verifier_rows)
+    {
+        for (int emitted_start = 0; emitted_start <= 1; ++emitted_start)
+        {
+            if (emitted_start > verifier_rows)
+                continue;
+
+            const int maximum_new_outputs = verifier_rows - emitted_start;
+            for (int budget = 0; budget <= 18; ++budget)
+            {
+                const MTPVisibleStateCommitPlan plan =
+                    planMTPVisibleStateCommit(
+                        verifier_rows,
+                        emitted_start,
+                        budget);
+                ASSERT_TRUE(plan)
+                    << "rows=" << verifier_rows
+                    << " emitted_start=" << emitted_start
+                    << " budget=" << budget
+                    << " reason=" << plan.reason;
+
+                const bool reaches_response_boundary =
+                    budget > 0 && budget <= maximum_new_outputs;
+                const int expected_commit_rows =
+                    reaches_response_boundary
+                        ? std::clamp(
+                              budget + emitted_start - 1,
+                              0,
+                              verifier_rows)
+                        : verifier_rows;
+                EXPECT_EQ(
+                    plan.max_state_commit_rows,
+                    expected_commit_rows)
+                    << "rows=" << verifier_rows
+                    << " emitted_start=" << emitted_start
+                    << " budget=" << budget;
+                EXPECT_EQ(
+                    plan.response_boundary_clipped,
+                    expected_commit_rows < verifier_rows);
+            }
+        }
+    }
+}
+
+TEST(Test__MTPStateTransaction, VisibleCommitPlanRejectsAmbiguousLifecycleInputs)
+{
+    EXPECT_FALSE(planMTPVisibleStateCommit(0, 0, 1));
+    EXPECT_FALSE(planMTPVisibleStateCommit(2, -1, 1));
+    EXPECT_FALSE(planMTPVisibleStateCommit(2, 3, 1));
+    EXPECT_FALSE(planMTPVisibleStateCommit(2, 0, -1));
 }
 
 } // namespace llaminar2

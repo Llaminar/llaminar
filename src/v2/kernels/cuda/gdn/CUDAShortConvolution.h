@@ -16,6 +16,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/FNV1a.h"
 #include "../../../utils/Logger.h"
 
 #include <algorithm>
@@ -859,17 +860,7 @@ namespace llaminar2
 
         static uint64_t hashFloatBytes(const float *values, size_t count)
         {
-            constexpr uint64_t kOffset = 1469598103934665603ull;
-            constexpr uint64_t kPrime = 1099511628211ull;
-            uint64_t hash = kOffset;
-            const auto *bytes = reinterpret_cast<const unsigned char *>(values);
-            const size_t byte_count = count * sizeof(float);
-            for (size_t i = 0; i < byte_count; ++i)
-            {
-                hash ^= static_cast<uint64_t>(bytes[i]);
-                hash *= kPrime;
-            }
-            return hash;
+            return fnv1a64(values, count * sizeof(float));
         }
 
         static size_t countNonZeroFloats(const float *values, size_t count)

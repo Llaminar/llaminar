@@ -877,7 +877,8 @@ namespace llaminar2
         return aggregate;
     }
 
-    PrefixStateSnapshot StageRunnerRegistry::captureLivePrefixCheckpointAll(int seq_idx) const
+    PrefixStateSnapshot StageRunnerRegistry::captureLivePrefixCheckpointAll(
+        const PrefixCheckpointCaptureRequest &request) const
     {
         PrefixStateSnapshot aggregate;
         bool saw_runner = false;
@@ -891,7 +892,8 @@ namespace llaminar2
         auto capture_runner = [&](const IInferenceRunner &runner)
         {
             saw_runner = true;
-            PrefixStateSnapshot child = runner.captureLivePrefixCheckpoint(seq_idx);
+            PrefixStateSnapshot child =
+                runner.captureLivePrefixCheckpoint(request);
             if (!child.valid)
                 return false;
 
@@ -1878,9 +1880,10 @@ namespace llaminar2
         return stage_runners_.captureLivePrefixStateAll(seq_idx);
     }
 
-    PrefixStateSnapshot GlobalOrchestrator::captureLivePrefixCheckpoint(int seq_idx) const
+    PrefixStateSnapshot GlobalOrchestrator::captureLivePrefixCheckpoint(
+        const PrefixCheckpointCaptureRequest &request) const
     {
-        return stage_runners_.captureLivePrefixCheckpointAll(seq_idx);
+        return stage_runners_.captureLivePrefixCheckpointAll(request);
     }
 
     bool GlobalOrchestrator::restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx)

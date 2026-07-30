@@ -1245,6 +1245,17 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphCaptureController] Normal replay missing segment capture");
             return false;
         }
+        if (!capture_stream ||
+            segment.capture->executionStream() != capture_stream)
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Replay executable does not own "
+                "the declared graph-cache producer stream"
+                << " declared_stream=" << capture_stream
+                << " executable_stream="
+                << segment.capture->executionStream());
+            return false;
+        }
 
         const bool profiling = KernelProfiler::isEnabled();
         const GraphReplayCaptureMode replay_mode = full_graph_replay
@@ -1765,6 +1776,17 @@ namespace llaminar2
         if (!segment.capture)
         {
             LOG_ERROR("[DeviceGraphCaptureController] Capture finalize missing segment capture");
+            return false;
+        }
+        if (!capture_stream ||
+            segment.capture->executionStream() != capture_stream)
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Captured executable does not own "
+                "the declared graph-cache producer stream"
+                << " declared_stream=" << capture_stream
+                << " executable_stream="
+                << segment.capture->executionStream());
             return false;
         }
 

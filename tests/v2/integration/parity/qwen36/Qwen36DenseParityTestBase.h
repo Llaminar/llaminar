@@ -12,6 +12,7 @@
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/mtp/MTPDecodeCatchup.h"
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
+#include "execution/mtp/MTPStateTransaction.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "kernels/KernelFactory.h"
 #include "loaders/ModelContext.h"
@@ -332,6 +333,48 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
+     * @brief Format every tagged instance of one PerfStats counter.
+     *
+     * Stochastic MTP regressions need to compare the exact transaction chosen
+     * during first capture with the transaction chosen during graph reuse.
+     * PerfStats is deliberately reset between those requests, so formatting
+     * the saved snapshots is more reliable than querying the live collector in
+     * a later assertion message.
+     */
+    inline std::string densePerfCounterTagSummary(
+        const std::vector<PerfStatRecord> &records,
+        const char *domain,
+        const char *name)
+    {
+        std::ostringstream out;
+        bool found = false;
+        for (const PerfStatRecord &record : records)
+        {
+            if (record.kind != PerfStatRecord::Kind::Counter ||
+                record.domain != domain ||
+                record.name != name)
+            {
+                continue;
+            }
+
+            if (found)
+                out << '\n';
+            found = true;
+            out << domain << '.' << name << '{';
+            bool first_tag = true;
+            for (const auto &[key, value] : record.tags)
+            {
+                if (!first_tag)
+                    out << ',';
+                first_tag = false;
+                out << key << '=' << value;
+            }
+            out << '}';
+        }
+        return found ? out.str() : std::string("<no matching records>");
+    }
+
+    /**
      * @brief Return whether every participant uses one homogeneous GPU backend.
      *
      * CUDA-only and ROCm-only graphs can capture their backend-native
@@ -500,14 +543,13 @@ namespace llaminar2::test::parity::qwen36
             return;
         }
 
-        EXPECT_TRUE(denseHasPositivePerfCounterTag(
-            records,
-            "forward_graph",
-            "full_graph_plan_graphs",
-            "type",
-            "capturable"))
-            << context << " did not produce a whole-graph capture plan.\n"
-            << PerfStatsCollector::summaryString({"forward_graph"});
+        const bool planned_capturable_full_graph =
+            denseHasPositivePerfCounterTag(
+                records,
+                "forward_graph",
+                "full_graph_plan_graphs",
+                "type",
+                "capturable");
         const bool captured_full_graph = denseHasPerfCounter(
             records,
             "forward_graph",
@@ -516,6 +558,14 @@ namespace llaminar2::test::parity::qwen36
             records,
             "forward_graph",
             "full_graph_replay_calls");
+        EXPECT_TRUE(
+            planned_capturable_full_graph ||
+            captured_full_graph ||
+            replayed_full_graph)
+            << context << " provided no proof of a whole-graph capture plan, "
+                          "executable, or replay. A reused graph does not rerun "
+                          "planning merely to recreate PerfStats evidence.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
         EXPECT_TRUE(captured_full_graph || replayed_full_graph)
             << context << " neither instantiated nor replayed a whole native graph.\n"
             << PerfStatsCollector::summaryString({"forward_graph"});
@@ -3165,10 +3215,15 @@ namespace llaminar2::test::parity::qwen36
         runner->setSkipLogitsGatherPrefill(true);
         runner->setSkipLogitsGatherDecode(true);
 
+        constexpr int kCatchupTargetSampleSlot = 0;
         ASSERT_TRUE(runner->forward(
             prompt_tokens.data(),
             static_cast<int>(prompt_tokens.size())));
-        ASSERT_EQ(runner->sampleGreedyOnDevice(), expected_tokens[0]);
+        int32_t prefill_sample = -1;
+        ASSERT_TRUE(runner->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+            kCatchupTargetSampleSlot,
+            &prefill_sample));
+        ASSERT_EQ(prefill_sample, expected_tokens[0]);
 
         const int base_position = runner->get_position();
         const PrefixStateSnapshot base_checkpoint = runner->captureLivePrefixState();
@@ -3180,10 +3235,16 @@ namespace llaminar2::test::parity::qwen36
         request.allow_speculative_discard = true;
         request.verifier_path = "phase138_first_transaction_regression";
         request.verifier_base_checkpoint = &base_checkpoint;
+        request.device_target_sample_slot = kCatchupTargetSampleSlot;
 
         auto sample_after_forward = [&](int32_t) -> int32_t
         {
-            return runner->sampleGreedyOnDevice();
+            int32_t sampled = -1;
+            return runner->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+                       kCatchupTargetSampleSlot,
+                       &sampled)
+                       ? sampled
+                       : -1;
         };
 
         MTPDecodeCatchupGreedyResult shared =
@@ -4798,17 +4859,29 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_NE(runner, nullptr);
         ASSERT_GT(runner->vocab_size(), 0);
 
+        constexpr int kSetupTargetSampleSlot = 0;
+        constexpr int kCatchupTargetSampleSlot = 1;
+        auto sample_current_to_slot =
+            [&](const char *label, int target_sample_slot) -> int32_t
+        {
+            int32_t sampled = -1;
+            const bool sampled_ok =
+                device.is_gpu()
+                    ? runner->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+                          target_sample_slot,
+                          &sampled)
+                    : ((sampled = runner->sampleGreedyOnDevice()) >= 0);
+            if (!sampled_ok || sampled < 0)
+            {
+                ADD_FAILURE()
+                    << "device-owned greedy sampling failed after " << label;
+                return -1;
+            }
+            return sampled;
+        };
         auto sample_current = [&](const char *label) -> int32_t
         {
-            int32_t sampled = runner->sampleGreedyOnDevice();
-            if (sampled >= 0)
-            {
-                return sampled;
-            }
-            const float *logits = runner->logits();
-            ADD_FAILURE() << "sampleGreedyOnDevice failed after " << label
-                          << "; falling back to host-visible logits";
-            return denseArgmaxToken(logits, runner->vocab_size());
+            return sample_current_to_slot(label, kSetupTargetSampleSlot);
         };
 
         runner->setSuppressTimeline(true);
@@ -4821,35 +4894,47 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_EQ(sample_current("prefill"), expected_tokens[0]);
 
         int32_t token_after_setup = -1;
+        /*
+         * Match the production shifted-MTP ordering exactly. The sampled token
+         * remains in the persistent target slot while the sidecar consumes it;
+         * only after that event-published append do we advance the main graph.
+         * Delaying both sidecar appends until after serial setup would lose the
+         * token-to-terminal-hidden relationship and would require a host replay.
+         */
         for (int i = 0; i < 2; ++i)
         {
             const int32_t token = expected_tokens[static_cast<size_t>(i)];
+            const int setup_sidecar_position = runner->get_position();
+            const bool shifted_row_committed =
+                device.is_gpu()
+                    ? runner->commitMTPShiftedRowFromDeviceTargetSample(
+                          kSetupTargetSampleSlot,
+                          /*already_appended_tokens=*/0,
+                          /*allow_speculative_discard=*/true,
+                          setup_sidecar_position)
+                    : runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+                          token,
+                          /*already_appended_tokens=*/0,
+                          /*allow_speculative_discard=*/true,
+                          setup_sidecar_position);
+            ASSERT_TRUE(shifted_row_committed)
+                << "failed to publish shifted MTP setup row " << i
+                << " from the production condition-token owner";
             ASSERT_TRUE(runner->forward(&token, 1))
                 << "serial setup forward failed at token index " << i;
             token_after_setup = sample_current("serial setup");
         }
         ASSERT_GE(token_after_setup, 0)
             << "serial setup must produce the first verifier input token";
-
-        /*
-         * The shared stepwise verifier publishes shifted-MTP rows before each
-         * accepted main-model forward.  These two setup rows were ordinary
-         * serial decode steps, so prime the shifted cache to the same logical
-         * base position before the M=1..4 proof begins.
-         */
-        const int setup_sidecar_position = runner->get_position();
-        ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
-            expected_tokens[0],
-            /*already_appended_tokens=*/0,
-            /*allow_speculative_discard=*/true,
-            setup_sidecar_position - 2))
-            << "failed to prime shifted MTP cache for first dense setup token";
-        ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
-            expected_tokens[1],
-            /*already_appended_tokens=*/0,
-            /*allow_speculative_discard=*/true,
-            setup_sidecar_position - 1))
-            << "failed to prime shifted MTP cache for second dense setup token";
+        if (device.is_gpu())
+        {
+            ASSERT_TRUE(runner->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+                kCatchupTargetSampleSlot,
+                /*out_token=*/nullptr))
+                << "the verifier-base condition token must be checkpointed in "
+                   "a device-owned consumer slot before diagnostic serial rows "
+                   "overwrite the ordinary sampling slot";
+        }
 
         const PrefixStateSnapshot verifier_base = runner->captureLivePrefixState();
         ASSERT_TRUE(verifier_base.valid);
@@ -4873,6 +4958,16 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base))
             << "decode-equivalent row proof must restore the verifier base "
                "before running the shared production catch-up helper";
+        if (device.is_gpu())
+        {
+            ASSERT_TRUE(runner
+                            ->deviceStochasticTargetSampleSlot(
+                                kCatchupTargetSampleSlot,
+                                /*require_ready=*/true)
+                            .valid())
+                << "prefix restore must preserve the explicitly verifier-owned "
+                   "condition-token event edge";
+        }
 
         const int vocab = runner->vocab_size();
         const int base_sidecar_position = runner->get_position();
@@ -4888,11 +4983,17 @@ namespace llaminar2::test::parity::qwen36
         request.verifier_path = "phase97_dense_decode_equivalent_row_proof";
         request.implementation_name = "shared_stepwise";
         request.verifier_base_checkpoint = &verifier_base;
+        if (device.is_gpu())
+        {
+            request.device_target_sample_slot = kCatchupTargetSampleSlot;
+        }
 
         auto sample_after_forward = [&](int32_t) -> int32_t
         {
             const int32_t sampled =
-                sample_current("dense decode-equivalent catch-up row");
+                sample_current_to_slot(
+                    "dense decode-equivalent catch-up row",
+                    kCatchupTargetSampleSlot);
             const float *logits = runner->logits();
             if (!logits)
             {
@@ -5092,17 +5193,23 @@ namespace llaminar2::test::parity::qwen36
             runner->enableSnapshotCapture();
         }
 
+        constexpr int kSetupTargetSampleSlot = 0;
         auto sample_current = [&](const char *label) -> int32_t
         {
-            int32_t sampled = runner->sampleGreedyOnDevice();
-            if (sampled >= 0)
+            int32_t sampled = -1;
+            const bool sampled_ok =
+                device.is_gpu()
+                    ? runner->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+                          kSetupTargetSampleSlot,
+                          &sampled)
+                    : ((sampled = runner->sampleGreedyOnDevice()) >= 0);
+            if (!sampled_ok || sampled < 0)
             {
-                return sampled;
+                ADD_FAILURE()
+                    << "device-owned greedy sampling failed after " << label;
+                return -1;
             }
-            const float *logits = runner->logits();
-            ADD_FAILURE() << "sampleGreedyOnDevice failed after " << label
-                          << "; falling back to host-visible logits";
-            return denseArgmaxToken(logits, runner->vocab_size());
+            return sampled;
         };
 
         ASSERT_TRUE(runner->forward(
@@ -5372,6 +5479,41 @@ namespace llaminar2::test::parity::qwen36
         stochastic.presence_penalty = 0.25f;
         stochastic.seed = 123;
 
+        /*
+         * Same-seed graph-lifecycle parity is necessary but not sufficient:
+         * two MTP executions can agree on the same stale recurrent/KV state.
+         * Establish the production serial stochastic result first so every
+         * cold, warmup, capture, and replay result has an unambiguous oracle.
+         * This mirrors the MoE stochastic suite and keeps the dense GDN path
+         * honest when graph reuse changes execution ordering.
+         */
+        auto baseline_config =
+            makeDensePrefixRestoreConfig(
+                test_case,
+                model_path,
+                /*enable_prefix_cache=*/false,
+                block_size,
+                /*enable_mtp=*/false);
+        auto baseline =
+            factory->createFromOrchestrationConfig(baseline_config);
+        ASSERT_NE(baseline, nullptr);
+        ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        auto baseline_result =
+            baseline->generate(
+                prompt_tokens,
+                stochastic_decode_steps,
+                stochastic);
+        const auto baseline_snapshot = baseline->prefixStateProbe();
+        baseline->shutdown();
+
+        ASSERT_TRUE(baseline_result.error.empty())
+            << baseline_result.error;
+        ASSERT_EQ(
+            baseline_result.tokens.size(),
+            static_cast<size_t>(stochastic_decode_steps));
+        EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
+        EXPECT_EQ(baseline_snapshot.mtp_stochastic_accept_tests, 0u);
+
         auto mtp_config =
             makeDensePrefixRestoreConfig(
                 test_case,
@@ -5392,6 +5534,30 @@ namespace llaminar2::test::parity::qwen36
         auto mtp_result = mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
         ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
         ASSERT_EQ(mtp_result.tokens.size(), static_cast<size_t>(stochastic_decode_steps));
+        const PrefixRuntimeStateSnapshot initial_mtp_snapshot =
+            mtp->prefixStateProbe();
+        EXPECT_EQ(mtp_result.tokens, baseline_result.tokens)
+            << "Dense stochastic MTP must match serial stochastic decode for "
+               "the same seed on the first request";
+        MTPRuntimeSnapshotComparisonOptions state_comparison;
+        state_comparison.compare_shifted_mtp_kv = false;
+        const MTPStateValidationResult initial_state_match =
+            compareMTPRuntimeStateSnapshots(
+                baseline_snapshot,
+                initial_mtp_snapshot,
+                state_comparison);
+        EXPECT_TRUE(initial_state_match)
+            << "Dense stochastic MTP must leave main KV payload, GDN "
+               "recurrence, short-conv, terminal state, and logical metadata "
+               "serial-row-equivalent after its first graph lifecycle: "
+            << initial_state_match.reason;
+        const auto initial_phase138_records =
+            PerfStatsCollector::snapshot(
+                {"mtp", "tp_collective_runtime", "forward_graph"});
+        expectDenseHomogeneousGPUFullGraphReplay(
+            test_case,
+            initial_phase138_records,
+            test_case.name + " stochastic MTP during first capture");
 
         mtp->clearCache();
         PerfStatsCollector::reset();
@@ -5404,8 +5570,41 @@ namespace llaminar2::test::parity::qwen36
 
         ASSERT_TRUE(reused_mtp_result.error.empty()) << reused_mtp_result.error;
         ASSERT_EQ(reused_mtp_result.tokens.size(), mtp_result.tokens.size());
+        EXPECT_EQ(reused_mtp_result.tokens, baseline_result.tokens)
+            << "Dense stochastic MTP after clearCache() must match serial "
+               "stochastic decode for the same seed";
+        const MTPStateValidationResult reused_state_match =
+            compareMTPRuntimeStateSnapshots(
+                baseline_snapshot,
+                after_reused_mtp,
+                state_comparison);
+        EXPECT_TRUE(reused_state_match)
+            << "Dense stochastic MTP graph replay must preserve serial-row "
+               "equivalence for main KV payload, GDN recurrence, short-conv, "
+               "terminal state, and logical metadata: "
+            << reused_state_match.reason;
         EXPECT_EQ(reused_mtp_result.tokens, mtp_result.tokens)
-            << "Stochastic MTP with the same seed must be reproducible after clearCache()";
+            << "Stochastic MTP with the same seed must be reproducible after "
+               "clearCache().\nfirst-capture acceptance trace:\n"
+            << densePerfCounterTagSummary(
+                   initial_phase138_records,
+                   "mtp",
+                   "acceptance_trace")
+            << "\nreused-graph acceptance trace:\n"
+            << densePerfCounterTagSummary(
+                   phase138_records,
+                   "mtp",
+                   "acceptance_trace")
+            << "\nfirst-request graph phases:\n"
+            << densePerfCounterTagSummary(
+                   initial_phase138_records,
+                   "forward_graph",
+                   "decode_graph_phase")
+            << "\nreused-request graph phases:\n"
+            << densePerfCounterTagSummary(
+                   phase138_records,
+                   "forward_graph",
+                   "decode_graph_phase");
         EXPECT_FALSE(after_reused_mtp.mtp_bypassed) << after_reused_mtp.mtp_bypass_reason;
         EXPECT_EQ(after_reused_mtp.mtp_request.verify_mode, "speculative-sampling");
         EXPECT_TRUE(after_reused_mtp.mtp_request.stochastic_verify);
@@ -5506,27 +5705,38 @@ namespace llaminar2::test::parity::qwen36
                 << "GPU LocalTP Qwen3.6 stochastic MTP must not promote to a "
                    "single-owner all-position publication path\n"
                 << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_TRUE(denseHasPerfCounter(
-                phase138_records,
-                "tp_collective_runtime",
-                "sideband_only_multi_stream_groups"))
-                << "GPU LocalTP stochastic MTP must publish each compact "
-                   "mirrored outcome through the rank-level NCCL/RCCL "
-                   "multi-stream primitive\n"
-                << PerfStatsCollector::summaryString(
-                       {"mtp", "tp_collective_runtime"});
-            EXPECT_TRUE(denseHasPerfRecordTag(
-                phase138_records,
-                "tp_collective_runtime",
-                "sideband_only_multi_stream_groups",
-                "host_rendezvous",
-                "false"));
-            EXPECT_TRUE(denseHasPerfRecordTag(
-                phase138_records,
-                "tp_collective_runtime",
-                "sideband_only_multi_stream_groups",
-                "device_completion_wait",
-                "false"));
+            const bool used_rank_grouped_multi_stream_publication =
+                denseHasPerfCounter(
+                    phase138_records,
+                    "tp_collective_runtime",
+                    "sideband_only_multi_stream_groups");
+            if (test_case.topology == DensePrefixParityTopology::LocalTP)
+            {
+                EXPECT_TRUE(used_rank_grouped_multi_stream_publication)
+                    << "GPU LocalTP stochastic MTP must publish each compact "
+                       "mirrored outcome through the rank-level NCCL/RCCL "
+                       "multi-stream primitive\n"
+                    << PerfStatsCollector::summaryString(
+                           {"mtp", "tp_collective_runtime"});
+                EXPECT_TRUE(denseHasPerfRecordTag(
+                    phase138_records,
+                    "tp_collective_runtime",
+                    "sideband_only_multi_stream_groups",
+                    "host_rendezvous",
+                    "false"));
+                EXPECT_TRUE(denseHasPerfRecordTag(
+                    phase138_records,
+                    "tp_collective_runtime",
+                    "sideband_only_multi_stream_groups",
+                    "device_completion_wait",
+                    "false"));
+            }
+            else
+            {
+                EXPECT_FALSE(used_rank_grouped_multi_stream_publication)
+                    << "SingleDevice stochastic MTP must publish locally and "
+                       "must not enter a rank-level collective.";
+            }
         }
         else
         {

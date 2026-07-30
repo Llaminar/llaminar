@@ -372,9 +372,15 @@ namespace
             return snapshot;
         }
 
-        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override
+        PrefixStateSnapshot captureLivePrefixCheckpoint(
+            const PrefixCheckpointCaptureRequest &request) const override
         {
-            return captureLivePrefixState(seq_idx);
+            PrefixStateSnapshot snapshot =
+                captureLivePrefixState(request.sequence_index);
+            if (!request.valid())
+                return {};
+            snapshot.cached_tokens = request.logical_cached_tokens;
+            return snapshot;
         }
 
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override

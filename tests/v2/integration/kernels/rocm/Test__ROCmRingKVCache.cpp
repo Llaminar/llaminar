@@ -503,6 +503,9 @@ TEST(Test__ROCmRingKVCache, DeviceResidentSequenceStatePublicationRemainsDeviceO
     device_request.target_cached_tokens_device = d_target;
     device_request.accepted_state_counts_device = d_accepted;
     device_request.publication_ok_flags_device = d_ok;
+    device_request.basis =
+        IKVCache::DeviceSequenceStatePublicationBasis::
+            CurrentVisibleWindow;
     device_request.stream = stream.opaque();
     std::string device_error;
     ASSERT_TRUE(cache->publishSequenceStateFromDeviceMetadata(device_request, &device_error))
@@ -541,6 +544,169 @@ TEST(Test__ROCmRingKVCache, DeviceResidentSequenceStatePublicationRemainsDeviceO
     (void)hipFree(d_ok);
     (void)hipFree(d_accepted);
     (void)hipFree(d_target);
+    (void)hipFree(d_V);
+    (void)hipFree(d_K);
+}
+
+/**
+ * @brief Captured-base publication commits every cache layer, not only layer zero.
+ *
+ * A grouped verifier advances all attention layers through its complete physical
+ * row set. Accepted-state publication must then derive every canonical
+ * head/count pair from the same immutable pre-verifier checkpoint. This
+ * regression uses more than one layer because a single-layer fixture cannot
+ * detect incomplete two-dimensional publication launch geometry.
+ */
+TEST(Test__ROCmRingKVCache, CapturedBasePublicationCommitsEveryLayer)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int n_layers = 4;
+    constexpr int batch_size = 1;
+    constexpr int max_seq_len = 16;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 16;
+    constexpr int kv_dim = n_kv_heads * head_dim;
+    constexpr int base_tokens = 6;
+    constexpr int verifier_rows = 2;
+    constexpr int accepted_rows = 1;
+    constexpr int target_tokens = base_tokens + accepted_rows;
+
+    auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
+    ASSERT_NE(cache, nullptr);
+    ScopedWorkspaceBinding workspace(
+        cache.get(), DeviceId::rocm(0),
+        max_seq_len, batch_size, head_dim);
+    ScopedHipStream stream;
+
+    auto h_K = generateRandomFP32(base_tokens * kv_dim, 20260730);
+    auto h_V = generateRandomFP32(base_tokens * kv_dim, 20260731);
+    float *d_K = nullptr;
+    float *d_V = nullptr;
+    ASSERT_EQ(
+        hipMalloc(&d_K, base_tokens * kv_dim * sizeof(float)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMalloc(&d_V, base_tokens * kv_dim * sizeof(float)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            d_K, h_K.data(), base_tokens * kv_dim * sizeof(float),
+            hipMemcpyHostToDevice, stream.stream()),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            d_V, h_V.data(), base_tokens * kv_dim * sizeof(float),
+            hipMemcpyHostToDevice, stream.stream()),
+        hipSuccess);
+    for (int layer = 0; layer < n_layers; ++layer)
+    {
+        ASSERT_TRUE(cache->append(
+            layer, 0, d_K, d_V, base_tokens, stream.stream()));
+    }
+
+    const size_t checkpoint_bytes =
+        cache->deviceSequenceStateCheckpointBytes();
+    ASSERT_EQ(
+        checkpoint_bytes,
+        static_cast<size_t>(2 * n_layers) * sizeof(int32_t));
+    int32_t *d_checkpoint = nullptr;
+    ASSERT_EQ(hipMalloc(&d_checkpoint, checkpoint_bytes), hipSuccess);
+    std::string checkpoint_error;
+    ASSERT_TRUE(cache->captureDeviceSequenceStateCheckpoint(
+        0,
+        d_checkpoint,
+        checkpoint_bytes,
+        stream.opaque(),
+        &checkpoint_error))
+        << checkpoint_error;
+
+    for (int layer = 0; layer < n_layers; ++layer)
+    {
+        ASSERT_TRUE(cache->append(
+            layer, 0, d_K, d_V, verifier_rows, stream.stream()));
+    }
+
+    int32_t *d_target = nullptr;
+    int32_t *d_accepted = nullptr;
+    int32_t *d_ok = nullptr;
+    const int32_t h_target = target_tokens;
+    const int32_t h_accepted = accepted_rows;
+    const int32_t h_ok = 1;
+    ASSERT_EQ(hipMalloc(&d_target, sizeof(int32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_accepted, sizeof(int32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_ok, sizeof(int32_t)), hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            d_target, &h_target, sizeof(int32_t),
+            hipMemcpyHostToDevice, stream.stream()),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            d_accepted, &h_accepted, sizeof(int32_t),
+            hipMemcpyHostToDevice, stream.stream()),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            d_ok, &h_ok, sizeof(int32_t),
+            hipMemcpyHostToDevice, stream.stream()),
+        hipSuccess);
+
+    IKVCache::DeviceSequenceStatePublicationRequest request;
+    request.request_count = 1;
+    request.first_seq_idx = 0;
+    request.target_cached_tokens_device = d_target;
+    request.accepted_state_counts_device = d_accepted;
+    request.publication_ok_flags_device = d_ok;
+    request.basis =
+        IKVCache::DeviceSequenceStatePublicationBasis::CapturedBase;
+    request.base_sequence_state_checkpoint_device = d_checkpoint;
+    request.base_sequence_state_checkpoint_bytes = checkpoint_bytes;
+    request.stream = stream.opaque();
+    std::string publication_error;
+    ASSERT_TRUE(cache->publishSequenceStateFromDeviceMetadata(
+        request, &publication_error))
+        << publication_error;
+
+    std::array<int, n_layers> heads{};
+    std::array<int, n_layers> counts{};
+    for (int layer = 0; layer < n_layers; ++layer)
+    {
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                &heads[static_cast<size_t>(layer)],
+                cache->deviceRingHeadPtr(layer, 0),
+                sizeof(int),
+                hipMemcpyDeviceToHost,
+                stream.stream()),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                &counts[static_cast<size_t>(layer)],
+                cache->deviceCachedTokenCountPtr(layer, 0),
+                sizeof(int),
+                hipMemcpyDeviceToHost,
+                stream.stream()),
+            hipSuccess);
+    }
+    stream.synchronize();
+
+    for (int layer = 0; layer < n_layers; ++layer)
+    {
+        EXPECT_EQ(heads[static_cast<size_t>(layer)], target_tokens)
+            << "layer=" << layer;
+        EXPECT_EQ(counts[static_cast<size_t>(layer)], target_tokens)
+            << "layer=" << layer;
+    }
+
+    (void)hipFree(d_ok);
+    (void)hipFree(d_accepted);
+    (void)hipFree(d_target);
+    (void)hipFree(d_checkpoint);
     (void)hipFree(d_V);
     (void)hipFree(d_K);
 }
