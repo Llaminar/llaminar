@@ -707,7 +707,8 @@ namespace llaminar2
             ffn_layer_idx,
             input.seq_len,
             input.batch_size,
-            device);
+            device,
+            input.device_state_publication_stream);
         if (ffn.size() == 0)
             return ComputeGraph{};
 

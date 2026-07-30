@@ -493,9 +493,11 @@ namespace
         auto *cuda_cache = dynamic_cast<llaminar2::ICUDARingKVCache *>(cache);
         if (!cuda_cache)
             throw std::runtime_error("hybrid cache does not expose ICUDARingKVCache");
-        if (!cuda_cache->append(layer, 0, d_k.ptr, d_v.ptr, tokens, 0))
+        CudaStream stream;
+        if (!cuda_cache->append(
+                layer, 0, d_k.ptr, d_v.ptr, tokens, stream.stream))
             throw std::runtime_error("ICUDARingKVCache append failed");
-        checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after KV append");
+        stream.synchronize("cudaStreamSynchronize after KV append");
     }
 
     /// @brief Copies one device-owned sequence metadata integer back for assertions.

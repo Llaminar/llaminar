@@ -9849,6 +9849,28 @@ add_v2_test(V2_Unit_QwenStandardGraph_PPLayerRange
     LABELS "V2;Unit;Models;Qwen2;QwenStandardGraph;PipelineParallelism;Regression"
 )
 
+# Test: GPU PP residual-fusion lowering with real publication streams.
+add_executable(
+    v2_integration_qwen_standard_graph_gpu_residual_fusion
+    integration/models/qwen/Test__QwenStandardGraph_GPUResidualFusion.cpp
+)
+target_include_directories(
+    v2_integration_qwen_standard_graph_gpu_residual_fusion
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(
+    v2_integration_qwen_standard_graph_gpu_residual_fusion
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_QwenStandardGraph_GPUResidualFusion
+    COMMAND $<TARGET_FILE:v2_integration_qwen_standard_graph_gpu_residual_fusion>
+    MPI_PROCS 1
+    LABELS "V2;Integration;GPU;CUDA;ROCm;Models;Qwen2;QwenStandardGraph;PipelineParallelism;Regression;Synchronization"
+)
+
 # Test: PlacementStrategy and PlacementPlan (weight/compute placement algorithms)
 add_executable(v2_test_placement_strategy unit/execution/mpi_orchestration/Test__PlacementStrategy.cpp)
 target_link_libraries(v2_test_placement_strategy 
@@ -13757,7 +13779,7 @@ add_v2_test(V2_Unit_Qwen35MoEGraph
 )
 
 # Test: Qwen35MoEGraphNativeProductionLowering — graph-native overlay lowering regressions
-add_executable(v2_test_qwen35moe_graph_native_production_lowering unit/models/qwen35moe/Test__Qwen35MoEGraphNativeProductionLowering.cpp)
+add_executable(v2_test_qwen35moe_graph_native_production_lowering integration/models/qwen35moe/Test__Qwen35MoEGraphNativeProductionLowering.cpp)
 target_link_libraries(v2_test_qwen35moe_graph_native_production_lowering
     llaminar2_core
     GTest::gtest
@@ -13766,9 +13788,9 @@ target_link_libraries(v2_test_qwen35moe_graph_native_production_lowering
 target_include_directories(v2_test_qwen35moe_graph_native_production_lowering PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-add_v2_test(V2_Unit_Qwen35MoEGraphNativeProductionLowering
+add_v2_test(V2_Integration_Qwen35MoEGraphNativeProductionLowering
     COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
-    LABELS "V2;Unit;Qwen35MoE;Graph;MixtureOfExperts;GraphNativeOverlay"
+    LABELS "V2;Integration;Qwen35MoE;Graph;MixtureOfExperts;GraphNativeOverlay;GPU"
     MPI_PROCS 1
 )
 

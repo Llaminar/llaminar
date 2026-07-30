@@ -339,7 +339,9 @@ TEST(Test__CUDARingKVCache, BasicAppendRetrieve_FP32)
     cudaMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
     // Append to cache (layer 0)
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, num_tokens, stream.stream()));
+    stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
     EXPECT_FALSE(cache->is_wrapped(0, 0)); // Should not be wrapped yet
 
@@ -677,6 +679,7 @@ TEST(Test__CUDARingKVCache, WrapAround_FP32)
         ActivationPrecision::FP32,
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
     ASSERT_NE(cache, nullptr);
+    ScopedCudaStream stream;
 
     // Phase 1: Fill buffer with 6 tokens [T0..T5]
     const int phase1_tokens = 6;
@@ -690,7 +693,9 @@ TEST(Test__CUDARingKVCache, WrapAround_FP32)
     cudaMemcpy(d_K, h_K1.data(), phase1_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V1.data(), phase1_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, phase1_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, phase1_tokens, stream.stream()));
+    stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 6);
     EXPECT_EQ(cache->get_head_position(0, 0), 6);
     EXPECT_FALSE(cache->is_wrapped(0, 0));
@@ -706,7 +711,9 @@ TEST(Test__CUDARingKVCache, WrapAround_FP32)
     cudaMemcpy(d_K, h_K2.data(), phase2_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V2.data(), phase2_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, phase2_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, phase2_tokens, stream.stream()));
+    stream.synchronize();
 
     // The canonical count clamps at capacity, retaining T2 through T9.
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 8);
@@ -784,6 +791,7 @@ TEST(Test__CUDARingKVCache, Eviction_O1)
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP32,
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ScopedCudaStream stream;
 
     // Fill with 50 tokens
     auto h_K = generateRandomFP32(50 * kv_dim);
@@ -795,7 +803,9 @@ TEST(Test__CUDARingKVCache, Eviction_O1)
     cudaMemcpy(d_K, h_K.data(), 50 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V.data(), 50 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    cache->append(0, 0, d_K, d_V, 50, 0);
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, 50, stream.stream()));
+    stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 50);
 
     // Evict 20 tokens - should be O(1), no kernel launch
@@ -855,6 +865,7 @@ TEST(Test__CUDARingKVCache, SlidingWindow)
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP32,
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ScopedCudaStream stream;
 
     float *d_K, *d_V;
     cudaMalloc(&d_K, kv_dim * sizeof(float));
@@ -870,7 +881,9 @@ TEST(Test__CUDARingKVCache, SlidingWindow)
         cudaMemcpy(d_V, h_V.data(), kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
         // Append 1 token
-        cache->append(0, 0, d_K, d_V, 1, 0);
+        ASSERT_TRUE(cache->append(
+            0, 0, d_K, d_V, 1, stream.stream()));
+        stream.synchronize();
 
         // Cache should never exceed window size (auto-evicts)
         EXPECT_LE(cache->get_cached_tokens(0, 0), max_seq_len);
@@ -1005,6 +1018,7 @@ TEST(Test__CUDARingKVCache, ContiguousOptimization)
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP32,
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ScopedCudaStream stream;
 
     // Append tokens without wrapping
     auto h_K = generateRandomFP32(30 * kv_dim);
@@ -1016,7 +1030,9 @@ TEST(Test__CUDARingKVCache, ContiguousOptimization)
     cudaMemcpy(d_K, h_K.data(), 30 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V.data(), 30 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    cache->append(0, 0, d_K, d_V, 30, 0);
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, 30, stream.stream()));
+    stream.synchronize();
 
     // Should NOT be wrapped
     EXPECT_FALSE(cache->is_wrapped(0, 0));
@@ -1063,6 +1079,7 @@ TEST(Test__CUDARingKVCache, ClearOperations)
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP32,
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ScopedCudaStream stream;
 
     // Fill all layers and sequences
     auto h_K = generateRandomFP32(10 * kv_dim);
@@ -1078,9 +1095,11 @@ TEST(Test__CUDARingKVCache, ClearOperations)
     {
         for (int seq = 0; seq < batch_size; ++seq)
         {
-            cache->append(layer, seq, d_K, d_V, 10, 0);
+            ASSERT_TRUE(cache->append(
+                layer, seq, d_K, d_V, 10, stream.stream()));
         }
     }
+    stream.synchronize();
 
     // Verify all filled
     for (int layer = 0; layer < n_layers; ++layer)
@@ -1151,6 +1170,7 @@ TEST(Test__CUDARingKVCache, MultiPrecision_FP16)
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
     ASSERT_NE(cache, nullptr);
     EXPECT_EQ(cache->precision(), ActivationPrecision::FP16);
+    ScopedCudaStream stream;
 
     // Generate FP32 data and convert to FP16
     auto h_K_fp32 = generateRandomFP32(10 * kv_dim);
@@ -1170,7 +1190,9 @@ TEST(Test__CUDARingKVCache, MultiPrecision_FP16)
     cudaMemcpy(d_K, h_K_fp16.data(), 10 * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V_fp16.data(), 10 * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 10, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, 10, stream.stream()));
+    stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 10);
 
     const void *d_K_out, *d_V_out;
@@ -1622,10 +1644,19 @@ TEST(Test__CUDARingKVCache, AppendWithStream_RejectsNullAndAcceptsExplicitStream
         V_tensor->mutable_data()[i] = -0.0625f * static_cast<float>((i % 5) - 2);
     }
 
-    EXPECT_FALSE(cache->appendWithStream(0, 0,
-                                         static_cast<const ITensor *>(K_tensor.get()),
-                                         static_cast<const ITensor *>(V_tensor.get()),
-                                         num_tokens, nullptr));
+    EXPECT_THROW(
+        cache->appendWithStream(
+            0,
+            0,
+            static_cast<const ITensor *>(K_tensor.get()),
+            static_cast<const ITensor *>(V_tensor.get()),
+            num_tokens,
+            nullptr),
+        std::invalid_argument);
+    EXPECT_THROW(
+        cache->resetRequestState(
+            IKVCache::StateResetContext::testReinitialization(nullptr)),
+        std::invalid_argument);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 
     ScopedCudaStream stream;
@@ -1836,6 +1867,7 @@ TEST(Test__CUDARingKVCache, MultiPrecision_BF16)
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
     ASSERT_NE(cache, nullptr);
     EXPECT_EQ(cache->precision(), ActivationPrecision::BF16);
+    ScopedCudaStream stream;
 
     // Generate FP32 data and convert to BF16
     auto h_K_fp32 = generateRandomFP32(10 * kv_dim);
@@ -1855,7 +1887,9 @@ TEST(Test__CUDARingKVCache, MultiPrecision_BF16)
     cudaMemcpy(d_K, h_K_bf16.data(), 10 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V_bf16.data(), 10 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 10, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, 10, stream.stream()));
+    stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 10);
 
     const void *d_K_out, *d_V_out;

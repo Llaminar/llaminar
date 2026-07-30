@@ -772,12 +772,12 @@ namespace llaminar2
          *
          * Prefix restore is a replacement of live request state with a cached
          * prefix snapshot.  KV/GDN/MTP/logical sequence owners are always
-         * cleared before importing the snapshot.  Model-local runtime state is
-         * cleared only when the prefix entry has no explicit model-runtime
-         * snapshot; otherwise the caller restores that owner immediately after
-         * this reset.  Replay-safe graph captures are discarded here because a
-         * restored prefix may replace device-side pointer tables, mailboxes, or
-         * recurrent payloads captured by earlier request execution.
+         * cleared before importing the snapshot. Model-local runtime state is
+         * restored to its immutable baseline only when the prefix entry has no
+         * explicit model-runtime snapshot; otherwise the caller restores that
+         * owner immediately after this reset. Both paths mutate contents behind
+         * model-lifetime device addresses and publish one event, so replay-safe
+         * graph captures remain valid.
          */
         static InferenceStateResetRequest prefixRestoreBoundary(
             const char *why,
@@ -790,7 +790,7 @@ namespace llaminar2
             request.reset_mtp = true;
             request.reset_model_runtime = reset_model_runtime_owner;
             request.reset_logical_sequence = true;
-            request.preserve_replay_safe_graphs = false;
+            request.preserve_replay_safe_graphs = true;
             request.reason = why ? why : "prefix-restore";
             return request;
         }

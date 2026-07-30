@@ -138,6 +138,16 @@ namespace llaminar2
          * attention, or decode consumer observes the restored state.
          */
         bool rehydrate_prefix_runtime_on_device = false;
+        /**
+         * @brief Exact producer stream for model-owned GPU state publication.
+         *
+         * Graph construction may perform one-time publication of immutable
+         * descriptor tables whose addresses are captured by later graph nodes.
+         * GPU callers must provide the explicit stream that owns those writes;
+         * builders must never substitute the legacy null/default stream.
+         * CPU graph construction leaves this null.
+         */
+        void *device_state_publication_stream = nullptr;
         DeviceId device = DeviceId::cpu(); ///< Target device
         IKVCache *kv_cache = nullptr;      ///< KV cache (optional)
 
@@ -245,6 +255,14 @@ namespace llaminar2
         int seq_len = 0;                   ///< Sequence length
         int batch_size = 1;                ///< Batch size (number of sequences)
         DeviceId device = DeviceId::cpu(); ///< Target device
+        /**
+         * @brief Exact producer stream for model-owned GPU state publication.
+         *
+         * GPU layer-graph callers must provide the stream that owns any
+         * graph-build descriptor writes. CPU callers explicitly leave this
+         * null because their graph construction is synchronous.
+         */
+        void *device_state_publication_stream = nullptr;
         const int *position_ids = nullptr; ///< Host position IDs for RoPE
         const void *position_ids_device = nullptr; ///< Device INT32 position IDs for GPU RoPE
         IKVCache *kv_cache = nullptr;      ///< KV cache
@@ -646,7 +664,27 @@ namespace llaminar2
             return {};
         }
 
-        /// Build FFN block sub-graph for a single layer
+        /**
+         * @brief Build the FFN subgraph for one transformer layer.
+         *
+         * GPU graph construction may publish model-owned side state, such as
+         * the active MoE runtime-table bank. The caller must therefore supply
+         * the exact stream that owns those writes. Implementations must reject
+         * a null stream for GPU devices before allocating, copying, or
+         * publishing device state. CPU construction is synchronous and names
+         * that fact explicitly by passing `nullptr`.
+         *
+         * @param layer Layer weights consumed by the FFN stages.
+         * @param buffers Activation buffers bound into the generated graph.
+         * @param layer_idx Model layer index.
+         * @param seq_len Sequence length represented by this graph.
+         * @param batch_size Number of request rows represented by this graph.
+         * @param device Device on which the graph will execute.
+         * @param device_state_publication_stream Exact producer stream for GPU
+         *        graph-build publications; `nullptr` is legal only for CPU.
+         * @param sequence_lengths_device Optional device-resident real-length
+         *        array used by padded grouped execution.
+         */
         virtual ComputeGraph buildFFNGraph(
             const LayerWeights &layer,
             ActivationBuffers &buffers,
@@ -654,6 +692,7 @@ namespace llaminar2
             int seq_len,
             int batch_size,
             DeviceId device,
+            void *device_state_publication_stream,
             const int32_t *sequence_lengths_device = nullptr)
         {
             (void)layer;
@@ -662,6 +701,7 @@ namespace llaminar2
             (void)seq_len;
             (void)batch_size;
             (void)device;
+            (void)device_state_publication_stream;
             (void)sequence_lengths_device;
             return {};
         }

@@ -169,6 +169,33 @@ namespace llaminar2
         };
 
         /**
+         * @brief Reject an omitted stream at a GPU cache API boundary.
+         *
+         * GPU cache mutation is asynchronous and therefore has no meaningful
+         * ordering contract without the exact producer stream. Concrete CUDA
+         * and ROCm caches call this before validating any other argument so a
+         * missing stream cannot be reported as a generic cache failure or
+         * silently replaced with a backend default stream.
+         *
+         * CPU caches do not call this helper: their synchronous mutations
+         * intentionally use a null stream.
+         *
+         * @param execution_stream Exact CUDA/HIP stream for the operation.
+         * @param operation Human-readable API name included in diagnostics.
+         * @throws std::invalid_argument when @p execution_stream is null.
+         */
+        static void requireGPUExecutionStream(
+            void *execution_stream,
+            const char *operation)
+        {
+            if (execution_stream)
+                return;
+            throw std::invalid_argument(
+                std::string(operation ? operation : "GPU KV cache operation") +
+                " requires an explicit non-null execution stream");
+        }
+
+        /**
          * @brief Bind this cache to one immutable orchestration lifetime.
          *
          * Binding is idempotent only for the exact same identity.  Conflicting

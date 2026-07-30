@@ -3186,7 +3186,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ClearCachePreservesReplaySafeMTPGraphCa
         << "Typed non-preserving reset boundaries still need reset telemetry.";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, PrefixRestoreWithoutModelRuntimeInvalidatesMTPSidecarGraphs)
+TEST(Test__GpuWorkspaceAllocationPolicy, PrefixRestorePreservesStableMTPSidecarGraphs)
 {
     const auto header =
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
@@ -3199,58 +3199,96 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixRestoreWithoutModelRuntimeInvalid
         header,
         "void resetInferenceState(const InferenceStateResetRequest &request) override",
         "void clear_cache() override")));
-    const auto invalidation_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
-        source,
-        "void DeviceGraphOrchestrator::invalidateMTPSidecarDepth0GraphState(",
-        "void DeviceGraphOrchestrator::resetMTPSidecarDepth0ReplayState()")));
-    const auto invalidation_body_with_strings = removeAsciiWhitespace(sliceBetween(
-        source,
-        "void DeviceGraphOrchestrator::invalidateMTPSidecarDepth0GraphState(",
-        "void DeviceGraphOrchestrator::resetMTPSidecarDepth0ReplayState()"));
+    const auto compact_source =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
 
     /*
      * Regression guard for prefix-cache + MTP + MoE LocalTP: a restored prefix
      * block may contain live KV/GDN/MTP payloads but no graph-owned
-     * model-runtime placement snapshot.  That boundary resets MoE runtime
-     * tables, so cached MTP sidecar graphs must be destroyed and rebuilt rather
-     * than merely resetting replay handles while leaving stale stage metadata.
+     * model-runtime placement snapshot. The no-payload path restores the
+     * immutable initial MoE state behind model-lifetime device addresses. Since
+     * neither captured pointers nor graph topology change, sidecar executables
+     * must survive the boundary and consume the reset-ready event.
      */
-    EXPECT_NE(compact_header.find("voidinvalidateMTPSidecarDepth0GraphState(constchar*reason);"),
+    EXPECT_EQ(compact_header.find("invalidateMTPSidecarDepth0GraphState"),
               std::string::npos)
-        << "MTP sidecar graph invalidation must remain a named coherence operation.";
+        << "Stable-address prefix restore must not retain a graph-invalidation escape hatch.";
+    EXPECT_EQ(compact_source.find("invalidateMTPSidecarDepth0GraphState"),
+              std::string::npos)
+        << "The obsolete prefix graph-invalidation implementation must stay retired.";
     EXPECT_NE(reset_body.find(
-                  "constboolprefix_restore_resets_model_runtime_owner=prefix_restore_boundary&&request.reset_model_runtime;"),
+                  "if(!request.preserve_replay_safe_graphs){throwstd::invalid_argument("),
               std::string::npos)
-        << "Prefix restore needs an explicit no-model-runtime-snapshot predicate.";
+        << "Prefix restore must reject requests that attempt to discard replay-safe captures.";
     EXPECT_NE(reset_body.find(
-                  "elseif(prefix_restore_resets_model_runtime_owner){invalidateMTPSidecarDepth0GraphState(reset_reason);}"),
+                  "if(preserve_replay_safe_graphs){mtp_sidecar_depth0_cache_.resetSessionStatePreservingGraphReplay();"),
               std::string::npos)
-        << "Prefix restore without model-runtime state must invalidate sidecar graphs.";
-    expectNeedleBefore(
-        reset_body,
-        "invalidateMTPSidecarDepth0GraphState(reset_reason);",
-        "mtp_sidecar_depth0_cache_.resetSessionState();",
-        "The no-snapshot prefix restore branch must bypass stale-graph resetSessionState().");
+        << "Prefix restore must retain the ordinary MTP sidecar executable.";
     EXPECT_NE(reset_body.find(
-                  "elseif(!prefix_restore_resets_model_runtime_owner)cache->resetSessionState();"),
+                  "mtp_sidecar_depth0_device_token_cache_.resetSessionStatePreservingGraphReplay();"),
               std::string::npos)
-        << "Batched KV-only MTP sidecar caches must not survive the no-snapshot restore branch.";
+        << "The production stochastic sidecar executable must remain replay-hot.";
+    EXPECT_NE(reset_body.find(
+                  "mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionStatePreservingGraphReplay();"),
+              std::string::npos)
+        << "KV-only device-token sidecars share the stable-address lifetime.";
+    EXPECT_NE(reset_body.find(
+                  "if(preserve_replay_safe_graphs)cache->resetSessionStatePreservingGraphReplay();"),
+              std::string::npos)
+        << "Batched KV-only sidecars must preserve their graph executables too.";
+    EXPECT_EQ(source.find("sidecar_graph_invalidations"), std::string::npos)
+        << "Prefix restore must not report graph invalidation after stable-address restoration.";
+}
 
-    EXPECT_NE(invalidation_body.find("mtp_sidecar_depth0_device_token_cache_.invalidate();"),
-              std::string::npos)
-        << "Device-token sidecars were the observed stale cache hit and must be destroyed.";
-    EXPECT_NE(invalidation_body.find("mtp_sidecar_depth0_kv_only_device_token_cache_.invalidate();"),
-              std::string::npos)
-        << "KV-only device-token sidecars follow the same runtime-table lifetime.";
-    EXPECT_NE(invalidation_body.find("cache->invalidate();"), std::string::npos)
-        << "Batched KV-only sidecar caches must be invalidated as a group.";
-    EXPECT_NE(invalidation_body_with_strings.find(
-                  "PerfStatsCollector::addCounter(\"mtp\",\"sidecar_graph_invalidations\""),
-              std::string::npos)
-        << "Perfstats must expose that prefix restore invalidated MTP sidecar graphs.";
-    EXPECT_NE(invalidation_body_with_strings.find("tags[\"reason\"]=reason?reason:\"unknown\";"),
-              std::string::npos)
-        << "The invalidation counter should identify the reset boundary.";
+TEST(Test__GpuWorkspaceAllocationPolicy, GraphBuildPublicationStreamHasNoAmbientBuilderState)
+{
+    const auto interface_source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/graph/IGraphBuilder.h");
+    const auto qwen_header =
+        readFile(repoRoot() / "src/v2/models/qwen/QwenGraphBase.h");
+    const auto qwen_source =
+        readFile(repoRoot() / "src/v2/models/qwen/QwenGraphBase.cpp");
+    const auto moe_source =
+        readFile(repoRoot() / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp");
+    const auto orchestrator_header =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+
+    const auto compact_interface =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(interface_source));
+    const auto compact_qwen_header =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(qwen_header));
+    const auto compact_qwen_source =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(qwen_source));
+    const auto compact_moe_source =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(moe_source));
+    const auto compact_orchestrator_header =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(orchestrator_header));
+
+    EXPECT_NE(
+        compact_interface.find(
+            "void*device_state_publication_stream=nullptr;constint*position_ids"),
+        std::string::npos)
+        << "LayerContext must carry graph-build publication ownership as an explicit value.";
+    EXPECT_NE(
+        compact_interface.find(
+            "DeviceIddevice,void*device_state_publication_stream,constint32_t*sequence_lengths_device=nullptr"),
+        std::string::npos)
+        << "Every direct FFN graph build must name its publication stream.";
+    EXPECT_EQ(
+        compact_qwen_header.find("device_state_publication_stream_"),
+        std::string::npos)
+        << "The Qwen builder must not cache a producer stream as ambient mutable state.";
+    EXPECT_EQ(
+        compact_qwen_source.find("device_state_publication_stream_"),
+        std::string::npos);
+    EXPECT_EQ(
+        compact_moe_source.find("device_state_publication_stream_"),
+        std::string::npos);
+    EXPECT_NE(
+        compact_orchestrator_header.find(
+            "FFNGraphSession&withDeviceStatePublicationStream(void*stream);"),
+        std::string::npos)
+        << "The fluent orchestrator API must expose the publication dependency at the call site.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, DeviceResidentHostAdoptionApiIsRetired)
@@ -7460,6 +7498,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUKVLogicalBlockAccessRequiresExplicit
         readFile(repoRoot() / "src/v2/kernels/cuda/kvcache/CUDARingKVCache.cu");
     const auto rocm_source =
         readFile(repoRoot() / "src/v2/kernels/rocm/kvcache/ROCmRingKVCache.cpp");
+    const auto cuda_tq_source =
+        readFile(repoRoot() / "src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu");
+    const auto rocm_tq_source =
+        readFile(repoRoot() / "src/v2/kernels/rocm/kvcache/ROCmRingKVCacheTQ.hip");
 
     const auto cuda_export = sliceBetween(
         cuda_source,
@@ -7477,6 +7519,22 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUKVLogicalBlockAccessRequiresExplicit
         rocm_source,
         "bool ROCmRingKVCache<Precision>::importLogicalBlock(",
         "bool ROCmRingKVCache<Precision>::truncateSequence(");
+    const auto cuda_tq_export = sliceBetween(
+        cuda_tq_source,
+        "bool CUDARingKVCacheTQ::exportLogicalBlock(",
+        "bool CUDARingKVCacheTQ::importLogicalBlock(");
+    const auto cuda_tq_import = sliceBetween(
+        cuda_tq_source,
+        "bool CUDARingKVCacheTQ::importLogicalBlock(",
+        "bool CUDARingKVCacheTQ::get_kv(");
+    const auto rocm_tq_export = sliceBetween(
+        rocm_tq_source,
+        "bool ROCmRingKVCacheTQ::exportLogicalBlock(",
+        "bool ROCmRingKVCacheTQ::importLogicalBlock(");
+    const auto rocm_tq_import = sliceBetween(
+        rocm_tq_source,
+        "bool ROCmRingKVCacheTQ::importLogicalBlock(",
+        "bool ROCmRingKVCacheTQ::get_kv(");
 
     const auto compact_interface =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(interface_source));
@@ -7485,6 +7543,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUKVLogicalBlockAccessRequiresExplicit
         removeAsciiWhitespace(stripCommentsAndStringLiterals(cuda_import)),
         removeAsciiWhitespace(stripCommentsAndStringLiterals(rocm_export)),
         removeAsciiWhitespace(stripCommentsAndStringLiterals(rocm_import)),
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(cuda_tq_export)),
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(cuda_tq_import)),
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(rocm_tq_export)),
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(rocm_tq_import)),
     };
 
     EXPECT_NE(interface_source.find("GPU implementations require @ref stream"),
@@ -7496,8 +7558,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUKVLogicalBlockAccessRequiresExplicit
 
     for (const auto &body : bodies)
     {
-        EXPECT_NE(body.find("if(!desc.stream)"), std::string::npos)
-            << "GPU logical KV import/export must fail fast when no explicit stream is supplied.";
+        EXPECT_NE(
+            body.find("requireGPUExecutionStream(desc.stream,"),
+            std::string::npos)
+            << "Every ordinary and TurboQuant GPU logical KV operation must "
+               "throw at its API boundary when no exact stream is supplied.";
         EXPECT_EQ(body.find("getEffectiveStream(nullptr)"), std::string::npos)
             << "GPU logical KV import/export must not quietly fall back to a default stream.";
     }
@@ -8427,8 +8492,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDARingKVCacheGroupedGatherHasNoRawAll
     expectNoRawGpuAllocationCalls(gather_body, "CUDARingKVCache::gather_kv_batched");
     const auto compact =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(gather_body));
-    EXPECT_NE(compact.find("!stream"), std::string::npos)
-        << "Grouped gather must reject the device-default stream.";
+    EXPECT_NE(
+        compact.find(
+            "requireGPUExecutionStream(static_cast<void*>(stream),"),
+        std::string::npos)
+        << "Grouped gather must throw before a device-default stream can be used.";
     EXPECT_NE(compact.find("d_head_params_"), std::string::npos);
     EXPECT_NE(compact.find("d_count_params_"), std::string::npos)
         << "Grouped gather must consume canonical device ring state.";
@@ -8464,8 +8532,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPURequestBatchedKVViewsRemainDeviceOwn
     {
         const auto compact =
             removeAsciiWhitespace(stripCommentsAndStringLiterals(view));
-        EXPECT_NE(compact.find("!gpu_stream"), std::string::npos)
-            << "Native grouped KV reads must reject the device-default stream.";
+        EXPECT_NE(
+            compact.find("requireGPUExecutionStream(gpu_stream,"),
+            std::string::npos)
+            << "Native grouped KV reads must throw before a device-default "
+               "stream can be used.";
         EXPECT_NE(compact.find("d_head_params_"), std::string::npos);
         EXPECT_NE(compact.find("d_count_params_"), std::string::npos)
             << "Grouped attention must read graph-ordered cache counts on device.";

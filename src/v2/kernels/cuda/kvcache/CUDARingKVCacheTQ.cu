@@ -466,7 +466,10 @@ namespace llaminar2
 
     bool CUDARingKVCacheTQ::publishBatchedEntryTables(cudaStream_t stream)
     {
-        if (!stream || n_layers_ <= 0 || batch_size_ <= 0)
+        requireGPUExecutionStream(
+            static_cast<void *>(stream),
+            "CUDARingKVCacheTQ::publishBatchedEntryTables");
+        if (n_layers_ <= 0 || batch_size_ <= 0)
             return false;
 
         const size_t entry_count =
@@ -589,16 +592,13 @@ namespace llaminar2
                                              const ITensor *K, const ITensor *V,
                                              int num_tokens, void *gpu_stream)
     {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "CUDARingKVCacheTQ::appendWithStream");
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return false;
         if (num_tokens <= 0)
             return true;
-        if (!gpu_stream)
-        {
-            LOG_ERROR("[CUDARingKVCacheTQ::appendWithStream] Null stream is not allowed");
-            return false;
-        }
-
         cudaSetDevice(device_id_);
         cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream);
         cached_stream_ = stream;
@@ -690,8 +690,11 @@ namespace llaminar2
         int verifier_rows,
         void *gpu_stream)
     {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "CUDARingKVCacheTQ::appendVerifierRowsDecodeEquivalent");
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_ ||
-            verifier_rows < 1 || !K || !V || !gpu_stream)
+            verifier_rows < 1 || !K || !V)
         {
             LOG_ERROR("[CUDARingKVCacheTQ] Invalid grouped verifier append request");
             return false;
@@ -856,6 +859,9 @@ namespace llaminar2
         void *dst_k,
         void *dst_v) const
     {
+        requireGPUExecutionStream(
+            desc.stream,
+            "CUDARingKVCacheTQ::exportLogicalBlock");
         const int layer = remapLayerIndex(desc.layer);
         if (layer < 0 || desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
             desc.logical_token_start < 0 || desc.token_count < 0)
@@ -874,7 +880,7 @@ namespace llaminar2
             return observeDeviceSequenceState(layer, desc.seq_idx, &state) &&
                    desc.logical_token_start <= state.cached_tokens;
         }
-        if (!desc.stream || !dst_k || !dst_v || !entry.d_K || !entry.d_V)
+        if (!dst_k || !dst_v || !entry.d_K || !entry.d_V)
         {
             LOG_ERROR("[CUDARingKVCacheTQ::exportLogicalBlock] Non-empty export requires destinations and an explicit stream");
             return false;
@@ -970,11 +976,14 @@ namespace llaminar2
         const void *src_k,
         const void *src_v)
     {
+        requireGPUExecutionStream(
+            desc.stream,
+            "CUDARingKVCacheTQ::importLogicalBlock");
         const int layer = remapLayerIndex(desc.layer);
         if (layer < 0 || desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
             desc.logical_token_start < 0 || desc.token_count < 0 ||
             desc.logical_token_start > max_seq_len_ ||
-            desc.token_count > max_seq_len_ - desc.logical_token_start || !desc.stream)
+            desc.token_count > max_seq_len_ - desc.logical_token_start)
         {
             return false;
         }
@@ -1258,6 +1267,9 @@ namespace llaminar2
         ITensor **out_v,
         void *gpu_stream)
     {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "CUDARingKVCacheTQ::get_kv_batched_device_view");
         if (out_k)
             *out_k = nullptr;
         if (out_v)
@@ -1265,7 +1277,6 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_ || first_seq_idx < 0 ||
             request_count <= 0 ||
             first_seq_idx > batch_size_ - request_count ||
-            !gpu_stream ||
             !d_head_params_ || !d_count_params_ ||
             !d_batched_k_entry_table_ || !d_batched_v_entry_table_ ||
             !rotations_.d_rotations || !workspace_ ||

@@ -2380,6 +2380,7 @@ namespace llaminar2
          *     .withBuffers(buffers)
          *     .withSequence(seq_len)
          *     .onDevice(device)
+         *     .withDeviceStatePublicationStream(stream)
          *     .build();
          * @endcode
          */
@@ -2394,6 +2395,7 @@ namespace llaminar2
             FFNGraphSession &withBuffers(ActivationBuffers &buffers);
             FFNGraphSession &withSequence(int seq_len, int batch_size = 1);
             FFNGraphSession &onDevice(DeviceId device);
+            FFNGraphSession &withDeviceStatePublicationStream(void *stream);
 
             // Build (terminal operation)
             [[nodiscard]] SubGraphBuildResult build();
@@ -2412,6 +2414,7 @@ namespace llaminar2
             int seq_len_ = 0;
             int batch_size_ = 1;
             std::optional<DeviceId> device_;
+            void *device_state_publication_stream_ = nullptr;
         };
 
         /**
@@ -2989,11 +2992,11 @@ namespace llaminar2
          * kernel-owned dynamic buffers, so this path must not globally wipe
          * kernel dynamic state while it keeps those graph executables alive.
          *
-         * Proven replay-safe GPU segments, such as single-token decode,
-         * all-position verifier replay, and MTP sidecar graphs, keep their
-         * captured executables; their stages are reset and rebound to explicit
-         * streams before the next launch.  Unproven request-stateful captures,
-         * such as monolithic prefill, still recapture.
+         * Replay-safe GPU graphs, including prefill, single-token decode,
+         * all-position verifier, and MTP sidecars, keep their captured
+         * executables. Their stages reset request metadata and rebind to
+         * explicit streams before the next launch; state content changes behind
+         * stable addresses are never treated as a reason to recapture.
          */
         void resetInferenceState(const InferenceStateResetRequest &request) override
         {
@@ -3018,11 +3021,11 @@ namespace llaminar2
             }
             else if (prefix_restore_boundary)
             {
-                if (request.preserve_replay_safe_graphs)
+                if (!request.preserve_replay_safe_graphs)
                 {
                     throw std::invalid_argument(
                         "DeviceGraphOrchestrator::resetInferenceState prefix restore must "
-                        "discard replay-safe graph captures before importing cached state");
+                        "preserve replay-safe graph captures while importing cached state");
                 }
             }
             else
@@ -3033,8 +3036,6 @@ namespace llaminar2
             }
             const char *reset_reason = request.reason ? request.reason : "request-boundary";
             const bool preserve_replay_safe_graphs = request.preserve_replay_safe_graphs;
-            const bool prefix_restore_resets_model_runtime_owner =
-                prefix_restore_boundary && request.reset_model_runtime;
             void *const reset_stream =
                 state_.device_id.is_gpu()
                     ? explicitGPUStreamForOperation(
@@ -3155,10 +3156,6 @@ namespace llaminar2
                 mtp_sidecar_depth0_kv_only_cache_.resetSessionStatePreservingGraphReplay();
                 mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionStatePreservingGraphReplay();
             }
-            else if (prefix_restore_resets_model_runtime_owner)
-            {
-                invalidateMTPSidecarDepth0GraphState(reset_reason);
-            }
             else
             {
                 mtp_sidecar_depth0_cache_.resetSessionState();
@@ -3172,7 +3169,7 @@ namespace llaminar2
             {
                 if (preserve_replay_safe_graphs)
                     cache->resetSessionStatePreservingGraphReplay();
-                else if (!prefix_restore_resets_model_runtime_owner)
+                else
                     cache->resetSessionState();
             }
             reset_transaction.enter(
@@ -3840,8 +3837,11 @@ namespace llaminar2
          * never made resident in that graph.
          *
          * @param graph Newly built forward graph, before it becomes executable.
+         * @param publication_stream Exact stream that owns placement publication.
          */
-        void applyCurrentExpertPlacementToGraph(ComputeGraph &graph);
+        void applyCurrentExpertPlacementToGraph(
+            ComputeGraph &graph,
+            void *publication_stream);
 
         /** Get device contexts for all PP pipeline devices. */
         std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override;
@@ -5058,18 +5058,6 @@ namespace llaminar2
          */
         void resetMTPSidecarDepth0ReplayState();
         /**
-         * @brief Destroy every cached depth-0 MTP sidecar graph and replay handle.
-         *
-         * Prefix restore can legally import a block that contains KV/GDN/MTP
-         * payloads but no model-runtime placement snapshot.  In that case the
-         * graph builder clears graph-owned MoE runtime tables, so a cached MTP
-         * sidecar graph would keep stage objects that point at metadata that is
-         * intentionally no longer initialized.  Invalidating, rather than only
-         * resetting replay state, makes the next sidecar call rebuild the graph
-         * and republish its depth-scoped runtime placement table.
-         */
-        void invalidateMTPSidecarDepth0GraphState(const char *reason);
-        /**
          * @brief Advance the replay epoch after shifted MTP KV changes.
          *
          * A shifted MTP KV append does not change the main request position,
@@ -6262,6 +6250,21 @@ namespace llaminar2
         };
 
         /**
+         * @brief Completion of one cold graph-build device-state publication.
+         *
+         * Main and MTP graph builds own separate instances because a sidecar can
+         * be materialized while the main graph cache remains live. Each state is
+         * published after immutable descriptor/table writes and consumed exactly
+         * once by the first execution stream for that newly built graph.
+         */
+        struct PendingGraphBuildDeviceStateReadyState
+        {
+            std::shared_ptr<void> event;
+            void *producer_stream = nullptr;
+            bool valid = false;
+        };
+
+        /**
          * @brief Event-backed ownership of one external GPU request admission.
          *
          * The event allocation is created during runner initialization, before
@@ -6345,6 +6348,10 @@ namespace llaminar2
         mutable PendingMTPPrefillTerminalArchiveReadyState
             mtp_prefill_terminal_archive_ready_;
         PendingRequestStateResetReadyState request_state_reset_ready_;
+        PendingGraphBuildDeviceStateReadyState
+            main_graph_build_device_state_ready_;
+        PendingGraphBuildDeviceStateReadyState
+            mtp_graph_build_device_state_ready_;
         PendingRequestInputAdmissionReadyState
             request_input_admission_ready_;
         PendingRequestInputReuseReadyState
@@ -7305,6 +7312,26 @@ namespace llaminar2
          * @brief Queue the first graph behind request-state reset completion.
          */
         bool waitForPendingRequestStateReset(
+            void *consumer_stream,
+            DeviceTimelineRole consumer_role,
+            const char *consumer_name);
+
+        /**
+         * @brief Publish one graph build's model-owned GPU descriptor writes.
+         *
+         * A second publication before the prior graph consumes its event is a
+         * fatal state-machine error.
+         */
+        void publishGraphBuildDeviceStateReady(
+            PendingGraphBuildDeviceStateReadyState &ready,
+            void *producer_stream,
+            const char *producer_name);
+
+        /**
+         * @brief Queue first graph execution after its cold-build publication.
+         */
+        bool waitForPendingGraphBuildDeviceStateReady(
+            PendingGraphBuildDeviceStateReadyState &ready,
             void *consumer_stream,
             DeviceTimelineRole consumer_role,
             const char *consumer_name);

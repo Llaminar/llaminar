@@ -6749,21 +6749,21 @@ namespace llaminar2::test
         ASSERT_NE(prefix_reset_end, std::string::npos);
         const std::string prefix_reset_body =
             graph.substr(prefix_reset_start, prefix_reset_end - prefix_reset_start);
-        EXPECT_NE(prefix_reset_body.find("resetDecodeRuntimeState(execution_stream)"),
+        EXPECT_NE(prefix_reset_body.find("restoreInitialRuntimeState(execution_stream)"),
                   std::string::npos)
-            << "No-payload prefix restore must return MoE placement tables to "
-               "the empty pre-decode baseline that split prefill observes.";
+            << "No-payload prefix restore must republish the immutable "
+               "model-lifetime MoE state on the reset transaction stream.";
         EXPECT_EQ(prefix_reset_body.find("resetDecodeRuntimeState();"),
                   std::string::npos)
             << "GPU prefix reset must never select an implicit stream.";
+        EXPECT_EQ(prefix_reset_body.find("resetDecodeRuntimeState(execution_stream)"),
+                  std::string::npos)
+            << "An empty runtime table is not a valid prefix-restored model "
+               "state and must not replace the immutable initial placement.";
         EXPECT_NE(prefix_reset_body.find("resetRequestPublications(execution_stream)"),
                   std::string::npos)
             << "Prefix reset must retire every transient transfer-slot "
                "publication on the same transaction stream.";
-        EXPECT_EQ(prefix_reset_body.find("restoreInitialRuntimeState("),
-                  std::string::npos)
-            << "No-payload prefix restore must not restore the first decode bank "
-               "as an initial state; split prefill has no active decode bank.";
         EXPECT_EQ(prefix_reset_body.find("moe_graph_rebalance_bindings_.clear()"),
                   std::string::npos)
             << "Graph stages retain binding pointers across replay-executable "

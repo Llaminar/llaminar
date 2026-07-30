@@ -389,6 +389,32 @@ TEST(Test__IKVCacheLogicalBlockIO, EmptyExportImportContract)
     EXPECT_FALSE(state.wrapped);
 }
 
+TEST(Test__IKVCacheLogicalBlockIO, GPUExecutionStreamGuardFailsFastWithOperationName)
+{
+    try
+    {
+        IKVCache::requireGPUExecutionStream(
+            nullptr,
+            "TestGpuCache::mutate");
+        FAIL() << "A GPU cache mutation without a stream must throw";
+    }
+    catch (const std::invalid_argument &error)
+    {
+        EXPECT_NE(
+            std::string(error.what()).find("TestGpuCache::mutate"),
+            std::string::npos);
+        EXPECT_NE(
+            std::string(error.what()).find(
+                "explicit non-null execution stream"),
+            std::string::npos);
+    }
+
+    int fake_stream = 0;
+    EXPECT_NO_THROW(IKVCache::requireGPUExecutionStream(
+        &fake_stream,
+        "TestGpuCache::mutate"));
+}
+
 TEST(Test__IKVCacheLogicalBlockIO, PositionMajorExportsNonWrappedLogicalSlice)
 {
     constexpr int KV_DIM = 2;

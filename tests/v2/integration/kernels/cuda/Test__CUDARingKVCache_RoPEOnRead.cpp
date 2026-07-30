@@ -33,6 +33,32 @@ namespace
         return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
     }
 
+    /// @brief Owns one explicit CUDA stream for typed KV cache append tests.
+    class ScopedCudaStream
+    {
+    public:
+        ScopedCudaStream()
+        {
+            EXPECT_EQ(cudaStreamCreate(&stream_), cudaSuccess);
+        }
+
+        ~ScopedCudaStream()
+        {
+            if (stream_)
+                (void)cudaStreamDestroy(stream_);
+        }
+
+        cudaStream_t get() const { return stream_; }
+
+        void synchronize() const
+        {
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        }
+
+    private:
+        cudaStream_t stream_ = nullptr;
+    };
+
     /**
      * @brief Binds setup-owned conversion scratch for one cache test lifetime.
      *
@@ -156,7 +182,10 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP16_RoPEChangesK)
     cudaMemcpy(d_K, h_K_fp16.data(), num_tokens * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V_fp16.data(), num_tokens * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
+    ScopedCudaStream append_stream;
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, num_tokens, append_stream.get()));
+    append_stream.synchronize();
 
     // Get raw K data via get_kv_for_attention (the void* API)
     const void *d_K_raw_ptr = nullptr;
@@ -231,7 +260,10 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP16_VUnchangedByRoPE)
     cudaMalloc(&d_V, num_tokens * kv_dim * sizeof(__half));
     cudaMemcpy(d_K, h_K_fp16.data(), num_tokens * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V_fp16.data(), num_tokens * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
+    ScopedCudaStream append_stream;
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, num_tokens, append_stream.get()));
+    append_stream.synchronize();
 
     IKVCache::KVReadParams rope_params;
     rope_params.rope_theta = 10000.0f;
@@ -364,7 +396,10 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP32_RoPEConvertsToFP16)
     cudaMalloc(&d_V, num_tokens * kv_dim * sizeof(float));
     cudaMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
+    ScopedCudaStream append_stream;
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, num_tokens, append_stream.get()));
+    append_stream.synchronize();
 
     IKVCache::KVReadParams rope_params;
     rope_params.rope_theta = 10000.0f;

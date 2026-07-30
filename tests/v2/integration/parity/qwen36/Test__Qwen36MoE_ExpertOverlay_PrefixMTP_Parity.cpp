@@ -409,6 +409,17 @@ namespace
         test_case.default_metadata_path = metadata_path;
         test_case.decode_steps = 4;
         test_case.max_seq_len = 768;
+
+        /*
+         * This fixture is the static-placement stochastic control. Runtime
+         * configuration defaults to Dynamic, so leaving the optional override
+         * unset would silently turn a small parity probe into a 40-layer
+         * transfer-slot stress test. Dynamic and LLEP coverage use their
+         * dedicated phase-split fixtures below.
+         */
+        MoERebalanceRuntimeConfig static_placement;
+        static_placement.mode = MoERebalanceRuntimeMode::Off;
+        test_case.moe_rebalance = static_placement;
     }
 
     /**

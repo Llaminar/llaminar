@@ -632,8 +632,10 @@ namespace
         HipFloatBuffer d_k(k), d_v(v);
         auto *rocm_cache = dynamic_cast<llaminar2::IROCmRingKVCache *>(cache);
         ASSERT_NE(rocm_cache, nullptr);
-        ASSERT_TRUE(rocm_cache->append(layer, 0, d_k.ptr, d_v.ptr, tokens, 0));
-        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+        HipStream stream;
+        ASSERT_TRUE(rocm_cache->append(
+            layer, 0, d_k.ptr, d_v.ptr, tokens, stream.stream));
+        stream.synchronize("hipStreamSynchronize after KV append");
     }
 
     /// @brief Copies one device-owned sequence metadata integer back for assertions.

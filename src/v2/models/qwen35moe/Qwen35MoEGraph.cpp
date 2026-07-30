@@ -1698,16 +1698,11 @@ namespace llaminar2
         void *execution_stream)
     {
         /*
-         * Prefix restore without a model-runtime payload means the matched
-         * cache boundary did not own portable MoE runtime state that can be
-         * replayed in this restore domain.  That is not permission to keep
-         * decode-era dynamic movement from the previous request, and it is not
-         * permission to restore the first decode bank as the "initial" state.
-         * The correct boundary is the empty pre-decode runtime table that an
-         * uncached split prefill observes before it executes the suffix.  The
-         * runtime table reset keeps already-allocated prefill scratch pointers
-         * so graph construction does not silently rebuild ownership by relying
-         * on stale dynamic placement.
+         * A cache block without a portable MoE payload owns no request-local
+         * placement changes. Restore the immutable model-lifetime placement
+         * template captured during cold graph construction. The template uses
+         * the same runtime-table and scratch addresses as every captured graph,
+         * so content restoration cannot require recapture.
          */
         Qwen35Graph::resetState(execution_stream);
         prefix_runtime_device_rehydration_pending_ = false;
@@ -1718,10 +1713,11 @@ namespace llaminar2
         /*
          * Graph-side bindings, auxiliary streams, and transfer-slot
          * directories own model-lifetime pointer identities captured by stage
-         * nodes.  Prefix reset must preserve those owners.  Only runtime-table
-         * placement claims are request state; resetDecodeRuntimeState() removes
-         * every transient arrival claim while retaining the stable directory
-         * addresses that the next graph capture/replay will use.
+         * nodes. Prefix reset must preserve those owners. Runtime placement
+         * claims are request state; restoreInitialRuntimeState() removes every
+         * transient arrival claim while retaining the stable directory
+         * addresses and canonical static descriptors that the existing graph
+         * replay will use.
          *
          * Clearing these maps used to free directories underneath existing
          * graph stages and then assume a later graph build would recreate
@@ -1734,7 +1730,7 @@ namespace llaminar2
         {
             (void)key;
             if (table)
-                table->resetDecodeRuntimeState(execution_stream);
+                table->restoreInitialRuntimeState(execution_stream);
         }
         for (auto &[key, directory] : moe_transfer_slot_directories_)
         {
@@ -2452,8 +2448,16 @@ namespace llaminar2
         int seq_len,
         int batch_size,
         DeviceId device,
+        void *device_state_publication_stream,
         const int32_t *sequence_lengths_device)
     {
+        if (device.is_gpu() && !device_state_publication_stream)
+        {
+            throw std::invalid_argument(
+                "[Qwen35MoEGraph::buildFFNGraph] GPU graph construction "
+                "requires an explicit non-null device-state publication stream");
+        }
+
         // If this layer doesn't have MoE weights, fall back to dense FFN
         if (!layer.moe_gate || !layer.moe_gate_exps)
         {
@@ -2464,6 +2468,7 @@ namespace llaminar2
                 seq_len,
                 batch_size,
                 device,
+                device_state_publication_stream,
                 sequence_lengths_device);
         }
 
@@ -4721,7 +4726,7 @@ namespace llaminar2
                             expert_params.prepared_gate_gemm,
                             expert_params.prepared_up_gemm,
                             expert_params.prepared_down_gemm,
-                            nullptr,
+                            device_state_publication_stream,
                             prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident,
                             "LocalTP expert-ID-apportioned LLEP grouped prefill runtime bank"))
                     {
@@ -4765,7 +4770,7 @@ namespace llaminar2
                             expert_params.prepared_gate_gemm,
                             expert_params.prepared_up_gemm,
                             expert_params.prepared_down_gemm,
-                            nullptr,
+                            device_state_publication_stream,
                             /*allow_existing_dynamic_bank=*/true,
                             "LocalTP expert-ID-apportioned masked GPU decode graph build"))
                     {
@@ -5055,6 +5060,10 @@ namespace llaminar2
                         local_params.expert_mask = std::move(participant_mask);
                         local_params.prepared_store = prepared_weight_store_;
                         local_params.runtime_participant_index = target_participant;
+                        local_params.runtime_publication_stream =
+                            target_device.is_gpu()
+                                ? device_state_publication_stream
+                                : nullptr;
                         if (model_ctx_)
                         {
                             auto weight_mgr = model_ctx_->concreteWeightManager();
@@ -5298,7 +5307,7 @@ namespace llaminar2
                                 expert_params.prepared_gate_gemm,
                                 expert_params.prepared_up_gemm,
                                 expert_params.prepared_down_gemm,
-                                nullptr,
+                                device_state_publication_stream,
                                 /*allow_existing_dynamic_bank=*/true,
                                 "LocalTP expert-ID-apportioned masked GPU decode graph build"))
                         {
@@ -5334,7 +5343,7 @@ namespace llaminar2
                                 expert_params.prepared_gate_gemm,
                                 expert_params.prepared_up_gemm,
                                 expert_params.prepared_down_gemm,
-                                nullptr,
+                                device_state_publication_stream,
                                 "single-device GPU decode graph build"))
                         {
                             throw std::runtime_error(

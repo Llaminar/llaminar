@@ -263,8 +263,10 @@ namespace llaminar2
         int cached_tokens,
         void *stream)
     {
-        if (!stream ||
-            seq_idx < 0 || seq_idx >= batch_size_ ||
+        requireGPUExecutionStream(
+            stream,
+            "ROCmRingKVCacheBase::truncateSequence");
+        if (seq_idx < 0 || seq_idx >= batch_size_ ||
             cached_tokens < 0 || cached_tokens > max_seq_len_ ||
             !d_head_params_ || !d_count_params_)
         {
@@ -357,8 +359,10 @@ namespace llaminar2
     bool ROCmRingKVCacheBase::resetRequestState(
         const StateResetContext &context)
     {
-        if (!context.permitsRequestReset() ||
-            !context.execution_stream || !context.hasReason() ||
+        requireGPUExecutionStream(
+            context.execution_stream,
+            "ROCmRingKVCacheBase::resetRequestState");
+        if (!context.permitsRequestReset() || !context.hasReason() ||
             !d_head_params_ || !d_count_params_ ||
             !activateOwningDevice("request-state reset"))
         {
@@ -439,8 +443,10 @@ namespace llaminar2
         int seq_idx,
         const StateResetContext &context)
     {
-        if (!context.permitsSequenceReset() ||
-            !context.execution_stream || !context.hasReason() ||
+        requireGPUExecutionStream(
+            context.execution_stream,
+            "ROCmRingKVCacheBase::resetSequenceState");
+        if (!context.permitsSequenceReset() || !context.hasReason() ||
             seq_idx < 0 || seq_idx >= batch_size_)
         {
             LOG_ERROR("[ROCmRingKVCacheBase] Sequence-state reset has invalid ownership"
@@ -463,8 +469,10 @@ namespace llaminar2
         int seq_idx,
         const StateResetContext &context)
     {
-        if (!context.permitsLayerSequenceReset() ||
-            !context.execution_stream || !context.hasReason() ||
+        requireGPUExecutionStream(
+            context.execution_stream,
+            "ROCmRingKVCacheBase::resetLayerSequenceState");
+        if (!context.permitsLayerSequenceReset() || !context.hasReason() ||
             !validLayerSeq(layer, seq_idx))
         {
             LOG_ERROR("[ROCmRingKVCacheBase] Layer/sequence reset has invalid ownership"
@@ -491,8 +499,10 @@ namespace llaminar2
         int layer,
         const StateResetContext &context)
     {
-        if (!context.permitsLayerReset() ||
-            !context.execution_stream || !context.hasReason() ||
+        requireGPUExecutionStream(
+            context.execution_stream,
+            "ROCmRingKVCacheBase::resetLayerState");
+        if (!context.permitsLayerReset() || !context.hasReason() ||
             layer < 0 || layer >= n_layers_ ||
             !d_head_params_ || !d_count_params_ ||
             !activateOwningDevice("layer-state reset"))
@@ -541,9 +551,11 @@ namespace llaminar2
         int captured_max_tokens,
         void *gpu_stream)
     {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "ROCmRingKVCacheBase::bindGraphAppendCountSource");
         if (!validLayerSeq(layer, seq_idx) ||
             captured_max_tokens <= 0 ||
-            !gpu_stream ||
             !d_head_params_ ||
             !d_count_params_)
         {
@@ -597,8 +609,11 @@ namespace llaminar2
         void *stream,
         std::string *error) const
     {
+        requireGPUExecutionStream(
+            stream,
+            "ROCmRingKVCacheBase::captureDeviceSequenceStateCheckpoint");
         const size_t required_bytes = deviceSequenceStateCheckpointBytes();
-        if (!checkpoint_device || !stream ||
+        if (!checkpoint_device ||
             seq_idx < 0 || seq_idx >= batch_size_ ||
             required_bytes == 0 || checkpoint_bytes < required_bytes)
         {
@@ -639,8 +654,11 @@ namespace llaminar2
         void *stream,
         std::string *error)
     {
+        requireGPUExecutionStream(
+            stream,
+            "ROCmRingKVCacheBase::restoreDeviceSequenceStateCheckpoint");
         const size_t required_bytes = deviceSequenceStateCheckpointBytes();
-        if (!checkpoint_device || !stream ||
+        if (!checkpoint_device ||
             seq_idx < 0 || seq_idx >= batch_size_ ||
             required_bytes == 0 || checkpoint_bytes < required_bytes)
         {
@@ -698,8 +716,10 @@ namespace llaminar2
         int count,
         void *gpu_stream)
     {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "ROCmRingKVCacheBase::setDeviceSequenceState");
         if (!validLayerSeq(layer, seq_idx) ||
-            !gpu_stream ||
             !d_head_params_ ||
             !d_count_params_ ||
             head < 0 ||
@@ -726,9 +746,11 @@ namespace llaminar2
         int num_tokens,
         void *gpu_stream)
     {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "ROCmRingKVCacheBase::evictOldestDeviceSequenceState");
         if (!validLayerSeq(layer, seq_idx) ||
             num_tokens < 0 ||
-            !gpu_stream ||
             !d_head_params_ ||
             !d_count_params_)
         {
@@ -753,6 +775,9 @@ namespace llaminar2
         const DeviceSequenceStatePublicationRequest &request,
         std::string *error)
     {
+        requireGPUExecutionStream(
+            request.stream,
+            "ROCmRingKVCacheBase::publishSequenceStateFromDeviceMetadata");
         if (!request.valid())
         {
             if (error)

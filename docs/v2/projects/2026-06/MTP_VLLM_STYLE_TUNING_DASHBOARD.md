@@ -30,10 +30,12 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   Ordinary prefill remains on the legacy production heuristic.
 - RAM/disk prefix tiers support model-SHA archives, FIFO demotion/overwrite,
   cold-hit VRAM promotion, restart, and pressure paths.
-- CUDA MoE prefix restore now invalidates stale forward and runtime-bank
-  publications explicitly. The restored sampler joins the live mutation
-  timeline, and every layer republishes its device descriptor bank before use.
-- Integration unit gate: `589/589` green on 2026-07-30.
+- CUDA/ROCm MoE prefix restore preserves reusable captures and restores the
+  stable-address model-lifetime runtime template through explicit graph-build
+  producer streams/events. GPU FFN/MTP graph APIs reject null publication
+  streams before device work.
+- Integration-build unit gate: `588/588` green on 2026-07-30; GPU graph lowering is
+  registered only in the integration tier.
 
 ## Production Matrix
 
@@ -69,6 +71,9 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   `22/22` each with strict full-graph PerfStats, 2048 generated tokens, clean
   shutdown, and complete VRAM release. Dynamic/LLEP long-context and prefix
   matrices are green.
+- The original CUDA2 LocalTP long-context stochastic prefix+MTP stale-bank
+  reproduction now passes at 590 seconds; matching CUDA2/ROCm2 focused graph
+  lifecycle cells are green.
 - Transfer-state stress covers all 336 slot rotations and 32 cross-stream
   reset epochs on CUDA/ROCm. Source policies forbid eventless publication,
   blocking GPU sync, hidden hot-path allocation, and direct coherence

@@ -1,10 +1,12 @@
 /**
  * @file Test__Qwen35MoEGraphNativeProductionLowering.cpp
- * @brief Production default graph-native lowering checks for Qwen3.5 MoE overlay tiers.
+ * @brief Production GPU graph-native lowering checks for Qwen3.5 MoE overlay tiers.
  */
 
 #include <gtest/gtest.h>
 
+#include "backends/BackendManager.h"
+#include "backends/IBackend.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/stages/MoEExpertDispatchStage.h"
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
@@ -38,6 +40,67 @@ namespace llaminar2::test
         constexpr int kTopK = 2;
         constexpr int kSeqLen = 3;
         constexpr int kBatchSize = 1;
+
+        /**
+         * @brief Own the exact stream used to publish graph-build device state.
+         *
+         * These tests lower production GPU graphs and may initialize the
+         * device-resident MoE runtime table while doing so. Keeping a real
+         * backend stream beside each graph builder exercises the same explicit
+         * producer contract as the orchestrator. The test-only synchronization
+         * runs during fixture cleanup, before the graph builder releases the
+         * table storage; it is not part of the production graph-build path.
+         */
+        class ScopedDevicePublicationStream
+        {
+        public:
+            explicit ScopedDevicePublicationStream(DeviceId device)
+                : device_(device),
+                  backend_(getBackendFor(device))
+            {
+                if (!device_.is_gpu())
+                    return;
+                if (!backend_)
+                {
+                    throw std::runtime_error(
+                        "No backend is available for graph publication on " +
+                        device_.to_string());
+                }
+                stream_ = backend_->createStream(device_.toKernelDeviceIndex());
+                if (!stream_)
+                {
+                    throw std::runtime_error(
+                        "Failed to create graph publication stream on " +
+                        device_.to_string());
+                }
+            }
+
+            ~ScopedDevicePublicationStream()
+            {
+                if (!stream_)
+                    return;
+                const int ordinal = device_.toKernelDeviceIndex();
+                if (!backend_->synchronizeStream(stream_, ordinal))
+                {
+                    ADD_FAILURE()
+                        << "Failed to synchronize graph publication stream on "
+                        << device_.to_string();
+                }
+                backend_->destroyStream(stream_, ordinal);
+            }
+
+            ScopedDevicePublicationStream(
+                const ScopedDevicePublicationStream &) = delete;
+            ScopedDevicePublicationStream &operator=(
+                const ScopedDevicePublicationStream &) = delete;
+
+            [[nodiscard]] void *get() const { return stream_; }
+
+        private:
+            DeviceId device_;
+            IBackend *backend_ = nullptr;
+            void *stream_ = nullptr;
+        };
 
         class ScopedDebugEnv
         {
@@ -529,7 +592,14 @@ namespace llaminar2::test
         auto buffers = makeActivationBuffers(activation_arena);
 
         Qwen35MoEGraph graph_builder(config, nullptr);
-        ComputeGraph graph = graph_builder.buildFFNGraph(layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::cpu());
+        ComputeGraph graph = graph_builder.buildFFNGraph(
+            layer,
+            buffers,
+            0,
+            kSeqLen,
+            kBatchSize,
+            DeviceId::cpu(),
+            /*device_state_publication_stream=*/nullptr);
 
         const auto *dispatch_node = graph.getNode("layer0_moe_expert_dispatch");
         ASSERT_NE(dispatch_node, nullptr);
@@ -592,7 +662,15 @@ namespace llaminar2::test
         auto model_ctx =
             makeTestingModelContextWithHotDomainExperts(config.n_layers);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
-        ComputeGraph graph = graph_builder.buildFFNGraph(layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
+        ScopedDevicePublicationStream publication_stream(DeviceId::rocm(0));
+        ComputeGraph graph = graph_builder.buildFFNGraph(
+            layer,
+            buffers,
+            0,
+            kSeqLen,
+            kBatchSize,
+            DeviceId::rocm(0),
+            publication_stream.get());
 
         EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_EXPERT_DISPATCH), 0u)
             << "Homogeneous LocalTP GPU prefill must not lower through the host dispatch descriptor path";
@@ -673,13 +751,15 @@ namespace llaminar2::test
             auto buffers = makeActivationBuffers(activation_arena);
 
             Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+            ScopedDevicePublicationStream publication_stream(device);
             ComputeGraph graph = graph_builder.buildFFNGraph(
                 layer,
                 buffers,
                 /*layer_idx=*/0,
                 /*seq_len=*/2,
                 kBatchSize,
-                device);
+                device,
+                publication_stream.get());
 
             ASSERT_NE(graph.getNode("layer0_moe_routing"), nullptr);
             const auto *shared_node =
@@ -729,8 +809,10 @@ namespace llaminar2::test
         auto model_ctx =
             makeTestingModelContextWithHotDomainExperts(config.n_layers);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        ScopedDevicePublicationStream publication_stream(DeviceId::rocm(0));
         ComputeGraph graph = graph_builder.buildFFNGraph(
-            layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
+            layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0),
+            publication_stream.get());
 
         const auto *expert_node = graph.getNode("layer0_moe_expert_ffn_overlay_fast");
         ASSERT_NE(expert_node, nullptr);
@@ -776,8 +858,10 @@ namespace llaminar2::test
         auto model_ctx =
             makeTestingModelContextWithHotDomainExperts(config.n_layers);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        ScopedDevicePublicationStream publication_stream(DeviceId::rocm(0));
         ComputeGraph graph = graph_builder.buildFFNGraph(
-            layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
+            layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0),
+            publication_stream.get());
 
         const auto *expert_node = graph.getNode("layer0_moe_expert_ffn_overlay_fast");
         ASSERT_NE(expert_node, nullptr);
@@ -846,13 +930,15 @@ namespace llaminar2::test
         auto model_ctx =
             makeTestingModelContextWithHotDomainExperts(config.n_layers);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        ScopedDevicePublicationStream publication_stream(DeviceId::rocm(0));
         ComputeGraph graph = graph_builder.buildFFNGraph(
             layer,
             buffers,
             /*layer_idx=*/0,
             /*seq_len=*/3,
             kBatchSize,
-            DeviceId::rocm(0));
+            DeviceId::rocm(0),
+            publication_stream.get());
 
         const auto *expert_node =
             graph.getNode("layer0_moe_expert_ffn_overlay_fast");
@@ -911,12 +997,16 @@ namespace llaminar2::test
 
         auto model_ctx = makeTestingModelContextWithHotDomainExperts(kLayerCount);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        ScopedDevicePublicationStream publication_stream(DeviceId::rocm(0));
         ComputeGraph graph0 = graph_builder.buildFFNGraph(
-            layer_weights, buffers0, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
+            layer_weights, buffers0, 0, kSeqLen, kBatchSize, DeviceId::rocm(0),
+            publication_stream.get());
         ComputeGraph graph1 = graph_builder.buildFFNGraph(
-            layer_weights, buffers1, 1, kSeqLen, kBatchSize, DeviceId::rocm(0));
+            layer_weights, buffers1, 1, kSeqLen, kBatchSize, DeviceId::rocm(0),
+            publication_stream.get());
         ComputeGraph graph2 = graph_builder.buildFFNGraph(
-            layer_weights, buffers2, 2, kSeqLen, kBatchSize, DeviceId::rocm(0));
+            layer_weights, buffers2, 2, kSeqLen, kBatchSize, DeviceId::rocm(0),
+            publication_stream.get());
 
         const auto *stage0 = expertComputeStage(graph0, "layer0_moe_expert_ffn_overlay_fast");
         const auto *stage1 = expertComputeStage(graph1, "layer1_moe_expert_ffn_overlay_fast");
@@ -1045,8 +1135,10 @@ namespace llaminar2::test
 
         auto model_ctx = makeTestingModelContextWithHotDomainExperts();
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        ScopedDevicePublicationStream publication_stream(DeviceId::rocm(0));
         ComputeGraph graph = graph_builder.buildFFNGraph(
-            layer, buffers, 0, 1, kBatchSize, DeviceId::rocm(0));
+            layer, buffers, 0, 1, kBatchSize, DeviceId::rocm(0),
+            publication_stream.get());
 
         const auto *expert_node = graph.getNode("layer0_moe_expert_ffn_overlay_fast");
         ASSERT_NE(expert_node, nullptr);
@@ -1093,12 +1185,16 @@ namespace llaminar2::test
         auto model_ctx = makeTestingModelContextWithHotDomainExperts();
 
         Qwen35MoEGraph graph_builder0(model_ctx, nullptr, config0);
+        ScopedDevicePublicationStream publication_stream0(DeviceId::rocm(0));
         ComputeGraph graph0 = graph_builder0.buildFFNGraph(
-            layer, buffers0, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
+            layer, buffers0, 0, kSeqLen, kBatchSize, DeviceId::rocm(0),
+            publication_stream0.get());
 
         Qwen35MoEGraph graph_builder1(model_ctx, nullptr, config1);
+        ScopedDevicePublicationStream publication_stream1(DeviceId::rocm(1));
         ComputeGraph graph1 = graph_builder1.buildFFNGraph(
-            layer, buffers1, 0, kSeqLen, kBatchSize, DeviceId::rocm(1));
+            layer, buffers1, 0, kSeqLen, kBatchSize, DeviceId::rocm(1),
+            publication_stream1.get());
 
         const auto allreduces0 = stageNamesOfType(graph0, ComputeStageType::ALLREDUCE);
         const auto allreduces1 = stageNamesOfType(graph1, ComputeStageType::ALLREDUCE);

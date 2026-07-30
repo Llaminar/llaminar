@@ -21,6 +21,7 @@
 #include <cstring>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace llaminar2
@@ -193,6 +194,13 @@ namespace llaminar2
     {
         if (!params_.moe_runtime_table || params_.layer_idx < 0 || params_.num_experts <= 0)
             return false;
+        if (params_.device_id.is_gpu() &&
+            !params_.runtime_publication_stream)
+        {
+            throw std::invalid_argument(
+                "[MoELocalExpertStage] GPU runtime placement publication "
+                "requires an explicit non-null producer stream");
+        }
 
         try
         {
@@ -276,7 +284,10 @@ namespace llaminar2
             }
 
             params_.moe_runtime_table->prepareInactiveBank(params_.layer_idx, update);
-            params_.moe_runtime_table->flipActiveBank(params_.layer_idx, update.epoch, nullptr);
+            params_.moe_runtime_table->flipActiveBank(
+                params_.layer_idx,
+                update.epoch,
+                params_.runtime_publication_stream);
             moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
             return runtimeTableHasActiveOverlayBank();
         }

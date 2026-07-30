@@ -465,8 +465,11 @@ namespace llaminar2
             int seq_idx,
             const typename IKVCache::StateResetContext &context) override
         {
+            IKVCache::requireGPUExecutionStream(
+                context.execution_stream,
+                "CUDAHybridRingKVCache::resetLayerSequenceState");
             if (!context.permitsLayerSequenceReset() ||
-                !context.execution_stream || !context.hasReason() ||
+                !context.hasReason() ||
                 seq_idx < 0 || seq_idx >= this->batch_size_)
                 return false;
             int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
@@ -487,8 +490,10 @@ namespace llaminar2
             int layer,
             const typename IKVCache::StateResetContext &context) override
         {
-            if (!context.permitsLayerReset() ||
-                !context.execution_stream || !context.hasReason())
+            IKVCache::requireGPUExecutionStream(
+                context.execution_stream,
+                "CUDAHybridRingKVCache::resetLayerState");
+            if (!context.permitsLayerReset() || !context.hasReason())
             {
                 return false;
             }

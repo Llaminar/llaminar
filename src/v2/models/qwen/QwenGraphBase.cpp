@@ -1401,7 +1401,9 @@ namespace llaminar2
         // Build FFN graph
         ComputeGraph ffn_graph = buildFFNGraph(
             layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
-            ctx.batch_size, ctx.device, ctx.sequence_lengths_device);
+            ctx.batch_size, ctx.device,
+            ctx.device_state_publication_stream,
+            ctx.sequence_lengths_device);
 
         // Merge: attention -> FFN
         std::string attn_last = attn_graph.terminalNode();
@@ -1629,7 +1631,9 @@ namespace llaminar2
             // Build FFN graph for this layer
             ComputeGraph ffn_graph = buildFFNGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
-                input.batch_size, device, input.sequence_lengths_device);
+                input.batch_size, device,
+                input.device_state_publication_stream,
+                input.sequence_lengths_device);
 
             // Get the terminal node of FFN sub-graph
             std::string ffn_last = ffn_graph.terminalNode();
@@ -1970,7 +1974,9 @@ namespace llaminar2
             // Build FFN graph for this layer
             ComputeGraph ffn_graph = buildFFNGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
-                input.batch_size, device, input.sequence_lengths_device);
+                input.batch_size, device,
+                input.device_state_publication_stream,
+                input.sequence_lengths_device);
 
             // Get the terminal node of FFN sub-graph
             std::string ffn_last = ffn_graph.terminalNode();
@@ -2315,6 +2321,7 @@ namespace llaminar2
                     layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                     input.batch_size,
                     stage_device,
+                    input.device_state_publication_stream,
                     input.sequence_lengths_device);
 
                 // Get the terminal node of FFN sub-graph
@@ -2907,8 +2914,15 @@ namespace llaminar2
         int seq_len,
         int batch_size,
         DeviceId device,
+        void *device_state_publication_stream,
         const int32_t *sequence_lengths_device)
     {
+        if (device.is_gpu() && !device_state_publication_stream)
+        {
+            throw std::invalid_argument(
+                "[QwenGraphBase::buildFFNGraph] GPU graph construction "
+                "requires an explicit non-null device-state publication stream");
+        }
         (void)sequence_lengths_device;
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";

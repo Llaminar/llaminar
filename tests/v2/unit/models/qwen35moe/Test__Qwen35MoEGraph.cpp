@@ -310,7 +310,14 @@ namespace
             DeviceId device)
         {
             DecodeReplicatedDenseScope decode_dense_scope(*this, seq_len * batch_size);
-            ComputeGraph graph = buildFFNGraph(layer, buffers, layer_idx, seq_len, batch_size, device);
+            ComputeGraph graph = buildFFNGraph(
+                layer,
+                buffers,
+                layer_idx,
+                seq_len,
+                batch_size,
+                device,
+                /*device_state_publication_stream=*/nullptr);
             return graph;
         }
 
@@ -752,7 +759,9 @@ TEST(Test__Qwen35MoEGraph, ReplicatedRoutedExpertOutputFeedsCombineDirectlyUnder
     auto layer = makeMoELayerWeights(arena);
     auto buffers = makeActivationBuffers(arena, /*tokens=*/2, config.d_model, config.moe.num_experts, config.moe.top_k);
 
-    ComputeGraph graph = graph_builder.buildFFNGraph(layer, buffers, /*layer_idx=*/0, /*seq_len=*/2, /*batch_size=*/1, DeviceId::cpu());
+    ComputeGraph graph = graph_builder.buildFFNGraph(
+        layer, buffers, /*layer_idx=*/0, /*seq_len=*/2, /*batch_size=*/1,
+        DeviceId::cpu(), /*device_state_publication_stream=*/nullptr);
 
     ASSERT_NE(graph.getNode("layer0_moe_expert_ffn"), nullptr);
     ASSERT_EQ(graph.getNode("layer0_moe_expert_allreduce"), nullptr)
@@ -775,7 +784,8 @@ TEST(Test__Qwen35MoEGraph, SingleDeviceSharedGateFusesMoECombine)
 
     ComputeGraph graph = graph_builder.buildFFNGraph(
         layer, buffers, /*layer_idx=*/0, /*seq_len=*/2,
-        /*batch_size=*/1, DeviceId::cpu());
+        /*batch_size=*/1, DeviceId::cpu(),
+        /*device_state_publication_stream=*/nullptr);
 
     ASSERT_NE(graph.getNode("layer0_moe_expert_ffn"), nullptr);
     ASSERT_NE(graph.getNode("layer0_shared_expert_gate"), nullptr);
@@ -807,7 +817,9 @@ TEST(Test__Qwen35MoEGraph, ExpertParallelRoutedExpertOutputAllreducesUnderTP)
     auto layer = makeMoELayerWeights(arena);
     auto buffers = makeActivationBuffers(arena, /*tokens=*/2, config.d_model, config.moe.num_experts, config.moe.top_k);
 
-    ComputeGraph graph = graph_builder.buildFFNGraph(layer, buffers, /*layer_idx=*/0, /*seq_len=*/2, /*batch_size=*/1, DeviceId::cpu());
+    ComputeGraph graph = graph_builder.buildFFNGraph(
+        layer, buffers, /*layer_idx=*/0, /*seq_len=*/2, /*batch_size=*/1,
+        DeviceId::cpu(), /*device_state_publication_stream=*/nullptr);
 
     ASSERT_NE(graph.getNode("layer0_moe_expert_ffn"), nullptr);
     ASSERT_NE(graph.getNode("layer0_moe_expert_allreduce"), nullptr)
@@ -843,7 +855,8 @@ TEST(Test__Qwen35MoEGraph, LocalTPApportionedOverlayCombinesMoEBranchesBeforeAll
 
     ComputeGraph graph = graph_builder.buildFFNGraph(
         layer, buffers, /*layer_idx=*/0, /*seq_len=*/2,
-        /*batch_size=*/1, DeviceId::cpu());
+        /*batch_size=*/1, DeviceId::cpu(),
+        /*device_state_publication_stream=*/nullptr);
 
     ASSERT_NE(graph.getNode("layer0_moe_expert_ffn_overlay_fast"), nullptr);
     ASSERT_NE(graph.getNode("layer0_shared_expert_gate"), nullptr);
@@ -891,7 +904,8 @@ TEST(Test__Qwen35MoEGraph, DenseTPDisabledKeepsExpertParticipantAllreduceOnly)
 
         ComputeGraph graph = graph_builder.buildFFNGraph(
             layer, buffers, /*layer_idx=*/0, /*seq_len=*/2,
-            /*batch_size=*/1, DeviceId::cpu());
+            /*batch_size=*/1, DeviceId::cpu(),
+            /*device_state_publication_stream=*/nullptr);
 
         ASSERT_NE(graph.getNode("layer0_down_proj"), nullptr);
         EXPECT_EQ(graph.getNode("layer0_down_allreduce"), nullptr)
@@ -919,7 +933,8 @@ TEST(Test__Qwen35MoEGraph, DenseTPDisabledKeepsExpertParticipantAllreduceOnly)
 
         ComputeGraph graph = graph_builder.buildFFNGraph(
             layer, buffers, /*layer_idx=*/0, /*seq_len=*/2,
-            /*batch_size=*/1, DeviceId::cpu());
+            /*batch_size=*/1, DeviceId::cpu(),
+            /*device_state_publication_stream=*/nullptr);
 
         ASSERT_NE(graph.getNode("layer0_moe_expert_ffn_overlay_fast"), nullptr);
         EXPECT_NE(graph.getNode("layer0_moe_expert_overlay_fast_allreduce"), nullptr)
@@ -2045,7 +2060,8 @@ TEST(Test__Qwen35MoEGraph, CPUAllPositionMoEVerifierUsesDecodeEquivalentExpertPa
 
     ComputeGraph graph = graph_builder.buildFFNGraph(
         layer, buffers, /*layer_idx=*/0, /*seq_len=*/2,
-        /*batch_size=*/1, DeviceId::cpu());
+        /*batch_size=*/1, DeviceId::cpu(),
+        /*device_state_publication_stream=*/nullptr);
 
     auto *node = graph.getNode("layer0_moe_expert_ffn");
     ASSERT_NE(node, nullptr);
@@ -2058,6 +2074,44 @@ TEST(Test__Qwen35MoEGraph, CPUAllPositionMoEVerifierUsesDecodeEquivalentExpertPa
     auto *shared_stage = dynamic_cast<SharedExpertFFNStage *>(shared_node->stage.get());
     ASSERT_NE(shared_stage, nullptr);
     EXPECT_TRUE(shared_stage->usesCPUDecodeEquivalentVerifierPrefillForTesting());
+}
+
+/**
+ * @brief GPU FFN construction must fail before touching a backend on null stream.
+ *
+ * The test deliberately uses host tensors and does not initialize either GPU
+ * backend. A successful exception therefore proves that stream ownership is
+ * validated at the public graph-builder boundary rather than after allocation
+ * or publication has already begun.
+ */
+TEST(Test__Qwen35MoEGraph, GPUFFNGraphBuildRejectsNullPublicationStreamBeforeDeviceWork)
+{
+    GraphConfig config = makeMoEConfig();
+    Qwen35MoEGraph graph_builder(config, nullptr);
+
+    TensorArena arena;
+    auto layer = makeMoELayerWeights(arena);
+    auto buffers = makeActivationBuffers(
+        arena,
+        /*tokens=*/2,
+        config.d_model,
+        config.moe.num_experts,
+        config.moe.top_k);
+
+    for (const DeviceId device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE("device=" + device.to_string());
+        EXPECT_THROW(
+            graph_builder.buildFFNGraph(
+                layer,
+                buffers,
+                /*layer_idx=*/0,
+                /*seq_len=*/2,
+                /*batch_size=*/1,
+                device,
+                /*device_state_publication_stream=*/nullptr),
+            std::invalid_argument);
+    }
 }
 
 /**

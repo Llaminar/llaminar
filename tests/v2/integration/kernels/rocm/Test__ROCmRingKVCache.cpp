@@ -367,6 +367,7 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP32)
     ScopedWorkspaceBinding workspace(
         cache.get(), DeviceId::rocm(0),
         max_seq_len, batch_size, head_dim);
+    ScopedHipStream stream;
 
     // Verify initial state
     EXPECT_EQ(cache->n_layers(), n_layers);
@@ -389,7 +390,9 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP32)
     (void)hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     // Append to cache (layer 0)
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, num_tokens, stream.stream()));
+    stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
     EXPECT_FALSE(cache->is_wrapped(0, 0)); // Should not be wrapped yet
 
@@ -736,6 +739,7 @@ TEST(Test__ROCmRingKVCache, WrapAround_FP32)
     ScopedWorkspaceBinding workspace(
         cache.get(), DeviceId::rocm(0),
         max_seq_len, batch_size, head_dim);
+    ScopedHipStream stream;
 
     // Generate test data: 12 tokens (exceeds max_seq_len=8)
     const int total_tokens = 12;
@@ -750,7 +754,9 @@ TEST(Test__ROCmRingKVCache, WrapAround_FP32)
     (void)hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     // Append all 12 tokens - should wrap and auto-evict oldest 4
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, total_tokens, stream.stream()));
+    stream.synchronize();
 
     // Should have max_seq_len=8 tokens, with oldest 4 evicted
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
@@ -813,6 +819,7 @@ TEST(Test__ROCmRingKVCache, WrapAround_ExactlyDouble_FP32)
     ScopedWorkspaceBinding workspace(
         cache.get(), DeviceId::rocm(0),
         max_seq_len, batch_size, head_dim);
+    ScopedHipStream stream;
 
     // Exactly 2x buffer size: 16 tokens into 8-slot buffer
     const int total_tokens = 16;
@@ -825,7 +832,9 @@ TEST(Test__ROCmRingKVCache, WrapAround_ExactlyDouble_FP32)
     (void)hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     (void)hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, total_tokens, stream.stream()));
+    stream.synchronize();
 
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
     EXPECT_TRUE(cache->is_wrapped(0, 0));
@@ -880,6 +889,7 @@ TEST(Test__ROCmRingKVCache, WrapAround_BarelyOver_FP32)
     ScopedWorkspaceBinding workspace(
         cache.get(), DeviceId::rocm(0),
         max_seq_len, batch_size, head_dim);
+    ScopedHipStream stream;
 
     // Just 1 more than buffer: 9 tokens into 8-slot buffer
     const int total_tokens = 9;
@@ -892,7 +902,9 @@ TEST(Test__ROCmRingKVCache, WrapAround_BarelyOver_FP32)
     (void)hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     (void)hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, total_tokens, stream.stream()));
+    stream.synchronize();
 
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
     EXPECT_TRUE(cache->is_wrapped(0, 0));
@@ -946,6 +958,7 @@ TEST(Test__ROCmRingKVCache, WrapAround_TripleBuffer_FP32)
     ScopedWorkspaceBinding workspace(
         cache.get(), DeviceId::rocm(0),
         max_seq_len, batch_size, head_dim);
+    ScopedHipStream stream;
 
     // 3x buffer size: 24 tokens into 8-slot buffer
     const int total_tokens = 24;
@@ -958,7 +971,9 @@ TEST(Test__ROCmRingKVCache, WrapAround_TripleBuffer_FP32)
     (void)hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     (void)hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, total_tokens, stream.stream()));
+    stream.synchronize();
 
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
     EXPECT_TRUE(cache->is_wrapped(0, 0));
@@ -1011,6 +1026,7 @@ TEST(Test__ROCmRingKVCache, Eviction_FP32)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedHipStream stream;
 
     // Append 10 tokens
     const int num_tokens = 10;
@@ -1023,7 +1039,9 @@ TEST(Test__ROCmRingKVCache, Eviction_FP32)
     (void)hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     (void)hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, num_tokens, stream.stream()));
+    stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 10);
 
     // Evict 3 oldest tokens
@@ -1082,6 +1100,7 @@ TEST(Test__ROCmRingKVCache, Clear_FP32)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedHipStream stream;
 
     // Append some tokens to multiple layers/sequences
     const int num_tokens = 5;
@@ -1099,10 +1118,12 @@ TEST(Test__ROCmRingKVCache, Clear_FP32)
     {
         for (int seq = 0; seq < batch_size; ++seq)
         {
-            ASSERT_TRUE(cache->append(layer, seq, d_K, d_V, num_tokens, 0));
+            ASSERT_TRUE(cache->append(
+                layer, seq, d_K, d_V, num_tokens, stream.stream()));
             EXPECT_EQ(cache->get_cached_tokens(layer, seq), num_tokens);
         }
     }
+    stream.synchronize();
 
     ScopedHipStream reset_stream;
 
@@ -1178,10 +1199,19 @@ TEST(Test__ROCmRingKVCache, AppendWithStream_RejectsNullAndAcceptsExplicitStream
                                static_cast<const ITensor *>(K_tensor.get()),
                                static_cast<const ITensor *>(V_tensor.get()),
                                num_tokens));
-    EXPECT_FALSE(cache->appendWithStream(0, 0,
-                                         static_cast<const ITensor *>(K_tensor.get()),
-                                         static_cast<const ITensor *>(V_tensor.get()),
-                                         num_tokens, nullptr));
+    EXPECT_THROW(
+        cache->appendWithStream(
+            0,
+            0,
+            static_cast<const ITensor *>(K_tensor.get()),
+            static_cast<const ITensor *>(V_tensor.get()),
+            num_tokens,
+            nullptr),
+        std::invalid_argument);
+    EXPECT_THROW(
+        cache->resetRequestState(
+            IKVCache::StateResetContext::testReinitialization(nullptr)),
+        std::invalid_argument);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 
     ScopedHipStream stream;
@@ -1438,6 +1468,7 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP16)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP16>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedHipStream stream;
 
     // Verify precision
     EXPECT_EQ(cache->precision(), ActivationPrecision::FP16);
@@ -1464,7 +1495,9 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP16)
     (void)hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(_Float16), hipMemcpyHostToDevice);
 
     // Append
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, num_tokens, stream.stream()));
+    stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
     // Retrieve
@@ -1634,6 +1667,7 @@ TEST(Test__ROCmRingKVCache, LinearizationStatistics_FP32)
     ScopedWorkspaceBinding workspace(
         cache.get(), DeviceId::rocm(0),
         max_seq_len, batch_size, head_dim);
+    ScopedHipStream stream;
 
     // Initial stats
     EXPECT_EQ(cache->get_linearization_count(), 0);
@@ -1649,7 +1683,9 @@ TEST(Test__ROCmRingKVCache, LinearizationStatistics_FP32)
     (void)hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     (void)hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, num_tokens, stream.stream()));
+    stream.synchronize();
     EXPECT_TRUE(cache->is_wrapped(0, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
 
@@ -1697,6 +1733,7 @@ TEST(Test__ROCmRingKVCache, SlidingWindow)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedHipStream stream;
 
     float *d_K, *d_V;
     (void)hipMalloc(&d_K, kv_dim * sizeof(float));
@@ -1712,7 +1749,9 @@ TEST(Test__ROCmRingKVCache, SlidingWindow)
         (void)hipMemcpy(d_V, h_V.data(), kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
         // Append 1 token
-        ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 1, 0));
+        ASSERT_TRUE(cache->append(
+            0, 0, d_K, d_V, 1, stream.stream()));
+        stream.synchronize();
 
         // Cache should never exceed window size (auto-evicts)
         EXPECT_LE(cache->get_cached_tokens(0, 0), max_seq_len);
@@ -1956,6 +1995,7 @@ TEST(Test__ROCmRingKVCache, ContiguousOptimization)
     auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
+    ScopedHipStream stream;
 
     // Append tokens without wrapping
     auto h_K = generateRandomFP32(30 * kv_dim);
@@ -1967,7 +2007,9 @@ TEST(Test__ROCmRingKVCache, ContiguousOptimization)
     (void)hipMemcpy(d_K, h_K.data(), 30 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     (void)hipMemcpy(d_V, h_V.data(), 30 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 30, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, 30, stream.stream()));
+    stream.synchronize();
 
     // Should NOT be wrapped
     EXPECT_FALSE(cache->is_wrapped(0, 0));
@@ -2015,6 +2057,7 @@ TEST(Test__ROCmRingKVCache, MultiPrecision_BF16)
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
     EXPECT_EQ(cache->precision(), ActivationPrecision::BF16);
+    ScopedHipStream stream;
 
     // Generate FP32 data and convert to BF16
     const int num_tokens = 10;
@@ -2036,7 +2079,9 @@ TEST(Test__ROCmRingKVCache, MultiPrecision_BF16)
     (void)hipMemcpy(d_K, h_K_bf16.data(), num_tokens * kv_dim * sizeof(hip_bfloat16), hipMemcpyHostToDevice);
     (void)hipMemcpy(d_V, h_V_bf16.data(), num_tokens * kv_dim * sizeof(hip_bfloat16), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, num_tokens, stream.stream()));
+    stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
     const void *d_K_out, *d_V_out;
@@ -2097,6 +2142,7 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_Q81)
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
     ASSERT_NE(cache, nullptr);
     EXPECT_EQ(cache->precision(), ActivationPrecision::Q8_1);
+    ScopedHipStream stream;
 
     const int num_tokens = 9;
     const size_t block_count = static_cast<size_t>(num_tokens) * static_cast<size_t>(kv_blocks);
@@ -2123,7 +2169,9 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_Q81)
     (void)hipMemcpy(d_K, h_K.data(), block_count * sizeof(Q8_1Block), hipMemcpyHostToDevice);
     (void)hipMemcpy(d_V, h_V.data(), block_count * sizeof(Q8_1Block), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, num_tokens, stream.stream()));
+    stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
     const void *d_K_out = nullptr;
@@ -2170,6 +2218,7 @@ TEST(Test__ROCmRingKVCache, WrapAround_Q81)
     ScopedWorkspaceBinding workspace(
         cache.get(), DeviceId::rocm(0),
         max_seq_len, batch_size, head_dim);
+    ScopedHipStream stream;
 
     const int total_tokens = 12;
     const size_t total_blocks = static_cast<size_t>(total_tokens) * static_cast<size_t>(kv_blocks);
@@ -2196,7 +2245,9 @@ TEST(Test__ROCmRingKVCache, WrapAround_Q81)
     (void)hipMemcpy(d_K, h_K_all.data(), total_blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
     (void)hipMemcpy(d_V, h_V_all.data(), total_blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, total_tokens, stream.stream()));
+    stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
     EXPECT_TRUE(cache->is_wrapped(0, 0));
 

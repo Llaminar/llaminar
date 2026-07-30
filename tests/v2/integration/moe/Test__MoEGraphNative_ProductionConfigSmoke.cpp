@@ -263,7 +263,14 @@ namespace llaminar2::test
         auto buffers = makeActivationBuffers(activation_arena);
 
         Qwen35MoEGraph graph_builder(graph_config, nullptr);
-        ComputeGraph graph = graph_builder.buildFFNGraph(layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::cpu());
+        ComputeGraph graph = graph_builder.buildFFNGraph(
+            layer,
+            buffers,
+            0,
+            kSeqLen,
+            kBatchSize,
+            DeviceId::cpu(),
+            /*device_state_publication_stream=*/nullptr);
 
         EXPECT_GT(countStagesOfType(graph, ComputeStageType::MOE_SPARSE_DISPATCH), 0u);
         EXPECT_GT(countStagesOfType(graph, ComputeStageType::MOE_SPARSE_RETURN_REDUCE), 0u);

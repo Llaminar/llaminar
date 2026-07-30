@@ -118,17 +118,14 @@ namespace llaminar2
                                             const ITensor *K, const ITensor *V,
                                             int num_tokens, void *gpu_stream)
     {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "ICUDARingKVCache::appendWithStream");
         if (!K || !V)
         {
             LOG_DEBUG("[ICUDARingKVCache::appendWithStream] Null K or V tensor");
             return false;
         }
-        if (!gpu_stream)
-        {
-            LOG_ERROR("[ICUDARingKVCache::appendWithStream] Null CUDA stream is not allowed");
-            return false;
-        }
-
         const auto target = DeviceId::cuda(device_id());
 
         const auto prepare_input = [&](const ITensor *tensor, const char *label)

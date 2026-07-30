@@ -542,7 +542,14 @@ TEST(Test__ROCmRingKVCacheTQ, AppendRequiresExplicitNonNullStream)
 
     EXPECT_FALSE(cache->append(0, 0, k_view.get(), v_view.get(), num_tokens));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
-    EXPECT_FALSE(cache->appendWithStream(0, 0, k_view.get(), v_view.get(), num_tokens, nullptr));
+    EXPECT_THROW(
+        cache->appendWithStream(
+            0, 0, k_view.get(), v_view.get(), num_tokens, nullptr),
+        std::invalid_argument);
+    EXPECT_THROW(
+        cache->resetRequestState(
+            IKVCache::StateResetContext::testReinitialization(nullptr)),
+        std::invalid_argument);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 
     ScopedHipStream stream;

@@ -78,6 +78,13 @@ namespace llaminar2
             IMoERuntimeTable *moe_runtime_table = nullptr;
             /// Optional logical participant id recorded in runtime placement descriptors.
             int runtime_participant_index = -1;
+            /**
+             * Exact producer stream for cold GPU runtime-table publication.
+             *
+             * CPU stages leave this null. A GPU stage that needs to initialize
+             * its placement bank fails immediately when no stream was supplied.
+             */
+            void *runtime_publication_stream = nullptr;
             /// Cached slab references for PreparedWeightStore-based resolution.
             std::optional<ExpertSlabRef> gate_slab_ref;
             std::optional<ExpertSlabRef> up_slab_ref;

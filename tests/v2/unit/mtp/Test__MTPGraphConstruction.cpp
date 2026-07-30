@@ -3136,7 +3136,8 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
         64,
         1,
         1,
-        DeviceId::cpu());
+        DeviceId::cpu(),
+        /*device_state_publication_stream=*/nullptr);
     const auto *main_dispatch_stage = firstStageOfType<MoESparseDispatchStage>(main_graph);
     ASSERT_NE(main_dispatch_stage, nullptr);
     EXPECT_EQ(main_dispatch_stage->params().key.key_namespace, MoEOverlayCollectiveNamespace::Main);

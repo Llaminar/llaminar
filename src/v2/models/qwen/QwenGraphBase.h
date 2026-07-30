@@ -341,6 +341,7 @@ namespace llaminar2
             int seq_len,
             int batch_size,
             DeviceId device,
+            void *device_state_publication_stream,
             const int32_t *sequence_lengths_device = nullptr) override;
 
     protected:

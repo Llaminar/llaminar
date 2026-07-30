@@ -163,6 +163,34 @@ namespace llaminar2::test
                "forward publication.";
     }
 
+    TEST(Test__DeviceExecutionTimeline, GraphBuildPublicationPrecedesEveryGraphFamily)
+    {
+        const auto publication =
+            DeviceEventEdge::at(
+                DeviceTimelinePoint::GraphBuildDeviceStateReady)
+                .from(
+                    DeviceTimelineRole::
+                        GraphBuildDeviceStatePublication);
+
+        EXPECT_TRUE(publication.validForPublication());
+        EXPECT_TRUE(
+            publication.to(DeviceTimelineRole::MainForwardGraph)
+                .validForConsumption());
+        EXPECT_TRUE(
+            publication.to(DeviceTimelineRole::MTPSidecarGraph)
+                .validForConsumption());
+        EXPECT_TRUE(
+            publication.to(DeviceTimelineRole::RequestStateReset)
+                .validForConsumption())
+            << "A request that ends before first execution must retire cold "
+               "graph-build publication before resetting model state.";
+        EXPECT_FALSE(
+            publication.to(DeviceTimelineRole::RequestAdmissionTransfer)
+                .validForConsumption())
+            << "Graph-build descriptor publication is consumed by graph "
+               "execution, not by independent request admission.";
+    }
+
     TEST(Test__DeviceExecutionTimeline, DurableForwardPublicationNeedsNoProducerStream)
     {
         MockBackend backend(DeviceType::CUDA);

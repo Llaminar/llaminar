@@ -1676,6 +1676,12 @@ namespace llaminar2
 
     bool DeviceMoERuntimeTable::flipActiveBank(int layer_idx, uint32_t epoch, void *stream)
     {
+        if (mirror_to_device_ && !stream)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] GPU active-bank publication requires an "
+                "explicit non-null producer stream");
+        }
         validateLayerIndex(layer_idx);
         auto &state = host_layers_[static_cast<size_t>(layer_idx)];
         const uint32_t inactive_bank = 1u - state.active_bank;
@@ -2003,6 +2009,12 @@ namespace llaminar2
 
     void DeviceMoERuntimeTable::uploadLayerState(int layer_idx, void *stream)
     {
+        if (mirror_to_device_ && !stream)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] GPU runtime-table upload requires an "
+                "explicit non-null producer stream");
+        }
         auto *dst = device_layers_ + layer_idx;
         auto *src = host_layers_.data() + layer_idx;
         copyHostToMirror(device_id_, dst, src, sizeof(DeviceMoELayerRuntime), stream,
@@ -2013,6 +2025,12 @@ namespace llaminar2
         int layer_idx,
         void *stream)
     {
+        if (mirror_to_device_ && !stream)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] GPU runtime-template upload requires an "
+                "explicit non-null producer stream");
+        }
         validateLayerIndex(layer_idx);
         const auto idx = static_cast<size_t>(layer_idx);
         copyHostToMirror(

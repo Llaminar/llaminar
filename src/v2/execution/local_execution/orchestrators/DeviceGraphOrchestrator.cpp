@@ -3651,7 +3651,7 @@ namespace llaminar2
         published.reserve(
             stochastic_target_sample_ready_.size() +
             stochastic_draft_sample_ready_.size() +
-            9);
+            11);
 
         const auto append =
             [&](const char *name,
@@ -3691,6 +3691,12 @@ namespace llaminar2
         append("request_state_reset",
                request_state_reset_ready_.event,
                request_state_reset_ready_.valid);
+        append("main_graph_build_device_state",
+               main_graph_build_device_state_ready_.event,
+               main_graph_build_device_state_ready_.valid);
+        append("mtp_graph_build_device_state",
+               mtp_graph_build_device_state_ready_.event,
+               mtp_graph_build_device_state_ready_.valid);
         append("request_input_admission",
                request_input_admission_ready_.event,
                request_input_admission_ready_.valid);
@@ -5267,11 +5273,17 @@ namespace llaminar2
                 make_request_input_event();
             request_state_reset_ready_.event =
                 make_request_input_event();
+            main_graph_build_device_state_ready_.event =
+                make_request_input_event();
+            mtp_graph_build_device_state_ready_.event =
+                make_request_input_event();
             if (!request_input_admission_ready_.event ||
                 !request_input_reuse_ready_.event ||
-                !request_state_reset_ready_.event)
+                !request_state_reset_ready_.event ||
+                !main_graph_build_device_state_ready_.event ||
+                !mtp_graph_build_device_state_ready_.event)
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to preallocate request-boundary reset/admission/reuse events");
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to preallocate request-boundary and graph-build ordering events");
                 return false;
             }
         }
@@ -8208,14 +8220,40 @@ namespace llaminar2
     GraphBuildResult DeviceGraphOrchestrator::buildForwardGraph(
         const ForwardInput &input)
     {
-        auto session = buildGraph().forInput(input);
+        ForwardInput build_input = input;
+        if (build_input.device.is_gpu())
+        {
+            if (!build_input.device_state_publication_stream)
+            {
+                build_input.device_state_publication_stream =
+                    explicitGPUStreamForOperation(
+                        "forward_graph_device_state_publication");
+            }
+            if (!build_input.device_state_publication_stream)
+            {
+                throw std::runtime_error(
+                    "GPU forward graph construction requires an explicit "
+                    "non-null device-state publication stream");
+            }
+        }
+        auto session = buildGraph().forInput(build_input);
 
         auto finalize = [&](GraphBuildResult result) -> GraphBuildResult
         {
             if (!result)
                 return result;
 
-            applyCurrentExpertPlacementToGraph(result.graph());
+            applyCurrentExpertPlacementToGraph(
+                result.graph(),
+                build_input.device_state_publication_stream);
+
+            if (build_input.device.is_gpu())
+            {
+                publishGraphBuildDeviceStateReady(
+                    main_graph_build_device_state_ready_,
+                    build_input.device_state_publication_stream,
+                    "forward_graph_build");
+            }
 
             if (raw_expert_weights_released_after_graph_build_ || !graph_builder_)
                 return result;
@@ -8304,7 +8342,9 @@ namespace llaminar2
         }
     }
 
-    void DeviceGraphOrchestrator::applyCurrentExpertPlacementToGraph(ComputeGraph &graph)
+    void DeviceGraphOrchestrator::applyCurrentExpertPlacementToGraph(
+        ComputeGraph &graph,
+        void *publication_stream)
     {
         const bool has_current_masks = !current_expert_masks_.empty();
         const bool has_current_replicas = current_expert_replica_participant_id_ >= 0;
@@ -8313,12 +8353,8 @@ namespace llaminar2
 
         int mask_count = 0;
         int replica_count = 0;
-        void *publication_stream = nullptr;
         auto ensure_graph_placement_publication_stream = [&]() -> void *
         {
-            if (publication_stream)
-                return publication_stream;
-            publication_stream = explicitGPUStreamForOperation("moe_current_placement_graph_publish");
             if (!publication_stream)
             {
                 throw std::runtime_error(
@@ -9226,6 +9262,11 @@ namespace llaminar2
                               .withBuffers(buffers)
                               .withSequence(seq_len, 1)
                               .onDevice(device)
+                              .withDeviceStatePublicationStream(
+                                  device.is_gpu()
+                                      ? explicitGPUStreamForOperation(
+                                            "cached_ffn_graph_build")
+                                      : nullptr)
                               .build();
 
             if (!result)
@@ -9263,6 +9304,11 @@ namespace llaminar2
                           .withBuffers(buffers)
                           .withSequence(seq_len, 1)
                           .onDevice(device)
+                          .withDeviceStatePublicationStream(
+                              device.is_gpu()
+                                  ? explicitGPUStreamForOperation(
+                                        "ffn_graph_build")
+                                  : nullptr)
                           .build();
 
         if (!result)
@@ -11175,6 +11221,18 @@ namespace llaminar2
             graph_builder_ &&
             graph_builder_->
                 prefixCacheRuntimeStateRequiresDeviceRehydration();
+        input.device_state_publication_stream =
+            state_.device_id.is_gpu()
+                ? explicitGPUStreamForOperation(
+                      "forward_graph_device_state_publication")
+                : nullptr;
+        if (state_.device_id.is_gpu() &&
+            !input.device_state_publication_stream)
+        {
+            throw std::runtime_error(
+                "GPU forward input construction requires an explicit "
+                "device-state publication stream");
+        }
         input.device = state_.device_id;
         input.kv_cache = state_.kv_cache.get();
 
@@ -13240,6 +13298,19 @@ namespace llaminar2
         input.batch_size = request_batch;
         input.seq_len = token_count;
         input.first_sequence_index = first_seq_idx;
+        input.device_state_publication_stream =
+            state_.device_id.is_gpu()
+                ? explicitGPUStreamForOperation(
+                      "mtp_graph_device_state_publication")
+                : nullptr;
+        if (state_.device_id.is_gpu() &&
+            !input.device_state_publication_stream)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] MTP graph construction requires an "
+                "explicit non-null device-state publication stream");
+            return false;
+        }
         input.device = state_.device_id;
         input.terminal_hidden_buffer_id = terminal_hidden_buffer_id;
         input.kv_cache_only = kv_cache_only;
@@ -13348,6 +13419,13 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to build MTP sidecar graph");
                 return false;
             }
+            if (state_.device_id.is_gpu())
+            {
+                publishGraphBuildDeviceStateReady(
+                    mtp_graph_build_device_state_ready_,
+                    cached_input.device_state_publication_stream,
+                    "mtp_sidecar_graph_build");
+            }
 
             sidecar_cache.graph = std::make_unique<ComputeGraph>(std::move(graph));
             sidecar_cache.dynamic_param_stages.clear();
@@ -13443,6 +13521,15 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to create MTP sidecar graph capture stream");
                 return false;
             }
+        }
+        if (state_.device_id.is_gpu() &&
+            !waitForPendingGraphBuildDeviceStateReady(
+                mtp_graph_build_device_state_ready_,
+                sidecar_dynamic_stream,
+                DeviceTimelineRole::MTPSidecarGraph,
+                "mtp_sidecar_graph_build_state"))
+        {
+            return false;
         }
         if (state_.device_id.is_gpu() &&
             !waitForPendingDeviceMoERebalanceMaintenance(
@@ -24437,6 +24524,14 @@ namespace llaminar2
         {
             return false;
         }
+        if (!waitForPendingGraphBuildDeviceStateReady(
+                main_graph_build_device_state_ready_,
+                execution_stream,
+                DeviceTimelineRole::MainForwardGraph,
+                "forward_graph_build_device_state"))
+        {
+            return false;
+        }
         if (!waitForPendingRequestInputAdmission(
                 execution_stream,
                 "forward_graph_request_input"))
@@ -26586,20 +26681,20 @@ namespace llaminar2
                                .defaultStream();
             if (!stream)
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] "
-                          << (operation ? operation : "gpu_operation")
-                          << " requires an explicit non-null GPU stream on "
-                          << state_.device_id.toString());
+                throw std::runtime_error(
+                    std::string(operation ? operation : "gpu_operation") +
+                    " requires an explicit non-null GPU stream on " +
+                    state_.device_id.toString());
             }
             return stream;
         }
         catch (const std::exception &e)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] "
-                      << (operation ? operation : "gpu_operation")
-                      << " could not acquire an explicit GPU stream on "
-                      << state_.device_id.toString() << ": " << e.what());
-            return nullptr;
+            throw std::runtime_error(
+                std::string("[DeviceGraphOrchestrator] ") +
+                (operation ? operation : "gpu_operation") +
+                " could not acquire an explicit GPU stream on " +
+                state_.device_id.toString() + ": " + e.what());
         }
     }
 
@@ -26711,31 +26806,6 @@ namespace llaminar2
         }
         PerfStatsCollector::addCounter("mtp",
                                        "live_prefix_replay_state_after_mutation",
-                                       1.0,
-                                       "decode",
-                                       state_.device_id.toString(),
-                                       std::move(tags));
-    }
-
-    void DeviceGraphOrchestrator::invalidateMTPSidecarDepth0GraphState(const char *reason)
-    {
-        mtp_sidecar_depth0_cache_.invalidate();
-        mtp_sidecar_depth0_device_token_cache_.invalidate();
-        mtp_sidecar_depth0_chained_cache_.invalidate();
-        mtp_sidecar_depth0_chained_device_token_cache_.invalidate();
-        mtp_sidecar_depth0_kv_only_cache_.invalidate();
-        mtp_sidecar_depth0_kv_only_device_token_cache_.invalidate();
-        for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
-        {
-            cache->invalidate();
-        }
-
-        PerfStatsCollector::Tags tags;
-        tags["reason"] = reason ? reason : "unknown";
-        tags["state_epoch"] = std::to_string(session_epoch_);
-        tags["moe_placement_epoch"] = std::to_string(moePlacementEpoch());
-        PerfStatsCollector::addCounter("mtp",
-                                       "sidecar_graph_invalidations",
                                        1.0,
                                        "decode",
                                        state_.device_id.toString(),
@@ -32022,6 +32092,23 @@ namespace llaminar2
                 "RequestStateResetReady",
                 consumer_name);
         }
+        if (!waitForPendingGraphBuildDeviceStateReady(
+                main_graph_build_device_state_ready_,
+                reset_stream,
+                DeviceTimelineRole::RequestStateReset,
+                consumer_name) ||
+            !waitForPendingGraphBuildDeviceStateReady(
+                mtp_graph_build_device_state_ready_,
+                reset_stream,
+                DeviceTimelineRole::RequestStateReset,
+                consumer_name))
+        {
+            return reportDeviceTimelineJoinFailure(
+                state_.device_id,
+                "request_state_reset",
+                "GraphBuildDeviceStateReady",
+                consumer_name);
+        }
         if (!waitForLiveInferenceStateReadyForObservation(
                 reset_stream,
                 consumer_name,
@@ -32237,6 +32324,129 @@ namespace llaminar2
         PerfStatsCollector::addCounter(
             "request_reset",
             "device_state_ready_waits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"consumer",
+              consumer_name && consumer_name[0] != '\0'
+                  ? consumer_name
+                  : "unknown"},
+             {"same_stream",
+              boolTag(consumer_stream == ready.producer_stream)}});
+        ready.valid = false;
+        ready.producer_stream = nullptr;
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::publishGraphBuildDeviceStateReady(
+        PendingGraphBuildDeviceStateReadyState &ready,
+        void *producer_stream,
+        const char *producer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return;
+        if (!ready.event || ready.valid)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Graph-build device-state "
+                "publication has invalid lifecycle ownership"
+                << " producer="
+                << (producer_name && producer_name[0] != '\0'
+                        ? producer_name
+                        : "unknown")
+                << " event=" << static_cast<bool>(ready.event)
+                << " already_valid=" << ready.valid);
+            std::terminate();
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!producer_stream ||
+            !backend ||
+            !DeviceEventEdge::at(
+                 DeviceTimelinePoint::GraphBuildDeviceStateReady)
+                 .from(
+                     DeviceTimelineRole::
+                         GraphBuildDeviceStatePublication)
+                 .publish(
+                     *backend,
+                     state_.device_id,
+                     ready.event.get(),
+                     producer_stream))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Failed to publish graph-build "
+                "device-state readiness");
+            std::terminate();
+        }
+
+        ready.producer_stream = producer_stream;
+        ready.valid = true;
+        PerfStatsCollector::addCounter(
+            "graph",
+            "device_state_publication_events",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"producer",
+              producer_name && producer_name[0] != '\0'
+                  ? producer_name
+                  : "unknown"},
+             {"ordering", "event_wait"}});
+    }
+
+    bool DeviceGraphOrchestrator::waitForPendingGraphBuildDeviceStateReady(
+        PendingGraphBuildDeviceStateReadyState &ready,
+        void *consumer_stream,
+        DeviceTimelineRole consumer_role,
+        const char *consumer_name)
+    {
+        if (!state_.device_id.is_gpu() || !ready.valid)
+            return true;
+        if (!consumer_stream ||
+            !ready.event ||
+            !ready.producer_stream ||
+            (consumer_role != DeviceTimelineRole::MainForwardGraph &&
+             consumer_role != DeviceTimelineRole::MTPSidecarGraph &&
+             consumer_role != DeviceTimelineRole::RequestStateReset))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Graph-build device-state dependency "
+                "has incomplete or invalid ownership"
+                << " consumer="
+                << (consumer_name && consumer_name[0] != '\0'
+                        ? consumer_name
+                        : "unknown"));
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend ||
+            !DeviceEventEdge::at(
+                 DeviceTimelinePoint::GraphBuildDeviceStateReady)
+                 .from(
+                     DeviceTimelineRole::
+                         GraphBuildDeviceStatePublication)
+                 .to(consumer_role)
+                 .enqueueWait(
+                     *backend,
+                     state_.device_id,
+                     ready.event.get(),
+                     ready.producer_stream,
+                     consumer_stream))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Failed to order graph execution "
+                "after graph-build device-state publication"
+                << " consumer="
+                << (consumer_name && consumer_name[0] != '\0'
+                        ? consumer_name
+                        : "unknown"));
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "graph",
+            "device_state_publication_waits",
             1.0,
             perfPhaseName(),
             state_.device_id.toString(),
@@ -39896,6 +40106,14 @@ namespace llaminar2
         return *this;
     }
 
+    DeviceGraphOrchestrator::FFNGraphSession &
+    DeviceGraphOrchestrator::FFNGraphSession::withDeviceStatePublicationStream(
+        void *stream)
+    {
+        device_state_publication_stream_ = stream;
+        return *this;
+    }
+
     bool DeviceGraphOrchestrator::FFNGraphSession::isValid() const
     {
         return validationError().empty();
@@ -39927,6 +40145,11 @@ namespace llaminar2
         {
             return "No device configured (call onDevice())";
         }
+        if (device_->is_gpu() && !device_state_publication_stream_)
+        {
+            return "GPU FFN graph construction requires an explicit non-null "
+                   "device-state publication stream";
+        }
         return "";
     }
 
@@ -39945,7 +40168,13 @@ namespace llaminar2
         }
 
         ComputeGraph graph = graph_builder->buildFFNGraph(
-            *layer_, *buffers_, layer_idx_, seq_len_, batch_size_, device_.value());
+            *layer_,
+            *buffers_,
+            layer_idx_,
+            seq_len_,
+            batch_size_,
+            device_.value(),
+            device_state_publication_stream_);
 
         if (graph.size() == 0)
         {

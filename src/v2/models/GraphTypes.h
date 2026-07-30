@@ -899,6 +899,15 @@ namespace llaminar2
          * silently publishing every payload into slot zero.
          */
         int first_sequence_index = 0;
+        /**
+         * @brief Exact producer stream for one-time sidecar device-state publication.
+         *
+         * GPU MoE sidecar construction may publish immutable runtime
+         * descriptors before its first execution. The orchestrator supplies a
+         * non-null stream and orders the eventual execution stream after that
+         * producer with a named device event.
+         */
+        void *device_state_publication_stream = nullptr;
         DeviceId device = DeviceId::cpu();
         BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
         bool kv_cache_only = false;

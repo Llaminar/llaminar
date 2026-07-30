@@ -272,17 +272,14 @@ namespace llaminar2
                                             const ITensor *K, const ITensor *V,
                                             int num_tokens, void *gpu_stream)
     {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "IROCmRingKVCache::appendWithStream");
         if (!K || !V)
         {
             LOG_DEBUG("[IROCmRingKVCache::appendWithStream] Null K or V tensor");
             return false;
         }
-        if (!gpu_stream)
-        {
-            LOG_ERROR("[IROCmRingKVCache::appendWithStream] Null HIP stream is not allowed");
-            return false;
-        }
-
         const auto target = DeviceId::rocm(device_id());
 
         const auto prepare_input = [&](const ITensor *tensor, const char *label)
@@ -935,6 +932,9 @@ namespace llaminar2
         const DataT *d_k, const DataT *d_v,
         int num_tokens, hipStream_t stream)
     {
+        requireGPUExecutionStream(
+            static_cast<void *>(stream),
+            "ROCmRingKVCache::append");
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
         {
             LOG_ERROR("[ROCmRingKVCache::append] Invalid layer=" << layer << " or seq_idx=" << seq_idx);
@@ -942,26 +942,6 @@ namespace llaminar2
         }
 
         EntryT &entry = entries_[layer][seq_idx];
-        const bool capture_active = isGraphCaptureActive();
-        hipStream_t effective_stream = stream;
-        if (!effective_stream)
-        {
-            if (capture_active)
-            {
-                LOG_ERROR("[ROCmRingKVCache::append] Explicit HIP stream required during graph capture");
-                return false;
-            }
-            // Keep sequence-state ownership coherent on device even for legacy
-            // callers that pass nullptr. This is an explicit worker stream, not
-            // HIP's device-default stream, so later metadata uploads are ordered
-            // with the payload append instead of silently leaving stale counters.
-            effective_stream = device_ctx_
-                                   ? static_cast<hipStream_t>(device_ctx_->defaultStream())
-                                   : static_cast<hipStream_t>(
-                                         GPUDeviceContextPool::instance()
-                                             .getAMDContext(device_id_)
-                                             .defaultStream());
-        }
 
         if (num_tokens > 0)
         {
@@ -982,15 +962,15 @@ namespace llaminar2
                          << " d_head=" << static_cast<const void *>(&d_head_params_[idx])
                          << " d_count=" << static_cast<const void *>(&d_count_params_[idx])
                          << " d_append_count=" << static_cast<const void *>(d_append_count)
-                         << " stream=" << static_cast<void *>(effective_stream));
+                         << " stream=" << static_cast<void *>(stream));
             }
             launch_append_kernel_dynamic(entry, d_k, d_v,
                                          &d_head_params_[idx], d_append_count,
-                                         num_tokens, effective_stream);
+                                         num_tokens, stream);
             hip_kv_sequence_state_advance_dynamic(
                 &d_head_params_[idx], &d_count_params_[idx],
                 d_append_count,
-                num_tokens, max_seq_len_, effective_stream);
+                num_tokens, max_seq_len_, stream);
         }
 
         return true;
@@ -1005,10 +985,13 @@ namespace llaminar2
         int verifier_rows,
         void *gpu_stream)
     {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "ROCmRingKVCache::appendVerifierRowsDecodeEquivalent");
         if (layer < 0 || layer >= n_layers_ ||
             seq_idx < 0 || seq_idx >= batch_size_ ||
             verifier_rows < 1 ||
-            !K || !V || !gpu_stream)
+            !K || !V)
         {
             LOG_ERROR("[ROCmRingKVCache] Invalid verifier append request: layer="
                       << layer << " n_layers=" << n_layers_
@@ -1255,6 +1238,9 @@ namespace llaminar2
         }
         else
         {
+            requireGPUExecutionStream(
+                static_cast<void *>(stream),
+                "ROCmRingKVCache::appendConvertedWithStream");
             if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             {
                 LOG_ERROR("[ROCmRingKVCache::appendConvertedWithStream] Invalid layer=" << layer
@@ -1264,11 +1250,6 @@ namespace llaminar2
             if (!d_k_src || !d_v_src || num_tokens < 0)
             {
                 LOG_ERROR("[ROCmRingKVCache::appendConvertedWithStream] Invalid source pointers or token count");
-                return false;
-            }
-            if (!stream)
-            {
-                LOG_ERROR("[ROCmRingKVCache::appendConvertedWithStream] Explicit HIP stream is required");
                 return false;
             }
             if (num_tokens == 0)
@@ -1564,24 +1545,14 @@ namespace llaminar2
     bool ROCmRingKVCache<Precision>::exportLogicalBlock(
         const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const
     {
+        requireGPUExecutionStream(
+            desc.stream,
+            "ROCmRingKVCache::exportLogicalBlock");
         const int local_layer = remapLayerIndex(desc.layer);
         if (local_layer < 0 || local_layer >= n_layers_ ||
             desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
             desc.logical_token_start < 0 || desc.token_count < 0)
         {
-            return false;
-        }
-
-        if (!desc.stream)
-        {
-            if (desc.token_count == 0)
-            {
-                KVCacheSequenceState state;
-                return observeDeviceSequenceState(
-                           local_layer, desc.seq_idx, &state) &&
-                       desc.logical_token_start <= state.cached_tokens;
-            }
-            LOG_ERROR("[ROCmRingKVCache::exportLogicalBlock] non-empty GPU logical export requires an explicit stream");
             return false;
         }
 
@@ -1778,6 +1749,9 @@ namespace llaminar2
     bool ROCmRingKVCache<Precision>::importLogicalBlock(
         const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v)
     {
+        requireGPUExecutionStream(
+            desc.stream,
+            "ROCmRingKVCache::importLogicalBlock");
         const int local_layer = remapLayerIndex(desc.layer);
         if (local_layer < 0 || local_layer >= n_layers_ ||
             desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
@@ -1789,11 +1763,6 @@ namespace llaminar2
         }
 
         auto &entry = entries_[local_layer][desc.seq_idx];
-        if (!desc.stream)
-        {
-            LOG_ERROR("[ROCmRingKVCache::importLogicalBlock] GPU logical import requires an explicit stream");
-            return false;
-        }
         hipStream_t stream = static_cast<hipStream_t>(desc.stream);
         if (desc.payload_domain ==
             KVCacheLogicalBlockPayloadDomain::Device)
@@ -2013,6 +1982,9 @@ namespace llaminar2
         int *kv_lens, int max_kv_len,
         hipStream_t stream)
     {
+        requireGPUExecutionStream(
+            static_cast<void *>(stream),
+            "ROCmRingKVCache::gather_kv_batched");
         if (layer < 0 || layer >= n_layers_ || num_seqs > batch_size_)
         {
             LOG_ERROR("[ROCmRingKVCache::gather_kv_batched] Invalid layer=" << layer);
@@ -2038,7 +2010,7 @@ namespace llaminar2
         // Use provided max_kv_len or actual
         int out_max_kv_len = (max_kv_len > 0) ? max_kv_len : actual_max_kv_len;
 
-        if (!stream || !d_k_out || !d_v_out ||
+        if (!d_k_out || !d_v_out ||
             !d_batched_k_entry_table_ || !d_batched_v_entry_table_ ||
             !d_head_params_ || !d_count_params_ ||
             !batched_pointer_tables_ready_)
@@ -2101,6 +2073,9 @@ namespace llaminar2
         ITensor **out_v,
         void *gpu_stream)
     {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "ROCmRingKVCache::get_kv_batched_device_view");
         if (out_k)
             *out_k = nullptr;
         if (out_v)
@@ -2111,7 +2086,7 @@ namespace llaminar2
             request_count <= batch_size_ &&
             first_seq_idx <= batch_size_ - request_count;
         if (layer < 0 || layer >= n_layers_ || !request_range_valid ||
-            !gpu_stream || !workspace_ || !workspace_->isAllocated() ||
+            !workspace_ || !workspace_->isAllocated() ||
             !d_head_params_ || !d_count_params_ ||
             !batched_pointer_tables_ready_)
         {

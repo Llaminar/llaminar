@@ -40,6 +40,17 @@ namespace llaminar2
                     }),
                 },
                 {
+                    .point = DeviceTimelinePoint::GraphBuildDeviceStateReady,
+                    .name = "graph_build_device_state_ready",
+                    .producer =
+                        DeviceTimelineRole::GraphBuildDeviceStatePublication,
+                    .consumers = roles({
+                        DeviceTimelineRole::MainForwardGraph,
+                        DeviceTimelineRole::MTPSidecarGraph,
+                        DeviceTimelineRole::RequestStateReset,
+                    }),
+                },
+                {
                     .point = DeviceTimelinePoint::RequestInputAdmission,
                     .name = "request_input_admission",
                     .producer = DeviceTimelineRole::RequestAdmissionTransfer,
@@ -276,6 +287,8 @@ namespace llaminar2
         {
         case DeviceTimelineRole::RequestStateReset:
             return "request_state_reset";
+        case DeviceTimelineRole::GraphBuildDeviceStatePublication:
+            return "graph_build_device_state_publication";
         case DeviceTimelineRole::RequestAdmissionTransfer:
             return "request_admission_transfer";
         case DeviceTimelineRole::MainForwardGraph:

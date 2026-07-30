@@ -4105,7 +4105,10 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossParti
         auto table = std::make_unique<MoERuntimeTable>(config);
         auto update = make_update(participant_id);
         EXPECT_TRUE(table->prepareInactiveBank(0, update));
-        EXPECT_TRUE(table->flipActiveBank(0, update.epoch, nullptr));
+        EXPECT_TRUE(table->flipActiveBank(
+            0,
+            update.epoch,
+            rocmMoETestStream()));
         return table;
     };
 

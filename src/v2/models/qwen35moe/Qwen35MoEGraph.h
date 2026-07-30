@@ -63,6 +63,7 @@ namespace llaminar2
             int seq_len,
             int batch_size,
             DeviceId device,
+            void *device_state_publication_stream,
             const int32_t *sequence_lengths_device = nullptr) override;
 
         ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
@@ -94,11 +95,11 @@ namespace llaminar2
          * the restoring domain.  In that case the cached KV/GDN/MTP tensors are
          * still valid, but any decode-era dynamic placement, transfer slots, or
          * graph-side rebalance scratch owned by this graph builder must not
-         * survive into suffix prefill.  The implementation resets decode
-         * runtime tables to their empty pre-decode state while preserving their
-         * allocated prefill scratch bindings, then clears transient movement
-         * helpers so suffix prefill observes the same model-runtime baseline as
-         * an uncached split prefill from the same token boundary.
+         * survive into suffix prefill. The implementation restores the
+         * immutable model-lifetime placement template at the same stable device
+         * addresses used by captured graphs, then clears transient movement
+         * publications so suffix prefill and grouped decode observe the same
+         * canonical ownership as an uncached request.
          */
         void resetPrefixCacheRuntimeStateWithoutSnapshot(
             void *execution_stream = nullptr) override;
@@ -208,7 +209,9 @@ namespace llaminar2
     private:
         struct ScopedMTPGraphContext
         {
-            ScopedMTPGraphContext(Qwen35MoEGraph &graph, int depth_idx);
+            ScopedMTPGraphContext(
+                Qwen35MoEGraph &graph,
+                int depth_idx);
             ~ScopedMTPGraphContext();
 
             Qwen35MoEGraph &graph;
