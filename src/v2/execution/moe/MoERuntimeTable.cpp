@@ -477,6 +477,7 @@ namespace llaminar2
         empty_host_layers_ = host_layers_;
         initial_host_layers_ = empty_host_layers_;
         initial_layer_captured_.assign(host_layers_.size(), 0u);
+        decode_runtime_publication_required_.assign(host_layers_.size(), 0u);
 
         if (mirror_to_device_)
         {
@@ -528,6 +529,12 @@ namespace llaminar2
     {
         validateLayerIndex(layer_idx);
         return host_layers_[static_cast<size_t>(layer_idx)];
+    }
+
+    bool DeviceMoERuntimeTable::decodeRuntimePublicationRequired(int layer_idx) const
+    {
+        validateLayerIndex(layer_idx);
+        return decode_runtime_publication_required_[static_cast<size_t>(layer_idx)] != 0u;
     }
 
     bool DeviceMoERuntimeTable::hasPrefillRouteScratchCapacity(int layer_idx, int token_count) const
@@ -872,6 +879,10 @@ namespace llaminar2
 
     void DeviceMoERuntimeTable::resetDecodeRuntimeState(void *stream)
     {
+        std::fill(decode_runtime_publication_required_.begin(),
+                  decode_runtime_publication_required_.end(),
+                  uint8_t{1});
+
         if (mirror_to_device_)
         {
             if (!stream)
@@ -945,6 +956,11 @@ namespace llaminar2
                 host_layers_.size() * sizeof(DeviceMoELayerRuntime),
                 stream,
                 "[MoERuntimeTable] device-owned initial runtime restore");
+            for (size_t layer_idx = 0; layer_idx < initial_layer_captured_.size(); ++layer_idx)
+            {
+                decode_runtime_publication_required_[layer_idx] =
+                    initial_layer_captured_[layer_idx] == 0u ? 1u : 0u;
+            }
             return;
         }
 
@@ -957,6 +973,8 @@ namespace llaminar2
                         : empty_host_layers_[static_cast<size_t>(layer_idx)];
             restoreRuntimeScratchBindings(state, scratch);
             resetPerRequestRuntimeFields(state, num_experts_);
+            decode_runtime_publication_required_[static_cast<size_t>(layer_idx)] =
+                initial_layer_captured_[static_cast<size_t>(layer_idx)] == 0u ? 1u : 0u;
         }
     }
 
@@ -1051,6 +1069,7 @@ namespace llaminar2
                 resetPerRequestRuntimeFields(state, num_experts_);
                 if (mirror_to_device_)
                     uploadLayerState(layer_idx, active_stream);
+                decode_runtime_publication_required_[static_cast<size_t>(layer_idx)] = 0u;
             }
 
             if (mirror_to_device_)
@@ -1404,6 +1423,7 @@ namespace llaminar2
                     layerPrefix(layer_idx) +
                         "portable restore transfer-plan upload");
                 uploadLayerState(layer_idx, stream);
+                decode_runtime_publication_required_[idx] = 0u;
                 continue;
             }
 
@@ -1603,9 +1623,27 @@ namespace llaminar2
     bool DeviceMoERuntimeTable::prepareInactiveBank(int layer_idx, const MoEPlacementUpdate &update)
     {
         validateLayerIndex(layer_idx);
+
+        const size_t layer = static_cast<size_t>(layer_idx);
+        if (decode_runtime_publication_required_[layer] != 0u)
+        {
+            /*
+             * A device-only reset deliberately leaves the old host recipe
+             * untouched.  Starting a new publication generation must therefore
+             * clear that stale epoch before validating the replacement update.
+             * Persistent graph scratch is part of model identity and survives
+             * the generation boundary.
+             */
+            auto &staging_state = host_layers_[layer];
+            const RuntimeScratchBindings scratch =
+                captureRuntimeScratchBindings(staging_state);
+            resetLayer(staging_state);
+            restoreRuntimeScratchBindings(staging_state, scratch);
+        }
+
         validateUpdate(layer_idx, update);
 
-        auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+        auto &state = host_layers_[layer];
         const uint32_t inactive_bank = 1u - state.active_bank;
         auto &bank = state.banks[inactive_bank];
         state.participant_id = update.participant_id;
@@ -1657,6 +1695,7 @@ namespace llaminar2
         if (mirror_to_device_)
             uploadLayerState(layer_idx, stream);
 
+        decode_runtime_publication_required_[static_cast<size_t>(layer_idx)] = 0u;
         return true;
     }
 

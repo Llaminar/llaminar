@@ -286,6 +286,15 @@ namespace llaminar2
         virtual DeviceMoELayerRuntime *deviceLayerState(int layer_idx) = 0;
         virtual int layerCount() const = 0;
         virtual const DeviceMoELayerRuntime &hostLayerState(int layer_idx) const = 0;
+        /**
+         * @brief Report whether the layer has no currently published decode bank.
+         *
+         * The host layer record is a publication recipe, not a coherence mirror
+         * of a GPU table.  A device-owned reset can therefore invalidate the
+         * published bank without rewriting that host recipe.  Every caller that
+         * considers reusing a bank must reject it while this flag is set.
+         */
+        virtual bool decodeRuntimePublicationRequired(int layer_idx) const = 0;
         virtual bool prepareInactiveBank(int layer_idx, const MoEPlacementUpdate &update) = 0;
         virtual bool flipActiveBank(int layer_idx, uint32_t epoch, void *stream) = 0;
         virtual bool hasPrefillRouteScratchCapacity(int layer_idx, int token_count) const = 0;
@@ -338,6 +347,7 @@ namespace llaminar2
 
         DeviceMoELayerRuntime &hostLayerState(int layer_idx);
         const DeviceMoELayerRuntime &hostLayerState(int layer_idx) const override;
+        bool decodeRuntimePublicationRequired(int layer_idx) const override;
         bool hasPrefillRouteScratchCapacity(int layer_idx, int token_count) const override;
         void recordDecodeHistogramProducerStream(void *stream) override;
         void *decodeHistogramProducerStream() const override;
@@ -421,6 +431,15 @@ namespace llaminar2
         std::vector<DeviceMoELayerRuntime> initial_host_layers_;
         std::vector<DeviceMoELayerRuntime> empty_host_layers_;
         std::vector<uint8_t> initial_layer_captured_;
+        /**
+         * @brief Host-side lifecycle metadata for ordered decode-bank publication.
+         *
+         * This vector describes whether a publication has been enqueued; it
+         * never claims that host bytes mirror live GPU bytes.  It lets graph
+         * construction distinguish a reusable publication recipe from a stale
+         * recipe left behind after a device-to-device reset.
+         */
+        std::vector<uint8_t> decode_runtime_publication_required_;
         DeviceMoELayerRuntime *device_layers_ = nullptr;
         DeviceMoELayerRuntime *device_initial_layers_ = nullptr;
         DeviceMoELayerRuntime *device_empty_layers_ = nullptr;

@@ -775,6 +775,7 @@ namespace llaminar2::test
 
         table.resetDecodeRuntimeState();
 
+        EXPECT_TRUE(table.decodeRuntimePublicationRequired(0));
         const auto &after = table.hostLayerState(0);
         EXPECT_EQ(after.active_epoch, 0u);
         EXPECT_EQ(after.route_expert_ids, reinterpret_cast<int32_t *>(0x1000u));
@@ -800,6 +801,19 @@ namespace llaminar2::test
         EXPECT_EQ(after.decode_histogram[2], 0u);
         EXPECT_EQ(after.decode_local_histogram[2], 0u);
         EXPECT_EQ(after.router_hot_cache_used_dispatches, 0u);
+
+        /*
+         * A reset starts a fresh publication generation.  Reusing epoch one is
+         * intentional: monotonicity applies within a generation, while the
+         * reset has already removed the previous bank from live execution.
+         */
+        ASSERT_TRUE(table.prepareInactiveBank(0, updateForEpoch(1, 4)));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+        EXPECT_FALSE(table.decodeRuntimePublicationRequired(0));
+        const auto &republished = table.hostLayerState(0);
+        EXPECT_EQ(republished.active_epoch, 1u);
+        EXPECT_EQ(republished.route_expert_ids, reinterpret_cast<int32_t *>(0x1000u));
+        EXPECT_EQ(republished.reserved_ptrs[2], reinterpret_cast<void *>(0xE000u));
     }
 
     TEST(Test__MoERuntimeTable, PortableRuntimeStatePreservesTransientLogicalPlacementWithoutPointers)

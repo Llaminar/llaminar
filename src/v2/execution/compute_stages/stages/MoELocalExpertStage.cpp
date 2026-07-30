@@ -199,8 +199,10 @@ namespace llaminar2
             if (runtimeTableHasActiveOverlayBank())
                 return true;
 
+            const bool publication_required =
+                params_.moe_runtime_table->decodeRuntimePublicationRequired(params_.layer_idx);
             const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
-            if (state.active_epoch != 0)
+            if (!publication_required && state.active_epoch != 0)
             {
                 LOG_ERROR("[MoELocalExpertStage] Invalid active MoE runtime placement bank for layer "
                           << params_.layer_idx << "; refusing to overwrite non-zero epoch "
@@ -290,6 +292,8 @@ namespace llaminar2
     {
         if (!params_.moe_runtime_table || params_.layer_idx < 0 || params_.num_experts <= 0)
             return false;
+        if (params_.moe_runtime_table->decodeRuntimePublicationRequired(params_.layer_idx))
+            return false;
 
         const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
         if (state.active_bank > 1 ||
@@ -342,6 +346,8 @@ namespace llaminar2
     bool MoELocalExpertStage::runtimeLocalComputeEnabled(int expert_id) const
     {
         if (!params_.moe_runtime_table || expert_id < 0 || expert_id >= params_.num_experts)
+            return false;
+        if (params_.moe_runtime_table->decodeRuntimePublicationRequired(params_.layer_idx))
             return false;
         const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
         if (state.active_bank > 1 || state.active_epoch == 0)

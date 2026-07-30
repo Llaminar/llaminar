@@ -39,6 +39,7 @@
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+#include "../KVCacheTestWorkspace.h"
 #include "kernels/rocm/kvcache/ROCmRingKVCacheTQ.h"
 #include "kernels/rocm/kvcache/ROCmRingKVCacheTQFactory.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
@@ -50,6 +51,7 @@
 #include "utils/Logger.h"
 
 using namespace llaminar2;
+using llaminar2::test::KVCacheTestWorkspaceBinding;
 
 namespace
 {
@@ -222,6 +224,7 @@ TEST(Test__ROCmRingKVCacheTQ, BasicAppendRetrieve_SplitTQ)
     ASSERT_NE(cache_ptr, nullptr);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     EXPECT_EQ(cache->n_layers(), n_layers);
@@ -304,6 +307,7 @@ TEST(Test__ROCmRingKVCacheTQ, WrapAround_PreservesNewest)
         1, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     // Append 12 tokens (overwrites first 4)
@@ -355,6 +359,7 @@ TEST(Test__ROCmRingKVCacheTQ, IncrementalAppend_DecodeLike)
         1, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     std::vector<std::vector<float>> all_K;
@@ -417,6 +422,7 @@ TEST(Test__ROCmRingKVCacheTQ, MultiLayer_IndependentData)
         n_layers, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     for (int layer = 0; layer < n_layers; ++layer)
@@ -478,6 +484,7 @@ TEST(Test__ROCmRingKVCacheTQ, Clear_ResetsAllLayers)
         n_layers, 1, 16, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     auto h_K = generateRandomFP32(5 * kv_dim, 100);
@@ -524,6 +531,7 @@ TEST(Test__ROCmRingKVCacheTQ, AppendRequiresExplicitNonNullStream)
     auto cache_ptr = createROCmRingKVCacheTQ(1, 1, 16, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 700);
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 701);
@@ -562,6 +570,7 @@ TEST(Test__ROCmRingKVCacheTQ, ClearSequenceLayerAndAllInvalidateConvertedScratch
     auto cache_ptr = createROCmRingKVCacheTQ(n_layers, batch_size, 16, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     auto append_seeded = [&](int layer, int seq_idx, unsigned seed)
@@ -627,6 +636,7 @@ TEST(Test__ROCmRingKVCacheTQ, ClearThenReappendConvertedScratchUsesNewRows)
     auto cache_ptr = createROCmRingKVCacheTQ(1, 1, 16, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     auto append_host = [&](const std::vector<float> &h_K, const std::vector<float> &h_V)
@@ -694,6 +704,7 @@ TEST(Test__ROCmRingKVCacheTQ, QuantizationError_WithinBounds)
         1, 1, 64, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 314);
@@ -742,6 +753,7 @@ TEST(Test__ROCmRingKVCacheTQ, KQuality_StrictlyBetterThan_V)
         1, 1, 64, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     auto h_data = generateRandomFP32(num_tokens * kv_dim, 999);
@@ -784,6 +796,7 @@ TEST(Test__ROCmRingKVCacheTQ, GetKVConverted_WithRoPE)
         1, 1, 32, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 123);
@@ -858,6 +871,7 @@ TEST(Test__ROCmRingKVCacheTQ, GetKVConverted_DequantOnly)
         1, 1, 32, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 555);
@@ -909,6 +923,7 @@ TEST(Test__ROCmRingKVCacheTQ, Eviction_ReducesCount)
         1, 1, 32, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 111);
@@ -953,6 +968,7 @@ TEST(Test__ROCmRingKVCacheTQ, ShadowInvalidation_AfterAppend)
         1, 1, 32, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     // Append batch 1
@@ -1012,6 +1028,7 @@ TEST(Test__ROCmRingKVCacheTQ, HeadDim128_BasicRoundtrip)
         1, 1, 32, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 777);
@@ -1064,6 +1081,7 @@ TEST(Test__ROCmRingKVCacheTQ, RoPE_PositionCorrectness)
         1, 1, 32, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     std::vector<float> h_K(num_tokens * kv_dim, 1.0f);
@@ -1129,6 +1147,7 @@ TEST(Test__ROCmRingKVCacheTQ, HostCreatedTensorIsPreparedOnDeviceBeforeAppend)
         1, 1, 32, n_kv_heads, head_dim, &tq_ctx, 0);
     auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_ptr.get());
     ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
     ScopedHipStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 111);
@@ -1207,6 +1226,7 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBy
             n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
         auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_owner.get());
         ASSERT_NE(cache, nullptr);
+        KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
         ScopedHipStream stream;
         std::vector<float *> allocations;
 
@@ -1412,6 +1432,10 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
         ROCmRingKVCacheTQ reference(
             /*n_layers=*/1, batch_size, max_seq_len,
             n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+        KVCacheTestWorkspaceBinding actual_workspace(
+            actual, DeviceId::rocm(0));
+        KVCacheTestWorkspaceBinding reference_workspace(
+            reference, DeviceId::rocm(0));
         ASSERT_TRUE(k_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
         ASSERT_TRUE(v_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
 
@@ -1655,6 +1679,10 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
         ROCmRingKVCacheTQ reference(
             /*n_layers=*/1, /*batch_size=*/1, max_seq_len,
             n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+        KVCacheTestWorkspaceBinding actual_workspace(
+            actual, DeviceId::rocm(0));
+        KVCacheTestWorkspaceBinding reference_workspace(
+            reference, DeviceId::rocm(0));
         ASSERT_TRUE(history_k->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
         ASSERT_TRUE(history_v->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
         ASSERT_TRUE(continuation_k->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));

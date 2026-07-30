@@ -11,7 +11,7 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 | Goal | Completion | Remaining proof |
 |---|---:|---|
-| SingleDevice fully device-resident MTP | 95% | refresh d1 economy and MoE production lifetime |
+| SingleDevice fully device-resident MTP | 96% | refresh d1 economy and full stochastic matrix |
 | LocalTP fully device-resident MTP | 97% | remote-participant stochastic/economy matrix |
 | ExpertParallel fully device-resident MTP | 95% | mirrored-head request batching across every EP mode |
 
@@ -30,7 +30,10 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   Ordinary prefill remains on the legacy production heuristic.
 - RAM/disk prefix tiers support model-SHA archives, FIFO demotion/overwrite,
   cold-hit VRAM promotion, restart, and pressure paths.
-- Integration unit gate: `589/589` green on 2026-07-29.
+- CUDA MoE prefix restore now invalidates stale forward and runtime-bank
+  publications explicitly. The restored sampler joins the live mutation
+  timeline, and every layer republishes its device descriptor bank before use.
+- Integration unit gate: `589/589` green on 2026-07-30.
 
 ## Production Matrix
 
@@ -53,6 +56,10 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - CPU fused TurboQuant quantization and grouped materialization are byte exact
   against serial rows for both TQ modes, D=64/128/256, `M=1..16`, plain and
   RoPE-on-read.
+- Direct CUDA/ROCm TurboQuant cache integration now binds the same persistent
+  workspace ownership contract as production. The symmetric `8/8` matrix is
+  green for TQ4/TQ8, captured request batches, unequal continuation, and
+  incremental dequantization; the corresponding CPU cache/TQ gate is `10/10`.
 - CUDA/ROCm deterministic MoE route planning covers `M=1..4`,
   `top_k={1,2,4,8,16}`, all 256 expert metadata entries, and 20 repeated exact
   launches per cell.
@@ -95,11 +102,9 @@ Matched llama.cpp master comparison, tok/s:
 
 ## Next Gates
 
-1. Localize the CUDA MoE lifetime/batch-invariance regression before accepting
-   a refreshed benchmark baseline.
-2. Run the full-context greedy and stochastic CPU/CUDA/ROCm matrix with strict
+1. Run the full-context greedy and stochastic CPU/CUDA/ROCm matrix with strict
    MTP, prefix, Dynamic/LLEP, collective, and full-graph counters.
-3. Close remote-participant lifetime and mirrored-head request batching for
+2. Close remote-participant lifetime and mirrored-head request batching for
    every LocalTP and ExpertParallel mode.
-4. Tune d1 attention/GEMV and MoE grouped FFN until SingleDevice is at least
+3. Tune d1 attention/GEMV and MoE grouped FFN until SingleDevice is at least
    llama.cpp economy, preserving byte equality and the device-owned graph.

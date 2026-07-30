@@ -2,6 +2,7 @@
 #include "execution/moe/MoERuntimeTable.h"
 #include <algorithm>
 #include <array>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -126,6 +127,12 @@ namespace llaminar2
         fields.push_back({scope + ".layer_count", std::to_string(layer_count)});
         for (int layer = 0; layer < layer_count; ++layer)
         {
+            if (table.decodeRuntimePublicationRequired(layer))
+            {
+                throw std::logic_error(
+                    "[PrefixCacheFingerprint] cannot fingerprint unpublished MoE runtime layer " +
+                    std::to_string(layer));
+            }
             const auto &state = table.hostLayerState(layer);
             const std::string layer_prefix = scope + ".layer." + std::to_string(layer);
             const uint32_t active_bank = state.active_bank <= 1 ? state.active_bank : 0;

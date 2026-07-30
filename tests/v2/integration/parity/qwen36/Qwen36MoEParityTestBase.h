@@ -3461,6 +3461,54 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
         logMoEParityPhase(test_case, "mtp.initialize", phase_start);
 
+        /*
+         * A decode graph's first invocation is its allocation-free warmup; the
+         * second invocation captures the native executable.  This fixture uses
+         * only two output tokens to avoid a known model-specific CUDA near-tie,
+         * which otherwise gives it only one verifier transaction and leaves
+         * graph capture unexercised.  Prime the same verifier geometry with a
+         * distinct valid prompt before collecting evidence.  The insertion
+         * request must then capture, and the restored request must replay, the
+         * same graph.  Rotating existing token ids keeps the prompt valid while
+         * preventing an accidental full prefix-cache hit.
+         */
+        const bool homogeneous_gpu =
+            !test_case.devices.empty() &&
+            (std::all_of(
+                 test_case.devices.begin(),
+                 test_case.devices.end(),
+                 [](const GlobalDeviceAddress &device)
+                 {
+                     return device.isCUDA();
+                 }) ||
+             std::all_of(
+                 test_case.devices.begin(),
+                 test_case.devices.end(),
+                 [](const GlobalDeviceAddress &device)
+                 {
+                     return device.isROCm();
+                 }));
+        if (homogeneous_gpu)
+        {
+            ASSERT_GT(prompt_tokens.size(), 1u);
+            auto graph_priming_prompt = prompt_tokens;
+            std::rotate(
+                graph_priming_prompt.begin(),
+                graph_priming_prompt.begin() + 1,
+                graph_priming_prompt.end());
+            phase_start = parityPhaseStart();
+            auto priming = mtp->generate(
+                graph_priming_prompt,
+                test_case.decode_steps,
+                greedy);
+            logMoEParityPhase(test_case, "mtp.graph-capture-prime", phase_start);
+            mtp->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
+            ASSERT_TRUE(priming.error.empty()) << priming.error;
+            ASSERT_EQ(
+                priming.tokens.size(),
+                static_cast<size_t>(test_case.decode_steps));
+        }
+
         PerfStatsCollector::reset();
         phase_start = parityPhaseStart();
         auto first = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
@@ -6684,6 +6732,20 @@ namespace llaminar2::test::parity::qwen36
                 {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
             }));
         }
+        std::unique_ptr<ScopedEnvironmentValues> publication_diagnostics;
+        if (verify_published_state_continuation)
+        {
+            /*
+             * State probes on both sides of a byte-equivalence assertion must
+             * collect the same payloads.  Enabling these only after the serial
+             * row-zero snapshot produced a structurally incomplete oracle
+             * whose missing GDN bytes looked like a publication mismatch.
+             */
+            publication_diagnostics.reset(new ScopedEnvironmentValues({
+                {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
+                {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+            }));
+        }
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -6717,7 +6779,8 @@ namespace llaminar2::test::parity::qwen36
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
         config.use_mapped_memory = false;
         config.mtp.enabled = true;
-        config.mtp.draft_tokens = 1;
+        config.mtp.draft_tokens =
+            std::max(1, verifier_row_count - 1);
         config.moe_routed_expert_plan = test_case.moe_routed_expert_plan;
 
         auto proof_runner =
@@ -7256,10 +7319,6 @@ namespace llaminar2::test::parity::qwen36
             ASSERT_LE(verifier_tokens.size(), 4u)
                 << "Phase 9.8 direct resident publication promotion is bounded "
                    "to the M=2..4 verifier rows proven by the focused suite";
-            ScopedEnvironmentValues kv_payload_probe_env({
-                {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
-                {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
-            });
             /*
              * The all-position verifier can produce correct logits while still
              * leaving the live KV/GDN state in a non-decode-equivalent shape.
@@ -7331,6 +7390,8 @@ namespace llaminar2::test::parity::qwen36
             publication_request.request_count = 1;
             publication_request.max_draft_tokens =
                 static_cast<int>(verifier_tokens.size());
+            publication_request.max_state_commit_rows =
+                committed_verifier_rows;
             publication_request.publish_mtp_shifted_kv = true;
 
             std::string publication_error;
@@ -7359,30 +7420,41 @@ namespace llaminar2::test::parity::qwen36
             const PrefixRuntimeStateSnapshot published_state_probe =
                 runner->prefixStateProbe();
             const bool published_state_is_device_owned = logical_state.valid();
-            ASSERT_TRUE(pre_publication_serial_row0_state_probe.has_value())
-                << "publication proof must preserve a serial row-zero state "
-                   "oracle before grouped execution";
-            EXPECT_TRUE(verifierGDNStateByteIdentical(
-                published_state_probe,
-                *pre_publication_serial_row0_state_probe,
-                "MoE publication versus pre-publication serial row zero"))
-                << "Accepted row-zero publication must match the serial state "
-                   "captured before the verifier/publication lifecycle began.";
-            MTPRuntimeSnapshotComparisonOptions
-                pre_publication_row0_compare_options;
-            pre_publication_row0_compare_options.compare_main_kv_payload_hashes =
-                true;
-            pre_publication_row0_compare_options.compare_shifted_mtp_kv = false;
-            pre_publication_row0_compare_options.compare_gdn_hashes = true;
-            const MTPStateValidationResult pre_publication_row0_match =
-                compareMTPRuntimeStateSnapshots(
-                    *pre_publication_serial_row0_state_probe,
+            if (committed_verifier_rows == 1)
+            {
+                /*
+                 * Rejection publication commits row zero only, so its final
+                 * state can be compared directly with the pre-grouped serial
+                 * row-zero snapshot.  Multi-row acceptance is compared below
+                 * against serial execution of the complete committed prefix;
+                 * comparing that final cursor to row zero is inherently
+                 * off by M-1 positions.
+                 */
+                ASSERT_TRUE(pre_publication_serial_row0_state_probe.has_value())
+                    << "one-row publication proof must preserve a serial "
+                       "row-zero oracle before grouped execution";
+                EXPECT_TRUE(verifierGDNStateByteIdentical(
                     published_state_probe,
-                    pre_publication_row0_compare_options);
-            EXPECT_TRUE(pre_publication_row0_match)
-                << "Accepted row-zero publication must preserve the serial main "
-                   "KV payload and recurrent state captured before publication."
-                << "\nreason=" << pre_publication_row0_match.reason;
+                    *pre_publication_serial_row0_state_probe,
+                    "MoE publication versus pre-publication serial row zero"))
+                    << "One-row publication must match the serial state "
+                       "captured before the verifier/publication lifecycle began.";
+                MTPRuntimeSnapshotComparisonOptions
+                    pre_publication_row0_compare_options;
+                pre_publication_row0_compare_options.compare_main_kv_payload_hashes =
+                    true;
+                pre_publication_row0_compare_options.compare_shifted_mtp_kv = false;
+                pre_publication_row0_compare_options.compare_gdn_hashes = true;
+                const MTPStateValidationResult pre_publication_row0_match =
+                    compareMTPRuntimeStateSnapshots(
+                        *pre_publication_serial_row0_state_probe,
+                        published_state_probe,
+                        pre_publication_row0_compare_options);
+                EXPECT_TRUE(pre_publication_row0_match)
+                    << "One-row publication must preserve serial main KV "
+                       "payload and recurrent state."
+                    << "\nreason=" << pre_publication_row0_match.reason;
+            }
 
             auto summarize_runtime_state =
                 [](const PrefixRuntimeStateSnapshot &probe) -> std::string

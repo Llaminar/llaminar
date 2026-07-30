@@ -3288,7 +3288,7 @@ namespace llaminar2
                  * verifier graph then consumes one explicit transitive event
                  * instead of trusting a host-side sampler mirror.
                  */
-                if (!resetMTPGeneratedTokenHistoryOnStream(
+                if (!zeroAndPublishMTPGeneratedTokenHistoryOnStream(
                         reset_transaction.executionStream(),
                         reset_reason))
                 {
@@ -3947,13 +3947,25 @@ namespace llaminar2
             const char *producer);
 
         /**
-         * @brief Zero and publish the device-owned generated-token histogram.
+         * @brief Establish an empty device-owned generated-token histogram.
+         *
+         * Construction and request reset share this single ownership boundary:
+         * enqueue the zero-fill on the exact producer stream, then publish that
+         * stream's event through BufferArena before any verifier graph may read
+         * the histogram.  Allocation alone is deliberately insufficient because
+         * newly allocated GPU storage has no initialized device-authoritative
+         * bytes.
          *
          * Kept out of the inline reset transaction so backend selection and
          * IBackend's complete type remain private to the implementation unit.
+         *
+         * @param producer_stream Explicit stream carrying the zero-fill.
+         * @param reason Stable lifecycle reason used by fatal diagnostics.
+         * @return true only after the initialized bytes and producer event have
+         *         both been published to the arena.
          */
-        bool resetMTPGeneratedTokenHistoryOnStream(
-            void *reset_stream,
+        bool zeroAndPublishMTPGeneratedTokenHistoryOnStream(
+            void *producer_stream,
             const char *reason);
 
         /**

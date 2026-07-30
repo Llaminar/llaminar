@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include "../KVCacheTestWorkspace.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "kernels/cuda/kvcache/CUDARingKVCacheTQ.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
@@ -40,6 +41,7 @@
 #include "utils/Logger.h"
 
 using namespace llaminar2;
+using llaminar2::test::KVCacheTestWorkspaceBinding;
 
 namespace
 {
@@ -220,6 +222,7 @@ TEST(Test__CUDARingKVCacheTQ, BasicAppendRetrieve_SplitTQ)
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(n_layers, batch_size, max_seq_len,
                             n_kv_heads, head_dim, &tq_ctx, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     EXPECT_EQ(cache.n_layers(), n_layers);
@@ -307,6 +310,7 @@ TEST(Test__CUDARingKVCacheTQ, WrapAround_PreservesNewest)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     // Append 12 tokens (overwrites first 4)
@@ -357,6 +361,7 @@ TEST(Test__CUDARingKVCacheTQ, IncrementalAppend_DecodeLike)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     // Simulate decode: append one token at a time
@@ -423,6 +428,7 @@ TEST(Test__CUDARingKVCacheTQ, MultiLayer_IndependentData)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(n_layers, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     // Append different data to each layer
@@ -484,6 +490,7 @@ TEST(Test__CUDARingKVCacheTQ, Clear_ResetsAllLayers)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(n_layers, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     // Fill some data
@@ -529,6 +536,7 @@ TEST(Test__CUDARingKVCacheTQ, AppendRequiresExplicitNonNullStream)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 16, n_kv_heads, head_dim, &tq_ctx, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 700);
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 701);
@@ -565,6 +573,7 @@ TEST(Test__CUDARingKVCacheTQ, ClearSequenceLayerAndAllInvalidateConvertedScratch
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(n_layers, batch_size, 16, n_kv_heads, head_dim, &tq_ctx, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     auto append_seeded = [&](int layer, int seq_idx, unsigned seed)
@@ -628,6 +637,7 @@ TEST(Test__CUDARingKVCacheTQ, ClearThenReappendConvertedScratchUsesNewRows)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 16, n_kv_heads, head_dim, &tq_ctx, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     auto append_host = [&](const std::vector<float> &h_K, const std::vector<float> &h_V)
@@ -693,6 +703,7 @@ TEST(Test__CUDARingKVCacheTQ, QuantizationError_WithinBounds)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 314);
@@ -739,6 +750,7 @@ TEST(Test__CUDARingKVCacheTQ, KQuality_StrictlyBetterThan_V)
 
     TurboQuantContext tq_ctx_7(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 64, n_kv_heads, head_dim, &tq_ctx_7, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     auto h_data = generateRandomFP32(num_tokens * kv_dim, 999);
@@ -778,6 +790,7 @@ TEST(Test__CUDARingKVCacheTQ, GetKVConverted_WithRoPE)
 
     TurboQuantContext tq_ctx_8(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 32, n_kv_heads, head_dim, &tq_ctx_8, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 123);
@@ -849,6 +862,7 @@ TEST(Test__CUDARingKVCacheTQ, GetKVConverted_DequantOnly)
 
     TurboQuantContext tq_ctx_9(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 32, n_kv_heads, head_dim, &tq_ctx_9, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 555);
@@ -898,6 +912,7 @@ TEST(Test__CUDARingKVCacheTQ, Eviction_ReducesCount)
 
     TurboQuantContext tq_ctx_10(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx_10, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 111);
@@ -939,6 +954,7 @@ TEST(Test__CUDARingKVCacheTQ, ShadowInvalidation_AfterAppend)
 
     TurboQuantContext tq_ctx_11(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 32, n_kv_heads, head_dim, &tq_ctx_11, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     // Append batch 1
@@ -995,6 +1011,7 @@ TEST(Test__CUDARingKVCacheTQ, HeadDim128_BasicRoundtrip)
 
     TurboQuantContext tq_ctx_12(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 32, n_kv_heads, head_dim, &tq_ctx_12, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 777);
@@ -1044,6 +1061,7 @@ TEST(Test__CUDARingKVCacheTQ, RoPE_PositionCorrectness)
 
     TurboQuantContext tq_ctx_13(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 32, n_kv_heads, head_dim, &tq_ctx_13, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     // Use simple predictable data
@@ -1107,6 +1125,7 @@ TEST(Test__CUDARingKVCacheTQ, HostCreatedTensorIsPreparedOnDeviceBeforeAppend)
 
     TurboQuantContext tq_ctx_14(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 32, n_kv_heads, head_dim, &tq_ctx_14, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 111);
@@ -1149,6 +1168,7 @@ TEST(Test__CUDARingKVCacheTQ, CrossPath_CPUQuantize_GPUDequant)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 64, n_kv_heads, head_dim, &tq_ctx, 0);
+    KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
     // Generate random FP32 data
@@ -1261,6 +1281,7 @@ TEST(Test__CUDARingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBy
         CUDARingKVCacheTQ cache(
             /*n_layers=*/1, batch_size, max_seq_len,
             n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+        KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
         ScopedCudaStream stream;
         std::vector<float *> allocations;
 
@@ -1449,6 +1470,10 @@ TEST(Test__CUDARingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
         CUDARingKVCacheTQ reference(
             /*n_layers=*/1, batch_size, max_seq_len,
             n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+        KVCacheTestWorkspaceBinding actual_workspace(
+            actual, DeviceId::cuda(0));
+        KVCacheTestWorkspaceBinding reference_workspace(
+            reference, DeviceId::cuda(0));
         ASSERT_TRUE(k_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
         ASSERT_TRUE(v_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
 
@@ -1693,6 +1718,10 @@ TEST(Test__CUDARingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
         CUDARingKVCacheTQ reference(
             /*n_layers=*/1, /*batch_size=*/1, max_seq_len,
             n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+        KVCacheTestWorkspaceBinding actual_workspace(
+            actual, DeviceId::cuda(0));
+        KVCacheTestWorkspaceBinding reference_workspace(
+            reference, DeviceId::cuda(0));
         ASSERT_TRUE(history_k->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
         ASSERT_TRUE(history_v->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
         ASSERT_TRUE(continuation_k->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));

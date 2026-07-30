@@ -1101,6 +1101,8 @@ namespace llaminar2
             return false;
         if (!moe_runtime_layer_ || params_.layer_idx < 0)
             return false;
+        if (params_.moe_runtime_table->decodeRuntimePublicationRequired(params_.layer_idx))
+            return false;
 
         const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
         return state.active_bank <= 1 &&

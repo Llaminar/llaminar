@@ -4082,6 +4082,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         std::string::npos);
     EXPECT_NE(
         compact_published_join.find(
+            "caseDeviceTimelineRole::TargetSampler:"),
+        std::string::npos)
+        << "The target sampler must observe restore/publication events without "
+           "consuming the ownership needed by the following graph.";
+    EXPECT_NE(
+        compact_published_join.find(
             "clearPendingLivePrefixMutationReady();"),
         std::string::npos);
     EXPECT_EQ(
@@ -10241,6 +10247,62 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LiveCheckpointStorageUsesReusableDomain
     EXPECT_EQ(checkpoint_body.find("live_prefix_checkpoint_payload_required"),
               std::string::npos)
         << "Headroom is an admission invariant, not a reason to change checkpoint architecture.";
+}
+
+/**
+ * @brief Guards first-request ownership of persistent MTP sampling history.
+ *
+ * A fresh GPU runner may enter prefill and verifier execution without a
+ * request-boundary reset.  The generated-token histogram therefore has to be
+ * initialized and event-published during runner construction; merely allocating
+ * its arena address leaves host-authoritative zeroes and makes graph input
+ * admission fail on the first request.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     PersistentMTPGeneratedTokenHistoryIsPublishedBeforeFirstRequest)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto header =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    const auto initialization_body = removeAsciiWhitespace(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::initializeInferenceStateFromArena(",
+        "bool DeviceGraphOrchestrator::initializeKVCaches("));
+    const auto publication_body = removeAsciiWhitespace(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::zeroAndPublishMTPGeneratedTokenHistoryOnStream(",
+        "bool DeviceGraphOrchestrator::materializePendingMTPVerifierInputTokensOnDevice("));
+    const auto reset_body = removeAsciiWhitespace(sliceBetween(
+        header,
+        "void resetInferenceState(",
+        "void clear_cache() override"));
+
+    EXPECT_NE(
+        initialization_body.find(
+            "explicitGPUStreamForOperation(\"initialize_mtp_generated_token_history\")"),
+        std::string::npos)
+        << "Fresh GPU runners need an explicit initialization producer stream.";
+    EXPECT_NE(
+        initialization_body.find(
+            "zeroAndPublishMTPGeneratedTokenHistoryOnStream("),
+        std::string::npos)
+        << "Construction must publish initialized histogram bytes before the first request.";
+    EXPECT_NE(publication_body.find("backend->memset("), std::string::npos)
+        << "The histogram must be initialized directly on its owning GPU.";
+    EXPECT_NE(
+        publication_body.find("publishPreparedArenaGraphInput("),
+        std::string::npos)
+        << "The zero-fill must publish its exact producer event to BufferArena.";
+    EXPECT_EQ(publication_body.find("copyToDevice("), std::string::npos)
+        << "Persistent MTP history initialization must not round-trip through a host mirror.";
+    EXPECT_EQ(publication_body.find("synchronize"), std::string::npos)
+        << "Initialization ordering is an event edge, never a stream or device synchronization.";
+    EXPECT_NE(
+        reset_body.find(
+            "zeroAndPublishMTPGeneratedTokenHistoryOnStream(reset_transaction.executionStream(),reset_reason)"),
+        std::string::npos)
+        << "Request reset and construction must use the same ownership boundary.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, LiveCheckpointPublicationFailureIsFatal)

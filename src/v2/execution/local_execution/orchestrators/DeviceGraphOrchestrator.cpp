@@ -6464,6 +6464,11 @@ namespace llaminar2
                     (layer_window_start +
                      (layer_window_count == 0u ? wave_layer : wave_layer % layer_window_count)) %
                     params.config.num_layers;
+                if (params.moe_runtime_table->decodeRuntimePublicationRequired(
+                        static_cast<int>(layer)))
+                {
+                    continue;
+                }
                 const auto &runtime = params.moe_runtime_table->hostLayerState(
                     static_cast<int>(layer));
                 if (runtime.active_bank > 1u)
@@ -9746,6 +9751,27 @@ namespace llaminar2
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize transient MTP checkpoint storage");
             return false;
+        }
+        if (config.mtp.enabled && device.is_gpu())
+        {
+            /*
+             * MTP_GENERATED_TOKEN_COUNTS is persistent graph input state, not
+             * overwrite-only scratch.  allocateDeviceStorage() establishes its
+             * address but intentionally does not invent initialized device
+             * bytes.  Publish the empty request history now so a fresh runner
+             * may enter a prefix-cache miss followed by MTP verification
+             * without requiring a synthetic request reset first.
+             */
+            void *const initialization_stream =
+                explicitGPUStreamForOperation(
+                    "initialize_mtp_generated_token_history");
+            if (!zeroAndPublishMTPGeneratedTokenHistoryOnStream(
+                    initialization_stream,
+                    "initial_inference_state"))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize device-owned MTP generated-token history");
+                return false;
+            }
         }
 
         LOG_DEBUG("[DeviceGraphOrchestrator] Inference state initialized from arena: "
@@ -16496,6 +16522,16 @@ namespace llaminar2
          * makes stale-logits sampling structurally impossible even when no
          * deferred stream handoff was armed for this invocation.
          */
+        if (!joinPublishedLiveStateHandoffs(
+                stream,
+                DeviceTimelineRole::TargetSampler,
+                consumer_name))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Main-logits device consumer "
+                      << consumer_name
+                      << " could not join the live-state mutation timeline");
+            return nullptr;
+        }
         if (!waitForForwardGraphOutputReady(
                 stream,
                 DeviceTimelineRole::TargetSampler,
@@ -17205,6 +17241,17 @@ namespace llaminar2
 
         shifted_mtp_kv_ready_.valid = false;
         shifted_mtp_kv_ready_.producer_stream = nullptr;
+
+        /*
+         * A prefix restore replaces the storage contents described by the
+         * previous forward publication. Preserve the event allocation, but
+         * invalidate its semantic provenance before any restored terminal
+         * logits may be sampled. The terminal restore publishes through
+         * LivePrefixMutationReady, which the target sampler observes directly.
+         */
+        forward_graph_output_ready_.valid = false;
+        forward_graph_output_ready_.is_decode = false;
+        forward_graph_output_ready_.all_position_logits = false;
 
         clearMTPVerifierTransactionStateForBoundary(clear_reason);
 
@@ -21249,8 +21296,8 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::resetMTPGeneratedTokenHistoryOnStream(
-        void *reset_stream,
+    bool DeviceGraphOrchestrator::zeroAndPublishMTPGeneratedTokenHistoryOnStream(
+        void *producer_stream,
         const char *reason)
     {
         IBackend *const backend = getBackendFor(state_.device_id);
@@ -21258,7 +21305,7 @@ namespace llaminar2
             static_cast<size_t>(mtp_generated_token_count_capacity_) *
             sizeof(int32_t);
         if (!state_.device_id.is_gpu() ||
-            !reset_stream ||
+            !producer_stream ||
             !backend ||
             !mtp_generated_token_counts_dev_ ||
             mtp_generated_token_count_capacity_ != state_.vocab_size ||
@@ -21267,18 +21314,18 @@ namespace llaminar2
                 0,
                 history_bytes,
                 state_.device_id.gpu_ordinal(),
-                reset_stream) ||
+                producer_stream) ||
             !publishPreparedArenaGraphInput(
                 BufferId::MTP_GENERATED_TOKEN_COUNTS,
                 mtp_generated_token_counts_dev_,
-                reset_stream,
+                producer_stream,
                 state_.device_id,
-                "request_reset_mtp_generated_history"))
+                "zero_mtp_generated_token_history"))
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Could not reset device-owned MTP generated-token history"
+            LOG_ERROR("[DeviceGraphOrchestrator] Could not establish empty device-owned MTP generated-token history"
                       << " reason=" << (reason ? reason : "unknown")
                       << " device=" << state_.device_id.toString()
-                      << " stream=" << reset_stream
+                      << " stream=" << producer_stream
                       << " history=" << mtp_generated_token_counts_dev_
                       << " capacity="
                       << mtp_generated_token_count_capacity_
@@ -23660,6 +23707,7 @@ namespace llaminar2
         case DeviceTimelineRole::MTPSidecarGraph:
         case DeviceTimelineRole::PrefixCheckpointArchive:
         case DeviceTimelineRole::MoERebalanceMaintenance:
+        case DeviceTimelineRole::TargetSampler:
         case DeviceTimelineRole::Diagnostics:
             break;
 
@@ -28622,6 +28670,25 @@ namespace llaminar2
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload restored prefix terminal logits: "
                           "missing explicit GPU stream");
+                return false;
+            }
+            /*
+             * Full-hit restore is two ordered mutations: populatePrefix()
+             * restores KV/GDN/MTP payloads, then this method restores the
+             * terminal logits and hidden row.  Consume the first publication
+             * through the typed timeline before reusing the mutation event for
+             * the second transaction.  The join is a stream event wait even
+             * when both operations currently share a context stream; no host
+             * synchronization or implicit same-stream assumption is allowed.
+             */
+            if (!joinPublishedLiveStateHandoffs(
+                    terminal_restore_stream,
+                    DeviceTimelineRole::PrefixRestoreMutation,
+                    "restore_prefix_terminal_state_previous_mutation"))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Failed to join bulk prefix "
+                    "restore before terminal-state restoration");
                 return false;
             }
             if (!prepareLivePrefixMutationReadyEvent(

@@ -2329,6 +2329,65 @@ TEST_F(
             "retained_terminal_sources.push_back(std::move(terminal))"),
         std::string::npos)
         << "Terminal logits/hidden restore must retain its exact source owner";
+    const auto terminal_join_pos =
+        terminal_restore_body.find(
+            "joinPublishedLiveStateHandoffs(");
+    const auto terminal_preflight_pos =
+        terminal_restore_body.find(
+            "prepareLivePrefixMutationReadyEvent(");
+    ASSERT_NE(terminal_join_pos, std::string::npos)
+        << "Terminal restore must consume the preceding bulk prefix mutation.";
+    ASSERT_NE(terminal_preflight_pos, std::string::npos);
+    EXPECT_LT(terminal_join_pos, terminal_preflight_pos)
+        << "The previous restore publication must be joined before the terminal "
+           "transaction reuses the mutation event.";
+    EXPECT_NE(
+        terminal_restore_body.find(
+            "DeviceTimelineRole::PrefixRestoreMutation"),
+        std::string::npos)
+        << "The join must use the typed consuming restore role.";
+    const auto sampler_prepare_pos =
+        source.find(
+            "void *DeviceGraphOrchestrator::prepareMainLogitsDeviceConsumer(");
+    const auto pending_wait_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::waitForPendingLogitsStream(",
+            sampler_prepare_pos);
+    ASSERT_NE(sampler_prepare_pos, std::string::npos);
+    ASSERT_NE(pending_wait_pos, std::string::npos);
+    const std::string sampler_prepare_body =
+        source.substr(
+            sampler_prepare_pos,
+            pending_wait_pos - sampler_prepare_pos);
+    EXPECT_NE(
+        sampler_prepare_body.find(
+            "joinPublishedLiveStateHandoffs("),
+        std::string::npos)
+        << "A target sampler must observe restored terminal logits through "
+           "the typed live-state mutation event.";
+    EXPECT_NE(
+        sampler_prepare_body.find(
+            "DeviceTimelineRole::TargetSampler"),
+        std::string::npos);
+    const auto restore_clear_pos =
+        source.find(
+            "void DeviceGraphOrchestrator::clearLivePrefixRestoreTransientHandoffs(");
+    const auto sync_deferral_pos =
+        source.find(
+            "void DeviceGraphOrchestrator::setMTPAllPositionVerifierSyncDeferralEnabled(",
+            restore_clear_pos);
+    ASSERT_NE(restore_clear_pos, std::string::npos);
+    ASSERT_NE(sync_deferral_pos, std::string::npos);
+    const std::string restore_clear_body =
+        source.substr(
+            restore_clear_pos,
+            sync_deferral_pos - restore_clear_pos);
+    EXPECT_NE(
+        restore_clear_body.find(
+            "forward_graph_output_ready_.valid = false"),
+        std::string::npos)
+        << "Prefix restore must invalidate forward provenance for the "
+           "discarded logits timeline.";
     EXPECT_EQ(populate_body.find("prefix_cache_->retain"), std::string::npos);
     EXPECT_EQ(terminal_restore_body.find("prefix_cache_->retain"), std::string::npos);
 

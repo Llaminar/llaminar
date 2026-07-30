@@ -336,6 +336,8 @@ namespace llaminar2
         {
             if (!runtime_table || layer_idx < 0)
                 return false;
+            if (runtime_table->decodeRuntimePublicationRequired(layer_idx))
+                return false;
 
             const auto &state = runtime_table->hostLayerState(layer_idx);
             if (state.active_bank > 1 ||
@@ -386,6 +388,8 @@ namespace llaminar2
             const std::vector<int> &owner_participants = {})
         {
             if (!runtime_table || layer_idx < 0)
+                return false;
+            if (runtime_table->decodeRuntimePublicationRequired(layer_idx))
                 return false;
             if (!expert_mask.empty() &&
                 expert_mask.size() != static_cast<size_t>(num_experts))
@@ -472,6 +476,8 @@ namespace llaminar2
             const std::string &context)
         {
             if (!runtime_table || layer_idx < 0)
+                return false;
+            if (runtime_table->decodeRuntimePublicationRequired(layer_idx))
                 return false;
             if (local_participant < 0 ||
                 participant_count <= 0 ||
@@ -669,8 +675,10 @@ namespace llaminar2
                 return true;
             }
 
+            const bool publication_required =
+                runtime_table->decodeRuntimePublicationRequired(layer_idx);
             const auto &state = runtime_table->hostLayerState(layer_idx);
-            if (state.active_epoch != 0)
+            if (!publication_required && state.active_epoch != 0)
             {
                 LOG_ERROR("[Qwen35MoEGraph] " << context
                                               << ": refusing to replace active MoE decode runtime bank for layer "
@@ -839,8 +847,10 @@ namespace llaminar2
                 return true;
             }
 
+            const bool publication_required =
+                runtime_table->decodeRuntimePublicationRequired(layer_idx);
             const auto &state = runtime_table->hostLayerState(layer_idx);
-            if (state.active_epoch != 0)
+            if (!publication_required && state.active_epoch != 0)
             {
                 LOG_ERROR("[Qwen35MoEGraph] " << context
                                               << ": refusing to replace active MoE decode runtime bank for layer "
@@ -3245,6 +3255,8 @@ namespace llaminar2
         auto activeRuntimeBankUsesTransientLocalPayload = [&](int table_layer_idx) -> bool
         {
             if (!moe_runtime_table || table_layer_idx < 0)
+                return false;
+            if (moe_runtime_table->decodeRuntimePublicationRequired(table_layer_idx))
                 return false;
             return deviceMoELayerUsesTransientLocalPayload(
                 moe_runtime_table->hostLayerState(table_layer_idx));

@@ -199,12 +199,13 @@ namespace llaminar2::test
         Test__DeviceExecutionTimeline,
         PublishedLiveStateEdgesDeclareEveryPermittedOwner)
     {
-        const std::array<DeviceTimelineRole, 7> permitted = {
+        const std::array<DeviceTimelineRole, 8> permitted = {
             DeviceTimelineRole::MainForwardGraph,
             DeviceTimelineRole::MTPSidecarGraph,
             DeviceTimelineRole::PrefixCheckpointArchive,
             DeviceTimelineRole::PrefixRestoreMutation,
             DeviceTimelineRole::MoERebalanceMaintenance,
+            DeviceTimelineRole::TargetSampler,
             DeviceTimelineRole::RequestStateReset,
             DeviceTimelineRole::Diagnostics,
         };

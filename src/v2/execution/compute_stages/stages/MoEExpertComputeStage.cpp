@@ -4253,8 +4253,11 @@ namespace llaminar2
             if (runtimeTableHasActiveGroupedDecodeBank())
                 return true;
 
+            const bool publication_required =
+                params_.moe_runtime_table->decodeRuntimePublicationRequired(params_.layer_idx);
             const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
-            if (state.active_epoch == std::numeric_limits<uint32_t>::max())
+            if (!publication_required &&
+                state.active_epoch == std::numeric_limits<uint32_t>::max())
             {
                 LOG_ERROR("[MoEExpertComputeStage] Cannot initialize MoE runtime decode bank for layer "
                           << params_.layer_idx << ": epoch counter exhausted");
@@ -4314,7 +4317,7 @@ namespace llaminar2
                 return false;
 
             MoEPlacementUpdate update;
-            update.epoch = state.active_epoch + 1u;
+            update.epoch = publication_required ? 1u : state.active_epoch + 1u;
             update.expert_count = static_cast<uint32_t>(params_.num_experts);
             update.participant_id = static_cast<uint32_t>(params_.my_socket_id);
             update.participant_count = static_cast<uint32_t>(participant_count);
@@ -4503,6 +4506,12 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::runtimeTableHasActiveGroupedDecodeBank() const
     {
+        if (!params_.moe_runtime_table ||
+            params_.moe_runtime_table->decodeRuntimePublicationRequired(params_.layer_idx))
+        {
+            return false;
+        }
+
         const DeviceMoEPlacementBank *bank = activeRuntimePlacementBank();
         if (!bank || !moe_runtime_layer_)
             return false;
@@ -6177,6 +6186,8 @@ namespace llaminar2
     const DeviceMoEPlacementBank *MoEExpertComputeStage::activeRuntimePlacementBank() const
     {
         if (!params_.moe_runtime_table || params_.layer_idx < 0 || params_.num_experts <= 0)
+            return nullptr;
+        if (params_.moe_runtime_table->decodeRuntimePublicationRequired(params_.layer_idx))
             return nullptr;
 
         const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);

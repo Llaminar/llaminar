@@ -363,6 +363,7 @@ namespace
             static DeviceMoELayerRuntime state{};
             return state;
         }
+        bool decodeRuntimePublicationRequired(int) const override { return false; }
         bool prepareInactiveBank(int, const MoEPlacementUpdate &) override { return false; }
         bool flipActiveBank(int, uint32_t, void *) override { return false; }
         bool hasPrefillRouteScratchCapacity(int, int) const override { return false; }
