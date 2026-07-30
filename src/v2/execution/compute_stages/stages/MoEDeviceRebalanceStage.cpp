@@ -240,7 +240,7 @@ namespace llaminar2
             return;
 
         owned_moe_kernel_->resetDynamicState();
-        owned_moe_kernel_->setGPUStream(nullptr);
+        owned_moe_kernel_->clearGPUStreamBinding();
     }
 
     std::string MoEDeviceRebalanceStage::localHistogramBufferName() const

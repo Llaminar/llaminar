@@ -125,7 +125,7 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             bool supports_device(int device_idx) const override
             {
@@ -133,7 +133,8 @@ namespace llaminar2
             }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             bool apply(
                 const float *input, const float *residual, float *output,
@@ -219,7 +220,7 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             bool supports_device(int device_idx) const override
             {
@@ -227,7 +228,8 @@ namespace llaminar2
             }
 
             // GPU stream for graph capture and device-owned execution support.
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             bool apply(
                 const float *input, const float *residual, float *output,
@@ -326,7 +328,7 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             bool supports_device(int device_idx) const override
             {
@@ -334,7 +336,8 @@ namespace llaminar2
             }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             bool apply(
                 const float *input, const float *residual, float *output,

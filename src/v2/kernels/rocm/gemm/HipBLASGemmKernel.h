@@ -245,10 +245,17 @@ namespace llaminar2
             bool ownsHandle() const { return owns_handle_; }
 
             /**
-             * @brief Set the stream on the underlying hipBLAS handle
-             * @param stream HIP stream (cast to hipStream_t internally)
+             * @brief Bind a validated stream to this kernel and its hipBLAS handle.
+             *
+             * @param stream Non-null HIP stream validated by the public kernel
+             *        interface.
              */
-            void setStream(void *stream);
+            void bindStream(ExplicitGPUStream stream);
+
+            /**
+             * @brief End the borrowed stream lifetime without selecting stream zero.
+             */
+            void clearStreamBinding() noexcept;
 
         private:
             // hipblasHandle_t and hipblasLtHandle_t stored as void* to avoid including HIP headers.

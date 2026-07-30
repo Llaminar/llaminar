@@ -612,7 +612,7 @@ namespace llaminar2
             if (kernel)
             {
                 kernel->resetDynamicState();
-                kernel->setGPUStream(nullptr);
+                kernel->clearGPUStreamBinding();
             }
             grouped_gateup_desc_table_id_ = -1;
             grouped_gateup_desc_table_num_experts_ = 0;
@@ -1146,7 +1146,7 @@ namespace llaminar2
             if (owned_moe_kernel_)
             {
                 owned_moe_kernel_->resetDynamicState();
-                owned_moe_kernel_->setGPUStream(nullptr);
+                owned_moe_kernel_->clearGPUStreamBinding();
             }
             shared_grouped_gateup_desc_table_id_ = -1;
             shared_grouped_gateup_desc_table_d_model_ = 0;

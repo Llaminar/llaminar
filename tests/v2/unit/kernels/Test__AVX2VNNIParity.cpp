@@ -228,10 +228,11 @@ TEST(CPUNativeVNNIDecodePolicy, NormalizesGeometryDependentAliases)
  *
  * The generated tree names nominal candidate families learned from measured
  * shapes.  This sweep crosses every production runtime codebook, both frozen
- * K-partition regimes, and N boundaries where wider families become physical
- * aliases.  It therefore catches the grouped-seal failure where IQ4_XS at
- * N=160 and K=224 selected nominal NBC8 even though its three N chunks have
- * one physical NBC4 owner.
+ * K-partition regimes, positive runtime thread counts, and N boundaries where
+ * wider families become physical aliases. It therefore catches both missing
+ * topology coverage and the grouped-seal failure where IQ4_XS at N=160 and
+ * K=224 selected nominal NBC8 even though its three N chunks have one physical
+ * NBC4 owner.
  */
 TEST(CPUNativeVNNIDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
 {
@@ -249,6 +250,9 @@ TEST(CPUNativeVNNIDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
     };
     constexpr std::array<int, 9> input_widths{
         32, 224, 256, 800, 992, 2048, 8192, 11216, 16384,
+    };
+    constexpr std::array<int, 10> thread_counts{
+        1, 2, 3, 7, 27, 28, 31, 56, 112, 255,
     };
 
 #if LLAMINAR_COMPILED_WITH_AVX512
@@ -273,33 +277,38 @@ TEST(CPUNativeVNNIDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
             {
                 for (const int k : input_widths)
                 {
-                    for (const bool serial_kpart : {false, true})
+                    for (const int threads : thread_counts)
                     {
-                        CPUNativeVNNIDecodePolicy nominal{};
-                        ASSERT_TRUE(
-                            generated::selectCPUNativeVNNIDecodeGeneratedPolicy(
-                                build_isa,
-                                runtime_isa,
-                                28,
-                                codebook,
-                                n,
-                                k,
-                                serial_kpart,
-                                serial_kpart ? 2 : 1,
-                                nominal))
-                            << "codebook=" << static_cast<int>(codebook)
-                            << " N=" << n << " K=" << k
-                            << " serial_kpart=" << serial_kpart;
+                        for (const bool serial_kpart : {false, true})
+                        {
+                            CPUNativeVNNIDecodePolicy nominal{};
+                            ASSERT_TRUE(
+                                generated::selectCPUNativeVNNIDecodeGeneratedPolicy(
+                                    build_isa,
+                                    runtime_isa,
+                                    threads,
+                                    codebook,
+                                    n,
+                                    k,
+                                    serial_kpart,
+                                    serial_kpart ? 2 : 1,
+                                    nominal))
+                                << "threads=" << threads
+                                << " codebook=" << static_cast<int>(codebook)
+                                << " N=" << n << " K=" << k
+                                << " serial_kpart=" << serial_kpart;
 
-                        const DecodeSchedulePolicy physical =
-                            resolveGeneratedDecodeSchedulePolicy(nominal, n);
-                        EXPECT_EQ(
-                            normalizeDecodeSchedulePolicy(
-                                physical, (n + 63) / 64),
-                            physical)
-                            << "codebook=" << static_cast<int>(codebook)
-                            << " N=" << n << " K=" << k
-                            << " serial_kpart=" << serial_kpart;
+                            const DecodeSchedulePolicy physical =
+                                resolveGeneratedDecodeSchedulePolicy(nominal, n);
+                            EXPECT_EQ(
+                                normalizeDecodeSchedulePolicy(
+                                    physical, (n + 63) / 64),
+                                physical)
+                                << "threads=" << threads
+                                << " codebook=" << static_cast<int>(codebook)
+                                << " N=" << n << " K=" << k
+                                << " serial_kpart=" << serial_kpart;
+                        }
                     }
                 }
             }
@@ -323,11 +332,109 @@ TEST(CPUNativeVNNIDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
 }
 
 /**
+ * @test Prove grouped verifier dispatch is total over its runtime key space.
+ *
+ * The grouped selector maps every M above 16 to the trained M31 domain. This
+ * sweep combines that M-totality rule with every CPU codebook, all four aspect
+ * regimes, full-K and K-part geometries, and representative positive OpenMP
+ * widths. No exact overlay is required for an unseen topology.
+ */
+TEST(CPUNativeVNNIVerifierPolicy, GeneratedRulesCoverAllPositiveThreadCounts)
+{
+    using generated::CPUNativeVNNIBuildISA;
+    using generated::CPUNativeVNNIRuntimeISA;
+    using generated::CPUNativeVNNIVerifierRowsPolicy;
+
+    constexpr std::array<uint8_t, 18> codebooks{
+        0, 4, 5, 6, 7, 8, 9, 10, 11,
+        12, 13, 14, 15, 16, 17, 19, 20, 21,
+    };
+    constexpr std::array<int, 10> thread_counts{
+        1, 2, 3, 7, 27, 28, 31, 56, 112, 255,
+    };
+    constexpr std::array<int, 13> m_values{
+        2, 3, 4, 5, 8, 15, 16, 17, 31, 32, 255, 256, 1024,
+    };
+    constexpr std::array<std::pair<int, int>, 6> geometries{{
+        {16, 1024},
+        {256, 4096},
+        {1024, 1024},
+        {4096, 1024},
+        {16384, 256},
+        {248320, 7168},
+    }};
+
+#if LLAMINAR_COMPILED_WITH_AVX512
+    constexpr std::array runtime_regimes{
+        std::pair{CPUNativeVNNIBuildISA::AVX512,
+                  CPUNativeVNNIRuntimeISA::AVX2},
+        std::pair{CPUNativeVNNIBuildISA::AVX512,
+                  CPUNativeVNNIRuntimeISA::AVX512},
+    };
+#else
+    constexpr std::array runtime_regimes{
+        std::pair{CPUNativeVNNIBuildISA::AVX2,
+                  CPUNativeVNNIRuntimeISA::AVX2},
+    };
+#endif
+
+    for (const auto [build_isa, runtime_isa] : runtime_regimes)
+    {
+        for (const uint8_t codebook : codebooks)
+        {
+            for (const int M : m_values)
+            {
+                for (const auto [N, K] : geometries)
+                {
+                    for (const int threads : thread_counts)
+                    {
+                        for (const int k_tiles : {0, 2})
+                        {
+                            CPUNativeVNNIVerifierRowsPolicy policy{};
+                            ASSERT_TRUE(
+                                generated::
+                                    selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+                                        build_isa,
+                                        runtime_isa,
+                                        threads,
+                                        codebook,
+                                        M,
+                                        N,
+                                        K,
+                                        k_tiles,
+                                        policy))
+                                << "threads=" << threads << " M=" << M
+                                << " codebook=" << static_cast<int>(codebook)
+                                << " N=" << N << " K=" << K
+                                << " k_tiles=" << k_tiles;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    CPUNativeVNNIVerifierRowsPolicy policy{};
+    EXPECT_FALSE(
+        generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+            runtime_regimes.front().first,
+            runtime_regimes.front().second,
+            0,
+            0,
+            2,
+            1024,
+            1024,
+            0,
+            policy));
+}
+
+/**
  * @test Scalar M=1 execution remains an explicit diagnostic oracle only.
  *
  * Production `Auto` and concrete learned schedule requests must never turn an
- * unsupported runtime ISA into scalar row replay. The packed payload can stay
- * empty because the policy guard must reject the call before arithmetic begins.
+ * unsupported runtime ISA into scalar row replay. The storage can stay empty,
+ * but the packed geometry must remain valid so this test reaches the scalar
+ * policy guard instead of the independent malformed-geometry guard.
  */
 TEST(CPUNativeVNNIDecodePolicy, RejectsScalarProductionSchedules)
 {
@@ -335,6 +442,7 @@ TEST(CPUNativeVNNIDecodePolicy, RejectsScalarProductionSchedules)
     packed.N = 64;
     packed.K = 32;
     packed.blocks_per_row = 1;
+    packed.payload_bytes = 18;
     std::array<Q8_1Block, 1> activation{};
     std::array<float, 64> output{};
 

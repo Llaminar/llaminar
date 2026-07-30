@@ -653,7 +653,7 @@ namespace llaminar2
         }
 
         // Bind stage stream to kernel before execution
-        params_.kernel->setGPUStream(gpuStream());
+        bindStageStream(params_.kernel);
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;

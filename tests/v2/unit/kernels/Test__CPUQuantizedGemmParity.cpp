@@ -678,6 +678,63 @@ namespace
         omp_set_num_threads(saved_threads);
     }
 
+    /**
+     * @brief Prove ordinary prefill geometry is total for positive team sizes.
+     *
+     * Decode and grouped decode use generated selectors, while ordinary
+     * prefill intentionally retains this runtime geometry policy. Keeping its
+     * positive-thread contract explicit prevents a future topology-dependent
+     * divide-by-zero or empty launch from hiding behind the trained paths.
+     */
+    TEST(CPUQuantizedGemmParityRegression, PrefillTileGeometryHasPositiveThreadTotality)
+    {
+        using namespace llaminar2::cpu::native_vnni;
+        constexpr int thread_counts[] = {
+            1, 2, 3, 7, 27, 28, 31, 56, 112, 255,
+        };
+        constexpr int m_values[] = {2, 3, 4, 8, 15, 16, 31, 128, 512};
+        constexpr int shapes[][2] = {
+            {16, 256},
+            {896, 896},
+            {5120, 17408},
+            {248320, 7168},
+        };
+        constexpr int payload_bytes[] = {16, 20, 32, 36};
+
+        for (const int threads : thread_counts)
+        {
+            for (const int M : m_values)
+            {
+                for (const auto &shape : shapes)
+                {
+                    for (const int payload : payload_bytes)
+                    {
+                        SCOPED_TRACE(
+                            ::testing::Message()
+                            << "threads=" << threads << " M=" << M
+                            << " N=" << shape[0] << " K=" << shape[1]
+                            << " payload=" << payload);
+                        const NativeVNNITileConfig config =
+                            computeTileConfig(
+                                shape[0], shape[1], M, payload, threads);
+                        EXPECT_GT(config.n_block_chunks, 0);
+                        EXPECT_GE(config.k_tile_blocks, 0);
+                        EXPECT_GT(config.m_unroll, 0);
+                        EXPECT_GT(config.omp_min_tasks, 0);
+                        EXPECT_GE(config.k_tiles, 0);
+                    }
+                }
+            }
+        }
+
+        EXPECT_THROW(
+            (void)computeTileConfig(896, 896, 32, 16, 0),
+            std::invalid_argument);
+        EXPECT_THROW(
+            (void)computeTileConfig(896, 896, 32, 16, -1),
+            std::invalid_argument);
+    }
+
     // =========================================================================
     // Instantiate for all 20 quantized formats
     // =========================================================================

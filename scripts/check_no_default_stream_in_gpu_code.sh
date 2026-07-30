@@ -20,6 +20,9 @@
 #      in function/method signatures (allows callers to accidentally omit stream)
 #   5. Backend/context API parameters such as "void *stream = nullptr"
 #      which erase producer ownership at the public interface boundary
+#   6. Calling setGPUStream(nullptr) instead of the explicit teardown API
+#   7. Kernel implementations overriding the raw setGPUStream(void*) gateway
+#      instead of receiving an already validated ExplicitGPUStream
 #
 # Files with known violations are tracked in the allowlist below. The goal is
 # to shrink this list over time — never add to it without a strong reason.
@@ -172,6 +175,23 @@ pattern_async_nullptr='(hip|cuda)(Memcpy|Memset|Memcpy2D)Async\s*\([^;]*,\s*(nul
 #   - Comments
 # ==========================================================================
 pattern_default_param='(hip|cuda)Stream_t\s+\w+\s*=\s*(0|nullptr)'
+
+# ==========================================================================
+# Pattern 6: Null stream assignment disguised as kernel lifecycle teardown
+#   Bad:  kernel->setGPUStream(nullptr)
+#   Good: kernel->clearGPUStreamBinding()
+# ==========================================================================
+pattern_null_kernel_stream_binding='setGPUStream\s*\(\s*nullptr\s*\)'
+
+# ==========================================================================
+# Pattern 7: Kernel implementation bypasses the validating stream gateway
+#   Bad:  void setGPUStream(void *stream) override
+#   Good: void bindGPUStream(ExplicitGPUStream stream) override
+#
+# IComputeStage owns a separate raw-handle gateway and does not use override,
+# so this pattern only rejects implementation-level virtual overrides.
+# ==========================================================================
+pattern_raw_kernel_stream_override='setGPUStream\s*\([^)]*\)\s*(const\s*)?override'
 
 is_default_param_violation()
 {
@@ -343,6 +363,18 @@ for dir in "${scan_dirs[@]}"; do
                     file_violations+="$hit"$'\n'
                 fi
             done <<< "$p4_hits"
+        fi
+
+        # Check Pattern 6: setGPUStream(nullptr) used as teardown.
+        p6_hits=$(grep -n -E "$pattern_null_kernel_stream_binding" "$file" 2>/dev/null || true)
+        if [[ -n "$p6_hits" ]]; then
+            file_violations+="$p6_hits"$'\n'
+        fi
+
+        # Check Pattern 7: a kernel bypasses the validated binding callback.
+        p7_hits=$(grep -n -E "$pattern_raw_kernel_stream_override" "$file" 2>/dev/null || true)
+        if [[ -n "$p7_hits" ]]; then
+            file_violations+="$p7_hits"$'\n'
         fi
 
         if [[ -n "$file_violations" ]]; then

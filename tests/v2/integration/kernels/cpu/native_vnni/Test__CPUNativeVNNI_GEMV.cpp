@@ -2626,14 +2626,13 @@ namespace
     }
 #endif
 
-    TEST_F(CPUNativeVNNIGemvTest, MTP_UncertifiedVerifierThreadRegimeHardFails)
+    TEST_F(CPUNativeVNNIGemvTest, MTP_VerifierPolicyIsTotalAcrossPositiveThreadRegimes)
     {
         /**
-         * Learned CPU policy rows are certified for an explicit OpenMP thread
-         * count as well as build/runtime ISA. Silently choosing Pairwise for an
-         * unseen topology would turn a missing policy into an unmeasured
-         * production path. Use a deliberately uncertified thread count and
-         * prove the resolver fails closed instead.
+         * Exact overlays remain scoped to their measured OpenMP width, while
+         * the learned generic tree evaluates wave geometry with the positive
+         * runtime team size. Exercise non-power-of-two, measured, physical
+         * core, SMT-sized, and oversized teams through the production resolver.
          */
         const int N = 128;
         const int K = 256;
@@ -2646,22 +2645,13 @@ namespace
         ASSERT_TRUE(kernel.isValid());
         const auto &packed = kernel.packedWeights();
         const int original_threads = omp_get_max_threads();
-        omp_set_num_threads(7);
-        std::string error;
-        try
+        for (const int threads : {1, 3, 7, 27, 28, 31, 56, 112})
         {
-            (void)selectVerifierRowsPolicy(packed, M, N, K);
-        }
-        catch (const std::runtime_error &exception)
-        {
-            error = exception.what();
+            SCOPED_TRACE(::testing::Message() << "threads=" << threads);
+            omp_set_num_threads(threads);
+            EXPECT_NO_THROW((void)selectVerifierRowsPolicy(packed, M, N, K));
         }
         omp_set_num_threads(original_threads);
-
-        EXPECT_FALSE(error.empty());
-        EXPECT_NE(error.find("No certified CPU NativeVNNI"), std::string::npos)
-            << error;
-        EXPECT_NE(error.find("threads=7"), std::string::npos) << error;
     }
 
     TEST_F(CPUNativeVNNIGemvTest, MTP_VerifierRoutePublishesBuildAndRuntimeISA)

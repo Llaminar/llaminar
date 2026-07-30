@@ -313,11 +313,8 @@ namespace llaminar2
             setDeviceContext(ctx);
             device_idx_ = ctx->deviceOrdinal();
 
-            // Get stream from context
-            stream_ = ctx->defaultStream();
-
             LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Created for device " << device_idx_
-                                                                              << " using device context");
+                                                                              << "; awaiting explicit execution stream");
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::~CUDAFlashAttentionKernelT()
@@ -525,10 +522,22 @@ namespace llaminar2
             int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
             bool causal, int position_offset)
         {
+            /*
+             * A decode call without an explicit historical position consumes
+             * the newest query rows in the supplied KV span. Treating the
+             * default as absolute position zero silently truncated causal
+             * attention to the first key for every long-context raw-pointer
+             * caller. The negative sentinel keeps explicit positions intact
+             * while making the ordinary append-at-tail contract total for
+             * both M=1 decode and grouped verifier rows.
+             */
+            const int resolved_position_offset =
+                position_offset >= 0 ? position_offset : kv_len - seq_len;
             return apply_typed(Q, K, V, output,
                                1, seq_len, kv_len,
                                n_heads, n_kv_heads, head_dim,
-                               causal, -1, position_offset, device_idx_, nullptr, nullptr);
+                               causal, -1, resolved_position_offset,
+                               device_idx_, nullptr, nullptr);
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -1914,10 +1923,9 @@ namespace llaminar2
 
             setDeviceContext(ctx);
             device_idx_ = ctx->deviceOrdinal();
-            stream_ = ctx->defaultStream();
 
             LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Created for device " << device_idx_
-                                                                              << " using device context");
+                                                                              << "; awaiting explicit execution stream");
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::~CUDAFlashAttentionKernelT()
@@ -2209,10 +2217,9 @@ namespace llaminar2
 
             setDeviceContext(ctx);
             device_idx_ = ctx->deviceOrdinal();
-            stream_ = ctx->defaultStream();
 
             LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Created for device " << device_idx_
-                                                                              << " using device context");
+                                                                              << "; awaiting explicit execution stream");
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::~CUDAFlashAttentionKernelT()

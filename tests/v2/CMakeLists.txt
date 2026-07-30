@@ -3281,7 +3281,14 @@ target_link_libraries(v2_test_kernel_dynamic_state_lifecycle
 )
 add_v2_test(V2_Unit_KernelDynamicStateLifecycle
     COMMAND $<TARGET_FILE:v2_test_kernel_dynamic_state_lifecycle>
+            --gtest_filter=-Test__KernelDynamicStateLifecycle.CUDAEmbedding_*:Test__KernelDynamicStateLifecycle.ROCmEmbedding_*:Test__KernelDynamicStateLifecycle.Factory_ResetClearsGPUEmbeddingDynamicState
     LABELS "V2;Unit;Kernels;KernelFactory;DynamicState;SessionLifecycle"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_KernelDynamicStateLifecycle_GPU
+    COMMAND $<TARGET_FILE:v2_test_kernel_dynamic_state_lifecycle>
+            --gtest_filter=Test__KernelDynamicStateLifecycle.CUDAEmbedding_*:Test__KernelDynamicStateLifecycle.ROCmEmbedding_*:Test__KernelDynamicStateLifecycle.Factory_ResetClearsGPUEmbeddingDynamicState
+    LABELS "V2;Integration;Kernels;KernelFactory;DynamicState;SessionLifecycle;CUDA;ROCm;ExplicitStream"
     MPI_PROCS 1
 )
 
@@ -10294,6 +10301,25 @@ add_v2_test(V2_Perf_CPUNativeVNNI_GEMV
     LABELS "V2;Performance;GEMV;NativeVNNI;CPU;Q8_0;Decode;Qwen;Tuning"
     MPI_PROCS 1
 )
+
+# Performance Test: CPU NativeVNNI thread scaling across production regimes.
+add_executable(v2_perf_cpu_native_vnni_thread_scaling
+    performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_ThreadScaling.cpp)
+target_link_libraries(v2_perf_cpu_native_vnni_thread_scaling
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_perf_cpu_native_vnni_thread_scaling PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Perf_CPUNativeVNNI_ThreadScaling
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_thread_scaling>
+    LABELS "V2;Performance;GEMM;GEMV;NativeVNNI;CPU;MTP;GroupedVerifierRows;ThreadScaling"
+    MPI_PROCS 1
+    TIMEOUT 120
+)
+
 add_v2_test(V2_Perf_CPUNativeVNNI_VerifierRows
     COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_gemv>
             --gtest_filter=*MTP_VerifierRows_GroupedVsSerial_Synthetic
@@ -14124,12 +14150,15 @@ add_v2_test(V2_Unit_PrefillGraphCapturability
     MPI_PROCS 1
 )
 
-add_executable(v2_test_prefill_graph_capture_guards unit/stages/Test__PrefillGraphCaptureGuards.cpp)
-target_include_directories(v2_test_prefill_graph_capture_guards PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_test_prefill_graph_capture_guards llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_PrefillGraphCaptureGuards
-    COMMAND $<TARGET_FILE:v2_test_prefill_graph_capture_guards>
-    LABELS "V2;Unit;MoE;GDN;Stages;GraphCapture"
+add_executable(v2_integration_prefill_graph_capture_guards
+    integration/stages/Test__PrefillGraphCaptureGuards.cpp)
+target_include_directories(v2_integration_prefill_graph_capture_guards
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_integration_prefill_graph_capture_guards
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_PrefillGraphCaptureGuards_ROCm
+    COMMAND $<TARGET_FILE:v2_integration_prefill_graph_capture_guards>
+    LABELS "V2;Integration;ROCm;MoE;GDN;Stages;GraphCapture;ExplicitStream"
     MPI_PROCS 1
 )
 

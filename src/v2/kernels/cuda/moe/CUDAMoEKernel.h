@@ -575,8 +575,17 @@ namespace llaminar2
             return KernelSnapshotInfo::passthrough();
         }
 
-        /// @brief Forward stage stream binding into the CUDA base class.
-        void setGPUStream(void *stream) override { CUDAKernelBase::setGPUStream(stream); }
+        /// @brief Forward the validated stage stream into the CUDA base class.
+        void bindGPUStream(ExplicitGPUStream stream) override
+        {
+            CUDAKernelBase::bindGPUStream(stream);
+        }
+
+        /// @brief Explicitly end this kernel's borrowed stream lifetime.
+        void clearGPUStreamBinding() override
+        {
+            CUDAKernelBase::clearGPUStreamBinding();
+        }
 
         /// @brief Bind graph-owned workspace scratch used by routing/grouped MoE kernels.
         void bindWorkspace(DeviceWorkspaceManager *workspace) override;

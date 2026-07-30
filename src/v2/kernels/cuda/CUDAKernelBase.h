@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 
+#include "backends/ExplicitGPUStream.h"
 #include "backends/IWorkerGPUContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
@@ -89,18 +90,25 @@ namespace llaminar2
          * The default CUDA stream (stream 0) causes race conditions with
          * the executor's event-based coherence tracking.
          *
-         * @param stream Opaque CUDA stream pointer (cudaStream_t cast to void*)
+         * @param stream Validated non-null CUDA stream binding.
          */
-        void setGPUStream(void *stream) { gpu_stream_ = stream; }
+        void bindGPUStream(ExplicitGPUStream stream) { gpu_stream_ = stream.get(); }
+
+        /**
+         * @brief Explicitly release the borrowed execution-stream binding.
+         *
+         * Clearing is a lifecycle action and therefore cannot be confused with
+         * assigning a null execution stream.
+         */
+        void clearGPUStreamBinding() noexcept { gpu_stream_ = nullptr; }
 
         /**
          * @brief Report whether a caller explicitly selected the launch stream.
          *
-         * `getStream()` may return a worker-context default. Consumers that
-         * establish transfer or graph ordering must distinguish that fallback
-         * from a stream explicitly owned by the current transaction.
+         * Consumers use this query to verify that the current transaction
+         * explicitly named its launch stream.
          *
-         * @return true only when `setGPUStream()` received a non-null stream.
+         * @return true only when bindGPUStream() received a non-null stream.
          */
         [[nodiscard]] bool hasExplicitGPUStream() const noexcept
         {
@@ -110,11 +118,9 @@ namespace llaminar2
         /**
          * @brief Get the non-null GPU stream for kernel dispatch.
          *
-         * Returns the explicitly bound stream, or the worker context's real
-         * non-default stream when the kernel belongs to that context. A kernel
-         * with neither source of stream ownership is not launchable: throwing
-         * here makes the violation happen while C++ evaluates launch arguments,
-         * before CUDA can enqueue work on stream zero.
+         * A kernel without an explicit binding is not launchable. Device
+         * contexts own streams but do not silently lend one to a kernel: the
+         * executor must name the exact producer stream for every invocation.
          *
          * @return cudaStream_t cast to a non-null opaque pointer.
          * @throws std::runtime_error when no owned stream exists.
@@ -123,15 +129,8 @@ namespace llaminar2
         {
             if (gpu_stream_)
                 return gpu_stream_;
-            if (device_ctx_)
-            {
-                void *stream = device_ctx_->defaultStream();
-                if (stream)
-                    return stream;
-            }
             throw std::runtime_error(
-                "[CUDAKernelBase] GPU execution requires an explicit or "
-                "worker-context-owned non-null stream");
+                "[CUDAKernelBase] GPU execution requires an explicit non-null stream binding");
         }
 
         /**

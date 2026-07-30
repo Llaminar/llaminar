@@ -916,7 +916,7 @@ namespace
             if (stream_)
                 (void)cudaStreamSynchronize(stream_);
             if (kernel_)
-                kernel_->setGPUStream(nullptr);
+                kernel_->clearGPUStreamBinding();
             if (workspace_consumer_)
                 workspace_consumer_->unbindWorkspace();
             if (start_)

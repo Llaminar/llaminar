@@ -650,14 +650,19 @@ namespace llaminar2
             return std::make_unique<HipBLASGemmKernel>(device_id, precision);
         }
 
-        void HipBLASGemmKernel::setStream(void *stream)
+        void HipBLASGemmKernel::bindStream(ExplicitGPUStream stream)
         {
-            gpu_stream_ = stream;
+            ROCmKernelBase::bindGPUStream(stream);
             if (handle_)
             {
                 hipblasSetStream(static_cast<hipblasHandle_t>(handle_),
-                                 static_cast<hipStream_t>(stream));
+                                 static_cast<hipStream_t>(stream.get()));
             }
+        }
+
+        void HipBLASGemmKernel::clearStreamBinding() noexcept
+        {
+            ROCmKernelBase::clearGPUStreamBinding();
         }
 
         void registerHipBLASGemmKernelFactory()
@@ -736,7 +741,8 @@ namespace llaminar2
 
         void registerHipBLASGemmKernelFactory() {}
 
-        void HipBLASGemmKernel::setStream(void *) {}
+        void HipBLASGemmKernel::bindStream(ExplicitGPUStream) {}
+        void HipBLASGemmKernel::clearStreamBinding() noexcept {}
 
 #endif // HAVE_ROCM
 

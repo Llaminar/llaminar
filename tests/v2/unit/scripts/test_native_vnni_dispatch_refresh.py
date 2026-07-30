@@ -3540,7 +3540,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("const int row_tile_width =", source)
         self.assertIn("plan.effective_verifier_schedule", source)
         self.assertNotIn("if (use_avx512 && M >= 2 && M <= 4)", source)
-        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_POLICY_ABI 2", generated_source)
+        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_POLICY_ABI 3", generated_source)
         self.assertIn("enum class CPUNativeVNNIBuildISA", generated_source)
         self.assertIn("enum class CPUNativeVNNIRuntimeISA", generated_source)
         self.assertIn("threads == 28", generated_source)

@@ -1028,7 +1028,7 @@ namespace
                                        static_cast<size_t>(d_model));
         }
 
-        static_cast<ITensorKernel &>(moe_kernel).setGPUStream(nullptr);
+        static_cast<ITensorKernel &>(moe_kernel).clearGPUStreamBinding();
         ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
     }
@@ -1077,7 +1077,7 @@ namespace
 
         kernel.unbindWorkspace();
 #ifdef HAVE_ROCM
-        kernel.setGPUStream(nullptr);
+        kernel.clearGPUStreamBinding();
         ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
     }
@@ -1212,7 +1212,7 @@ namespace
             static_cast<size_t>(N));
 
 #ifdef HAVE_ROCM
-        kernel->setGPUStream(nullptr);
+        kernel->clearGPUStreamBinding();
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
         kernel->unbindWorkspace();
@@ -2083,7 +2083,7 @@ namespace
             EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
         if (stream)
         {
-            kernel.setGPUStream(nullptr);
+            kernel.clearGPUStreamBinding();
             EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
         }
 #endif
@@ -2294,7 +2294,7 @@ namespace
             EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
         if (graph)
             EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
-        kernel.setGPUStream(nullptr);
+        kernel.clearGPUStreamBinding();
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
     }
@@ -2414,9 +2414,9 @@ namespace
         k_kernel.unbindWorkspace();
         v_kernel.unbindWorkspace();
 #ifdef HAVE_ROCM
-        q_kernel.setGPUStream(nullptr);
-        k_kernel.setGPUStream(nullptr);
-        v_kernel.setGPUStream(nullptr);
+        q_kernel.clearGPUStreamBinding();
+        k_kernel.clearGPUStreamBinding();
+        v_kernel.clearGPUStreamBinding();
         ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
     }
@@ -2592,9 +2592,9 @@ namespace
         k_kernel.unbindWorkspace();
         v_kernel.unbindWorkspace();
 #ifdef HAVE_ROCM
-        q_kernel.setGPUStream(nullptr);
-        k_kernel.setGPUStream(nullptr);
-        v_kernel.setGPUStream(nullptr);
+        q_kernel.clearGPUStreamBinding();
+        k_kernel.clearGPUStreamBinding();
+        v_kernel.clearGPUStreamBinding();
         ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
     }
@@ -3250,7 +3250,7 @@ namespace
 
 #ifdef HAVE_ROCM
         for (auto &kernel : kernels)
-            kernel->setGPUStream(nullptr);
+            kernel->clearGPUStreamBinding();
         ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
         for (auto &kernel : kernels)
@@ -3419,7 +3419,7 @@ namespace
 
 #ifdef HAVE_ROCM
         for (auto &kernel : kernels)
-            kernel->setGPUStream(nullptr);
+            kernel->clearGPUStreamBinding();
         ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
         for (auto &kernel : kernels)
@@ -3489,7 +3489,7 @@ namespace
             EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
         if (graph)
             EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
-        kernel.setGPUStream(nullptr);
+        kernel.clearGPUStreamBinding();
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
         kernel.unbindWorkspace();
     }
@@ -3794,7 +3794,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExa
             }
 
             kernel->unbindWorkspace();
-            kernel->setGPUStream(nullptr);
+            kernel->clearGPUStreamBinding();
             ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
         }
         ++geometry_index;
@@ -4046,7 +4046,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, ExplicitIQGridTrainerCandidateControlsLDSRou
     EXPECT_GT(l2Norm(output->data(), output->numel()), 1.0e-7)
         << "The observed candidate must produce a non-zero output witness";
 
-    kernel->setGPUStream(nullptr);
+    kernel->clearGPUStreamBinding();
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
     kernel->unbindWorkspace();
     PerfStatsCollector::reset();
@@ -4471,7 +4471,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FloatingProjectionAllFormatsRuntimeMMatchSer
             auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
             ASSERT_NE(consumer, nullptr);
             consumer->unbindWorkspace();
-            kernel->setGPUStream(nullptr);
+            kernel->clearGPUStreamBinding();
         }
     }
 
@@ -4714,7 +4714,7 @@ TEST(
             auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
             ASSERT_NE(consumer, nullptr);
             consumer->unbindWorkspace();
-            kernel->setGPUStream(nullptr);
+            kernel->clearGPUStreamBinding();
         }
     }
 
@@ -4877,7 +4877,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FloatingSwiGLUDownAllFormatsRuntimeMMatchSer
         }
 
         consumer->unbindWorkspace();
-        down_prepared.kernel->setGPUStream(nullptr);
+        down_prepared.kernel->clearGPUStreamBinding();
     }
 
     std::array<
@@ -5007,7 +5007,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, RealQwen36OutputGEMMStageGroupedVerifierRows
             wo_weight.get(), prepared, 4, N, K, input_scale, /*graph_capture=*/true, stream);
     }
 
-    prepared.kernel->setGPUStream(nullptr);
+    prepared.kernel->clearGPUStreamBinding();
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
 }
@@ -5080,7 +5080,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, RealQwen36MoELMHeadGroupedVerifierRowsMatchS
         /*graph_capture=*/true,
         stream);
 
-    prepared.kernel->setGPUStream(nullptr);
+    prepared.kernel->clearGPUStreamBinding();
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
 }
@@ -6623,10 +6623,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, Qwen36MoEGDNProjectionStageQ6KVerifierRowsMa
         stage.unbindWorkspace();
     }
 
-    qkv_prepared.kernel->setGPUStream(nullptr);
-    z_prepared.kernel->setGPUStream(nullptr);
-    a_prepared.kernel->setGPUStream(nullptr);
-    b_prepared.kernel->setGPUStream(nullptr);
+    qkv_prepared.kernel->clearGPUStreamBinding();
+    z_prepared.kernel->clearGPUStreamBinding();
+    a_prepared.kernel->clearGPUStreamBinding();
+    b_prepared.kernel->clearGPUStreamBinding();
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
 }

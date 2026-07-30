@@ -32,11 +32,11 @@ namespace llaminar2
     void FusedQKVGEMMStage::clearCachedGemmStreams()
     {
         if (cached_gemm_q_)
-            cached_gemm_q_->setGPUStream(nullptr);
+            cached_gemm_q_->clearGPUStreamBinding();
         if (cached_gemm_k_)
-            cached_gemm_k_->setGPUStream(nullptr);
+            cached_gemm_k_->clearGPUStreamBinding();
         if (cached_gemm_v_)
-            cached_gemm_v_->setGPUStream(nullptr);
+            cached_gemm_v_->clearGPUStreamBinding();
     }
 
     void FusedQKVGEMMStage::resetSessionState()
@@ -169,14 +169,12 @@ namespace llaminar2
         auto *gemm_k = cached_gemm_k_;
         auto *gemm_v = cached_gemm_v_;
         const bool gpu_execution = params_.device_id.is_gpu();
-        void *const stage_stream =
-            gpu_execution ? requireGPUStream() : nullptr;
         if (gemm_q)
-            gemm_q->setGPUStream(stage_stream);
+            bindStageStream(gemm_q);
         if (gemm_k)
-            gemm_k->setGPUStream(stage_stream);
+            bindStageStream(gemm_k);
         if (gemm_v)
-            gemm_v->setGPUStream(stage_stream);
+            bindStageStream(gemm_v);
         LOG_DEBUG("[FusedQKVGEMMStage] device_id=" << params_.device_id.to_string()
                                                    << " is_gpu=" << gpu_execution);
         bool success = false;

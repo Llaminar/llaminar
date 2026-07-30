@@ -550,30 +550,52 @@ def validate_emitter_inputs(
 
 
 def validate_total_policy(generic_rules: list[CPUDecodeGenericRule]) -> None:
-    """Prove every ISA/codebook/arithmetic domain has one cross-aspect tree."""
+    """Prove every ISA/codebook/arithmetic domain has one thread-total tree.
+
+    A rule retains the measured OpenMP width as evidence provenance, but
+    production generic dispatch evaluates its learned wave predicates with the
+    positive runtime width. Until generic fitting jointly trains multiple
+    widths, each ISA regime must contribute exactly one evidence width.
+    """
 
     groups = {
-        (item.build_isa, item.runtime_isa, item.threads)
+        (item.build_isa, item.runtime_isa)
         for item in generic_rules
     }
-    observed_regimes = {(build, runtime) for build, runtime, _ in groups}
-    if observed_regimes != REQUIRED_ISA_REGIMES:
+    if groups != REQUIRED_ISA_REGIMES:
         raise ValueError(
             "CPU decode generated policy has incomplete ISA groups: "
-            f"missing={sorted(REQUIRED_ISA_REGIMES-observed_regimes)}"
+            f"missing={sorted(REQUIRED_ISA_REGIMES-groups)}"
+        )
+    widths_by_group = {
+        group: sorted({
+            item.threads
+            for item in generic_rules
+            if (item.build_isa, item.runtime_isa) == group
+        })
+        for group in groups
+    }
+    ambiguous_widths = {
+        group: widths
+        for group, widths in widths_by_group.items()
+        if len(widths) != 1
+    }
+    if ambiguous_widths:
+        raise ValueError(
+            "CPU decode generic ISA regime has multiple independent thread "
+            f"trees instead of one runtime-parametric tree: {ambiguous_widths}"
         )
     codebooks = sorted({spec.runtime_codebook("cpu") for spec in FORMAT_SPECS})
     missing = []
     malformed = []
-    for build, runtime, threads in sorted(groups):
+    for build, runtime in sorted(groups):
         for codebook in codebooks:
             for bundle in DECODE_BUNDLES:
-                key = (build, runtime, threads, codebook, bundle)
+                key = (build, runtime, codebook, bundle)
                 domain_rules = [
                     item.rule for item in generic_rules
                     if item.build_isa == build
                     and item.runtime_isa == runtime
-                    and item.threads == threads
                     and item.rule.domain.runtime_codebook_id == codebook
                     and item.rule.domain.bundle_signature == bundle
                     and item.rule.domain.m == 1
@@ -665,6 +687,8 @@ def generate_include(
         "    uint8_t codebook, int n, int k, bool serial_kpart, int k_tiles,",
         "    CPUNativeVNNIDecodePolicy &policy)",
         "{",
+        "    if (threads <= 0 || n <= 0 || k <= 0 || k_tiles < 0)",
+        "        return false;",
         "    const uint64_t key = packCPUNativeVNNIDecodePolicyKey(",
         "        codebook, serial_kpart, n, k);",
     ]
@@ -681,42 +705,59 @@ def generate_include(
         ]
 
     groups = sorted({
-        (entry.build_isa, entry.runtime_isa, entry.threads)
+        (entry.build_isa, entry.runtime_isa)
         for entry in entries
     } | {
-        (item.build_isa, item.runtime_isa, item.threads)
+        (item.build_isa, item.runtime_isa)
         for item in generic_rules
     })
-    for build, runtime, threads in groups:
+    for build, runtime in groups:
         group_entries = [
             entry for entry in entries
-            if (entry.build_isa, entry.runtime_isa, entry.threads)
-            == (build, runtime, threads)
+            if (entry.build_isa, entry.runtime_isa) == (build, runtime)
         ]
         group_rules = [
             item for item in generic_rules
-            if (item.build_isa, item.runtime_isa, item.threads)
-            == (build, runtime, threads)
+            if (item.build_isa, item.runtime_isa) == (build, runtime)
         ]
+        evidence_widths = sorted({item.threads for item in group_rules})
+        if len(evidence_widths) > 1:
+            raise ValueError(
+                "CPU decode generic ISA regime has multiple independent "
+                f"thread trees: {build}/{runtime} widths={evidence_widths}"
+            )
         lines.extend([
             f"    if (build_isa == CPUNativeVNNIDecodeBuildISA::{build} &&",
-            f"        runtime_isa == CPUNativeVNNIDecodeRuntimeISA::{runtime} &&",
-            f"        threads == {threads})",
+            f"        runtime_isa == CPUNativeVNNIDecodeRuntimeISA::{runtime})",
             "    {",
         ])
-        if group_entries:
-            lines.extend(["        switch (key)", "        {"])
-            for entry in sorted(group_entries):
+        for exact_threads in sorted({entry.threads for entry in group_entries}):
+            exact_entries = [
+                entry for entry in group_entries
+                if entry.threads == exact_threads
+            ]
+            lines.extend([
+                f"        if (threads == {exact_threads})",
+                "        {",
+                "            switch (key)",
+                "            {",
+            ])
+            for entry in sorted(exact_entries):
                 shape_text = ",".join(entry.shape_names)
                 lines.extend([
-                    f"        case 0x{_pack_key(entry.codebook, entry.serial_kpart, entry.n, entry.k):016x}ULL:",
-                    f"            // CB={entry.codebook} {shape_text} "
+                    f"            case 0x{_pack_key(entry.codebook, entry.serial_kpart, entry.n, entry.k):016x}ULL:",
+                    f"                // CB={entry.codebook} {shape_text} "
                     f"{entry.candidate_id} max-regret={entry.max_surface_regret:.4%}",
-                    "            policy = "
+                    "                policy = "
                     f"CPUNativeVNNIDecodePolicy::{entry.policy};",
-                    "            return true;",
+                    "                return true;",
                 ])
-            lines.extend(["        default:", "            break;", "        }"])
+            lines.extend([
+                "            default:",
+                "                break;",
+                "            }",
+                "        }",
+            ])
         if group_rules:
             lines.extend([
                 "        const long long work_items =",
@@ -743,6 +784,7 @@ def generate_include(
                         predicate_condition(
                             value,
                             k_tiles_expression="k_tiles",
+                            parallelism_expression="threads",
                         )
                         for value in rule.predicates
                     ),

@@ -1456,7 +1456,7 @@ namespace
             }
 
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            kernel.setGPUStream(nullptr);
+            kernel.clearGPUStreamBinding();
             ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
             cleanupWorkspace(kernel);
             }

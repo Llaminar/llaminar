@@ -43,13 +43,17 @@ heuristic, model-shape override, CSV parser, or installation path.
    row replay, CPU fitting, or another scorer after explicit acceleration.
 9. Unit tests launch no GPU work. Put CUDA/ROCm execution in integration or
    performance suites.
-10. Prove dispatch totality independently along all three runtime axes. Every
+10. Prove dispatch totality independently along every runtime axis. Every
     positive M must map to exactly one certified bucket, every legal positive
     `(N,K)` geometry must reach exactly one complementary generic-tree leaf,
-    and every production runtime codebook must own every required domain.
-    Keep focused negative regressions that remove one M domain, one codebook,
-    or one tree branch while exact overlays remain present; installation must
-    reject all three cases.
+    and every production runtime codebook must own every required domain. CPU
+    generic decode and grouped-verifier rules must additionally dispatch every
+    positive runtime thread count: exact overlays remain scoped to their
+    measured thread regime, while learned wave and tail-utilization predicates
+    evaluate the actual OpenMP team width. Keep focused negative regressions
+    that remove one M domain, one codebook, one tree branch, or positive-thread
+    coverage while exact overlays remain present; installation must reject all
+    four cases.
 
 ## Use The Turnkey Transaction
 

@@ -785,13 +785,18 @@ namespace llaminar2
             return std::make_unique<CuBLASGemmKernel>(ctx, precision);
         }
 
-        void CuBLASGemmKernel::setStream(void *stream)
+        void CuBLASGemmKernel::bindStream(ExplicitGPUStream stream)
         {
-            gpu_stream_ = stream;
+            CUDAKernelBase::bindGPUStream(stream);
             if (handle_)
             {
-                cublasSetStream(handle_, static_cast<cudaStream_t>(stream));
+                cublasSetStream(handle_, static_cast<cudaStream_t>(stream.get()));
             }
+        }
+
+        void CuBLASGemmKernel::clearStreamBinding() noexcept
+        {
+            CUDAKernelBase::clearGPUStreamBinding();
         }
 
 #else // !HAVE_CUDA
@@ -858,7 +863,8 @@ namespace llaminar2
             return nullptr;
         }
 
-        void CuBLASGemmKernel::setStream(void *) {}
+        void CuBLASGemmKernel::bindStream(ExplicitGPUStream) {}
+        void CuBLASGemmKernel::clearStreamBinding() noexcept {}
 
 #endif // HAVE_CUDA
 

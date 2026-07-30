@@ -112,15 +112,23 @@ namespace llaminar2
             DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
             // ===== GPU Stream Support (Graph Capture) =====
-            void setGPUStream(void *stream) override
+            void bindGPUStream(ExplicitGPUStream stream) override
             {
-                if (gpu_stream_ != stream)
+                if (gpu_stream_ != stream.get())
                 {
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
                     dynamic_position_ids_device_ptr_ = nullptr;
                 }
-                gpu_stream_ = stream;
+                gpu_stream_ = stream.get();
+            }
+
+            void clearGPUStreamBinding() override
+            {
+                gpu_stream_ = nullptr;
+                dynamic_pos_device_valid_ = false;
+                dynamic_position_ids_device_valid_ = false;
+                dynamic_position_ids_device_ptr_ = nullptr;
             }
 
             /// Publish pos_offset into graph-stable device params.
@@ -309,18 +317,29 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const
+            {
+                return requireExplicitGPUStreamBinding(gpu_stream_, "CUDARoPEKernelT<BF16>");
+            }
 
             // ===== GPU Stream Support (Graph Capture) =====
-            void setGPUStream(void *stream) override
+            void bindGPUStream(ExplicitGPUStream stream) override
             {
-                if (gpu_stream_ != stream)
+                if (gpu_stream_ != stream.get())
                 {
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
                     dynamic_position_ids_device_ptr_ = nullptr;
                 }
-                gpu_stream_ = stream;
+                gpu_stream_ = stream.get();
+            }
+
+            void clearGPUStreamBinding() override
+            {
+                gpu_stream_ = nullptr;
+                dynamic_pos_device_valid_ = false;
+                dynamic_position_ids_device_valid_ = false;
+                dynamic_position_ids_device_ptr_ = nullptr;
             }
 
             /// Publish pos_offset into graph-stable device params.
@@ -548,18 +567,29 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const
+            {
+                return requireExplicitGPUStreamBinding(gpu_stream_, "CUDARoPEKernelT<FP16>");
+            }
 
             // ===== GPU Stream Support (Graph Capture) =====
-            void setGPUStream(void *stream) override
+            void bindGPUStream(ExplicitGPUStream stream) override
             {
-                if (gpu_stream_ != stream)
+                if (gpu_stream_ != stream.get())
                 {
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
                     dynamic_position_ids_device_ptr_ = nullptr;
                 }
-                gpu_stream_ = stream;
+                gpu_stream_ = stream.get();
+            }
+
+            void clearGPUStreamBinding() override
+            {
+                gpu_stream_ = nullptr;
+                dynamic_pos_device_valid_ = false;
+                dynamic_position_ids_device_valid_ = false;
+                dynamic_position_ids_device_ptr_ = nullptr;
             }
 
             /// Publish pos_offset into graph-stable device params.

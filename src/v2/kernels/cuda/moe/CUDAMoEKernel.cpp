@@ -7039,6 +7039,73 @@ namespace llaminar2
             !ensureGroupedDownDecodeCapacity(top_k, intermediate))
             return false;
 
+        /*
+         * Mutable placement publishes descriptor values from the active device
+         * runtime bank while immutable placement reads the uploaded model
+         * tables. Keep both modes on the same compact-table GEMV launch path:
+         * the runtime mode first materializes its active bank into stable
+         * graph-owned workspace slots on this exact producer stream.
+         *
+         * Besides avoiding a cache-hostile walk through the complete runtime
+         * object from every output lane, this gives CUDA and ROCm one placement
+         * contract. A descriptor is executable only when the active bank says
+         * the expert is both locally computable and resident on this
+         * participant. DeviceMoERuntimeTable enforces that invariant when it
+         * publishes a bank; the materializer preserves it during every graph
+         * replay without host inspection, allocation, or synchronization.
+         */
+        const DeviceNativeVNNIMatrixDesc *decode_gate_descs =
+            gateup_table.device_gate_descs;
+        const DeviceNativeVNNIMatrixDesc *decode_up_descs =
+            gateup_table.device_up_descs;
+        const DeviceNativeVNNIMatrixDesc *decode_down_descs =
+            down_table.device_descs;
+        if (use_runtime_descriptors)
+        {
+            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            if (!bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                    gateup_table.workspace_slot,
+                    gateup_table.num_experts,
+                    &runtime_gate_descs,
+                    "CUDA runtime decode gate descriptors") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE,
+                    gateup_table.workspace_slot,
+                    gateup_table.num_experts,
+                    &runtime_up_descs,
+                    "CUDA runtime decode up descriptors") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                    down_table.workspace_slot,
+                    down_table.num_experts,
+                    &runtime_down_descs,
+                    "CUDA runtime decode down descriptors"))
+            {
+                LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
+                          "failed to bind graph-owned runtime descriptor slots");
+                return false;
+            }
+            if (!cudaMoE_materialize_runtime_prefill_descriptor_tables(
+                    runtime_layer,
+                    runtime_gate_descs,
+                    runtime_up_descs,
+                    runtime_down_descs,
+                    gateup_table.num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
+                          "failed to materialize compact runtime descriptor tables");
+                return false;
+            }
+            decode_gate_descs = runtime_gate_descs;
+            decode_up_descs = runtime_up_descs;
+            decode_down_descs = runtime_down_descs;
+        }
+
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         if (!d_hidden && capture_active)
         {
@@ -7109,86 +7176,47 @@ namespace llaminar2
                 {{"top_k", std::to_string(top_k)},
                  {"d_model", std::to_string(d_model)}});
         }
-        const bool gateup_ok = use_runtime_descriptors
-                                   ? cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
-                                         d_hidden,
-                                         runtime_layer,
-                                         d_expert_ids,
-                                         d_gate_ptrs,
-                                         d_up_ptrs,
-                                         d_decode_hidden_int8_,
-                                         d_decode_hidden_scales_,
-                                         reuse_router_q8_hidden,
-                                         d_grouped_gateup_gate_partials_,
-                                         d_grouped_gateup_up_partials_,
-                                         top_k,
-                                         intermediate,
-                                         d_model,
-                                         gateup_table.num_experts,
-                                         gateup_table.codebook_id,
-                                         gateup_k_partitions,
-                                         device_ordinal_,
-                                         stream)
-                                   : cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                                         d_hidden,
-                                         gateup_table.device_gate_descs,
-                                         gateup_table.device_up_descs,
-                                         d_expert_ids,
-                                         d_gate_ptrs,
-                                         d_up_ptrs,
-                                         d_decode_hidden_int8_,
-                                         d_decode_hidden_scales_,
-                                         reuse_router_q8_hidden,
-                                         d_grouped_gateup_gate_partials_,
-                                         d_grouped_gateup_up_partials_,
-                                         top_k,
-                                         intermediate,
-                                         d_model,
-                                         gateup_table.num_experts,
-                                         gateup_table.codebook_id,
-                                         gateup_k_partitions,
-                                         device_ordinal_,
-                                         stream);
+        const bool gateup_ok = cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+            d_hidden,
+            decode_gate_descs,
+            decode_up_descs,
+            d_expert_ids,
+            d_gate_ptrs,
+            d_up_ptrs,
+            d_decode_hidden_int8_,
+            d_decode_hidden_scales_,
+            reuse_router_q8_hidden,
+            d_grouped_gateup_gate_partials_,
+            d_grouped_gateup_up_partials_,
+            top_k,
+            intermediate,
+            d_model,
+            gateup_table.num_experts,
+            gateup_table.codebook_id,
+            gateup_k_partitions,
+            device_ordinal_,
+            stream);
         if (!gateup_ok)
             return false;
 
-        const bool down_ok = use_runtime_descriptors
-                                 ? cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
-                                       d_down_gate_ptrs,
-                                       d_down_up_ptrs,
-                                       runtime_layer,
-                                       d_expert_ids,
-                                       d_weights,
-                                       d_decode_swiglu_int8_,
-                                       d_decode_swiglu_scales_,
-                                       d_grouped_down_partials_,
-                                       d_output,
-                                       top_k,
-                                       d_model,
-                                       intermediate,
-                                       down_table.num_experts,
-                                       down_table.codebook_id,
-                                       down_k_partitions,
-                                       device_ordinal_,
-                                       stream)
-                                 : cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
-                                       d_down_gate_ptrs,
-                                       d_down_up_ptrs,
-                                       down_table.device_descs,
-                                       d_expert_ids,
-                                       d_weights,
-                                       d_decode_swiglu_int8_,
-                                       d_decode_swiglu_scales_,
-                                       d_grouped_down_partials_,
-                                       d_output,
-                                       top_k,
-                                       d_model,
-                                       intermediate,
-                                       down_table.num_experts,
-                                       down_table.codebook_id,
-                                       down_k_partitions,
-                                       device_ordinal_,
-                                       stream);
+        const bool down_ok = cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+            d_down_gate_ptrs,
+            d_down_up_ptrs,
+            decode_down_descs,
+            d_expert_ids,
+            d_weights,
+            d_decode_swiglu_int8_,
+            d_decode_swiglu_scales_,
+            d_grouped_down_partials_,
+            d_output,
+            top_k,
+            d_model,
+            intermediate,
+            down_table.num_experts,
+            down_table.codebook_id,
+            down_k_partitions,
+            device_ordinal_,
+            stream);
         if (!down_ok)
             return false;
 

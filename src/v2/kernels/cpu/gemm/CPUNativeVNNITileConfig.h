@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 #include "utils/CPUFeatures.h"
 #include "utils/DebugEnv.h"
@@ -77,6 +78,18 @@ namespace llaminar2::cpu::native_vnni
     inline NativeVNNITileConfig computeTileConfig(
         int N, int K, int M, int payload_bytes, int num_threads)
     {
+        if (N <= 0 || K <= 0 || M <= 0 || payload_bytes <= 0)
+        {
+            throw std::invalid_argument(
+                "CPU NativeVNNI tile geometry requires positive N, K, M, "
+                "and payload byte dimensions");
+        }
+        if (num_threads <= 0)
+        {
+            throw std::invalid_argument(
+                "CPU NativeVNNI tile geometry requires a positive thread count");
+        }
+
         CacheInfo cache;
         NativeVNNITileConfig cfg{};
 

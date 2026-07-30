@@ -3053,7 +3053,7 @@ namespace llaminar
                         if (!kernel)
                             continue;
                         kernel->resetDynamicState();
-                        kernel->setGPUStream(nullptr);
+                        kernel->clearGPUStreamBinding();
                     }
                 };
 
@@ -3630,15 +3630,30 @@ namespace llaminar
                 {
                 }
 
-                // Propagate GPU stream to internal GEMM kernels so they
-                // launch on the correct stream during graph capture/replay.
-                void setGPUStream(void *stream) override
+                /**
+                 * @brief Propagate one validated producer stream to both GEMMs.
+                 *
+                 * The adapter receives only a non-null binding from the
+                 * ITensorKernel gateway, so both child launches are guaranteed
+                 * to join the same graph-capture or replay transaction.
+                 */
+                void bindGPUStream(llaminar2::ExplicitGPUStream stream) override
                 {
-                    llaminar2::ITensorFusedGateUpGemm::setGPUStream(stream);
                     if (gemm_gate_)
-                        gemm_gate_->setGPUStream(stream);
+                        gemm_gate_->bindGPUStream(stream);
                     if (gemm_up_)
-                        gemm_up_->setGPUStream(stream);
+                        gemm_up_->bindGPUStream(stream);
+                }
+
+                /**
+                 * @brief Explicitly end the borrowed child-stream lifetime.
+                 */
+                void clearGPUStreamBinding() override
+                {
+                    if (gemm_gate_)
+                        gemm_gate_->clearGPUStreamBinding();
+                    if (gemm_up_)
+                        gemm_up_->clearGPUStreamBinding();
                 }
 
                 bool execute(

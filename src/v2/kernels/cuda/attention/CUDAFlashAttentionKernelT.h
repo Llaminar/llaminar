@@ -206,7 +206,7 @@ namespace llaminar2
                 const float *Q, const float *K, const float *V, float *output,
                 int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
                 bool causal = true,
-                int position_offset = 0);
+                int position_offset = -1);
 
             /**
              * @brief Internal typed implementation
@@ -262,7 +262,8 @@ namespace llaminar2
             /**
              * @brief Create CUDA Flash Attention kernel using device context
              *
-             * Uses the device context's stream for kernel execution.
+             * The context supplies device resources only. The executor must
+             * bind the exact producer stream before kernel execution.
              *
              * @param ctx Device context (must outlive this kernel)
              * @throws std::runtime_error if ctx is null or not initialized
@@ -278,11 +279,17 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            void setGPUStream(void *stream) override
+            void bindGPUStream(ExplicitGPUStream stream) override
             {
-                if (stream_ != stream)
+                if (stream_ != stream.get())
                     dynamic_attn_device_valid_ = false;
-                stream_ = stream;
+                stream_ = stream.get();
+            }
+
+            void clearGPUStreamBinding() override
+            {
+                dynamic_attn_device_valid_ = false;
+                stream_ = nullptr;
             }
 
             /// Enqueue a stream-ordered device write for explicit attention geometry.
@@ -328,7 +335,7 @@ namespace llaminar2
                 const float *Q, const float *K, const float *V, float *output,
                 int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
                 bool causal = true,
-                int position_offset = 0);
+                int position_offset = -1);
 
             bool apply_typed(
                 const float *Q, const float *K, const float *V, float *output,
@@ -617,7 +624,7 @@ namespace llaminar2
                 const float *Q, const float *K, const float *V, float *output,
                 int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
                 bool causal = true,
-                int position_offset = 0);
+                int position_offset = -1);
 
             bool apply_typed(
                 const uint16_t *Q, const uint16_t *K, const uint16_t *V, uint16_t *output,
@@ -754,7 +761,7 @@ namespace llaminar2
                 const float *Q, const float *K, const float *V, float *output,
                 int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
                 bool causal = true,
-                int position_offset = 0);
+                int position_offset = -1);
 
             bool apply_typed(
                 const uint16_t *Q, const uint16_t *K, const uint16_t *V, uint16_t *output,

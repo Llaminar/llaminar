@@ -641,13 +641,15 @@ namespace llaminar2
             return KernelSnapshotInfo::passthrough();
         }
 
-    protected:
-        /// Propagate stream changes to the child hipBLAS kernel
-        void setGPUStream(void *stream) override
+        /// Propagate a validated stream binding to the child hipBLAS kernel.
+        void bindGPUStream(ExplicitGPUStream stream) override
         {
-            ROCmKernelBase::setGPUStream(stream);
+            ROCmKernelBase::bindGPUStream(stream);
             syncBlasStream();
         }
+
+        /// Explicitly end both parent and child borrowed-stream lifetimes.
+        void clearGPUStreamBinding() override;
 
     private:
         /**

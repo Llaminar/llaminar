@@ -178,7 +178,7 @@ namespace llaminar2
             if (cached_kernel_)
             {
                 cached_kernel_->resetDynamicState();
-                cached_kernel_->setGPUStream(nullptr);
+                cached_kernel_->clearGPUStreamBinding();
             }
         }
 
@@ -221,7 +221,7 @@ namespace llaminar2
             debug_effective_v_rows_ = 0;
             debug_effective_v_cols_ = 0;
             if (cached_kernel_)
-                cached_kernel_->setGPUStream(nullptr);
+                cached_kernel_->clearGPUStreamBinding();
         }
 
         /**

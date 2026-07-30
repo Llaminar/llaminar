@@ -469,7 +469,7 @@ namespace
                 ~StreamGuard()
                 {
                     if (kernel)
-                        kernel->setGPUStream(nullptr);
+                        kernel->clearGPUStreamBinding();
                     if (stream)
                         (void)cudaStreamDestroy(stream);
                 }

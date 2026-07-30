@@ -1421,11 +1421,15 @@ namespace llaminar2
         // Create hipBLAS GEMM kernel using device context (shares hipBLAS handle)
         blas_gemm_ = std::make_unique<rocm::HipBLASGemmKernel>(&ctx);
 
-        // Ensure hipBLAS runs on the same stream as our HIP kernels
-        syncBlasStream();
-
-        LOG_TRACE("[ROCmMoEKernel] Created for ROCm device " << device_ordinal
-                                                             << " stream=" << ROCmKernelBase::getStream());
+        /*
+         * Construction establishes device resources only. The graph executor
+         * has not assigned a producer stream yet, so binding hipBLAS here would
+         * either consult an implicit context default or make construction
+         * order-dependent. bindGPUStream() performs the parent/child stream
+         * transition atomically once the executor supplies its exact stream.
+         */
+        LOG_TRACE("[ROCmMoEKernel] Created unbound for ROCm device "
+                  << device_ordinal);
     }
 
     void ROCmMoEKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
@@ -1797,7 +1801,14 @@ namespace llaminar2
     void ROCmMoEKernel::syncBlasStream()
     {
         if (blas_gemm_)
-            blas_gemm_->setStream(ROCmKernelBase::getStream());
+            blas_gemm_->bindStream(ExplicitGPUStream{ROCmKernelBase::getStream()});
+    }
+
+    void ROCmMoEKernel::clearGPUStreamBinding()
+    {
+        ROCmKernelBase::clearGPUStreamBinding();
+        if (blas_gemm_)
+            blas_gemm_->clearStreamBinding();
     }
 
     bool ROCmMoEKernel::ensureSharedGateScratchCapacity(int seq_len)

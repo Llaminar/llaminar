@@ -856,6 +856,133 @@ class CPUNativeVNNIVerifierTrainerTest(unittest.TestCase):
             )
             self.assertEqual(executed.returncode, 0, executed.stderr.decode())
 
+    def test_generated_selector_is_total_and_thread_parametric(self) -> None:
+        """Grouped exact overlays stay scoped while generic rules consume T."""
+
+        spec = importlib.util.spec_from_file_location(
+            "cpu_native_vnni_thread_totality_test_module",
+            ANALYZER,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        domain = GenericDomain(
+            backend=Backend.CPU,
+            architecture_class=(
+                "x86_64-test|build=AVX512|runtime=AVX512|threads=28"
+            ),
+            semantic_contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+            operation_kind="NativeVNNIVerifierRows",
+            bundle_signature="single",
+            prepared_family_id="NativeVNNI_cpu_CB0",
+            packing_abi="native-vnni-cpu-cb0-v1",
+            runtime_codebook_id=0,
+            execution_mode=ExecutionMode.EAGER,
+            m=2,
+            aspect_bucket=AspectBucket.BALANCED,
+        )
+        threshold = FeatureThreshold(
+            FeatureAxis.MN_PARALLEL_WAVES_64,
+            numerator=1,
+            parallelism_width=28,
+            task_multiplier=2,
+        )
+
+        def rule(
+            require_less_equal: bool,
+            candidate_id: str,
+        ) -> module.CPUGenericDispatchRule:
+            return module.CPUGenericDispatchRule(
+                "AVX512",
+                "AVX512",
+                28,
+                GenericDispatchRule(
+                    domain=domain,
+                    predicates=(
+                        FeaturePredicate(threshold, require_less_equal),
+                    ),
+                    candidate_id=candidate_id,
+                    arithmetic_fingerprint="sha256:test-thread-totality",
+                    development_shape_groups=("shape-a", "shape-b"),
+                    development_max_regret=0.0,
+                    development_p95_regret=0.0,
+                    development_mean_regret=0.0,
+                ),
+            )
+
+        exact = module.PolicyEntry(
+            build_isa="AVX512",
+            runtime_isa="AVX512",
+            threads=28,
+            codebook=0,
+            m=2,
+            n=1280,
+            k=1024,
+            policy="Pairwise",
+            candidate_id="cpu.nvnni.verifier.pairwise",
+            shape_names=("MeasuredT28",),
+            max_surface_regret=0.0,
+            max_cv=0.0,
+        )
+        generated = module.generate_include(
+            [exact],
+            [
+                rule(True, "cpu.nvnni.verifier.pairwise"),
+                rule(False, "cpu.nvnni.verifier.wide_rows"),
+            ],
+            corpus_digest="sha256:test-corpus",
+            registry_digest="sha256:test-registry",
+            profile=MeasurementProfile.QUICK,
+        )
+        self.assertIn("static_cast<long long>(threads)", generated)
+        source = "\n".join((
+            generated,
+            "#include <climits>",
+            "int main() {",
+            "  using namespace llaminar2::cpu::native_vnni::generated;",
+            "  CPUNativeVNNIVerifierRowsPolicy policy{};",
+            "  const int widths[] = {1, 2, 3, 7, 27, 28, 31, 40, 56, 112, INT_MAX};",
+            "  for (const int threads : widths) {",
+            "    if (!selectCPUNativeVNNIVerifierRowsGeneratedPolicy(",
+            "            CPUNativeVNNIBuildISA::AVX512,",
+            "            CPUNativeVNNIRuntimeISA::AVX512,",
+            "            threads, 0, 2, 1280, 1024, 0, policy))",
+            "      return 1;",
+            "    const auto expected = threads == 28 || threads >= 40",
+            "        ? CPUNativeVNNIVerifierRowsPolicy::Pairwise",
+            "        : CPUNativeVNNIVerifierRowsPolicy::WideRows;",
+            "    if (policy != expected)",
+            "      return 2;",
+            "  }",
+            "  if (selectCPUNativeVNNIVerifierRowsGeneratedPolicy(",
+            "          CPUNativeVNNIBuildISA::AVX512,",
+            "          CPUNativeVNNIRuntimeISA::AVX512,",
+            "          0, 0, 2, 1280, 1024, 0, policy))",
+            "    return 3;",
+            "  return 0;",
+            "}",
+        ))
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "cpu-verifier-thread-totality"
+            compiled = subprocess.run(
+                ["g++", "-std=c++20", "-x", "c++", "-o", str(binary), "-"],
+                input=source,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            executed = subprocess.run(
+                [str(binary)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(executed.returncode, 0, executed.stderr.decode())
+
 
 if __name__ == "__main__":
     unittest.main()

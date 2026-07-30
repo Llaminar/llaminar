@@ -558,7 +558,7 @@ namespace llaminar2::test::native_vnni_gemm_perf
             ~ExecutionStreamGuard()
             {
                 if (kernel)
-                    kernel->setGPUStream(nullptr);
+                    kernel->clearGPUStreamBinding();
                 if (stream)
                     (void)cudaStreamDestroy(stream);
             }

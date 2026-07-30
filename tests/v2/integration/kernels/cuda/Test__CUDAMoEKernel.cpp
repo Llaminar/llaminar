@@ -17195,6 +17195,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
         for (int expert = 0; expert < num_experts; ++expert)
         {
             bank.local_compute_mask[expert] = 1;
+            bank.resident_participant_mask[expert] = 1u;
             auto &desc = bank.experts[expert];
             desc.logical_expert_id = expert;
             desc.owner_participant = 0;

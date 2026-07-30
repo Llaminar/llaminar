@@ -30,7 +30,7 @@ namespace llaminar2
     void FusedGateUpGEMMStage::clearCachedKernelStream()
     {
         if (cached_kernel_)
-            cached_kernel_->setGPUStream(nullptr);
+            cached_kernel_->clearGPUStreamBinding();
     }
 
     void FusedGateUpGEMMStage::resetSessionState()
@@ -193,7 +193,7 @@ namespace llaminar2
             LOG_ERROR("[FusedGateUpGEMMStage] Failed to get fused Gate/Up kernel");
             return false;
         }
-        fused_kernel->setGPUStream(gpuStream());
+        bindStageStream(fused_kernel);
 
         if (params_.force_decode_equivalent_verifier_prefill && params_.m > 1)
         {
@@ -274,8 +274,8 @@ namespace llaminar2
                       << " up=" << static_cast<const void *>(up_gemm));
             return false;
         }
-        gate_gemm->setGPUStream(gpuStream());
-        up_gemm->setGPUStream(gpuStream());
+        bindStageStream(gate_gemm);
+        bindStageStream(up_gemm);
 
         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
             {gate_gemm, output_gate, params_.n_gate, params_.bias_gate, "gate"},

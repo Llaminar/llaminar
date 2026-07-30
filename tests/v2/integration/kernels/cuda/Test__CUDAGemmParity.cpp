@@ -774,7 +774,7 @@ namespace
         for (ITensorGemm *kernel : kernels)
         {
             if (kernel)
-                kernel->setGPUStream(nullptr);
+                kernel->clearGPUStreamBinding();
         }
 
         const cudaError_t destroy_status = cudaStreamDestroy(stream);
@@ -2525,7 +2525,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
             }
 
             ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-            cuda_kernel->setGPUStream(nullptr);
+            cuda_kernel->clearGPUStreamBinding();
             cleanupWorkspaceIfNeeded(cuda_kernel);
             llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
             ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
@@ -2788,7 +2788,7 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
 
 DEFINE_QUANTIZED_PARITY_TEST(Q8_0_SmallMatrix, Q8_0Tensor, createQ8_0Random, 32, 101)
 
-TEST_F(Test__CUDAGemmParity, Q8_0_PrefillM35_896x896)
+TEST_F(Test__CUDAGemmParity, Q8_0_PrefillM35_896x896PreservesOrderedKReduction)
 {
     ScopedCudaPrefillModes modes;
     cudaNativeVNNIPrefill_setForceTile(-1, 0);
@@ -2824,8 +2824,16 @@ TEST_F(Test__CUDAGemmParity, Q8_0_PrefillM35_896x896)
         int used_bk256 = 0;
         int used_streamk = 0;
         cudaNativeVNNIPrefill_getLastLaunchSelection(&tile_id, &split_k, &used_bk256, &used_streamk);
-        EXPECT_GT(split_k, 1)
-            << "Production regression should exercise multi-partition split-K prefill";
+        /*
+         * Production prefill deliberately keeps one increasing-K walk for
+         * every output row. Split-K used to improve occupancy here, but its
+         * reduction combines rounded partition sums and therefore cannot be
+         * byte-equivalent to the canonical serial reduction. The current
+         * launch policy recovers occupancy through output-tile geometry while
+         * retaining split_k=1 for batch invariance.
+         */
+        EXPECT_EQ(split_k, 1)
+            << "Production prefill must preserve the ordered K reduction";
         EXPECT_EQ(used_streamk, 0)
             << "This shape should use split-K rather than Stream-K";
 
@@ -5294,7 +5302,7 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELMHeadGroupedVerifierRowsMatchSerialDe
         cleanupWorkspaceIfNeeded(prepared.kernel);
     }
 
-    prepared.kernel->setGPUStream(nullptr);
+    prepared.kernel->clearGPUStreamBinding();
 }
 
 /**
@@ -6494,7 +6502,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40M1GEMVRepeatFromSameQuantizedActivationIsBit
 
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
     cudaGemvContext_destroy(gemv_ctx);
-    kernel->setGPUStream(nullptr);
+    kernel->clearGPUStreamBinding();
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
     cleanupWorkspaceIfNeeded(kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
@@ -6661,7 +6669,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40SmallMGEMVRepeatFromSameQuantizedActivationI
     if (rowmajor)
         cudaRowMajorWeights_destroy(rowmajor);
     cudaGemvContext_destroy(gemv_ctx);
-    kernel->setGPUStream(nullptr);
+    kernel->clearGPUStreamBinding();
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
     cleanupWorkspaceIfNeeded(kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
@@ -6740,7 +6748,7 @@ TEST_F(Test__CUDAGemmParity, MTP_BlockwiseActivationQuantizeM1RepeatIsBitwiseSta
         first_scales.size());
 
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    kernel->setGPUStream(nullptr);
+    kernel->clearGPUStreamBinding();
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
     cleanupWorkspaceIfNeeded(kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
@@ -7044,7 +7052,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
         if (rowmajor)
             cudaRowMajorWeights_destroy(rowmajor);
         cudaGemvContext_destroy(gemv_ctx);
-        base_kernel->setGPUStream(nullptr);
+        base_kernel->clearGPUStreamBinding();
         ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
         cleanupWorkspaceIfNeeded(base_kernel);
         EXPECT_FALSE(base_kernel->hasDynamicStateActive())
@@ -8288,8 +8296,8 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
         << "Deterministic M=1 gate/up must route through canonical decode GEMV";
 
     cleanupSharedWorkspace({cuda_gate, cuda_up});
-    cuda_gate->setGPUStream(nullptr);
-    cuda_up->setGPUStream(nullptr);
+    cuda_gate->clearGPUStreamBinding();
+    cuda_up->clearGPUStreamBinding();
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
     EXPECT_FALSE(cuda_gate->hasDynamicStateActive());
     EXPECT_FALSE(cuda_up->hasDynamicStateActive());
@@ -8400,8 +8408,8 @@ TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
         << "Deterministic M=1 Q5_K gate/up must route through canonical decode GEMV";
 
     cleanupSharedWorkspace({cuda_gate, cuda_up});
-    cuda_gate->setGPUStream(nullptr);
-    cuda_up->setGPUStream(nullptr);
+    cuda_gate->clearGPUStreamBinding();
+    cuda_up->clearGPUStreamBinding();
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
     EXPECT_FALSE(cuda_gate->hasDynamicStateActive());
     EXPECT_FALSE(cuda_up->hasDynamicStateActive());

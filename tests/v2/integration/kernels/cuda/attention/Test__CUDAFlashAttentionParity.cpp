@@ -595,6 +595,24 @@ protected:
     std::mt19937 rng_{42};
     std::uniform_real_distribution<float> dist_{-0.5f, 0.5f};
     MPIContext mpi_ctx_{0, 1, MPI_COMM_WORLD};
+#ifdef HAVE_CUDA
+    cudaStream_t attention_stream_ = nullptr;
+    cudaStream_t bound_attention_stream_ = nullptr;
+#endif
+
+    void TearDown() override
+    {
+#ifdef HAVE_CUDA
+        if (attention_stream_)
+        {
+            EXPECT_EQ(cudaStreamDestroy(attention_stream_), cudaSuccess)
+                << "Failed to destroy the fixture-owned CUDA attention stream";
+            attention_stream_ = nullptr;
+        }
+        bound_attention_stream_ = nullptr;
+#endif
+        CUDATestBase::TearDown();
+    }
 
     std::vector<float> randomFP32(size_t count)
     {
@@ -622,8 +640,42 @@ protected:
     std::unique_ptr<DeviceWorkspaceManager> bindAttentionWorkspace(
         llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> &kernel,
         int n_heads,
-        int head_dim)
+        int head_dim,
+        cudaStream_t producer_stream = nullptr)
     {
+#ifdef HAVE_CUDA
+        /*
+         * Older raw-pointer parity cases do not own a stage or executor that
+         * can supply the production stream binding. Give those cases one
+         * durable, fixture-owned nonblocking stream before any kernel launch.
+         *
+         * Tests that model a richer producer/consumer chain pass their exact
+         * stream explicitly. This helper is therefore the single binding
+         * boundary for both styles, and no caller needs to inspect or infer a
+         * kernel's internal stream state.
+         */
+        if (!producer_stream)
+        {
+            if (!attention_stream_)
+            {
+                const cudaError_t status =
+                    cudaStreamCreateWithFlags(
+                        &attention_stream_,
+                        cudaStreamNonBlocking);
+                if (status != cudaSuccess)
+                {
+                    ADD_FAILURE()
+                        << "Failed to create the fixture-owned CUDA attention "
+                           "stream: "
+                        << cudaGetErrorString(status);
+                    return nullptr;
+                }
+            }
+            producer_stream = attention_stream_;
+        }
+        bound_attention_stream_ = producer_stream;
+        kernel.setGPUStream(producer_stream);
+#endif
         auto requirements = kernel.getWorkspaceRequirements(1, n_heads, head_dim);
         auto workspace = std::make_unique<DeviceWorkspaceManager>(
             gpu_device_, requirements.total_bytes_with_alignment() + 4096);
@@ -634,6 +686,66 @@ protected:
         }
         kernel.bindWorkspace(workspace.get());
         return workspace;
+    }
+
+    /**
+     * @brief Publish raw-pointer attention inputs on the bound kernel stream.
+     *
+     * The raw-pointer parity cases predate tensor coherence and therefore own
+     * their device allocations directly. Their H2D copies must nevertheless
+     * obey the same producer-stream rule as production tensor publication.
+     * Centralizing the three copies here prevents a test from accidentally
+     * publishing through the legacy default stream while the kernel consumes
+     * through an unrelated nonblocking stream.
+     */
+    bool uploadAttentionInputs(
+        float *device_q,
+        const float *host_q,
+        size_t q_elements,
+        float *device_k,
+        const float *host_k,
+        size_t k_elements,
+        float *device_v,
+        const float *host_v,
+        size_t v_elements)
+    {
+#ifdef HAVE_CUDA
+        if (!bound_attention_stream_)
+        {
+            ADD_FAILURE()
+                << "Attention input publication requires a bound CUDA stream";
+            return false;
+        }
+        return cudaMemcpyAsync(
+                   device_q,
+                   host_q,
+                   q_elements * sizeof(float),
+                   cudaMemcpyHostToDevice,
+                   bound_attention_stream_) == cudaSuccess &&
+               cudaMemcpyAsync(
+                   device_k,
+                   host_k,
+                   k_elements * sizeof(float),
+                   cudaMemcpyHostToDevice,
+                   bound_attention_stream_) == cudaSuccess &&
+               cudaMemcpyAsync(
+                   device_v,
+                   host_v,
+                   v_elements * sizeof(float),
+                   cudaMemcpyHostToDevice,
+                   bound_attention_stream_) == cudaSuccess;
+#else
+        (void)device_q;
+        (void)host_q;
+        (void)q_elements;
+        (void)device_k;
+        (void)host_k;
+        (void)k_elements;
+        (void)device_v;
+        (void)host_v;
+        (void)v_elements;
+        return false;
+#endif
     }
 
     /**
@@ -1100,8 +1212,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedDe
 
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(
         cuda_ordinal_);
-    cuda_kernel.setGPUStream(stream);
-    auto workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    auto workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim, stream);
     ASSERT_NE(workspace, nullptr);
 
     ASSERT_TRUE(cuda_kernel.prepareDynamicAttnParams(
@@ -2785,7 +2896,8 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Small)
 
     // CUDA kernel
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
-    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    auto attention_workspace =
+        bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
     ASSERT_NE(attention_workspace, nullptr);
 
     // Allocate device memory
@@ -2796,10 +2908,13 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Small)
     cudaMalloc(&d_output, out_size * sizeof(float));
 
     // Copy inputs to device
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     // Execute CUDA kernel
     bool cuda_success = cuda_kernel.compute(
@@ -2815,7 +2930,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Small)
         &mpi_ctx_,
         0 // device_idx
     );
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_TRUE(cuda_success) << "CUDA attention failed";
 
@@ -2872,7 +2987,8 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Medium)
 
     // CUDA kernel
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
-    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    auto attention_workspace =
+        bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
     ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
@@ -2881,16 +2997,19 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Medium)
     cudaMalloc(&d_V, kv_size * sizeof(float));
     cudaMalloc(&d_output, out_size * sizeof(float));
 
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     bool cuda_success = cuda_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_TRUE(cuda_success);
 
@@ -2940,7 +3059,8 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Large)
     ASSERT_TRUE(cpu_success);
 
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
-    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    auto attention_workspace =
+        bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
     ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
@@ -2949,16 +3069,19 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Large)
     cudaMalloc(&d_V, kv_size * sizeof(float));
     cudaMalloc(&d_output, out_size * sizeof(float));
 
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     bool cuda_success = cuda_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_TRUE(cuda_success);
 
@@ -3037,16 +3160,19 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Qwen36MoEShortFullAttenti
     ASSERT_EQ(cudaMalloc(&d_V, kv_size * sizeof(float)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_output, out_size * sizeof(float)), cudaSuccess);
 
-    ASSERT_EQ(cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
-    ASSERT_EQ(cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
-    ASSERT_EQ(cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
-    ASSERT_EQ(cudaMemset(d_output, 0, out_size * sizeof(float)), cudaSuccess);
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     ASSERT_TRUE(cuda_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, cuda_ordinal_));
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_EQ(cudaMemcpy(cuda_output.data(), d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
 
@@ -3324,16 +3450,19 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Qwen36MoELayer3RealSnapsh
     ASSERT_EQ(cudaMalloc(&d_V, kv_size * sizeof(float)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_output, out_size * sizeof(float)), cudaSuccess);
 
-    ASSERT_EQ(cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
-    ASSERT_EQ(cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
-    ASSERT_EQ(cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
-    ASSERT_EQ(cudaMemset(d_output, 0, out_size * sizeof(float)), cudaSuccess);
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     ASSERT_TRUE(cuda_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, cuda_ordinal_));
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_EQ(cudaMemcpy(cuda_output.data(), d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
 
@@ -3400,10 +3529,13 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short_Parity)
     cudaMalloc(&d_V, kv_size * sizeof(float));
     cudaMalloc(&d_output, out_size * sizeof(float));
 
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     bool cuda_success = cuda_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
@@ -3412,7 +3544,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short_Parity)
         n_heads, n_kv_heads, head_dim,
         true, // causal
         0);   // position_offset
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_TRUE(cuda_success) << "CUDA Flash Decoding failed";
 
@@ -3510,8 +3642,8 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP16KV_Qwen35FullAttentionSho
     ASSERT_TRUE(transfer.uploadFull(out_tensor.get(), gpu_device_, stream).success);
 
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
-    cuda_kernel.setGPUStream(stream);
-    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    auto attention_workspace =
+        bindAttentionWorkspace(cuda_kernel, n_heads, head_dim, stream);
     ASSERT_NE(attention_workspace, nullptr);
 
     ASSERT_TRUE(cuda_kernel.prepareDynamicAttnParams(kv_len, kv_len - 1, 1, stream));
@@ -5577,16 +5709,19 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Long_Parity)
     cudaMalloc(&d_V, kv_size * sizeof(float));
     cudaMalloc(&d_output, out_size * sizeof(float));
 
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     bool cuda_success = cuda_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         1, kv_len, n_heads, n_kv_heads, head_dim,
         true); // causal
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_TRUE(cuda_success);
 
@@ -5689,17 +5824,20 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)
     cudaMalloc(&d_V, kv_size * sizeof(float));
     cudaMalloc(&d_output, out_size * sizeof(float));
 
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_from_q81, kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_from_q81, kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_from_q81, kv_size,
+        d_V, V_from_q81, kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     bool cuda_success = cuda_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         1, kv_len, n_heads, n_kv_heads, head_dim,
         true,
         0);
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
     ASSERT_TRUE(cuda_success);
 
     cudaMemcpy(cuda_q81_output.data(), d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost);
@@ -5766,16 +5904,19 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
     cudaMalloc(&d_V, kv_size * sizeof(float));
     cudaMalloc(&d_output, out_size * sizeof(float));
 
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     bool cuda_success = cuda_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         1, kv_len, n_heads, n_kv_heads, head_dim,
         true, 0);
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_TRUE(cuda_success);
 
@@ -5834,16 +5975,19 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
     cudaMalloc(&d_V, kv_size * sizeof(float));
     cudaMalloc(&d_output, out_size * sizeof(float));
 
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     bool cuda_success = cuda_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         1, kv_len, n_heads, n_kv_heads, head_dim,
         true, 0);
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_TRUE(cuda_success);
 
@@ -5902,16 +6046,19 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_HeadDim128_Parity)
     cudaMalloc(&d_V, kv_size * sizeof(float));
     cudaMalloc(&d_output, out_size * sizeof(float));
 
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     bool cuda_success = cuda_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         1, kv_len, n_heads, n_kv_heads, head_dim,
         true, 0);
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_TRUE(cuda_success);
 
@@ -5970,10 +6117,13 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_NonCausal_Parity)
     cudaMalloc(&d_V, kv_size * sizeof(float));
     cudaMalloc(&d_output, out_size * sizeof(float));
 
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     // Note: compute_decode may not support non-causal, but let's test it
     bool cuda_success = cuda_kernel.compute_decode(
@@ -5981,7 +6131,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_NonCausal_Parity)
         1, kv_len, n_heads, n_kv_heads, head_dim,
         false, // non-causal
         0);
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_TRUE(cuda_success);
 
@@ -6044,16 +6194,19 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_HeadDim128)
     cudaMalloc(&d_V, kv_size * sizeof(float));
     cudaMalloc(&d_output, out_size * sizeof(float));
 
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     bool cuda_success = cuda_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_TRUE(cuda_success);
 
@@ -6117,17 +6270,20 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_NonCausal)
     cudaMalloc(&d_V, kv_size * sizeof(float));
     cudaMalloc(&d_output, out_size * sizeof(float));
 
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     bool cuda_success = cuda_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         false, // non-causal
         -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_TRUE(cuda_success);
 
@@ -6219,17 +6375,20 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_CausalMasking)
     cudaMalloc(&d_V, kv_size * sizeof(float));
     cudaMalloc(&d_output, out_size * sizeof(float));
 
-    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_output, 0, out_size * sizeof(float));
+    ASSERT_TRUE(uploadAttentionInputs(
+        d_Q, Q_data.data(), q_size,
+        d_K, K_data.data(), kv_size,
+        d_V, V_data.data(), kv_size));
+    ASSERT_EQ(cudaMemsetAsync(
+                  d_output, 0, out_size * sizeof(float), bound_attention_stream_),
+              cudaSuccess);
 
     bool cuda_success = cuda_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         true, // causal
         -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
     ASSERT_TRUE(cuda_success);
 
@@ -6307,13 +6466,16 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_BatchDecoding)
     // Process each batch element
     for (int b = 0; b < batch_size; b++)
     {
-        cudaMemcpy(d_Q, Q_data.data() + b * q_per_batch,
-                   q_per_batch * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_K, K_data.data() + b * kv_per_batch,
-                   kv_per_batch * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_V, V_data.data() + b * kv_per_batch,
-                   kv_per_batch * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemset(d_output, 0, out_per_batch * sizeof(float));
+        ASSERT_TRUE(uploadAttentionInputs(
+            d_Q, Q_data.data() + b * q_per_batch, q_per_batch,
+            d_K, K_data.data() + b * kv_per_batch, kv_per_batch,
+            d_V, V_data.data() + b * kv_per_batch, kv_per_batch));
+        ASSERT_EQ(cudaMemsetAsync(
+                      d_output,
+                      0,
+                      out_per_batch * sizeof(float),
+                      bound_attention_stream_),
+                  cudaSuccess);
 
         // Use compute_decode for single-token decode
         bool success = cuda_kernel.compute_decode(
@@ -6323,7 +6485,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_BatchDecoding)
             n_heads, n_kv_heads, head_dim,
             true, // causal
             0);   // position_offset
-        cudaDeviceSynchronize();
+        ASSERT_EQ(cudaStreamSynchronize(bound_attention_stream_), cudaSuccess);
 
         if (!success)
         {
@@ -6465,8 +6627,8 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FusedQ81_Parity)
 
     // Call compute_tensor with Q8_1 K/V — should trigger fused kernel
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
-    cuda_kernel.setGPUStream(stream);
-    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    auto attention_workspace =
+        bindAttentionWorkspace(cuda_kernel, n_heads, head_dim, stream);
     ASSERT_NE(attention_workspace, nullptr);
     bool success = cuda_kernel.compute_tensor(
         Q_tensor.get(), k_q81.get(), v_q81.get(), output_tensor.get(),
@@ -6574,8 +6736,8 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FusedQ81_HeadDim128_Parity)
 
     // Fused Q8_1 decode
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
-    cuda_kernel.setGPUStream(stream);
-    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    auto attention_workspace =
+        bindAttentionWorkspace(cuda_kernel, n_heads, head_dim, stream);
     ASSERT_NE(attention_workspace, nullptr);
     bool success = cuda_kernel.compute_tensor(
         Q_tensor.get(), k_q81.get(), v_q81.get(), output_tensor.get(),

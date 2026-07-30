@@ -821,12 +821,9 @@ def generate_include(
             ),
         ]
 
-    group_keys = sorted({
+    exact_group_keys = sorted({
         (entry.build_isa, entry.runtime_isa, entry.threads)
         for entry in entries
-    } | {
-        (item.build_isa, item.runtime_isa, item.threads)
-        for item in generic_rules
     })
     entries_by_group = {
         group: sorted(
@@ -839,18 +836,32 @@ def generate_include(
                 entry.codebook, entry.m, entry.n, entry.k
             ),
         )
-        for group in group_keys
+        for group in exact_group_keys
     }
-    rules_by_group = {
-        group: [
+    isa_keys = sorted({
+        (entry.build_isa, entry.runtime_isa)
+        for entry in entries
+    } | {
+        (item.build_isa, item.runtime_isa)
+        for item in generic_rules
+    })
+    rules_by_isa = {
+        isa: [
             item
             for item in generic_rules
-            if (item.build_isa, item.runtime_isa, item.threads) == group
+            if (item.build_isa, item.runtime_isa) == isa
         ]
-        for group in group_keys
+        for isa in isa_keys
     }
+    for isa, rules in rules_by_isa.items():
+        evidence_widths = sorted({item.threads for item in rules})
+        if len(evidence_widths) > 1:
+            raise ValueError(
+                "CPU verifier generic ISA regime has multiple independent "
+                f"thread trees: {isa[0]}/{isa[1]} widths={evidence_widths}"
+            )
 
-    for build_isa, runtime_isa, threads in group_keys:
+    for build_isa, runtime_isa, threads in exact_group_keys:
         group = (build_isa, runtime_isa, threads)
         group_entries = entries_by_group[group]
         if not group_entries:
@@ -937,27 +948,29 @@ def generate_include(
         "    CPUNativeVNNIVerifierRowsPolicy &policy, float *measured_speedup = nullptr)",
         "{",
         "    const int policy_m = cpuNativeVNNIVerifierPolicyM(m);",
-        "    if (policy_m == 0 || n <= 0 || k <= 0 || k_tiles < 0)",
+        "    if (threads <= 0 || policy_m == 0 || n <= 0 || k <= 0 || k_tiles < 0)",
         "        return false;",
         "    const uint64_t key =",
         "        packCPUNativeVNNIVerifierRowsPolicyKey(codebook, m, n, k);",
     ])
-    for build_isa, runtime_isa, threads in group_keys:
-        group = (build_isa, runtime_isa, threads)
-        group_entries = entries_by_group[group]
-        group_rules = rules_by_group[group]
+    for build_isa, runtime_isa in isa_keys:
+        group_rules = rules_by_isa[(build_isa, runtime_isa)]
         lines.extend([
             f"    if (build_isa == CPUNativeVNNIBuildISA::{build_isa} &&",
-            f"        runtime_isa == CPUNativeVNNIRuntimeISA::{runtime_isa} &&",
-            f"        threads == {threads})",
+            f"        runtime_isa == CPUNativeVNNIRuntimeISA::{runtime_isa})",
             "    {",
         ])
-        if group_entries:
+        for exact_threads in sorted({
+            group_threads
+            for group_build, group_runtime, group_threads in exact_group_keys
+            if (group_build, group_runtime) == (build_isa, runtime_isa)
+        }):
             identifier = _exact_table_identifier(
-                build_isa, runtime_isa, threads
+                build_isa, runtime_isa, exact_threads
             )
             lines.extend([
-                "        if (m <= 255 && selectCPUNativeVNNIVerifierRowsExactPolicy(",
+                f"        if (threads == {exact_threads} && m <= 255 &&",
+                "            selectCPUNativeVNNIVerifierRowsExactPolicy(",
                 f"                kCPUNativeVNNIVerifierExact{identifier}Keys,",
                 f"                kCPUNativeVNNIVerifierExact{identifier}Policies,",
                 "                key, policy))",
@@ -990,6 +1003,7 @@ def generate_include(
                         predicate_condition(
                             predicate,
                             k_tiles_expression="k_tiles",
+                            parallelism_expression="threads",
                         )
                         for predicate in rule.predicates
                     ),

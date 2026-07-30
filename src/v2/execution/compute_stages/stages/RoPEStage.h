@@ -186,7 +186,7 @@ namespace llaminar2
             if (cached_kernel_)
             {
                 cached_kernel_->resetDynamicState();
-                cached_kernel_->setGPUStream(nullptr);
+                cached_kernel_->clearGPUStreamBinding();
             }
         }
 
@@ -207,7 +207,7 @@ namespace llaminar2
             params_.position_ids_device = nullptr;
             position_ids_cache_.clear();
             if (cached_kernel_)
-                cached_kernel_->setGPUStream(nullptr);
+                cached_kernel_->clearGPUStreamBinding();
         }
 
         /**

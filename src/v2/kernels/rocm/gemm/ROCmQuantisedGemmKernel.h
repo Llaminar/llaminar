@@ -551,7 +551,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override;
 
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             /**
              * @brief Return the exact non-null stream owned by this kernel.

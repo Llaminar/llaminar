@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "../backends/ExplicitGPUStream.h"
 #include "../utils/MPIContext.h"
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../kernels/IPackedWeights.h"
@@ -312,17 +313,43 @@ namespace llaminar2
         virtual bool supports_device(int device_idx) const = 0;
 
         /**
-         * @brief Set the GPU stream for kernel dispatch (GPU graph capture support)
+         * @brief Validate and bind the stream used by subsequent GPU dispatches.
          *
-         * When non-null, GPU kernels dispatch work on this stream instead of the
-         * default stream. This is required for GPU graph capture — all kernels must
-         * dispatch to the capture stream for nodes to be recorded in the graph.
+         * This non-virtual gateway is the only raw-handle entry point. It converts
+         * the nullable ABI representation into ExplicitGPUStream before any kernel
+         * implementation can observe it, so a null CUDA or HIP stream fails
+         * immediately instead of becoming an implicit default-stream request.
          *
-         * CPU kernels ignore this (default no-op).
+         * CPU kernels accept the validated binding and ignore it through the
+         * default bindGPUStream() implementation.
          *
-         * @param stream Opaque stream pointer (hipStream_t or cudaStream_t cast to void*)
+         * @param stream Non-null cudaStream_t or hipStream_t cast to void*.
+         * @throws std::invalid_argument when @p stream is null.
          */
-        virtual void setGPUStream(void *stream) { (void)stream; }
+        void setGPUStream(void *stream)
+        {
+            bindGPUStream(ExplicitGPUStream{stream});
+        }
+
+        /**
+         * @brief Install a stream that has already crossed the non-null boundary.
+         *
+         * Kernel implementations override this method rather than setGPUStream().
+         * This ensures implementations cannot accidentally reinterpret null as a
+         * default stream or as lifecycle teardown.
+         *
+         * @param stream Validated non-null GPU stream binding.
+         */
+        virtual void bindGPUStream(ExplicitGPUStream stream) { (void)stream; }
+
+        /**
+         * @brief Explicitly remove a borrowed GPU stream binding.
+         *
+         * Teardown is intentionally a different operation from stream
+         * assignment so null can never masquerade as an execution stream.
+         * CPU kernels retain the default no-op implementation.
+         */
+        virtual void clearGPUStreamBinding() {}
 
         // =====================================================================
         // Session Lifecycle (kernel state that depends on input data, not weights)
@@ -3242,8 +3269,17 @@ namespace llaminar2
     public:
         virtual ~ITensorShortConvolution() = default;
 
-        /// Set the GPU stream for kernel dispatch (no-op for CPU implementations)
-        virtual void setGPUStream(void *stream) { (void)stream; }
+        /// Validate a raw CUDA/HIP stream before forwarding it to the implementation.
+        void setGPUStream(void *stream)
+        {
+            bindGPUStream(ExplicitGPUStream{stream});
+        }
+
+        /// Bind a validated non-null GPU stream (no-op for CPU implementations).
+        virtual void bindGPUStream(ExplicitGPUStream stream) { (void)stream; }
+
+        /// Explicitly remove a borrowed GPU stream binding.
+        virtual void clearGPUStreamBinding() {}
 
         /**
          * @brief Bind cache-owned persistent GPU state before execution.
@@ -3704,8 +3740,17 @@ namespace llaminar2
     public:
         virtual ~ITensorGatedDeltaNet() = default;
 
-        /// Set the GPU stream for kernel dispatch (no-op for CPU implementations)
-        virtual void setGPUStream(void *stream) { (void)stream; }
+        /// Validate a raw CUDA/HIP stream before forwarding it to the implementation.
+        void setGPUStream(void *stream)
+        {
+            bindGPUStream(ExplicitGPUStream{stream});
+        }
+
+        /// Bind a validated non-null GPU stream (no-op for CPU implementations).
+        virtual void bindGPUStream(ExplicitGPUStream stream) { (void)stream; }
+
+        /// Explicitly remove a borrowed GPU stream binding.
+        virtual void clearGPUStreamBinding() {}
 
         /**
          * @brief Bind cache-owned persistent GPU state before execution.

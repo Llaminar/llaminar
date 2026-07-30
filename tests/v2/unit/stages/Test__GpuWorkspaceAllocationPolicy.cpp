@@ -2668,7 +2668,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIDispatchSweepUsesExplicit
         << "The CUDA NativeVNNI dispatch trainer must create an explicit non-blocking stream.";
     EXPECT_NE(source.find("kernel->setGPUStream(static_cast<void *>(stream))"), std::string::npos)
         << "The CUDA NativeVNNI dispatch trainer must bind its GEMM kernel to the explicit stream.";
-    EXPECT_NE(source.find("kernel->setGPUStream(nullptr)"), std::string::npos)
+    EXPECT_NE(source.find("kernel->clearGPUStreamBinding()"), std::string::npos)
         << "The CUDA NativeVNNI dispatch trainer must unbind the stream before leaving the run.";
     EXPECT_NE(source.find("cudaEventRecord(start, stream)"), std::string::npos)
         << "Benchmark timing must record the start event on the same explicit stream as GEMV.";

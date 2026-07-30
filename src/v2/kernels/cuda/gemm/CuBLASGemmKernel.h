@@ -217,10 +217,20 @@ namespace llaminar2
             bool ownsHandle() const { return owns_handle_; }
 
             /**
-             * @brief Set the stream on the underlying cuBLAS handle
-             * @param stream CUDA stream (cast to cudaStream_t internally)
+             * @brief Bind a validated stream to this kernel and its cuBLAS handle.
+             *
+             * @param stream Non-null CUDA stream validated by the public kernel
+             *        interface.
              */
-            void setStream(void *stream);
+            void bindStream(ExplicitGPUStream stream);
+
+            /**
+             * @brief End the borrowed stream lifetime without selecting stream zero.
+             *
+             * The handle is not rebound during teardown. A subsequent operation
+             * must call bindStream() before it can reach a launch boundary.
+             */
+            void clearStreamBinding() noexcept;
 
         private:
 #ifdef HAVE_CUDA

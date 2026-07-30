@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -33,7 +35,12 @@ from native_vnni_dispatch.schema import (  # noqa: E402
     ExecutionMode,
     SemanticContract,
 )
-from native_vnni_dispatch.segmented_policy import GenericDispatchRule  # noqa: E402
+from native_vnni_dispatch.segmented_policy import (  # noqa: E402
+    FeatureAxis,
+    FeaturePredicate,
+    FeatureThreshold,
+    GenericDispatchRule,
+)
 
 
 def total_rules() -> list[CPUDecodeGenericRule]:
@@ -149,6 +156,124 @@ class CPUDecodeTrainerTest(unittest.TestCase):
             r"not total: missing_count=18 .*serial-kpart",
         ):
             validate_total_policy(missing_bundle)
+
+    def test_generated_selector_is_total_and_thread_parametric(self) -> None:
+        """Exact overlays stay scoped while generic wave rules use runtime T."""
+
+        architecture = "unit|build=AVX512|runtime=AVX512|threads=28"
+        domain = GenericDomain(
+            backend=Backend.CPU,
+            architecture_class=architecture,
+            semantic_contract=SemanticContract.FAST,
+            operation_kind="NativeVNNIFastM1Projection",
+            bundle_signature=DECODE_BUNDLES[0],
+            prepared_family_id="unit-family-0",
+            packing_abi="unit-packing-0",
+            runtime_codebook_id=0,
+            execution_mode=ExecutionMode.EAGER,
+            m=1,
+            aspect_bucket=AspectBucket.BALANCED,
+            all_aspects=True,
+        )
+        threshold = FeatureThreshold(
+            FeatureAxis.N_PARALLEL_WAVES_64,
+            numerator=1,
+            parallelism_width=28,
+        )
+
+        def rule(
+            require_less_equal: bool,
+            candidate_id: str,
+        ) -> CPUDecodeGenericRule:
+            return CPUDecodeGenericRule(
+                build_isa="AVX512",
+                runtime_isa="AVX512",
+                threads=28,
+                rule=GenericDispatchRule(
+                    domain=domain,
+                    predicates=(
+                        FeaturePredicate(threshold, require_less_equal),
+                    ),
+                    candidate_id=candidate_id,
+                    arithmetic_fingerprint="unit-byte-exact-arithmetic",
+                    development_shape_groups=("unit",),
+                    development_max_regret=0.0,
+                    development_p95_regret=0.0,
+                    development_mean_regret=0.0,
+                ),
+            )
+
+        exact = DecodePolicyEntry(
+            build_isa="AVX512",
+            runtime_isa="AVX512",
+            threads=28,
+            codebook=0,
+            n=1280,
+            k=1024,
+            serial_kpart=False,
+            policy="Nbc1",
+            candidate_id="cpu.nvnni.decode.n_chunk_grid.nbc1",
+            shape_names=("MeasuredT28",),
+            max_surface_regret=0.0,
+            max_cv=0.0,
+        )
+        generated = generate_include(
+            [exact],
+            [
+                rule(True, "cpu.nvnni.decode.n_chunk_grid.nbc2"),
+                rule(False, "cpu.nvnni.decode.n_chunk_grid.nbc8"),
+            ],
+            corpus_digest="sha256:" + "1" * 64,
+            registry_digest="sha256:" + "2" * 64,
+            profile=MeasurementProfile.QUICK,
+        )
+        self.assertIn("static_cast<long long>(threads)", generated)
+        source = "\n".join((
+            generated,
+            "#include <climits>",
+            "int main() {",
+            "  using namespace llaminar2::cpu::native_vnni::generated;",
+            "  CPUNativeVNNIDecodePolicy policy{};",
+            "  const int widths[] = {1, 2, 3, 7, 27, 28, 31, 56, 112, INT_MAX};",
+            "  for (const int threads : widths) {",
+            "    if (!selectCPUNativeVNNIDecodeGeneratedPolicy(",
+            "            CPUNativeVNNIDecodeBuildISA::AVX512,",
+            "            CPUNativeVNNIDecodeRuntimeISA::AVX512,",
+            "            threads, 0, 1280, 1024, false, 0, policy))",
+            "      return 1;",
+            "    const auto expected = threads == 28",
+            "        ? CPUNativeVNNIDecodePolicy::Nbc1",
+            "        : (threads >= 20 ? CPUNativeVNNIDecodePolicy::Nbc2",
+            "                         : CPUNativeVNNIDecodePolicy::Nbc8);",
+            "    if (policy != expected)",
+            "      return 2;",
+            "  }",
+            "  if (selectCPUNativeVNNIDecodeGeneratedPolicy(",
+            "          CPUNativeVNNIDecodeBuildISA::AVX512,",
+            "          CPUNativeVNNIDecodeRuntimeISA::AVX512,",
+            "          0, 0, 1280, 1024, false, 0, policy))",
+            "    return 3;",
+            "  return 0;",
+            "}",
+        ))
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "cpu-decode-thread-totality"
+            compiled = subprocess.run(
+                ["g++", "-std=c++20", "-x", "c++", "-o", str(binary), "-"],
+                input=source,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            executed = subprocess.run(
+                [str(binary)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(executed.returncode, 0, executed.stderr.decode())
 
 
 if __name__ == "__main__":

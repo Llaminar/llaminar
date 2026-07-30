@@ -214,7 +214,7 @@ namespace llaminar2
     void GEMMStage::clearCachedGemmStream()
     {
         if (cached_gemm_)
-            cached_gemm_->setGPUStream(nullptr);
+            cached_gemm_->clearGPUStreamBinding();
     }
 
     void GEMMStage::resetSessionState()
@@ -366,7 +366,7 @@ namespace llaminar2
         }
 
         // Thread GPU stream for graph capture
-        gemm->setGPUStream(gpuStream());
+        bindStageStream(gemm);
 
         LOG_DEBUG("[GEMMStage] Got kernel ptr=" << static_cast<const void *>(gemm)
                                                 << " for weight ITensor*=" << static_cast<const void *>(params_.B)
@@ -415,7 +415,7 @@ namespace llaminar2
                 LOG_ERROR("[GEMMStage] Cannot run SwiGLU fallback: failed to create SwiGLU kernel");
                 return false;
             }
-            swiglu->setGPUStream(gpuStream());
+            bindStageStream(swiglu.get());
 
             if (!swiglu->apply_tensor(
                     gate_base, A_base_up, swiglu_output,

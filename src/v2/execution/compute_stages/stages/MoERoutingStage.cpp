@@ -148,7 +148,7 @@ namespace llaminar2
             return;
 
         kernel->resetDynamicState();
-        kernel->setGPUStream(nullptr);
+        kernel->clearGPUStreamBinding();
     }
 
     IMoEKernel *MoERoutingStage::ensureMoEKernel() const

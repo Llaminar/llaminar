@@ -505,7 +505,7 @@ namespace llaminar2
          * position rows fresh without rebuilding the graph.
          */
         setGPUStream(stream);
-        kernel->setGPUStream(stream);
+        bindStageStream(kernel);
         if (params_.position_ids_device && params_.seq_len > 0)
         {
             kernel->setDynamicDevicePositionIds(params_.position_ids_device, params_.seq_len);

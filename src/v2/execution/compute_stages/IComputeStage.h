@@ -1662,12 +1662,15 @@ namespace llaminar2
         }
 
         /**
-         * @brief Bind this stage's GPU stream to a kernel when available
+         * @brief Apply this stage's device-specific stream lifecycle to a kernel
          *
-         * Many stages repeat `kernel->setGPUStream(gpuStream())`. This helper
-         * centralizes that pattern while keeping behavior unchanged.
+         * GPU stages must bind the exact non-null producer stream assigned by
+         * the graph executor. CPU stages explicitly clear any stale GPU
+         * binding that may remain on a reused prepared kernel. Keeping both
+         * transitions behind this boundary prevents callers from representing
+         * GPU execution with a nullable raw stream.
          *
-         * @tparam KernelT Kernel type exposing setGPUStream(void*)
+         * @tparam KernelT Kernel type exposing the explicit GPU stream lifecycle
          * @param kernel Kernel pointer (may be nullptr)
          * @return The same kernel pointer for fluent usage
          */
@@ -1679,7 +1682,7 @@ namespace llaminar2
                 if (device_id_.is_gpu())
                     gpuExecution().bind(kernel);
                 else
-                    kernel->setGPUStream(nullptr);
+                    kernel->clearGPUStreamBinding();
             }
             return kernel;
         }

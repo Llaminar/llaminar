@@ -199,13 +199,13 @@ namespace llaminar2
     void GDNProjectionStage::clearCachedGemmStreams()
     {
         if (params_.gemm_qkv)
-            params_.gemm_qkv->setGPUStream(nullptr);
+            params_.gemm_qkv->clearGPUStreamBinding();
         if (params_.gemm_z)
-            params_.gemm_z->setGPUStream(nullptr);
+            params_.gemm_z->clearGPUStreamBinding();
         if (params_.gemm_a)
-            params_.gemm_a->setGPUStream(nullptr);
+            params_.gemm_a->clearGPUStreamBinding();
         if (params_.gemm_b)
-            params_.gemm_b->setGPUStream(nullptr);
+            params_.gemm_b->clearGPUStreamBinding();
     }
 
     void GDNProjectionStage::resetSessionState()
@@ -359,10 +359,10 @@ namespace llaminar2
         }
 
         // Set GPU stream on all engines (no-op for CPU)
-        gemm_qkv->setGPUStream(gpuStream());
-        gemm_z->setGPUStream(gpuStream());
-        gemm_a->setGPUStream(gpuStream());
-        gemm_b->setGPUStream(gpuStream());
+        bindStageStream(gemm_qkv);
+        bindStageStream(gemm_z);
+        bindStageStream(gemm_a);
+        bindStageStream(gemm_b);
 
         // Fused 4-projection GEMM: quantizes input once, single OMP region
         // for decode (M=1). For prefill (M>1), falls back to sequential GEMMs

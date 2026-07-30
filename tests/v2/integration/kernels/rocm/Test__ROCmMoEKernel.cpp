@@ -230,18 +230,13 @@ namespace
          * Tests that upload fixtures on their own explicit stream bind that
          * stream before entering this helper; replacing it here would let
          * input H2D and kernel execution race on unrelated queues. When a
-         * standalone test has not selected a custom stream, promote the
-         * kernel's resolved context stream to an explicit binding so default
-         * tensor transfers and kernel dispatch share one queue.
+         * standalone test has not selected a custom stream, bind the
+         * process-owned nonblocking fixture stream. Direct tests have no graph
+         * executor to inject a producer stream, and consulting a device-context
+         * default here would conceal the production contract under test.
          */
         if (!kernel.hasExplicitGPUStream())
-        {
-            void *resolved_stream = kernel.getStream();
-            if (!resolved_stream)
-                throw std::runtime_error(
-                    "ROCm MoE integration workspace binding has no resolved stream");
-            static_cast<ITensorKernel &>(kernel).setGPUStream(resolved_stream);
-        }
+            bindROCmMoETestStream(kernel);
         kernel.bindWorkspace(workspace.get());
         return workspace;
     }
@@ -1263,6 +1258,28 @@ namespace
 
         return output;
     }
+}
+
+/**
+ * @brief Prove construction cannot adopt the ROCm context's default stream.
+ *
+ * A kernel object is created before the graph executor assigns its producer
+ * stream. Construction may allocate durable backend resources, but it must not
+ * bind either the parent MoE kernel or its child hipBLAS kernel to a process
+ * default. The explicit fixture binding below models the executor transition
+ * and must be the first point at which a launch stream becomes observable.
+ */
+TEST(Test__ROCmMoEKernel, ConstructionRemainsUnboundUntilExplicitStreamAssignment)
+{
+    SKIP_IF_NO_ROCM();
+
+    ROCmMoEKernel kernel(0);
+    EXPECT_FALSE(kernel.hasExplicitGPUStream());
+    EXPECT_THROW((void)kernel.getStream(), std::runtime_error);
+
+    bindROCmMoETestStream(kernel);
+    EXPECT_TRUE(kernel.hasExplicitGPUStream());
+    EXPECT_EQ(kernel.getStream(), static_cast<void *>(rocmMoETestStream()));
 }
 
 TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesRejectInvalidDescriptors)
@@ -15336,6 +15353,7 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
         for (int expert = 0; expert < num_experts; ++expert)
         {
             bank.local_compute_mask[expert] = 1;
+            bank.resident_participant_mask[expert] = 1u;
             auto &desc = bank.experts[expert];
             desc.logical_expert_id = expert;
             desc.owner_participant = 0;

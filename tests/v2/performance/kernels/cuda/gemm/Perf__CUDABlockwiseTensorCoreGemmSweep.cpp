@@ -646,7 +646,7 @@ namespace
             {
                 if (ws_consumer)
                     ws_consumer->unbindWorkspace();
-                kernel->setGPUStream(nullptr);
+                kernel->clearGPUStreamBinding();
                 cudaStreamDestroy(stream);
                 cudaNativeVNNIGemvSweep_clearConfig();
             };

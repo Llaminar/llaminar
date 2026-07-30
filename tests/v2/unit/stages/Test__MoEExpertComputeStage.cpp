@@ -210,10 +210,15 @@ namespace
     public:
         bool supports_device(int) const override { return true; }
 
-        void setGPUStream(void *stream) override
+        void bindGPUStream(ExplicitGPUStream stream) override
         {
-            observed_stream = stream;
+            observed_stream = stream.get();
             ++set_stream_calls;
+        }
+
+        void clearGPUStreamBinding() override
+        {
+            observed_stream = nullptr;
         }
 
         bool multiply_tensor(const TensorBase *, TensorBase *,

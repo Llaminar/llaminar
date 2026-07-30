@@ -152,7 +152,7 @@ namespace llaminar2
             prefill_replay_params_set_ = false;
             if (params_.kernel)
             {
-                params_.kernel->setGPUStream(nullptr);
+                params_.kernel->clearGPUStreamBinding();
                 clearKernelVerifierStateWorkspace();
             }
         }
@@ -172,7 +172,7 @@ namespace llaminar2
             prefill_bucket_seq_len_ = 0;
             prefill_replay_params_set_ = false;
             if (params_.kernel)
-                params_.kernel->setGPUStream(nullptr);
+                params_.kernel->clearGPUStreamBinding();
         }
 
         /**

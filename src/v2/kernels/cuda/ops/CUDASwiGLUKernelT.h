@@ -69,10 +69,11 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             // ===== ITensorSwiGLU interface =====
             bool apply(
@@ -197,10 +198,11 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             // ===== ITensorSwiGLU interface =====
             bool apply(
@@ -325,10 +327,11 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             // ===== ITensorSwiGLU interface =====
             bool apply(

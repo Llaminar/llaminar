@@ -382,11 +382,8 @@ namespace llaminar2
             setDeviceContext(ctx);
             device_idx_ = ctx->deviceOrdinal();
 
-            // Get stream from context
-            stream_ = ctx->defaultStream();
-
             LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Created for device " << device_idx_
-                                                                              << " using device context");
+                                                                              << "; awaiting explicit execution stream");
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::~ROCmFlashAttentionKernelT()
@@ -2060,10 +2057,9 @@ namespace llaminar2
 
             setDeviceContext(ctx);
             device_idx_ = ctx->deviceOrdinal();
-            stream_ = ctx->defaultStream();
 
             LOG_DEBUG("[ROCmFlashAttentionKernelT<FP16>] Created for device " << device_idx_
-                                                                              << " using device context");
+                                                                              << "; awaiting explicit execution stream");
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::~ROCmFlashAttentionKernelT()
@@ -2420,10 +2416,10 @@ namespace llaminar2
             }
             setDeviceContext(ctx);
             device_idx_ = ctx->deviceOrdinal();
-            stream_ = ctx->defaultStream();
             // Note: MI50 has limited BF16 support - may fall back to FP32
             LOG_DEBUG("[ROCmFlashAttentionKernelT<BF16>] Created for device " << device_idx_
-                                                                              << " using device context (Note: MI50 has limited BF16 support)");
+                                                                              << "; awaiting explicit execution stream"
+                                                                              << " (Note: MI50 has limited BF16 support)");
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::~ROCmFlashAttentionKernelT()

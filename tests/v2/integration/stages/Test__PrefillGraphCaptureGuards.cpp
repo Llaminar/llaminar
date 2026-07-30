@@ -1,26 +1,32 @@
 /**
  * @file Test__PrefillGraphCaptureGuards.cpp
- * @brief Tests that capture-blocking operation guards prevent illegal HIP
- *        operations (hipMalloc, hipFree) during GPU graph capture.
+ * @brief ROCm integration tests proving capture-blocking guards reject
+ *        unplanned device allocation and missing workspace capacity.
+ *
+ * Every asynchronous operation uses one fixture-owned, non-default stream.
+ * The tests deliberately perform real ROCm allocation and kernel work, so they
+ * belong to the integration gate rather than the CPU-only unit gate.
  */
 
 #include <gtest/gtest.h>
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
-#include "backends/GPUDeviceContextPool.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
 #include "backends/DeviceId.h"
 #include "tensors/Tensors.h"
+#include "../../utils/ScopedGPUStream.h"
 
 #include <memory>
+#include <stdexcept>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
 #endif
 
 using namespace llaminar2;
+using namespace llaminar2::test;
 
 class Test__PrefillGraphCaptureGuards : public ::testing::Test
 {
@@ -35,8 +41,21 @@ protected:
         if (device_count <= 0)
             GTEST_SKIP() << "No ROCm device available";
         (void)hipSetDevice(0);
+        stream_ = std::make_unique<ScopedGPUStream>(DeviceId::rocm(0));
 #endif
     }
+
+#ifdef HAVE_ROCM
+    void *stream() const
+    {
+        if (!stream_)
+            throw std::runtime_error(
+                "ROCm graph-capture guard fixture has no explicit stream");
+        return stream_->get();
+    }
+
+    std::unique_ptr<ScopedGPUStream> stream_;
+#endif
 };
 
 // =============================================================================
@@ -72,6 +91,7 @@ TEST_F(Test__PrefillGraphCaptureGuards, MoE_PrepareExpertGroupsAsync_RequiresBou
 {
 #ifdef HAVE_ROCM
     ROCmMoEKernel kernel(0);
+    kernel.setGPUStream(stream());
     auto bind_moe_workspace = [&](int max_seq, int num_experts, int top_k) {
         auto reqs = MoEWorkspaceBuffers::rocmMoE(
             max_seq,
@@ -102,8 +122,8 @@ TEST_F(Test__PrefillGraphCaptureGuards, MoE_PrepareExpertGroupsAsync_RequiresBou
     }
 
     // Upload to device before calling prepareExpertGroupsAsync
-    routing_indices->ensureOnDevice(DeviceId::rocm(0));
-    routing_weights->ensureOnDevice(DeviceId::rocm(0));
+    ASSERT_TRUE(routing_indices->ensureOnDevice(DeviceId::rocm(0), stream()));
+    ASSERT_TRUE(routing_weights->ensureOnDevice(DeviceId::rocm(0), stream()));
 
     auto warm_workspace = bind_moe_workspace(warm_seq, warm_experts, warm_topk);
     ASSERT_NE(warm_workspace, nullptr);
@@ -126,8 +146,8 @@ TEST_F(Test__PrefillGraphCaptureGuards, MoE_PrepareExpertGroupsAsync_RequiresBou
     }
 
     // Upload to device
-    big_indices->ensureOnDevice(DeviceId::rocm(0));
-    big_weights->ensureOnDevice(DeviceId::rocm(0));
+    ASSERT_TRUE(big_indices->ensureOnDevice(DeviceId::rocm(0), stream()));
+    ASSERT_TRUE(big_weights->ensureOnDevice(DeviceId::rocm(0), stream()));
 
     // The kernel must not allocate a hidden larger scratch buffer under capture.
     {
@@ -178,8 +198,7 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_ChunkForward_FailsDuringCapture_NoSt
 {
 #ifdef HAVE_ROCM
     ROCmGatedDeltaNet gdn(0);
-    auto &ctx = GPUDeviceContextPool::instance().getAMDContext(0);
-    gdn.setGPUStream(ctx.defaultStream());
+    gdn.setGPUStream(stream());
 
     const int n_heads = 4, d_k = 64, d_v = 64, seq_len = 8;
     // Allocate dummy device buffers for the call
@@ -212,8 +231,7 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_RecurrentStep_FailsDuringCapture_NoS
 {
 #ifdef HAVE_ROCM
     ROCmGatedDeltaNet gdn(0);
-    auto &ctx = GPUDeviceContextPool::instance().getAMDContext(0);
-    gdn.setGPUStream(ctx.defaultStream());
+    gdn.setGPUStream(stream());
 
     const int n_heads = 4, d_k = 64, d_v = 64;
     float *d_buf = nullptr;
@@ -245,8 +263,7 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_DeinterleaveQKV_RequiresBoundWorkspa
 {
 #ifdef HAVE_ROCM
     ROCmGatedDeltaNet gdn(0);
-    auto &ctx = GPUDeviceContextPool::instance().getAMDContext(0);
-    gdn.setGPUStream(ctx.defaultStream());
+    gdn.setGPUStream(stream());
 
     const int n_k_heads = 4, n_v_heads = 4, d_k = 64, d_v = 64;
     auto bind_deinterleave_workspace = [&](size_t scratch_floats) {

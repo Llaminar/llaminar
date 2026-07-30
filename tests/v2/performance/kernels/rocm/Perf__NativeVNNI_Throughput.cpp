@@ -1832,7 +1832,7 @@ namespace
             requirements.total_bytes_with_alignment() + 4 * 1024 * 1024);
         if (!workspace->allocate(requirements))
         {
-            kernel.setGPUStream(nullptr);
+            kernel.clearGPUStreamBinding();
             (void)hipStreamDestroy(stream);
             return fail("workspace_allocate");
         }
@@ -1856,7 +1856,7 @@ namespace
                 hipStreamSynchronize(stream) != hipSuccess)
             {
                 kernel.unbindWorkspace();
-                kernel.setGPUStream(nullptr);
+                kernel.clearGPUStreamBinding();
                 (void)hipStreamDestroy(stream);
                 return fail("serial_row_launch");
             }
@@ -1869,7 +1869,7 @@ namespace
                 hipStreamSynchronize(stream) != hipSuccess)
             {
                 kernel.unbindWorkspace();
-                kernel.setGPUStream(nullptr);
+                kernel.clearGPUStreamBinding();
                 (void)hipStreamDestroy(stream);
                 return fail("serial_row_download");
             }
@@ -1902,7 +1902,7 @@ namespace
             result.failure_reason = "serial_route_proof";
 
         kernel.unbindWorkspace();
-        kernel.setGPUStream(nullptr);
+        kernel.clearGPUStreamBinding();
         (void)hipStreamDestroy(stream);
         return result;
     }
@@ -1952,7 +1952,7 @@ namespace
             requirements.total_bytes_with_alignment() + 4 * 1024 * 1024);
         if (!workspace->allocate(requirements))
         {
-            kernel.setGPUStream(nullptr);
+            kernel.clearGPUStreamBinding();
             (void)hipStreamDestroy(stream);
             return fail("workspace_allocate");
         }
@@ -1964,7 +1964,7 @@ namespace
             !output->allocateOnDevice(DeviceId::rocm(device_id)))
         {
             kernel.unbindWorkspace();
-            kernel.setGPUStream(nullptr);
+            kernel.clearGPUStreamBinding();
             (void)hipStreamDestroy(stream);
             return fail("tensor_prepare");
         }
@@ -1985,7 +1985,7 @@ namespace
             !captured_launch.capture(stream, run_once))
         {
             kernel.unbindWorkspace();
-            kernel.setGPUStream(nullptr);
+            kernel.clearGPUStreamBinding();
             (void)hipStreamDestroy(stream);
             return fail("graph_capture");
         }
@@ -1999,7 +1999,7 @@ namespace
         {
             captured_launch.reset();
             kernel.unbindWorkspace();
-            kernel.setGPUStream(nullptr);
+            kernel.clearGPUStreamBinding();
             (void)hipStreamDestroy(stream);
         };
         if (!execute_once() || hipStreamSynchronize(stream) != hipSuccess)

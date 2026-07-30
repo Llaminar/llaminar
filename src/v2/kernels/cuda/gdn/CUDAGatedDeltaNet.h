@@ -672,7 +672,8 @@ namespace llaminar2
             return ok;
         }
 
-        void setGPUStream(void *stream) override { stream_ = stream; }
+        void bindGPUStream(ExplicitGPUStream stream) override { stream_ = stream.get(); }
+        void clearGPUStreamBinding() override { stream_ = nullptr; }
 
         /**
          * @brief Enqueue a diagnostic copy of the resident request-state bank.

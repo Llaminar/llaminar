@@ -266,7 +266,7 @@ namespace llaminar2
 
         // Propagate the current stage stream so every device-side parameter
         // writer is ordered with the attention graph that consumes it.
-        cached_kernel_->setGPUStream(gpuStream());
+        bindStageStream(cached_kernel_);
 
         const int kv_len = dynamic_post_append_kv_len_;
         const int logical_pos_offset = std::max(0, kv_len - logical_seq_len);

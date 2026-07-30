@@ -542,7 +542,7 @@ namespace llaminar2
             if (handle && handle->prepared_weights && handle->prepared_weights->kernel)
             {
                 handle->prepared_weights->kernel->resetDynamicState();
-                handle->prepared_weights->kernel->setGPUStream(nullptr);
+                handle->prepared_weights->kernel->clearGPUStreamBinding();
             }
         }
 
@@ -551,7 +551,7 @@ namespace llaminar2
             if (fused)
             {
                 fused->resetDynamicState();
-                fused->setGPUStream(nullptr);
+                fused->clearGPUStreamBinding();
             }
         }
 
@@ -560,7 +560,7 @@ namespace llaminar2
             if (sliced)
             {
                 sliced->resetDynamicState();
-                sliced->setGPUStream(nullptr);
+                sliced->clearGPUStreamBinding();
             }
         }
 
@@ -575,7 +575,7 @@ namespace llaminar2
                 if (expert.engine)
                 {
                     expert.engine->resetDynamicState();
-                    expert.engine->setGPUStream(nullptr);
+                    expert.engine->clearGPUStreamBinding();
                 }
             }
         }

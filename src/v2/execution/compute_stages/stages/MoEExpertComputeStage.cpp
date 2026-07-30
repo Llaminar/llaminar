@@ -1420,7 +1420,7 @@ namespace llaminar2
         {
             if (!gemm)
                 return;
-            gemm->setGPUStream(gpuStream());
+            bindStageStream(gemm);
             if (bound_workspace_)
             {
                 auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
@@ -3936,7 +3936,7 @@ namespace llaminar2
              * failure and blur the scheduler/compute ownership boundary.
              */
             if (!params_.device_id.is_gpu() || hasGPUStream())
-                gemm->setGPUStream(gpuStream());
+                bindStageStream(gemm);
             if (bound_workspace_)
             {
                 auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
@@ -4175,9 +4175,9 @@ namespace llaminar2
             return false;
         }
 
-        shared_gate->setGPUStream(gpuStream());
-        shared_up->setGPUStream(gpuStream());
-        shared_down->setGPUStream(gpuStream());
+        bindStageStream(shared_gate);
+        bindStageStream(shared_up);
+        bindStageStream(shared_down);
         auto bind_if_needed = [&](ITensorGemm *gemm)
         {
             if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm))
@@ -7072,7 +7072,7 @@ namespace llaminar2
              * immediately before launching any kernel.
              */
             if (!params_.device_id.is_gpu() || hasGPUStream())
-                gemm->setGPUStream(gpuStream());
+                bindStageStream(gemm);
             if (bound_workspace_)
             {
                 auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
@@ -7480,9 +7480,9 @@ namespace llaminar2
             LOG_ERROR("[SharedExpertFFNStage] Missing shared expert GEMM engine");
             return false;
         }
-        cached_gate_gemm_->setGPUStream(gpuStream());
-        cached_up_gemm_->setGPUStream(gpuStream());
-        cached_down_gemm_->setGPUStream(gpuStream());
+        bindStageStream(cached_gate_gemm_);
+        bindStageStream(cached_up_gemm_);
+        bindStageStream(cached_down_gemm_);
 
         if (!validatePlannedScratch(seq_len, intermediate))
             return false;
@@ -7974,7 +7974,7 @@ namespace llaminar2
             return;
 
         owned_moe_kernel_->resetDynamicState();
-        owned_moe_kernel_->setGPUStream(nullptr);
+        owned_moe_kernel_->clearGPUStreamBinding();
     }
 
     int SharedExpertGateStage::effectivePrefillSeqLen() const

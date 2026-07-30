@@ -230,7 +230,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override;
 
-            void setGPUStream(void *stream) override;
+            void bindGPUStream(ExplicitGPUStream stream) override;
+            void clearGPUStreamBinding() override;
 
             WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
             void bindWorkspace(DeviceWorkspaceManager *workspace) override;

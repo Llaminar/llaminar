@@ -105,15 +105,27 @@ namespace llaminar2
         }
     }
 
-    void ROCmEmbeddingKernelT::setGPUStream(void *stream)
+    void ROCmEmbeddingKernelT::bindGPUStream(ExplicitGPUStream stream)
     {
-        gpu_stream_ = stream;
+        gpu_stream_ = stream.get();
 
         int current_device = -1;
         if (hipGetDevice(&current_device) == hipSuccess && current_device >= 0)
         {
             std::lock_guard<std::mutex> lock(stream_mutex_);
-            stream_by_device_[current_device] = stream;
+            stream_by_device_[current_device] = stream.get();
+        }
+    }
+
+    void ROCmEmbeddingKernelT::clearGPUStreamBinding()
+    {
+        gpu_stream_ = nullptr;
+
+        int current_device = -1;
+        if (hipGetDevice(&current_device) == hipSuccess && current_device >= 0)
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            stream_by_device_.erase(current_device);
         }
     }
 
@@ -130,7 +142,7 @@ namespace llaminar2
             }
         }
 
-        return gpu_stream_ ? gpu_stream_ : (device_ctx_ ? device_ctx_->defaultStream() : nullptr);
+        return requireExplicitGPUStreamBinding(gpu_stream_, "ROCmEmbeddingKernelT");
     }
 
     void ROCmEmbeddingKernelT::setDynamicTokenIds(const int *token_ids, int num_tokens)

@@ -846,7 +846,7 @@ namespace llaminar2
         };
 
         // Bind stage stream to kernel before execution.
-        params_.kernel->setGPUStream(gpuStream());
+        bindStageStream(params_.kernel);
         {
             PerfStatsCollector::ScopedTimer timer(
                 "gdn_recurrence_cpu_detail",

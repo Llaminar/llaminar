@@ -1436,12 +1436,21 @@ namespace llaminar2
             return (dev.type == ComputeBackendType::GPU_CUDA && dev.device_id == cuda_device_id_);
         }
 
-        void CUDAFloatingPointGemmKernel::setGPUStream(void *stream)
+        void CUDAFloatingPointGemmKernel::bindGPUStream(ExplicitGPUStream stream)
         {
-            gpu_stream_ = stream;
+            gpu_stream_ = stream.get();
             if (cublas_kernel_)
             {
-                cublas_kernel_->setStream(stream);
+                cublas_kernel_->bindStream(stream);
+            }
+        }
+
+        void CUDAFloatingPointGemmKernel::clearGPUStreamBinding()
+        {
+            gpu_stream_ = nullptr;
+            if (cublas_kernel_)
+            {
+                cublas_kernel_->clearStreamBinding();
             }
         }
 

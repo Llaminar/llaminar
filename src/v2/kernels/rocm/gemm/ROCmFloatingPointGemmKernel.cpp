@@ -1340,12 +1340,21 @@ namespace llaminar2
             return (dev.type == ComputeBackendType::GPU_ROCM && dev.device_id == rocm_device_id_);
         }
 
-        void ROCmFloatingPointGemmKernel::setGPUStream(void *stream)
+        void ROCmFloatingPointGemmKernel::bindGPUStream(ExplicitGPUStream stream)
         {
-            gpu_stream_ = stream;
+            gpu_stream_ = stream.get();
             if (hipblas_kernel_)
             {
-                hipblas_kernel_->setStream(stream);
+                hipblas_kernel_->bindStream(stream);
+            }
+        }
+
+        void ROCmFloatingPointGemmKernel::clearGPUStreamBinding()
+        {
+            gpu_stream_ = nullptr;
+            if (hipblas_kernel_)
+            {
+                hipblas_kernel_->clearStreamBinding();
             }
         }
 

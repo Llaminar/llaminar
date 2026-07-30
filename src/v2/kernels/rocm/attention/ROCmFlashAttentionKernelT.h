@@ -141,7 +141,8 @@ namespace llaminar2
                 return device_idx >= 0; // GPU only
             }
 
-            void setGPUStream(void *stream) override { stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { stream_ = nullptr; }
 
             /**
              * @brief Compute single-sequence attention
@@ -318,7 +319,8 @@ namespace llaminar2
             /**
              * @brief Create ROCm Flash Attention kernel using device context
              *
-             * Uses the device context's stream for kernel execution.
+             * The context supplies device resources only. The executor must
+             * bind the exact producer stream before kernel execution.
              *
              * @param ctx Device context (must outlive this kernel)
              * @throws std::runtime_error if ctx is null or not initialized
@@ -334,11 +336,17 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            void setGPUStream(void *stream) override
+            void bindGPUStream(ExplicitGPUStream stream) override
             {
-                if (stream_ != stream)
+                if (stream_ != stream.get())
                     dynamic_attn_device_valid_ = false;
-                stream_ = stream;
+                stream_ = stream.get();
+            }
+
+            void clearGPUStreamBinding() override
+            {
+                dynamic_attn_device_valid_ = false;
+                stream_ = nullptr;
             }
 
             bool compute(
@@ -621,7 +629,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            void setGPUStream(void *stream) override { stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { stream_ = nullptr; }
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
@@ -758,7 +767,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            void setGPUStream(void *stream) override { stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { stream_ = nullptr; }
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,

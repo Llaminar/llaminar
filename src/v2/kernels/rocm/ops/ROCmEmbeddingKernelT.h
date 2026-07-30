@@ -71,7 +71,8 @@ namespace llaminar2
             return device_idx >= 0; // ROCm supports any valid device index
         }
 
-        void setGPUStream(void *stream) override;
+        void bindGPUStream(ExplicitGPUStream stream) override;
+        void clearGPUStreamBinding() override;
         void setPreparedEmbeddingHandle(const PreparedEmbeddingHandle *handle) override
         {
             prepared_embedding_handle_ = handle;

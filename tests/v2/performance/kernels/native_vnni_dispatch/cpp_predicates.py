@@ -102,13 +102,16 @@ def predicate_condition(
     k_expression: str = "k",
     work_expression: str = "work_items",
     k_tiles_expression: str = "1",
+    parallelism_expression: str | None = None,
 ) -> str:
     """Render one learner edge with the same exact rational comparison as Python.
 
     Tile-count features use positive ceil division, and K-groups-per-N-tile uses
     the learner's 32-value NativeVNNI group unit. Every intermediate is widened
     before addition or multiplication so large LM-head dimensions cannot change
-    a branch through signed 32-bit overflow.
+    a branch through signed 32-bit overflow. CPU emitters provide the runtime
+    OpenMP width through ``parallelism_expression``; GPU emitters omit it and
+    retain the launch parallelism frozen into the measured threshold.
     """
 
     threshold = predicate.threshold
@@ -116,6 +119,11 @@ def predicate_condition(
     denominator = threshold.denominator
     n64 = _i64(n_expression)
     k64 = _i64(k_expression)
+    parallelism = (
+        _i64(parallelism_expression)
+        if parallelism_expression is not None
+        else f"{threshold.parallelism_width}LL"
+    )
 
     if threshold.axis == FeatureAxis.AGGREGATE_N:
         comparison = f"{n64} * {denominator}LL <= {numerator}LL"
@@ -171,19 +179,18 @@ def predicate_condition(
         width = N_PARALLEL_WAVE_WIDTH_BY_AXIS[threshold.axis]
         tasks = f"(({n64} + {width - 1}LL) / {width}LL)"
         waves = (
-            f"(({tasks} + {threshold.parallelism_width - 1}LL) / "
-            f"{threshold.parallelism_width}LL)"
+            f"(({tasks} + {parallelism} - 1LL) / {parallelism})"
         )
         comparison = f"{waves} * {denominator}LL <= {numerator}LL"
     elif threshold.axis in N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS:
         width = N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS[threshold.axis]
         tasks = f"(({n64} + {width - 1}LL) / {width}LL)"
         final_wave_tasks = (
-            f"((({tasks} - 1LL) % {threshold.parallelism_width}LL) + 1LL)"
+            f"((({tasks} - 1LL) % {parallelism}) + 1LL)"
         )
         comparison = (
             f"{final_wave_tasks} * {denominator}LL <= "
-            f"{threshold.parallelism_width}LL * {numerator}LL"
+            f"{parallelism} * {numerator}LL"
         )
     elif threshold.axis in KPART_PRODUCER_WAVE_WIDTH_BY_AXIS:
         width = KPART_PRODUCER_WAVE_WIDTH_BY_AXIS[threshold.axis]
@@ -196,8 +203,7 @@ def predicate_condition(
             f"{positive_k_tiles}))"
         )
         waves = (
-            f"(({tasks} + {threshold.parallelism_width - 1}LL) / "
-            f"{threshold.parallelism_width}LL)"
+            f"(({tasks} + {parallelism} - 1LL) / {parallelism})"
         )
         comparison = f"{waves} * {denominator}LL <= {numerator}LL"
     elif threshold.axis in KPART_FINAL_PRODUCER_WAVE_WIDTH_BY_AXIS:
@@ -211,11 +217,11 @@ def predicate_condition(
             f"{positive_k_tiles}))"
         )
         final_wave_tasks = (
-            f"((({tasks} - 1LL) % {threshold.parallelism_width}LL) + 1LL)"
+            f"((({tasks} - 1LL) % {parallelism}) + 1LL)"
         )
         comparison = (
             f"{final_wave_tasks} * {denominator}LL <= "
-            f"{threshold.parallelism_width}LL * {numerator}LL"
+            f"{parallelism} * {numerator}LL"
         )
     elif threshold.axis in KPART_PARTITION_GEOMETRY_AXES:
         blocks_per_tile, final_tile_blocks = _kpart_geometry_expressions(
@@ -248,8 +254,7 @@ def predicate_condition(
         n_tiles = f"(({n64} + {width - 1}LL) / {width}LL)"
         tasks = f"({threshold.task_multiplier}LL * {n_tiles})"
         waves = (
-            f"(({tasks} + {threshold.parallelism_width - 1}LL) / "
-            f"{threshold.parallelism_width}LL)"
+            f"(({tasks} + {parallelism} - 1LL) / {parallelism})"
         )
         comparison = f"{waves} * {denominator}LL <= {numerator}LL"
     elif threshold.axis in MN_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS:
@@ -257,11 +262,11 @@ def predicate_condition(
         n_tiles = f"(({n64} + {width - 1}LL) / {width}LL)"
         tasks = f"({threshold.task_multiplier}LL * {n_tiles})"
         final_wave_tasks = (
-            f"((({tasks} - 1LL) % {threshold.parallelism_width}LL) + 1LL)"
+            f"((({tasks} - 1LL) % {parallelism}) + 1LL)"
         )
         comparison = (
             f"{final_wave_tasks} * {denominator}LL <= "
-            f"{threshold.parallelism_width}LL * {numerator}LL"
+            f"{parallelism} * {numerator}LL"
         )
     else:
         raise ValueError(

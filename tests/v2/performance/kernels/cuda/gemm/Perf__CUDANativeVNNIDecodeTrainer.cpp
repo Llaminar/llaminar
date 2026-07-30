@@ -1307,7 +1307,7 @@ namespace
                 device, workspaceBudgetFor(requirements));
             if (!workspace->allocate(requirements))
             {
-                kernel->setGPUStream(nullptr);
+                kernel->clearGPUStreamBinding();
                 (void)cudaStreamDestroy(stream);
                 return fail("workspace_allocate");
             }
@@ -1329,7 +1329,7 @@ namespace
                     cudaSuccess)
                 {
                     workspace_consumer->unbindWorkspace();
-                    kernel->setGPUStream(nullptr);
+                    kernel->clearGPUStreamBinding();
                     (void)cudaStreamDestroy(stream);
                     return fail("workspace_poison");
                 }
@@ -1339,7 +1339,7 @@ namespace
         {
             if (workspace_consumer)
                 workspace_consumer->unbindWorkspace();
-            kernel->setGPUStream(nullptr);
+            kernel->clearGPUStreamBinding();
             (void)cudaStreamDestroy(stream);
         };
 
@@ -1547,7 +1547,7 @@ namespace
             }
             if (workspace_consumer)
                 workspace_consumer->unbindWorkspace();
-            kernel->setGPUStream(nullptr);
+            kernel->clearGPUStreamBinding();
             if (stream)
                 (void)cudaStreamDestroy(stream);
         };

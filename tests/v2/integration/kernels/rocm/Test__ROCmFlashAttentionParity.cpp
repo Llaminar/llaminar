@@ -396,6 +396,29 @@ protected:
 
 #ifdef HAVE_ROCM
     /**
+     * @brief Bind an attention kernel to the exact stream that owns its inputs.
+     *
+     * Raw-pointer parity tests do not have an executor or compute stage to
+     * perform the production stream binding.  The fixture therefore owns one
+     * durable nonblocking stream and makes this helper the explicit binding
+     * boundary before any direct kernel launch.  Tests with a richer
+     * producer/consumer chain may supply that chain's stream instead.
+     *
+     * @param kernel Attention kernel that will consume the published inputs.
+     * @param producer_stream Exact producer stream, or the fixture stream when
+     *                        omitted.
+     */
+    void bindAttentionStream(
+        llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> &kernel,
+        hipStream_t producer_stream = nullptr)
+    {
+        hipStream_t exact_stream = producer_stream ? producer_stream : test_stream_;
+        ASSERT_NE(exact_stream, nullptr)
+            << "ROCm attention tests require an explicit non-null producer stream";
+        kernel.setGPUStream(exact_stream);
+    }
+
+    /**
      * @brief Set up workspace for FlashDecode kernel
      *
      * FlashDecode requires workspace buffers for multi-block reduction:
@@ -408,7 +431,7 @@ protected:
         int batch_size, int n_heads, int head_dim,
         hipStream_t stream = nullptr)
     {
-        kernel.setGPUStream(stream ? stream : test_stream_);
+        bindAttentionStream(kernel, stream);
         auto reqs = kernel.getWorkspaceRequirements(batch_size, n_heads, head_dim);
 
         // Compute actual budget from requirements (with alignment padding) + 1MB margin
@@ -536,6 +559,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Small)
 
     // ROCm kernel
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    bindAttentionStream(rocm_kernel);
 
     // Allocate device memory
     float *d_Q, *d_K, *d_V, *d_output;
@@ -626,6 +650,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Medium_GQA)
 
     // ROCm kernel
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    bindAttentionStream(rocm_kernel);
 
     float *d_Q, *d_K, *d_V, *d_output;
     (void)hipMalloc(&d_Q, q_size * sizeof(float));
@@ -702,6 +727,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim)
 
     // ROCm kernel
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    bindAttentionStream(rocm_kernel);
 
     float *d_Q, *d_K, *d_V, *d_output;
     (void)hipMalloc(&d_Q, q_size * sizeof(float));
@@ -776,6 +802,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim_LargerSeq)
     ASSERT_TRUE(cpu_success);
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    bindAttentionStream(rocm_kernel);
 
     float *d_Q, *d_K, *d_V, *d_output;
     (void)hipMalloc(&d_Q, q_size * sizeof(float));
@@ -850,6 +877,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim_GQA)
     ASSERT_TRUE(cpu_success);
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    bindAttentionStream(rocm_kernel);
 
     float *d_Q, *d_K, *d_V, *d_output;
     (void)hipMalloc(&d_Q, q_size * sizeof(float));
@@ -928,6 +956,7 @@ TEST_F(Test__ROCmFlashAttentionParity, DeviceResidentPrefillHonorsExternalMask)
     ASSERT_NE(mask_tensor.gpu_data_ptr(), nullptr);
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    bindAttentionStream(rocm_kernel);
 
     float *d_Q = nullptr;
     float *d_K = nullptr;
@@ -3058,6 +3087,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_NonCausal)
 
     // ROCm kernel
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    bindAttentionStream(rocm_kernel);
 
     float *d_Q, *d_K, *d_V, *d_output;
     (void)hipMalloc(&d_Q, q_size * sizeof(float));
@@ -3135,6 +3165,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Large)
     ASSERT_TRUE(cpu_success);
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    bindAttentionStream(rocm_kernel);
 
     float *d_Q, *d_K, *d_V, *d_output;
     (void)hipMalloc(&d_Q, q_size * sizeof(float));
@@ -3200,6 +3231,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Qwen35LongPrefillSampledR
     std::vector<float> rocm_output(out_size, 0.0f);
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    bindAttentionStream(rocm_kernel);
 
     float *d_Q = nullptr;
     float *d_K = nullptr;
@@ -5466,6 +5498,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_CausalMasking)
     ASSERT_TRUE(cpu_success);
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    bindAttentionStream(rocm_kernel);
 
     float *d_Q, *d_K, *d_V, *d_output;
     (void)hipMalloc(&d_Q, q_size * sizeof(float));

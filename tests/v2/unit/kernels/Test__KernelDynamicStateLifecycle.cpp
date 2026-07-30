@@ -23,9 +23,9 @@
 #include "tensors/KernelSnapshotInfo.h"
 #include "backends/ComputeBackend.h"
 #include "backends/DeviceId.h"
-#include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
+#include "../../utils/ScopedGPUStream.h"
 #include "../../utils/TestTensorFactory.h"
 
 #ifdef HAVE_ROCM
@@ -63,6 +63,7 @@ protected:
     {
         std::unique_ptr<ITensorEmbedding> kernel;
         std::unique_ptr<DeviceWorkspaceManager> workspace;
+        std::unique_ptr<ScopedGPUStream> stream;
     };
 
     GpuKernelWithWorkspace createGpuEmbeddingWithWorkspace(DeviceType dev_type, int ordinal = 0)
@@ -84,9 +85,16 @@ protected:
         if (ws_consumer)
             ws_consumer->bindWorkspace(workspace.get());
 
-        kernel->setGPUStream(GPUDeviceContextPool::instance().getContext(device).defaultStream());
+        /*
+         * Dynamic token publication is asynchronous GPU work. Keep one
+         * non-default stream alive beside the kernel and workspace so the
+         * fixture exercises the same explicit producer-stream contract as the
+         * production stage instead of borrowing a context default.
+         */
+        auto stream = std::make_unique<ScopedGPUStream>(device);
+        kernel->setGPUStream(stream->get());
 
-        return {std::move(kernel), std::move(workspace)};
+        return {std::move(kernel), std::move(workspace), std::move(stream)};
     }
 };
 
@@ -153,16 +161,17 @@ TEST_F(Test__KernelDynamicStateLifecycle, CUDAEmbedding_SetDynamicTokenIds_Activ
     if (!hasCUDA())
         GTEST_SKIP() << "No CUDA GPU available";
 
-    auto [kernel, workspace] = createGpuEmbeddingWithWorkspace(DeviceType::CUDA, 0);
-    ASSERT_NE(kernel, nullptr);
+    auto fixture = createGpuEmbeddingWithWorkspace(DeviceType::CUDA, 0);
+    ASSERT_NE(fixture.kernel, nullptr);
 
-    EXPECT_FALSE(kernel->hasDynamicStateActive());
+    EXPECT_FALSE(fixture.kernel->hasDynamicStateActive());
 
     // Preload token IDs → should activate dynamic state
     std::vector<int> tokens = {1, 5, 10};
-    kernel->setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
+    fixture.kernel->setDynamicTokenIds(
+        tokens.data(), static_cast<int>(tokens.size()));
 
-    EXPECT_TRUE(kernel->hasDynamicStateActive())
+    EXPECT_TRUE(fixture.kernel->hasDynamicStateActive())
         << "setDynamicTokenIds must activate dynamic state on CUDA kernel";
 }
 
@@ -171,16 +180,17 @@ TEST_F(Test__KernelDynamicStateLifecycle, CUDAEmbedding_ResetDynamicState_Clears
     if (!hasCUDA())
         GTEST_SKIP() << "No CUDA GPU available";
 
-    auto [kernel, workspace] = createGpuEmbeddingWithWorkspace(DeviceType::CUDA, 0);
-    ASSERT_NE(kernel, nullptr);
+    auto fixture = createGpuEmbeddingWithWorkspace(DeviceType::CUDA, 0);
+    ASSERT_NE(fixture.kernel, nullptr);
 
     // Activate then reset
     std::vector<int> tokens = {1, 5, 10};
-    kernel->setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
-    ASSERT_TRUE(kernel->hasDynamicStateActive());
+    fixture.kernel->setDynamicTokenIds(
+        tokens.data(), static_cast<int>(tokens.size()));
+    ASSERT_TRUE(fixture.kernel->hasDynamicStateActive());
 
-    kernel->resetDynamicState();
-    EXPECT_FALSE(kernel->hasDynamicStateActive())
+    fixture.kernel->resetDynamicState();
+    EXPECT_FALSE(fixture.kernel->hasDynamicStateActive())
         << "resetDynamicState must clear dynamic_params_active_ on CUDA kernel";
 }
 
@@ -189,15 +199,16 @@ TEST_F(Test__KernelDynamicStateLifecycle, CUDAEmbedding_DoubleResetIsSafe)
     if (!hasCUDA())
         GTEST_SKIP() << "No CUDA GPU available";
 
-    auto [kernel, workspace] = createGpuEmbeddingWithWorkspace(DeviceType::CUDA, 0);
-    ASSERT_NE(kernel, nullptr);
+    auto fixture = createGpuEmbeddingWithWorkspace(DeviceType::CUDA, 0);
+    ASSERT_NE(fixture.kernel, nullptr);
 
     std::vector<int> tokens = {1, 5, 10};
-    kernel->setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
+    fixture.kernel->setDynamicTokenIds(
+        tokens.data(), static_cast<int>(tokens.size()));
 
-    kernel->resetDynamicState();
-    kernel->resetDynamicState(); // Must not crash
-    EXPECT_FALSE(kernel->hasDynamicStateActive());
+    fixture.kernel->resetDynamicState();
+    fixture.kernel->resetDynamicState(); // Must not crash
+    EXPECT_FALSE(fixture.kernel->hasDynamicStateActive());
 }
 
 TEST_F(Test__KernelDynamicStateLifecycle, CUDAEmbedding_ReactivateAfterReset)
@@ -205,21 +216,23 @@ TEST_F(Test__KernelDynamicStateLifecycle, CUDAEmbedding_ReactivateAfterReset)
     if (!hasCUDA())
         GTEST_SKIP() << "No CUDA GPU available";
 
-    auto [kernel, workspace] = createGpuEmbeddingWithWorkspace(DeviceType::CUDA, 0);
-    ASSERT_NE(kernel, nullptr);
+    auto fixture = createGpuEmbeddingWithWorkspace(DeviceType::CUDA, 0);
+    ASSERT_NE(fixture.kernel, nullptr);
 
     // Cycle: activate → reset → re-activate
     std::vector<int> tokens = {1, 5, 10};
-    kernel->setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
-    ASSERT_TRUE(kernel->hasDynamicStateActive());
+    fixture.kernel->setDynamicTokenIds(
+        tokens.data(), static_cast<int>(tokens.size()));
+    ASSERT_TRUE(fixture.kernel->hasDynamicStateActive());
 
-    kernel->resetDynamicState();
-    ASSERT_FALSE(kernel->hasDynamicStateActive());
+    fixture.kernel->resetDynamicState();
+    ASSERT_FALSE(fixture.kernel->hasDynamicStateActive());
 
     // Re-activate with different tokens
     std::vector<int> tokens2 = {42, 99};
-    kernel->setDynamicTokenIds(tokens2.data(), static_cast<int>(tokens2.size()));
-    EXPECT_TRUE(kernel->hasDynamicStateActive())
+    fixture.kernel->setDynamicTokenIds(
+        tokens2.data(), static_cast<int>(tokens2.size()));
+    EXPECT_TRUE(fixture.kernel->hasDynamicStateActive())
         << "Kernel must be re-activatable after reset";
 }
 
@@ -232,15 +245,16 @@ TEST_F(Test__KernelDynamicStateLifecycle, ROCmEmbedding_SetDynamicTokenIds_Activ
     if (!hasROCm())
         GTEST_SKIP() << "No ROCm GPU available";
 
-    auto [kernel, workspace] = createGpuEmbeddingWithWorkspace(DeviceType::ROCm, 0);
-    ASSERT_NE(kernel, nullptr);
+    auto fixture = createGpuEmbeddingWithWorkspace(DeviceType::ROCm, 0);
+    ASSERT_NE(fixture.kernel, nullptr);
 
-    EXPECT_FALSE(kernel->hasDynamicStateActive());
+    EXPECT_FALSE(fixture.kernel->hasDynamicStateActive());
 
     std::vector<int> tokens = {1, 5, 10};
-    kernel->setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
+    fixture.kernel->setDynamicTokenIds(
+        tokens.data(), static_cast<int>(tokens.size()));
 
-    EXPECT_TRUE(kernel->hasDynamicStateActive())
+    EXPECT_TRUE(fixture.kernel->hasDynamicStateActive())
         << "setDynamicTokenIds must activate dynamic state on ROCm kernel";
 }
 
@@ -249,15 +263,16 @@ TEST_F(Test__KernelDynamicStateLifecycle, ROCmEmbedding_ResetDynamicState_Clears
     if (!hasROCm())
         GTEST_SKIP() << "No ROCm GPU available";
 
-    auto [kernel, workspace] = createGpuEmbeddingWithWorkspace(DeviceType::ROCm, 0);
-    ASSERT_NE(kernel, nullptr);
+    auto fixture = createGpuEmbeddingWithWorkspace(DeviceType::ROCm, 0);
+    ASSERT_NE(fixture.kernel, nullptr);
 
     std::vector<int> tokens = {1, 5, 10};
-    kernel->setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
-    ASSERT_TRUE(kernel->hasDynamicStateActive());
+    fixture.kernel->setDynamicTokenIds(
+        tokens.data(), static_cast<int>(tokens.size()));
+    ASSERT_TRUE(fixture.kernel->hasDynamicStateActive());
 
-    kernel->resetDynamicState();
-    EXPECT_FALSE(kernel->hasDynamicStateActive())
+    fixture.kernel->resetDynamicState();
+    EXPECT_FALSE(fixture.kernel->hasDynamicStateActive())
         << "resetDynamicState must clear dynamic_params_active_ on ROCm kernel";
 }
 
@@ -266,19 +281,21 @@ TEST_F(Test__KernelDynamicStateLifecycle, ROCmEmbedding_ReactivateAfterReset)
     if (!hasROCm())
         GTEST_SKIP() << "No ROCm GPU available";
 
-    auto [kernel, workspace] = createGpuEmbeddingWithWorkspace(DeviceType::ROCm, 0);
-    ASSERT_NE(kernel, nullptr);
+    auto fixture = createGpuEmbeddingWithWorkspace(DeviceType::ROCm, 0);
+    ASSERT_NE(fixture.kernel, nullptr);
 
     std::vector<int> tokens = {1, 5, 10};
-    kernel->setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
-    ASSERT_TRUE(kernel->hasDynamicStateActive());
+    fixture.kernel->setDynamicTokenIds(
+        tokens.data(), static_cast<int>(tokens.size()));
+    ASSERT_TRUE(fixture.kernel->hasDynamicStateActive());
 
-    kernel->resetDynamicState();
-    ASSERT_FALSE(kernel->hasDynamicStateActive());
+    fixture.kernel->resetDynamicState();
+    ASSERT_FALSE(fixture.kernel->hasDynamicStateActive());
 
     std::vector<int> tokens2 = {42, 99};
-    kernel->setDynamicTokenIds(tokens2.data(), static_cast<int>(tokens2.size()));
-    EXPECT_TRUE(kernel->hasDynamicStateActive())
+    fixture.kernel->setDynamicTokenIds(
+        tokens2.data(), static_cast<int>(tokens2.size()));
+    EXPECT_TRUE(fixture.kernel->hasDynamicStateActive())
         << "Kernel must be re-activatable after reset";
 }
 
@@ -293,6 +310,7 @@ TEST_F(Test__KernelDynamicStateLifecycle, ROCmEmbedding_UnbindClearsDeviceSpecif
     ROCmEmbeddingKernelT kernel;
     DeviceId device = DeviceId::rocm(0);
     auto workspace = std::make_unique<DeviceWorkspaceManager>(device, 64 * 1024);
+    ScopedGPUStream stream(device);
 
     WorkspaceRequirements reqs;
     reqs.buffers.push_back({EmbeddingWorkspaceBuffers::TOKEN_IDS,
@@ -300,6 +318,7 @@ TEST_F(Test__KernelDynamicStateLifecycle, ROCmEmbedding_UnbindClearsDeviceSpecif
     ASSERT_TRUE(workspace->allocate(reqs));
 
     kernel.bindWorkspace(workspace.get());
+    kernel.setGPUStream(stream.get());
 
     std::vector<int> tokens = {1, 5, 10};
     kernel.setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
@@ -370,7 +389,8 @@ TEST_F(Test__KernelDynamicStateLifecycle, Factory_ResetClearsGPUEmbeddingDynamic
     auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(cached);
     ASSERT_NE(ws_consumer, nullptr);
     ws_consumer->bindWorkspace(workspace.get());
-    cached->setGPUStream(GPUDeviceContextPool::instance().getContext(device).defaultStream());
+    ScopedGPUStream stream(device);
+    cached->setGPUStream(stream.get());
 
     // Activate dynamic state (simulates prefill preloading token IDs)
     std::vector<int> tokens = {1, 5, 10};

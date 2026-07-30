@@ -183,13 +183,22 @@ TEST_F(Test__CUDAKernelBaseDeviceContext, GetStreamRejectsMissingOwnershipBefore
     EXPECT_THROW(kernel_->getStream(), std::runtime_error);
 }
 
-TEST_F(Test__CUDAKernelBaseDeviceContext, GetStream_ReturnsContextStream)
+TEST_F(Test__CUDAKernelBaseDeviceContext, ContextStreamDoesNotBecomeAnImplicitKernelBinding)
 {
     void *expected_stream = reinterpret_cast<void *>(0xABCDEF);
     mock_ctx_->setMockStream(expected_stream);
     kernel_->setDeviceContext(mock_ctx_.get());
 
+    EXPECT_FALSE(kernel_->hasExplicitGPUStream());
+    EXPECT_THROW(kernel_->getStream(), std::runtime_error);
+
+    kernel_->bindGPUStream(ExplicitGPUStream{expected_stream});
+    EXPECT_TRUE(kernel_->hasExplicitGPUStream());
     EXPECT_EQ(kernel_->getStream(), expected_stream);
+
+    kernel_->clearGPUStreamBinding();
+    EXPECT_FALSE(kernel_->hasExplicitGPUStream());
+    EXPECT_THROW(kernel_->getStream(), std::runtime_error);
 }
 
 TEST_F(Test__CUDAKernelBaseDeviceContext, GetBlasHandle_ReturnsNullWithoutContext)
@@ -264,13 +273,22 @@ TEST_F(Test__ROCmKernelBaseDeviceContext, GetStreamRejectsMissingOwnershipBefore
     EXPECT_THROW(kernel_->getStream(), std::runtime_error);
 }
 
-TEST_F(Test__ROCmKernelBaseDeviceContext, GetStream_ReturnsContextStream)
+TEST_F(Test__ROCmKernelBaseDeviceContext, ContextStreamDoesNotBecomeAnImplicitKernelBinding)
 {
     void *expected_stream = reinterpret_cast<void *>(0xFEDCBA);
     mock_ctx_->setMockStream(expected_stream);
     kernel_->setDeviceContext(mock_ctx_.get());
 
+    EXPECT_FALSE(kernel_->hasExplicitGPUStream());
+    EXPECT_THROW(kernel_->getStream(), std::runtime_error);
+
+    kernel_->bindGPUStream(ExplicitGPUStream{expected_stream});
+    EXPECT_TRUE(kernel_->hasExplicitGPUStream());
     EXPECT_EQ(kernel_->getStream(), expected_stream);
+
+    kernel_->clearGPUStreamBinding();
+    EXPECT_FALSE(kernel_->hasExplicitGPUStream());
+    EXPECT_THROW(kernel_->getStream(), std::runtime_error);
 }
 
 TEST_F(Test__ROCmKernelBaseDeviceContext, GetBlasHandle_ReturnsNullWithoutContext)
@@ -302,6 +320,11 @@ TEST_F(Test__ROCmKernelBaseDeviceContext, WorkspaceAndContextAreIndependent)
 // ============================================================================
 // Cross-Context Tests
 // ============================================================================
+
+TEST(Test__KernelBaseDeviceContext, ExplicitGPUStreamRejectsNullBeforeKernelBinding)
+{
+    EXPECT_THROW((void)ExplicitGPUStream{nullptr}, std::invalid_argument);
+}
 
 TEST(Test__KernelBaseDeviceContext, MultipleKernelsCanShareContext)
 {
