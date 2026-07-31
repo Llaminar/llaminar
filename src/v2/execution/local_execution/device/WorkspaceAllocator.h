@@ -32,6 +32,44 @@ namespace llaminar2
     class IBackend;
 
     /**
+     * @brief Declares the physical lifetime relationship between GPU graphs.
+     *
+     * GPU graph executables retain raw workspace addresses. The policy therefore
+     * describes both the sizing surface that must be known before capture and
+     * whether another graph may use the same physical bytes.
+     *
+     * A serial device family includes ordinary prefill/decode, MTP sidecars,
+     * grouped verification, accepted-state publication, and decode catch-up on
+     * one device. Producer events order every transition between those graphs,
+     * so their graph-local layouts may alias one primary allocation. Buffers
+     * within one participant never alias each other, and buffers whose contents
+     * survive into a concurrently executable graph require
+     * @ref ExclusiveLifetime.
+     */
+    enum class WorkspaceGraphFamilyPolicy : uint8_t
+    {
+        /**
+         * @brief Storage may overlap other serial participants; size this graph
+         *        from its exact declared rows plus decode/compact regimes.
+         */
+        SerialDeviceFamilyExactParticipant,
+
+        /**
+         * @brief Storage may overlap other serial participants; additionally
+         *        size row-scaled main-forward scratch for the largest bucket.
+         */
+        SerialDeviceFamilyLargestParticipant,
+
+        /**
+         * @brief Storage can remain live while another graph executes.
+         *
+         * Late requirements in this class receive append-only storage. This is
+         * intentionally exceptional and must be selected explicitly.
+         */
+        ExclusiveLifetime,
+    };
+
+    /**
      * @brief Configuration for workspace memory budget calculation
      *
      * Controls how WorkspaceAllocator computes workspace budgets for GPU and CPU
@@ -55,11 +93,53 @@ namespace llaminar2
     struct WorkspaceSizingHints
     {
         int max_seq_len = 4096;
+        /**
+         * @brief Largest row count that any serial forward graph may execute.
+         *
+         * This field is consulted only when @ref graph_family_policy is
+         * `SerialDeviceFamilyLargestParticipant`. It is separate from
+         * `max_seq_len`, which remains the exact shape of the graph currently
+         * being bound.
+         */
+        int serial_family_max_rows = 0;
+        /**
+         * @brief Largest compact decode-equivalent row group in this family.
+         *
+         * Workspace demand is not monotonic in M: a large prefill may select a
+         * GEMM that needs no K-partition partials while M=2..16 selects grouped
+         * GEMV and needs a larger reduction bank. Querying this explicit regime
+         * before the first capture keeps common names address-stable for every
+         * configured MTP depth.
+         */
+        int serial_family_max_compact_rows = 0;
         int n_heads = 0;
         int head_dim = 0;
         int d_model = 0;
         int batch_size = 1;
         int vocab_size = 0;
+        WorkspaceGraphFamilyPolicy graph_family_policy =
+            WorkspaceGraphFamilyPolicy::ExclusiveLifetime;
+    };
+
+    /**
+     * @brief Defines how an explicit workspace consumer interprets its M value.
+     *
+     * Most kernel workspaces use M as graph token rows and must be queried for
+     * each serial participant. Control-plane workspaces can use M for another
+     * dimension, such as request count; substituting prompt or verifier rows in
+     * that case silently changes the declared data structure.
+     */
+    enum class WorkspaceConsumerShapePolicy : uint8_t
+    {
+        /**
+         * @brief Replace M with each prefill/decode/verifier participant's rows.
+         */
+        GraphParticipantRows,
+
+        /**
+         * @brief Preserve the request's explicit M, N, and K for every participant.
+         */
+        FixedDeclaredShape,
     };
 
     /**
@@ -72,6 +152,8 @@ namespace llaminar2
         int m = 4096;
         int n = 0;
         int k = 0;
+        WorkspaceConsumerShapePolicy shape_policy =
+            WorkspaceConsumerShapePolicy::GraphParticipantRows;
     };
 
     /**

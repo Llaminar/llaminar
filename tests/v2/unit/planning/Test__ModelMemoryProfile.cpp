@@ -355,6 +355,19 @@ TEST(Test__ModelMemoryProfile, SerializeDeserialize_RoundTrip_ScalarFields)
     EXPECT_EQ(restored.head_dim, original.head_dim);
     EXPECT_EQ(restored.vocab_size, original.vocab_size);
     EXPECT_EQ(restored.max_seq_len, original.max_seq_len);
+    EXPECT_EQ(restored.mtp_layer_count, original.mtp_layer_count);
+    EXPECT_EQ(
+        restored.full_attention_interval,
+        original.full_attention_interval);
+    EXPECT_EQ(
+        restored.gdn_conv_kernel_size,
+        original.gdn_conv_kernel_size);
+    EXPECT_EQ(restored.gdn_state_size, original.gdn_state_size);
+    EXPECT_EQ(restored.gdn_inner_size, original.gdn_inner_size);
+    EXPECT_EQ(restored.gdn_group_count, original.gdn_group_count);
+    EXPECT_EQ(
+        restored.gdn_time_step_rank,
+        original.gdn_time_step_rank);
     EXPECT_EQ(restored.total_native_bytes, original.total_native_bytes);
 }
 

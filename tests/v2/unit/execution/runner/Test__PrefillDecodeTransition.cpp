@@ -268,11 +268,13 @@ namespace
         bool forwardWithDeviceTokenIds(
             const int *token_shadow,
             const void *token_ids_device,
-            int seq_len) override
+            int seq_len,
+            DeviceTokenForwardPurpose purpose) override
         {
             ++forward_with_device_token_ids_count_;
             last_forward_device_token_ids_ = token_ids_device;
             last_forward_device_token_seq_len_ = seq_len;
+            last_device_token_forward_purpose_ = purpose;
             return token_shadow && token_ids_device && forward(token_shadow, seq_len);
         }
 
@@ -696,8 +698,7 @@ namespace
         bool commitMTPShiftedRowFromDeviceTargetSample(
             int target_sample_slot,
             int already_appended_tokens,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1) override
+            bool allow_speculative_discard = false) override
         {
             ++device_target_shifted_commit_count_;
             if (!supports_mtp_device_draft_token_input_ ||
@@ -715,7 +716,7 @@ namespace
                 token,
                 already_appended_tokens,
                 allow_speculative_discard,
-                position_offset_override);
+                /*position_offset_override=*/-1);
         }
 
         bool hasMTPLogitsLocal() const override
@@ -4411,6 +4412,10 @@ namespace
         }
         const void *lastForwardDeviceTokenIds() const { return last_forward_device_token_ids_; }
         int lastForwardDeviceTokenSeqLen() const { return last_forward_device_token_seq_len_; }
+        DeviceTokenForwardPurpose lastDeviceTokenForwardPurpose() const
+        {
+            return last_device_token_forward_purpose_;
+        }
         const std::array<int32_t, kMockVerifierTokenCapacity>
             &deviceVerifierInputTokens() const
         {
@@ -5901,6 +5906,8 @@ namespace
         int last_prepare_mtp_verifier_draft_token_count_{0};
         int last_prepare_mtp_verifier_total_tokens_{0};
         int last_forward_device_token_seq_len_{0};
+        DeviceTokenForwardPurpose last_device_token_forward_purpose_{
+            DeviceTokenForwardPurpose::GroupedMTPVerifier};
         bool is_first_forward_in_cycle_{true};
         bool mtp_enabled_{false};
         bool accept_mtp_token_{true};
@@ -8129,6 +8136,95 @@ namespace
         EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
         EXPECT_EQ(mock->lastCommitMTPPositionOffsetOverride(), 6);
         EXPECT_THAT(mock->lastCommitMTPTokens(), ElementsAre(4));
+    }
+
+    /**
+     * @brief GPU forced-token injection is one device-owned MTP transaction.
+     *
+     * A bounded-thinking stop sequence is selected by request policy on the
+     * host, but neither shifted-MTP maintenance nor the main graph may consume
+     * that host shadow. Each forced token is published to the persistent target
+     * slot, committed to shifted KV from that slot, and immediately forwarded
+     * through the stable device-token row. Immediate forwarding restores a
+     * ready-logits boundary, allowing every subsequent forced token to follow
+     * the identical transaction without a host-token condition replay.
+     */
+    TEST_F(Test__PrefillDecodeTransition, GPUForceDecodeTokenPublishesAndAdvancesEntirelyFromDeviceToken)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0));
+        mock->enableMTPDeviceDraftTokenInput();
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        EXPECT_EQ(mock->forwardCallCount(), 1);
+
+        const GenerationResult first_forced = runner->forceDecodeToken(2);
+        ASSERT_TRUE(first_forced.success()) << first_forced.error;
+        EXPECT_THAT(first_forced.tokens, ElementsAre(2));
+        EXPECT_EQ(mock->stageStochasticTargetTokenCount(), 1);
+        EXPECT_THAT(mock->lastStagedStochasticTargetTokens(), ElementsAre(2));
+        EXPECT_THAT(mock->lastStagedStochasticTargetSlots(), ElementsAre(0));
+        EXPECT_EQ(mock->deviceTargetShiftedCommitCount(), 1);
+        EXPECT_EQ(mock->lastDeviceTargetShiftedCommitToken(), 2);
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 1);
+        EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 1);
+        EXPECT_EQ(mock->forwardCallCount(), 2);
+        EXPECT_THAT(mock->lastForwardTokens(), ElementsAre(2));
+
+        const GenerationResult second_forced = runner->forceDecodeToken(4);
+        ASSERT_TRUE(second_forced.success()) << second_forced.error;
+        EXPECT_THAT(second_forced.tokens, ElementsAre(4));
+        EXPECT_EQ(mock->stageStochasticTargetTokenCount(), 2);
+        EXPECT_THAT(mock->lastStagedStochasticTargetTokens(), ElementsAre(2, 4));
+        EXPECT_THAT(mock->lastStagedStochasticTargetSlots(), ElementsAre(0, 0));
+        EXPECT_EQ(mock->deviceTargetShiftedCommitCount(), 2);
+        EXPECT_EQ(mock->lastDeviceTargetShiftedCommitToken(), 4);
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 2);
+        EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 2);
+        EXPECT_EQ(mock->forwardCallCount(), 3);
+        EXPECT_THAT(mock->lastForwardTokens(), ElementsAre(4));
+    }
+
+    /**
+     * @brief A forced GPU-MTP stop token is a terminal control outcome.
+     *
+     * Stop tokens are not appended to main or shifted model state because no
+     * subsequent token can consume that state. The dedicated terminal branch
+     * must retire ready logits without falling through the CPU serial path and
+     * without publishing a device scalar that no graph will consume.
+     */
+    TEST_F(Test__PrefillDecodeTransition, GPUForceDecodeStopTokenDoesNotEnterAnyExecutionPath)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0));
+        mock->enableMTPDeviceDraftTokenInput();
+        runner->setStopTokens({2});
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        ASSERT_EQ(mock->forwardCallCount(), 1);
+
+        const GenerationResult forced_stop = runner->forceDecodeToken(2);
+        ASSERT_TRUE(forced_stop.success()) << forced_stop.error;
+        EXPECT_TRUE(forced_stop.is_complete);
+        EXPECT_THAT(forced_stop.tokens, ElementsAre(2));
+        EXPECT_EQ(mock->stageStochasticTargetTokenCount(), 0);
+        EXPECT_EQ(mock->deviceTargetShiftedCommitCount(), 0);
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 0);
+        EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 0);
+        EXPECT_EQ(mock->commitMTPShiftedCount(), 0);
+        EXPECT_EQ(mock->forwardCallCount(), 1);
     }
 
     /**
@@ -14404,11 +14500,66 @@ namespace
             << "GPU shifted MTP publication must consume the persistent target slot.";
         EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 1)
             << "GPU main-state advance must read a device token row.";
+        EXPECT_EQ(
+            mock->lastDeviceTokenForwardPurpose(),
+            DeviceTokenForwardPurpose::MTPCondition)
+            << "Depth-zero state advance must select ordinary condition policy, "
+               "not grouped-verifier append/outcome policy.";
         EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 1)
             << "The direct-emit main input must be materialized from the same target slot.";
         EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1);
         EXPECT_THAT(mock->lastForwardTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+    }
+
+    /**
+     * @brief Preserve scheduler position across a first GPU direct emit.
+     *
+     * The first post-prefill transaction can be clamped to one output token.
+     * That transaction advances the captured main graph but does not produce a
+     * speculative-outcome mailbox.  The next ordinary MTP call must therefore
+     * plan from the validated transaction commit itself, independent of whether
+     * a transient mailbox happened to be published by the preceding path.
+     *
+     * This device-free regression intentionally performs both calls.  A
+     * one-call test cannot observe an accidentally erased scheduler position.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           MTPGpuBudgetClampDirectEmitPublishesPositionForNextVerifier)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false);
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+        mock->enableMTPSidecarPreservesMainState();
+        mock->enableMTPShiftedRowReuseFromSidecar();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->setVerifierAcceptedPrefixScript({1});
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        runner->setDecodeStepTokenBudget(1);
+        const GenerationResult direct = runner->decodeStep();
+        runner->setDecodeStepTokenBudget(0);
+        ASSERT_TRUE(direct.success()) << direct.error;
+        ASSERT_THAT(direct.tokens, SizeIs(1));
+
+        const GenerationResult verifier = runner->decodeStep();
+        ASSERT_TRUE(verifier.success()) << verifier.error;
+        EXPECT_FALSE(verifier.tokens.empty());
+        EXPECT_GT(mock->publishDeviceResidentMTPSpecStateCount(), 0)
+            << "The second call must enter the production grouped verifier, "
+               "not merely survive through another direct-emit path.";
     }
 
     /**

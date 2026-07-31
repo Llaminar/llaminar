@@ -792,14 +792,25 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceTransferDirectorySeparatesActiveAndS
     EXPECT_EQ(capacity.staging_slots, 64u);
     EXPECT_EQ(capacity.total_slots, 144u);
 
+    const auto qwen36_hot_ten_percent =
+        DeviceMoETransferSlotDirectory::planBufferedCapacity(
+            /*requested_active_slots=*/1000,
+            /*transfer_wave_slots=*/2,
+            /*transfer_buffer_count=*/2);
+    EXPECT_EQ(qwen36_hot_ten_percent.active_slots, 1000u);
+    EXPECT_EQ(qwen36_hot_ten_percent.staging_slots, 4u);
+    EXPECT_EQ(qwen36_hot_ten_percent.total_slots, 1004u)
+        << "Qwen3.6's forty routed layers and twenty-five hot replicas per "
+           "participant must not inherit the unrelated 256-expert layer bound";
+
     EXPECT_THROW(
         DeviceMoETransferSlotDirectory::planBufferedCapacity(
-            /*requested_active_slots=*/200,
-            /*transfer_wave_slots=*/32,
-            /*transfer_buffer_count=*/2),
+            /*requested_active_slots=*/
+                static_cast<uint64_t>(kDeviceMoEMaxTransferSlots),
+            /*transfer_wave_slots=*/1,
+            /*transfer_buffer_count=*/1),
         std::invalid_argument)
-        << "An unaddressable directory must fail during graph construction, not "
-           "publish a partial or fallback transfer plan.";
+        << "The signed descriptor slot ABI must reject overflow before graph construction.";
 }
 
 TEST_F(ComputeStagesTest, GEMMStage_EstimatedFlops)

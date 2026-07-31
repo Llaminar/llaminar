@@ -219,6 +219,14 @@ namespace llaminar2
             /// Maximum sequence length
             size_t max_seq_len = 4096;
 
+            /**
+             * @brief Common resident graph-row capacity for every participant.
+             *
+             * LocalTP devices must receive the same value so their captured
+             * buckets and serial graph-family workspaces remain symmetric.
+             */
+            int resident_graph_rows = 0;
+
             /// Batch size for inference
             int batch_size = 1;
 
@@ -451,7 +459,8 @@ namespace llaminar2
         bool forwardWithDeviceTokenIds(
             const int *token_shadow,
             const void *token_ids_device,
-            int seq_len) override;
+            int seq_len,
+            DeviceTokenForwardPurpose purpose) override;
         bool forwardBatchWithDeviceTokenIds(
             const std::vector<std::vector<int>> &token_batches,
             const void *token_ids_device,
@@ -625,8 +634,7 @@ namespace llaminar2
         bool commitMTPShiftedRowFromDeviceTargetSample(
             int target_sample_slot,
             int already_appended_tokens,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1) override;
+            bool allow_speculative_discard = false) override;
         bool commitMTPShiftedRowFromDeviceResidentLogicalState(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_index,

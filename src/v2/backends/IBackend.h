@@ -817,6 +817,40 @@ namespace llaminar2
         }
 
         /**
+         * @brief Publish one host-selected control token into device memory.
+         *
+         * Some request policies, such as a bounded-thinking stop sequence, choose
+         * a token on the host rather than from model logits. GPU execution still
+         * requires that token to acquire a persistent device owner before any
+         * shifted-MTP or main-graph consumer observes it. Implementations launch
+         * a one-thread scalar publication kernel so the scalar is captured in
+         * launch parameters; they must not issue an H2D copy from the caller's
+         * short-lived stack storage.
+         *
+         * This operation performs no allocation, transfer API call, default-stream
+         * work, or synchronization. The caller owns event publication after this
+         * enqueue so every later consumer waits on the exact producer stream.
+         *
+         * @param value Host request-policy scalar to publish.
+         * @param out_value_device Persistent INT32 device destination.
+         * @param device_id Backend-local GPU ordinal.
+         * @param stream Explicit non-null producer stream.
+         * @return true when publication was enqueued successfully.
+         */
+        virtual bool enqueuePublishInt32ControlScalarDevice(
+            int32_t value,
+            void *out_value_device,
+            int device_id,
+            void *stream)
+        {
+            (void)value;
+            (void)out_value_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Enqueue graph-capturable top-k/top-p distribution construction.
          *
          * Writes a compact probability table of length top_k to device buffers.

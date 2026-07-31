@@ -2050,6 +2050,34 @@ namespace llaminar2::test
         EXPECT_NE(ffn_body.find("masked_local_tp_apportioned_decode_runtime_table"),
                   std::string::npos)
             << "Plain homogeneous LocalTP apportioned decode must build masked runtime tables for graph-side rebalance.";
+        const size_t apportioned_table_start =
+            ffn_body.find("const bool masked_local_tp_apportioned_decode_runtime_table");
+        ASSERT_NE(apportioned_table_start, std::string::npos);
+        const size_t apportioned_table_end =
+            ffn_body.find("const bool decode_runtime_table_eligible", apportioned_table_start);
+        ASSERT_NE(apportioned_table_end, std::string::npos);
+        const std::string apportioned_table_policy =
+            ffn_body.substr(
+                apportioned_table_start,
+                apportioned_table_end - apportioned_table_start);
+        EXPECT_NE(
+            apportioned_table_policy.find("local_decode_layer"),
+            std::string::npos)
+            << "Masked apportioned LocalTP decode is a topology contract, not a Dynamic-rebalance capability. "
+               "Static, Dynamic, and LLEP decode must all enter the device-resident runtime table.";
+        EXPECT_NE(
+            apportioned_table_policy.find(
+                "mtp_sidecar_context && total_tokens == 1"),
+            std::string::npos)
+            << "Single-row MTP sidecars share the same masked, device-resident apportioned topology.";
+        EXPECT_NE(
+            apportioned_table_policy.find("device.is_gpu()"),
+            std::string::npos)
+            << "The masked runtime table is the GPU graph-owned route contract.";
+        EXPECT_EQ(
+            apportioned_table_policy.find("device_side_graph_rebalance_candidate"),
+            std::string::npos)
+            << "Static LocalTP must not lose its masked runtime table merely because no rebalance wave is active.";
         EXPECT_NE(ffn_body.find("\"LocalTP expert-ID-apportioned masked GPU decode graph build\""),
                   std::string::npos)
             << "The standard LocalTP path must initialize the same masked runtime-table contract as overlay.";
@@ -6477,6 +6505,28 @@ namespace llaminar2::test
             << "Maintenance must pass launch resources explicitly instead of retargeting inherited state.";
         EXPECT_EQ(maintenance_body.find("synchronizeStream("), std::string::npos)
             << "Steady-state maintenance must remain graph/event ordered.";
+
+        const size_t rocm_rebalance_begin = rocm_source.find(
+            "bool ROCmMoEKernel::runDeviceRebalanceController(");
+        const size_t rocm_rebalance_end = rocm_source.find(
+            "void ROCmMoEKernel::zeroBuffer(",
+            rocm_rebalance_begin);
+        ASSERT_NE(rocm_rebalance_begin, std::string::npos);
+        ASSERT_NE(rocm_rebalance_end, std::string::npos);
+        const std::string rocm_rebalance_body =
+            rocm_source.substr(
+                rocm_rebalance_begin,
+                rocm_rebalance_end - rocm_rebalance_begin);
+        EXPECT_NE(
+            rocm_rebalance_body.find(
+                "static_cast<hipStream_t>(stream)"),
+            std::string::npos)
+            << "ROCm rebalance profiling must use the immutable launch-context stream.";
+        EXPECT_EQ(
+            rocm_rebalance_body.find(
+                "static_cast<hipStream_t>(getStream())"),
+            std::string::npos)
+            << "ROCm rebalance profiling must not consult unrelated mutable kernel stream state.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
@@ -7412,6 +7462,50 @@ namespace llaminar2::test
             controller.find(
                 "refusing to discard the backend error",
                 failed_update),
+            std::string::npos);
+    }
+
+    /**
+     * @brief Keep graph lifecycle attribution attached to physical cache identity.
+     *
+     * Logical MTP operations may reuse one sidecar graph when their typed role,
+     * stable device slots, geometry, and workspace bindings match. Relabeling
+     * the cache on every invocation makes a capture appear under one context
+     * and its replay under another, obscuring whether a real executable exists.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         MTPSidecarCaptureIdentityIsImmutableAcrossLogicalInvocations)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path header_path =
+            root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h";
+        const fs::path source_path =
+            root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
+        ASSERT_TRUE(fs::exists(header_path));
+        ASSERT_TRUE(fs::exists(source_path));
+
+        const std::string header = readFile(header_path);
+        const std::string source = readFile(source_path);
+        EXPECT_NE(header.find("std::string capture_perf_context;"), std::string::npos);
+        EXPECT_NE(
+            source.find(
+                "sidecar_cache.capture_perf_context = sidecar_context;"),
+            std::string::npos);
+        EXPECT_NE(
+            source.find(
+                "sidecar_cache.segment_cache.perf_context =\n"
+                "                    sidecar_cache.capture_perf_context;"),
+            std::string::npos);
+        EXPECT_EQ(
+            source.find(
+                "sidecar_cache.segment_cache.perf_context = sidecar_context;"),
+            std::string::npos)
+            << "A logical invocation context must never relabel an existing physical graph.";
+        EXPECT_NE(source.find("{\"invocation_context\", sidecar_context}"),
+                  std::string::npos);
+        EXPECT_NE(
+            source.find(
+                "{\"graph_context\", sidecar_cache.capture_perf_context}"),
             std::string::npos);
     }
 

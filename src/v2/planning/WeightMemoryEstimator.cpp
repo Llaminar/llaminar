@@ -1,6 +1,8 @@
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/ModelMemoryProfile.h"
+#include "kernels/common/EmbedQ8Block.h"
 #include "tensors/BlockStructures.h"
+#include "tensors/NativeVnniFormatInfo.h"
 
 /**
  * @file WeightMemoryEstimator.cpp
@@ -21,14 +23,6 @@ namespace llaminar2
             const char *quant_type;
             size_t block_bytes;
             size_t block_elements;
-        };
-
-        struct GPUNativeVNNILayout
-        {
-            const char *quant_type;
-            int payload_bytes_per_32;
-            bool is_asymmetric;
-            bool has_emins;
         };
 
         constexpr NativeBlockLayout kNativeBlockLayouts[] = {
@@ -62,36 +56,6 @@ namespace llaminar2
             {"IQ1_M", sizeof(IQ1_MBlock), IQ1_MBlock::BLOCK_SIZE},
         };
 
-        constexpr GPUNativeVNNILayout kGPUNativeVNNILayouts[] = {
-            {"Q4_0", 16, false, false},
-            {"IQ4_NL", 16, false, false},
-            {"Q4_1", 16, true, false},
-            {"Q5_0", 20, false, false},
-            {"Q5_1", 20, true, false},
-            {"Q8_0", 32, false, false},
-            {"Q8_1", 32, false, false},
-            {"Q2_K", 8, true, true},
-            {"Q3_K", 12, true, false},
-            {"Q3_K_S", 12, true, false},
-            {"Q3_K_M", 12, true, false},
-            {"Q3_K_L", 12, true, false},
-            {"Q4_K", 16, true, false},
-            {"Q4_K_S", 16, true, false},
-            {"Q4_K_M", 16, true, false},
-            {"Q5_K", 20, true, false},
-            {"Q5_K_S", 20, true, false},
-            {"Q5_K_M", 20, true, false},
-            {"Q6_K", 24, true, false},
-            {"IQ4_XS", 16, false, false},
-            {"IQ2_XXS", 8, false, false},
-            {"IQ2_XS", 9, true, false},
-            {"IQ3_XXS", 12, false, false},
-            {"IQ2_S", 9, true, false},
-            {"IQ3_S", 13, false, false},
-            {"IQ1_S", 6, true, false},
-            {"IQ1_M", 6, true, false},
-        };
-
         const NativeBlockLayout *findNativeBlockLayout(const std::string &quant_type)
         {
             for (const auto &layout : kNativeBlockLayouts)
@@ -102,19 +66,60 @@ namespace llaminar2
             return nullptr;
         }
 
-        const GPUNativeVNNILayout *findGPUNativeVNNILayout(const std::string &quant_type)
-        {
-            for (const auto &layout : kGPUNativeVNNILayouts)
-            {
-                if (quant_type == layout.quant_type)
-                    return &layout;
-            }
-            return nullptr;
-        }
-
         float blockBytesPerWeight(size_t block_bytes, size_t block_elements)
         {
             return static_cast<float>(block_bytes) / static_cast<float>(block_elements);
+        }
+
+        bool isEmbeddingTensor(const std::string &name)
+        {
+            return name.find("token_embd") != std::string::npos ||
+                   name.find("embed_tokens") != std::string::npos;
+        }
+
+        bool isLMHeadTensor(const std::string &name)
+        {
+            return name == "output.weight" ||
+                   name.find("lm_head") != std::string::npos;
+        }
+
+        bool isQuantizedFormat(const std::string &quant_type)
+        {
+            return quant_type != "F32" &&
+                   quant_type != "F16" &&
+                   quant_type != "FP16" &&
+                   quant_type != "BF16";
+        }
+
+        constexpr size_t kWeightPoolAlignment = 256;
+
+        size_t alignUp(size_t bytes, size_t alignment)
+        {
+            return (bytes + alignment - 1) & ~(alignment - 1);
+        }
+
+        size_t exactGpuPackedMatrixBytes(
+            size_t rows,
+            size_t columns,
+            const NativeVnniFormatInfo &format)
+        {
+            const NativeVnniPackedRegionSizes regions =
+                nativeVnniPackedRegionSizes(rows, columns, format);
+
+            /*
+             * WeightVRAMPool starts every independently-addressable region at
+             * a 256-byte boundary. Rounding each non-empty region gives the
+             * exact aggregate pool contribution except for at most one final
+             * trailing alignment unit, and is deliberately conservative for
+             * preflight admission.
+             */
+            size_t bytes = alignUp(regions.payload_bytes, kWeightPoolAlignment);
+            bytes += alignUp(regions.scales_bytes, kWeightPoolAlignment);
+            if (regions.mins_bytes > 0)
+                bytes += alignUp(regions.mins_bytes, kWeightPoolAlignment);
+            if (regions.emins_bytes > 0)
+                bytes += alignUp(regions.emins_bytes, kWeightPoolAlignment);
+            return bytes;
         }
     } // anonymous namespace
 
@@ -151,16 +156,18 @@ namespace llaminar2
         if (quant_type == "F32")
             return 4.0f;
 
-        if (const auto *layout = findGPUNativeVNNILayout(quant_type))
+        if (const auto *format =
+                native_vnni_formats::forQuantType(quant_type))
         {
-            const int scale_bytes = sizeof(uint16_t);
-            const int min_bytes = layout->is_asymmetric ? static_cast<int>(sizeof(uint16_t)) : 0;
-            const int emin_bytes = layout->has_emins ? static_cast<int>(sizeof(uint32_t)) : 0;
-            return static_cast<float>(layout->payload_bytes_per_32 + scale_bytes + min_bytes + emin_bytes) / 32.0f;
+            const size_t metadata_bytes =
+                sizeof(uint16_t) +
+                (format->is_asymmetric ? sizeof(uint16_t) : 0) +
+                (format->has_emins ? sizeof(uint32_t) : 0);
+            return static_cast<float>(
+                       static_cast<size_t>(format->payload_bytes) +
+                       metadata_bytes) /
+                   32.0f;
         }
-
-        if (quant_type == "Q8_K")
-            return blockBytesPerWeight(sizeof(Q8_KBlock), Q8_KBlock::BLOCK_SIZE);
 
         return getCUDAPackedBytesPerWeight(K);
     }
@@ -219,6 +226,13 @@ namespace llaminar2
         }
 
         WeightEstimate est;
+        const bool has_explicit_lm_head = std::any_of(
+            profile.tensors.begin(),
+            profile.tensors.end(),
+            [](const TensorSizeInfo &tensor)
+            {
+                return isLMHeadTensor(tensor.name);
+            });
 
         for (const auto &t : profile.tensors)
         {
@@ -247,13 +261,72 @@ namespace llaminar2
             size_t device_size;
             if (device.is_gpu())
             {
-                float bytes_per_weight = getGPUPackedBytesPerWeight(t.quant_type, t.K);
-                size_t elements = t.elements;
-                if (total_shards > 1 && isShardedTensor(t.name))
+                if (isEmbeddingTensor(t.name) &&
+                    isQuantizedFormat(t.quant_type) &&
+                    profile.d_model > 0)
                 {
-                    elements = elements / static_cast<size_t>(total_shards);
+                    /*
+                     * GPU embedding lookup consumes the universal EmbedQ8
+                     * representation, not the GEMM-native packed layout.
+                     * A model with tied output weights also needs a separate
+                     * GEMM representation because the LM head performs a
+                     * matrix multiply over the same logical source tensor.
+                     */
+                    const size_t rows =
+                        t.elements /
+                        static_cast<size_t>(profile.d_model);
+                    const size_t blocks_per_row =
+                        (static_cast<size_t>(profile.d_model) + 31) / 32;
+                    device_size =
+                        rows * blocks_per_row * sizeof(EmbedQ8Block);
+                    est.prepared_embedding_bytes += device_size;
+
+                    if (!has_explicit_lm_head)
+                    {
+                        const auto *format =
+                            native_vnni_formats::forQuantType(t.quant_type);
+                        const size_t tied_lm_head_bytes =
+                            format
+                                ? exactGpuPackedMatrixBytes(
+                                      rows,
+                                      static_cast<size_t>(profile.d_model),
+                                      *format)
+                                : static_cast<size_t>(
+                                      static_cast<float>(t.elements) *
+                                      getGPUPackedBytesPerWeight(
+                                          t.quant_type,
+                                          static_cast<size_t>(
+                                              profile.d_model)));
+                        device_size += tied_lm_head_bytes;
+                        est.tied_lm_head_bytes += tied_lm_head_bytes;
+                    }
                 }
-                device_size = static_cast<size_t>(static_cast<float>(elements) * bytes_per_weight);
+                else
+                {
+                    size_t elements = t.elements;
+                    if (total_shards > 1 && isShardedTensor(t.name))
+                    {
+                        elements =
+                            elements / static_cast<size_t>(total_shards);
+                    }
+
+                    if (const auto *format =
+                            native_vnni_formats::forQuantType(t.quant_type);
+                        format && t.K > 0)
+                    {
+                        const size_t rows = elements / t.K;
+                        device_size =
+                            exactGpuPackedMatrixBytes(rows, t.K, *format);
+                    }
+                    else
+                    {
+                        const float bytes_per_weight =
+                            getGPUPackedBytesPerWeight(t.quant_type, t.K);
+                        device_size = static_cast<size_t>(
+                            static_cast<float>(elements) *
+                            bytes_per_weight);
+                    }
+                }
             }
             else
             {

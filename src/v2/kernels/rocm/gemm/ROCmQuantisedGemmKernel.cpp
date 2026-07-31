@@ -296,7 +296,7 @@ namespace llaminar2
             // Supports all native-VNNI formats via codebook_id.
             // Output is FP32 with scale_A applied inline — no separate epilogue needed.
             // Halved HBM bandwidth vs INT8 GEMM (4.5 bpw vs 8 bpw for Q4_0/IQ4_NL).
-            // Defined in ROCmQuantisedGemmKernel_native_VNNI.hip
+            // Public dispatcher for the physically sharded NativeVNNI GEMM TUs.
             bool rocmGemm_native_vnni_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,

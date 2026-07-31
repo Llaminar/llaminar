@@ -64,6 +64,22 @@ namespace llaminar2
     };
 
     /**
+     * @brief Semantic owner of one concrete forward-graph invocation.
+     *
+     * Shape and output selection do not identify graph purpose. In particular,
+     * request-batched prefill and a grouped MTP verifier may both request
+     * all-position logits. This role travels through the execution engine and
+     * returns in @ref ForwardExecutionProvenance so consumers can validate the
+     * producer they actually require.
+     */
+    enum class ForwardExecutionRole : uint8_t
+    {
+        MainInference,      ///< User-visible prefill or serial decode.
+        GroupedMTPVerifier, ///< Main-model verification of speculative rows.
+        MTPCondition,       ///< One live main-model condition row per request.
+    };
+
+    /**
      * @brief Generic forward pass input
      *
      * Contains all fields needed for forward pass execution including
@@ -104,6 +120,8 @@ namespace llaminar2
          * unambiguous source of truth.
          */
         ForwardPositionPolicy position_policy = ForwardPositionPolicy::ExplicitRows;
+        ForwardExecutionRole execution_role =
+            ForwardExecutionRole::MainInference; ///< Semantic owner of this invocation.
         int batch_size = 1;                ///< Number of sequences
         int seq_len = 0;                   ///< Sequence length per batch
         /**
@@ -228,8 +246,10 @@ namespace llaminar2
         bool valid = false;                    ///< True only after successful graph execution.
         DeviceId device = DeviceId::invalid(); ///< Device that owns the produced output.
         void *stream = nullptr;                ///< Exact GPU producer stream; null for CPU.
+        ForwardExecutionRole execution_role =
+            ForwardExecutionRole::MainInference; ///< Typed purpose copied from ForwardInput.
         bool is_decode = false;                ///< Whether decode semantics selected this graph.
-        bool all_position_logits = false;      ///< Whether this was a grouped verifier graph.
+        bool all_position_logits = false;      ///< Whether this invocation produced all-position logits.
         int graph_seq_len = 0;                 ///< Captured graph rows per request, including prefill bucketing.
         int graph_batch_size = 0;              ///< Captured graph request count.
     };

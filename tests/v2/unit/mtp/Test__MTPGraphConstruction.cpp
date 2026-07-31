@@ -747,76 +747,124 @@ namespace
         config.gdn.time_step_rank = 2;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 2;
+        config.grouped_mtp_verifier = true;
         config.compute_all_position_logits = true;
         return config;
     }
 
-    LayerWeights tinyQwen35GDNLayerWeights(const GraphConfig &config)
+    /**
+     * @brief Own a complete tiny GDN layer for graph-construction tests.
+     *
+     * LayerWeights is a non-owning bundle of tensor pointers. Keeping ownership
+     * in a named fixture makes the lifetime visible at each call site and lets
+     * several independently constructed graphs coexist. The previous helper
+     * hid tensors in a function-static vector that it cleared on the next call,
+     * leaving already-built graphs with dangling weight pointers.
+     */
+    struct TinyQwen35GDNLayerFixture
     {
-        const size_t d = static_cast<size_t>(config.d_model);
-        const size_t qkv_dim = 48;
-        const size_t value_dim = static_cast<size_t>(config.gdn.inner_size);
-        const size_t value_heads = static_cast<size_t>(config.gdn.time_step_rank);
-        const size_t kernel = static_cast<size_t>(config.gdn.conv_kernel_size);
-
-        static std::vector<std::unique_ptr<FP32Tensor>> owned;
-        owned.clear();
-        auto tensor = [](std::vector<size_t> shape, int seed) -> FP32Tensor *
+        explicit TinyQwen35GDNLayerFixture(const GraphConfig &config)
         {
-            owned.push_back(TestTensorFactory::createFP32Random(
+            const size_t d = static_cast<size_t>(config.d_model);
+            const size_t qkv_dim = 48;
+            const size_t value_dim =
+                static_cast<size_t>(config.gdn.inner_size);
+            const size_t value_heads =
+                static_cast<size_t>(config.gdn.time_step_rank);
+            const size_t kernel =
+                static_cast<size_t>(config.gdn.conv_kernel_size);
+
+            layer.attn_norm = makeOnes({d});
+            layer.attn_qkv = makeRandom({qkv_dim, d}, 301);
+            layer.attn_gate = makeRandom({value_dim, d}, 302);
+            layer.ssm_alpha = makeRandom({value_heads, d}, 303);
+            layer.ssm_beta = makeRandom({value_heads, d}, 304);
+            layer.ssm_conv1d = makeRandom({kernel, qkv_dim}, 305);
+            layer.ssm_dt_bias = makeRandom({value_heads}, 306);
+            layer.ssm_a = makeRandom({value_heads}, 307);
+            layer.ssm_norm =
+                makeOnes({static_cast<size_t>(config.gdn.state_size)});
+            layer.ssm_out = makeRandom({d, value_dim}, 308);
+        }
+
+        TinyQwen35GDNLayerFixture(const TinyQwen35GDNLayerFixture &) = delete;
+        TinyQwen35GDNLayerFixture &operator=(
+            const TinyQwen35GDNLayerFixture &) = delete;
+
+        LayerWeights layer;
+
+    private:
+        FP32Tensor *makeRandom(std::vector<size_t> shape, int seed)
+        {
+            owned_.push_back(TestTensorFactory::createFP32Random(
                 shape,
                 -0.02f,
                 0.02f,
                 seed));
-            return owned.back().get();
-        };
-        auto ones = [](std::vector<size_t> shape) -> FP32Tensor *
+            return owned_.back().get();
+        }
+
+        FP32Tensor *makeOnes(std::vector<size_t> shape)
         {
-            owned.push_back(TestTensorFactory::createFP32Ones(shape));
-            return owned.back().get();
-        };
+            owned_.push_back(TestTensorFactory::createFP32Ones(shape));
+            return owned_.back().get();
+        }
 
-        LayerWeights layer;
-        layer.attn_norm = ones({d});
-        layer.attn_qkv = tensor({qkv_dim, d}, 301);
-        layer.attn_gate = tensor({value_dim, d}, 302);
-        layer.ssm_alpha = tensor({value_heads, d}, 303);
-        layer.ssm_beta = tensor({value_heads, d}, 304);
-        layer.ssm_conv1d = tensor({kernel, qkv_dim}, 305);
-        layer.ssm_dt_bias = tensor({value_heads}, 306);
-        layer.ssm_a = tensor({value_heads}, 307);
-        layer.ssm_norm = ones({static_cast<size_t>(config.gdn.state_size)});
-        layer.ssm_out = tensor({d, value_dim}, 308);
-        return layer;
-    }
+        std::vector<std::unique_ptr<FP32Tensor>> owned_;
+    };
 
-    ActivationBuffers tinyQwen35GDNActivationBuffers(const GraphConfig &config, int total_tokens)
+    /**
+     * @brief Own one tiny GDN activation set for the lifetime of its graph.
+     *
+     * ActivationBuffers is also non-owning. A separate fixture per graph role
+     * prevents main-prefill and grouped-verifier construction from invalidating
+     * one another and models the production arena rule that concurrently live
+     * graph roles retain stable bindings.
+     */
+    struct TinyQwen35GDNActivationFixture
     {
-        const size_t rows = static_cast<size_t>(total_tokens);
-        const size_t d = static_cast<size_t>(config.d_model);
-        const size_t qkv_dim = 48;
-        const size_t value_dim = static_cast<size_t>(config.gdn.inner_size);
-        const size_t value_heads = static_cast<size_t>(config.gdn.time_step_rank);
-
-        static std::vector<std::unique_ptr<FP32Tensor>> owned;
-        owned.clear();
-        auto buffer = [](std::vector<size_t> shape) -> FP32Tensor *
+        TinyQwen35GDNActivationFixture(
+            const GraphConfig &config,
+            int total_tokens)
         {
-            owned.push_back(TestTensorFactory::createFP32(shape));
-            return owned.back().get();
-        };
+            const size_t rows = static_cast<size_t>(total_tokens);
+            const size_t d = static_cast<size_t>(config.d_model);
+            const size_t qkv_dim = 48;
+            const size_t value_dim =
+                static_cast<size_t>(config.gdn.inner_size);
+            const size_t value_heads =
+                static_cast<size_t>(config.gdn.time_step_rank);
+
+            buffers.current_hidden = makeBuffer({rows, d});
+            buffers.normalized = makeBuffer({rows, d});
+            buffers.attn_output = makeBuffer({rows, value_dim});
+            buffers.attn_proj = makeBuffer({rows, d});
+            buffers.extensions[BufferId::GDN_QKV] =
+                makeBuffer({rows, qkv_dim});
+            buffers.extensions[BufferId::GDN_Z] =
+                makeBuffer({rows, value_dim});
+            buffers.extensions[BufferId::GDN_ALPHA] =
+                makeBuffer({rows, value_heads});
+            buffers.extensions[BufferId::GDN_BETA] =
+                makeBuffer({rows, value_heads});
+        }
+
+        TinyQwen35GDNActivationFixture(
+            const TinyQwen35GDNActivationFixture &) = delete;
+        TinyQwen35GDNActivationFixture &operator=(
+            const TinyQwen35GDNActivationFixture &) = delete;
 
         ActivationBuffers buffers;
-        buffers.current_hidden = buffer({rows, d});
-        buffers.normalized = buffer({rows, d});
-        buffers.attn_output = buffer({rows, value_dim});
-        buffers.attn_proj = buffer({rows, d});
-        buffers.extensions[BufferId::GDN_QKV] = buffer({rows, qkv_dim});
-        buffers.extensions[BufferId::GDN_Z] = buffer({rows, value_dim});
-        buffers.extensions[BufferId::GDN_ALPHA] = buffer({rows, value_heads});
-        buffers.extensions[BufferId::GDN_BETA] = buffer({rows, value_heads});
-        return buffers;
-    }
+
+    private:
+        FP32Tensor *makeBuffer(std::vector<size_t> shape)
+        {
+            owned_.push_back(TestTensorFactory::createFP32(shape));
+            return owned_.back().get();
+        }
+
+        std::vector<std::unique_ptr<FP32Tensor>> owned_;
+    };
 
     template <typename StageType>
     const StageType *firstStageOfType(const ComputeGraph &graph)
@@ -2695,8 +2743,12 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
         DeviceId::cpu());
 
     Qwen35Graph graph_builder(config, mpi);
-    LayerWeights layer = tinyQwen35GDNLayerWeights(config);
-    ActivationBuffers buffers = tinyQwen35GDNActivationBuffers(config, /*total_tokens=*/2);
+    TinyQwen35GDNLayerFixture layer_fixture(config);
+    TinyQwen35GDNActivationFixture activation_fixture(
+        config,
+        /*total_tokens=*/2);
+    LayerWeights &layer = layer_fixture.layer;
+    ActivationBuffers &buffers = activation_fixture.buffers;
 
     ComputeGraph graph = graph_builder.buildAttentionGraph(
         layer,
@@ -2717,7 +2769,10 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
         << "Batched verifier graphs must request speculative state slots for every flattened request row";
     const WorkspaceRequirements short_conv_reqs =
         short_conv->getWorkspaceRequirements(/*m=*/2);
-    EXPECT_NE(short_conv_reqs.find("gdn_shortconv_speculative_state_slots_layer0"), nullptr)
+    EXPECT_NE(
+        short_conv_reqs.find(
+            "gdn_shortconv_speculative_state_slots_grouped_mtp_verifier_layer0"),
+        nullptr)
         << "CUDA verifier GDN graphs must snapshot short-conv state rows for cheap MTP rollback";
 
     const auto *recurrence_node = graph.getNode("layer0_gdn_recurrence");
@@ -2728,7 +2783,10 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
         << "Batched verifier graphs must request speculative state slots for every flattened request row";
     const WorkspaceRequirements recurrence_reqs =
         recurrence->getWorkspaceRequirements(/*m=*/2);
-    EXPECT_NE(recurrence_reqs.find("gdn_speculative_state_slots_layer0"), nullptr)
+    EXPECT_NE(
+        recurrence_reqs.find(
+            "gdn_speculative_state_slots_grouped_mtp_verifier_layer0"),
+        nullptr)
         << "CUDA verifier GDN graphs must snapshot recurrence state rows for cheap MTP rollback";
 }
 
@@ -2747,7 +2805,8 @@ TEST(Test__MTPGraphConstruction, CUDAGDNMutableScratchIsGraphRoleOwned)
     auto mpi = std::make_shared<MockMPIContext>(0, 1);
     GraphConfig main_config = tinyQwen35GDNConfig(DeviceId::cuda(0));
     main_config.mtp.draft_tokens = 2;
-    main_config.compute_all_position_logits = false;
+    main_config.grouped_mtp_verifier = false;
+    main_config.compute_all_position_logits = true;
 
     GraphConfig verifier_config = main_config;
     verifier_config.grouped_mtp_verifier = true;
@@ -2763,11 +2822,17 @@ TEST(Test__MTPGraphConstruction, CUDAGDNMutableScratchIsGraphRoleOwned)
         main_config.head_dim,
         DeviceId::cpu());
 
-    LayerWeights layer = tinyQwen35GDNLayerWeights(main_config);
-    ActivationBuffers main_buffers =
-        tinyQwen35GDNActivationBuffers(main_config, /*total_tokens=*/4);
-    ActivationBuffers verifier_buffers =
-        tinyQwen35GDNActivationBuffers(verifier_config, /*total_tokens=*/4);
+    TinyQwen35GDNLayerFixture layer_fixture(main_config);
+    TinyQwen35GDNActivationFixture main_activation_fixture(
+        main_config,
+        /*total_tokens=*/4);
+    TinyQwen35GDNActivationFixture verifier_activation_fixture(
+        verifier_config,
+        /*total_tokens=*/4);
+    LayerWeights &layer = layer_fixture.layer;
+    ActivationBuffers &main_buffers = main_activation_fixture.buffers;
+    ActivationBuffers &verifier_buffers =
+        verifier_activation_fixture.buffers;
 
     Qwen35Graph main_builder(main_config, mpi);
     ComputeGraph main_graph = main_builder.buildAttentionGraph(
@@ -2793,18 +2858,36 @@ TEST(Test__MTPGraphConstruction, CUDAGDNMutableScratchIsGraphRoleOwned)
         DeviceId::cuda(0),
         /*sequence_lengths=*/nullptr);
 
+    const auto *main_conv_node = main_graph.getNode("layer0_short_conv");
+    const auto *verifier_conv_node =
+        verifier_graph.getNode("layer0_short_conv");
+    const auto *main_recurrence_node =
+        main_graph.getNode("layer0_gdn_recurrence");
+    const auto *verifier_recurrence_node =
+        verifier_graph.getNode("layer0_gdn_recurrence");
+    ASSERT_NE(main_conv_node, nullptr);
+    ASSERT_NE(verifier_conv_node, nullptr);
+    ASSERT_NE(main_recurrence_node, nullptr);
+    ASSERT_NE(verifier_recurrence_node, nullptr);
     const auto *main_conv = dynamic_cast<const ShortConv1dStage *>(
-        main_graph.getNode("layer0_short_conv")->stage.get());
+        main_conv_node->stage.get());
     const auto *verifier_conv = dynamic_cast<const ShortConv1dStage *>(
-        verifier_graph.getNode("layer0_short_conv")->stage.get());
+        verifier_conv_node->stage.get());
     const auto *main_recurrence = dynamic_cast<const GDNRecurrenceStage *>(
-        main_graph.getNode("layer0_gdn_recurrence")->stage.get());
-    const auto *verifier_recurrence = dynamic_cast<const GDNRecurrenceStage *>(
-        verifier_graph.getNode("layer0_gdn_recurrence")->stage.get());
+        main_recurrence_node->stage.get());
+    const auto *verifier_recurrence =
+        dynamic_cast<const GDNRecurrenceStage *>(
+            verifier_recurrence_node->stage.get());
     ASSERT_NE(main_conv, nullptr);
     ASSERT_NE(verifier_conv, nullptr);
     ASSERT_NE(main_recurrence, nullptr);
     ASSERT_NE(verifier_recurrence, nullptr);
+    EXPECT_EQ(main_conv->getParams().speculative_state_slot_rows, 0)
+        << "All-position main prefill must not allocate grouped-verifier rollback slots.";
+    EXPECT_EQ(main_recurrence->getParams().speculative_state_slot_rows, 0)
+        << "Output policy must not imply speculative GDN state ownership.";
+    EXPECT_GT(verifier_conv->getParams().speculative_state_slot_rows, 0);
+    EXPECT_GT(verifier_recurrence->getParams().speculative_state_slot_rows, 0);
 
     const WorkspaceRequirements main_conv_reqs =
         main_conv->getWorkspaceRequirements(/*m=*/4);
@@ -2844,6 +2927,11 @@ TEST(Test__MTPGraphConstruction, CUDAGDNMutableScratchIsGraphRoleOwned)
             "gdn_shortconv_inplace_scratch_grouped_mtp_verifier"),
         nullptr)
         << "Serialized layers in one graph role must reuse one economical scratch allocation.";
+    EXPECT_NE(
+        second_conv.getWorkspaceRequirements(/*m=*/4).find(
+            "gdn_shortconv_speculative_state_work_grouped_mtp_verifier"),
+        nullptr)
+        << "Temporary short-conv verifier work must be shared across serialized layers.";
 
     GDNRecurrenceStage::Params second_recurrence_params =
         verifier_recurrence->getParams();
@@ -2854,6 +2942,11 @@ TEST(Test__MTPGraphConstruction, CUDAGDNMutableScratchIsGraphRoleOwned)
             "gdn_deinterleave_scratch_grouped_mtp_verifier"),
         nullptr)
         << "Serialized layers in one graph role must reuse one economical scratch allocation.";
+    EXPECT_NE(
+        second_recurrence.getWorkspaceRequirements(/*m=*/4).find(
+            "gdn_speculative_state_work_grouped_mtp_verifier"),
+        nullptr)
+        << "Temporary recurrence verifier work must be shared across serialized layers.";
 }
 
 TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresRequestBatchedStateCaptureWorkspace)
@@ -2866,7 +2959,7 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresRequestBatchedState
     const int request_seq_len = 2;
     const int total_tokens = request_count * request_seq_len;
     const int expected_capture_rows =
-        resolveMTPMaxTargetQueryRows(config.mtp) * request_count;
+        resolveMTPMaxTargetQueryRows(config.mtp);
 
     CPUHybridRingKVCacheFP32 cache(
         tinyGDNHybridConfig(),
@@ -2879,8 +2972,12 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresRequestBatchedState
         DeviceId::cpu());
 
     Qwen35Graph graph_builder(config, mpi);
-    LayerWeights layer = tinyQwen35GDNLayerWeights(config);
-    ActivationBuffers buffers = tinyQwen35GDNActivationBuffers(config, total_tokens);
+    TinyQwen35GDNLayerFixture layer_fixture(config);
+    TinyQwen35GDNActivationFixture activation_fixture(
+        config,
+        total_tokens);
+    LayerWeights &layer = layer_fixture.layer;
+    ActivationBuffers &buffers = activation_fixture.buffers;
 
     ComputeGraph graph = graph_builder.buildAttentionGraph(
         layer,
@@ -2901,15 +2998,17 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresRequestBatchedState
     EXPECT_EQ(short_conv->getParams().request_seq_len, request_seq_len);
     EXPECT_EQ(short_conv->getParams().seq_len, total_tokens);
     EXPECT_EQ(short_conv->getParams().speculative_state_slot_rows, expected_capture_rows)
-        << "Request-batched verifier graphs use flat [request,row] snapshot slots.";
+        << "Configured target-row capacity is already flattened across every request.";
 
     const WorkspaceRequirements short_conv_reqs =
         short_conv->getWorkspaceRequirements(total_tokens);
     const WorkspaceDescriptor *short_conv_slots =
-        short_conv_reqs.find("gdn_shortconv_speculative_state_slots_layer0");
+        short_conv_reqs.find(
+            "gdn_shortconv_speculative_state_slots_grouped_mtp_verifier_layer0");
     ASSERT_NE(short_conv_slots, nullptr);
     const WorkspaceDescriptor *short_conv_work =
-        short_conv_reqs.find("gdn_shortconv_speculative_state_work_layer0");
+        short_conv_reqs.find(
+            "gdn_shortconv_speculative_state_work_grouped_mtp_verifier");
     ASSERT_NE(short_conv_work, nullptr);
     const size_t short_conv_state_floats =
         static_cast<size_t>(short_conv->getParams().channels) *
@@ -2922,7 +3021,8 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresRequestBatchedState
     const WorkspaceRequirements short_conv_dynamic_reqs =
         short_conv->getWorkspaceRequirements(request_seq_len);
     const WorkspaceDescriptor *short_conv_dynamic_scratch =
-        short_conv_dynamic_reqs.find(ShortConv1dStage::WS_INPLACE_PREFILL_SCRATCH);
+        short_conv_dynamic_reqs.find(
+            "gdn_shortconv_inplace_scratch_grouped_mtp_verifier");
     ASSERT_NE(short_conv_dynamic_scratch, nullptr);
     EXPECT_GE(short_conv_dynamic_scratch->size_bytes,
               static_cast<size_t>(total_tokens) *
@@ -2938,15 +3038,17 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresRequestBatchedState
     EXPECT_EQ(recurrence->getParams().request_seq_len, request_seq_len);
     EXPECT_EQ(recurrence->getParams().seq_len, total_tokens);
     EXPECT_EQ(recurrence->getParams().speculative_state_slot_rows, expected_capture_rows)
-        << "Request-batched verifier graphs use flat [request,row] snapshot slots.";
+        << "Configured target-row capacity must not be multiplied by live batch again.";
 
     const WorkspaceRequirements recurrence_reqs =
         recurrence->getWorkspaceRequirements(total_tokens);
     const WorkspaceDescriptor *recurrence_slots =
-        recurrence_reqs.find("gdn_speculative_state_slots_layer0");
+        recurrence_reqs.find(
+            "gdn_speculative_state_slots_grouped_mtp_verifier_layer0");
     ASSERT_NE(recurrence_slots, nullptr);
     const WorkspaceDescriptor *recurrence_work =
-        recurrence_reqs.find("gdn_speculative_state_work_layer0");
+        recurrence_reqs.find(
+            "gdn_speculative_state_work_grouped_mtp_verifier");
     ASSERT_NE(recurrence_work, nullptr);
     const size_t recurrence_state_floats =
         static_cast<size_t>(recurrence->getParams().n_heads) *
@@ -2959,9 +3061,11 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresRequestBatchedState
     const WorkspaceRequirements recurrence_dynamic_reqs =
         recurrence->getWorkspaceRequirements(request_seq_len);
     const WorkspaceDescriptor *recurrence_full_scratch =
-        recurrence_reqs.find(GDNRecurrenceStage::WS_DEINTERLEAVE_SCRATCH);
+        recurrence_reqs.find(
+            "gdn_deinterleave_scratch_grouped_mtp_verifier");
     const WorkspaceDescriptor *recurrence_dynamic_scratch =
-        recurrence_dynamic_reqs.find(GDNRecurrenceStage::WS_DEINTERLEAVE_SCRATCH);
+        recurrence_dynamic_reqs.find(
+            "gdn_deinterleave_scratch_grouped_mtp_verifier");
     ASSERT_NE(recurrence_full_scratch, nullptr);
     ASSERT_NE(recurrence_dynamic_scratch, nullptr);
     EXPECT_EQ(recurrence_dynamic_scratch->size_bytes,
@@ -3418,6 +3522,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
             {"context", "mtp_decode_sidecar"},
             {"depth", "0"},
             {"device_tokens", "false"},
+            {"graph_context", "mtp_decode_sidecar"},
             {"kv_cache_only", "false"},
             {"path", "plain_after_build"},
             {"seq_len", "1"}};
@@ -3426,6 +3531,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
             {"context", "mtp_decode_sidecar"},
             {"depth", "0"},
             {"device_tokens", "false"},
+            {"graph_context", "mtp_decode_sidecar"},
             {"kv_cache_only", "false"},
             {"path", "plain"},
             {"seq_len", "1"}};
@@ -3541,6 +3647,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
             {"context", "mtp_decode_sidecar"},
             {"depth", "0"},
             {"device_tokens", "false"},
+            {"graph_context", "mtp_decode_sidecar"},
             {"kv_cache_only", "false"},
             {"path", "plain_after_build"},
             {"seq_len", "1"}};
@@ -3549,6 +3656,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
             {"context", "mtp_decode_sidecar"},
             {"depth", "0"},
             {"device_tokens", "false"},
+            {"graph_context", "mtp_decode_sidecar"},
             {"kv_cache_only", "false"},
             {"path", "plain"},
             {"seq_len", "1"}};
@@ -3858,6 +3966,7 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeFullGraphRep
         {"context", "mtp_decode_sidecar"},
         {"depth", "0"},
         {"device_tokens", "false"},
+        {"graph_context", "mtp_decode_sidecar"},
         {"kv_cache_only", "false"},
         {"path", "plain_after_build"},
         {"seq_len", "1"}};
@@ -3865,6 +3974,7 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeFullGraphRep
         {"context", "mtp_decode_sidecar"},
         {"depth", "0"},
         {"device_tokens", "false"},
+        {"graph_context", "mtp_decode_sidecar"},
         {"kv_cache_only", "false"},
         {"path", "full_graph"},
         {"seq_len", "1"}};
@@ -3893,6 +4003,7 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeFullGraphRep
         {"defer_final_sync", "false"},
         {"force_recapture", "false"},
         {"has_collectives", "false"},
+        {"invocation_context", "mtp_decode_sidecar"},
         {"seq_len", "1"}};
     const PerfStatRecord *policy_record = findMTPRecord(
         records,
@@ -3981,6 +4092,7 @@ TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFro
             {"context", context},
             {"depth", "0"},
             {"device_tokens", device_tokens},
+            {"graph_context", context},
             {"kv_cache_only", "false"},
             {"path", path},
             {"seq_len", "1"}};
@@ -4137,6 +4249,7 @@ TEST(Test__MTPGraphConstruction, GPUShiftedPrefillSidecarPolicyUsesShiftedPrefil
         {"defer_final_sync", "false"},
         {"force_recapture", "false"},
         {"has_collectives", "false"},
+        {"invocation_context", "mtp_shifted_prefill"},
         {"seq_len", "4"}};
     const PerfStatRecord *policy_record = findMTPRecord(
         records,

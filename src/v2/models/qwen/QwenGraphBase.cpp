@@ -3767,9 +3767,17 @@ namespace llaminar2
              * Binding those absolute lengths as append counts makes the
              * capture guard reject every value greater than `seq_len`, turning
              * the condition append into a silent zero-row operation.
+             *
+             * Grouped verifier ownership is equally explicit. Compact
+             * request-batch prefill also enables all-position logits so it can
+             * select one terminal row per request; that output policy does not
+             * make its cache mutation speculative. Inferring append semantics
+             * from `compute_all_position_logits` would append every padded row
+             * and corrupt every request shorter than the physical graph width.
              */
             const int32_t *kv_append_lengths_device =
-                config_.live_mtp_request_batch_condition
+                config_.live_mtp_request_batch_condition ||
+                        config_.grouped_mtp_verifier
                     ? nullptr
                     : request_sequence_lengths_device;
             const bool phase_split_handoff =
@@ -3876,8 +3884,7 @@ namespace llaminar2
                               .batch_size = batch_size,
                               .seq_len = seq_len,
                               .append_semantics =
-                                  config_.compute_all_position_logits &&
-                                          seq_len >= 2
+                                  config_.grouped_mtp_verifier
                                       ? KVCacheAppendSemantics::DecodeEquivalentVerifier
                                       : KVCacheAppendSemantics::Standard,
                               .request_sequence_lengths_device =

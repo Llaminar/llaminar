@@ -40,6 +40,25 @@ namespace llaminar2
         return normalized;
     }
 
+    std::vector<int> prefillGraphBucketsAtOrBelowCapacity(
+        const std::vector<int> &buckets,
+        int resident_graph_rows)
+    {
+        if (resident_graph_rows <= 0)
+            return normalizePrefillGraphBuckets(buckets);
+
+        std::vector<int> bounded;
+        for (int bucket : normalizePrefillGraphBuckets(buckets))
+        {
+            if (bucket <= resident_graph_rows)
+                bounded.push_back(bucket);
+        }
+        bounded.push_back(resident_graph_rows);
+        std::sort(bounded.begin(), bounded.end());
+        bounded.erase(std::unique(bounded.begin(), bounded.end()), bounded.end());
+        return bounded;
+    }
+
     PrefillBucketSelection selectPrefillGraphBucket(
         int real_seq_len,
         const std::vector<int> &bucket_sizes)

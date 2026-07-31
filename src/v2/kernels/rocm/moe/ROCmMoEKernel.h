@@ -349,7 +349,9 @@ namespace llaminar2
             DeviceMoERebalanceCommandBufferHeader *command_header = nullptr,
             DeviceMoERebalanceWaveState *wave_state = nullptr,
             DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
-            uint32_t command_buffer_count = 1) override;
+            uint32_t command_buffer_count = 1,
+            const DeviceMoEExpertDirectoryEntry *local_transfer_slots = nullptr,
+            uint32_t local_transfer_slot_count = 0) override;
 
         bool packDeviceRebalanceHistograms(
             const MoEKernelLaunchContext &launch,

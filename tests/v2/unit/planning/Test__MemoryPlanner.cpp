@@ -90,6 +90,40 @@ namespace
         return p;
     }
 
+    ModelMemoryProfile createQwen36HybridMTPStateProfile()
+    {
+        ModelMemoryProfile profile;
+        profile.architecture = "qwen3.6";
+        profile.n_layers = 65;
+        profile.mtp_layer_count = 1;
+        profile.d_model = 5120;
+        profile.d_ff = 27648;
+        profile.n_heads = 40;
+        profile.n_kv_heads = 8;
+        profile.head_dim = 128;
+        profile.vocab_size = 248320;
+        profile.max_seq_len = 4096;
+        profile.full_attention_interval = 4;
+        profile.gdn_conv_kernel_size = 4;
+        profile.gdn_state_size = 128;
+        profile.gdn_inner_size = 6144;
+        profile.gdn_group_count = 16;
+        profile.gdn_time_step_rank = 48;
+
+        for (int layer = 0; layer < profile.n_layers; ++layer)
+        {
+            TensorSizeInfo attention_marker;
+            attention_marker.name =
+                "blk." + std::to_string(layer) +
+                (layer >= 64 || (layer + 1) % 4 == 0
+                     ? ".attn_q.weight"
+                     : ".attn_qkv.weight");
+            attention_marker.layer_index = layer;
+            profile.tensors.push_back(std::move(attention_marker));
+        }
+        return profile;
+    }
+
 } // anonymous namespace
 
 TEST(Test__MemoryPlanner, SingleGPU_Fits)
@@ -136,8 +170,109 @@ TEST(Test__MemoryPlanner, Qwen36DenseLike_UsesTerminalLogitsAndPreparedEmbedding
     EXPECT_TRUE(device_plan.fits()) << plan.renderTable();
     EXPECT_LT(device_plan.activation_bytes, 2ULL * GiB)
         << "normal prefill must not reserve full-context all-position logits";
-    EXPECT_EQ(device_plan.workspace_bytes, 768ULL * 1024ULL * 1024ULL)
-        << "prepared embedding runs must not reserve vocab-by-hidden fallback workspace";
+    EXPECT_GT(device_plan.workspace_bytes, 768ULL * 1024ULL * 1024ULL)
+        << "large grouped-prefill accumulators must exceed the minimum floor";
+    EXPECT_LT(
+        device_plan.workspace_bytes,
+        size_t{151936} * size_t{5120} * sizeof(float))
+        << "prepared embedding must not reserve a vocab-by-hidden fallback table";
+}
+
+TEST(Test__MemoryPlanner, Qwen36HybridMTP_AccountsExactKVAndPersistentState)
+{
+    auto profile = createQwen36HybridMTPStateProfile();
+
+    DevicePlanConfig cfg;
+    cfg.device = DeviceId::cuda(0);
+    cfg.device_total_bytes = 24ULL * 1024ULL * 1024ULL * 1024ULL;
+    cfg.device_free_bytes = cfg.device_total_bytes;
+    cfg.batch_size = 1;
+    cfg.max_seq_len = 4096;
+    cfg.kv_precision = "fp16";
+    cfg.mtp_enabled = true;
+
+    const auto plan = MemoryPlanner::plan(profile, {cfg});
+    ASSERT_EQ(plan.devices.size(), 1u);
+    const auto &device = plan.devices.front();
+
+    constexpr size_t expected_main_gdn_payload =
+        156893184ULL;
+    constexpr size_t expected_live_gdn_arena =
+        313786368ULL;
+    constexpr size_t expected_terminal_hidden =
+        5120ULL * sizeof(float);
+    constexpr size_t expected_kv =
+        17ULL * 4096ULL * 8ULL * 128ULL *
+        2ULL * sizeof(uint16_t);
+
+    EXPECT_EQ(device.kv_cache_bytes, expected_kv)
+        << "Only 16 main FA layers plus one shifted MTP FA layer own KV.";
+    EXPECT_EQ(
+        device.live_recurrent_state_bytes,
+        expected_live_gdn_arena);
+    EXPECT_EQ(
+        device.checkpoint_state_bytes,
+        4ULL *
+            (expected_main_gdn_payload +
+             expected_terminal_hidden))
+        << "The shifted FA cache must not reserve a recurrent payload slot.";
+    EXPECT_GT(
+        device.persistent_state_bytes,
+        device.live_recurrent_state_bytes +
+            device.checkpoint_state_bytes)
+        << "Device sequence metadata must remain explicitly accounted.";
+}
+
+TEST(Test__MemoryPlanner, TerminalParticipantOwnsTrailingMTPWeights)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen3.6";
+    profile.n_layers = 3;
+    profile.mtp_layer_count = 1;
+    profile.d_model = 32;
+    profile.d_ff = 64;
+    profile.n_heads = 1;
+    profile.n_kv_heads = 1;
+    profile.head_dim = 32;
+    profile.vocab_size = 64;
+    profile.max_seq_len = 16;
+
+    for (int layer = 0; layer < profile.n_layers; ++layer)
+    {
+        TensorSizeInfo tensor;
+        tensor.name =
+            "blk." + std::to_string(layer) + ".ffn_gate.weight";
+        tensor.elements = 32 * 32;
+        tensor.K = 32;
+        tensor.quant_type = "F32";
+        tensor.native_bytes = tensor.elements * sizeof(float);
+        tensor.layer_index = layer;
+        profile.total_native_bytes += tensor.native_bytes;
+        profile.tensors.push_back(std::move(tensor));
+    }
+
+    DevicePlanConfig config;
+    config.device = DeviceId::cuda(0);
+    config.device_total_bytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+    config.device_free_bytes = config.device_total_bytes;
+    config.first_layer = 0;
+    config.last_layer = 1;
+    config.batch_size = 1;
+    config.max_seq_len = 16;
+    config.activation_seq_len = 16;
+
+    const auto without_mtp = MemoryPlanner::plan(profile, {config});
+    config.mtp_enabled = true;
+    const auto with_mtp = MemoryPlanner::plan(profile, {config});
+
+    ASSERT_EQ(without_mtp.devices.size(), 1u);
+    ASSERT_EQ(with_mtp.devices.size(), 1u);
+    EXPECT_EQ(
+        with_mtp.devices.front().weight_bytes -
+            without_mtp.devices.front().weight_bytes,
+        32ULL * 32ULL * sizeof(float))
+        << "The terminal main-graph participant must reserve the trailing "
+           "predictor block loaded by the MTP sidecar.";
 }
 
 TEST(Test__MemoryPlanner, GPUActivationBufferSizing_UsesLargestPrefillBucket)
@@ -185,6 +320,42 @@ TEST(Test__MemoryPlanner, LongContext_KeepsKVFullContextButCapsActivationWorkspa
     EXPECT_EQ(long_device.max_seq_len, 16384);
     EXPECT_EQ(long_device.activation_seq_len, 4096);
     EXPECT_TRUE(long_plan.fits()) << long_plan.renderTable();
+}
+
+TEST(Test__MemoryPlanner, ResidentGraphSelection_ChoosesLargestFittingBucket)
+{
+    constexpr size_t GiB = 1024ULL * 1024ULL * 1024ULL;
+    auto profile = createQwen36DenseLikeProfile(16ULL * GiB);
+
+    DevicePlanConfig probe;
+    probe.device = DeviceId::cuda(0);
+    probe.device_total_bytes = 24ULL * GiB;
+    probe.device_free_bytes = 24ULL * GiB;
+    probe.batch_size = 1;
+    probe.max_seq_len = 16384;
+    probe.activation_seq_len = 2048;
+    probe.kv_precision = "q8_1";
+
+    const auto plan_2k = MemoryPlanner::plan(profile, {probe});
+    ASSERT_TRUE(plan_2k.fits()) << plan_2k.renderTable();
+
+    probe.device_free_bytes =
+        plan_2k.devices.front().total_bytes() +
+        probe.headroom_bytes +
+        1ULL * 1024ULL * 1024ULL;
+
+    const auto selected =
+        MemoryPlanner::planLargestFittingResidentGraphRows(
+            profile,
+            {probe},
+            {1024, 2048, 4096});
+
+    ASSERT_TRUE(selected.fits()) << selected.memory_plan.renderTable();
+    EXPECT_EQ(selected.resident_graph_rows, 2048);
+    ASSERT_EQ(selected.memory_plan.devices.size(), 1u);
+    EXPECT_EQ(selected.memory_plan.devices.front().activation_seq_len, 2048);
+    EXPECT_EQ(selected.memory_plan.devices.front().max_seq_len, 16384)
+        << "resident graph rows must not shrink full KV context capacity";
 }
 
 TEST(Test__MemoryPlanner, SingleGPU_DoesNotFit)

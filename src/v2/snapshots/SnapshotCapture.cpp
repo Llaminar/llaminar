@@ -241,6 +241,24 @@ namespace llaminar2
                     storeOutput(prefix + "_ATTENTION_EFFECTIVE_V", output);
                     storeRowsForSmallEffectiveKV(prefix + "_ATTENTION_EFFECTIVE_V", output);
                 }
+                else if (output_name.starts_with("device_kv_count_request_") &&
+                         output.data)
+                {
+                    storeOutput(
+                        prefix + "_ATTENTION_DEVICE_KV_COUNT_REQUEST_" +
+                            output_name.substr(
+                                std::string("device_kv_count_request_").size()),
+                        output);
+                }
+                else if (output_name.starts_with("device_kv_head_request_") &&
+                         output.data)
+                {
+                    storeOutput(
+                        prefix + "_ATTENTION_DEVICE_KV_HEAD_REQUEST_" +
+                            output_name.substr(
+                                std::string("device_kv_head_request_").size()),
+                        output);
+                }
             }
             return;
         }
@@ -446,6 +464,14 @@ namespace llaminar2
         if (dtype_str == "FP32")
         {
             std::memcpy(data.data(), out.data, count * sizeof(float));
+            return data;
+        }
+
+        if (dtype_str == "INT32")
+        {
+            const auto *int_data = static_cast<const int32_t *>(out.data);
+            for (size_t i = 0; i < count; ++i)
+                data[i] = static_cast<float>(int_data[i]);
             return data;
         }
 

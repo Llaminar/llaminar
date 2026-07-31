@@ -1301,8 +1301,13 @@ namespace
         std::unique_ptr<DeviceWorkspaceManager> workspace;
         if (workspace_consumer)
         {
-            const auto requirements = workspace_consumer->getWorkspaceRequirements(
-                std::max(1, m), n, k);
+            /*
+             * This oracle executes public serial decode one row at a time.
+             * Request its actual M=1 participant rather than borrowing the
+             * grouped candidate's independently aliased workspace layout.
+             */
+            const auto requirements =
+                workspace_consumer->getWorkspaceRequirements(1, n, k);
             workspace = std::make_unique<DeviceWorkspaceManager>(
                 device, workspaceBudgetFor(requirements));
             if (!workspace->allocate(requirements))

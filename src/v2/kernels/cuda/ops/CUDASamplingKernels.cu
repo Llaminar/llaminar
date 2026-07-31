@@ -76,6 +76,22 @@ constexpr int ARGMAX_FINALIZE_THREADS = 256;
 // which keeps all 82 SMs of an RTX 3090 busy without oversubscription.
 constexpr int ARGMAX_ELEMS_PER_THREAD = 8;
 
+/**
+ * @brief Publish one request-policy INT32 scalar into persistent device state.
+ *
+ * Kernel launch arguments are copied by the CUDA runtime before enqueue
+ * returns, unlike an asynchronous H2D transfer sourced from a caller's stack
+ * scalar. This one-thread kernel is therefore the correct ownership boundary
+ * for host-selected control tokens such as a bounded-thinking stop sequence.
+ */
+__global__ void cuda_publish_int32_control_scalar_kernel(
+    int32_t value,
+    int32_t *out_value)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        *out_value = value;
+}
+
 __device__ __forceinline__ bool argmax_better(float candidate_value,
                                               int candidate_index,
                                               float current_value,
@@ -4272,6 +4288,34 @@ extern "C"
             fprintf(
                 stderr,
                 "CUDA MTP greedy penalty history commit launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_publish_int32_control_scalar(
+        int32_t value,
+        int32_t *out_value,
+        int device_idx,
+        void *stream)
+    {
+        if (value < 0 || !out_value || !stream)
+            return false;
+
+        cudaSetDevice(device_idx);
+        cuda_publish_int32_control_scalar_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(value, out_value);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA INT32 control-scalar publication launch failed: %s\n",
                 cudaGetErrorString(err));
             return false;
         }

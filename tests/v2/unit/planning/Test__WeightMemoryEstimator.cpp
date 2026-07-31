@@ -137,7 +137,7 @@ namespace
             {"Q4_K", 20.0f / 32.0f},
             {"Q5_K", 24.0f / 32.0f},
             {"Q6_K", 28.0f / 32.0f},
-            {"Q8_K", 288.0f / 256.0f},
+            {"Q8_K", 34.0f / 32.0f},
             {"IQ4_NL", 18.0f / 32.0f},
             {"IQ4_XS", 18.0f / 32.0f},
             {"IQ2_XXS", 10.0f / 32.0f},
@@ -316,6 +316,74 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_Q4KUsesCompactGPUPacking)
     EXPECT_EQ(estimate.native_bytes, q4k_tensor.native_bytes);
     EXPECT_EQ(estimate.device_bytes, expected_gpu_bytes);
     EXPECT_LT(estimate.device_bytes, static_cast<size_t>(static_cast<float>(q4k_tensor.elements) * 1.0f));
+}
+
+TEST(Test__WeightMemoryEstimator, QuantizedEmbeddingUsesPreparedEmbedQ8Bytes)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen3.6";
+    profile.n_layers = 1;
+    profile.d_model = 64;
+
+    TensorSizeInfo embedding;
+    embedding.name = "token_embd.weight";
+    embedding.elements = 1000 * 64;
+    embedding.K = 64;
+    embedding.quant_type = "Q4_K";
+    embedding.native_bytes = embedding.elements * 144 / 256;
+    profile.total_native_bytes = embedding.native_bytes;
+    profile.tensors.push_back(embedding);
+
+    const auto estimate =
+        WeightMemoryEstimator::estimate(
+            profile,
+            DeviceId::cuda(0));
+    const size_t expected_embedding_bytes =
+        1000ULL * 2ULL * 36ULL;
+    const size_t expected_tied_lm_head_bytes =
+        32000ULL + 4096ULL + 4096ULL;
+
+    EXPECT_EQ(
+        estimate.prepared_embedding_bytes,
+        expected_embedding_bytes);
+    EXPECT_EQ(
+        estimate.tied_lm_head_bytes,
+        expected_tied_lm_head_bytes);
+    EXPECT_EQ(
+        estimate.device_bytes,
+        expected_embedding_bytes +
+            expected_tied_lm_head_bytes);
+}
+
+TEST(Test__WeightMemoryEstimator, ExplicitLMHeadPreventsSyntheticTiedCopy)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen3.6";
+    profile.n_layers = 1;
+    profile.d_model = 64;
+
+    for (const std::string &name :
+         {"token_embd.weight", "output.weight"})
+    {
+        TensorSizeInfo tensor;
+        tensor.name = name;
+        tensor.elements = 1000 * 64;
+        tensor.K = 64;
+        tensor.quant_type = "Q8_0";
+        tensor.native_bytes = tensor.elements * 34 / 32;
+        profile.total_native_bytes += tensor.native_bytes;
+        profile.tensors.push_back(tensor);
+    }
+
+    const auto estimate =
+        WeightMemoryEstimator::estimate(
+            profile,
+            DeviceId::cuda(0));
+
+    EXPECT_EQ(estimate.tied_lm_head_bytes, 0u);
+    EXPECT_EQ(
+        estimate.prepared_embedding_bytes,
+        1000ULL * 2ULL * 36ULL);
 }
 
 TEST(Test__WeightMemoryEstimator, TPSharded_ReducesDeviceBytes)

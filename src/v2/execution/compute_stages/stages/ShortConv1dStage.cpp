@@ -325,7 +325,17 @@ namespace llaminar2
 
     std::string ShortConv1dStage::speculativeStateWorkBufferName() const
     {
-        return std::string(WS_SPECULATIVE_STATE_WORK) + "_" + workspaceStableId();
+        /*
+         * Speculative work is transient scratch for one short-convolution stage.
+         * Layers in a transformer graph are dependency-serialized, so one work
+         * bank per graph role is sufficient. Persistent speculative state slots
+         * remain layer-qualified because accepted-state publication consumes
+         * every layer after verifier execution.
+         */
+        if (params_.workspace_namespace.empty())
+            return WS_SPECULATIVE_STATE_WORK;
+        return std::string(WS_SPECULATIVE_STATE_WORK) + "_" +
+               params_.workspace_namespace;
     }
 
     int ShortConv1dStage::requestedSpeculativeStateSlotRows() const

@@ -551,6 +551,7 @@ namespace llaminar2
 
         // Runtime fields from pre-parsed RuntimeConfig
         config.max_seq_len = plan.runtime.max_seq_len;
+        config.resident_graph_rows = plan.runtime.resident_graph_rows;
         config.batch_size = plan.runtime.batch_size;
         config.activation_precision = plan.runtime.activation_precision;
         config.kv_cache_precision = plan.runtime.kv_cache_precision;
@@ -1196,6 +1197,7 @@ namespace llaminar2
                                                  // Build InferenceRunnerConfig for LOCAL TP
                                                  InferenceRunnerConfig runner_config;
                                                  runner_config.max_seq_len = static_cast<int>(config_.max_seq_len);
+                                                 runner_config.activation_seq_len = config_.resident_graph_rows;
                                                  runner_config.batch_size = config_.batch_size;
                                                  runner_config.activation_precision = config_.activation_precision;
                                                  runner_config.kv_cache_scale_k = config_.kv_cache_scale_k;
@@ -1482,6 +1484,7 @@ namespace llaminar2
             // =====================================================================
             InferenceRunnerConfig runner_config;
             runner_config.max_seq_len = static_cast<int>(config_.max_seq_len);
+            runner_config.activation_seq_len = config_.resident_graph_rows;
             runner_config.batch_size = config_.batch_size;
             runner_config.activation_precision = config_.activation_precision;
             runner_config.kv_cache_scale_k = config_.kv_cache_scale_k;
@@ -1525,6 +1528,7 @@ namespace llaminar2
                 nested_config.weights = stage_config.tp_weights;
                 nested_config.backend = stage_config.tp_backend;
                 nested_config.max_seq_len = config_.max_seq_len;
+                nested_config.resident_graph_rows = config_.resident_graph_rows;
                 nested_config.batch_size = config_.batch_size;
                 nested_config.activation_precision = config_.activation_precision;
                 nested_config.kv_cache_scale_k = config_.kv_cache_scale_k;
@@ -1878,21 +1882,24 @@ namespace llaminar2
     bool RankOrchestrator::forwardWithDeviceTokenIds(
         const int *token_shadow,
         const void *token_ids_device,
-        int seq_len)
+        int seq_len,
+        DeviceTokenForwardPurpose purpose)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
             return pp_sidecar->forwardWithDeviceTokenIds(
                 token_shadow,
                 token_ids_device,
-                seq_len);
+                seq_len,
+                purpose);
         }
         if (device_runners_.size() == 1 && device_runners_[0])
         {
             return device_runners_[0]->forwardWithDeviceTokenIds(
                 token_shadow,
                 token_ids_device,
-                seq_len);
+                seq_len,
+                purpose);
         }
         if (device_runners_.size() < 2 ||
             !token_shadow ||
@@ -1902,7 +1909,7 @@ namespace llaminar2
                 device_runners_.size() ||
             rank_mtp_verifier_child_token_count_ != seq_len)
         {
-            LOG_ERROR("RankOrchestrator::forwardWithDeviceTokenIds: invalid LocalTP verifier token bundle");
+            LOG_ERROR("RankOrchestrator::forwardWithDeviceTokenIds: invalid LocalTP device-token input bundle");
             return false;
         }
 
@@ -1912,7 +1919,7 @@ namespace llaminar2
                 !rank_mtp_verifier_child_token_inputs_[i])
             {
                 LOG_ERROR("RankOrchestrator::forwardWithDeviceTokenIds: participant "
-                          << i << " has no staged verifier token row");
+                          << i << " has no staged device-token input row");
                 return false;
             }
         }
@@ -1940,6 +1947,7 @@ namespace llaminar2
             [this,
              token_shadow,
              seq_len,
+             purpose,
              kernel_phase,
              rocm_phase,
              cuda_phase,
@@ -1968,7 +1976,8 @@ namespace llaminar2
                     device_runners_[i]->forwardWithDeviceTokenIds(
                         token_shadow,
                         rank_mtp_verifier_child_token_inputs_[i],
-                        seq_len);
+                        seq_len,
+                        purpose);
 
                 if (debugEnv().tp_collective_contract_trace)
                 {
@@ -5268,16 +5277,14 @@ namespace llaminar2
     bool RankOrchestrator::commitMTPShiftedRowFromDeviceTargetSample(
         int target_sample_slot,
         int already_appended_tokens,
-        bool allow_speculative_discard,
-        int position_offset_override)
+        bool allow_speculative_discard)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
             return pp_sidecar->commitMTPShiftedRowFromDeviceTargetSample(
                 target_sample_slot,
                 already_appended_tokens,
-                allow_speculative_discard,
-                position_offset_override);
+                allow_speculative_discard);
         }
         if (device_runners_.empty())
         {
@@ -5289,8 +5296,7 @@ namespace llaminar2
                    device_runners_[0]->commitMTPShiftedRowFromDeviceTargetSample(
                        target_sample_slot,
                        already_appended_tokens,
-                       allow_speculative_discard,
-                       position_offset_override);
+                       allow_speculative_discard);
         }
 
         /*
@@ -5326,7 +5332,6 @@ namespace llaminar2
              target_sample_slot,
              already_appended_tokens,
              allow_speculative_discard,
-             position_offset_override,
              kernel_phase,
              rocm_phase,
              cuda_phase,
@@ -5348,8 +5353,7 @@ namespace llaminar2
                 return device_runners_[i]->commitMTPShiftedRowFromDeviceTargetSample(
                            target_sample_slot,
                            already_appended_tokens,
-                           allow_speculative_discard,
-                           position_offset_override);
+                           allow_speculative_discard);
             });
 
         bool all_success = true;

@@ -62,51 +62,44 @@ TEST(Test__ActivationMemoryEstimator, CPUAndGPUSameEstimate)
     EXPECT_EQ(gpu, cpu);
 }
 
-TEST(Test__ActivationMemoryEstimator, PeakFormula_MatchesManualComputation)
+TEST(Test__ActivationMemoryEstimator, LogicalArenaOwnership_MatchesManualComputation)
 {
-    // Manually compute the three-phase peak for known inputs:
+    // Manually compute the physical BufferId owners for known inputs:
     // B=1, S=512, D=256, F=1024, H=4, HK=2, HD=64, V=1000
     constexpr size_t B = 1, S = 512, D = 256, F = 1024;
     constexpr size_t H = 4, HK = 2, HD = 64, V = 1000;
     constexpr size_t FP32 = 4;
 
-    size_t hidden_state = B * S * D * FP32;
-    size_t residual = B * S * D * FP32;
-    size_t q_proj = B * S * H * HD * FP32;
-    size_t k_proj = B * S * HK * HD * FP32;
-    size_t v_proj = B * S * HK * HD * FP32;
-    size_t attn_output = B * S * D * FP32;
-    size_t norm_scratch = B * S * D * FP32;
-    size_t ffn_gate = B * S * F * FP32;
-    size_t ffn_up = B * S * F * FP32;
-    size_t ffn_down = B * S * D * FP32;
-    size_t logits = B * V * FP32;
-
-    size_t attn_phase = hidden_state + residual + q_proj + k_proj + v_proj + attn_output + norm_scratch;
-    size_t ffn_phase = hidden_state + residual + ffn_gate + ffn_up + ffn_down + norm_scratch;
-    size_t lm_head_phase = hidden_state + logits;
-    size_t expected_peak = std::max({attn_phase, ffn_phase, lm_head_phase});
+    const size_t Q = H * HD;
+    const size_t KV = HK * HD;
+    const size_t expected_owned =
+        B * S * (5 * D + 2 * Q + 2 * KV + 2 * F + S) * FP32 +
+        B * V * FP32;
 
     size_t actual = ActivationMemoryEstimator::estimate(
         1, 512, 256, 1024, 4, 2, 64, 1000, DeviceId::cuda(0));
 
-    EXPECT_EQ(actual, expected_peak);
+    EXPECT_EQ(actual, expected_owned);
 }
 
-TEST(Test__ActivationMemoryEstimator, OneRowPrefill_LargeVocabLMHeadDominates)
+TEST(Test__ActivationMemoryEstimator, OneRowPrefill_StillOwnsEveryRegisteredBuffer)
 {
-    // With S=1 and vocab=500000, lm_head_phase = B*(S*D+V)*4
-    // dominates. This keeps the estimator honest about terminal-row logits.
+    // A large vocabulary dominates this case, but registered one-row graph
+    // buffers remain physically owned and must not disappear from the estimate.
     constexpr size_t B = 1, S = 1, D = 256, F = 1024;
     constexpr size_t H = 4, HK = 2, HD = 64, V = 500000;
     constexpr size_t FP32 = 4;
 
-    size_t lm_head_phase = B * S * D * FP32 + B * V * FP32;
+    const size_t Q = H * HD;
+    const size_t KV = HK * HD;
+    const size_t expected =
+        B * S * (5 * D + 2 * Q + 2 * KV + 2 * F + S) * FP32 +
+        B * V * FP32;
 
     size_t actual = ActivationMemoryEstimator::estimate(
         static_cast<int>(B), static_cast<int>(S), static_cast<int>(D), static_cast<int>(F),
         static_cast<int>(H), static_cast<int>(HK), static_cast<int>(HD), static_cast<int>(V),
         DeviceId::cuda(0));
 
-    EXPECT_EQ(actual, lm_head_phase);
+    EXPECT_EQ(actual, expected);
 }

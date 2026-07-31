@@ -1801,18 +1801,24 @@ namespace llaminar2::test::gpu_kv_verifier
                     IKVCache::KVCacheLogicalBlockDescriptor null_stream_descriptor =
                         device_descriptor;
                     null_stream_descriptor.stream = nullptr;
-                    EXPECT_FALSE(source.cache->exportLogicalBlock(
-                        null_stream_descriptor, source_k, source_v))
-                        << "GPU device export must never enter a default stream";
+                    EXPECT_THROW(
+                        source.cache->exportLogicalBlock(
+                            null_stream_descriptor, source_k, source_v),
+                        std::invalid_argument)
+                        << "GPU device export must fail hard before it can enter "
+                           "a default stream";
 
                     ASSERT_TRUE(source.cache->exportLogicalBlock(
                         device_descriptor, source_k, source_v));
                     auto restored = makeBoundCache(
                         device, format.cache_precision, topology,
                         max_seq_len, head_dim, &tq_context);
-                    EXPECT_FALSE(restored.cache->importLogicalBlock(
-                        null_stream_descriptor, source_k, source_v))
-                        << "GPU device import must never enter a default stream";
+                    EXPECT_THROW(
+                        restored.cache->importLogicalBlock(
+                            null_stream_descriptor, source_k, source_v),
+                        std::invalid_argument)
+                        << "GPU device import must fail hard before it can enter "
+                           "a default stream";
                     ASSERT_TRUE(restored.cache->importLogicalBlock(
                         device_descriptor, source_k, source_v));
                     ASSERT_TRUE(restored.cache->exportLogicalBlock(

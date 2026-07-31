@@ -547,6 +547,7 @@ namespace llaminar2
             ss << "  Cross-rank backend: " << collectiveBackendTypeToString(cross_rank_backend) << "\n";
             ss << "  Runtime Config:\n";
             ss << "    max_seq_len: " << runtime.max_seq_len << "\n";
+            ss << "    resident_graph_rows: " << runtime.resident_graph_rows << "\n";
             ss << "    activation_precision: " << activationPrecisionToString(runtime.activation_precision) << "\n";
             ss << "    kv_cache_precision: " << kvCachePrecisionToString(runtime.kv_cache_precision) << "\n";
             if (!runtime.tp_allreduce_precision_override.empty())

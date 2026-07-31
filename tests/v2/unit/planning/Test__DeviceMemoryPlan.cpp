@@ -41,6 +41,18 @@ TEST(Test__DeviceMemoryPlan, TotalBytes_SumsAllComponents)
     EXPECT_EQ(p.total_bytes(), (100 + 50 + 30 + 200) * 1024ULL * 1024);
 }
 
+TEST(Test__DeviceMemoryPlan, TotalBytesIncludesPersistentState)
+{
+    constexpr size_t MB = 1024ULL * 1024ULL;
+    auto p = makePlan(100, 50, 30, 200, 1024);
+    p.persistent_state_bytes = 75 * MB;
+
+    EXPECT_EQ(
+        p.total_bytes(),
+        (100 + 50 + 75 + 30 + 200) * MB);
+    EXPECT_NE(p.summary().find("state=75 MB"), std::string::npos);
+}
+
 TEST(Test__DeviceMemoryPlan, Fits_TrueWhenUnderBudget)
 {
     // Total = 380 MB + 128 MB headroom = 508 MB, free = 1024 MB

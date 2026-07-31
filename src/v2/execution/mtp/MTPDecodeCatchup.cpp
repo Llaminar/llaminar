@@ -432,8 +432,7 @@ namespace llaminar2
                     ok = runner.commitMTPShiftedRowFromDeviceTargetSample(
                         *request.device_target_sample_slot,
                         token_index,
-                        request.allow_speculative_discard,
-                        request.base_sidecar_position);
+                        request.allow_speculative_discard);
                 }
                 else
                 {

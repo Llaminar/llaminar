@@ -21,6 +21,7 @@
 #include "PrefillBucketUtils.h"
 #include "../graph/DeviceGraphExecutor.h"
 #include "../device/DeviceContext.h"
+#include "../device/WorkspaceAllocator.h"
 #include "../../factory/InferenceRunnerFactory.h" // For FactoryPPStageConfig
 #include "../../../utils/ForwardPassProfiler.h"
 
@@ -102,6 +103,22 @@ namespace llaminar2
             int workspace_seq_len = 0) = 0;
 
         /**
+         * @brief Ensure workspace under an explicit graph-family lifetime policy.
+         *
+         * Production GPU hosts override this typed form. The compatibility
+         * implementation preserves lightweight test hosts while making the
+         * execution engine's serial-family intent visible at the API boundary.
+         */
+        virtual bool ensureDeviceWorkspaceAllocated(
+            const ComputeGraph &graph,
+            int workspace_seq_len,
+            WorkspaceGraphFamilyPolicy graph_family_policy)
+        {
+            (void)graph_family_policy;
+            return ensureDeviceWorkspaceAllocated(graph, workspace_seq_len);
+        }
+
+        /**
          * @brief Return the workspace generation for a device, if the host tracks it.
          *
          * A generation change means raw workspace addresses may have changed.
@@ -111,6 +128,18 @@ namespace llaminar2
         virtual uint64_t workspaceGeneration(DeviceId device) const
         {
             (void)device;
+            return 0;
+        }
+
+        /**
+         * @brief Return the host's memory-planned resident graph-row capacity.
+         *
+         * A zero result means the lightweight host has no explicit bound.
+         * Production GPU hosts return a positive value selected before graph
+         * construction.
+         */
+        virtual int residentGraphRows() const
+        {
             return 0;
         }
 
@@ -332,6 +361,28 @@ namespace llaminar2
          * wait.  This keeps publication atomic without forcing a CPU stream sync.
          */
         virtual bool prepareLiveStateForForwardGraphExecution(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device)
+        {
+            (void)input;
+            (void)execution_stream;
+            (void)execution_device;
+            return true;
+        }
+
+        /**
+         * @brief Publish caller-staged device token rows on the graph stream.
+         *
+         * Device-token composition is a forward-input concern, not verifier
+         * metadata.  The engine invokes this hook for every GPU forward after
+         * joining live-state publication and before any dynamic graph parameter
+         * reads the row.  Implementations must enqueue copies on
+         * `execution_stream` and publish the resulting arena write; they must
+         * not synchronize the stream or defer this work to an all-position-only
+         * hook.
+         */
+        virtual bool prepareDeviceTokenInputsForForwardGraphExecution(
             const ForwardInput &input,
             void *execution_stream,
             DeviceId execution_device)
@@ -819,7 +870,7 @@ namespace llaminar2
          *
          * Used at request/session boundaries after the orchestrator clears KV and
          * model recurrent state. Keeping the ComputeGraph avoids weight
-         * re-coherence.  When @p preserve_replay_safe_segmented_captures is true,
+         * re-coherence. When @p preserve_replay_safe_graphs is true,
          * single-token decode and all-position verifier segment captures survive
          * the request reset because their device inputs are rebound/refreshed
          * before every launch. Exact and bucketed prefill cache state also uses
@@ -829,7 +880,7 @@ namespace llaminar2
          * ordinary decode replay state is still discarded.
          */
         ReplayStateResetSummary resetSessionReplayState(
-            bool preserve_replay_safe_segmented_captures = false);
+            bool preserve_replay_safe_graphs = false);
 
         /** Check if cache is empty. */
         [[nodiscard]] bool cacheEmpty() const { return cache_.empty(); }

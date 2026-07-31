@@ -12,10 +12,13 @@
 #include "../../compute_stages/IComputeStage.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../../utils/VramBillOfMaterials.h"
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace llaminar2
 {
@@ -157,40 +160,131 @@ namespace llaminar2
             int m = 4096;
             int n = 0;
             int k = 0;
+            /**
+             * @brief True when this consumer's M follows graph prefill rows.
+             *
+             * Terminal LM-head projection consumes one selected row during
+             * ordinary prefill, and attention exposes its own batch/head
+             * workspace geometry. Feeding either consumer an artificial prompt
+             * M fabricates buffers that no real graph can execute.
+             */
+            bool scales_with_serial_family_rows = true;
+            /**
+             * @brief Whether auxiliary graph roles may replace M with their rows.
+             *
+             * Graph stages use participant rows. Explicit consumers may instead
+             * declare a fixed control-plane shape whose M means request count or
+             * another non-token dimension.
+             */
+            WorkspaceConsumerShapePolicy shape_policy =
+                WorkspaceConsumerShapePolicy::GraphParticipantRows;
         };
 
-        auto requirementsForGraphBinding = [](const ConsumerBinding &binding) -> WorkspaceRequirements
+        /**
+         * @brief Logical participant whose requirements are being assembled.
+         *
+         * The role is explicit because row count is not a lifetime contract:
+         * a short prompt and grouped MTP verification may have the same M while
+         * selecting different production kernels and disjoint scratch arenas.
+         */
+        enum class SerialWorkspaceParticipantRole : uint8_t
         {
-            WorkspaceRequirements combined;
-            if (!binding.consumer)
-                return combined;
+            PrefillGraph,
+            DecodeGraph,
+            GroupedVerifierGraph,
+        };
 
-            /**
-             * Production graphs are often allocated with a prefill-sized M but
-             * later replayed for one-row decode. Several CUDA fused projection
-             * stages need decode-only side-stream GEMV buffers that are not
-             * visible from a large-M sizing request. Merge an explicit M=1
-             * request so a single graph workspace covers both regimes.
-             *
-             * Query the auxiliary decode shape first, then the active graph
-             * shape. Some tests and diagnostic consumers record the last sizing
-             * request they saw; leaving the graph shape last keeps that
-             * observability meaningful while preserving the merged decode-only
-             * buffers.
-             */
-            if (binding.m != 1)
-            {
-                combined.merge(binding.consumer->getWorkspaceRequirements(
-                    1,
+        auto requirementsForRows =
+            [&hints](
+                const ConsumerBinding &binding,
+                int requested_rows,
+                SerialWorkspaceParticipantRole role) -> WorkspaceRequirements
+        {
+            if (!binding.consumer)
+                return {};
+
+            const int effective_rows =
+                binding.shape_policy ==
+                        WorkspaceConsumerShapePolicy::FixedDeclaredShape
+                    ? binding.m
+                    : requested_rows;
+            WorkspaceRequirements requirements =
+                binding.consumer->getWorkspaceRequirements(
+                    std::max(1, effective_rows),
                     binding.n,
-                    binding.k));
+                    binding.k);
+
+            if (hints.graph_family_policy !=
+                WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
+            {
+                std::erase_if(
+                    requirements.buffers,
+                    [role](const WorkspaceDescriptor &descriptor)
+                    {
+                        switch (role)
+                        {
+                        case SerialWorkspaceParticipantRole::PrefillGraph:
+                            return descriptor.regime ==
+                                   WorkspaceExecutionRegime::
+                                       CompactDecodeOnly;
+                        case SerialWorkspaceParticipantRole::DecodeGraph:
+                        case SerialWorkspaceParticipantRole::
+                            GroupedVerifierGraph:
+                            return descriptor.regime ==
+                                   WorkspaceExecutionRegime::PrefillOnly;
+                        }
+                        return false;
+                    });
             }
 
-            combined.merge(binding.consumer->getWorkspaceRequirements(
-                binding.m,
-                binding.n,
-                binding.k));
+            return requirements;
+        };
 
+        auto activeRowsForBinding =
+            [&hints](const ConsumerBinding &binding) -> int
+        {
+            if (hints.graph_family_policy ==
+                    WorkspaceGraphFamilyPolicy::
+                        SerialDeviceFamilyLargestParticipant &&
+                binding.scales_with_serial_family_rows &&
+                hints.serial_family_max_rows > binding.m)
+            {
+                return hints.serial_family_max_rows;
+            }
+            return binding.m;
+        };
+
+        auto requirementsForGraphBinding =
+            [&](const ConsumerBinding &binding) -> WorkspaceRequirements
+        {
+            if (hints.graph_family_policy !=
+                WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
+            {
+                return requirementsForRows(
+                    binding,
+                    activeRowsForBinding(binding),
+                    binding.scales_with_serial_family_rows
+                        ? SerialWorkspaceParticipantRole::PrefillGraph
+                        : SerialWorkspaceParticipantRole::DecodeGraph);
+            }
+
+            /*
+             * Exclusive diagnostic users retain the historical union contract:
+             * their storage cannot alias another participant, so the same block
+             * must cover both the declared shape and one-row decode.
+             */
+            WorkspaceRequirements combined;
+            if (binding.m != 1)
+            {
+                combined.merge(requirementsForRows(
+                    binding,
+                    1,
+                    SerialWorkspaceParticipantRole::DecodeGraph));
+            }
+            combined.merge(requirementsForRows(
+                binding,
+                binding.m,
+                SerialWorkspaceParticipantRole::PrefillGraph));
             return combined;
         };
 
@@ -298,12 +392,14 @@ namespace llaminar2
                 binding.m = std::max(1, hints.batch_size);
                 binding.n = std::max(0, hints.n_heads);
                 binding.k = std::max(0, hints.head_dim);
+                binding.scales_with_serial_family_rows = false;
             }
             else if (is_lm_head)
             {
                 binding.m = std::max(1, hints.batch_size);
                 binding.n = 0;
                 binding.k = 0;
+                binding.scales_with_serial_family_rows = false;
             }
             else if (is_embedding)
             {
@@ -335,6 +431,8 @@ namespace llaminar2
                 std::max(1, request.m),
                 request.n,
                 request.k,
+                true,
+                request.shape_policy,
             });
         }
 
@@ -393,6 +491,36 @@ namespace llaminar2
                     combined.merge(requirementsForGraphBinding(consumer_binding));
                 }
                 const size_t needed = combined.total_bytes_with_alignment();
+                if (hints.graph_family_policy !=
+                    WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
+                {
+                    logVramBomLine(
+                        "workspace_plan",
+                        "phase=serial_alias_bind device=" +
+                            device.toString() +
+                            " consumers=" +
+                            std::to_string(consumers.size()) +
+                            " buffers=" +
+                            std::to_string(combined.buffers.size()) +
+                            " logical_bytes=" + std::to_string(needed) +
+                            " logical_mib=" + vramBomMiB(needed) +
+                            " primary_block_bytes=" +
+                            std::to_string(existing->second->primaryBlockSize()) +
+                            " physical_growth_bytes=0");
+                    if (!existing->second->bindSerialParticipant(combined))
+                    {
+                        LOG_ERROR("[WorkspaceAllocator] Serial graph-family participant could not bind into the primary workspace on "
+                                  << device.toString());
+                        return false;
+                    }
+                    for (const auto &consumer_binding : consumers)
+                    {
+                        consumer_binding.consumer->bindWorkspace(
+                            existing->second.get());
+                    }
+                    continue;
+                }
+
                 LOG_TRACE("[WorkspaceAllocator] Extending workspace append-only on "
                           << device.toString() << " for "
                           << combined.buffers.size() << " current requirements ("
@@ -450,7 +578,145 @@ namespace llaminar2
                 combined.merge(requirementsForGraphBinding(consumer_binding));
             }
 
-            if (combined.buffers.empty())
+            WorkspaceRequirements decode_participant;
+            WorkspaceRequirements compact_participant;
+            if (hints.graph_family_policy !=
+                WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
+            {
+                /*
+                 * Build auxiliary layouts independently. Their names are
+                 * published before the first capture, but their bytes overlay
+                 * the largest participant because device events serialize the
+                 * graph roles.
+                 */
+                for (const auto &consumer_binding : consumers)
+                {
+                    decode_participant.merge(
+                        requirementsForRows(
+                            consumer_binding,
+                            1,
+                            SerialWorkspaceParticipantRole::DecodeGraph));
+                }
+                if (hints.serial_family_max_compact_rows > 1)
+                {
+                    for (const auto &consumer_binding : consumers)
+                    {
+                        compact_participant.merge(
+                            requirementsForRows(
+                                consumer_binding,
+                                hints.serial_family_max_compact_rows,
+                                SerialWorkspaceParticipantRole::
+                                    GroupedVerifierGraph));
+                    }
+                }
+
+                /*
+                 * A workspace name is part of the captured pointer ABI. If
+                 * several serial participants use the same name, the first
+                 * published address must have enough capacity for every one of
+                 * them. Promote only the first participant that publishes the
+                 * name to its family-wide capacity. Later participants retain
+                 * their actual live extent, allowing role-exclusive buffers
+                 * to reuse the unused tail while the manager still advertises
+                 * the larger captured capacity. Names absent from a
+                 * participant remain fully role-exclusive.
+                 */
+                struct FamilyBufferCapacity
+                {
+                    size_t size_bytes = 0;
+                    size_t alignment = 1;
+                    bool required = false;
+                };
+
+                std::unordered_map<std::string, FamilyBufferCapacity>
+                    family_capacities;
+                const std::vector<WorkspaceRequirements *>
+                    serial_participants{
+                        &combined,
+                        &decode_participant,
+                        &compact_participant};
+                for (const WorkspaceRequirements *participant :
+                     serial_participants)
+                {
+                    for (const WorkspaceDescriptor &descriptor :
+                         participant->buffers)
+                    {
+                        FamilyBufferCapacity &capacity =
+                            family_capacities[descriptor.name];
+                        capacity.size_bytes = std::max(
+                            capacity.size_bytes,
+                            descriptor.size_bytes);
+                        capacity.alignment = std::max(
+                            capacity.alignment,
+                            descriptor.alignment);
+                        capacity.required =
+                            capacity.required || descriptor.required;
+                    }
+                }
+
+                size_t promoted_descriptors = 0;
+                size_t promoted_bytes = 0;
+                std::unordered_set<std::string> published_names;
+                for (WorkspaceRequirements *participant :
+                     serial_participants)
+                {
+                    for (WorkspaceDescriptor &descriptor :
+                         participant->buffers)
+                    {
+                        const bool publishes_name =
+                            published_names.insert(
+                                descriptor.name).second;
+                        if (!publishes_name)
+                            continue;
+
+                        const FamilyBufferCapacity &capacity =
+                            family_capacities.at(descriptor.name);
+                        if (descriptor.size_bytes <
+                            capacity.size_bytes)
+                        {
+                            const size_t delta =
+                                capacity.size_bytes -
+                                descriptor.size_bytes;
+                            promoted_bytes += delta;
+                            ++promoted_descriptors;
+                            logVramBomLine(
+                                "workspace_serial_shared_capacity",
+                                "device=" + device.toString() +
+                                    " name=" + descriptor.name +
+                                    " previous_bytes=" +
+                                    std::to_string(
+                                        descriptor.size_bytes) +
+                                    " family_bytes=" +
+                                    std::to_string(
+                                        capacity.size_bytes) +
+                                    " promoted_bytes=" +
+                                    std::to_string(delta));
+                        }
+                        descriptor.size_bytes =
+                            capacity.size_bytes;
+                        descriptor.alignment =
+                            capacity.alignment;
+                        descriptor.required =
+                            capacity.required;
+                    }
+                }
+                if (promoted_descriptors > 0)
+                {
+                    PerfStatsCollector::addCounter(
+                        "memory",
+                        "workspace_serial_shared_capacity_promotions",
+                        static_cast<double>(
+                            promoted_descriptors),
+                        "materialize",
+                        device.to_string(),
+                        {{"promoted_bytes",
+                          std::to_string(promoted_bytes)}});
+                }
+            }
+
+            if (combined.buffers.empty() &&
+                decode_participant.buffers.empty() &&
+                compact_participant.buffers.empty())
             {
                 LOG_DEBUG("[WorkspaceAllocator] No workspace requirements for device "
                           << device.toString());
@@ -461,7 +727,57 @@ namespace llaminar2
             // expand up to the available device memory (minus headroom).
             // The initial budget uses a conservative max_budget cap that may
             // be too small for models with many per-instance GEMM workspaces.
-            const size_t needed = combined.total_bytes_with_alignment();
+            const size_t active_needed =
+                combined.total_bytes_with_alignment();
+            const size_t decode_needed =
+                decode_participant.total_bytes_with_alignment();
+            const size_t compact_needed =
+                compact_participant.total_bytes_with_alignment();
+            const size_t needed = std::max(
+                active_needed,
+                std::max(decode_needed, compact_needed));
+            if (hints.graph_family_policy ==
+                WorkspaceGraphFamilyPolicy::
+                    SerialDeviceFamilyLargestParticipant)
+            {
+                PerfStatsCollector::addCounter(
+                    "memory",
+                    "workspace_serial_family_largest_participant_bytes",
+                    static_cast<double>(needed),
+                    "materialize",
+                    device.to_string(),
+                    {{"current_rows", std::to_string(hints.max_seq_len)},
+                     {"largest_rows",
+                      std::to_string(hints.serial_family_max_rows)},
+                     {"buffer_count",
+                      std::to_string(combined.buffers.size())},
+                     {"active_logical_bytes",
+                      std::to_string(active_needed)},
+                     {"decode_logical_bytes",
+                      std::to_string(decode_needed)},
+                     {"compact_logical_bytes",
+                      std::to_string(compact_needed)},
+                     {"ordering", "serial_graph_family"}});
+                logVramBomLine(
+                    "workspace_serial_family_plan",
+                    "device=" + device.toString() +
+                        " current_rows=" +
+                        std::to_string(hints.max_seq_len) +
+                        " largest_rows=" +
+                        std::to_string(hints.serial_family_max_rows) +
+                        " buffers=" +
+                        std::to_string(combined.buffers.size()) +
+                        " active_logical_bytes=" +
+                        std::to_string(active_needed) +
+                        " decode_logical_bytes=" +
+                        std::to_string(decode_needed) +
+                        " compact_logical_bytes=" +
+                        std::to_string(compact_needed) +
+                        " needed_bytes=" + std::to_string(needed) +
+                        " needed_mib=" + vramBomMiB(needed) +
+                        " ownership=largest_participant" +
+                        " ordering=serial_graph_family");
+            }
             if (needed > budget)
             {
                 const size_t available = queryAvailableMemory(device);
@@ -492,12 +808,27 @@ namespace llaminar2
                     " model_floor_bytes=" + std::to_string(model_floor_budget) +
                     " model_floor_mib=" + vramBomMiB(model_floor_budget));
             logWorkspaceVramTrace(device, "workspace.before_allocate", needed);
-            if (!manager->allocate(combined))
+            if (!manager->allocate(combined, needed))
             {
                 LOG_ERROR("[WorkspaceAllocator] Failed to allocate workspace on "
                           << device.toString()
                           << " (needed=" << needed
                           << ", budget=" << budget << ")");
+                return false;
+            }
+
+            if (!compact_participant.buffers.empty() &&
+                !manager->bindSerialParticipant(compact_participant))
+            {
+                LOG_ERROR("[WorkspaceAllocator] Failed to prebind compact serial participant on "
+                          << device.toString());
+                return false;
+            }
+            if (!decode_participant.buffers.empty() &&
+                !manager->bindSerialParticipant(decode_participant))
+            {
+                LOG_ERROR("[WorkspaceAllocator] Failed to prebind decode serial participant on "
+                          << device.toString());
                 return false;
             }
 

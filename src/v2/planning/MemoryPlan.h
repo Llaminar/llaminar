@@ -18,6 +18,9 @@ struct DeviceMemoryPlan
     int activation_seq_len = 0;
     size_t weight_bytes = 0;
     size_t kv_cache_bytes = 0;
+    size_t persistent_state_bytes = 0;
+    size_t live_recurrent_state_bytes = 0;
+    size_t checkpoint_state_bytes = 0;
     size_t activation_bytes = 0;
     size_t workspace_bytes = 0;
 
@@ -27,7 +30,8 @@ struct DeviceMemoryPlan
 
     size_t total_bytes() const
     {
-        return weight_bytes + kv_cache_bytes + activation_bytes + workspace_bytes;
+        return weight_bytes + kv_cache_bytes + persistent_state_bytes +
+               activation_bytes + workspace_bytes;
     }
 
     bool fits() const
@@ -55,6 +59,7 @@ struct DeviceMemoryPlan
         ss << device.to_string() << ": "
            << "weights=" << mb(weight_bytes) << " MB, "
            << "kv_cache=" << mb(kv_cache_bytes) << " MB, "
+           << "state=" << mb(persistent_state_bytes) << " MB, "
            << "activations=" << mb(activation_bytes) << " MB, "
            << "workspace=" << mb(workspace_bytes) << " MB, "
            << "total=" << mb(total_bytes()) << "/" << mb(device_free_bytes) << " MB"

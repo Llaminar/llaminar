@@ -825,8 +825,7 @@ public:
     bool commitMTPShiftedRowFromDeviceTargetSample(
         int target_sample_slot,
         int already_appended_tokens,
-        bool allow_speculative_discard = false,
-        int position_offset_override = -1) override
+        bool allow_speculative_discard = false) override
     {
         ++commit_mtp_device_target_sample_calls_;
         last_commit_mtp_device_target_sample_slot_ = target_sample_slot;
@@ -834,8 +833,6 @@ public:
         last_commit_mtp_main_forward_token_count_ = 0;
         last_commit_mtp_allow_speculative_discard_ =
             allow_speculative_discard;
-        last_commit_mtp_position_offset_override_ =
-            position_offset_override;
         last_commit_mtp_tokens_.clear();
         return commit_mtp_shifted_rows_ok_ &&
                target_sample_slot >= 0 &&
@@ -5983,8 +5980,7 @@ TEST_F(Test__RankOrchestrator, DeviceTargetShiftedCommitRunsOnEveryLocalTPChild)
     EXPECT_TRUE(orchestrator->commitMTPShiftedRowFromDeviceTargetSample(
         /*target_sample_slot=*/3,
         /*already_appended_tokens=*/1,
-        /*allow_speculative_discard=*/true,
-        /*position_offset_override=*/64));
+        /*allow_speculative_discard=*/true));
 
     EXPECT_EQ(runner0_ptr->commit_mtp_device_target_sample_call_count(), 1u);
     EXPECT_EQ(runner1_ptr->commit_mtp_device_target_sample_call_count(), 1u);
@@ -5994,8 +5990,6 @@ TEST_F(Test__RankOrchestrator, DeviceTargetShiftedCommitRunsOnEveryLocalTPChild)
     EXPECT_EQ(runner1_ptr->last_commit_mtp_already_appended(), 1);
     EXPECT_TRUE(runner0_ptr->last_commit_mtp_allow_speculative_discard());
     EXPECT_TRUE(runner1_ptr->last_commit_mtp_allow_speculative_discard());
-    EXPECT_EQ(runner0_ptr->last_commit_mtp_position_offset_override(), 64);
-    EXPECT_EQ(runner1_ptr->last_commit_mtp_position_offset_override(), 64);
 }
 
 TEST_F(Test__RankOrchestrator, LocalTPAllPositionRowBatchSamplingConsumesVerifierStreamsOnce)
@@ -8687,6 +8681,30 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_UnknownShardingRejectsMultiDeviceCombi
     EXPECT_TRUE(snapshot.combined_data.empty());
     EXPECT_EQ(snapshot.combined_rows, 0);
     EXPECT_EQ(snapshot.combined_cols, 0);
+}
+
+TEST_F(Test__RankOrchestrator, TPSnapshot_SchemaFamiliesResolveByLongestPrefix)
+{
+    StageShardingConfig sharding = {
+        {"ATTENTION_DEVICE_*", SnapshotShardingMode::COLUMN_PARALLEL},
+        {"ATTENTION_DEVICE_KV_COUNT_REQUEST_*", SnapshotShardingMode::REPLICATED},
+    };
+
+    EXPECT_EQ(
+        getStageShardingMode(
+            "layer3_ATTENTION_DEVICE_KV_COUNT_REQUEST_11",
+            sharding),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        getStageShardingMode(
+            "layer3_ATTENTION_DEVICE_OTHER",
+            sharding),
+        SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(
+        getStageShardingMode(
+            "layer3_ATTENTION_CONTEXT",
+            sharding),
+        SnapshotShardingMode::UNKNOWN);
 }
 
 TEST_F(Test__RankOrchestrator, TPSnapshot_LegacyEmbeddingShardingDistinguishesPreAndPostAllreduce)

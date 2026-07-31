@@ -1185,6 +1185,16 @@ namespace llaminar2
         /// Maximum sequence length (buffer allocation sizing)
         int max_seq_len = 4096;
 
+        /**
+         * @brief Maximum rows owned by one resident forward graph family.
+         *
+         * Zero means memory planning has not selected the value yet. The
+         * selected positive value sizes activation buffers, serially shared
+         * kernel workspace, and captured prefill buckets. It never reduces KV
+         * context capacity; longer prompts execute as ordered graph chunks.
+         */
+        int resident_graph_rows = 0;
+
         /// Maximum active request batch size for runner-owned state.
         int batch_size = 1;
 

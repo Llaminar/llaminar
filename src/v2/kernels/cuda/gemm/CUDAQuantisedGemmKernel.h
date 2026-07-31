@@ -616,9 +616,10 @@ namespace llaminar2
              * projections use the two-phase KPAR GEMV reduction, so each side stream
              * needs a disjoint partials arena before launch.
              *
-             * @param projection_count Number of projections launched by the fused
-             *                         stage. Slot 0 uses GEMV_KPAR_PARTIALS and the
-             *                         remaining projection_count-1 slots use
+             * @param projection_count Number of M=1 projections launched by the
+             *                         fused stage. Slot 0 uses
+             *                         GEMV_KPAR_PARTIALS and the remaining
+             *                         projection_count-1 slots use
              *                         CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS.
              */
             void bindConcurrentNativeDecodeScratch(

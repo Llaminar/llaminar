@@ -453,7 +453,10 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
 
     RankExecutionPlan plan;
     plan.runtime = runtime;
+    plan.runtime.resident_graph_rows = 2048;
     InferenceRunnerConfig runner_config = InferenceRunnerConfig::fromPlan(plan);
+    RankOrchestrator::Config rank_config =
+        RankOrchestrator::Config::fromPlan(plan);
 
     GraphConfig graph_config;
     graph_config.prefix_cache = runner_config.prefix_cache;
@@ -478,6 +481,8 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
     EXPECT_EQ(graph_config.mtp.depth_policy.window_size, 8);
     EXPECT_EQ(runtime.batch_size, 4);
     EXPECT_EQ(runner_config.batch_size, 4);
+    EXPECT_EQ(runner_config.activation_seq_len, 2048);
+    EXPECT_EQ(rank_config.resident_graph_rows, 2048);
 }
 
 TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings)

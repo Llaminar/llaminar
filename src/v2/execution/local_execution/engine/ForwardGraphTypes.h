@@ -282,27 +282,6 @@ namespace llaminar2
             classifyForwardReplayStateCache(signature));
     }
 
-    inline ForwardReplayStateAction chooseForwardReplayStateAction(
-        ForwardReplayStateMutationKind mutation,
-        const ForwardGraphSignature &signature,
-        bool graph_has_collective_nodes)
-    {
-        if (mutation == ForwardReplayStateMutationKind::RequestBoundaryStateReset &&
-            signature.decode &&
-            graph_has_collective_nodes)
-        {
-            /*
-             * LocalTP/MoE-overlay decode graphs contain stream-ordered collective
-             * rendezvous state in addition to the stable per-stage buffers. Until
-             * multi-device graph capture gives those rendezvous points a first-class
-             * replay contract, request-boundary clear_cache() must recapture instead
-             * of reusing graph executables captured for the previous request.
-             */
-            return ForwardReplayStateAction::ResetReplayState;
-        }
-        return chooseForwardReplayStateAction(mutation, signature);
-    }
-
     /**
      * @brief Latest runtime metadata observed for a prefill graph-cache entry.
      *

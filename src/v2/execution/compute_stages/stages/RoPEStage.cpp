@@ -727,31 +727,39 @@ namespace llaminar2
 
     StageBufferContract RoPEStage::bufferContract() const
     {
-        if (!params_.q_buffer_id || !params_.k_buffer_id)
-            return {};
-
         auto contract = StageBufferContract::build();
 
-        // Hybrid mode: separate input → output buffers
-        if (params_.Q_out && params_.q_out_buffer_id)
+        /*
+         * Q-only RoPE is a first-class execution mode. Attention variants that
+         * rotate K on read intentionally pass K=nullptr, so requiring both
+         * BufferIds would silently erase Q's ownership declaration and permit
+         * capture to observe an unprepared input. Describe Q and K independently
+         * while retaining the same in-place/separate-output semantics.
+         */
+        if (params_.q_buffer_id)
         {
-            contract.addInput(*params_.q_buffer_id);
-            contract.addOutput(*params_.q_out_buffer_id);
-        }
-        else
-        {
-            // Standard in-place mode
-            contract.addInOut(*params_.q_buffer_id);
+            if (params_.Q_out && params_.q_out_buffer_id)
+            {
+                contract.addInput(*params_.q_buffer_id);
+                contract.addOutput(*params_.q_out_buffer_id);
+            }
+            else
+            {
+                contract.addInOut(*params_.q_buffer_id);
+            }
         }
 
-        if (params_.K_out && params_.k_out_buffer_id)
+        if (params_.k_buffer_id)
         {
-            contract.addInput(*params_.k_buffer_id);
-            contract.addOutput(*params_.k_out_buffer_id);
-        }
-        else
-        {
-            contract.addInOut(*params_.k_buffer_id);
+            if (params_.K_out && params_.k_out_buffer_id)
+            {
+                contract.addInput(*params_.k_buffer_id);
+                contract.addOutput(*params_.k_out_buffer_id);
+            }
+            else
+            {
+                contract.addInOut(*params_.k_buffer_id);
+            }
         }
 
         return contract;

@@ -167,18 +167,15 @@ namespace
     }
 
     /**
-     * @brief Execute one quantized parity cell without granting unit-test
-     * thread counts production dispatch authority.
+     * @brief Execute one quantized parity cell through production dispatch.
      *
-     * The installed CPU decode policy is certified for the production thread
-     * domain.  This unit test deliberately sweeps every thread count from one
-     * through 56 to expose ownership and tail bugs, so an `M=1` cell cannot
-     * truthfully use production `Auto` dispatch at every point in that sweep.
-     * Decode cells therefore request the explicit frozen diagnostic schedule.
-     * The diagnostic uses the same packed weights, activation quantizer, and
-     * vectorized NativeVNNI microkernel as production; only learned task
-     * ownership is bypassed.  Ordinary `M>1` cells still enter the public GEMM
-     * method and consequently exercise the total production prefill heuristic.
+     * Positive OpenMP thread-count totality is part of the installed
+     * NativeVNNI policy contract.  The `M=1` cells therefore use `Auto`
+     * dispatch while this unit test sweeps every width from one through 56.
+     * Forcing the frozen serial oracle here would conceal a missing generated
+     * rule or an invalid learned task-ownership schedule.  Ordinary `M>1`
+     * cells enter the public GEMM method and exercise the total production
+     * prefill heuristic.
      *
      * @param kernel Tensor GEMM created from the quantized test weights.
      * @param input FP32 activation tensor with `M * K` values.
@@ -219,7 +216,7 @@ namespace
             quantized_input.data(),
             output->mutable_data(),
             ISAPath::AUTO,
-            DecodeSchedulePolicy::FrozenSerialOracle);
+            DecodeSchedulePolicy::Auto);
         return true;
     }
 

@@ -12,6 +12,8 @@ namespace llaminar2
     {
         size_t native_bytes = 0; // As stored in GGUF
         size_t device_bytes = 0; // After device-specific packing/repacking
+        size_t prepared_embedding_bytes = 0;
+        size_t tied_lm_head_bytes = 0;
     };
 
     class WeightMemoryEstimator

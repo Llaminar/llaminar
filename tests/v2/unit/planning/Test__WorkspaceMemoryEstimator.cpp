@@ -40,7 +40,12 @@ TEST(Test__WorkspaceMemoryEstimator, PreparedEmbeddingPathDoesNotReserveEmbeddin
     size_t bytes = WorkspaceMemoryEstimator::estimate(
         1, 4096, 5120, 27648, 151936, DeviceId::cuda(0));
 
-    EXPECT_EQ(bytes, 768ULL * 1024 * 1024);
+    const size_t embedding_table_temp =
+        size_t{151936} * size_t{5120} * sizeof(float);
+    EXPECT_GT(bytes, 768ULL * 1024 * 1024)
+        << "grouped-prefill accumulators must scale with resident rows";
+    EXPECT_LT(bytes, embedding_table_temp)
+        << "prepared embedding must not reserve a vocab-by-hidden fallback table";
 }
 
 TEST(Test__WorkspaceMemoryEstimator, VeryLongContextCanExceedFloorFromGemmOverhead)

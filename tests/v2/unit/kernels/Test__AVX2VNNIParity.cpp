@@ -15,9 +15,12 @@
 
 #include <gtest/gtest.h>
 #include <immintrin.h>
+#include <omp.h>
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <random>
 #include <vector>
@@ -177,6 +180,37 @@ namespace avx2_parity_helpers
         EXPECT_GE(cos, 0.999999) << label << " cosine";
         EXPECT_LE(skl, 1.0e-7) << label << " symmetric KL";
     }
+
+    /**
+     * @brief Restore process-global OpenMP controls after a thread sweep.
+     *
+     * GoogleTest fatal assertions unwind the test body, so an RAII guard is
+     * required to prevent one failed thread-totality cell from contaminating
+     * every later CPU unit test in the process.
+     */
+    class ScopedOpenMPControls final
+    {
+    public:
+        ScopedOpenMPControls()
+            : original_threads_(omp_get_max_threads()),
+              original_dynamic_(omp_get_dynamic())
+        {
+            omp_set_dynamic(0);
+        }
+
+        ScopedOpenMPControls(const ScopedOpenMPControls &) = delete;
+        ScopedOpenMPControls &operator=(const ScopedOpenMPControls &) = delete;
+
+        ~ScopedOpenMPControls()
+        {
+            omp_set_num_threads(original_threads_);
+            omp_set_dynamic(original_dynamic_);
+        }
+
+    private:
+        int original_threads_;
+        int original_dynamic_;
+    };
 } // namespace avx2_parity_helpers
 
 using namespace avx2_parity_helpers;
@@ -426,6 +460,241 @@ TEST(CPUNativeVNNIVerifierPolicy, GeneratedRulesCoverAllPositiveThreadCounts)
             1024,
             0,
             policy));
+}
+
+/**
+ * @test Prove generated dispatch has no practical positive-thread holes.
+ *
+ * The broad policy tests above cross formats, geometries, M values, and
+ * arithmetic regimes at representative thread counts.  This orthogonal sweep
+ * holds representative full-K and K-partition geometries fixed while checking
+ * every positive thread count through 4096 plus `INT_MAX`.  Together the tests
+ * catch both topology-specific rule gaps and integer-boundary failures without
+ * multiplying the complete geometry matrix by thousands of redundant widths.
+ */
+TEST(CPUNativeVNNIThreadTotality, GeneratedSelectorsHaveNoPositiveThreadHoles)
+{
+    using generated::CPUNativeVNNIBuildISA;
+    using generated::CPUNativeVNNIDecodeBuildISA;
+    using generated::CPUNativeVNNIDecodePolicy;
+    using generated::CPUNativeVNNIDecodeRuntimeISA;
+    using generated::CPUNativeVNNIRuntimeISA;
+    using generated::CPUNativeVNNIVerifierRowsPolicy;
+
+    constexpr std::array<uint8_t, 18> codebooks{
+        0, 4, 5, 6, 7, 8, 9, 10, 11,
+        12, 13, 14, 15, 16, 17, 19, 20, 21,
+    };
+
+#if LLAMINAR_COMPILED_WITH_AVX512
+    constexpr std::array decode_runtime_regimes{
+        std::pair{CPUNativeVNNIDecodeBuildISA::AVX512,
+                  CPUNativeVNNIDecodeRuntimeISA::AVX2},
+        std::pair{CPUNativeVNNIDecodeBuildISA::AVX512,
+                  CPUNativeVNNIDecodeRuntimeISA::AVX512},
+    };
+    constexpr std::array verifier_runtime_regimes{
+        std::pair{CPUNativeVNNIBuildISA::AVX512,
+                  CPUNativeVNNIRuntimeISA::AVX2},
+        std::pair{CPUNativeVNNIBuildISA::AVX512,
+                  CPUNativeVNNIRuntimeISA::AVX512},
+    };
+#else
+    constexpr std::array decode_runtime_regimes{
+        std::pair{CPUNativeVNNIDecodeBuildISA::AVX2,
+                  CPUNativeVNNIDecodeRuntimeISA::AVX2},
+    };
+    constexpr std::array verifier_runtime_regimes{
+        std::pair{CPUNativeVNNIBuildISA::AVX2,
+                  CPUNativeVNNIRuntimeISA::AVX2},
+    };
+#endif
+
+    const auto verify_thread_count = [&](int threads)
+    {
+        for (const uint8_t codebook : codebooks)
+        {
+            for (const auto [build_isa, runtime_isa] : decode_runtime_regimes)
+            {
+                CPUNativeVNNIDecodePolicy full_k_policy{};
+                ASSERT_TRUE(
+                    generated::selectCPUNativeVNNIDecodeGeneratedPolicy(
+                        build_isa,
+                        runtime_isa,
+                        threads,
+                        codebook,
+                        512,
+                        256,
+                        false,
+                        1,
+                        full_k_policy))
+                    << "full-K decode threads=" << threads
+                    << " codebook=" << static_cast<int>(codebook);
+
+                CPUNativeVNNIDecodePolicy kpart_policy{};
+                ASSERT_TRUE(
+                    generated::selectCPUNativeVNNIDecodeGeneratedPolicy(
+                        build_isa,
+                        runtime_isa,
+                        threads,
+                        codebook,
+                        64,
+                        8192,
+                        true,
+                        8,
+                        kpart_policy))
+                    << "K-part decode threads=" << threads
+                    << " codebook=" << static_cast<int>(codebook);
+            }
+
+            for (const auto [build_isa, runtime_isa] : verifier_runtime_regimes)
+            {
+                CPUNativeVNNIVerifierRowsPolicy full_k_policy{};
+                ASSERT_TRUE(
+                    generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+                        build_isa,
+                        runtime_isa,
+                        threads,
+                        codebook,
+                        3,
+                        512,
+                        256,
+                        0,
+                        full_k_policy))
+                    << "full-K verifier threads=" << threads
+                    << " codebook=" << static_cast<int>(codebook);
+
+                CPUNativeVNNIVerifierRowsPolicy kpart_policy{};
+                ASSERT_TRUE(
+                    generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+                        build_isa,
+                        runtime_isa,
+                        threads,
+                        codebook,
+                        15,
+                        64,
+                        8192,
+                        8,
+                        kpart_policy))
+                    << "K-part verifier threads=" << threads
+                    << " codebook=" << static_cast<int>(codebook);
+            }
+        }
+    };
+
+    for (int threads = 1; threads <= 4096; ++threads)
+        verify_thread_count(threads);
+    verify_thread_count(std::numeric_limits<int>::max());
+}
+
+/**
+ * @test Execute production decode and grouped verifier across CPU team sizes.
+ *
+ * The generated selector test proves dispatch lookup totality without
+ * launching thousands of oversized OpenMP teams.  This execution regression
+ * complements it with every thread width from one through the OpenMP runtime's
+ * available-processor count, capped at 64 for unit-test latency, plus awkward
+ * non-power-of-two widths. Both full-K and serial K-partition geometries run
+ * through production `Auto` dispatch. Every grouped row must be byte-identical
+ * to a production M=1 invocation under the same runtime thread topology.
+ */
+TEST(CPUNativeVNNIThreadTotality, ProductionDecodeAndGroupedVerifierExecute)
+{
+    if (!cpu_supports_avx2())
+        GTEST_SKIP() << "NativeVNNI production kernels require AVX2";
+
+    ScopedOpenMPControls openmp_guard;
+    constexpr int M = 3;
+    const int bounded_runtime_width =
+        std::clamp(omp_get_num_procs(), 1, 64);
+
+    std::vector<int> execution_widths;
+    execution_widths.reserve(static_cast<size_t>(bounded_runtime_width) + 4);
+    for (int threads = 1; threads <= bounded_runtime_width; ++threads)
+        execution_widths.push_back(threads);
+    for (const int threads : {27, 31, 56, 63})
+    {
+        if (std::find(execution_widths.begin(), execution_widths.end(), threads) ==
+            execution_widths.end())
+        {
+            execution_widths.push_back(threads);
+        }
+    }
+
+    struct Geometry
+    {
+        int n;
+        int k;
+        uint32_t seed;
+        const char *label;
+    };
+    constexpr std::array geometries{
+        Geometry{512, 256, 0x7100u, "full-K"},
+        Geometry{64, 8192, 0x7200u, "K-partitioned"},
+    };
+
+    for (const Geometry &geometry : geometries)
+    {
+        SCOPED_TRACE(geometry.label);
+        auto weights = TestTensorFactory::createQ4_0Random(
+            {static_cast<size_t>(geometry.n),
+             static_cast<size_t>(geometry.k)},
+            geometry.seed);
+        ASSERT_NE(weights, nullptr);
+        const CPUNativeVNNIPackedWeights packed = packWeights(weights.get());
+
+        std::vector<Q8_1Block> activations(
+            static_cast<size_t>(M) * packed.blocks_per_row);
+        for (int row = 0; row < M; ++row)
+        {
+            const auto row_blocks =
+                createRandomQ8_1(geometry.k, geometry.seed + row + 1);
+            std::copy(
+                row_blocks.begin(),
+                row_blocks.end(),
+                activations.begin() +
+                    static_cast<size_t>(row) * packed.blocks_per_row);
+        }
+
+        std::vector<float> serial(
+            static_cast<size_t>(M) * geometry.n);
+        std::vector<float> grouped(
+            static_cast<size_t>(M) * geometry.n);
+
+        for (const int threads : execution_widths)
+        {
+            SCOPED_TRACE(::testing::Message() << "threads=" << threads);
+            omp_set_num_threads(threads);
+            std::fill(serial.begin(), serial.end(), 0.0f);
+            std::fill(grouped.begin(), grouped.end(), 0.0f);
+
+            for (int row = 0; row < M; ++row)
+            {
+                gemv_native_vnni_preq(
+                    packed,
+                    activations.data() +
+                        static_cast<size_t>(row) * packed.blocks_per_row,
+                    serial.data() + static_cast<size_t>(row) * geometry.n,
+                    ISAPath::AUTO,
+                    DecodeSchedulePolicy::Auto);
+            }
+            gemm_native_vnni_preq_decode_equivalent_rows(
+                packed,
+                activations.data(),
+                grouped.data(),
+                M,
+                geometry.n);
+
+            EXPECT_EQ(
+                std::memcmp(
+                    grouped.data(),
+                    serial.data(),
+                    grouped.size() * sizeof(float)),
+                0)
+                << geometry.label << " grouped verifier differs from "
+                << "production serial decode at threads=" << threads;
+        }
+    }
 }
 
 /**

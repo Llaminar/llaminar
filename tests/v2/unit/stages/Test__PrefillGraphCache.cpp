@@ -383,6 +383,24 @@ TEST(Test__PrefillGraphCache, BucketSelection_NormalizesConfiguredBuckets)
     EXPECT_EQ(selection.bucket_seq_len, 256);
 }
 
+TEST(Test__PrefillGraphCache, ResidentCapacityFiltersLargerBucketsAndRemainsTotal)
+{
+    const auto bounded = prefillGraphBucketsAtOrBelowCapacity(
+        {64, 128, 256, 512, 1024, 2048, 4096},
+        2048);
+
+    EXPECT_EQ(
+        bounded,
+        (std::vector<int>{64, 128, 256, 512, 1024, 2048}));
+    EXPECT_TRUE(selectPrefillGraphBucket(2048, bounded));
+    EXPECT_FALSE(selectPrefillGraphBucket(2049, bounded));
+
+    const auto below_default_minimum =
+        prefillGraphBucketsAtOrBelowCapacity({64, 128}, 32);
+    EXPECT_EQ(below_default_minimum, (std::vector<int>{32}))
+        << "short-context runners still need one total graph boundary";
+}
+
 TEST(Test__PrefillGraphCache, BucketPadding_CopiesRealTokensAndPadsTail)
 {
     const int tokens[] = {10, 11, 12};

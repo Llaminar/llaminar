@@ -11,6 +11,7 @@
 #include "CUDABackend.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
+#include "../../utils/VramBillOfMaterials.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
@@ -478,6 +479,19 @@ namespace llaminar2
         }
 
         LOG_TRACE("[CUDABackend::allocate] ALLOC ptr=" << ptr << " bytes=" << bytes << " device_id=" << device_id);
+        if (vramBomEnabled())
+        {
+            size_t free_after = 0;
+            size_t total_bytes = 0;
+            (void)cudaMemGetInfo(&free_after, &total_bytes);
+            logVramBomLine(
+                "backend_allocation",
+                "backend=cuda action=allocate device=" + std::to_string(device_id) +
+                    " ptr=" + vramBomPointer(ptr) +
+                    " " + vramBomBytes(bytes) +
+                    " free_after_bytes=" + std::to_string(free_after) +
+                    " total_bytes=" + std::to_string(total_bytes));
+        }
         return ptr;
     }
 
@@ -504,11 +518,25 @@ namespace llaminar2
             return;
         }
 
+        const std::string bom_ptr =
+            vramBomEnabled() ? vramBomPointer(ptr) : std::string{};
         err = cudaFree(ptr);
         if (err != cudaSuccess)
         {
             LOG_DEBUG("[CUDABackend] cudaFree failed for ptr=" << std::hex << ptr << std::dec
                                                                << " on device " << device_id << ": " << cudaGetErrorString(err));
+        }
+        else if (vramBomEnabled())
+        {
+            size_t free_after = 0;
+            size_t total_bytes = 0;
+            (void)cudaMemGetInfo(&free_after, &total_bytes);
+            logVramBomLine(
+                "backend_allocation",
+                "backend=cuda action=free device=" + std::to_string(device_id) +
+                    " ptr=" + bom_ptr +
+                    " free_after_bytes=" + std::to_string(free_after) +
+                    " total_bytes=" + std::to_string(total_bytes));
         }
     }
 
@@ -853,6 +881,11 @@ namespace llaminar2
         const float *data, int n, int k, float top_p, float temperature,
         unsigned long long rng_seed, unsigned long long rng_offset,
         int *out_token, int device_idx, void *stream);
+    extern "C" bool cudaOps_publish_int32_control_scalar(
+        int32_t value,
+        int32_t *out_value,
+        int device_idx,
+        void *stream);
     extern "C" bool cudaOps_topk_topp_distribution_f32(
         const float *data, int n, int k, float top_p, float temperature,
         int *out_token_ids, float *out_probs,
@@ -1596,6 +1629,26 @@ namespace llaminar2
             static_cast<unsigned long long>(rng_seed),
             static_cast<unsigned long long>(rng_offset),
             static_cast<int *>(out_token_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueuePublishInt32ControlScalarDevice(
+        int32_t value,
+        void *out_value_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            value < 0 || !out_value_device || !stream)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_publish_int32_control_scalar(
+            value,
+            static_cast<int32_t *>(out_value_device),
             device_id,
             stream);
     }

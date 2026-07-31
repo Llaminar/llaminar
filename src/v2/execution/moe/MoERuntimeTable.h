@@ -10,9 +10,11 @@
 #include "../../backends/DeviceId.h"
 #include "../../tensors/TensorKernels.h"
 
-#include <cstdint>
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <memory>
 #include <type_traits>
 #include <vector>
 
@@ -22,6 +24,17 @@ namespace llaminar2
     class DecodeExpertHistogram;
 
     inline constexpr uint32_t kDeviceMoEMaxExperts = 256;
+    /**
+     * @brief Largest transfer-directory slot representable by the runtime ABI.
+     *
+     * Logical expert IDs index fixed per-layer arrays and remain bounded by
+     * @ref kDeviceMoEMaxExperts. Transfer slots instead name physical payload
+     * allocations shared across every layer. Their descriptor field is signed
+     * so negative values can remain invalid sentinels; positive slot IDs are
+     * therefore total through INT32_MAX and are constrained in practice by the
+     * directory's VRAM preflight, not by the number of experts in one layer.
+     */
+    inline constexpr uint32_t kDeviceMoEMaxTransferSlots = 0x7fffffffu;
     inline constexpr uint32_t kDeviceMoEMaxTopK = 16;
     inline constexpr uint32_t kDeviceMoEMaxParticipants = 8;
 
@@ -278,6 +291,93 @@ namespace llaminar2
         std::vector<uint64_t> local_histogram;
     };
 
+    /**
+     * @brief Device pointers backing one serial MoE route-planning transaction.
+     *
+     * These buffers contain only transient route/grouping data. They do not
+     * contain graph-specific placement banks, epochs, or histograms. A graph
+     * builder may therefore bind several non-concurrent runtime tables to the
+     * same allocation while preserving independent placement metadata.
+     */
+    struct DeviceMoEPrefillRouteScratchBindings
+    {
+        int32_t *route_expert_ids = nullptr;
+        float *route_weights = nullptr;
+        int32_t *route_participant_ids = nullptr;
+        int32_t *expert_counts = nullptr;
+        int32_t *expert_offsets = nullptr;
+        int32_t *grouped_token_ids = nullptr;
+        float *grouped_route_weights = nullptr;
+        int32_t *llep_split_ends = nullptr;
+        least_loaded_ep::LeastLoadedExpertAssignmentSpan *llep_assignment_spans = nullptr;
+        least_loaded_ep::LeastLoadedExpertWeightTransfer *llep_weight_transfers = nullptr;
+        uint32_t token_capacity = 0;
+        uint32_t route_capacity = 0;
+        uint32_t expert_capacity = 0;
+        uint32_t llep_plan_capacity = 0;
+    };
+
+    /**
+     * @brief Immutable per-device scratch arena shared by serial GPU graphs.
+     *
+     * CUDA and HIP graph executables capture every pointer in @ref bindings_.
+     * The arena consequently allocates its maximum capacity exactly once and
+     * never exposes a resize operation. Main-model prefill, grouped verifier,
+     * and MTP sidecar runtime tables may share it only when their execution is
+     * ordered by one stream or an explicit producer/consumer event handoff.
+     *
+     * Placement tables remain graph-specific. Sharing this arena therefore
+     * saves transient VRAM without allowing request resets or placement epochs
+     * from one graph role to mutate another role's metadata.
+     */
+    class DeviceMoESerialRouteScratchArena final
+    {
+    public:
+        struct Config
+        {
+            DeviceId device_id = DeviceId::cpu();
+            int num_experts = 0;
+            int top_k = 0;
+            int token_capacity = 0;
+        };
+
+        explicit DeviceMoESerialRouteScratchArena(Config config);
+        ~DeviceMoESerialRouteScratchArena();
+
+        DeviceMoESerialRouteScratchArena(
+            const DeviceMoESerialRouteScratchArena &) = delete;
+        DeviceMoESerialRouteScratchArena &operator=(
+            const DeviceMoESerialRouteScratchArena &) = delete;
+        DeviceMoESerialRouteScratchArena(
+            DeviceMoESerialRouteScratchArena &&) = delete;
+        DeviceMoESerialRouteScratchArena &operator=(
+            DeviceMoESerialRouteScratchArena &&) = delete;
+
+        const DeviceId &deviceId() const noexcept { return device_id_; }
+        int expertCount() const noexcept { return num_experts_; }
+        int topK() const noexcept { return top_k_; }
+        int tokenCapacity() const noexcept
+        {
+            return static_cast<int>(bindings_.token_capacity);
+        }
+        /**
+         * @brief Return the requested device bytes owned by this arena.
+         *
+         * This is the sum of the ten immutable scratch allocations. It excludes
+         * allocator bookkeeping and alignment padding, making it stable enough
+         * for PerfStats and VRAM bill-of-materials regression checks.
+         */
+        size_t allocationBytes() const noexcept;
+
+    private:
+        friend class DeviceMoERuntimeTable;
+
+        DeviceId device_id_;
+        int num_experts_ = 0;
+        int top_k_ = 0;
+        DeviceMoEPrefillRouteScratchBindings bindings_;
+    };
+
     class IMoERuntimeTable
     {
     public:
@@ -326,6 +426,16 @@ namespace llaminar2
             int top_k = 0;
             bool mirror_to_device = false;
             int prefill_token_capacity = 0;
+            /**
+             * @brief Optional immutable scratch owned by a serial graph domain.
+             *
+             * When present, every layer in this table binds the same stable
+             * addresses and @ref ensurePrefillRouteScratchCapacity becomes a
+             * validation-only operation. Exceeding the arena capacity is a
+             * fatal planning error; captured addresses are never replaced.
+             */
+            std::shared_ptr<DeviceMoESerialRouteScratchArena>
+                serial_route_scratch_arena;
         };
 
         explicit DeviceMoERuntimeTable(Config config);
@@ -419,6 +529,10 @@ namespace llaminar2
         int expertCount() const noexcept { return num_experts_; }
         int topK() const noexcept { return top_k_; }
         bool isMirroredToDevice() const noexcept { return mirror_to_device_; }
+        bool usesImmutableSerialRouteScratch() const noexcept
+        {
+            return serial_route_scratch_arena_ != nullptr;
+        }
 
     private:
         DeviceId device_id_;
@@ -445,31 +559,21 @@ namespace llaminar2
         DeviceMoELayerRuntime *device_empty_layers_ = nullptr;
         void *decode_histogram_producer_stream_ = nullptr;
 
-        struct PrefillRouteScratchAllocation
-        {
-            int32_t *route_expert_ids = nullptr;
-            float *route_weights = nullptr;
-            int32_t *route_participant_ids = nullptr;
-            int32_t *expert_counts = nullptr;
-            int32_t *expert_offsets = nullptr;
-            int32_t *grouped_token_ids = nullptr;
-            float *grouped_route_weights = nullptr;
-            int32_t *llep_split_ends = nullptr;
-            least_loaded_ep::LeastLoadedExpertAssignmentSpan *llep_assignment_spans = nullptr;
-            least_loaded_ep::LeastLoadedExpertWeightTransfer *llep_weight_transfers = nullptr;
-            uint32_t token_capacity = 0;
-            uint32_t route_capacity = 0;
-            uint32_t expert_capacity = 0;
-            uint32_t llep_plan_capacity = 0;
-        };
-        std::vector<PrefillRouteScratchAllocation> prefill_route_scratch_;
+        std::shared_ptr<DeviceMoESerialRouteScratchArena>
+            serial_route_scratch_arena_;
+        std::vector<DeviceMoEPrefillRouteScratchBindings>
+            prefill_route_scratch_;
 
         void validateLayerIndex(int layer_idx) const;
         void validateUpdate(int layer_idx, const MoEPlacementUpdate &update) const;
         void resetLayer(DeviceMoELayerRuntime &state) const;
         void captureInitialLayerStateIfNeeded(int layer_idx, void *stream);
-        bool prefillRouteScratchAllocationHasCapacity(const PrefillRouteScratchAllocation &allocation,
-                                                      int token_capacity) const;
+        bool prefillRouteScratchAllocationHasCapacity(
+            const DeviceMoEPrefillRouteScratchBindings &allocation,
+            int token_capacity) const;
+        void bindPrefillRouteScratchToLayer(
+            int layer_idx,
+            const DeviceMoEPrefillRouteScratchBindings &allocation);
         void allocateDeviceMirror();
         void releaseDeviceMirror() noexcept;
         void allocatePrefillRouteScratchForLayer(int layer_idx, int token_capacity);

@@ -5838,6 +5838,53 @@ namespace llaminar2
                 continue;
             }
 
+            /*
+             * Quantized embeddings have one production representation on a
+             * GPU: PreparedEmbeddingWeights. Preparing that representation
+             * here keeps it inside the device-preparation lifecycle and avoids
+             * uploading a raw quantized tensor that no execution stage reads.
+             *
+             * Do this before pointer de-duplication. A tied embedding/LM-head
+             * tensor may legitimately need both an embedding representation
+             * and a GEMM representation, and those representations have
+             * independent binding identities.
+             */
+            if (binding.identity.role == WeightRole::Embedding &&
+                dynamic_cast<const IINT8Unpackable *>(binding.tensor))
+            {
+                WeightBinding prepared_binding = binding;
+                prepared_binding.residency.home_device = target_device;
+                prepared_binding.residency.resident_device = target_device;
+
+                auto store = preparedWeightStore();
+                if (!store->preparedRefForBinding(
+                        prepared_binding.binding_id,
+                        target_device)
+                         .has_value())
+                {
+                    const size_t vocab_offset =
+                        prepared_binding.slice.row_start;
+                    const size_t total_vocab =
+                        prepared_binding.slice.source_rows > 0
+                            ? prepared_binding.slice.source_rows
+                            : prepared_binding.tensor->rows();
+                    store->prepareEmbedding(
+                        prepared_binding,
+                        static_cast<int>(prepared_binding.tensor->cols()),
+                        vocab_offset,
+                        total_vocab);
+                }
+
+                markPrepState(
+                    name,
+                    target_device,
+                    WeightPrepState::READY,
+                    false,
+                    "quantized embedding prepared without raw device upload");
+                ++uploaded_count;
+                continue;
+            }
+
             TensorBase *tensor = binding.tensor;
             if (!visited.insert(tensor).second)
                 continue;

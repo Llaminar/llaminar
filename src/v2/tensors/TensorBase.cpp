@@ -13,6 +13,7 @@
 #include "../utils/DebugEnv.h"
 #include "../utils/StackTrace.h"
 #include "../utils/KernelProfiler.h"
+#include "../utils/VramBillOfMaterials.h"
 #include "../backends/BackendManager.h"
 #include "../backends/ComputeBackend.h"
 #include "../backends/DeviceId.h"
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <vector>
 #include <chrono>
+#include <sstream>
 #include <omp.h>
 
 #ifdef HAVE_ROCM
@@ -1084,6 +1086,28 @@ namespace llaminar2
             // or HOST_AUTHORITATIVE from the release above, and MUTABLE_HOST_ACCESS
             // from HOST_ONLY → HOST_ONLY which is correct but less descriptive).
             setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
+
+            if (vramBomEnabled())
+            {
+                std::ostringstream shape_text;
+                shape_text << "[";
+                const auto &tensor_shape = shape();
+                for (size_t axis = 0; axis < tensor_shape.size(); ++axis)
+                {
+                    if (axis != 0)
+                        shape_text << "x";
+                    shape_text << tensor_shape[axis];
+                }
+                shape_text << "]";
+                logVramBomLine(
+                    "tensor_device_owner",
+                    "action=bind device=" + target_device.toString() +
+                        " ptr=" + vramBomPointer(gpu_data_ptr_) +
+                        " name=" + (debugName().empty() ? std::string{"(unnamed)"} : debugName()) +
+                        " shape=" + shape_text.str() +
+                        " dtype=" + dtype_name() +
+                        " " + vramBomBytes(bytes));
+            }
 
             LOG_TRACE("[TensorBase::allocateOnDevice] Allocated " << bytes
                                                                   << " bytes on device " << target_device.toString()

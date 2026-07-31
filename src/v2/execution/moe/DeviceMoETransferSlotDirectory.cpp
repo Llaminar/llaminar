@@ -204,9 +204,12 @@ namespace llaminar2
             static_cast<uint64_t>(transfer_wave_slots) *
             static_cast<uint64_t>(transfer_buffer_count);
         const uint64_t total_slots = requested_active_slots + staging_slots;
-        if (requested_active_slots > static_cast<uint64_t>(kDeviceMoEMaxExperts) ||
-            staging_slots > static_cast<uint64_t>(kDeviceMoEMaxExperts) ||
-            total_slots > static_cast<uint64_t>(kDeviceMoEMaxExperts))
+        if (requested_active_slots >
+                static_cast<uint64_t>(kDeviceMoEMaxTransferSlots) ||
+            staging_slots >
+                static_cast<uint64_t>(kDeviceMoEMaxTransferSlots) ||
+            total_slots >
+                static_cast<uint64_t>(kDeviceMoEMaxTransferSlots))
         {
             throw std::invalid_argument(
                 "DeviceMoETransferSlotDirectory buffered capacity exceeds the "
@@ -214,7 +217,8 @@ namespace llaminar2
                 std::to_string(requested_active_slots) +
                 " staging=" + std::to_string(staging_slots) +
                 " total=" + std::to_string(total_slots) +
-                " maximum=" + std::to_string(kDeviceMoEMaxExperts));
+                " maximum=" +
+                std::to_string(kDeviceMoEMaxTransferSlots));
         }
 
         return BufferedCapacity{

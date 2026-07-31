@@ -1395,6 +1395,7 @@ TEST(Test__Qwen35MoEGraph, MTPAllPositionVerifierUsesMirroredGDNStateWhenHandoff
     config.dense_tp_enabled = true;
     config.dense_tp_decode_replicated = true;
     config.compute_all_position_logits = true;
+    config.grouped_mtp_verifier = true;
     config.mtp.enabled = true;
     config.mtp.draft_tokens = 1;
     config.tp_device_idx = 0;

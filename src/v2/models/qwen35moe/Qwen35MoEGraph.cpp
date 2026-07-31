@@ -26,6 +26,7 @@
 #include "../../loaders/GPUVramPreflight.h"
 #include "../../memory/BufferId.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
+#include "../../planning/ActivationBufferSizing.h"
 #include "../../tensors/NativeVnniFormatInfo.h"
 #include "../../tensors/Tensors.h"
 #include "../../utils/DebugEnv.h"
@@ -2269,6 +2270,61 @@ namespace llaminar2
         if (!device.is_gpu() || config_.moe.num_experts <= 0 || config_.moe.top_k <= 0 || table_layers <= 0)
             return nullptr;
 
+        /*
+         * Graph executables freeze direct route-scratch pointers. Allocate the
+         * complete serial execution domain before the first graph is built:
+         * ordinary prefill needs the largest configured graph bucket, while
+         * grouped verification and request-batched MTP need their flattened
+         * target-row capacity. Every role is event/stream ordered by the
+         * orchestrator, so one largest-participant arena is both correct and
+         * substantially smaller than one allocation per layer and MTP depth.
+         */
+        const int prefill_graph_rows =
+            resolveActivationBufferSeqLen(config_.max_seq_len, device);
+        const int verifier_rows =
+            config_.mtp.enabled
+                ? resolveMTPMaxTargetQueryRows(config_.mtp)
+                : 1;
+        const int planned_route_rows =
+            std::max({
+                1,
+                prefill_token_capacity,
+                prefill_graph_rows,
+                verifier_rows,
+            });
+        const std::string scratch_key = device.to_string();
+        auto scratch_it =
+            moe_serial_route_scratch_arenas_.find(scratch_key);
+        if (scratch_it == moe_serial_route_scratch_arenas_.end())
+        {
+            DeviceMoESerialRouteScratchArena::Config scratch_config;
+            scratch_config.device_id = device;
+            scratch_config.num_experts = config_.moe.num_experts;
+            scratch_config.top_k = config_.moe.top_k;
+            scratch_config.token_capacity = planned_route_rows;
+            scratch_it = moe_serial_route_scratch_arenas_
+                             .emplace(
+                                 scratch_key,
+                                 std::make_shared<
+                                     DeviceMoESerialRouteScratchArena>(
+                                     scratch_config))
+                             .first;
+        }
+        else if (!scratch_it->second ||
+                 scratch_it->second->tokenCapacity() < planned_route_rows)
+        {
+            throw std::logic_error(
+                "Qwen35 MoE graph requested route scratch beyond the immutable "
+                "per-device plan for " +
+                device.to_string() +
+                ": requested=" + std::to_string(planned_route_rows) +
+                " planned=" +
+                std::to_string(
+                    scratch_it->second
+                        ? scratch_it->second->tokenCapacity()
+                        : 0));
+        }
+
         const std::string key = key_suffix.empty()
                                     ? device.to_string()
                                     : device.to_string() + "#" + key_suffix;
@@ -2302,7 +2358,8 @@ namespace llaminar2
         table_config.num_experts = config_.moe.num_experts;
         table_config.top_k = config_.moe.top_k;
         table_config.mirror_to_device = true;
-        table_config.prefill_token_capacity = std::max(0, prefill_token_capacity);
+        table_config.prefill_token_capacity = planned_route_rows;
+        table_config.serial_route_scratch_arena = scratch_it->second;
 
         auto table = std::make_unique<MoERuntimeTable>(table_config);
         IMoERuntimeTable *ptr = table.get();
@@ -2802,7 +2859,9 @@ namespace llaminar2
             overlay_plan &&
             canUseLocalTPExpertIdApportionedFastPath(*overlay_plan, device);
         const bool masked_local_tp_apportioned_decode_runtime_table =
-            device_side_graph_rebalance_candidate &&
+            (local_decode_layer ||
+             (mtp_sidecar_context && total_tokens == 1)) &&
+            device.is_gpu() &&
             !use_expert_overlay &&
             config_.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned &&
             config_.moe.local_expert_count >= 0 &&
@@ -2812,12 +2871,6 @@ namespace llaminar2
             static_full_local_expert_ownership ||
             masked_local_tp_overlay_decode_runtime_table ||
             masked_local_tp_apportioned_decode_runtime_table;
-        const bool allow_eager_partial_owner_gpu_route =
-            device.is_gpu() &&
-            total_tokens == 1 &&
-            !static_full_local_expert_ownership &&
-            (config_.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned ||
-             use_expert_overlay);
         if (total_tokens == 1 &&
             rocm_env.moe_grouped_decode &&
             rocm_env.moe_device_routed_decode &&
@@ -2825,7 +2878,7 @@ namespace llaminar2
         {
             moe_runtime_table = moeRuntimeTableForDevice(
                 device,
-                0,
+                total_tokens,
                 runtime_table_suffix,
                 runtime_table_layers,
                 register_runtime_histogram_for_decode);
@@ -2844,7 +2897,7 @@ namespace llaminar2
             // decode producer stream.
             moe_runtime_table = moeRuntimeTableForDevice(
                 device,
-                0,
+                total_tokens,
                 runtime_table_suffix,
                 runtime_table_layers,
                 /*register_decode_histogram=*/false);
@@ -4268,8 +4321,6 @@ namespace llaminar2
                 forceGroupedMoEVerifierPrefill(device);
             route_params.routed_pipeline_kernel_owner =
                 routed_pipeline_kernel_owner;
-            route_params.allow_eager_gpu_single_row_route_for_partial_expert_owner =
-                allow_eager_partial_owner_gpu_route;
             route_params.force_decode_equivalent_verifier_prefill =
                 forceDecodeEquivalentMoERouting(device);
             route_params.output_indices = routing_indices;

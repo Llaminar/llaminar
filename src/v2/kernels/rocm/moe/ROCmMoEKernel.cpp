@@ -522,6 +522,8 @@ extern "C"
         void *wave_state,
         void *controller_state,
         uint32_t command_buffer_count,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
         int device_idx,
         void *stream);
 
@@ -4345,10 +4347,10 @@ namespace llaminar2
         DeviceMoERebalanceCommandBufferHeader *command_header,
         DeviceMoERebalanceWaveState *wave_state,
         DeviceMoERebalanceGraphControllerState *controller_state,
-        uint32_t command_buffer_count)
+        uint32_t command_buffer_count,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::runDeviceRebalanceController] invalid device rebalance config");
@@ -4362,6 +4364,9 @@ namespace llaminar2
         void *stream = explicitMoELaunchStream(launch, "runDeviceRebalanceController");
         if (!stream)
             return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "runDeviceRebalanceController"))
             return false;
 
@@ -4378,6 +4383,8 @@ namespace llaminar2
             wave_state,
             controller_state,
             command_buffer_count,
+            local_transfer_slots,
+            local_transfer_slot_count,
             device_ordinal_,
             stream);
     }
@@ -4391,8 +4398,6 @@ namespace llaminar2
         const DeviceMoERebalanceGraphControllerState *controller_state,
         uint32_t command_buffer_count)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceHistograms] invalid device rebalance config");
@@ -4406,6 +4411,9 @@ namespace llaminar2
         void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceHistograms");
         if (!stream)
             return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceHistograms"))
             return false;
 
@@ -4426,8 +4434,6 @@ namespace llaminar2
         DeviceMoEExpertDirectoryEntry *local_directory,
         const DeviceMoERebalanceConfig &config)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceDirectory] invalid device rebalance config");
@@ -4441,6 +4447,9 @@ namespace llaminar2
         void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceDirectory");
         if (!stream)
             return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceDirectory"))
             return false;
 
@@ -4463,8 +4472,6 @@ namespace llaminar2
         DeviceMoERebalanceGraphControllerState *controller_state,
         uint32_t command_buffer_count)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceSourceDescriptors] invalid device rebalance config");
@@ -4479,6 +4486,9 @@ namespace llaminar2
         void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceSourceDescriptors");
         if (!stream)
             return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceSourceDescriptors"))
             return false;
 
@@ -4512,8 +4522,6 @@ namespace llaminar2
         const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
         uint32_t local_transfer_slot_count)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::projectDeviceRebalanceDomainCommands] invalid device rebalance config");
@@ -4530,6 +4538,9 @@ namespace llaminar2
         void *stream = explicitMoELaunchStream(launch, "projectDeviceRebalanceDomainCommands");
         if (!stream)
             return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "projectDeviceRebalanceDomainCommands"))
             return false;
 
@@ -4568,8 +4579,6 @@ namespace llaminar2
         uint32_t local_transfer_slot_count,
         uint32_t command_buffer_count)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::projectPrefillLeastLoadedDomainCommands] invalid device rebalance config");
@@ -4587,6 +4596,9 @@ namespace llaminar2
         void *stream = explicitMoELaunchStream(launch, "projectPrefillLeastLoadedDomainCommands");
         if (!stream)
             return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "projectPrefillLeastLoadedDomainCommands"))
             return false;
 
@@ -4621,8 +4633,6 @@ namespace llaminar2
         uint32_t layer_idx,
         uint32_t command_buffer_count)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::materializePrefillLeastLoadedTransferCommands] invalid device rebalance config");
@@ -4643,6 +4653,9 @@ namespace llaminar2
         void *stream = explicitMoELaunchStream(launch, "materializePrefillLeastLoadedTransferCommands");
         if (!stream)
             return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "materializePrefillLeastLoadedTransferCommands"))
             return false;
 
@@ -4675,8 +4688,6 @@ namespace llaminar2
         DeviceMoERebalanceGraphControllerState *controller_state,
         uint32_t command_buffer_count)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceCompactPayloads] invalid device rebalance config");
@@ -4693,6 +4704,9 @@ namespace llaminar2
         void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceCompactPayloads");
         if (!stream)
             return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceCompactPayloads"))
             return false;
 
@@ -4725,8 +4739,6 @@ namespace llaminar2
         const DeviceMoERebalanceCommandBufferHeader *command_header,
         int target_layer)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::applyDeviceRebalanceArrivals] invalid device rebalance config");
@@ -4741,6 +4753,9 @@ namespace llaminar2
         void *stream = explicitMoELaunchStream(launch, "applyDeviceRebalanceArrivals");
         if (!stream)
             return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "applyDeviceRebalanceArrivals"))
             return false;
 
@@ -4773,8 +4788,6 @@ namespace llaminar2
         DeviceMoERebalanceGraphControllerState *controller_state,
         uint32_t command_buffer_count)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceCollectivePayloads] invalid device rebalance config");
@@ -4791,6 +4804,9 @@ namespace llaminar2
         void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceCollectivePayloads");
         if (!stream)
             return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceCollectivePayloads"))
             return false;
 
@@ -4826,8 +4842,6 @@ namespace llaminar2
         DeviceMoERebalanceGraphControllerState *controller_state,
         uint32_t command_buffer_count)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::unpackDeviceRebalanceCollectivePayloads] invalid device rebalance config");
@@ -4844,6 +4858,9 @@ namespace llaminar2
         void *stream = explicitMoELaunchStream(launch, "unpackDeviceRebalanceCollectivePayloads");
         if (!stream)
             return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "unpackDeviceRebalanceCollectivePayloads"))
             return false;
 
@@ -4870,8 +4887,6 @@ namespace llaminar2
         DeviceMoERebalanceGraphControllerState *controller_state,
         const DeviceMoERebalanceConfig &config)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::initializeDeviceRebalanceGraphController] invalid device rebalance config");
@@ -4883,6 +4898,11 @@ namespace llaminar2
             return false;
         }
         void *stream = explicitMoELaunchStream(launch, "initializeDeviceRebalanceGraphController");
+        if (!stream)
+            return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "initializeDeviceRebalanceGraphController"))
             return false;
 
@@ -4905,8 +4925,6 @@ namespace llaminar2
         const DeviceMoERebalanceConfig &config,
         uint32_t command_buffer_count)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::publishDeviceRebalanceTransferComplete] invalid device rebalance config");
@@ -4919,6 +4937,11 @@ namespace llaminar2
             return false;
         }
         void *stream = explicitMoELaunchStream(launch, "publishDeviceRebalanceTransferComplete");
+        if (!stream)
+            return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "publishDeviceRebalanceTransferComplete"))
             return false;
 
@@ -4951,8 +4974,6 @@ namespace llaminar2
         int target_layer,
         uint32_t command_buffer_count)
     {
-        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
-
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::applyReadyDeviceRebalanceWave] invalid device rebalance config");
@@ -4965,6 +4986,11 @@ namespace llaminar2
             return false;
         }
         void *stream = explicitMoELaunchStream(launch, "applyReadyDeviceRebalanceWave");
+        if (!stream)
+            return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
         if (!setMoEDevice(device_ordinal_, "applyReadyDeviceRebalanceWave"))
             return false;
 

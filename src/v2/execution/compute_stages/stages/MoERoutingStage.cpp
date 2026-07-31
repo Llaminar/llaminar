@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <limits>
+#include <sstream>
 
 #ifdef HAVE_CUDA
 #include "../../../kernels/cuda/ops/CUDARowSelectKernels.h"
@@ -793,31 +794,18 @@ namespace llaminar2
         if (params_.device_id.is_gpu() && params_.seq_len == 1 &&
             !isDeviceRoutedDecodeGraphCapturable())
         {
-            if (params_.allow_eager_gpu_single_row_route_for_partial_expert_owner)
-            {
-                if (isGraphCaptureActive())
-                {
-                    LOG_ERROR("[MoERoutingStage] Partial-owner GPU MoE routeWithTensors "
-                              "path is eager-only and cannot run during graph capture on "
-                              << params_.device_id.toString());
-                    return false;
-                }
-            }
-            else
-            {
             /*
-             * Production GPU decode must not fall back to routeWithTensors()
-             * here: that path can materialize top-k routing on the host for
-             * decode bookkeeping.  MoE MTP verifier work relies on the
-             * runtime-table route being the single owner of live route state,
-             * otherwise host/device mirrors can diverge across replay and
-             * publication.
+             * Every GPU decode topology, including partial expert owners and
+             * depth-scoped MTP sidecars, must publish through a mask-aware
+             * device runtime table. routeWithTensors() is the grouped prefill
+             * primitive; admitting it here would create an eager-only decode
+             * contract outside the captured graph and split ownership of live
+             * route state.
              */
             LOG_ERROR("[MoERoutingStage] GPU single-row MoE routing requires "
-                      "the runtime-table device path; refusing host-top-k "
-                      "fallback on " << params_.device_id.toString());
+                      "the runtime-table device path on "
+                      << params_.device_id.toString());
             return false;
-            }
         }
 
         const bool padded_prefill_replay =
@@ -971,6 +959,50 @@ namespace llaminar2
 
         return decode_supported || isDeviceRoutedPrefillGraphCaptureSupported();
 #endif
+    }
+
+    std::string MoERoutingStage::graphCaptureReadinessDebugString() const
+    {
+        const bool decode_equivalent_supported =
+            isDecodeEquivalentVerifierPrefillGraphCaptureSupported();
+        const bool decode_equivalent_ready =
+            isDecodeEquivalentVerifierPrefillGraphCapturable();
+        const bool runtime_decode_ready =
+            isDeviceRoutedDecodeGraphCapturable();
+        const bool prefill_supported =
+            isDeviceRoutedPrefillGraphCaptureSupported();
+        const bool prefill_ready =
+            isDeviceRoutedPrefillGraphCapturable();
+
+        std::ostringstream out;
+        out << "device=" << params_.device_id.toString()
+            << " layer=" << params_.layer_idx
+            << " seq_len=" << params_.seq_len
+            << " d_model=" << params_.d_model
+            << " num_experts=" << params_.num_experts
+            << " top_k=" << params_.top_k
+            << " force_grouped_verifier="
+            << (params_.force_grouped_verifier_prefill_for_decode ? "true" : "false")
+            << " force_decode_equivalent="
+            << (params_.force_decode_equivalent_verifier_prefill ? "true" : "false")
+            << " input=" << (params_.input ? "true" : "false")
+            << " gate=" << (params_.gate_weights ? "true" : "false")
+            << " indices=" << (params_.output_indices ? "true" : "false")
+            << " weights=" << (params_.output_weights ? "true" : "false")
+            << " kernel=" << (moe_kernel_ ? "true" : "false")
+            << " runtime_table=" << (params_.moe_runtime_table ? "true" : "false")
+            << " runtime_layer=" << (moe_runtime_layer_ ? "true" : "false")
+            << " runtime_decode_ready="
+            << (runtime_decode_ready ? "true" : "false")
+            << " grouped_prefill_supported="
+            << (prefill_supported ? "true" : "false")
+            << " grouped_prefill_ready="
+            << (prefill_ready ? "true" : "false")
+            << " decode_equivalent_supported="
+            << (decode_equivalent_supported ? "true" : "false")
+            << " decode_equivalent_ready="
+            << (decode_equivalent_ready ? "true" : "false");
+        return out.str();
     }
 
     bool MoERoutingStage::supportsLazyPrefillGraphCapturePreflight() const

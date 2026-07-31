@@ -94,6 +94,37 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             self.assertNotIn("no-prefill-graph-buckets", row)
             self.assertIn("prefill-graph-probe", row)
 
+    def test_qwen36_moe_cells_name_their_rebalance_mode_explicitly(self) -> None:
+        """Do not let a CLI default silently change a canonical matrix lane."""
+
+        harness = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'S9_STATIC_FLAGS="--moe-rebalance off"',
+            harness,
+        )
+        qwen36_moe_rows = [
+            line
+            for line in harness.splitlines()
+            if "SUITES+=" in line and "qwen36-moe-" in line
+        ]
+        self.assertGreater(len(qwen36_moe_rows), 0)
+        for row in qwen36_moe_rows:
+            has_explicit_mode = any(
+                marker in row
+                for marker in (
+                    "${S9_STATIC_FLAGS}",
+                    "--moe-rebalance dynamic",
+                    "--moe-rebalance llep",
+                    "${S9_REBALANCE_FLAGS}",
+                )
+            )
+            self.assertTrue(
+                has_explicit_mode,
+                f"Qwen3.6 MoE matrix row inherits an ambiguous CLI mode: {row}",
+            )
+
     def test_prefill_graph_probe_defeats_full_prefix_hits_at_fixed_geometry(
         self,
     ) -> None:
@@ -556,6 +587,54 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         )
         self.assertIsNone(result.error)
         self.assertEqual(result.incomplete_contexts, ())
+
+    def test_mtp_sidecar_groups_logical_aliases_by_physical_graph(self) -> None:
+        """Logical callers cannot conceal duplicate physical graph builds."""
+
+        records = [
+            counter(
+                "full_graph_plan_graphs",
+                tags={"type": "capturable"},
+            ),
+            counter(
+                "full_graph_capture_executable_nodes",
+                value=17.0,
+                tags={
+                    "context": "mtp_decode_sidecar",
+                    "source": "full_graph_capture",
+                    "type": "captured_executable",
+                },
+            ),
+            counter(
+                "sidecar_graph_capture_path",
+                domain="mtp",
+                tags={
+                    "context": "mtp_decode_sidecar_chain_device_token",
+                    "graph_context": "mtp_decode_sidecar",
+                    "path": "plain_after_build",
+                    "seq_len": "1",
+                },
+            ),
+            counter(
+                "sidecar_graph_capture_path",
+                domain="mtp",
+                tags={
+                    "context": "mtp_decode_sidecar_resident_logical_state",
+                    "graph_context": "mtp_decode_sidecar",
+                    "path": "plain_after_build",
+                    "seq_len": "1",
+                },
+            ),
+        ]
+        result = validate_graph_capture_policy(records, "cuda:0", "")
+        self.assertIn("rebuilt graph 2 times", result.error or "")
+        self.assertEqual(
+            result.incomplete_contexts,
+            (
+                "unknown:mtp_decode_sidecar[seq_len=1] "
+                "(rebuilt graph 2 times for one stable shape)",
+            ),
+        )
 
     def test_full_graph_plan_without_instantiated_nodes_fails(self) -> None:
         records = [

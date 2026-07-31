@@ -494,6 +494,25 @@ namespace llaminar2
         bool advanceDecodeTransactionPlanningPositionAfterForward(
             const char *source);
         /**
+         * @brief Publish the scheduler position produced by an atomic MTP commit.
+         *
+         * The validated transaction base and committed-row count are sufficient
+         * to advance the scheduler's control-plane coordinate.  Publication must
+         * not depend on whether the backend currently exposes a transient
+         * resident-outcome mailbox: the first post-prefill direct emit has no
+         * outcome mailbox, yet it still commits one real device row.
+         *
+         * @param transaction_base_tokens Scheduler position at transaction entry.
+         * @param committed_rows Number of main-graph rows atomically committed.
+         * @param source Diagnostic name for the commit path.
+         * @return true when the position was published, or when the active lane
+         *         is CPU and therefore owns its position inside the CPU runner.
+         */
+        bool publishDecodeTransactionPlanningPositionAfterMTPCommit(
+            int transaction_base_tokens,
+            int committed_rows,
+            const char *source);
+        /**
          * @brief Resolve the scalar sidecar base position for MTP planning.
          *
          * GPU lanes must use the orchestration-owned transaction position

@@ -48,10 +48,17 @@ namespace llaminar2
     }
 
     /**
-     * @brief Map of stage type string to sharding mode
+     * @brief Map of semantic snapshot keys to tensor-parallel sharding modes.
      *
-     * Stage type strings are the canonical suffixes (e.g., "Q_PROJECTION",
-     * "FFN_DOWN", "LM_HEAD") without layer prefixes.
+     * Exact entries use canonical suffixes such as `Q_PROJECTION`, `FFN_DOWN`,
+     * and `LM_HEAD`, without a `layerN_` prefix.  A key ending in `*` declares
+     * an indexed snapshot family by prefix.  For example,
+     * `ATTENTION_DEVICE_KV_COUNT_REQUEST_*` covers every request index emitted
+     * by a request-batched attention stage.
+     *
+     * Exact entries always take precedence.  When multiple family declarations
+     * match, the longest prefix wins so a schema can refine a broad family
+     * without depending on unordered-map iteration order.
      */
     using StageShardingConfig = std::unordered_map<std::string, SnapshotShardingMode>;
 

@@ -712,6 +712,8 @@ extern "C"
         void *wave_state,
         void *controller_state,
         uint32_t command_buffer_count,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
         int device_idx,
         void *stream);
 
@@ -3494,7 +3496,9 @@ namespace llaminar2
         DeviceMoERebalanceCommandBufferHeader *command_header,
         DeviceMoERebalanceWaveState *wave_state,
         DeviceMoERebalanceGraphControllerState *controller_state,
-        uint32_t command_buffer_count)
+        uint32_t command_buffer_count,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count)
     {
         if (!validateDeviceMoERebalanceConfig(config))
         {
@@ -3527,6 +3531,8 @@ namespace llaminar2
             wave_state,
             controller_state,
             command_buffer_count,
+            local_transfer_slots,
+            local_transfer_slot_count,
             device_ordinal_,
             stream);
     }

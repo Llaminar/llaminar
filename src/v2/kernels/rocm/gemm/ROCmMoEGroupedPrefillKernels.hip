@@ -29,7 +29,7 @@
  * byte-identical to serial row decode.
  *
  * @see ROCmGemvKernel_native_VNNI.hip for decode grouped kernels (M=1)
- * @see ROCmQuantisedGemmKernel_native_VNNI.hip for non-grouped prefill GEMM
+ * @see ROCmNativeVNNIGemmShardImpl.hip.inc for non-grouped prefill GEMM
  */
 
 #include <hip/hip_runtime.h>

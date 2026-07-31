@@ -137,6 +137,11 @@ namespace llaminar2
                                             uint64_t rng_seed, uint64_t rng_offset,
                                             int device_id, void *stream,
                                             void *out_token_device) override;
+        bool enqueuePublishInt32ControlScalarDevice(
+            int32_t value,
+            void *out_value_device,
+            int device_id,
+            void *stream) override;
         bool enqueueBuildTopKTopPDistributionF32Device(const void *data_device, int n,
                                                        int top_k, float top_p, float temperature,
                                                        int device_id, void *stream,

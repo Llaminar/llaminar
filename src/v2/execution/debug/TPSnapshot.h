@@ -68,9 +68,11 @@ namespace llaminar2
      *
      * Preferred overload: uses a model-specific StageShardingConfig returned
      * by ISchemaFactory::getStageShardingConfig(). Returns UNKNOWN for stage
-     * types not present in the map.  Callers that combine multi-device
-     * snapshots must treat UNKNOWN as a contract error, not as permission to
-     * choose an arbitrary TP participant.
+     * types not present in the map.  A schema key ending in `*` declares a
+     * parameterized snapshot family and is matched as a prefix after exact-key
+     * lookup.  Callers that combine multi-device snapshots must treat UNKNOWN
+     * as a contract error, not as permission to choose an arbitrary TP
+     * participant.
      *
      * @param stage_key The snapshot key (e.g., "layer0_ATTENTION_CONTEXT")
      * @param config    Stage type → SnapshotShardingMode map from the schema factory
@@ -86,6 +88,38 @@ namespace llaminar2
         {
             return it->second;
         }
+
+        /*
+         * Request-batched diagnostics and other cardinality-dependent
+         * snapshots append an integer identity to a semantic family name.
+         * Keep that variability declarative in the schema: a terminal '*'
+         * means prefix match.  Longest-prefix selection is deterministic and
+         * permits a model schema to refine a broader family if necessary.
+         */
+        size_t best_prefix_length = 0;
+        SnapshotShardingMode family_mode = SnapshotShardingMode::UNKNOWN;
+        for (const auto &[configured_key, configured_mode] : config)
+        {
+            if (configured_key.empty() || configured_key.back() != '*')
+            {
+                continue;
+            }
+
+            const std::string_view family_prefix(
+                configured_key.data(),
+                configured_key.size() - 1);
+            if (stage_type.starts_with(family_prefix) &&
+                family_prefix.size() > best_prefix_length)
+            {
+                best_prefix_length = family_prefix.size();
+                family_mode = configured_mode;
+            }
+        }
+        if (best_prefix_length != 0)
+        {
+            return family_mode;
+        }
+
         return SnapshotShardingMode::UNKNOWN;
     }
 

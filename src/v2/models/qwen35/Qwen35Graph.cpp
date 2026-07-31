@@ -897,8 +897,14 @@ namespace llaminar2
         int total_tokens = batch_size * seq_len;
         const bool live_state_allgather_available =
             gdnLiveStateAllGatherAvailable(total_tokens, device);
+        /*
+         * All-position logits are also used by compact request-batch prefill.
+         * Rollback slots belong only to a true grouped verifier transaction;
+         * allocating them for main prefill both misstates ownership and retains
+         * one large append-only bank per GDN layer in captured GPU workspaces.
+         */
         const bool verifier_state_capture_supported =
-            config_.compute_all_position_logits &&
+            config_.grouped_mtp_verifier &&
             config_.mtp.enabled &&
             (device.is_cpu() || device.is_cuda() || device.is_rocm());
         /*
@@ -999,10 +1005,18 @@ namespace llaminar2
                                                                     << " n_v_heads=" << n_v_heads << " (full=" << n_v_heads_full << ")"
                                                                     << " d_k=" << d_k << " d_v=" << d_v
                                                                     << " qkv_dim=" << qkv_dim << " value_dim=" << value_dim);
-        const int per_request_verifier_state_capture_rows =
-            verifier_state_capture_supported ? resolveMTPMaxTargetQueryRows(config_.mtp) : 0;
+        /*
+         * resolveMTPMaxTargetQueryRows() already returns the flattened capacity
+         * across `max_request_batch`. Multiplying by this graph's live batch size
+         * again makes request-batched captures reserve batch^2 rollback rows.
+         * Besides wasting VRAM, an earlier scalar graph leaves the smaller
+         * capture-address bank alive, so append-only workspace growth retains
+         * both allocations and can exhaust an otherwise healthy GPU.
+         */
         const int verifier_state_capture_rows =
-            per_request_verifier_state_capture_rows * std::max(1, batch_size);
+            verifier_state_capture_supported
+                ? resolveMTPMaxTargetQueryRows(config_.mtp)
+                : 0;
         const bool force_decode_equivalent_gdn_verifier_prefill =
             config_.usesMTPGroupedDecodeEquivalentRows() &&
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&

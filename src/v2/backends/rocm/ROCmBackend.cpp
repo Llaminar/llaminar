@@ -12,6 +12,7 @@
 #include "HipDeviceGuard.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
+#include "../../utils/VramBillOfMaterials.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../kernels/common/SamplingMath.h"
 #include <hip/hip_runtime.h>
@@ -658,6 +659,11 @@ namespace llaminar2
         const float *data, int n, int k, float top_p, float temperature,
         unsigned long long rng_seed, unsigned long long rng_offset,
         int *out_token, int device_idx, void *stream);
+    extern "C" bool rocmOps_publish_int32_control_scalar(
+        int32_t value,
+        int32_t *out_value,
+        int device_idx,
+        void *stream);
     extern "C" bool rocmOps_topk_topp_distribution_f32(
         const float *data, int n, int k, float top_p, float temperature,
         int *out_token_ids, float *out_probs,
@@ -1106,6 +1112,26 @@ namespace llaminar2
             static_cast<unsigned long long>(rng_seed),
             static_cast<unsigned long long>(rng_offset),
             static_cast<int *>(out_token_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueuePublishInt32ControlScalarDevice(
+        int32_t value,
+        void *out_value_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            value < 0 || !out_value_device || !stream)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_publish_int32_control_scalar(
+            value,
+            static_cast<int32_t *>(out_value_device),
             device_id,
             stream);
     }
@@ -2996,6 +3022,19 @@ namespace llaminar2
         LOG_TRACE("[ROCM_PTR_ALLOC] ptr=" << ptr
                                           << " bytes=" << bytes
                                           << " device=" << device_id);
+        if (vramBomEnabled())
+        {
+            size_t free_after = 0;
+            size_t total_bytes = 0;
+            (void)hipMemGetInfo(&free_after, &total_bytes);
+            logVramBomLine(
+                "backend_allocation",
+                "backend=rocm action=allocate device=" + std::to_string(device_id) +
+                    " ptr=" + vramBomPointer(ptr) +
+                    " " + vramBomBytes(bytes) +
+                    " free_after_bytes=" + std::to_string(free_after) +
+                    " total_bytes=" + std::to_string(total_bytes));
+        }
 
         // DIAGNOSTIC: Verify allocation ended up on the correct device
         {
@@ -3162,6 +3201,19 @@ namespace llaminar2
             LOG_TRACE("[ROCM_PTR_FREE] ptr=" << ptr
                                              << " bytes=" << recorded_size
                                              << " device=" << device_id);
+            if (vramBomEnabled())
+            {
+                size_t free_after = 0;
+                size_t total_bytes = 0;
+                (void)hipMemGetInfo(&free_after, &total_bytes);
+                logVramBomLine(
+                    "backend_allocation",
+                    "backend=rocm action=free device=" + std::to_string(device_id) +
+                        " ptr=" + vramBomPointer(ptr) +
+                        " " + vramBomBytes(recorded_size) +
+                        " free_after_bytes=" + std::to_string(free_after) +
+                        " total_bytes=" + std::to_string(total_bytes));
+            }
         }
     }
 

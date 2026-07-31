@@ -86,5 +86,42 @@ TEST(Test__NativeVnniFormatInfo, TensorMetadataMatchesPerfSweepCodebookIds)
         EXPECT_EQ(info->is_asymmetric, expected.is_asymmetric) << expected.name;
         EXPECT_EQ(info->is_superblock, expected.is_superblock) << expected.name;
         EXPECT_EQ(info->has_emins, expected.has_emins) << expected.name;
+        EXPECT_EQ(
+            info,
+            native_vnni_formats::forQuantType(expected.name))
+            << expected.name
+            << " tensor metadata and planner catalog must be one object";
+    }
+}
+
+TEST(Test__NativeVnniFormatInfo, PackedRegionSizingMatchesCanonicalMetadata)
+{
+    constexpr size_t rows = 17;
+    constexpr size_t columns = 256;
+
+    for (const auto &expected : kExpectations)
+    {
+        SCOPED_TRACE(expected.name);
+        const NativeVnniFormatInfo *format =
+            native_vnni_formats::forQuantType(expected.name);
+        ASSERT_NE(format, nullptr);
+
+        const NativeVnniPackedRegionSizes regions =
+            nativeVnniPackedRegionSizes(rows, columns, *format);
+        const size_t blocks = rows * columns / 32;
+        EXPECT_EQ(
+            regions.payload_bytes,
+            blocks * static_cast<size_t>(expected.payload_bytes));
+        EXPECT_EQ(regions.scales_bytes, blocks * sizeof(uint16_t));
+        EXPECT_EQ(
+            regions.mins_bytes,
+            expected.is_asymmetric
+                ? blocks * sizeof(uint16_t)
+                : 0);
+        EXPECT_EQ(
+            regions.emins_bytes,
+            expected.has_emins
+                ? blocks * sizeof(uint32_t)
+                : 0);
     }
 }

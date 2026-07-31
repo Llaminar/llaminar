@@ -287,6 +287,18 @@ namespace llaminar2
 
     private:
         std::unordered_map<std::string, std::unique_ptr<MoERuntimeTable>> moe_runtime_tables_;
+        /**
+         * @brief Per-device transient route scratch shared by serial graph roles.
+         *
+         * Main prefill, grouped verifier, and every MTP sidecar retain separate
+         * runtime metadata tables, but the orchestrator orders their execution.
+         * Their transient route planners therefore bind one largest-participant
+         * arena per device instead of multiplying scratch by layer and depth.
+         */
+        std::unordered_map<
+            std::string,
+            std::shared_ptr<DeviceMoESerialRouteScratchArena>>
+            moe_serial_route_scratch_arenas_;
         std::unordered_map<std::string, std::shared_ptr<DeviceMoETransferSlotDirectory>> moe_transfer_slot_directories_;
         std::unordered_map<std::string, std::shared_ptr<DeviceMoERebalanceTransferState>> moe_rebalance_transfer_states_;
         std::unordered_map<std::string, GraphSideRebalanceBinding> moe_graph_rebalance_bindings_;

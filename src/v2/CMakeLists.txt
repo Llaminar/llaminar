@@ -379,6 +379,20 @@ if(HAVE_CUDA)
         # Profiling utilities
         utils/CUDAKernelProfiler.cu                   # CUDA event-based kernel profiling
     )
+
+    # These two NativeVNNI files own hundreds of independent device-template
+    # instantiations. CUDA's split compiler partitions their optimization work
+    # internally while preserving one public ABI and one copy of mutable
+    # trainer/context state. Restrict the option to these compilation hot spots
+    # so an ordinary parallel Ninja build does not multiply worker counts for
+    # every small CUDA source.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.3")
+        set_source_files_properties(
+            kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu
+            kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu
+            PROPERTIES COMPILE_OPTIONS "--split-compile=8"
+        )
+    endif()
     
     # NOTE: CUDA kernel ITensorGemm adapters (CUDAFloatingPointGemmKernel.cpp, CUDAQuantisedGemmKernel.cpp)
     # are added to llaminar2_core with target_sources() below, compiled with regular C++ compiler (NOT nvcc)
@@ -585,7 +599,17 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmGemvKernel.hip               # GEMV kernel suite documentation index (split into files below)
         kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip    # INT8 VNNI GEMV/GEMM kernels for decode + prefill (gfx906)
         kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMV kernels (gfx906)
-        kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMM kernels for M>1 prefill (gfx906)
+        # NativeVNNI prefill is physically sharded by codebook pair so LLVM can
+        # optimize all format families concurrently instead of serializing one
+        # multi-minute translation unit.
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard0.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard1.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard2.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard3.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard4.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard5.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard6.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard7.hip
         kernels/rocm/gemm/ROCmSmallNFP32ProjectionKernels.hip # Graph-capturable FP32 small-output projection kernels
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
@@ -639,6 +663,7 @@ if(HAVE_ROCM)
         collective/backends/RCCLDynamicLoader.cpp            # Dynamic loader for RCCL (dlopen/dlsym)
         collective/backends/RCCLBackendHIP.cpp               # HIP runtime wrappers for RCCL backend
         collective/coordinators/RCCLCoordinator.cpp          # RCCL collective coordinator
+        kernels/rocm/gemm/ROCmNativeVNNIGemmDispatch.cpp     # Host-only public dispatcher for sharded NativeVNNI GEMM
         ${ROCM_KERNEL_SOURCES}
     )
     # Resolve HIP device symbols at library build time (same rationale as cuda_backend).
@@ -1511,6 +1536,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/ModelMemoryProfile.cpp
     planning/WeightMemoryEstimator.cpp
     planning/KVCacheMemoryEstimator.cpp
+    planning/PersistentStateMemoryEstimator.cpp
     planning/ActivationMemoryEstimator.cpp
     planning/WorkspaceMemoryEstimator.cpp
     planning/MemoryPlanner.cpp

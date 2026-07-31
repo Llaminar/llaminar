@@ -346,6 +346,10 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     S9_MODEL="/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
     S9_PREFIX_FLAGS="${S8_PREFIX_FLAGS} --prefix-cache-moe-policy placement-fingerprint"
     S9_MTP_FLAGS="${S8_MTP_FLAGS}"
+    # MoE mode is part of the behavioral contract of every matrix cell. Keep
+    # static cells explicit because the production CLI default may evolve
+    # independently of this regression matrix.
+    S9_STATIC_FLAGS="--moe-rebalance off"
     S9_TP_CUDA2_FLAGS="--tp-devices cuda:0,cuda:1"
     S9_TP_ROCM2_FLAGS="--tp-devices rocm:0,rocm:1"
     S9_TP_ROCM4_FLAGS="--tp-devices rocm:0,rocm:1,rocm:2,rocm:3"
@@ -360,15 +364,15 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     S9_OVERLAY_CUDA2_CPU2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;routed_compute=apportioned;owner=0 --moe-routed-expert-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;ranks=0,1 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=240;memory-mb=4096 --moe-routed-expert-tier cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
     S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;routed_compute=apportioned;owner=0 --moe-routed-expert-domain qwen36_moe_rocm_warm=rocm:0,rocm:1;scope=local;backend=rccl;routed_compute=apportioned;owner=0 --moe-routed-expert-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;ranks=0,1 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=192;memory-mb=4096 --moe-routed-expert-tier warm@qwen36_moe_rocm_warm;priority=1;max-experts-per-layer=64;memory-mb=4096 --moe-routed-expert-tier cold@qwen36_moe_cpu_cold;priority=2;max-experts-per-layer=0;memory-mb=0;fallback=true"
     if [ -f "$S9_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200||qwen36-moe-baseline")
-        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_PREFIX_FLAGS}|qwen36-moe-prefix-ram|no-long-context")
-        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_MTP_FLAGS}|qwen36-moe-mtp-greedy-d2|no-long-context")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-prefix-ram-cuda2tp|no-long-context,prefill-graph-probe")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-mtp-greedy-d2-cuda2tp|no-long-context,prefill-graph-probe")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-prefix-ram-rocm2tp|no-long-context,prefill-graph-probe")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm2tp|no-long-context,prefill-graph-probe")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-prefix-ram-rocm4tp|no-long-context,prefill-graph-probe")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm4tp|no-long-context,prefill-graph-probe")
+        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_STATIC_FLAGS}|qwen36-moe-baseline")
+        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS}|qwen36-moe-prefix-ram|no-long-context")
+        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS}|qwen36-moe-mtp-greedy-d2|no-long-context")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-prefix-ram-cuda2tp|no-long-context,prefill-graph-probe")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-mtp-greedy-d2-cuda2tp|no-long-context,prefill-graph-probe")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-prefix-ram-rocm2tp|no-long-context,prefill-graph-probe")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm2tp|no-long-context,prefill-graph-probe")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-prefix-ram-rocm4tp|no-long-context,prefill-graph-probe")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm4tp|no-long-context,prefill-graph-probe")
         if [[ "$QWEN36_MOE_REBALANCE_E2E" == "1" ]]; then
             SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
             SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
@@ -392,12 +396,12 @@ if [ ${#SUITES[@]} -eq 0 ]; then
             SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS} --backend rccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-rocm2tp|no-long-context,prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe")
         fi
         if [[ "$REMOTE_EXPERT_OVERLAY_E2E" == "1" ]]; then
-            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-cpu2|no-long-context,no-prefill-graph-buckets")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-cpu2|no-long-context,no-prefill-graph-buckets")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
         fi
     fi
 fi
@@ -2172,6 +2176,63 @@ def flag_value(flag):
         if token.startswith(flag + "="):
             return token.split("=", 1)[1]
     return None
+
+expect_shared_moe_route_scratch = (
+    is_gpu
+    and is_mtp
+    and flag_value("--moe-routed-expert-placement")
+    == "tiered-overlay"
+)
+if expect_shared_moe_route_scratch:
+    allocation_records = [
+        record
+        for record in records
+        if record.get("domain") == "memory"
+        and record.get("name")
+        == "moe_serial_route_scratch_arena_allocations"
+    ]
+    binding_records = [
+        record
+        for record in records
+        if record.get("domain") == "memory"
+        and record.get("name")
+        == "moe_serial_route_scratch_runtime_table_bindings"
+    ]
+    if not allocation_records:
+        print(
+            "FAIL: GPU MoE+MTP cell emitted no immutable shared route-scratch "
+            "arena allocation evidence"
+        )
+        sys.exit(0)
+    for allocation in allocation_records:
+        device = str(allocation.get("device", ""))
+        tags = allocation.get("tags") or {}
+        if (
+            tags.get("ownership") != "per_device_serial_graph_domain"
+            or tags.get("immutable") != "true"
+            or tags.get("largest_participant") != "true"
+            or numeric(tags.get("bytes")) <= 0.0
+            or numeric(
+                allocation.get("value", allocation.get("count", 0.0))
+            )
+            != 1.0
+        ):
+            print(
+                "FAIL: GPU MoE route scratch is not exactly one immutable "
+                f"largest-participant arena for {device}: {allocation}"
+            )
+            sys.exit(0)
+        device_bindings = sum(
+            numeric(record.get("value", record.get("count", 0.0)))
+            for record in binding_records
+            if record.get("device") == device
+        )
+        if device_bindings <= 1.0:
+            print(
+                "FAIL: GPU MoE+MTP did not bind multiple graph-role runtime "
+                f"tables to the shared route arena for {device}"
+            )
+            sys.exit(0)
 
 decode_graph_captured = (
     has_record("decode_graph_phase", "forward_graph", {"phase": "capture"})

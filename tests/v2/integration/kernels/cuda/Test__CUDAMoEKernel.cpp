@@ -11903,6 +11903,26 @@ TEST_F(Test__CUDAMoEKernel,
     update.experts[0].flags |=
         llaminar2::toMoEExpertFlags(
             llaminar2::DeviceMoEExpertFlags::TransferSlot);
+    std::array<llaminar2::DeviceMoEExpertDirectoryEntry, 2>
+        host_transfer_directory{};
+    auto &promoted_entry = host_transfer_directory[1];
+    promoted_entry.descriptor = update.experts[0];
+    promoted_entry.layer = 0u;
+    promoted_entry.expert = 0u;
+    promoted_entry.participant = 0u;
+    promoted_entry.resident_mask = 0b01u;
+    promoted_entry.epoch = update.epoch;
+    promoted_entry.flags =
+        static_cast<uint32_t>(
+            llaminar2::DeviceMoERebalanceDirectoryFlags::Valid) |
+        static_cast<uint32_t>(
+            llaminar2::DeviceMoERebalanceDirectoryFlags::Resident) |
+        static_cast<uint32_t>(
+            llaminar2::DeviceMoERebalanceDirectoryFlags::TransferSlot) |
+        static_cast<uint32_t>(
+            llaminar2::DeviceMoERebalanceDirectoryFlags::CopyComplete);
+    promoted_entry.slot_index = 1u;
+    promoted_entry.generation = 1u;
     ASSERT_TRUE(runtime_table.prepareInactiveBank(0, update));
     ASSERT_TRUE(runtime_table.flipActiveBank(0, update.epoch, stream_));
 
@@ -11919,6 +11939,7 @@ TEST_F(Test__CUDAMoEKernel,
     uint64_t *d_local = nullptr;
     uint64_t *d_gathered = nullptr;
     llaminar2::DeviceMoERebalanceStatus *d_status = nullptr;
+    llaminar2::DeviceMoEExpertDirectoryEntry *d_transfer_directory = nullptr;
     ASSERT_EQ(cudaMalloc(
                   reinterpret_cast<void **>(&d_local),
                   config.num_experts * sizeof(uint64_t)),
@@ -11932,6 +11953,17 @@ TEST_F(Test__CUDAMoEKernel,
     ASSERT_EQ(cudaMalloc(
                   reinterpret_cast<void **>(&d_status),
                   sizeof(llaminar2::DeviceMoERebalanceStatus)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(
+                  reinterpret_cast<void **>(&d_transfer_directory),
+                  sizeof(host_transfer_directory)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  d_transfer_directory,
+                  host_transfer_directory.data(),
+                  sizeof(host_transfer_directory),
+                  cudaMemcpyHostToDevice,
+                  stream_),
               cudaSuccess);
     ASSERT_TRUE(cuda_kernel_->packDeviceRebalanceHistograms(
         launchContext(),
@@ -11960,7 +11992,17 @@ TEST_F(Test__CUDAMoEKernel,
         runtime_table.deviceLayerState(0),
         d_gathered,
         d_status,
-        config));
+        config,
+        /*plan_entries=*/nullptr,
+        /*plan_count=*/nullptr,
+        /*plan_capacity=*/0u,
+        /*payload_slot_capacity=*/0u,
+        /*command_header=*/nullptr,
+        /*wave_state=*/nullptr,
+        /*controller_state=*/nullptr,
+        /*command_buffer_count=*/1u,
+        d_transfer_directory,
+        static_cast<uint32_t>(host_transfer_directory.size())));
 
     std::array<uint64_t, 4> packed{};
     llaminar2::DeviceMoERebalanceStatus status{};
@@ -12000,9 +12042,87 @@ TEST_F(Test__CUDAMoEKernel,
     EXPECT_EQ(status.prefill_invalid_transfer_slot_claims, 0u);
     EXPECT_EQ(status.prefill_max_transfer_slot, 1u);
 
+    /*
+     * The controller may not silently fall back to descriptor-only accounting.
+     * Omitting the physical directory must publish a precise terminal error so
+     * a captured maintenance graph can never bless stale runtime metadata.
+     */
+    ASSERT_TRUE(cuda_kernel_->runDeviceRebalanceController(
+        launchContext(),
+        runtime_table.deviceLayerState(0),
+        d_gathered,
+        d_status,
+        config));
+    ASSERT_EQ(cudaMemcpyAsync(
+                  &status,
+                  d_status,
+                  sizeof(status),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    EXPECT_EQ(
+        status.status_code,
+        static_cast<uint32_t>(
+            llaminar2::DeviceMoERebalanceStatusCode::InvalidRuntime));
+    EXPECT_EQ(status.prefill_invalid_transfer_slot_claims, 1u);
+    EXPECT_EQ(
+        status.prefill_first_invalid_reasons,
+        llaminar2::moe_rebalance_policy::
+            TransferSlotClaimDirectoryIdentityMismatch);
+
+    /*
+     * A physical slot can be addressable while naming the wrong logical
+     * occupant. Keep that coherence failure distinct from two runtime
+     * descriptors genuinely aliasing the same directory slot.
+     */
+    host_transfer_directory[1].expert = 1u;
+    ASSERT_EQ(cudaMemcpyAsync(
+                  d_transfer_directory,
+                  host_transfer_directory.data(),
+                  sizeof(host_transfer_directory),
+                  cudaMemcpyHostToDevice,
+                  stream_),
+              cudaSuccess);
+    ASSERT_TRUE(cuda_kernel_->runDeviceRebalanceController(
+        launchContext(),
+        runtime_table.deviceLayerState(0),
+        d_gathered,
+        d_status,
+        config,
+        /*plan_entries=*/nullptr,
+        /*plan_count=*/nullptr,
+        /*plan_capacity=*/0u,
+        /*payload_slot_capacity=*/0u,
+        /*command_header=*/nullptr,
+        /*wave_state=*/nullptr,
+        /*controller_state=*/nullptr,
+        /*command_buffer_count=*/1u,
+        d_transfer_directory,
+        static_cast<uint32_t>(host_transfer_directory.size())));
+    ASSERT_EQ(cudaMemcpyAsync(
+                  &status,
+                  d_status,
+                  sizeof(status),
+                  cudaMemcpyDeviceToHost,
+                  stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    EXPECT_EQ(
+        status.status_code,
+        static_cast<uint32_t>(
+            llaminar2::DeviceMoERebalanceStatusCode::InvalidRuntime));
+    EXPECT_EQ(status.prefill_duplicate_transfer_slot_claims, 0u);
+    EXPECT_EQ(status.prefill_invalid_transfer_slot_claims, 1u);
+    EXPECT_EQ(
+        status.prefill_first_invalid_reasons,
+        llaminar2::moe_rebalance_policy::
+            TransferSlotClaimOccupantMismatch);
+
     cudaFree(d_local);
     cudaFree(d_gathered);
     cudaFree(d_status);
+    cudaFree(d_transfer_directory);
 #endif
 }
 
@@ -17617,6 +17737,71 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
 #endif
 }
 
+TEST(Test__CUDAMoERouteScratch,
+     SerialGraphRolesShareImmutableLargestParticipantArena)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int kExperts = 8;
+    constexpr int kTopK = 4;
+    constexpr int kPlannedRows = 31;
+    const auto device = llaminar2::DeviceId::cuda(0);
+
+    llaminar2::DeviceMoESerialRouteScratchArena::Config arena_config;
+    arena_config.device_id = device;
+    arena_config.num_experts = kExperts;
+    arena_config.top_k = kTopK;
+    arena_config.token_capacity = kPlannedRows;
+    auto arena =
+        std::make_shared<llaminar2::DeviceMoESerialRouteScratchArena>(
+            arena_config);
+
+    llaminar2::DeviceMoERuntimeTable::Config table_config;
+    table_config.device_id = device;
+    table_config.num_layers = 2;
+    table_config.num_experts = kExperts;
+    table_config.top_k = kTopK;
+    table_config.mirror_to_device = true;
+    table_config.prefill_token_capacity = kPlannedRows;
+    table_config.serial_route_scratch_arena = arena;
+
+    llaminar2::DeviceMoERuntimeTable main_table(table_config);
+    table_config.num_layers = 1;
+    llaminar2::DeviceMoERuntimeTable sidecar_table(table_config);
+
+    ASSERT_TRUE(main_table.usesImmutableSerialRouteScratch());
+    ASSERT_TRUE(sidecar_table.usesImmutableSerialRouteScratch());
+    const auto *stable_route_ids =
+        main_table.hostLayerState(0).route_expert_ids;
+    ASSERT_NE(stable_route_ids, nullptr);
+    EXPECT_EQ(
+        main_table.hostLayerState(1).route_expert_ids,
+        stable_route_ids)
+        << "serial transformer layers must share transient route scratch";
+    EXPECT_EQ(
+        sidecar_table.hostLayerState(0).route_expert_ids,
+        stable_route_ids)
+        << "ordered main and MTP graphs must share the largest-participant arena";
+
+    EXPECT_NO_THROW(
+        main_table.ensurePrefillRouteScratchCapacity(kPlannedRows));
+    EXPECT_THROW(
+        sidecar_table.ensurePrefillRouteScratchCapacity(kPlannedRows + 1),
+        std::logic_error)
+        << "captured scratch growth must fail instead of replacing addresses";
+    EXPECT_EQ(
+        main_table.hostLayerState(0).route_expert_ids,
+        stable_route_ids);
+    EXPECT_EQ(
+        sidecar_table.hostLayerState(0).route_expert_ids,
+        stable_route_ids);
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows)
 {
 #ifndef HAVE_CUDA
@@ -19292,6 +19477,119 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
                     << llaminar2::PerfStatsCollector::summaryString(
                            {"kernel.cuda_moe_masked_prefill_grouping_calls"});
             }
+        }
+
+        if (masked_local_tp)
+        {
+            /*
+             * M=1 is the degenerate grouped-verifier bucket. The production
+             * stage deliberately routes it through executeSingleToken(), while
+             * the M=2..31 inventory above enters grouped prefill directly. A
+             * backend-only sweep therefore cannot catch a stage admission
+             * predicate that accidentally rejects partial expert ownership.
+             *
+             * Keep this stage-level proof inside the all-format loop. Remote
+             * descriptor slots are genuinely empty and the routing row includes
+             * both local and remote experts, matching static apportioned LocalTP.
+             */
+            auto stage_input =
+                llaminar2::test::TestTensorFactory::createFP32Random(
+                    {1u, static_cast<size_t>(d_model)},
+                    -1.0f,
+                    1.0f,
+                    711001);
+            auto stage_indices =
+                llaminar2::test::TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(top_k)});
+            auto stage_weights =
+                llaminar2::test::TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(top_k)});
+            const std::array<float, top_k> stage_route_ids = {
+                0.0f, 2.0f, 1.0f, 3.0f};
+            const std::array<float, top_k> stage_route_weights = {
+                0.40f, 0.30f, 0.20f, 0.10f};
+            std::copy(
+                stage_route_ids.begin(),
+                stage_route_ids.end(),
+                stage_indices->mutable_data());
+            std::copy(
+                stage_route_weights.begin(),
+                stage_route_weights.end(),
+                stage_weights->mutable_data());
+            ASSERT_TRUE(stage_input->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(stage_indices->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(stage_weights->ensureOnDevice(device, stream_));
+
+            auto direct_output =
+                llaminar2::test::TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(d_model)});
+            auto stage_output =
+                llaminar2::test::TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(d_model)});
+            ASSERT_TRUE(direct_output->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(stage_output->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(moe_kernel.groupedExpertDecodeFromRouting(
+                stage_input.get(),
+                stage_indices.get(),
+                stage_weights.get(),
+                sparse_gateup_table,
+                sparse_down_table,
+                top_k,
+                direct_output.get(),
+                d_model,
+                intermediate,
+                local_expert_mask.data()));
+
+            llaminar2::MoEExpertComputeStage::Params params;
+            params.device_id = device;
+            params.input = stage_input.get();
+            params.seq_len = 1;
+            params.d_model = d_model;
+            params.num_experts = num_experts;
+            params.top_k = top_k;
+            params.expert_intermediate = intermediate;
+            params.local_expert_start = 0;
+            params.local_expert_count = num_experts / 2;
+            params.expert_mask = {true, true, false, false};
+            params.layer_idx = 0;
+            params.routing_indices = stage_indices.get();
+            params.routing_weights = stage_weights.get();
+            params.force_decode_equivalent_verifier_prefill = true;
+            params.output = stage_output.get();
+            params.output_registered_in_arena = false;
+            params.prepared_gate_gemm.assign(
+                static_cast<size_t>(num_experts), nullptr);
+            params.prepared_up_gemm.assign(
+                static_cast<size_t>(num_experts), nullptr);
+            params.prepared_down_gemm.assign(
+                static_cast<size_t>(num_experts), nullptr);
+            for (int expert = 0; expert < num_experts / 2; ++expert)
+            {
+                params.prepared_gate_gemm[static_cast<size_t>(expert)] =
+                    experts[static_cast<size_t>(expert)].gate;
+                params.prepared_up_gemm[static_cast<size_t>(expert)] =
+                    experts[static_cast<size_t>(expert)].up;
+                params.prepared_down_gemm[static_cast<size_t>(expert)] =
+                    experts[static_cast<size_t>(expert)].down;
+            }
+
+            llaminar2::MoEExpertComputeStage stage(std::move(params));
+            stage.bindWorkspace(&moe_workspace);
+            stage.setGPUStream(stream_);
+            llaminar2::CUDADeviceContext context(device, 0);
+            ASSERT_TRUE(stage.execute(&context))
+                << case_label
+                << " partial-ownership M=1 verifier stage must admit the "
+                   "mask-aware explicit-routing path";
+            ASSERT_TRUE(direct_output->ensureOnHost(stream_));
+            ASSERT_TRUE(stage_output->ensureOnHost(stream_));
+            expectBitwiseFP32RowsEqual(
+                case_label +
+                    " CUDA masked LocalTP M=1 stage verifier vs direct decode",
+                stage_output->data(),
+                direct_output->data(),
+                stage_output->numel(),
+                static_cast<size_t>(d_model));
         }
         }
         }

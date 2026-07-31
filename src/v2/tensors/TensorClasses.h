@@ -3290,8 +3290,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{4, 16, false, false, false, 127.0f};
-            return &info;
+            return &native_vnni_formats::IQ4_NL;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
@@ -3565,8 +3564,7 @@ namespace llaminar2
         // NativeVNNI support: codebook 19, 32-byte payload (raw int8 blocks)
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{19, 32, false, false, false, 127.0f};
-            return &info;
+            return &native_vnni_formats::Q8_0;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
@@ -3874,8 +3872,7 @@ namespace llaminar2
         // NativeVNNI support: codebook 20, 32-byte payload (raw int8 blocks)
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{20, 32, false, false, false, 127.0f};
-            return &info;
+            return &native_vnni_formats::Q8_1;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
@@ -4815,8 +4812,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{0, 16, false, false, false, 8.0f};
-            return &info;
+            return &native_vnni_formats::Q4_0;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
@@ -5040,8 +5036,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{5, 16, true, false, false, 15.0f};
-            return &info;
+            return &native_vnni_formats::Q4_1;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
@@ -5247,8 +5242,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{6, 20, false, false, false, 16.0f};
-            return &info;
+            return &native_vnni_formats::Q5_0;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
@@ -5457,8 +5451,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{7, 20, true, false, false, 31.0f};
-            return &info;
+            return &native_vnni_formats::Q5_1;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
@@ -5650,8 +5643,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{8, 24, true, true, false, 32.0f};
-            return &info;
+            return &native_vnni_formats::Q6_K;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
@@ -5819,8 +5811,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{10, 8, true, true, true, 3.0f};
-            return &info;
+            return &native_vnni_formats::Q2_K;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
@@ -5950,8 +5941,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{7, 20, true, true, false, 31.0f};
-            return &info;
+            return &native_vnni_formats::Q5_K;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
@@ -6162,8 +6152,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{9, 12, true, true, false, 4.0f};
-            return &info;
+            return &native_vnni_formats::Q3_K;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
@@ -6343,8 +6332,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{5, 16, true, true, false, 15.0f};
-            return &info;
+            return &native_vnni_formats::Q4_K;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
@@ -6544,8 +6532,7 @@ namespace llaminar2
          */
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{21, 32, false, true, false, 127.0f};
-            return &info;
+            return &native_vnni_formats::Q8_K;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
@@ -6802,8 +6789,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{4, 16, false, true, false, 127.0f};
-            return &info;
+            return &native_vnni_formats::IQ4_XS;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
@@ -6986,8 +6972,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{15, 8, false, true, false, 43.0f};
-            return &info;
+            return &native_vnni_formats::IQ2_XXS;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
@@ -7174,8 +7159,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{14, 9, true, true, false, 43.0f};
-            return &info;
+            return &native_vnni_formats::IQ2_XS;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
@@ -7370,8 +7354,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{12, 12, false, true, false, 62.0f};
-            return &info;
+            return &native_vnni_formats::IQ3_XXS;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
@@ -7554,8 +7537,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{13, 9, true, true, false, 43.0f};
-            return &info;
+            return &native_vnni_formats::IQ2_S;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
@@ -7746,8 +7728,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{11, 13, false, true, false, 15.0f};
-            return &info;
+            return &native_vnni_formats::IQ3_S;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
@@ -7934,8 +7915,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{16, 6, true, true, false, 1.125f};
-            return &info;
+            return &native_vnni_formats::IQ1_S;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
@@ -8122,8 +8102,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{17, 6, true, true, false, 1.125f};
-            return &info;
+            return &native_vnni_formats::IQ1_M;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;

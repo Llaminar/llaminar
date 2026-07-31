@@ -192,6 +192,8 @@ namespace llaminar2::moe_rebalance_policy
         TransferSlotClaimNegativeSlot = 1u << 3u,
         TransferSlotClaimExceedsCompileTimeCapacity = 1u << 4u,
         TransferSlotClaimExceedsDirectoryCapacity = 1u << 5u,
+        TransferSlotClaimDirectoryIdentityMismatch = 1u << 6u,
+        TransferSlotClaimOccupantMismatch = 1u << 7u,
     };
 
     /**

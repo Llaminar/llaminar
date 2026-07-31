@@ -276,11 +276,15 @@ namespace
 
             WorkspaceRequirements reqs;
             reqs.buffers.push_back({
-                GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS,
+                m > 1
+                    ? GemmWorkspaceBuffers::
+                          GROUPED_VERIFIER_GEMV_KPAR_PARTIALS
+                    : GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS,
                 static_cast<size_t>(k_groups) * static_cast<size_t>(rows) *
                     static_cast<size_t>(out_cols) * sizeof(float),
                 256,
-                true});
+                true,
+                WorkspaceExecutionRegime::CompactDecodeOnly});
             return reqs;
         }
 
@@ -2364,19 +2368,18 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_CudaSmallMDeclaresGateUpSideStrea
     const WorkspaceRequirements reqs =
         stage.getWorkspaceRequirements(rows, d_model, intermediate);
 
-    const auto *serial =
-        reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+    const auto *grouped =
+        reqs.find(
+            GemmWorkspaceBuffers::
+                GROUPED_VERIFIER_GEMV_KPAR_PARTIALS);
     const auto *side_stream =
         reqs.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
 
-    ASSERT_NE(serial, nullptr)
-        << "The stage must merge the underlying GEMM K-parallel partial buffer.";
-    ASSERT_NE(side_stream, nullptr)
-        << "CUDA shared-expert M=2..4 verifier gate/up can overlap on explicit "
-           "side streams, so the stage must declare the side-stream partial arena.";
-    EXPECT_EQ(side_stream->size_bytes, serial->size_bytes)
-        << "Shared gate/up has one side stream beyond the main stream, sized for "
-           "the largest projection's serial partial buffer.";
+    ASSERT_NE(grouped, nullptr)
+        << "The stage must merge the underlying grouped-verifier KPAR buffer.";
+    EXPECT_EQ(side_stream, nullptr)
+        << "Grouped verifier projections execute in-order on their graph stream "
+           "and must not reserve the M=1 concurrent-decode arena.";
 }
 
 TEST_F(MoEExpertComputeStageTest, SharedGate_TypeAndName)

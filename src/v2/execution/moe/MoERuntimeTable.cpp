@@ -9,6 +9,7 @@
 #include "../../backends/BackendManager.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
+#include "../../utils/VramBillOfMaterials.h"
 
 #include <algorithm>
 #include <bit>
@@ -18,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace llaminar2
@@ -214,6 +216,153 @@ namespace llaminar2
             if (route_capacity > std::numeric_limits<uint32_t>::max())
                 throw std::invalid_argument("[MoERuntimeTable] prefill route capacity exceeds uint32_t range");
             return static_cast<uint32_t>(route_capacity);
+        }
+
+        void releasePrefillRouteScratchBindings(
+            DeviceId device,
+            DeviceMoEPrefillRouteScratchBindings &scratch,
+            const std::string &label) noexcept
+        {
+            freeMirror(device, scratch.route_expert_ids, label + " route_expert_ids");
+            freeMirror(device, scratch.route_weights, label + " route_weights");
+            freeMirror(
+                device,
+                scratch.route_participant_ids,
+                label + " route_participant_ids");
+            freeMirror(device, scratch.expert_counts, label + " expert_counts");
+            freeMirror(device, scratch.expert_offsets, label + " expert_offsets");
+            freeMirror(
+                device,
+                scratch.grouped_token_ids,
+                label + " grouped_token_ids");
+            freeMirror(
+                device,
+                scratch.grouped_route_weights,
+                label + " grouped_route_weights");
+            freeMirror(device, scratch.llep_split_ends, label + " llep_split_ends");
+            freeMirror(
+                device,
+                scratch.llep_assignment_spans,
+                label + " llep_assignment_spans");
+            freeMirror(
+                device,
+                scratch.llep_weight_transfers,
+                label + " llep_weight_transfers");
+            scratch = {};
+        }
+
+        void allocatePrefillRouteScratchBindings(
+            DeviceId device,
+            int num_experts,
+            int top_k,
+            int token_capacity,
+            DeviceMoEPrefillRouteScratchBindings &allocation,
+            const std::string &label)
+        {
+            if (!device.is_gpu())
+                throw std::invalid_argument(label + ": route scratch requires a GPU device");
+            if (num_experts <= 0 ||
+                num_experts > static_cast<int>(kDeviceMoEMaxExperts))
+            {
+                throw std::invalid_argument(label + ": num_experts is out of range");
+            }
+            if (top_k <= 0 || top_k > static_cast<int>(kDeviceMoEMaxTopK))
+                throw std::invalid_argument(label + ": top_k is out of range");
+            if (token_capacity <= 0)
+                throw std::invalid_argument(label + ": token_capacity must be positive");
+
+            const uint32_t route_capacity =
+                checkedRouteCapacity(token_capacity, top_k);
+            auto allocate = [&](auto **ptr, size_t count, const char *name)
+            {
+                using Pointer =
+                    std::remove_pointer_t<std::remove_pointer_t<decltype(ptr)>>;
+                *ptr = static_cast<Pointer *>(
+                    allocateMirror(
+                        device,
+                        count * sizeof(Pointer),
+                        label + " allocation failed for " + name));
+            };
+
+            try
+            {
+                const size_t llep_plan_capacity =
+                    static_cast<size_t>(num_experts) *
+                    static_cast<size_t>(kDeviceMoEMaxParticipants);
+                allocate(
+                    &allocation.route_expert_ids,
+                    route_capacity,
+                    "route_expert_ids");
+                allocate(
+                    &allocation.route_weights,
+                    route_capacity,
+                    "route_weights");
+                allocate(
+                    &allocation.route_participant_ids,
+                    route_capacity,
+                    "route_participant_ids");
+                allocate(
+                    &allocation.expert_counts,
+                    static_cast<size_t>(num_experts),
+                    "expert_counts");
+                allocate(
+                    &allocation.expert_offsets,
+                    static_cast<size_t>(num_experts),
+                    "expert_offsets");
+                allocate(
+                    &allocation.grouped_token_ids,
+                    route_capacity,
+                    "grouped_token_ids");
+                allocate(
+                    &allocation.grouped_route_weights,
+                    route_capacity,
+                    "grouped_route_weights");
+                allocate(
+                    &allocation.llep_split_ends,
+                    llep_plan_capacity,
+                    "llep_split_ends");
+                allocate(
+                    &allocation.llep_assignment_spans,
+                    llep_plan_capacity,
+                    "llep_assignment_spans");
+                allocate(
+                    &allocation.llep_weight_transfers,
+                    llep_plan_capacity,
+                    "llep_weight_transfers");
+
+                allocation.token_capacity =
+                    static_cast<uint32_t>(token_capacity);
+                allocation.route_capacity = route_capacity;
+                allocation.expert_capacity =
+                    static_cast<uint32_t>(num_experts);
+                allocation.llep_plan_capacity =
+                    static_cast<uint32_t>(llep_plan_capacity);
+            }
+            catch (...)
+            {
+                releasePrefillRouteScratchBindings(device, allocation, label);
+                throw;
+            }
+        }
+
+        size_t prefillRouteScratchBindingBytes(
+            const DeviceMoEPrefillRouteScratchBindings &bindings) noexcept
+        {
+            const size_t route_capacity = bindings.route_capacity;
+            const size_t expert_capacity = bindings.expert_capacity;
+            const size_t llep_plan_capacity = bindings.llep_plan_capacity;
+            return route_capacity *
+                       (sizeof(int32_t) + sizeof(float) + sizeof(int32_t) +
+                        sizeof(int32_t) + sizeof(float)) +
+                   expert_capacity * (sizeof(int32_t) + sizeof(int32_t)) +
+                   llep_plan_capacity *
+                       (sizeof(int32_t) +
+                        sizeof(
+                            least_loaded_ep::
+                                LeastLoadedExpertAssignmentSpan) +
+                        sizeof(
+                            least_loaded_ep::
+                                LeastLoadedExpertWeightTransfer));
         }
 
         uint32_t participantBit(uint32_t participant)
@@ -445,13 +594,81 @@ namespace llaminar2
 
     } // namespace
 
+    DeviceMoESerialRouteScratchArena::DeviceMoESerialRouteScratchArena(
+        Config config)
+        : device_id_(config.device_id),
+          num_experts_(config.num_experts),
+          top_k_(config.top_k)
+    {
+        allocatePrefillRouteScratchBindings(
+            device_id_,
+            num_experts_,
+            top_k_,
+            config.token_capacity,
+            bindings_,
+            "[DeviceMoESerialRouteScratchArena]");
+
+        const size_t bytes = allocationBytes();
+        const PerfStatsCollector::Tags tags{
+            {"bytes", std::to_string(bytes)},
+            {"experts", std::to_string(num_experts_)},
+            {"immutable", "true"},
+            {"largest_participant", "true"},
+            {"ownership", "per_device_serial_graph_domain"},
+            {"route_capacity", std::to_string(bindings_.route_capacity)},
+            {"token_capacity", std::to_string(bindings_.token_capacity)},
+            {"top_k", std::to_string(top_k_)}};
+        PerfStatsCollector::addCounter(
+            "memory",
+            "moe_serial_route_scratch_arena_allocations",
+            1.0,
+            "model_setup",
+            device_id_.toString(),
+            tags);
+        PerfStatsCollector::addCounter(
+            "memory",
+            "moe_serial_route_scratch_arena_bytes",
+            static_cast<double>(bytes),
+            "model_setup",
+            device_id_.toString(),
+            tags);
+        logVramBomLine(
+            "moe_serial_route_scratch_arena",
+            "device=" + device_id_.toString() +
+                " ptr=" + vramBomPointer(bindings_.route_expert_ids) +
+                " ownership=per_device_serial_graph_domain"
+                " immutable=true largest_participant=true"
+                " token_capacity=" +
+                std::to_string(bindings_.token_capacity) +
+                " route_capacity=" +
+                std::to_string(bindings_.route_capacity) +
+                " experts=" + std::to_string(num_experts_) +
+                " top_k=" + std::to_string(top_k_) +
+                " " + vramBomBytes(bytes));
+    }
+
+    DeviceMoESerialRouteScratchArena::~DeviceMoESerialRouteScratchArena()
+    {
+        releasePrefillRouteScratchBindings(
+            device_id_,
+            bindings_,
+            "[DeviceMoESerialRouteScratchArena] free");
+    }
+
+    size_t DeviceMoESerialRouteScratchArena::allocationBytes() const noexcept
+    {
+        return prefillRouteScratchBindingBytes(bindings_);
+    }
+
     DeviceMoERuntimeTable::DeviceMoERuntimeTable(Config config)
         : device_id_(config.device_id),
           num_layers_(config.num_layers),
           num_experts_(config.num_experts),
           top_k_(config.top_k),
           mirror_to_device_(config.mirror_to_device),
-          prefill_token_capacity_(config.prefill_token_capacity)
+          prefill_token_capacity_(config.prefill_token_capacity),
+          serial_route_scratch_arena_(
+              std::move(config.serial_route_scratch_arena))
     {
         if (!device_id_.is_valid())
             throw std::invalid_argument("[MoERuntimeTable] device_id must be valid");
@@ -469,6 +686,46 @@ namespace llaminar2
             throw std::invalid_argument("[MoERuntimeTable] prefill_token_capacity must be non-negative");
         if (prefill_token_capacity_ > 0 && !mirror_to_device_)
             throw std::runtime_error("[MoERuntimeTable] prefill route scratch requires a mirrored GPU runtime table");
+        if (serial_route_scratch_arena_)
+        {
+            if (!mirror_to_device_)
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] serial route scratch arena requires a "
+                    "mirrored GPU runtime table");
+            }
+            if (serial_route_scratch_arena_->deviceId() != device_id_ ||
+                serial_route_scratch_arena_->expertCount() != num_experts_ ||
+                serial_route_scratch_arena_->topK() != top_k_)
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] serial route scratch arena shape/device "
+                    "does not match the runtime table");
+            }
+            if (prefill_token_capacity_ >
+                serial_route_scratch_arena_->tokenCapacity())
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] requested prefill capacity exceeds the "
+                    "immutable serial route scratch arena");
+            }
+            prefill_token_capacity_ =
+                serial_route_scratch_arena_->tokenCapacity();
+            PerfStatsCollector::addCounter(
+                "memory",
+                "moe_serial_route_scratch_runtime_table_bindings",
+                1.0,
+                "model_setup",
+                device_id_.toString(),
+                {{"arena_bytes",
+                  std::to_string(
+                      serial_route_scratch_arena_->allocationBytes())},
+                 {"arena_token_capacity",
+                  std::to_string(
+                      serial_route_scratch_arena_->tokenCapacity())},
+                 {"layers", std::to_string(num_layers_)},
+                 {"ownership", "per_device_serial_graph_domain"}});
+        }
         (void)checkedRouteCapacity(prefill_token_capacity_, top_k_);
 
         host_layers_.resize(static_cast<size_t>(num_layers_));
@@ -482,7 +739,16 @@ namespace llaminar2
         if (mirror_to_device_)
         {
             allocateDeviceMirror();
-            if (prefill_token_capacity_ > 0)
+            if (serial_route_scratch_arena_)
+            {
+                for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+                {
+                    bindPrefillRouteScratchToLayer(
+                        layer_idx,
+                        serial_route_scratch_arena_->bindings_);
+                }
+            }
+            else if (prefill_token_capacity_ > 0)
             {
                 prefill_route_scratch_.resize(host_layers_.size());
                 for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
@@ -1594,6 +1860,30 @@ namespace llaminar2
             throw std::runtime_error("[MoERuntimeTable] prefill route scratch requires a mirrored GPU runtime table");
         (void)checkedRouteCapacity(token_capacity, top_k_);
 
+        if (serial_route_scratch_arena_)
+        {
+            if (token_capacity >
+                serial_route_scratch_arena_->tokenCapacity())
+            {
+                throw std::logic_error(
+                    "[MoERuntimeTable] graph-captured serial route scratch "
+                    "capacity exceeded: requested=" +
+                    std::to_string(token_capacity) +
+                    " planned=" +
+                    std::to_string(
+                        serial_route_scratch_arena_->tokenCapacity()) +
+                    "; captured device addresses are immutable");
+            }
+
+            /*
+             * Shared graph scratch is fully allocated and bound before any
+             * capture starts. A request within the planned capacity is only a
+             * contract check: it must not enqueue an upload, synchronize a
+             * stream, or mutate host/device runtime records.
+             */
+            return;
+        }
+
         if (static_cast<int>(prefill_route_scratch_.size()) != num_layers_)
             prefill_route_scratch_.resize(static_cast<size_t>(num_layers_));
 
@@ -1802,7 +2092,7 @@ namespace llaminar2
     }
 
     bool DeviceMoERuntimeTable::prefillRouteScratchAllocationHasCapacity(
-        const PrefillRouteScratchAllocation &allocation,
+        const DeviceMoEPrefillRouteScratchBindings &allocation,
         int token_capacity) const
     {
         const uint32_t route_capacity = checkedRouteCapacity(token_capacity, top_k_);
@@ -1838,75 +2128,33 @@ namespace llaminar2
         if (prefillRouteScratchAllocationHasCapacity(allocation, token_capacity))
             return;
 
-        auto free_allocation = [&](PrefillRouteScratchAllocation &scratch) noexcept
-        {
-            if (scratch.route_expert_ids)
-                freeMirror(device_id_, scratch.route_expert_ids, layerPrefix(layer_idx) + "free prefill route_expert_ids");
-            if (scratch.route_weights)
-                freeMirror(device_id_, scratch.route_weights, layerPrefix(layer_idx) + "free prefill route_weights");
-            if (scratch.route_participant_ids)
-                freeMirror(device_id_, scratch.route_participant_ids, layerPrefix(layer_idx) + "free prefill route_participant_ids");
-            if (scratch.expert_counts)
-                freeMirror(device_id_, scratch.expert_counts, layerPrefix(layer_idx) + "free prefill expert_counts");
-            if (scratch.expert_offsets)
-                freeMirror(device_id_, scratch.expert_offsets, layerPrefix(layer_idx) + "free prefill expert_offsets");
-            if (scratch.grouped_token_ids)
-                freeMirror(device_id_, scratch.grouped_token_ids, layerPrefix(layer_idx) + "free prefill grouped_token_ids");
-            if (scratch.grouped_route_weights)
-                freeMirror(device_id_, scratch.grouped_route_weights, layerPrefix(layer_idx) + "free prefill grouped_route_weights");
-            if (scratch.llep_split_ends)
-                freeMirror(device_id_, scratch.llep_split_ends, layerPrefix(layer_idx) + "free prefill llep_split_ends");
-            if (scratch.llep_assignment_spans)
-                freeMirror(device_id_, scratch.llep_assignment_spans, layerPrefix(layer_idx) + "free prefill llep_assignment_spans");
-            if (scratch.llep_weight_transfers)
-                freeMirror(device_id_, scratch.llep_weight_transfers, layerPrefix(layer_idx) + "free prefill llep_weight_transfers");
-            scratch = {};
-        };
+        releasePrefillRouteScratchBindings(
+            device_id_,
+            allocation,
+            layerPrefix(layer_idx) + "free prefill");
+        allocatePrefillRouteScratchBindings(
+            device_id_,
+            num_experts_,
+            top_k_,
+            token_capacity,
+            allocation,
+            layerPrefix(layer_idx) + "prefill route scratch");
+        bindPrefillRouteScratchToLayer(layer_idx, allocation);
+    }
 
-        free_allocation(allocation);
-
-        const uint32_t route_capacity = checkedRouteCapacity(token_capacity, top_k_);
-        auto allocate = [&](auto **ptr, size_t count, const char *name)
+    void DeviceMoERuntimeTable::bindPrefillRouteScratchToLayer(
+        int layer_idx,
+        const DeviceMoEPrefillRouteScratchBindings &allocation)
+    {
+        validateLayerIndex(layer_idx);
+        if (!prefillRouteScratchAllocationHasCapacity(
+                allocation,
+                static_cast<int>(allocation.token_capacity)))
         {
-            using Pointer = std::remove_pointer_t<std::remove_pointer_t<decltype(ptr)>>;
-            *ptr = static_cast<Pointer *>(allocateMirror(device_id_, count * sizeof(Pointer),
-                                                         layerPrefix(layer_idx) + "allocation failed for " + name));
-        };
-
-        try
-        {
-            const size_t llep_plan_capacity =
-                static_cast<size_t>(num_experts_) * static_cast<size_t>(kDeviceMoEMaxParticipants);
-            allocate(&allocation.route_expert_ids, route_capacity, "prefill route_expert_ids");
-            allocate(&allocation.route_weights, route_capacity, "prefill route_weights");
-            allocate(&allocation.route_participant_ids, route_capacity, "prefill route_participant_ids");
-            allocate(&allocation.expert_counts, static_cast<size_t>(num_experts_), "prefill expert_counts");
-            allocate(&allocation.expert_offsets, static_cast<size_t>(num_experts_), "prefill expert_offsets");
-            allocate(&allocation.grouped_token_ids, route_capacity, "prefill grouped_token_ids");
-            allocate(&allocation.grouped_route_weights, route_capacity, "prefill grouped_route_weights");
-            allocate(&allocation.llep_split_ends,
-                     static_cast<size_t>(num_experts_) * static_cast<size_t>(kDeviceMoEMaxParticipants),
-                     "prefill llep_split_ends");
-            allocate(&allocation.llep_assignment_spans,
-                     llep_plan_capacity,
-                     "prefill llep_assignment_spans");
-            allocate(&allocation.llep_weight_transfers,
-                     llep_plan_capacity,
-                     "prefill llep_weight_transfers");
+            throw std::invalid_argument(
+                layerPrefix(layer_idx) +
+                "cannot bind incomplete prefill route scratch");
         }
-        catch (...)
-        {
-            free_allocation(allocation);
-            throw;
-        }
-
-        allocation.token_capacity = static_cast<uint32_t>(token_capacity);
-        allocation.route_capacity = route_capacity;
-        allocation.expert_capacity = static_cast<uint32_t>(num_experts_);
-        allocation.llep_plan_capacity =
-            static_cast<uint32_t>(static_cast<size_t>(num_experts_) *
-                                  static_cast<size_t>(kDeviceMoEMaxParticipants));
-
         auto &state = host_layers_[static_cast<size_t>(layer_idx)];
         state.route_expert_ids = allocation.route_expert_ids;
         state.route_weights = allocation.route_weights;
@@ -1953,27 +2201,10 @@ namespace llaminar2
             return;
         for (auto &allocation : prefill_route_scratch_)
         {
-            if (allocation.route_expert_ids)
-                freeMirror(device_id_, allocation.route_expert_ids, "[MoERuntimeTable] free prefill route_expert_ids");
-            if (allocation.route_weights)
-                freeMirror(device_id_, allocation.route_weights, "[MoERuntimeTable] free prefill route_weights");
-            if (allocation.route_participant_ids)
-                freeMirror(device_id_, allocation.route_participant_ids, "[MoERuntimeTable] free prefill route_participant_ids");
-            if (allocation.expert_counts)
-                freeMirror(device_id_, allocation.expert_counts, "[MoERuntimeTable] free prefill expert_counts");
-            if (allocation.expert_offsets)
-                freeMirror(device_id_, allocation.expert_offsets, "[MoERuntimeTable] free prefill expert_offsets");
-            if (allocation.grouped_token_ids)
-                freeMirror(device_id_, allocation.grouped_token_ids, "[MoERuntimeTable] free prefill grouped_token_ids");
-            if (allocation.grouped_route_weights)
-                freeMirror(device_id_, allocation.grouped_route_weights, "[MoERuntimeTable] free prefill grouped_route_weights");
-            if (allocation.llep_split_ends)
-                freeMirror(device_id_, allocation.llep_split_ends, "[MoERuntimeTable] free prefill llep_split_ends");
-            if (allocation.llep_assignment_spans)
-                freeMirror(device_id_, allocation.llep_assignment_spans, "[MoERuntimeTable] free prefill llep_assignment_spans");
-            if (allocation.llep_weight_transfers)
-                freeMirror(device_id_, allocation.llep_weight_transfers, "[MoERuntimeTable] free prefill llep_weight_transfers");
-            allocation = {};
+            releasePrefillRouteScratchBindings(
+                device_id_,
+                allocation,
+                "[MoERuntimeTable] free prefill");
         }
         prefill_route_scratch_.clear();
     }

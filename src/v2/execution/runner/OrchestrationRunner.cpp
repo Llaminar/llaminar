@@ -1339,7 +1339,9 @@ namespace llaminar2
             return setError(failure_message);
 
         const auto &exec = debugEnv().execution;
-        const auto buckets = normalizePrefillGraphBuckets(exec.prefill_graph_bucket_sizes);
+        const auto buckets = prefillGraphBucketsAtOrBelowCapacity(
+            exec.prefill_graph_bucket_sizes,
+            plan_.runtime.resident_graph_rows);
         const bool long_bucketed_prefill =
             exec.gpu_graphs &&
             exec.prefill_graph_buckets &&
@@ -4710,6 +4712,61 @@ namespace llaminar2
         return true;
     }
 
+    bool OrchestrationRunner::publishDecodeTransactionPlanningPositionAfterMTPCommit(
+        int transaction_base_tokens,
+        int committed_rows,
+        const char *source)
+    {
+        if (!runner_ || !runner_->primaryDeviceId().is_gpu())
+        {
+            decode_transaction_planning_position_.reset();
+            return true;
+        }
+        if (transaction_base_tokens < 0 || committed_rows < 0)
+        {
+            return setError(
+                "GPU MTP commit produced a negative scheduler transaction coordinate");
+        }
+        if (!decode_transaction_planning_position_.has_value() ||
+            *decode_transaction_planning_position_ < 0)
+        {
+            return setError(
+                "GPU MTP commit has no initialized scheduler-owned transaction position");
+        }
+        if (*decode_transaction_planning_position_ != transaction_base_tokens)
+        {
+            std::ostringstream error;
+            error << "GPU MTP commit transaction base does not match the "
+                     "scheduler-owned position: scheduler="
+                  << *decode_transaction_planning_position_
+                  << " transaction_base=" << transaction_base_tokens;
+            return setError(error.str());
+        }
+
+        /*
+         * The transaction validator has already proved that these rows are the
+         * decode-equivalent continuation of transaction_base_tokens.  This
+         * scalar is scheduler metadata used to plan the next captured launch;
+         * it is not a host mirror of KV, GDN, terminal-hidden, or outcome
+         * storage.  In particular, do not condition this publication on the
+         * lifetime of a transient device outcome mailbox.
+         */
+        decode_transaction_planning_position_ =
+            transaction_base_tokens + committed_rows;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "gpu_decode_transaction_position_publications",
+            1.0,
+            "decode",
+            {},
+            {{"path", source && source[0] != '\0' ? source : "unknown"},
+             {"position",
+              std::to_string(*decode_transaction_planning_position_)},
+             {"advanced_tokens", std::to_string(committed_rows)},
+             {"position_owner", "orchestration_transaction"}});
+        return true;
+    }
+
     std::optional<int> OrchestrationRunner::currentDecodeTransactionPositionForPlanning(
         const char *context,
         std::string *error) const
@@ -5644,26 +5701,16 @@ namespace llaminar2
                     return validation_error;
                 }
 
-                const int committed_position = base.cached_tokens + advanced_tokens;
-                const DeviceResidentLogicalSequenceStateHandle resident_state =
-                    runner_ ? runner_->deviceResidentLogicalSequenceState()
-                            : DeviceResidentLogicalSequenceStateHandle{};
-                if (resident_state.valid() && runner_)
+                if (!publishDecodeTransactionPlanningPositionAfterMTPCommit(
+                        base.cached_tokens,
+                        advanced_tokens,
+                        path))
                 {
-                    decode_transaction_planning_position_ = committed_position;
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "gpu_decode_transaction_position_publications",
-                        1.0,
-                        "decode",
-                        {},
-                        {{"path", path},
-                         {"position", std::to_string(committed_position)},
-                         {"advanced_tokens", std::to_string(advanced_tokens)}});
-                }
-                else
-                {
-                    decode_transaction_planning_position_.reset();
+                    return last_error_.empty()
+                               ? std::optional<std::string>{
+                                     "MTP transaction could not publish its "
+                                     "scheduler-owned position"}
+                               : std::optional<std::string>{last_error_};
                 }
             }
 
@@ -6545,8 +6592,7 @@ namespace llaminar2
                                       ->commitMTPShiftedRowFromDeviceTargetSample(
                                           /*target_sample_slot=*/0,
                                           /*already_appended_tokens=*/0,
-                                          /*allow_speculative_discard=*/true,
-                                          base_sidecar_position);
+                                          /*allow_speculative_discard=*/true);
                     }
                     else
                     {
@@ -6603,7 +6649,8 @@ namespace llaminar2
                         advance_ok = runner_->forwardWithDeviceTokenIds(
                             &first_token,
                             direct_emit_token_device,
-                            /*seq_len=*/1);
+                            /*seq_len=*/1,
+                            DeviceTokenForwardPurpose::MTPCondition);
                     }
                     else
                     {
@@ -8122,8 +8169,7 @@ namespace llaminar2
                                  ->commitMTPShiftedRowFromDeviceTargetSample(
                                      kDiagnosticTargetSampleSlot,
                                      shifted_rows_committed_in_this_replay,
-                                     /*allow_speculative_discard=*/true,
-                                     replay_position_offset);
+                                     /*allow_speculative_discard=*/true);
                     }
                     else
                     {
@@ -13690,97 +13736,221 @@ namespace llaminar2
             coordinated_force_command,
             "forceDecodeToken");
 
-        /*
-         * A forced token is a real generated token chosen by request policy
-         * rather than by the sampler.  If terminal logits are already ready
-         * from prefill or MTP publication, no main-state row has been appended
-         * for the next position yet; replacing the sampled choice starts as a
-         * metadata update.  Otherwise we must first append the previous
-         * last_token_ with a normal one-token forward so KV/GDN state reaches
-         * the forced token's logical position.
-         */
-        if (prefill_logits_ready_)
+        const bool token_is_stop =
+            std::find(stop_tokens_.begin(), stop_tokens_.end(), token) != stop_tokens_.end();
+        const bool gpu_mtp_force =
+            shouldUseMTPDecode() &&
+            runner_->primaryDeviceId().is_gpu();
+
+        if (gpu_mtp_force && token_is_stop)
         {
+            /*
+             * A terminal control token ends generation and therefore never
+             * becomes a model-state row. Keep this as an explicit GPU-MTP
+             * lifecycle state instead of allowing it to enter the CPU/non-MTP
+             * branch below. The ready logits and their sampled shadows belong
+             * to the completed request and are retired without publishing,
+             * committing, or forwarding the terminal token on any device.
+             */
             prefill_logits_ready_ = false;
             ready_sampled_token_.reset();
             ready_sampled_params_.reset();
             ready_sampled_resident_state_.reset();
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "forced_stop_token_state_mutations_skipped",
+                1.0,
+                "decode",
+                {},
+                {{"state_transition", "terminal_control_only"},
+                 {"device_execution", "none"}});
         }
-        else
+        else if (gpu_mtp_force)
         {
-            runner_->setMTPMainDecodeSyncDeferralEnabled(false);
-            if (traceChatGeneratedTokensEnabled())
+            /*
+             * A forced policy token replaces the sample selected from an already
+             * materialized terminal-logits boundary. Requiring that boundary
+             * makes the state transition unambiguous: the old ready token has
+             * never entered main KV/GDN state, and the forced token can become
+             * the sole owner of the next row. Every forced token is forwarded
+             * immediately below, which recreates the same boundary for the next
+             * token in a multi-token stop-thinking sequence.
+             */
+            if (!prefill_logits_ready_)
             {
-                LOG_INFO("[OrchestrationRunner/forceDecodeToken] rank="
-                         << rank << " forwarding previous token " << last_token_);
+                result.error =
+                    "GPU MTP forced decode requires a ready terminal-logits boundary";
+                return result;
             }
-            if (!runner_->forward(&last_token_, 1))
+
+            prefill_logits_ready_ = false;
+            ready_sampled_token_.reset();
+            ready_sampled_params_.reset();
+            ready_sampled_resident_state_.reset();
+
+            /*
+             * Request policy selected `token` on the host, but execution state
+             * becomes device-owned here. The backend publishes the scalar with a
+             * one-thread kernel into the persistent target slot and records the
+             * exact producer stream. No stack-backed H2D copy, allocation,
+             * default stream, or synchronization is permitted.
+             */
+            if (!runner_->stageStochasticTargetTokenForDeviceSampling(
+                    token,
+                    /*target_sample_slot=*/0))
             {
-                result.error = "Forward pass failed while committing forced token";
+                result.error =
+                    "GPU MTP forced decode could not publish its control token to device state";
+                return result;
+            }
+
+            /*
+             * Shifted MTP KV consumes the device token first, while terminal
+             * hidden still names the state immediately before that token. The
+             * commit's transaction lease and target-slot readiness event order
+             * this mutation without observing a host position mirror.
+             */
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "forced_token_shifted_commit_device",
+                    "decode");
+                if (!runner_->commitMTPShiftedRowFromDeviceTargetSample(
+                        /*target_sample_slot=*/0,
+                        /*already_appended_tokens=*/0,
+                        /*allow_speculative_discard=*/true))
+                {
+                    result.error =
+                        "GPU MTP forced-token shifted-cache maintenance failed";
+                    return result;
+                }
+            }
+
+            /*
+             * Materialize the same target slot into the stable one-row verifier
+             * token arena used by captured main-graph replay. Forwarding now,
+             * rather than leaving the token pending in `last_token_`, ensures the
+             * next forced or sampled token begins at another explicit ready-logits
+             * boundary and can never fall into the host-token condition path.
+             */
+            const void *forced_token_device =
+                runner_->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+                    /*first_target_sample_slot=*/0,
+                    /*first_draft_slot=*/0,
+                    /*draft_token_count=*/0,
+                    /*total_verifier_input_tokens=*/1);
+            if (!forced_token_device)
+            {
+                result.error =
+                    "GPU MTP forced decode could not materialize its device token row";
+                return result;
+            }
+
+            runner_->setMTPMainDecodeSyncDeferralEnabled(true);
+            if (!runner_->forwardWithDeviceTokenIds(
+                    &token,
+                    forced_token_device,
+                    /*seq_len=*/1,
+                    DeviceTokenForwardPurpose::MTPCondition))
+            {
+                runner_->setMTPMainDecodeSyncDeferralEnabled(false);
+                result.error =
+                    "GPU MTP forced-token main-state advance failed";
                 return result;
             }
             if (!advanceDecodeTransactionPlanningPositionAfterForward(
-                    "forced_decode_condition_forward"))
+                    "forced_decode_device_condition_forward"))
             {
                 result.error = last_error_;
                 return result;
             }
-            if (traceChatGeneratedTokensEnabled())
-            {
-                LOG_INFO("[OrchestrationRunner/forceDecodeToken] rank="
-                         << rank
-                         << " forward complete position="
-                         << trace_position("trace_force_decode_forward_complete"));
-            }
+
+            prefill_logits_ready_ = true;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "forced_token_device_owned_transactions",
+                1.0,
+                "decode",
+                {},
+                {{"publication", "control_scalar_kernel"},
+                 {"shifted_state", "device_target_slot"},
+                 {"main_forward", "device_token_ids"}});
         }
-
-        /*
-         * MTP maintains a shifted sidecar KV stream: each emitted non-stop token
-         * must publish a row derived from the terminal hidden state immediately
-         * before that token.  Normal decode and verifier catch-up do this before
-         * forwarding each accepted token.  Forced policy tokens, such as the
-         * Qwen stop-thinking phrase, must follow the same contract or the main
-         * KV/GDN state advances while the shifted sidecar cache stays behind.
-         */
-        const bool token_is_stop =
-            std::find(stop_tokens_.begin(), stop_tokens_.end(), token) != stop_tokens_.end();
-        if (shouldUseMTPDecode() && !token_is_stop)
+        else
         {
-            std::string position_error;
-            const std::optional<int> base_sidecar_position =
-                currentDecodeTransactionPositionForPlanning(
-                    "forced decode token",
-                    &position_error);
-            if (!base_sidecar_position)
+            /*
+             * CPU and non-MTP execution retain their serial token contract. A
+             * forced token chosen at request level replaces ready logits when
+             * present; otherwise the previous token must first advance ordinary
+             * serial decode state.
+             */
+            if (prefill_logits_ready_)
             {
-                result.error = position_error;
-                return result;
+                prefill_logits_ready_ = false;
+                ready_sampled_token_.reset();
+                ready_sampled_params_.reset();
+                ready_sampled_resident_state_.reset();
+            }
+            else if (!token_is_stop)
+            {
+                runner_->setMTPMainDecodeSyncDeferralEnabled(false);
+                if (traceChatGeneratedTokensEnabled())
+                {
+                    LOG_INFO("[OrchestrationRunner/forceDecodeToken] rank="
+                             << rank << " forwarding previous token " << last_token_);
+                }
+                if (!runner_->forward(&last_token_, 1))
+                {
+                    result.error =
+                        "Forward pass failed while committing forced token";
+                    return result;
+                }
+                if (!advanceDecodeTransactionPlanningPositionAfterForward(
+                        "forced_decode_condition_forward"))
+                {
+                    result.error = last_error_;
+                    return result;
+                }
             }
 
-            bool shifted_commit_ok = false;
+            /*
+             * CPU MTP maintains the same shifted sidecar stream using its
+             * serial-row implementation. GPU MTP never enters this host-token
+             * API: its complete device-owned transaction is handled above.
+             */
+            if (shouldUseMTPDecode() && !token_is_stop)
             {
+                std::string position_error;
+                const std::optional<int> base_sidecar_position =
+                    currentDecodeTransactionPositionForPlanning(
+                        "forced decode token",
+                        &position_error);
+                if (!base_sidecar_position)
+                {
+                    result.error = position_error;
+                    return result;
+                }
+
                 PerfStatsCollector::ScopedTimer timer(
                     "mtp",
                     "forced_token_shifted_commit",
                     "decode");
-                shifted_commit_ok =
-                    runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
+                if (!runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
                         token,
                         /*already_appended_tokens=*/0,
                         /*allow_speculative_discard=*/true,
-                        *base_sidecar_position);
+                        *base_sidecar_position))
+                {
+                    result.error =
+                        "MTP forced-token shifted-cache maintenance failed";
+                    return result;
+                }
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "forced_token_shifted_commits",
+                    1.0,
+                    "decode");
             }
-            if (!shifted_commit_ok)
-            {
-                result.error =
-                    "MTP forced-token shifted-cache maintenance failed";
-                return result;
-            }
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "forced_token_shifted_commits",
-                1.0,
-                "decode");
         }
 
         pending_mtp_condition_token_.reset();
@@ -14860,6 +15030,7 @@ namespace llaminar2
             cfg.batch_size = plan_.runtime.batch_size;
             cfg.max_seq_len = plan_.runtime.max_seq_len;
             cfg.activation_seq_len = resolveActivationBufferSeqLen(cfg.max_seq_len, device);
+            cfg.mtp_enabled = plan_.runtime.mtp.enabled;
 
             switch (plan_.runtime.kv_cache_precision)
             {
@@ -14947,7 +15118,47 @@ namespace llaminar2
                 plan_.weight_shard.total_shards));
         }
 
-        auto plan = MemoryPlanner::plan(profile, device_configs);
+        const bool has_gpu = std::any_of(
+            device_configs.begin(),
+            device_configs.end(),
+            [](const DevicePlanConfig &config)
+            {
+                return config.device.is_gpu();
+            });
+
+        MemoryPlan plan;
+        if (has_gpu &&
+            debugEnv().execution.gpu_graphs &&
+            debugEnv().execution.prefill_graph_buckets)
+        {
+            const auto configured_buckets = normalizePrefillGraphBuckets(
+                debugEnv().execution.prefill_graph_bucket_sizes);
+            auto resident_plan =
+                MemoryPlanner::planLargestFittingResidentGraphRows(
+                    profile,
+                    device_configs,
+                    configured_buckets);
+            plan_.runtime.resident_graph_rows =
+                resident_plan.resident_graph_rows;
+            plan = std::move(resident_plan.memory_plan);
+
+            if (resident_plan.fits())
+            {
+                LOG_INFO("[MemoryPlanner] Selected resident graph capacity "
+                         << plan_.runtime.resident_graph_rows
+                         << " rows; full KV context remains "
+                         << plan_.runtime.max_seq_len
+                         << " tokens");
+            }
+        }
+        else
+        {
+            plan = MemoryPlanner::plan(profile, device_configs);
+            plan_.runtime.resident_graph_rows =
+                device_configs.empty()
+                    ? 0
+                    : device_configs.front().activation_seq_len;
+        }
 
         if (!plan.fits())
         {

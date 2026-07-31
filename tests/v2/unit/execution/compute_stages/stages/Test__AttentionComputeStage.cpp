@@ -114,6 +114,8 @@ namespace
     public:
         int cached_tokens = 0;
         mutable int cached_token_queries = 0;
+        int canonical_device_cached_tokens = 0;
+        int canonical_device_ring_head = 0;
         ActivationPrecision k_precision_value = ActivationPrecision::FP16;
         ActivationPrecision v_precision_value = ActivationPrecision::FP16;
 
@@ -178,6 +180,26 @@ namespace
         {
             cached_tokens = 0;
             return true;
+        }
+
+        /**
+         * @brief Expose stable opaque addresses for device-metadata view tests.
+         *
+         * This CPU-only fake never dereferences these addresses through a GPU
+         * backend. AttentionComputeStage merely wraps them in graph-stable
+         * non-owning views while building diagnostic metadata. Providing both
+         * pointers keeps the fake faithful to the production GPU cache contract:
+         * effective-KV diagnostics may observe only the canonical count/head
+         * pair, never a host coherence mirror.
+         */
+        const int *deviceCachedTokenCountPtr(int, int = 0) const override
+        {
+            return &canonical_device_cached_tokens;
+        }
+
+        const int *deviceRingHeadPtr(int, int = 0) const override
+        {
+            return &canonical_device_ring_head;
         }
     };
 

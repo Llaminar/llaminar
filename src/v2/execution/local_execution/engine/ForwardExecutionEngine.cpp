@@ -78,6 +78,7 @@ namespace llaminar2
             ForwardOutput &output,
             DeviceId device,
             void *stream,
+            ForwardExecutionRole execution_role,
             bool is_decode,
             bool all_position_logits,
             int graph_seq_len,
@@ -87,6 +88,7 @@ namespace llaminar2
                 .valid = !device.is_gpu() || stream != nullptr,
                 .device = device,
                 .stream = stream,
+                .execution_role = execution_role,
                 .is_decode = is_decode,
                 .all_position_logits = all_position_logits,
                 .graph_seq_len = graph_seq_len,
@@ -809,7 +811,7 @@ namespace llaminar2
 
     ForwardExecutionEngine::ReplayStateResetSummary
     ForwardExecutionEngine::resetSessionReplayState(
-        bool preserve_replay_safe_segmented_captures)
+        bool preserve_replay_safe_graphs)
     {
         ReplayStateResetSummary summary;
         all_position_verifier_recapture_pending_ = false;
@@ -818,11 +820,10 @@ namespace llaminar2
             const ForwardReplayStateCacheClass cache_class =
                 classifyForwardReplayStateCache(signature);
             const ForwardReplayStateAction action =
-                preserve_replay_safe_segmented_captures
+                preserve_replay_safe_graphs
                     ? chooseForwardReplayStateAction(
                           ForwardReplayStateMutationKind::RequestBoundaryStateReset,
-                          signature,
-                          !cache.collective_nodes.empty())
+                          signature)
                     : ForwardReplayStateAction::ResetReplayState;
 
             if (action == ForwardReplayStateAction::ResetReplayState)
@@ -1128,6 +1129,11 @@ namespace llaminar2
             (is_pp_non_embedding_stage && has_position_input);
 
         const auto &env = debugEnv();
+        const int resident_graph_rows = host.residentGraphRows();
+        const auto resident_prefill_buckets =
+            prefillGraphBucketsAtOrBelowCapacity(
+                env.execution.prefill_graph_bucket_sizes,
+                resident_graph_rows);
         const int input_real_seq_len = effectiveRealSeqLen(input);
         const bool prefill_graph_min_seq_met =
             input_real_seq_len >= env.execution.prefill_graph_min_seq;
@@ -1167,7 +1173,7 @@ namespace llaminar2
             const int real_seq_len = input_real_seq_len;
             const auto selection = selectPrefillGraphBucket(
                 real_seq_len,
-                env.execution.prefill_graph_bucket_sizes);
+                resident_prefill_buckets);
             if (!selection)
             {
                 LOG_ERROR("[ForwardExecutionEngine] Bucketed prefill graph request rejected: "
@@ -1209,6 +1215,15 @@ namespace llaminar2
                               << " bucket_seq_len=" << input.bucket_seq_len);
                     return false;
                 }
+                if (resident_graph_rows > 0 &&
+                    input.bucket_seq_len > resident_graph_rows)
+                {
+                    LOG_ERROR("[ForwardExecutionEngine] Prepared prefill bucket "
+                              << input.bucket_seq_len
+                              << " exceeds memory-planned resident graph rows "
+                              << resident_graph_rows);
+                    return false;
+                }
                 bucketed_prefill = true;
                 bucketed_prefill_seq_len = input.bucket_seq_len;
             }
@@ -1218,7 +1233,7 @@ namespace llaminar2
                 planning_input.token_offset = effectiveTokenOffset(input);
                 raw_bucket_plan = prepareSinglePrefillChunkRuntimePlan(
                     planning_input,
-                    env.execution.prefill_graph_bucket_sizes,
+                    resident_prefill_buckets,
                     env.execution.prefill_graph_pad_token_id,
                     /*allow_padded_execution=*/true);
                 if (!raw_bucket_plan || !raw_bucket_plan->chunk)
@@ -1563,7 +1578,14 @@ namespace llaminar2
 
             if (!workspace_validated)
             {
-                if (!host.ensureDeviceWorkspaceAllocated(*forward_cache.graph, input.seq_len))
+                if (!host.ensureDeviceWorkspaceAllocated(
+                        *forward_cache.graph,
+                        input.seq_len,
+                        is_decode
+                            ? WorkspaceGraphFamilyPolicy::
+                                  SerialDeviceFamilyExactParticipant
+                            : WorkspaceGraphFamilyPolicy::
+                                  SerialDeviceFamilyLargestParticipant))
                 {
                     LOG_ERROR("[ForwardExecutionEngine] Failed to refresh cached graph workspace for "
                               << input.device.toString() << " seq_len=" << input.seq_len);
@@ -1828,6 +1850,15 @@ namespace llaminar2
                 stream_device))
         {
             LOG_ERROR("[ForwardExecutionEngine] Failed to prepare live state for cached forward graph execution");
+            return false;
+        }
+
+        if (!host.prepareDeviceTokenInputsForForwardGraphExecution(
+                input,
+                dynamic_param_stream,
+                stream_device))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Failed to prepare cached forward graph device-token inputs");
             return false;
         }
 
@@ -2258,6 +2289,7 @@ namespace llaminar2
                 forward_cache.outputProducerStream(
                     is_decode,
                     used_graph_replay),
+                input.execution_role,
                 is_decode,
                 host.computeAllPositionLogitsEnabled(),
                 input.seq_len,
@@ -3254,7 +3286,14 @@ namespace llaminar2
         // Ensure declared CPU/GPU workspace is allocated for this graph. Cache
         // hits repeat this step because another bucket can grow the shared
         // per-device workspace and leave cached stages bound to old pointers.
-        if (!host.ensureDeviceWorkspaceAllocated(graph, effective_input.seq_len))
+        if (!host.ensureDeviceWorkspaceAllocated(
+                graph,
+                effective_input.seq_len,
+                is_decode
+                    ? WorkspaceGraphFamilyPolicy::
+                          SerialDeviceFamilyExactParticipant
+                    : WorkspaceGraphFamilyPolicy::
+                          SerialDeviceFamilyLargestParticipant))
         {
             LOG_ERROR("[ForwardExecutionEngine] Failed to allocate workspace for forward graph on "
                       << effective_input.device.toString() << " seq_len=" << effective_input.seq_len);
@@ -3416,6 +3455,15 @@ namespace llaminar2
                 return false;
             }
 
+            if (!host.prepareDeviceTokenInputsForForwardGraphExecution(
+                    effective_input,
+                    execution_stream,
+                    ctx->deviceId()))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Failed to prepare forward graph device-token inputs");
+                return false;
+            }
+
             if (host.computeAllPositionLogitsEnabled() &&
                 host.allPositionLogitRows() > 0)
             {
@@ -3534,6 +3582,7 @@ namespace llaminar2
                 output,
                 producer_device,
                 execution_stream_used,
+                effective_input.execution_role,
                 is_decode,
                 host.computeAllPositionLogitsEnabled(),
                 effective_input.seq_len,

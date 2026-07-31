@@ -83,7 +83,9 @@ namespace llaminar2
     // Allocation
     // =========================================================================
 
-    bool DeviceWorkspaceManager::allocate(const WorkspaceRequirements &requirements)
+    bool DeviceWorkspaceManager::allocate(
+        const WorkspaceRequirements &requirements,
+        size_t minimum_primary_block_bytes)
     {
         if (allocated_)
         {
@@ -91,8 +93,19 @@ namespace llaminar2
             return false;
         }
 
-        // Handle empty requirements - still mark as allocated
-        if (requirements.buffers.empty())
+        if (minimum_primary_block_bytes > budget_bytes_)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Required primary family capacity "
+                      << minimum_primary_block_bytes << " bytes exceeds budget "
+                      << budget_bytes_ << " bytes on " << device_.to_string());
+            return false;
+        }
+
+        // Handle a genuinely empty allocation. A serial family may have no
+        // names in its first participant while still reserving physical space
+        // for a later participant, so a non-zero minimum continues below.
+        if (requirements.buffers.empty() &&
+            minimum_primary_block_bytes == 0)
         {
             LOG_DEBUG("[DeviceWorkspaceManager] Empty requirements, marking as allocated with no buffers");
             PerfStatsCollector::addCounter(
@@ -116,6 +129,7 @@ namespace llaminar2
             total_size = alignUp(total_size, buf.alignment);
             total_size += buf.size_bytes;
         }
+        total_size = std::max(total_size, minimum_primary_block_bytes);
 
         // Log all buffer requirements
         LOG_DEBUG("[DeviceWorkspaceManager] Workspace requirements (" << requirements.buffers.size() << " buffers):");
@@ -141,7 +155,7 @@ namespace llaminar2
                 }
             }
 
-            // Recalculate with only buffers that fit
+            // Recalculate with only buffers that fit.
             total_size = 0;
             std::vector<const WorkspaceDescriptor *> fitting_buffers;
             for (const auto &buf : requirements.buffers)
@@ -166,6 +180,9 @@ namespace llaminar2
                                                                                     << "' (doesn't fit)");
                 }
             }
+            total_size = std::max(
+                total_size,
+                minimum_primary_block_bytes);
 
             // If nothing fits, succeed with zero allocation
             if (fitting_buffers.empty())
@@ -245,7 +262,219 @@ namespace llaminar2
 
         if (fitting.empty())
             return true;
+
+        /*
+         * Keep descriptor-level evidence for every late graph-family request.
+         * A late extension is a lifetime-planning signal: if its producer graph
+         * is serialized with an already-resident graph, these names may be
+         * candidates for one preplanned largest-participant slot. Recording
+         * both the previous and requested capacities makes that analysis
+         * possible without a TRACE-sized execution log.
+         */
+        for (const WorkspaceDescriptor *buffer : fitting)
+        {
+            const auto existing = buffers_.find(buffer->name);
+            const size_t previous_bytes =
+                existing == buffers_.end() ? 0 : existing->second.size;
+            logVramBomLine(
+                "workspace_extension_buffer",
+                "device=" + device_.to_string() +
+                    " manager_id=" + std::to_string(id_) +
+                    " name=" + buffer->name +
+                    " previous_bytes=" + std::to_string(previous_bytes) +
+                    " requested_bytes=" +
+                    std::to_string(buffer->size_bytes) +
+                    " required=" +
+                    (buffer->required ? "true" : "false"));
+        }
         return allocateExtensionBuffers(fitting, extension_size);
+    }
+
+    bool DeviceWorkspaceManager::bindSerialParticipant(
+        const WorkspaceRequirements &requirements)
+    {
+        if (!allocated_ || !block_ || block_size_ == 0)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Cannot bind a serial participant before the primary workspace allocation on "
+                      << device_.to_string());
+            return false;
+        }
+
+        struct Interval
+        {
+            size_t begin = 0;
+            size_t end = 0;
+            std::string name;
+        };
+        struct PendingAlias
+        {
+            const WorkspaceDescriptor *descriptor = nullptr;
+            size_t offset = 0;
+        };
+
+        std::vector<Interval> occupied;
+        std::vector<const WorkspaceDescriptor *> missing;
+        occupied.reserve(requirements.buffers.size());
+        missing.reserve(requirements.buffers.size());
+
+        for (const WorkspaceDescriptor &descriptor : requirements.buffers)
+        {
+            const auto existing = buffers_.find(descriptor.name);
+            if (existing == buffers_.end())
+            {
+                missing.push_back(&descriptor);
+                continue;
+            }
+
+            if (existing->second.size < descriptor.size_bytes)
+            {
+                LOG_ERROR("[DeviceWorkspaceManager] Serial graph-family name '"
+                          << descriptor.name << "' was captured with "
+                          << existing->second.size << " bytes but a later participant requires "
+                          << descriptor.size_bytes << " bytes on "
+                          << device_.to_string()
+                          << "; compact/largest-participant preflight is incomplete");
+                return false;
+            }
+
+            /*
+             * An existing name in an old exclusive extension remains a valid
+             * fixed address, but it consumes no interval in the primary block.
+             * Fresh production families should never reach this case; retaining
+             * it makes mixed diagnostic setup deterministic.
+             */
+            if (existing->second.base != block_)
+                continue;
+
+            occupied.push_back(Interval{
+                .begin = existing->second.offset,
+                .end = existing->second.offset + descriptor.size_bytes,
+                .name = descriptor.name,
+            });
+        }
+
+        auto intervalOrder = [](const Interval &lhs, const Interval &rhs)
+        {
+            if (lhs.begin != rhs.begin)
+                return lhs.begin < rhs.begin;
+            if (lhs.end != rhs.end)
+                return lhs.end < rhs.end;
+            return lhs.name < rhs.name;
+        };
+        std::sort(occupied.begin(), occupied.end(), intervalOrder);
+        for (size_t i = 1; i < occupied.size(); ++i)
+        {
+            if (occupied[i].begin < occupied[i - 1].end)
+            {
+                LOG_ERROR("[DeviceWorkspaceManager] Serial graph participant requests previously published aliases '"
+                          << occupied[i - 1].name << "' and '" << occupied[i].name
+                          << "' whose primary-block lifetimes overlap; the graph-family declaration is invalid");
+                return false;
+            }
+        }
+
+        /*
+         * Largest-first placement reduces fragmentation for model-sized state
+         * captures. Name ordering makes the resulting addresses reproducible
+         * across runs even if consumer discovery order changes.
+         */
+        std::sort(
+            missing.begin(),
+            missing.end(),
+            [](const WorkspaceDescriptor *lhs,
+               const WorkspaceDescriptor *rhs)
+            {
+                if (lhs->size_bytes != rhs->size_bytes)
+                    return lhs->size_bytes > rhs->size_bytes;
+                return lhs->name < rhs->name;
+            });
+
+        std::vector<PendingAlias> pending;
+        pending.reserve(missing.size());
+        for (const WorkspaceDescriptor *descriptor : missing)
+        {
+            size_t candidate = 0;
+            bool placed = false;
+            std::sort(occupied.begin(), occupied.end(), intervalOrder);
+            for (const Interval &interval : occupied)
+            {
+                candidate = alignUp(candidate, descriptor->alignment);
+                if (candidate <= interval.begin &&
+                    descriptor->size_bytes <= interval.begin - candidate)
+                {
+                    placed = true;
+                    break;
+                }
+                candidate = std::max(candidate, interval.end);
+            }
+
+            if (!placed)
+            {
+                candidate = alignUp(candidate, descriptor->alignment);
+                placed =
+                    candidate <= block_size_ &&
+                    descriptor->size_bytes <= block_size_ - candidate;
+            }
+            if (!placed)
+            {
+                LOG_ERROR("[DeviceWorkspaceManager] Serial graph participant cannot fit buffer '"
+                          << descriptor->name << "' (" << descriptor->size_bytes
+                          << " bytes) into the " << block_size_
+                          << "-byte primary family workspace on "
+                          << device_.to_string()
+                          << "; no append-only fallback is permitted");
+                return false;
+            }
+
+            pending.push_back(PendingAlias{
+                .descriptor = descriptor,
+                .offset = candidate,
+            });
+            occupied.push_back(Interval{
+                .begin = candidate,
+                .end = candidate + descriptor->size_bytes,
+                .name = descriptor->name,
+            });
+        }
+
+        for (const PendingAlias &alias : pending)
+        {
+            const WorkspaceDescriptor &descriptor = *alias.descriptor;
+            buffers_[descriptor.name] = BufferInfo{
+                .base = block_,
+                .offset = alias.offset,
+                .size = descriptor.size_bytes,
+            };
+            logVramBomLine(
+                "workspace_serial_alias",
+                "device=" + device_.to_string() +
+                    " manager_id=" + std::to_string(id_) +
+                    " name=" + descriptor.name +
+                    " offset_bytes=" + std::to_string(alias.offset) +
+                    " primary_block_bytes=" + std::to_string(block_size_) +
+                    " requested_bytes=" +
+                    std::to_string(descriptor.size_bytes));
+            PerfStatsCollector::addCounter(
+                "memory",
+                "workspace_serial_alias_bytes",
+                static_cast<double>(descriptor.size_bytes),
+                "materialize",
+                device_.to_string(),
+                {{"name", descriptor.name},
+                 {"offset_bytes", std::to_string(alias.offset)},
+                 {"primary_block_bytes", std::to_string(block_size_)}});
+        }
+
+        PerfStatsCollector::addCounter(
+            "memory",
+            "workspace_serial_participant_bindings",
+            1.0,
+            "materialize",
+            device_.to_string(),
+            {{"buffer_count", std::to_string(requirements.buffers.size())},
+             {"new_alias_count", std::to_string(pending.size())},
+             {"physical_growth_bytes", "0"}});
+        return true;
     }
 
     bool DeviceWorkspaceManager::zeroAll(void *stream)

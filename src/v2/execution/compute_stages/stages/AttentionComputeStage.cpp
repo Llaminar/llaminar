@@ -7,6 +7,7 @@
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/GpuTensorView.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/TQ8Tensor.h"
 #include "../../../tensors/TQ4Tensor.h"
@@ -196,6 +197,61 @@ namespace llaminar2
           cpu_grouped_v_views_(static_cast<size_t>(std::max(0, params_.batch_size)), nullptr),
           cpu_grouped_kv_lens_(static_cast<size_t>(std::max(0, params_.batch_size)), 0)
     {
+        if (params_.device_id.is_gpu() &&
+            params_.kv_cache &&
+            debugEnv().attention.debug_effective_kv_snapshot &&
+            debugEnv().attention.debugEffectiveKVSnapshotLayerSelected(
+                params_.layer_idx))
+        {
+            const int request_count = std::max(1, params_.batch_size);
+            debug_device_kv_count_views_.reserve(
+                static_cast<size_t>(request_count));
+            debug_device_kv_head_views_.reserve(
+                static_cast<size_t>(request_count));
+            debug_device_kv_count_names_.reserve(
+                static_cast<size_t>(request_count));
+            debug_device_kv_head_names_.reserve(
+                static_cast<size_t>(request_count));
+
+            for (int request = 0; request < request_count; ++request)
+            {
+                const int *count =
+                    params_.kv_cache->deviceCachedTokenCountPtr(
+                        params_.layer_idx,
+                        request);
+                const int *head =
+                    params_.kv_cache->deviceRingHeadPtr(
+                        params_.layer_idx,
+                        request);
+                if (!count || !head)
+                {
+                    throw std::runtime_error(
+                        "effective-KV diagnostics require canonical device "
+                        "count and ring-head pointers for every request");
+                }
+
+                debug_device_kv_count_names_.push_back(
+                    "device_kv_count_request_" +
+                    std::to_string(request));
+                debug_device_kv_head_names_.push_back(
+                    "device_kv_head_request_" +
+                    std::to_string(request));
+                debug_device_kv_count_views_.push_back(
+                    std::make_unique<GpuTensorView>(
+                        const_cast<int *>(count),
+                        /*rows=*/1,
+                        /*cols=*/1,
+                        TensorType::INT32,
+                        params_.device_id));
+                debug_device_kv_head_views_.push_back(
+                    std::make_unique<GpuTensorView>(
+                        const_cast<int *>(head),
+                        /*rows=*/1,
+                        /*cols=*/1,
+                        TensorType::INT32,
+                        params_.device_id));
+            }
+        }
     }
 
     int AttentionComputeStage::dynamicAttentionParamRows(int logical_seq_len, int kv_len) const
@@ -1551,6 +1607,21 @@ namespace llaminar2
             if (effective_v_tensor && effective_v_rows > 0 && effective_v_cols > 0)
             {
                 info.addOutput("effective_v", effective_v_tensor, effective_v_rows, effective_v_cols);
+            }
+            for (size_t request = 0;
+                 request < debug_device_kv_count_views_.size();
+                 ++request)
+            {
+                info.addOutput(
+                    debug_device_kv_count_names_[request].c_str(),
+                    debug_device_kv_count_views_[request].get(),
+                    /*rows=*/1,
+                    /*cols=*/1);
+                info.addOutput(
+                    debug_device_kv_head_names_[request].c_str(),
+                    debug_device_kv_head_views_[request].get(),
+                    /*rows=*/1,
+                    /*cols=*/1);
             }
         }
 

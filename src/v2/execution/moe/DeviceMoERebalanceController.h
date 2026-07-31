@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <limits>
 #include <type_traits>
+#include <unordered_set>
 
 namespace llaminar2
 {
@@ -706,8 +707,8 @@ namespace llaminar2
      *
      * A transfer directory entry is mutable storage with exactly one current
      * logical occupant. Two active runtime descriptors may therefore never
-     * publish the same local slot. This scan is O(layers * experts), runs only
-     * in the maintenance controller, and requires no payload access.
+     * publish the same local slot. Host policy uses an exact hash set, runs
+     * only in the maintenance controller, and requires no payload access.
      *
      * @param runtime_layers Participant-local layer runtime array.
      * @param config Rebalance geometry and participant identity.
@@ -716,7 +717,7 @@ namespace llaminar2
     inline DeviceMoETransferSlotClaimSummary
     deviceMoETransferSlotClaimSummary(
         const DeviceMoELayerRuntime *runtime_layers,
-        const DeviceMoERebalanceConfig &config) noexcept
+        const DeviceMoERebalanceConfig &config)
     {
         DeviceMoETransferSlotClaimSummary summary;
         if (!runtime_layers ||
@@ -731,9 +732,13 @@ namespace llaminar2
             config.participant_id >= config.participant_count)
             return summary;
 
-        constexpr uint32_t kWordCount =
-            (kDeviceMoEMaxExperts + 31u) / 32u;
-        uint32_t claimed_slots[kWordCount] = {};
+        std::unordered_set<uint32_t> claimed_slots;
+        claimed_slots.reserve(
+            std::min<uint64_t>(
+                static_cast<uint64_t>(config.num_layers) *
+                    static_cast<uint64_t>(config.num_experts),
+                static_cast<uint64_t>(
+                    config.transfer_slot_directory_capacity)));
         const uint32_t local_participant_bit =
             moe_rebalance_policy::participantBit(config.participant_id);
         const uint32_t valid_flag =
@@ -769,7 +774,7 @@ namespace llaminar2
                         descriptor.owner_participant,
                         config.participant_id,
                         descriptor.local_slot,
-                        kDeviceMoEMaxExperts,
+                        kDeviceMoEMaxTransferSlots,
                         config.transfer_slot_directory_capacity,
                         valid_flag,
                         resident_flag,
@@ -810,9 +815,7 @@ namespace llaminar2
                     summary.max_slot_layer = layer;
                     summary.max_slot_expert = expert;
                 }
-                const uint32_t word = slot / 32u;
-                const uint32_t bit = 1u << (slot % 32u);
-                if ((claimed_slots[word] & bit) != 0u)
+                if (!claimed_slots.insert(slot).second)
                 {
                     if (summary.duplicate_claims == 0u)
                     {
@@ -824,7 +827,6 @@ namespace llaminar2
                     continue;
                 }
 
-                claimed_slots[word] |= bit;
                 ++summary.unique_claims;
             }
         }
@@ -1183,10 +1185,10 @@ namespace llaminar2
                moe_rebalance_policy::hasValidRootParticipant(config) &&
                config.active_transfer_slot_capacity > 0 &&
                config.active_transfer_slot_capacity <=
-                   kDeviceMoEMaxExperts &&
+                   kDeviceMoEMaxTransferSlots &&
                config.transfer_slot_directory_capacity > 0 &&
                config.transfer_slot_directory_capacity <=
-                   kDeviceMoEMaxExperts &&
+                   kDeviceMoEMaxTransferSlots &&
                config.active_transfer_slot_capacity <=
                    config.transfer_slot_directory_capacity &&
                config.window_size_tokens > 0 &&

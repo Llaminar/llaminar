@@ -1775,7 +1775,7 @@ TEST(Test__ForwardReplayStatePolicy, RequestBoundaryPreservesOnlyReplaySafeDecod
         << "Bucketed prefill replay remains warm while request-local graph-cache entries are demoted.";
 }
 
-TEST(Test__ForwardReplayStatePolicy, RequestBoundaryResetsDecodeCachesWithCollectives)
+TEST(Test__ForwardReplayStatePolicy, RequestBoundaryPreservesReplaySafeDecodeCachesWithCollectives)
 {
     ForwardGraphSignature single_token_decode;
     single_token_decode.decode = true;
@@ -1790,28 +1790,28 @@ TEST(Test__ForwardReplayStatePolicy, RequestBoundaryResetsDecodeCachesWithCollec
 
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::RequestBoundaryStateReset,
-                  single_token_decode,
-                  /*graph_has_collective_nodes=*/false),
+                  single_token_decode),
               ForwardReplayStateAction::PreserveReplayStateAndRebindStreams);
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::RequestBoundaryStateReset,
-                  single_token_decode,
-                  /*graph_has_collective_nodes=*/true),
-              ForwardReplayStateAction::ResetReplayState)
-        << "LocalTP/MoE decode graphs must not replay a graph executable captured for the previous request.";
-    EXPECT_EQ(chooseForwardReplayStateAction(
-                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
-                  all_position_verifier,
-                  /*graph_has_collective_nodes=*/true),
-              ForwardReplayStateAction::ResetReplayState)
-        << "Verifier decode captures with collectives need the same request-boundary recapture contract.";
-    EXPECT_EQ(chooseForwardReplayStateAction(
-                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
-                  prefill,
-                  /*graph_has_collective_nodes=*/true),
+                  all_position_verifier),
               ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
-        << "The collective request-boundary guard applies to decode replay; prefill has a separate "
-           "capture/readiness state machine.";
+        << "A captured NCCL/RCCL node is part of the immutable homogeneous graph; "
+           "request reset changes device-owned contents, not graph identity.";
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  prefill),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Prefill also retains its stable-address graph across request reset.";
+
+    ForwardGraphSignature multi_token_decode = single_token_decode;
+    multi_token_decode.seq_len = 4;
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  multi_token_decode),
+              ForwardReplayStateAction::ResetReplayState)
+        << "Only live-state-versioned multi-row ordinary decode recaptures; "
+           "collective presence does not alter the ownership policy.";
 }
 
 TEST(Test__ForwardGraphCache, InvalidateDestroysSegmentCaptureStream)

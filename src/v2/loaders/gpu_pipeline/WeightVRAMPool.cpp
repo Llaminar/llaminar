@@ -1,4 +1,5 @@
 #include "loaders/gpu_pipeline/WeightVRAMPool.h"
+#include "tensors/NativeVnniFormatInfo.h"
 #include "backends/IBackend.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
@@ -133,32 +134,41 @@ namespace llaminar2
             throw std::runtime_error("WeightVRAMPool: duplicate weight name '" + name + "'");
         }
 
-        const int blocks_per_row = K / 32;
-
         WeightPlan plan;
         plan.N = N;
         plan.K = K;
         plan.staging_bytes = raw_gguf_bytes;
 
-        // Payload region
-        plan.payload_bytes = static_cast<size_t>(blocks_per_row) * N * payload_bytes_per_block;
+        const NativeVnniFormatInfo format{
+            .codebook_id = 0,
+            .payload_bytes = payload_bytes_per_block,
+            .is_asymmetric = is_asymmetric,
+            .is_superblock = false,
+            .has_emins = has_emins,
+            .max_abs_factor = 0.0f,
+        };
+        const NativeVnniPackedRegionSizes regions =
+            nativeVnniPackedRegionSizes(
+                static_cast<size_t>(N),
+                static_cast<size_t>(K),
+                format);
+
+        // Every persistent region uses the canonical native-VNNI layout.
+        plan.payload_bytes = regions.payload_bytes;
         plan.payload_offset = allocateRegion(plan.payload_bytes);
 
-        // Scales region (FP16 = uint16_t)
-        plan.scales_bytes = static_cast<size_t>(blocks_per_row) * N * sizeof(uint16_t);
+        plan.scales_bytes = regions.scales_bytes;
         plan.scales_offset = allocateRegion(plan.scales_bytes);
 
-        // Mins region (asymmetric only)
-        if (is_asymmetric)
+        if (regions.mins_bytes > 0)
         {
-            plan.mins_bytes = plan.scales_bytes; // Same size as scales
+            plan.mins_bytes = regions.mins_bytes;
             plan.mins_offset = allocateRegion(plan.mins_bytes);
         }
 
-        // Emins region (Q2_K only)
-        if (has_emins)
+        if (regions.emins_bytes > 0)
         {
-            plan.emins_bytes = static_cast<size_t>(blocks_per_row) * N * sizeof(uint32_t);
+            plan.emins_bytes = regions.emins_bytes;
             plan.emins_offset = allocateRegion(plan.emins_bytes);
         }
 

@@ -34,6 +34,21 @@ namespace llaminar2
         int vocab_size = 0;
         int max_seq_len = 0;
 
+        /**
+         * @brief Hybrid recurrent and MTP geometry copied from GGUF metadata.
+         *
+         * Keeping these values in the compact profile lets rank-local memory
+         * planning reproduce the same cache construction performed later by
+         * Qwen35GraphConfigBuilder without loading model tensors on every rank.
+         */
+        int mtp_layer_count = 0;
+        int full_attention_interval = 0;
+        int gdn_conv_kernel_size = 0;
+        int gdn_state_size = 0;
+        int gdn_inner_size = 0;
+        int gdn_group_count = 0;
+        int gdn_time_step_rank = 0;
+
         // Weight sizing
         size_t total_native_bytes = 0;
         std::vector<TensorSizeInfo> tensors;

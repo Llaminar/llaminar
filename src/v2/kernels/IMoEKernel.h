@@ -931,7 +931,9 @@ namespace llaminar2
             DeviceMoERebalanceCommandBufferHeader *command_header = nullptr,
             DeviceMoERebalanceWaveState *wave_state = nullptr,
             DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
-            uint32_t command_buffer_count = 1)
+            uint32_t command_buffer_count = 1,
+            const DeviceMoEExpertDirectoryEntry *local_transfer_slots = nullptr,
+            uint32_t local_transfer_slot_count = 0)
         {
             (void)launch;
             (void)runtime_layers;
@@ -946,6 +948,8 @@ namespace llaminar2
             (void)wave_state;
             (void)controller_state;
             (void)command_buffer_count;
+            (void)local_transfer_slots;
+            (void)local_transfer_slot_count;
             return false;
         }
 

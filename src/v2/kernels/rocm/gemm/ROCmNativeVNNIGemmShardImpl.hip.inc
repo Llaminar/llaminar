@@ -1,5 +1,5 @@
 /**
- * @file ROCmQuantisedGemmKernel_native_VNNI.hip
+ * @file ROCmNativeVNNIGemmShardImpl.hip.inc
  * @brief Native-VNNI GEMM kernels for lossless sub-8-bit prefill on AMD MI50/MI60 (gfx906)
  *
  * @target AMD Instinct MI50 / MI60 (gfx906), 60 CUs, 4 SIMDs/CU
@@ -46,6 +46,20 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
 #include "ROCmNativeVNNIDecodeEquivalentMath.h"
+
+#ifndef LLAMINAR_ROCM_NATIVE_VNNI_SHARD
+#error "ROCmNativeVNNIGemmShardImpl.hip.inc requires a physical shard index"
+#endif
+
+#if LLAMINAR_ROCM_NATIVE_VNNI_SHARD < 0 || LLAMINAR_ROCM_NATIVE_VNNI_SHARD > 7
+#error "ROCm NativeVNNI GEMM shard index must be in [0, 7]"
+#endif
+
+#define LLAMINAR_ROCM_NVNNI_CONCAT_IMPL(A, B) A##B
+#define LLAMINAR_ROCM_NVNNI_CONCAT(A, B) \
+    LLAMINAR_ROCM_NVNNI_CONCAT_IMPL(A, B)
+#define LLAMINAR_ROCM_NVNNI_SHARD_SYMBOL(PREFIX) \
+    LLAMINAR_ROCM_NVNNI_CONCAT(PREFIX, LLAMINAR_ROCM_NATIVE_VNNI_SHARD)
 
 extern "C" bool rocmGemv_native_vnni_query_serial_m1_config(
     uint8_t codebook_id,
@@ -2925,7 +2939,8 @@ static bool launch_native_vnni_gemm(
 // ============================================================================
 
 extern "C"
-bool rocmGemm_native_vnni_fp32(
+bool LLAMINAR_ROCM_NVNNI_SHARD_SYMBOL(
+    rocmGemm_native_vnni_fp32_shard_)(
     const int8_t*  d_A_int8,       // [M × K] INT8 activations
     const uint8_t* d_payload,      // [blocks_per_row × N × PB] native-VNNI payload
     const void*    d_block_scales, // [blocks_per_row × N] __half per-block scales
@@ -2954,25 +2969,38 @@ bool rocmGemm_native_vnni_fp32(
 
     switch (codebook_id)
     {
+#if LLAMINAR_ROCM_NATIVE_VNNI_SHARD == 0
     case NVNNI_GEMM_Q4_0:     LAUNCH_GEMM(NVNNI_GEMM_Q4_0);
     case NVNNI_GEMM_IQ4_NL:   LAUNCH_GEMM(NVNNI_GEMM_IQ4_NL);
+#elif LLAMINAR_ROCM_NATIVE_VNNI_SHARD == 1
     case NVNNI_GEMM_Q4_1:     LAUNCH_GEMM(NVNNI_GEMM_Q4_1);
     case NVNNI_GEMM_Q5_0:     LAUNCH_GEMM(NVNNI_GEMM_Q5_0);
+#elif LLAMINAR_ROCM_NATIVE_VNNI_SHARD == 2
     case NVNNI_GEMM_Q5_1:     LAUNCH_GEMM(NVNNI_GEMM_Q5_1);
     case NVNNI_GEMM_Q6_K:     LAUNCH_GEMM(NVNNI_GEMM_Q6_K);
+#elif LLAMINAR_ROCM_NATIVE_VNNI_SHARD == 3
     case NVNNI_GEMM_Q3_K:     LAUNCH_GEMM(NVNNI_GEMM_Q3_K);
     case NVNNI_GEMM_Q2_K:     LAUNCH_GEMM(NVNNI_GEMM_Q2_K);
+#elif LLAMINAR_ROCM_NATIVE_VNNI_SHARD == 4
     case NVNNI_GEMM_IQ3_S:    LAUNCH_GEMM(NVNNI_GEMM_IQ3_S);
     case NVNNI_GEMM_IQ3_XXS:  LAUNCH_GEMM(NVNNI_GEMM_IQ3_XXS);
+#elif LLAMINAR_ROCM_NATIVE_VNNI_SHARD == 5
     case NVNNI_GEMM_IQ2_S:    LAUNCH_GEMM(NVNNI_GEMM_IQ2_S);
     case NVNNI_GEMM_IQ2_XS:   LAUNCH_GEMM(NVNNI_GEMM_IQ2_XS);
+#elif LLAMINAR_ROCM_NATIVE_VNNI_SHARD == 6
     case NVNNI_GEMM_IQ2_XXS:  LAUNCH_GEMM(NVNNI_GEMM_IQ2_XXS);
     case NVNNI_GEMM_IQ1_S:    LAUNCH_GEMM(NVNNI_GEMM_IQ1_S);
+#elif LLAMINAR_ROCM_NATIVE_VNNI_SHARD == 7
     case NVNNI_GEMM_IQ1_M:    LAUNCH_GEMM(NVNNI_GEMM_IQ1_M);
     case NVNNI_GEMM_Q8_0:     LAUNCH_GEMM(NVNNI_GEMM_Q8_0);
+#endif
     default:
-        fprintf(stderr, "[rocmGemm_native_vnni_fp32] Unsupported codebook_id=%d\n",
-                codebook_id);
+        fprintf(
+            stderr,
+            "[rocmGemm_native_vnni_fp32_shard_%d] codebook_id=%d does not "
+            "belong to this physical shard\n",
+            LLAMINAR_ROCM_NATIVE_VNNI_SHARD,
+            codebook_id);
         return false;
     }
 
@@ -2987,7 +3015,8 @@ bool rocmGemm_native_vnni_fp32(
 // ============================================================================
 
 extern "C"
-bool rocmInitIQGridTables_gemm(
+bool LLAMINAR_ROCM_NVNNI_SHARD_SYMBOL(
+    rocmInitIQGridTables_gemm_shard_)(
     int device_id,
     const void* h_iq3s_grid,    // [512]  uint32_t
     const void* h_iq3xxs_grid,  // [256]  uint32_t
@@ -3013,3 +3042,7 @@ bool rocmInitIQGridTables_gemm(
 
     return true;
 }
+
+#undef LLAMINAR_ROCM_NVNNI_SHARD_SYMBOL
+#undef LLAMINAR_ROCM_NVNNI_CONCAT
+#undef LLAMINAR_ROCM_NVNNI_CONCAT_IMPL

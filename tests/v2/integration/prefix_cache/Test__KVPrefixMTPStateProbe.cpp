@@ -98,6 +98,8 @@ namespace
             "K_NORM",
             "Q_ROPE",
             "K_ROPE",
+            "KV_APPEND_SOURCE_K",
+            "KV_APPEND_SOURCE_V",
             "FA_GATE",
             "ATTENTION_EFFECTIVE_K",
             "ATTENTION_EFFECTIVE_V",
@@ -570,6 +572,26 @@ namespace
         size_t comparable = 0;
         for (const std::string &key : ordered_keys)
         {
+            /*
+             * Effective K/V snapshots are fixed-stride cache banks, not
+             * token-major stage outputs.  For an isolated request the snapshot
+             * contains one max-sequence-capacity bank; a request batch contains
+             * one such bank per request.  Treating a complete bank as a compact
+             * "terminal row" compares intentionally inactive capacity after a
+             * short request's logical end and can hide the first real arithmetic
+             * divergence behind stale-but-unobservable cache bytes.
+             *
+             * requestBatchEffectiveKVBankByteIdentical() owns this tensor
+             * contract and compares only each request's live prefix.  Keeping
+             * cache-bank and token-row comparisons disjoint makes it impossible
+             * for padded capacity to masquerade as model-output corruption.
+             */
+            if (key.ends_with("_ATTENTION_EFFECTIVE_K") ||
+                key.ends_with("_ATTENTION_EFFECTIVE_V"))
+            {
+                continue;
+            }
+
             const auto scalar_it = scalar.find(key);
             const auto batch_it = batched.find(key);
             if (scalar_it == scalar.end() || batch_it == batched.end())
@@ -669,18 +691,20 @@ namespace
     /**
      * @brief Compare one active request prefix in a fixed-stride grouped KV view.
      *
-     * Scalar attention snapshots contain exactly `scalar_kv_rows` rows.  A GPU
-     * request-batch snapshot stores every bank with `grouped_kv_stride` rows,
-     * zero-padding the suffix of shorter requests.  Comparing only the active
-     * prefix isolates cache append/gather/RoPE correctness from the subsequent
-     * softmax and value reduction.
+     * Both scalar and request-batched GPU attention snapshots preserve the
+     * physical fixed-capacity KV-bank layout used by production execution.
+     * `active_kv_rows` names the logical prefix that participates in attention,
+     * while `physical_bank_rows` names the row stride between request banks.
+     * Comparing only the active prefix isolates cache append/gather/RoPE
+     * correctness from the subsequent softmax and value reduction without
+     * pretending that a fixed-capacity scalar snapshot is tightly packed.
      */
     ::testing::AssertionResult requestBatchEffectiveKVBankByteIdentical(
         const std::map<std::string, RequestBatchStageSnapshot> &scalar,
         const std::map<std::string, RequestBatchStageSnapshot> &grouped,
         const std::string &key,
-        size_t scalar_kv_rows,
-        size_t grouped_kv_stride,
+        size_t active_kv_rows,
+        size_t physical_bank_rows,
         size_t request_index,
         const std::string &label)
     {
@@ -693,21 +717,22 @@ namespace
                    << " scalar_present=" << (scalar_it != scalar.end())
                    << " grouped_present=" << (grouped_it != grouped.end());
         }
-        if (scalar_kv_rows == 0 || grouped_kv_stride < scalar_kv_rows ||
-            scalar_it->second.data.size() % scalar_kv_rows != 0)
+        if (active_kv_rows == 0 ||
+            physical_bank_rows < active_kv_rows ||
+            scalar_it->second.data.size() % physical_bank_rows != 0)
         {
             return ::testing::AssertionFailure()
                    << label << " has invalid KV row geometry for " << key
                    << " scalar_values=" << scalar_it->second.data.size()
-                   << " scalar_rows=" << scalar_kv_rows
-                   << " grouped_stride=" << grouped_kv_stride;
+                   << " active_rows=" << active_kv_rows
+                   << " physical_bank_rows=" << physical_bank_rows;
         }
 
         const size_t cols =
-            scalar_it->second.data.size() / scalar_kv_rows;
-        const size_t grouped_row_start = request_index * grouped_kv_stride;
+            scalar_it->second.data.size() / physical_bank_rows;
+        const size_t grouped_row_start = request_index * physical_bank_rows;
         const size_t grouped_value_start = grouped_row_start * cols;
-        const size_t compared_values = scalar_kv_rows * cols;
+        const size_t compared_values = active_kv_rows * cols;
         if (cols == 0 ||
             grouped_it->second.data.size() <
                 grouped_value_start + compared_values)
@@ -754,16 +779,62 @@ namespace
         uint32_t actual_bits = 0;
         std::memcpy(&expected_bits, expected + first, sizeof(expected_bits));
         std::memcpy(&actual_bits, actual + first, sizeof(actual_bits));
-        return ::testing::AssertionFailure()
-               << label << " effective KV bank differs at " << key
-               << " mismatches=" << mismatch_count << "/" << compared_values
-               << " first_row=" << first / cols
-               << " first_col=" << first % cols
-               << " grouped=" << actual[first]
-               << " scalar=" << expected[first]
-               << " grouped_bits=0x" << std::hex << actual_bits
-               << " scalar_bits=0x" << expected_bits << std::dec
-               << " max_abs=" << max_abs;
+        auto failure = ::testing::AssertionFailure();
+        failure << label << " effective KV bank differs at " << key
+                << " mismatches=" << mismatch_count << "/" << compared_values
+                << " first_row=" << first / cols
+                << " first_col=" << first % cols
+                << " grouped=" << actual[first]
+                << " scalar=" << expected[first]
+                << " grouped_bits=0x" << std::hex << actual_bits
+                << " scalar_bits=0x" << expected_bits << std::dec
+                << " max_abs=" << max_abs;
+
+        const size_t first_row = first / cols;
+        const size_t request_zero_same_row =
+            first_row * cols + (first % cols);
+        if (request_index > 0 &&
+            grouped_it->second.data.size() > request_zero_same_row)
+        {
+            failure << " request0_bank_same_row="
+                    << grouped_it->second.data[request_zero_same_row];
+        }
+
+        /*
+         * Report the exact append-source candidates at the first corrupted
+         * cache column.  The production cache in this scenario stores FP16, so
+         * round each FP32 projection value through the native cache format.
+         * Seeing the actual cache byte match request zero identifies source
+         * aliasing; matching neither source points instead at a stale ring row.
+         */
+        std::string source_key = key;
+        const std::string effective_marker = "ATTENTION_EFFECTIVE_";
+        const size_t marker = source_key.find(effective_marker);
+        if (marker != std::string::npos)
+        {
+            source_key.replace(
+                marker,
+                effective_marker.size(),
+                "KV_APPEND_SOURCE_");
+            const auto source_it = grouped.find(source_key);
+            const size_t first_col = first % cols;
+            if (source_it != grouped.end() &&
+                source_it->second.data.size() >=
+                    (request_index + 1) * cols)
+            {
+                const float request_zero_source =
+                    source_it->second.data[first_col];
+                const float selected_source =
+                    source_it->second.data[request_index * cols + first_col];
+                failure << " request0_source_fp16="
+                        << static_cast<float>(
+                               static_cast<_Float16>(request_zero_source))
+                        << " request" << request_index << "_source_fp16="
+                        << static_cast<float>(
+                               static_cast<_Float16>(selected_source));
+            }
+        }
+        return failure;
     }
 
     class ScopedDebugEnv
@@ -2987,6 +3058,8 @@ namespace
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT", "1"},
+            {"LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT_LAYER", "3"},
             {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT", "1"},
             {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT_LAYER", "3"},
             {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_request_batch_prefill_stats.json"},
@@ -3072,6 +3145,14 @@ namespace
             {
                 diagnostic_keys.push_back("layer3_ATTENTION_EFFECTIVE_K");
                 diagnostic_keys.push_back("layer3_ATTENTION_EFFECTIVE_V");
+                diagnostic_keys.push_back(
+                    "layer3_ATTENTION_DEVICE_KV_COUNT_REQUEST_0");
+                diagnostic_keys.push_back(
+                    "layer3_ATTENTION_DEVICE_KV_COUNT_REQUEST_1");
+                diagnostic_keys.push_back(
+                    "layer3_ATTENTION_DEVICE_KV_HEAD_REQUEST_0");
+                diagnostic_keys.push_back(
+                    "layer3_ATTENTION_DEVICE_KV_HEAD_REQUEST_1");
             }
             if (capture_stage_diagnostics)
             {
@@ -3245,19 +3326,45 @@ namespace
                         scalar_long_condition_snapshots,
                         grouped_condition_snapshots,
                         kv_key,
-                        /*scalar_kv_rows=*/long_prompt.size() + 1,
-                        /*grouped_kv_stride=*/long_prompt.size() + 1,
+                        /*active_kv_rows=*/long_prompt.size() + 1,
+                        /*physical_bank_rows=*/
+                        static_cast<size_t>(config.max_seq_len),
                         /*request_index=*/0,
                         backend_name + " long-request grouped condition"));
                     EXPECT_TRUE(requestBatchEffectiveKVBankByteIdentical(
                         scalar_short_condition_snapshots,
                         grouped_condition_snapshots,
                         kv_key,
-                        /*scalar_kv_rows=*/short_prompt.size() + 1,
-                        /*grouped_kv_stride=*/long_prompt.size() + 1,
+                        /*active_kv_rows=*/short_prompt.size() + 1,
+                        /*physical_bank_rows=*/
+                        static_cast<size_t>(config.max_seq_len),
                         /*request_index=*/1,
                         backend_name + " short-request grouped condition"));
                 }
+                const auto expect_device_kv_state =
+                    [&](const std::string &key, int expected)
+                {
+                    const auto it = grouped_condition_snapshots.find(key);
+                    ASSERT_NE(it, grouped_condition_snapshots.end())
+                        << "Missing graph-captured device KV state " << key;
+                    ASSERT_EQ(it->second.data.size(), 1u) << key;
+                    EXPECT_EQ(
+                        static_cast<int>(it->second.data.front()),
+                        expected)
+                        << key;
+                };
+                expect_device_kv_state(
+                    "layer3_ATTENTION_DEVICE_KV_COUNT_REQUEST_0",
+                    static_cast<int>(long_prompt.size() + 1));
+                expect_device_kv_state(
+                    "layer3_ATTENTION_DEVICE_KV_COUNT_REQUEST_1",
+                    static_cast<int>(short_prompt.size() + 1));
+                expect_device_kv_state(
+                    "layer3_ATTENTION_DEVICE_KV_HEAD_REQUEST_0",
+                    static_cast<int>(long_prompt.size() + 1));
+                expect_device_kv_state(
+                    "layer3_ATTENTION_DEVICE_KV_HEAD_REQUEST_1",
+                    static_cast<int>(short_prompt.size() + 1));
                 runner->disableSnapshotCapture();
             }
 

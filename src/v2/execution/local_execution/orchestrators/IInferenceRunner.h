@@ -39,6 +39,22 @@ namespace llaminar2
     class MoERebalanceController;
 
     /**
+     * @brief Semantic purpose of a single-request device-token forward.
+     *
+     * A stable device token row is used by two mathematically different MTP
+     * operations.  A condition advance commits one ordinary main-model decode
+     * row before sidecar drafting, while a grouped verifier evaluates every
+     * speculative row and may publish accepted state.  The purpose is mandatory
+     * so callers cannot accidentally select verifier graph policy merely
+     * because both operations happen to use the same persistent token buffer.
+     */
+    enum class DeviceTokenForwardPurpose : uint8_t
+    {
+        MTPCondition,       ///< One decode-equivalent main-model condition row.
+        GroupedMTPVerifier, ///< One request's grouped speculative verifier rows.
+    };
+
+    /**
      * @brief Lightweight view of a device runner's local logits state
      *
      * Returned by getLogitsLocalInfo() to provide GPU pointer, device, and
@@ -891,16 +907,19 @@ namespace llaminar2
          *        The pointer must remain valid for any cached graph replay that
          *        the runner enables for this shape.
          * @param seq_len Sequence length for this single-batch forward.
+         * @param purpose Required semantic owner of this device-token row.
          * @return true when the forward pass succeeds.
          */
         virtual bool forwardWithDeviceTokenIds(
             const int *token_shadow,
             const void *token_ids_device,
-            int seq_len)
+            int seq_len,
+            DeviceTokenForwardPurpose purpose)
         {
             (void)token_shadow;
             (void)token_ids_device;
             (void)seq_len;
+            (void)purpose;
             return false;
         }
 
@@ -1958,17 +1977,20 @@ namespace llaminar2
          * must still append that token's row, so supporting runners read the
          * token from the same target sample slot used by
          * forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling().
+         *
+         * The append position is derived from the request transaction's canonical
+         * device-resident shifted-cache count.  A host position argument is
+         * intentionally absent: accepting one would let token and position
+         * ownership split across independently advancing GPU and CPU timelines.
          */
         virtual bool commitMTPShiftedRowFromDeviceTargetSample(
             int target_sample_slot,
             int already_appended_tokens,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1)
+            bool allow_speculative_discard = false)
         {
             (void)target_sample_slot;
             (void)already_appended_tokens;
             (void)allow_speculative_discard;
-            (void)position_offset_override;
             return false;
         }
 
@@ -3120,18 +3142,21 @@ namespace llaminar2
         }
 
         /**
-         * @brief Stage one resolved target token into a device target sample slot.
+         * @brief Publish one host-resolved control token into a device target slot.
          *
          * LocalTP rank-level stochastic sampling reduces per-shard compact
          * candidates into one full-vocab token.  Once that token is known, each
          * child runner still needs it in the same runner-owned device slot used
          * by native device samplers, so later sidecar and verifier graph inputs
          * can consume a stable device pointer instead of a host token row.
+         * Request-policy tokens, such as bounded-thinking stop-sequence tokens,
+         * use the same ownership boundary before entering MTP state.
          *
-         * Implementations must enqueue the upload on an explicit backend stream
-         * and record the usual target-sample readiness event.  Returning false
-         * is a hard capability failure for callers that selected the device
-         * token path.
+         * Implementations must enqueue a scalar publication kernel on an explicit
+         * backend stream and record the usual target-sample readiness event.
+         * They must not issue an asynchronous H2D copy from the caller's stack
+         * scalar. Returning false is a hard capability failure for callers that
+         * selected the device-token path.
          */
         virtual bool stageStochasticTargetTokenForDeviceSampling(
             int32_t target_token,

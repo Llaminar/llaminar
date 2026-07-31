@@ -12090,6 +12090,26 @@ TEST(Test__ROCmMoEKernel,
         ~toMoEExpertFlags(DeviceMoEExpertFlags::LocalCompute);
     update.experts[0].flags |=
         toMoEExpertFlags(DeviceMoEExpertFlags::TransferSlot);
+    std::array<DeviceMoEExpertDirectoryEntry, 2>
+        host_transfer_directory{};
+    auto &promoted_entry = host_transfer_directory[1];
+    promoted_entry.descriptor = update.experts[0];
+    promoted_entry.layer = 0u;
+    promoted_entry.expert = 0u;
+    promoted_entry.participant = 0u;
+    promoted_entry.resident_mask = 0b01u;
+    promoted_entry.epoch = update.epoch;
+    promoted_entry.flags =
+        static_cast<uint32_t>(
+            DeviceMoERebalanceDirectoryFlags::Valid) |
+        static_cast<uint32_t>(
+            DeviceMoERebalanceDirectoryFlags::Resident) |
+        static_cast<uint32_t>(
+            DeviceMoERebalanceDirectoryFlags::TransferSlot) |
+        static_cast<uint32_t>(
+            DeviceMoERebalanceDirectoryFlags::CopyComplete);
+    promoted_entry.slot_index = 1u;
+    promoted_entry.generation = 1u;
     ASSERT_TRUE(runtime_table.prepareInactiveBank(0, update));
     ASSERT_TRUE(runtime_table.flipActiveBank(0, update.epoch, stream));
 
@@ -12108,6 +12128,7 @@ TEST(Test__ROCmMoEKernel,
     uint64_t *d_local = nullptr;
     uint64_t *d_gathered = nullptr;
     DeviceMoERebalanceStatus *d_status = nullptr;
+    DeviceMoEExpertDirectoryEntry *d_transfer_directory = nullptr;
     ASSERT_EQ(hipMalloc(
                   reinterpret_cast<void **>(&d_local),
                   config.num_experts * sizeof(uint64_t)),
@@ -12121,6 +12142,17 @@ TEST(Test__ROCmMoEKernel,
     ASSERT_EQ(hipMalloc(
                   reinterpret_cast<void **>(&d_status),
                   sizeof(DeviceMoERebalanceStatus)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(
+                  reinterpret_cast<void **>(&d_transfer_directory),
+                  sizeof(host_transfer_directory)),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(
+                  d_transfer_directory,
+                  host_transfer_directory.data(),
+                  sizeof(host_transfer_directory),
+                  hipMemcpyHostToDevice,
+                  stream),
               hipSuccess);
     ASSERT_TRUE(gpu_kernel.packDeviceRebalanceHistograms(
         moeLaunchContext(stream),
@@ -12149,7 +12181,17 @@ TEST(Test__ROCmMoEKernel,
         runtime_table.deviceLayerState(0),
         d_gathered,
         d_status,
-        config));
+        config,
+        /*plan_entries=*/nullptr,
+        /*plan_count=*/nullptr,
+        /*plan_capacity=*/0u,
+        /*payload_slot_capacity=*/0u,
+        /*command_header=*/nullptr,
+        /*wave_state=*/nullptr,
+        /*controller_state=*/nullptr,
+        /*command_buffer_count=*/1u,
+        d_transfer_directory,
+        static_cast<uint32_t>(host_transfer_directory.size())));
 
     std::array<uint64_t, 4> packed{};
     DeviceMoERebalanceStatus status{};
@@ -12185,9 +12227,86 @@ TEST(Test__ROCmMoEKernel,
     EXPECT_EQ(status.prefill_invalid_transfer_slot_claims, 0u);
     EXPECT_EQ(status.prefill_max_transfer_slot, 1u);
 
+    /*
+     * Descriptor-only accounting is not an admissible compatibility path. A
+     * missing physical directory must remain visible as a terminal device
+     * status with exact provenance.
+     */
+    ASSERT_TRUE(gpu_kernel.runDeviceRebalanceController(
+        moeLaunchContext(stream),
+        runtime_table.deviceLayerState(0),
+        d_gathered,
+        d_status,
+        config));
+    ASSERT_EQ(hipMemcpyAsync(
+                  &status,
+                  d_status,
+                  sizeof(status),
+                  hipMemcpyDeviceToHost,
+                  stream),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    EXPECT_EQ(
+        status.status_code,
+        static_cast<uint32_t>(
+            DeviceMoERebalanceStatusCode::InvalidRuntime));
+    EXPECT_EQ(status.prefill_invalid_transfer_slot_claims, 1u);
+    EXPECT_EQ(
+        status.prefill_first_invalid_reasons,
+        moe_rebalance_policy::
+            TransferSlotClaimDirectoryIdentityMismatch);
+
+    /*
+     * Preserve the semantic distinction between a stale directory occupant and
+     * duplicate claims published by two active runtime descriptors.
+     */
+    host_transfer_directory[1].expert = 1u;
+    ASSERT_EQ(hipMemcpyAsync(
+                  d_transfer_directory,
+                  host_transfer_directory.data(),
+                  sizeof(host_transfer_directory),
+                  hipMemcpyHostToDevice,
+                  stream),
+              hipSuccess);
+    ASSERT_TRUE(gpu_kernel.runDeviceRebalanceController(
+        moeLaunchContext(stream),
+        runtime_table.deviceLayerState(0),
+        d_gathered,
+        d_status,
+        config,
+        /*plan_entries=*/nullptr,
+        /*plan_count=*/nullptr,
+        /*plan_capacity=*/0u,
+        /*payload_slot_capacity=*/0u,
+        /*command_header=*/nullptr,
+        /*wave_state=*/nullptr,
+        /*controller_state=*/nullptr,
+        /*command_buffer_count=*/1u,
+        d_transfer_directory,
+        static_cast<uint32_t>(host_transfer_directory.size())));
+    ASSERT_EQ(hipMemcpyAsync(
+                  &status,
+                  d_status,
+                  sizeof(status),
+                  hipMemcpyDeviceToHost,
+                  stream),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    EXPECT_EQ(
+        status.status_code,
+        static_cast<uint32_t>(
+            DeviceMoERebalanceStatusCode::InvalidRuntime));
+    EXPECT_EQ(status.prefill_duplicate_transfer_slot_claims, 0u);
+    EXPECT_EQ(status.prefill_invalid_transfer_slot_claims, 1u);
+    EXPECT_EQ(
+        status.prefill_first_invalid_reasons,
+        moe_rebalance_policy::
+            TransferSlotClaimOccupantMismatch);
+
     EXPECT_EQ(hipFree(d_local), hipSuccess);
     EXPECT_EQ(hipFree(d_gathered), hipSuccess);
     EXPECT_EQ(hipFree(d_status), hipSuccess);
+    EXPECT_EQ(hipFree(d_transfer_directory), hipSuccess);
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
@@ -20025,6 +20144,69 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
+TEST(Test__ROCmMoERouteScratch,
+     SerialGraphRolesShareImmutableLargestParticipantArena)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    SKIP_IF_NO_ROCM();
+
+    constexpr int kExperts = 8;
+    constexpr int kTopK = 4;
+    constexpr int kPlannedRows = 31;
+    const auto device = DeviceId::rocm(0);
+
+    DeviceMoESerialRouteScratchArena::Config arena_config;
+    arena_config.device_id = device;
+    arena_config.num_experts = kExperts;
+    arena_config.top_k = kTopK;
+    arena_config.token_capacity = kPlannedRows;
+    auto arena =
+        std::make_shared<DeviceMoESerialRouteScratchArena>(arena_config);
+
+    DeviceMoERuntimeTable::Config table_config;
+    table_config.device_id = device;
+    table_config.num_layers = 2;
+    table_config.num_experts = kExperts;
+    table_config.top_k = kTopK;
+    table_config.mirror_to_device = true;
+    table_config.prefill_token_capacity = kPlannedRows;
+    table_config.serial_route_scratch_arena = arena;
+
+    DeviceMoERuntimeTable main_table(table_config);
+    table_config.num_layers = 1;
+    DeviceMoERuntimeTable sidecar_table(table_config);
+
+    ASSERT_TRUE(main_table.usesImmutableSerialRouteScratch());
+    ASSERT_TRUE(sidecar_table.usesImmutableSerialRouteScratch());
+    const auto *stable_route_ids =
+        main_table.hostLayerState(0).route_expert_ids;
+    ASSERT_NE(stable_route_ids, nullptr);
+    EXPECT_EQ(
+        main_table.hostLayerState(1).route_expert_ids,
+        stable_route_ids)
+        << "serial transformer layers must share transient route scratch";
+    EXPECT_EQ(
+        sidecar_table.hostLayerState(0).route_expert_ids,
+        stable_route_ids)
+        << "ordered main and MTP graphs must share the largest-participant arena";
+
+    EXPECT_NO_THROW(
+        main_table.ensurePrefillRouteScratchCapacity(kPlannedRows));
+    EXPECT_THROW(
+        sidecar_table.ensurePrefillRouteScratchCapacity(kPlannedRows + 1),
+        std::logic_error)
+        << "captured scratch growth must fail instead of replacing addresses";
+    EXPECT_EQ(
+        main_table.hostLayerState(0).route_expert_ids,
+        stable_route_ids);
+    EXPECT_EQ(
+        sidecar_table.hostLayerState(0).route_expert_ids,
+        stable_route_ids);
+#endif
+}
+
 TEST(Test__ROCmMoEKernel, SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFormats_RuntimeMMatchSerialStageDecode)
 {
     for (const int intermediate : {512, 256})
@@ -20497,6 +20679,18 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         ASSERT_TRUE(triplet.gate->exportNativeVNNIMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
         ASSERT_TRUE(triplet.up->exportNativeVNNIMatrixDesc(up_descs[static_cast<size_t>(expert)]));
         ASSERT_TRUE(triplet.down->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(expert)]));
+        if (masked_local_tp &&
+            local_expert_mask[static_cast<size_t>(expert)] == 0u)
+        {
+            /*
+             * Production apportioned tables retain global expert-id indexing
+             * but leave remote slots empty. A dense table plus a mask proves
+             * route filtering, yet misses descriptor-table construction bugs.
+             */
+            gate_descs[static_cast<size_t>(expert)] = {};
+            up_descs[static_cast<size_t>(expert)] = {};
+            down_descs[static_cast<size_t>(expert)] = {};
+        }
     }
 
     const int gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
@@ -20748,6 +20942,109 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     for (const int seq_len : row_inventory)
     {
         run_grouped_and_check(seq_len, "initial workspace");
+    }
+
+    if (masked_local_tp)
+    {
+        /*
+         * The runtime-M inventory starts at two rows. Exercise the production
+         * stage's special M=1 verifier transaction here as well, because that
+         * path enters executeSingleToken() and has a distinct admission
+         * predicate. Both local and remote route slots are present, while only
+         * the lower half of the global descriptor table is populated.
+         */
+        auto stage_input = make_hidden(1);
+        std::vector<float> stage_route_ids;
+        std::vector<float> stage_route_weights;
+        make_routes(1, stage_route_ids, stage_route_weights);
+        auto stage_indices = TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(top_k)});
+        auto stage_weights = TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(top_k)});
+        std::copy(
+            stage_route_ids.begin(),
+            stage_route_ids.end(),
+            stage_indices->mutable_data());
+        std::copy(
+            stage_route_weights.begin(),
+            stage_route_weights.end(),
+            stage_weights->mutable_data());
+        ASSERT_TRUE(stage_input->ensureOnDevice(device, stream));
+        ASSERT_TRUE(stage_indices->ensureOnDevice(device, stream));
+        ASSERT_TRUE(stage_weights->ensureOnDevice(device, stream));
+
+        auto direct_output = TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(d_model)});
+        auto stage_output = TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(d_model)});
+        ASSERT_TRUE(direct_output->ensureOnDevice(device, stream));
+        ASSERT_TRUE(stage_output->ensureOnDevice(device, stream));
+        ASSERT_TRUE(moe_kernel.groupedExpertDecodeFromRouting(
+            stage_input.get(),
+            stage_indices.get(),
+            stage_weights.get(),
+            gateup_table,
+            down_table,
+            top_k,
+            direct_output.get(),
+            d_model,
+            intermediate,
+            local_expert_mask.data()));
+
+        MoEExpertComputeStage::Params params;
+        params.device_id = device;
+        params.input = stage_input.get();
+        params.seq_len = 1;
+        params.d_model = d_model;
+        params.num_experts = num_experts;
+        params.top_k = top_k;
+        params.expert_intermediate = intermediate;
+        params.local_expert_start = 0;
+        params.local_expert_count = num_experts / 2;
+        params.expert_mask.assign(
+            static_cast<size_t>(num_experts), false);
+        params.layer_idx = 0;
+        params.routing_indices = stage_indices.get();
+        params.routing_weights = stage_weights.get();
+        params.force_decode_equivalent_verifier_prefill = true;
+        params.output = stage_output.get();
+        params.output_registered_in_arena = false;
+        params.prepared_gate_gemm.assign(
+            static_cast<size_t>(num_experts), nullptr);
+        params.prepared_up_gemm.assign(
+            static_cast<size_t>(num_experts), nullptr);
+        params.prepared_down_gemm.assign(
+            static_cast<size_t>(num_experts), nullptr);
+        for (int expert = 0; expert < num_experts / 2; ++expert)
+        {
+            params.expert_mask[static_cast<size_t>(expert)] = true;
+            const GemmTriplet &triplet = routed[variant_for_expert(expert)];
+            params.prepared_gate_gemm[static_cast<size_t>(expert)] =
+                triplet.gate;
+            params.prepared_up_gemm[static_cast<size_t>(expert)] =
+                triplet.up;
+            params.prepared_down_gemm[static_cast<size_t>(expert)] =
+                triplet.down;
+        }
+
+        MoEExpertComputeStage stage(std::move(params));
+        stage.bindWorkspace(moe_workspace.get());
+        stage.setGPUStream(stream);
+        ROCmDeviceContext context(device, 0);
+        ASSERT_TRUE(stage.execute(&context))
+            << format_name
+            << " partial-ownership M=1 verifier stage must admit the "
+               "mask-aware explicit-routing path";
+        ASSERT_TRUE(direct_output->ensureOnHost(stream));
+        ASSERT_TRUE(stage_output->ensureOnHost(stream));
+        expectBitwiseVerifierRowsEqual(
+            ("ROCm " + format_name +
+             " masked LocalTP M=1 stage verifier vs direct decode")
+                .c_str(),
+            stage_output->data(),
+            direct_output->data(),
+            stage_output->numel(),
+            static_cast<size_t>(d_model));
     }
 
     auto rebound_workspace = bindDefaultMoEWorkspace(

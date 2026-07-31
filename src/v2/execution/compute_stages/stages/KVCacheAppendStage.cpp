@@ -335,6 +335,35 @@ namespace llaminar2
                     }
                 }
 
+                /*
+                 * append_to_cache() receives one pointer-offset view at a time,
+                 * but SnapshotCapture observes this stage through the original
+                 * request-major parent tensors.  Restore the parent geometry
+                 * after every request has been enqueued so an integration
+                 * diagnostic can compare request `b` with its serial row.
+                 * Leaving the final one-row slice geometry here silently made
+                 * every grouped snapshot describe request zero only.
+                 */
+                if (debugEnv().attention.debug_kv_append_source_snapshot &&
+                    debugEnv().attention.debugKVAppendSourceLayerSelected(
+                        params_.layer_idx))
+                {
+                    const size_t source_rows =
+                        static_cast<size_t>(batch_size) *
+                        static_cast<size_t>(seq_len);
+                    debug_append_source_k_rows_ = source_rows;
+                    debug_append_source_v_rows_ = source_rows;
+                    debug_append_source_k_cols_ =
+                        params_.K->shape().size() > 1
+                            ? params_.K->shape()[1]
+                            : params_.K->cols();
+                    debug_append_source_v_cols_ =
+                        params_.V->shape().size() > 1
+                            ? params_.V->shape()[1]
+                            : params_.V->cols();
+                    invalidateDumpInfoCache();
+                }
+
                 return true;
             }
 
@@ -1475,9 +1504,9 @@ namespace llaminar2
                  debugEnv().attention.debugKVAppendSourceLayerSelected(params_.layer_idx) &&
                  !debugEnv().attention.debug_kv_cache_snapshot)
         {
-            LOG_WARN("[KVCacheAppendStage] KV append source snapshot is enabled for layer="
-                     << params_.layer_idx
-                     << " but KV cache snapshot is disabled in DebugEnv");
+            LOG_TRACE("[KVCacheAppendStage] Capturing KV append source without "
+                      "the optional post-append cache snapshot for layer="
+                      << params_.layer_idx);
         }
 
         info.addScalarInt("layer_idx", params_.layer_idx);

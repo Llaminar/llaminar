@@ -100,6 +100,22 @@ namespace llaminar2
             return result;
         }
 
+        int firstPositiveMetadataInt(
+            const GGUFModel &model,
+            const std::vector<std::string> &keys)
+        {
+            for (const auto &key : keys)
+            {
+                const auto it = model.metadata.find(key);
+                if (it == model.metadata.end())
+                    continue;
+                const uint64_t value = it->second.asUInt64();
+                if (value > 0)
+                    return static_cast<int>(value);
+            }
+            return 0;
+        }
+
     } // anonymous namespace
 
     ModelMemoryProfile ModelMemoryProfile::fromGGUF(const GGUFModel &model)
@@ -113,6 +129,33 @@ namespace llaminar2
         profile.n_kv_heads = static_cast<int>(model.head_count_kv);
         profile.vocab_size = static_cast<int>(model.vocab_size);
         profile.max_seq_len = static_cast<int>(model.context_length);
+        profile.mtp_layer_count = firstPositiveMetadataInt(
+            model,
+            {
+                model.architecture + ".nextn_predict_layers",
+                model.architecture + ".mtp_num_hidden_layers",
+                model.architecture + ".mtp.num_hidden_layers",
+                "mtp.num_hidden_layers",
+                "mtp_num_hidden_layers",
+            });
+        profile.full_attention_interval = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".full_attention_interval"});
+        profile.gdn_conv_kernel_size = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.conv_kernel"});
+        profile.gdn_state_size = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.state_size"});
+        profile.gdn_inner_size = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.inner_size"});
+        profile.gdn_group_count = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.group_count"});
+        profile.gdn_time_step_rank = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.time_step_rank"});
 
         // head_dim from key_length or computed
         if (model.key_length > 0)
@@ -302,6 +345,13 @@ namespace llaminar2
         writeVal<int32_t>(buf, head_dim);
         writeVal<int32_t>(buf, vocab_size);
         writeVal<int32_t>(buf, max_seq_len);
+        writeVal<int32_t>(buf, mtp_layer_count);
+        writeVal<int32_t>(buf, full_attention_interval);
+        writeVal<int32_t>(buf, gdn_conv_kernel_size);
+        writeVal<int32_t>(buf, gdn_state_size);
+        writeVal<int32_t>(buf, gdn_inner_size);
+        writeVal<int32_t>(buf, gdn_group_count);
+        writeVal<int32_t>(buf, gdn_time_step_rank);
         writeVal<uint64_t>(buf, total_native_bytes);
 
         // Tensor inventory
@@ -334,6 +384,13 @@ namespace llaminar2
         p.head_dim = readVal<int32_t>(ptr, end);
         p.vocab_size = readVal<int32_t>(ptr, end);
         p.max_seq_len = readVal<int32_t>(ptr, end);
+        p.mtp_layer_count = readVal<int32_t>(ptr, end);
+        p.full_attention_interval = readVal<int32_t>(ptr, end);
+        p.gdn_conv_kernel_size = readVal<int32_t>(ptr, end);
+        p.gdn_state_size = readVal<int32_t>(ptr, end);
+        p.gdn_inner_size = readVal<int32_t>(ptr, end);
+        p.gdn_group_count = readVal<int32_t>(ptr, end);
+        p.gdn_time_step_rank = readVal<int32_t>(ptr, end);
         p.total_native_bytes = readVal<uint64_t>(ptr, end);
 
         uint32_t n_tensors = readVal<uint32_t>(ptr, end);

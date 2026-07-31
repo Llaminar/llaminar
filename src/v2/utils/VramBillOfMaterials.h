@@ -35,6 +35,20 @@ namespace llaminar2
         return out.str();
     }
 
+    /**
+     * @brief Render an allocation address in a stable, joinable BOM field.
+     *
+     * Backend allocation records and higher-level tensor ownership records use
+     * the same representation so an offline diagnostic can attribute every
+     * live raw allocation without maintaining an always-on runtime registry.
+     */
+    inline std::string vramBomPointer(const void *ptr)
+    {
+        std::ostringstream out;
+        out << ptr;
+        return out.str();
+    }
+
     inline void logVramBomLine(const std::string &kind, const std::string &fields)
     {
         if (!vramBomEnabled())

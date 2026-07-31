@@ -237,7 +237,12 @@ def _incomplete_graph_contexts(
             seq_len = str(tags.get("seq_len", ""))
             path = str(tags.get("path", ""))
             if seq_len and path:
-                sidecar_key = (device, context, seq_len)
+                # A sidecar executable can serve multiple logical invocation
+                # roles. Its immutable graph_context is the lifecycle owner;
+                # grouping by the caller-facing context would conceal repeated
+                # rebuilds and split capture/replay evidence across aliases.
+                graph_context = str(tags.get("graph_context", context))
+                sidecar_key = (device, graph_context, seq_len)
                 counts = sidecar_path_counts.setdefault(sidecar_key, {})
                 counts[path] = counts.get(path, 0.0) + _record_value(record)
         elif (

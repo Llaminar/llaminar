@@ -512,6 +512,13 @@ namespace llaminar2
                 {"ATTENTION_EFFECTIVE_K", SnapshotShardingMode::COLUMN_PARALLEL},
                 {"ATTENTION_EFFECTIVE_V", SnapshotShardingMode::COLUMN_PARALLEL},
 
+                // Device-owned request cursors are scalar diagnostics copied
+                // from canonical per-request state.  Every TP participant must
+                // observe the same count and terminal position, so indexed
+                // request families are replicated rather than concatenated.
+                {"ATTENTION_DEVICE_KV_COUNT_REQUEST_*", SnapshotShardingMode::REPLICATED},
+                {"ATTENTION_DEVICE_KV_HEAD_REQUEST_*", SnapshotShardingMode::REPLICATED},
+
                 // Attention context - column-parallel (split by heads)
                 {"ATTENTION_CONTEXT", SnapshotShardingMode::COLUMN_PARALLEL},
 

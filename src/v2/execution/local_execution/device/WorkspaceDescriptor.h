@@ -24,6 +24,44 @@ namespace llaminar2
 {
 
     /**
+     * @brief Execution regime in which a workspace buffer may be live.
+     *
+     * A captured prefill graph and its decode/grouped-verifier companions are
+     * ordered serially by device events. Declaring regime ownership lets the
+     * family planner overlay buffers that can never be used by the same graph
+     * participant instead of conservatively summing their VRAM.
+     */
+    enum class WorkspaceExecutionRegime : uint8_t
+    {
+        /**
+         * @brief Buffer may be consumed by more than one graph-family role.
+         *
+         * Common buffers retain one stable address and the family planner
+         * publishes enough capacity for the largest participant that uses the
+         * name.
+         */
+        Any,
+
+        /**
+         * @brief Buffer is live only during ordinary M>1 prefill execution.
+         *
+         * Decode and grouped verification run after prefill through explicit
+         * device-event ordering. They may therefore overlay this storage while
+         * retaining stable captured addresses for every graph participant.
+         */
+        PrefillOnly,
+
+        /**
+         * @brief Buffer is live only during canonical decode or grouped verification.
+         *
+         * This category includes bounded K-partition reduction arenas whose
+         * demand is non-monotonic in M and which must not inflate the prefill
+         * participant merely because one kernel object serves both regimes.
+         */
+        CompactDecodeOnly,
+    };
+
+    /**
      * @brief Describes a single device workspace buffer requirement
      *
      * Each buffer has a unique name, size, alignment requirement, and
@@ -37,6 +75,8 @@ namespace llaminar2
         size_t size_bytes = 0;  ///< Required size in bytes
         size_t alignment = 256; ///< Alignment requirement (default 256 for device)
         bool required = true;   ///< If false, allocation failure is not fatal
+        WorkspaceExecutionRegime regime =
+            WorkspaceExecutionRegime::Any; ///< Participant lifetime classification
 
         // Default constructor
         WorkspaceDescriptor() = default;
@@ -46,8 +86,14 @@ namespace llaminar2
             const std::string &name_,
             size_t size_,
             size_t align_ = 256,
-            bool req_ = true)
-            : name(name_), size_bytes(size_), alignment(align_), required(req_)
+            bool req_ = true,
+            WorkspaceExecutionRegime regime_ =
+                WorkspaceExecutionRegime::Any)
+            : name(name_),
+              size_bytes(size_),
+              alignment(align_),
+              required(req_),
+              regime(regime_)
         {
         }
 
@@ -56,8 +102,14 @@ namespace llaminar2
             const char *name_,
             size_t size_,
             size_t align_ = 256,
-            bool req_ = true)
-            : name(name_), size_bytes(size_), alignment(align_), required(req_)
+            bool req_ = true,
+            WorkspaceExecutionRegime regime_ =
+                WorkspaceExecutionRegime::Any)
+            : name(name_),
+              size_bytes(size_),
+              alignment(align_),
+              required(req_),
+              regime(regime_)
         {
         }
     };
@@ -252,6 +304,13 @@ namespace llaminar2
                         }
                         // Keep required if either is required
                         existing.required = existing.required || buf.required;
+                        // A name used in more than one regime is a common
+                        // participant buffer and must retain one stable address.
+                        if (existing.regime != buf.regime)
+                        {
+                            existing.regime =
+                                WorkspaceExecutionRegime::Any;
+                        }
                         found = true;
                         break;
                     }

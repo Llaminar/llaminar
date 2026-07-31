@@ -265,6 +265,20 @@ namespace llaminar2
         mutable size_t debug_effective_v_rows_ = 0;
         mutable size_t debug_effective_v_cols_ = 0;
 
+        /**
+         * @brief Graph-stable non-owning views of canonical GPU KV metadata.
+         *
+         * These views are constructed with the stage, never during execute().
+         * When effective-KV diagnostics are enabled, SnapshotCapture records
+         * D2D copies of each request's count and ring head on the graph stream.
+         * They make append-state ordering failures observable without a device
+         * synchronization or a host-owned coherence mirror.
+         */
+        std::vector<std::unique_ptr<ITensor>> debug_device_kv_count_views_;
+        std::vector<std::unique_ptr<ITensor>> debug_device_kv_head_views_;
+        std::vector<std::string> debug_device_kv_count_names_;
+        std::vector<std::string> debug_device_kv_head_names_;
+
         /// Real-token metadata for fixed-bucket prefill graph replay. The graph
         /// launch remains bucket-shaped, but dynamic attention/KV metadata must
         /// expose only rows that are real prompt tokens.

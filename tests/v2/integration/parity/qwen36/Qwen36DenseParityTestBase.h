@@ -4910,8 +4910,7 @@ namespace llaminar2::test::parity::qwen36
                     ? runner->commitMTPShiftedRowFromDeviceTargetSample(
                           kSetupTargetSampleSlot,
                           /*already_appended_tokens=*/0,
-                          /*allow_speculative_discard=*/true,
-                          setup_sidecar_position)
+                          /*allow_speculative_discard=*/true)
                     : runner->commitMTPShiftedRowFromCurrentTerminalHidden(
                           token,
                           /*already_appended_tokens=*/0,
@@ -5282,7 +5281,8 @@ namespace llaminar2::test::parity::qwen36
             grouped_forward_ok = runner->forwardWithDeviceTokenIds(
                 verifier_tokens.data(),
                 verifier_tokens_device,
-                static_cast<int>(verifier_tokens.size()));
+                static_cast<int>(verifier_tokens.size()),
+                DeviceTokenForwardPurpose::GroupedMTPVerifier);
         }
         else
         {

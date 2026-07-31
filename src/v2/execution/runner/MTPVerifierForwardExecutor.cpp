@@ -75,7 +75,9 @@ namespace llaminar2
                              ? runner.forwardWithDeviceTokenIds(
                                    plan.verifier_input_tokens.data(),
                                    options.device_token_ids,
-                                   seq_len)
+                                   seq_len,
+                                   DeviceTokenForwardPurpose::
+                                       GroupedMTPVerifier)
                              : runner.forward(
                                    plan.verifier_input_tokens.data(),
                                    seq_len);

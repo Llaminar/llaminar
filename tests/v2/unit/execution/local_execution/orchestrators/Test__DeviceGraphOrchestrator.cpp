@@ -42,6 +42,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace llaminar2;
 
@@ -3286,6 +3287,7 @@ namespace
             last_n_ = n;
             last_k_ = k;
             saw_decode_m1_ = saw_decode_m1_ || (m == 1);
+            requested_m_values_.push_back(m);
             getRequirements_called_++;
             WorkspaceRequirements reqs;
             reqs.buffers.push_back(WorkspaceDescriptor{
@@ -3328,6 +3330,13 @@ namespace
         int getLastN() const { return last_n_; }
         int getLastK() const { return last_k_; }
         bool sawDecodeM1() const { return saw_decode_m1_; }
+        bool sawM(int m) const
+        {
+            return std::find(
+                       requested_m_values_.begin(),
+                       requested_m_values_.end(),
+                       m) != requested_m_values_.end();
+        }
 
     private:
         std::string name_;
@@ -3339,6 +3348,7 @@ namespace
         mutable int last_n_ = -1;
         mutable int last_k_ = -1;
         mutable bool saw_decode_m1_ = false;
+        mutable std::vector<int> requested_m_values_;
     };
 
     /**
@@ -3654,8 +3664,13 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualMaxSeqLen)
 
     orchestrator->execute(graph, ctx);
 
-    // Verify that max_seq_len was passed as m (first argument)
-    EXPECT_EQ(gpu_ptr->getLastM(), 2048) << "max_seq_len should be passed as m dimension";
+    /*
+     * A serial graph family is queried once for each relevant regime. The
+     * decode M=1 query may occur after the prefill query, so call order is not
+     * an API contract; presence of both participant geometries is.
+     */
+    EXPECT_TRUE(gpu_ptr->sawM(2048))
+        << "max_seq_len should be queried as the prefill M dimension";
     EXPECT_TRUE(gpu_ptr->sawDecodeM1())
         << "Prefill-sized graph workspaces should also include decode-only scratch";
 }
@@ -3689,11 +3704,9 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesExplicitRequestWhenPro
     IForwardExecutionHost &host = *orchestrator;
     ASSERT_TRUE(host.ensureDeviceWorkspaceAllocated(graph, 768));
 
-    // Bucketed prefill passes the active bucket shape so ROCm long-context
-    // warmup can avoid reserving the full configured max context up front.
-    // ForwardExecutionEngine handles later workspace growth by rebinding cached
-    // graphs and invalidating captured replay state.
-    EXPECT_EQ(gpu_ptr->getLastM(), 768);
+    // The explicit bucket remains a logical participant even though its
+    // storage may alias decode/verifier participants in the serial family.
+    EXPECT_TRUE(gpu_ptr->sawM(768));
     EXPECT_TRUE(gpu_ptr->sawDecodeM1())
         << "Bucketed graph workspaces should also include decode-only scratch";
     EXPECT_TRUE(gpu_ptr->wasBound());
@@ -3860,8 +3873,9 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_FallbackWhenMaxSeqLenZero)
     // Should not crash
     orchestrator->execute(graph, ctx);
 
-    // Verify fallback to default (4096)
-    EXPECT_EQ(gpu_ptr->getLastM(), 4096) << "max_seq_len=0 should fallback to 4096";
+    // Verify fallback to default (4096) independently of auxiliary query order.
+    EXPECT_TRUE(gpu_ptr->sawM(4096))
+        << "max_seq_len=0 should query the 4096-row fallback participant";
     EXPECT_TRUE(gpu_ptr->sawDecodeM1())
         << "Fallback graph workspaces should also include decode-only scratch";
 }

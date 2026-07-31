@@ -1949,11 +1949,24 @@ namespace llaminar2
             params_.expert_gate_views.size() == static_cast<size_t>(params_.num_experts) &&
             params_.expert_up_views.size() == static_cast<size_t>(params_.num_experts) &&
             params_.expert_down_views.size() == static_cast<size_t>(params_.num_experts);
-        if (!raw_weights_released_ &&
-            (!params_.gate_exps || !params_.up_exps || !params_.down_exps) &&
-            !has_complete_expert_views)
+        const bool has_complete_raw_expert_tensors =
+            params_.gate_exps && params_.up_exps && params_.down_exps;
+        const bool has_prepared_expert_slabs =
+            params_.prepared_store &&
+            params_.gate_slab_ref.has_value() &&
+            params_.up_slab_ref.has_value() &&
+            params_.down_slab_ref.has_value();
+        const bool has_locally_complete_prepared_engines =
+            hasPreparedExpertGemmEnginesForLocalOwnership();
+        if (!has_complete_raw_expert_tensors &&
+            !has_complete_expert_views &&
+            !has_prepared_expert_slabs &&
+            !has_locally_complete_prepared_engines)
         {
-            LOG_ERROR("[MoEExpertComputeStage] Missing both raw expert tensors and complete pre-extracted expert views");
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Missing a complete expert weight source: "
+                "provide raw tensors, global expert views, prepared slabs, or "
+                "gate/up/down GEMM engines for every locally owned expert");
             return false;
         }
 
@@ -2593,11 +2606,18 @@ namespace llaminar2
         /*
          * Explicit-routing M=1 decode binds one already-produced routing row as
          * device tensors and asks the backend to select descriptors without
-         * reading a stale host mirror.  Dynamic/LLEP overlay masks can remain
-         * participant scoped even when this GPU has every expert weight resident
-         * locally, so the device route converts masked-off top-k slots to -1 and
-         * computes the same participant-local partial result that the host route
-         * would have contributed before the MoE allreduce.
+         * reading a stale host mirror. Static expert-ID-apportioned LocalTP and
+         * Dynamic/LLEP overlays deliberately give each participant only a
+         * subset of complete experts. The device route therefore converts
+         * masked-off top-k slots to -1 and computes exactly the participant-
+         * local partial result consumed by the subsequent MoE allreduce.
+         *
+         * Do not require full local ownership here. Descriptor-table upload
+         * preserves one global expert-id slot per model expert, leaves remote
+         * slots empty, and prepares engines only for mask-active local experts.
+         * Requiring every expert locally would make the mandatory apportioned
+         * production topology impossible even though the backend contract is
+         * explicitly mask-aware.
          */
         const bool can_try_device_routing_tensor_decode =
             is_gpu &&
@@ -2607,8 +2627,7 @@ namespace llaminar2
             top_k > 0 && top_k <= 16 &&
             params_.replica_set.num_replicated == 0 &&
             (params_.expert_mask.empty() ||
-             params_.expert_mask.size() == static_cast<size_t>(num_experts)) &&
-            hasFullLocalExpertOwnership();
+             params_.expert_mask.size() == static_cast<size_t>(num_experts));
 
         if (can_try_device_routing_tensor_decode)
         {
@@ -6134,6 +6153,39 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEExpertComputeStage::hasPreparedExpertGemmEnginesForLocalOwnership() const
+    {
+        if (params_.prepared_gate_gemm.size() != static_cast<size_t>(params_.num_experts) ||
+            params_.prepared_up_gemm.size() != static_cast<size_t>(params_.num_experts) ||
+            params_.prepared_down_gemm.size() != static_cast<size_t>(params_.num_experts))
+        {
+            return false;
+        }
+
+        bool has_local_expert = false;
+        for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+        {
+            if (!expertComputesLocally(expert_id))
+                continue;
+
+            has_local_expert = true;
+            if (!params_.prepared_gate_gemm[static_cast<size_t>(expert_id)] ||
+                !params_.prepared_up_gemm[static_cast<size_t>(expert_id)] ||
+                !params_.prepared_down_gemm[static_cast<size_t>(expert_id)])
+            {
+                return false;
+            }
+        }
+
+        /*
+         * An empty ownership set is not a usable weight source for this stage.
+         * Device participants that legitimately own no experts are represented
+         * by a graph-level no-op stage rather than by pretending an empty
+         * prepared table is complete.
+         */
+        return has_local_expert;
+    }
+
     bool MoEExpertComputeStage::hasPreparedExpertGemmEnginesForExperts(
         const std::vector<int> &expert_ids) const
     {
@@ -7833,13 +7885,11 @@ namespace llaminar2
             combined.merge(c->getWorkspaceRequirements(rows, d_model, intermediate));
 
         /*
-         * The CUDA grouped verifier path can overlap the shared gate and up
-         * projections on separate explicit streams.  The individual GEMM
-         * engines only know about their serial stream-0 partial buffer, so the
-         * stage must declare the side-stream partial arena once it knows the
-         * fused projection fan-out.  This keeps graph capture allocation-free
-         * and makes missing workspace fail during planning instead of halfway
-         * through verifier replay.
+         * M=1 decode may overlap shared gate/up projections on the fixed CUDA
+         * stream pool. Grouped verifier execution has a different stable
+         * contract: it quantizes all rows once and launches each projection
+         * in-order on the graph stream, so its dedicated grouped KPAR buffer
+         * makes this helper a no-op.
          */
         addCudaConcurrentDecodeGemvSideStreamWorkspace(
             combined,

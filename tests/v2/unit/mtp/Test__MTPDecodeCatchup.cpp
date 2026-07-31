@@ -63,8 +63,7 @@ namespace
         bool commitMTPShiftedRowFromDeviceTargetSample(
             int target_sample_slot,
             int already_appended_tokens,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1) override
+            bool allow_speculative_discard = false) override
         {
             if (!commit_ok)
                 return false;
@@ -72,7 +71,6 @@ namespace
             committed_target_sample_slots.push_back(target_sample_slot);
             committed_indices.push_back(already_appended_tokens);
             committed_allow_discard.push_back(allow_speculative_discard);
-            committed_position_offsets.push_back(position_offset_override);
             return true;
         }
 

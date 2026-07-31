@@ -914,6 +914,41 @@ namespace llaminar2
                         detail << ' ' << type_name << '=' << count;
                     }
                 }
+                detail << ". Manual stages:";
+                bool described_manual_stage = false;
+                for (const auto &segment : segment_cache.segments)
+                {
+                    if (segment.capturable)
+                        continue;
+
+                    for (const auto &stage_name : segment.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        if (!node || !node->stage)
+                        {
+                            detail << " [" << stage_name << ": missing-node]";
+                            described_manual_stage = true;
+                            continue;
+                        }
+
+                        const std::string readiness =
+                            node->stage->graphCaptureReadinessDebugString();
+                        detail
+                            << " [" << stage_name
+                            << ": type="
+                            << computeStageTypeName(node->stage->type())
+                            << ", warmup_preflight="
+                            << (node->stage->supportsWarmupDependentGraphCapture()
+                                    ? "true"
+                                    : "false");
+                        if (!readiness.empty())
+                            detail << ", " << readiness;
+                        detail << ']';
+                        described_manual_stage = true;
+                    }
+                }
+                if (!described_manual_stage)
+                    detail << " <none>";
 
                 LOG_ERROR("[DeviceGraphCaptureController] " << detail.str());
                 throw std::runtime_error(detail.str());

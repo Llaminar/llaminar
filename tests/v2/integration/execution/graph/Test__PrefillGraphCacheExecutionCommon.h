@@ -29,6 +29,7 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/KernelFactory.h"
 #include "tensors/Tensors.h"
+#include "../../../utils/GraphArenaTestHarness.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
@@ -132,11 +133,9 @@ namespace
     /**
      * @brief Capturable one-kernel GPU stage used by the prefill cache test.
      *
-     * The stage opts out of executor-managed coherence because this test does
-     * not use a BufferArena. Instead, it performs the minimal tensor uploads and
-     * output state transitions needed for graph capture. The actual work is the
-     * backend residual-add kernel, so HIP/CUDA graph capture records real GPU
-     * nodes rather than a mock callback.
+     * The stage uses the same BufferArena contract and prepared-input API as a
+     * production stage. The actual work is the backend residual-add kernel, so
+     * HIP/CUDA graph capture records real GPU nodes rather than a mock callback.
      */
     class GPUResidualAddProbeStage final : public IComputeStage
     {
@@ -167,15 +166,15 @@ namespace
                 return false;
             }
 
-            // Warmup uploads happen before capture. During capture, these calls
-            // only verify the already-resident device buffers and avoid syncs.
-            if (!input_->ensureOnDevice(device(), gpuStream()) ||
-                !residual_->ensureOnDevice(device(), gpuStream()) ||
-                !output_->allocateOnDevice(device(), gpuStream()))
-            {
-                LOG_ERROR("[GPUResidualAddProbeStage] Failed to prepare GPU tensors");
-                return false;
-            }
+            /*
+             * DeviceGraphExecutor owns all movement and storage preparation.
+             * The stage may only consume the exact device buffers established
+             * from bufferContract() on its producer stream.
+             */
+            const StageGPUExecution execution = gpuExecution();
+            execution.requirePreparedInput(input_);
+            execution.requirePreparedInput(residual_);
+            execution.requirePreparedOutput(output_);
 
             ITensorResidualAdd *kernel = nullptr;
             try
@@ -214,7 +213,14 @@ namespace
                    backend == ComputeBackendType::GPU_ROCM;
         }
 
-        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
+        StageBufferContract bufferContract() const override
+        {
+            return StageBufferContract::build()
+                .addInput(BufferId::HIDDEN_STATE)
+                .addInput(BufferId::RESIDUAL)
+                .addOutput(BufferId::ATTN_OUTPUT);
+        }
+
         bool isGraphCapturable() const override { return true; }
         bool needsOnGraphReplayed() const override { return true; }
 
@@ -261,53 +267,17 @@ namespace
     };
 
     /**
-     * @brief Row-select probe that keeps real kernels but disables arena coherence.
-     *
-     * The shared graph-cache fixture does not allocate a BufferArena; tensors are
-     * managed directly by the synthetic stages. This subclass preserves the
-     * production HiddenStateRowSelectStage replay-param behavior while matching
-     * the fixture's manual-coherence contract.
-     */
-    class GPUHiddenStateRowSelectProbeStage final : public HiddenStateRowSelectStage
-    {
-    public:
-        explicit GPUHiddenStateRowSelectProbeStage(HiddenStateRowSelectStage::Params params)
-            : HiddenStateRowSelectStage(std::move(params)) {}
-
-        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
-    };
-
-    /**
-     * @brief KV-cache append probe that keeps production replay-param behavior.
-     *
-     * The synthetic graph owns tensors directly rather than through BufferArena,
-     * so this subclass disables executor coherence while still using the real
-     * backend KV cache append kernels and host-side replay callback contract.
-     */
-    class GPUKVCacheAppendProbeStage final : public KVCacheAppendStage
-    {
-    public:
-        explicit GPUKVCacheAppendProbeStage(KVCacheAppendStage::Params params)
-            : KVCacheAppendStage(std::move(params)) {}
-
-        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
-    };
-
-    /**
      * @brief RoPE probe that keeps production dynamic-position behavior.
      *
-     * The synthetic prefill graph does not use BufferArena coherence. This
-     * subclass preserves the production RoPEStage metadata path while disabling
-     * arena-managed coherence and accepting CUDA/ROCm backends explicitly for
-     * the small graph-capture fixture.
+     * This subclass changes only backend eligibility for the small integration
+     * graph. Buffer ownership and stream ordering remain the production
+     * RoPEStage contract.
      */
     class GPURoPEProbeStage final : public RoPEStage
     {
     public:
         explicit GPURoPEProbeStage(RoPEStage::Params params)
             : RoPEStage(std::move(params)) {}
-
-        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
 
         bool supportsBackend(ComputeBackendType backend) const override
         {
@@ -322,9 +292,13 @@ namespace
     class PrefillGraphCacheTestHost final : public IForwardExecutionHost
     {
     public:
-        PrefillGraphCacheTestHost(DeviceId device, IDeviceContext *ctx)
-            : device_(device), ctx_(ctx)
+        PrefillGraphCacheTestHost(
+            DeviceId device,
+            IDeviceContext *ctx,
+            test::GraphArenaTestHarness *arena_harness)
+            : device_(device), ctx_(ctx), arena_harness_(arena_harness)
         {
+            initializePersistentArenaTensors();
         }
 
         ~PrefillGraphCacheTestHost() override
@@ -533,6 +507,10 @@ namespace
 
             if (input.device != device_ || input.seq_len <= 0)
                 return GraphBuildResult("invalid input for GPU prefill graph cache test");
+            if (!arena_bindings_ready_)
+                return GraphBuildResult("failed to initialize persistent arena bindings");
+            if (input.seq_len > kLargeBucketSeqLen)
+                return GraphBuildResult("prefill graph cache test exceeded persistent bucket capacity");
 
             if (use_kv_append_probe_ && !kv_cache_)
             {
@@ -556,29 +534,9 @@ namespace
                     return GraphBuildResult("failed to create GPU KV cache probe");
             }
 
-            auto input_tensor = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(input.seq_len), static_cast<size_t>(kHiddenDim)},
-                DeviceId::cpu());
-            auto residual_tensor = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(input.seq_len), static_cast<size_t>(kHiddenDim)},
-                DeviceId::cpu());
-            auto output_tensor = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(input.seq_len), static_cast<size_t>(kHiddenDim)},
-                DeviceId::cpu());
-
-            const size_t count = static_cast<size_t>(input.seq_len) * static_cast<size_t>(kHiddenDim);
-            for (size_t i = 0; i < count; ++i)
-            {
-                input_tensor->mutable_data()[i] = 1.0f + static_cast<float>(i % 17) * 0.125f;
-                residual_tensor->mutable_data()[i] = 0.25f + static_cast<float>(i % 13) * 0.0625f;
-            }
-
-            FP32Tensor *input_ptr = input_tensor.get();
-            FP32Tensor *residual_ptr = residual_tensor.get();
-            FP32Tensor *residual_output_ptr = output_tensor.get();
-            tensors_.push_back(std::move(input_tensor));
-            tensors_.push_back(std::move(residual_tensor));
-            tensors_.push_back(std::move(output_tensor));
+            FP32Tensor *input_ptr = input_tensor_;
+            FP32Tensor *residual_ptr = residual_tensor_;
+            FP32Tensor *residual_output_ptr = residual_output_tensor_;
 
             auto stage = std::make_unique<GPUResidualAddProbeStage>(
                 "gpu_residual_add_probe",
@@ -595,33 +553,8 @@ namespace
 
             if (use_kv_append_probe_)
             {
-                auto k_tensor = std::make_unique<FP32Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(input.seq_len), static_cast<size_t>(kKVProbeDim)},
-                    DeviceId::cpu());
-                auto v_tensor = std::make_unique<FP32Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(input.seq_len), static_cast<size_t>(kKVProbeDim)},
-                    DeviceId::cpu());
-
-                const int real_seq_len = input.real_seq_len > 0 ? input.real_seq_len : input.seq_len;
-                for (int row = 0; row < input.seq_len; ++row)
-                {
-                    const bool hostile_pad = row >= real_seq_len;
-                    for (int col = 0; col < kKVProbeDim; ++col)
-                    {
-                        const size_t idx = static_cast<size_t>(row) * kKVProbeDim + col;
-                        k_tensor->mutable_data()[idx] = hostile_pad
-                                                            ? 11.0f + static_cast<float>(col) * 0.125f
-                                                            : 0.01f * static_cast<float>((row + col) % 19 + 1);
-                        v_tensor->mutable_data()[idx] = hostile_pad
-                                                            ? 29.0f + static_cast<float>(row - real_seq_len) * 3.0f
-                                                            : 0.02f * static_cast<float>((row * 3 + col) % 23 + 1);
-                    }
-                }
-
-                FP32Tensor *k_ptr = k_tensor.get();
-                FP32Tensor *v_ptr = v_tensor.get();
-                tensors_.push_back(std::move(k_tensor));
-                tensors_.push_back(std::move(v_tensor));
+                FP32Tensor *k_ptr = k_tensor_;
+                FP32Tensor *v_ptr = v_tensor_;
 
                 KVCacheAppendStage::Params kv_params;
                 kv_params.K = k_ptr;
@@ -636,8 +569,10 @@ namespace
                 kv_params.device_id = device_;
                 kv_params.request_sequence_lengths_device =
                     input.sequence_lengths_device;
+                kv_params.k_buffer_id = BufferId::K_PROJ;
+                kv_params.v_buffer_id = BufferId::V_PROJ;
 
-                auto kv_stage = std::make_unique<GPUKVCacheAppendProbeStage>(kv_params);
+                auto kv_stage = std::make_unique<KVCacheAppendStage>(kv_params);
                 kv_append_stage_ = kv_stage.get();
                 graph.addNode("kv_append_probe", std::move(kv_stage), device_);
                 graph.addDependency("kv_append_probe", "gpu_residual_add_probe");
@@ -645,10 +580,7 @@ namespace
 
             if (use_row_select_probe_)
             {
-                auto selected_row_tensor = std::make_unique<FP32Tensor>(
-                    std::vector<size_t>{1, static_cast<size_t>(kHiddenDim)},
-                    DeviceId::cpu());
-                output_tensor_ = selected_row_tensor.get();
+                output_tensor_ = selected_row_tensor_;
 
                 const int initial_real_seq_len = input.real_seq_len > 0 ? input.real_seq_len : input.seq_len;
                 HiddenStateRowSelectStage::Params row_params;
@@ -666,10 +598,11 @@ namespace
                               DynamicDeviceScalar;
                 row_params.request_sequence_length_device =
                     input.sequence_lengths_device;
+                row_params.input_buffer_id = BufferId::ATTN_OUTPUT;
+                row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROW;
 
-                auto row_select_stage = std::make_unique<GPUHiddenStateRowSelectProbeStage>(row_params);
+                auto row_select_stage = std::make_unique<HiddenStateRowSelectStage>(row_params);
                 row_select_stage_ = row_select_stage.get();
-                tensors_.push_back(std::move(selected_row_tensor));
                 graph.addNode("hidden_state_row_select", std::move(row_select_stage), device_);
                 graph.addDependency("hidden_state_row_select", "gpu_residual_add_probe");
             }
@@ -693,6 +626,7 @@ namespace
                 rope_params.position_ids = input.position_ids;
                 rope_params.position_ids_device = input.position_ids_device;
                 rope_params.device_id = device_;
+                rope_params.q_buffer_id = BufferId::ATTN_OUTPUT;
 
                 auto rope_stage = std::make_unique<GPURoPEProbeStage>(rope_params);
                 rope_stage_ = rope_stage.get();
@@ -966,6 +900,84 @@ namespace
 
     private:
         /**
+         * @brief Create one stable arena address set shared by every cached bucket.
+         *
+         * The production graph cache captures arena-owned addresses once and may
+         * retain several bucket geometries concurrently. This fixture therefore
+         * allocates the largest tested shape once, binds each semantic BufferId
+         * once, and varies only the active row count in stage parameters. A
+         * per-build rebind would invalidate older cached executables and conceal
+         * exactly the lifetime bugs this suite is intended to catch.
+         */
+        void initializePersistentArenaTensors()
+        {
+            if (!arena_harness_)
+                return;
+
+            const std::vector<size_t> hidden_shape{
+                static_cast<size_t>(kLargeBucketSeqLen),
+                static_cast<size_t>(kHiddenDim)};
+            const std::vector<size_t> kv_shape{
+                static_cast<size_t>(kLargeBucketSeqLen),
+                static_cast<size_t>(kKVProbeDim)};
+
+            input_tensor_ = arena_harness_->createPersistentTensor<FP32Tensor>(
+                BufferId::HIDDEN_STATE,
+                hidden_shape,
+                DeviceId::cpu());
+            residual_tensor_ = arena_harness_->createPersistentTensor<FP32Tensor>(
+                BufferId::RESIDUAL,
+                hidden_shape,
+                DeviceId::cpu());
+            residual_output_tensor_ =
+                arena_harness_->createPersistentTensor<FP32Tensor>(
+                    BufferId::ATTN_OUTPUT,
+                    hidden_shape,
+                    DeviceId::cpu());
+            selected_row_tensor_ =
+                arena_harness_->createPersistentTensor<FP32Tensor>(
+                    BufferId::LM_HEAD_INPUT_ROW,
+                std::vector<size_t>{1, static_cast<size_t>(kHiddenDim)},
+                DeviceId::cpu());
+            k_tensor_ = arena_harness_->createPersistentTensor<FP32Tensor>(
+                BufferId::K_PROJ,
+                kv_shape,
+                DeviceId::cpu());
+            v_tensor_ = arena_harness_->createPersistentTensor<FP32Tensor>(
+                BufferId::V_PROJ,
+                kv_shape,
+                DeviceId::cpu());
+
+            const size_t hidden_count =
+                static_cast<size_t>(kLargeBucketSeqLen) *
+                static_cast<size_t>(kHiddenDim);
+            for (size_t i = 0; i < hidden_count; ++i)
+            {
+                input_tensor_->mutable_data()[i] =
+                    1.0f + static_cast<float>(i % 17) * 0.125f;
+                residual_tensor_->mutable_data()[i] =
+                    0.25f + static_cast<float>(i % 13) * 0.0625f;
+            }
+
+            for (int row = 0; row < kLargeBucketSeqLen; ++row)
+            {
+                for (int col = 0; col < kKVProbeDim; ++col)
+                {
+                    const size_t index =
+                        static_cast<size_t>(row) *
+                            static_cast<size_t>(kKVProbeDim) +
+                        static_cast<size_t>(col);
+                    k_tensor_->mutable_data()[index] =
+                        0.01f * static_cast<float>((row + col) % 19 + 1);
+                    v_tensor_->mutable_data()[index] =
+                        0.02f * static_cast<float>((row * 3 + col) % 23 + 1);
+                }
+            }
+
+            arena_bindings_ready_ = true;
+        }
+
+        /**
          * @brief Materialize stable pinned/device position storage before launch.
          *
          * Capacity may grow only between fixture invocations, before admission
@@ -1009,6 +1021,8 @@ namespace
 
         DeviceId device_;
         IDeviceContext *ctx_ = nullptr;
+        test::GraphArenaTestHarness *arena_harness_ = nullptr; ///< Borrowed stable arena/tensor owner.
+        bool arena_bindings_ready_ = false;
         bool use_row_select_probe_ = false; ///< Whether to append HiddenStateRowSelectStage after residual add.
         bool use_kv_append_probe_ = false;  ///< Whether to append real GPU KVCacheAppendStage after residual add.
         bool use_rope_probe_ = false;       ///< Whether to append real GPU RoPEStage after residual add.
@@ -1016,7 +1030,12 @@ namespace
         bool bump_epoch_on_maintenance_ = false;
         uint64_t topology_delta_on_maintenance_ = 0;
         ForwardExecutionEngine *engine_to_clear_on_maintenance_ = nullptr;
-        std::vector<std::unique_ptr<FP32Tensor>> tensors_;
+        FP32Tensor *input_tensor_ = nullptr;
+        FP32Tensor *residual_tensor_ = nullptr;
+        FP32Tensor *residual_output_tensor_ = nullptr;
+        FP32Tensor *selected_row_tensor_ = nullptr;
+        FP32Tensor *k_tensor_ = nullptr;
+        FP32Tensor *v_tensor_ = nullptr;
         std::unique_ptr<IKVCache> kv_cache_;
         std::unique_ptr<DeviceWorkspaceManager> workspace_;
         int workspace_seq_len_ = 0;
@@ -1048,6 +1067,7 @@ namespace
         signature.batch_size = 1;
         signature.device = device;
         signature.decode = false;
+        signature.position_policy = ForwardPositionPolicy::ContiguousOffset;
         signature.standard_path = true;
         signature.pp_stage_enabled = false;
         signature.pp_first_layer = -1;
@@ -1188,12 +1208,16 @@ namespace
             GraphExecutorConfig executor_config;
             executor_config.enable_validation = false;
             executor_ = std::make_unique<DeviceGraphExecutor>(executor_config);
+            graph_arena_.bindExecutor(*executor_);
 
             ForwardExecutionEngine::Config engine_config;
             engine_config.cache_config.enabled = true;
             engine_config.has_unified_pp = false;
             engine_ = std::make_unique<ForwardExecutionEngine>(std::move(engine_config), *executor_);
-            host_ = std::make_unique<PrefillGraphCacheTestHost>(device_, device_ctx_.get());
+            host_ = std::make_unique<PrefillGraphCacheTestHost>(
+                device_,
+                device_ctx_.get(),
+                &graph_arena_);
         }
 
         void TearDown() override
@@ -1277,6 +1301,7 @@ namespace
                 *host_);
         }
 
+        test::GraphArenaTestHarness graph_arena_;
         DeviceId device_ = DeviceId::cpu();
         std::unique_ptr<IDeviceContext> device_ctx_;
         std::unique_ptr<DeviceGraphExecutor> executor_;
@@ -1490,7 +1515,7 @@ namespace
         ASSERT_GT(nodes_before_reset, 0u);
 
         engine_->resetSessionReplayState(
-            /*preserve_replay_safe_segmented_captures=*/true);
+            /*preserve_replay_safe_graphs=*/true);
 
         auto preserved = engine_->prefillGraphCacheSnapshot(signature, key);
         ASSERT_TRUE(preserved.has_value());
@@ -1558,7 +1583,7 @@ namespace
         ASSERT_EQ(warmed->capture_count, 0u);
 
         engine_->resetSessionReplayState(
-            /*preserve_replay_safe_segmented_captures=*/true);
+            /*preserve_replay_safe_graphs=*/true);
 
         auto initialized = engine_->prefillGraphCacheSnapshot(signature, key);
         ASSERT_TRUE(initialized.has_value());

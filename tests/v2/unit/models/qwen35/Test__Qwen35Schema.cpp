@@ -351,6 +351,12 @@ TEST(Test__Qwen35Schema, SnapshotShardingDeclaresCapturedDenseSemanticKeys)
     EXPECT_EQ(sharding.at("K_NORM"), SnapshotShardingMode::COLUMN_PARALLEL);
     EXPECT_EQ(sharding.at("KV_APPEND_SOURCE_K"), SnapshotShardingMode::COLUMN_PARALLEL);
     EXPECT_EQ(sharding.at("KV_CACHE_K"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(
+        sharding.at("ATTENTION_DEVICE_KV_COUNT_REQUEST_*"),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        sharding.at("ATTENTION_DEVICE_KV_HEAD_REQUEST_*"),
+        SnapshotShardingMode::REPLICATED);
     EXPECT_EQ(sharding.at("GDN_Z_PROJECTION"), SnapshotShardingMode::COLUMN_PARALLEL);
     EXPECT_EQ(sharding.at("GDN_ALPHA"), SnapshotShardingMode::COLUMN_PARALLEL);
     EXPECT_EQ(sharding.at("GDN_BETA"), SnapshotShardingMode::COLUMN_PARALLEL);
@@ -1324,6 +1330,10 @@ TEST_F(Qwen35GraphBuildTest, LiveMTPRequestBatchConditionUsesExactShapeKVAppend)
     EXPECT_EQ(append->getParams().batch_size, 2);
     EXPECT_EQ(append->getParams().request_sequence_lengths_device, nullptr)
         << "Absolute live sequence lengths must never become captured KV copy widths";
+    EXPECT_EQ(
+        append->getParams().append_semantics,
+        KVCacheAppendSemantics::Standard)
+        << "A live main-model condition is not a speculative verifier append";
 }
 
 TEST_F(Qwen35GraphBuildTest, HybridPPFullAttentionUsesGlobalLayerIdsForCacheStages)

@@ -79,20 +79,6 @@ namespace llaminar2
             int device_rebalance_apply_layer_idx = -2;
 
             /**
-             * @brief Permit eager GPU routeWithTensors() for partial expert owners.
-             *
-             * Single-device GPU decode must use the device-routed runtime table
-             * so graph capture, route metadata, and expert execution share one
-             * device-owned source of truth. LocalTP expert-id-apportioned runners are
-             * different: each participant owns only a subset of experts and the
-             * current runtime table is a full-owner contract.  Until the sharded
-             * runtime-table reducer exists, those TP participants use the explicit
-             * mask/range + allreduce path in eager mode and must not advertise
-             * decode graph capture.
-             */
-            bool allow_eager_gpu_single_row_route_for_partial_expert_owner = false;
-
-            /**
              * @brief Replay verifier rows through the normal one-token route path.
              *
              * MTP all-position verifier batches produce several candidate rows at
@@ -126,6 +112,15 @@ namespace llaminar2
         bool allowsZeroOutput() const override { return false; }
         bool isGraphCapturable() const override;
         bool supportsWarmupDependentGraphCapture() const override;
+        /**
+         * @brief Describe every routing graph-capture admission predicate.
+         *
+         * A router is often the first stage to expose an incomplete
+         * device-resident MoE lifecycle. Include both cold-preflight and warm
+         * readiness facts so a mandatory full-graph failure identifies the
+         * missing contract directly instead of merely reporting MOE_ROUTER.
+         */
+        std::string graphCaptureReadinessDebugString() const override;
         bool supportsLazyPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillRealLengthContract() const override;

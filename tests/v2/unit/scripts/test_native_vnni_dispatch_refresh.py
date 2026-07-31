@@ -3583,7 +3583,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             / "kernels"
             / "rocm"
             / "gemm"
-            / "ROCmQuantisedGemmKernel_native_VNNI.hip"
+            / "ROCmNativeVNNIGemmShardImpl.hip.inc"
         )
         cuda_source = cuda_kernel_path.read_text(encoding="utf-8")
         cuda_workspace_source = cuda_workspace_path.read_text(encoding="utf-8")
@@ -3623,6 +3623,44 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertNotIn("ROCmNativeVNNIPrefillDispatchGenerated.inc", rocm_source)
         self.assertNotIn("selectROCmNativeVNNIPrefillGenerated", rocm_source)
         self.assertIn("PATTERN S OPTIMIZED DISPATCH", rocm_source)
+
+    def test_turnkey_install_preserves_rocm_native_vnni_physical_shards(
+        self,
+    ) -> None:
+        """A policy refresh may replace an include, never the kernel topology."""
+
+        cmake_source = (
+            REPO_ROOT / "src" / "v2" / "CMakeLists.txt"
+        ).read_text(encoding="utf-8")
+        refresh_source = SCRIPT.read_text(encoding="utf-8")
+        gemm_directory = (
+            REPO_ROOT / "src" / "v2" / "kernels" / "rocm" / "gemm"
+        )
+
+        self.assertFalse(
+            (gemm_directory / "ROCmQuantisedGemmKernel_native_VNNI.hip").exists()
+        )
+        self.assertTrue(
+            (gemm_directory / "ROCmNativeVNNIGemmShardImpl.hip.inc").is_file()
+        )
+        self.assertTrue(
+            (gemm_directory / "ROCmNativeVNNIGemmDispatch.cpp").is_file()
+        )
+        for shard in range(8):
+            source_name = f"ROCmNativeVNNIGemmShard{shard}.hip"
+            self.assertTrue((gemm_directory / source_name).is_file())
+            self.assertEqual(cmake_source.count(source_name), 1)
+
+        self.assertNotIn(
+            "ROCmQuantisedGemmKernel_native_VNNI.hip",
+            refresh_source,
+        )
+        self.assertIn(
+            'rocm_source_include="${repo_root}/src/v2/kernels/rocm/gemm/'
+            'ROCmNativeVNNIDecodeDispatchGenerated.inc"',
+            refresh_source,
+        )
+        self.assertNotIn("ROCmNativeVNNIGemmShard", refresh_source)
 
     def test_strong_gpu_trainers_own_the_complete_runtime_m_envelope(self) -> None:
         cuda_trainer = (

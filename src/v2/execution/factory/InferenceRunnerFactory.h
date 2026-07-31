@@ -222,6 +222,7 @@ namespace llaminar2
         {
             InferenceRunnerConfig config;
             config.max_seq_len = plan.runtime.max_seq_len;
+            config.activation_seq_len = plan.runtime.resident_graph_rows;
             config.batch_size = plan.runtime.batch_size;
             config.activation_precision = plan.runtime.activation_precision;
             config.kv_cache_precision = plan.runtime.kv_cache_precision;

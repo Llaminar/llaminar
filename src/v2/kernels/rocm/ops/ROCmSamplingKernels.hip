@@ -44,6 +44,22 @@ constexpr int TOPK_SMALL_K_THREADS = 64;
 // Using 32 threads keeps register pressure manageable for large k
 constexpr int TOPK_THREADS = 32;
 
+/**
+ * @brief Publish one request-policy INT32 scalar into persistent device state.
+ *
+ * The scalar travels as a HIP kernel argument, whose lifetime is owned by the
+ * launch, rather than through an asynchronous H2D copy from stack storage.
+ * Later consumers are ordered by the target-slot readiness event published by
+ * the orchestrator on the same explicit stream.
+ */
+__global__ void rocm_publish_int32_control_scalar_kernel(
+    int32_t value,
+    int32_t *out_value)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        *out_value = value;
+}
+
 constexpr int topkSmallKPartialBlockCap(int k)
 {
     return k > 32 ? TOPK_SMALL_K_WIDE_PARTIAL_BLOCKS : TOPK_SMALL_K_PARTIAL_BLOCKS;
@@ -3613,6 +3629,37 @@ extern "C"
  * @param stream     HIP stream (nullptr for default)
  * @return true on success
  */
+bool rocmOps_publish_int32_control_scalar(
+    int32_t value,
+    int32_t *out_value,
+    int device_idx,
+    void *stream)
+{
+    if (value < 0 || !out_value || !stream)
+        return false;
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_publish_int32_control_scalar_kernel,
+        dim3(1),
+        dim3(1),
+        0,
+        static_cast<hipStream_t>(stream),
+        value,
+        out_value);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm INT32 control-scalar publication launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 bool rocmOps_topk_f32(
     const float* data,
     int n,

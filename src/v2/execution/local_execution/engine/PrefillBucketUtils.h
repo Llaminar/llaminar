@@ -128,6 +128,17 @@ namespace llaminar2
     std::vector<int> normalizePrefillGraphBuckets(const std::vector<int> &buckets);
 
     /**
+     * @brief Restrict configured buckets to one resident graph-row capacity.
+     *
+     * The capacity itself is included as a final boundary when it is positive,
+     * allowing contexts shorter than the smallest global default bucket to
+     * remain total. The returned vector is sorted and deduplicated.
+     */
+    std::vector<int> prefillGraphBucketsAtOrBelowCapacity(
+        const std::vector<int> &buckets,
+        int resident_graph_rows);
+
+    /**
      * @brief Select the smallest bucket that can contain real_seq_len tokens.
      *
      * Returns a failed selection when the list is empty, the real length is

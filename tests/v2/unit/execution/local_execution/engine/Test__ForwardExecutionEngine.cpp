@@ -158,6 +158,7 @@ namespace
         std::string prefill_domain_id = "single";
         int prefill_participant_id = 0;
         uint64_t prefill_topology_signature = 0;
+        int mock_resident_graph_rows = 0;
 
         // ----- IForwardExecutionHost Interface -----
 
@@ -249,6 +250,11 @@ namespace
             ensure_workspace_calls++;
             last_workspace_seq_len = workspace_seq_len;
             return true;
+        }
+
+        int residentGraphRows() const override
+        {
+            return mock_resident_graph_rows;
         }
 
         bool publishLogitsAtBoundary(
@@ -1445,6 +1451,42 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawBucketedPrefillPadsBeforeBuild)
     EXPECT_EQ(host.last_forward_input.token_offset, 200);
     EXPECT_EQ(host.last_forward_input.position_offset, 200);
     EXPECT_EQ(host.last_workspace_seq_len, 4);
+}
+
+TEST_F(Test__ForwardExecutionEngine, Execute_RejectsBucketBeyondResidentGraphRows)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4,8"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+    host.mock_resident_graph_rows = 4;
+
+    const std::vector<int> tokens = {80, 81, 82, 83, 84};
+    const std::vector<int> positions = {0, 1, 2, 3, 4};
+    auto input = makeTestInput(
+        5,
+        1,
+        DeviceId::cuda(0),
+        tokens.data(),
+        positions.data());
+
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.execute(input, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 0)
+        << "the orchestration layer must chunk before graph construction";
+    EXPECT_EQ(host.ensure_workspace_calls, 0);
 }
 
 TEST_F(Test__ForwardExecutionEngine, Execute_PaddedBucketedPrefillRejectsActiveNonGraphStableMoE)

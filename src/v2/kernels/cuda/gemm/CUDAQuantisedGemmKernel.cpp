@@ -1641,12 +1641,17 @@ namespace llaminar2
             {
                 float *kpar_partials = nullptr;
                 size_t kpar_partials_bytes = 0;
-                if (workspace_->hasBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS))
+                const char *kpar_buffer_name =
+                    explicitSmallMVerifierScopeActive()
+                        ? GemmWorkspaceBuffers::
+                              GROUPED_VERIFIER_GEMV_KPAR_PARTIALS
+                        : GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS;
+                if (workspace_->hasBuffer(kpar_buffer_name))
                 {
                     kpar_partials = static_cast<float *>(
-                        workspace_->getBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
+                        workspace_->getBuffer(kpar_buffer_name));
                     kpar_partials_bytes =
-                        workspace_->getBufferSize(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+                        workspace_->getBufferSize(kpar_buffer_name);
                 }
 
                 cudaGemvContext_bindWorkspace(
@@ -4043,16 +4048,29 @@ namespace llaminar2
 
             reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
+            reqs.buffers.push_back({
+                GemmWorkspaceBuffers::ACC_INT32,
+                acc_int32_bytes,
+                256,
+                true,
+                WorkspaceExecutionRegime::PrefillOnly});
             reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32,
-                                    concurrent_prefill_acc_bytes, 256, true});
+                                    concurrent_prefill_acc_bytes,
+                                    256,
+                                    true,
+                                    WorkspaceExecutionRegime::PrefillOnly});
 
             // Blockwise activation quantization scales: one float per 32-element block
             size_t num_blocks_per_row = static_cast<size_t>((k + 31) / 32);
             size_t scales_a_blockwise_bytes = static_cast<size_t>(workspace_m) * num_blocks_per_row * sizeof(float);
             size_t sums_a_blockwise_bytes = static_cast<size_t>(workspace_m) * num_blocks_per_row * sizeof(int32_t);
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, scales_a_blockwise_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::SUMS_A_BLOCKWISE, sums_a_blockwise_bytes, 256, true});
+            reqs.buffers.push_back({
+                GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,
+                sums_a_blockwise_bytes,
+                256,
+                true,
+                WorkspaceExecutionRegime::PrefillOnly});
 
             // FP32 output workspace for mapped memory redirect
             // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
@@ -4100,12 +4118,18 @@ namespace llaminar2
                     if (prefill_bounds.splitk_partials_bytes > 0)
                     {
                         reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS,
-                                                prefill_bounds.splitk_partials_bytes * prefill_scratch_slots, 256, true});
+                                                prefill_bounds.splitk_partials_bytes * prefill_scratch_slots,
+                                                256,
+                                                true,
+                                                WorkspaceExecutionRegime::PrefillOnly});
                     }
                     if (prefill_bounds.streamk_fixup_bytes > 0)
                     {
                         reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP,
-                                                prefill_bounds.streamk_fixup_bytes * prefill_scratch_slots, 256, true});
+                                                prefill_bounds.streamk_fixup_bytes * prefill_scratch_slots,
+                                                256,
+                                                true,
+                                                WorkspaceExecutionRegime::PrefillOnly});
                     }
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: codebook="
                               << static_cast<int>(native_codebook_id)
@@ -4141,7 +4165,17 @@ namespace llaminar2
                 const int k_groups = (k + 31) / 32;
                 const size_t kpar_bytes =
                     static_cast<size_t>(k_groups) * static_cast<size_t>(gemv_workspace_m) * n * sizeof(float);
-                reqs.buffers.push_back({GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS, kpar_bytes, 256, true});
+                const char *buffer_name =
+                    m > 1
+                        ? GemmWorkspaceBuffers::
+                              GROUPED_VERIFIER_GEMV_KPAR_PARTIALS
+                        : GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS;
+                reqs.buffers.push_back({
+                    buffer_name,
+                    kpar_bytes,
+                    256,
+                    true,
+                    WorkspaceExecutionRegime::CompactDecodeOnly});
             }
 
             LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "

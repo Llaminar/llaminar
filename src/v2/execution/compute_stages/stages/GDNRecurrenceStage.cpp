@@ -415,7 +415,18 @@ namespace llaminar2
 
     std::string GDNRecurrenceStage::speculativeStateWorkBufferName() const
     {
-        return std::string(WS_SPECULATIVE_STATE_WORK) + "_" + workspaceStableId();
+        /*
+         * This buffer is temporary input/output for one recurrence stage; unlike
+         * speculative state slots, it is not read after that layer completes.
+         * Transformer-layer dependencies serialize recurrence stages inside one
+         * graph role, so all layers can reuse one maximum-sized work allocation.
+         * Independently replayable roles retain separate names because they may
+         * execute concurrently on different streams.
+         */
+        if (params_.workspace_namespace.empty())
+            return WS_SPECULATIVE_STATE_WORK;
+        return std::string(WS_SPECULATIVE_STATE_WORK) + "_" +
+               params_.workspace_namespace;
     }
 
     int GDNRecurrenceStage::requestedSpeculativeStateSlotRows() const

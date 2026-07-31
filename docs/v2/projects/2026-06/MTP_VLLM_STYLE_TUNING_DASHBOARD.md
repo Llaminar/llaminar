@@ -34,8 +34,8 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   stable-address model-lifetime runtime template through explicit graph-build
   producer streams/events. GPU FFN/MTP graph APIs reject null publication
   streams before device work.
-- Integration-build unit gate: `588/588` green on 2026-07-30; GPU graph lowering is
-  registered only in the integration tier.
+- Integration-build unit gate: `585/585` green on 2026-07-31; GPU graph
+  lowering is registered only in the integration tier.
 
 ## Production Matrix
 
@@ -74,6 +74,9 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - The original CUDA2 LocalTP long-context stochastic prefix+MTP stale-bank
   reproduction now passes at 590 seconds; matching CUDA2/ROCm2 focused graph
   lifecycle cells are green.
+- CUDA/ROCm SingleDevice forced-token publication is device-owned and
+  graph-captured: both Release E2E lanes pass `31/31`, report full capture, and
+  account for all 96 forced-token transactions without a host control scalar.
 - Transfer-state stress covers all 336 slot rotations and 32 cross-stream
   reset epochs on CUDA/ROCm. Source policies forbid eventless publication,
   blocking GPU sync, hidden hot-path allocation, and direct coherence

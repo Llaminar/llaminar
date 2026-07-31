@@ -208,7 +208,10 @@ namespace llaminar2
 
         /**
          * @brief Allocate workspace buffers from requirements
-         * @param requirements Collection of buffer descriptors
+         * @param requirements Collection of buffer descriptors.
+         * @param minimum_primary_block_bytes Optional physical family capacity
+         *        larger than this participant's named layout. Unmapped tail
+         *        bytes are available to later serial participants.
          * @return true if all required buffers allocated, false on failure
          *
          * Allocates a single contiguous block from the backend and suballocates
@@ -216,7 +219,9 @@ namespace llaminar2
          *
          * Note: Non-required buffers that don't fit are silently skipped.
          */
-        bool allocate(const WorkspaceRequirements &requirements);
+        bool allocate(
+            const WorkspaceRequirements &requirements,
+            size_t minimum_primary_block_bytes = 0);
 
         /**
          * @brief Add missing or larger named buffers without moving old storage.
@@ -241,6 +246,28 @@ namespace llaminar2
          * @return true when every required addition fits the manager budget.
          */
         bool extend(const WorkspaceRequirements &requirements);
+
+        /**
+         * @brief Bind one serial graph participant into the primary allocation.
+         *
+         * The complete participant layout is packed without internal overlap.
+         * Names already published by an earlier captured graph keep their exact
+         * address and capacity. New graph-role names may alias bytes owned by a
+         * different serial participant because an explicit producer-event /
+         * consumer-wait edge prevents both participants from executing at once.
+         *
+         * This method performs no allocation and never relocates a published
+         * name. It fails when a common name was initially undersized, when two
+         * previously published aliases unexpectedly occur in the same
+         * participant, or when the participant cannot fit in the primary block.
+         * Those failures identify an incomplete graph-family plan and must not
+         * be repaired with an append-only fallback.
+         *
+         * @param requirements Complete requirements of one serial participant.
+         * @return true when every name has a stable alias in the primary block.
+         */
+        bool bindSerialParticipant(
+            const WorkspaceRequirements &requirements);
 
         /**
          * @brief Zero the complete allocated workspace on an explicit stream.
@@ -412,6 +439,11 @@ namespace llaminar2
          * @brief Get the number of allocated buffers
          */
         size_t bufferCount() const { return buffers_.size(); }
+
+        /**
+         * @brief Physical bytes in the primary serial-family allocation.
+         */
+        size_t primaryBlockSize() const { return block_size_; }
 
     private:
         DeviceId device_;

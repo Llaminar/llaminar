@@ -1468,7 +1468,9 @@ namespace llaminar2
                         command_header,
                         wave_state,
                         controller_state,
-                        static_cast<uint32_t>(commandBufferCount())))
+                        static_cast<uint32_t>(commandBufferCount()),
+                        params_.local_transfer_slots,
+                        params_.local_transfer_slot_count))
                 {
                     LOG_ERROR("[MoEDeviceRebalanceStage] Device rebalance controller failed");
                     return false;

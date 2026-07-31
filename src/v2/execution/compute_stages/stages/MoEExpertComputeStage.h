@@ -997,6 +997,21 @@ namespace llaminar2
         bool hasFullLocalExpertOwnership() const;
         bool expertMaskAllEnabled() const;
         bool hasAllPreparedExpertGemmEngines() const;
+        /**
+         * @brief Verify prepared GEMM ownership without requiring remote slots.
+         *
+         * Prepared expert arrays are indexed by global expert id so descriptor
+         * tables can preserve the model's routing namespace on every
+         * participant. Static apportioned and runtime-balanced topologies leave
+         * non-local entries null by design. This predicate therefore validates
+         * all three projections only for experts selected by
+         * expertComputesLocally(), while still requiring the arrays themselves
+         * to span the complete global expert namespace.
+         *
+         * @return True when every locally computable expert has gate, up, and
+         * down GEMM engines ready for descriptor publication.
+         */
+        bool hasPreparedExpertGemmEnginesForLocalOwnership() const;
         bool hasPreparedExpertGemmEnginesForExperts(const std::vector<int> &expert_ids) const;
         bool hasGroupedDecodeDescriptorExportSupport() const;
         const DeviceMoEPlacementBank *activeRuntimePlacementBank() const;

@@ -70,6 +70,7 @@
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
@@ -1941,7 +1942,8 @@ namespace llaminar2
         bool forwardWithDeviceTokenIds(
             const int *token_shadow,
             const void *token_ids_device,
-            int seq_len) override;
+            int seq_len,
+            DeviceTokenForwardPurpose purpose) override;
 
         /**
          * @brief Batched verifier forward from a flat device token buffer.
@@ -2111,8 +2113,7 @@ namespace llaminar2
         bool commitMTPShiftedRowFromDeviceTargetSample(
             int target_sample_slot,
             int already_appended_tokens,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1) override;
+            bool allow_speculative_discard = false) override;
         bool commitMTPShiftedRowFromDeviceResidentLogicalState(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_index,
@@ -3657,23 +3658,6 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Semantic owner of one forward-graph execution.
-         *
-         * Shape alone cannot identify a graph's role. In particular, an
-         * M-token execution may be prompt prefill, a grouped speculative
-         * verifier, or one device-resident condition row for each of M active
-         * requests. Keeping that distinction typed prevents verifier sidecars
-         * from publishing main-model diagnostic state and prevents request-batch
-         * decode from being mislabeled as prefill.
-         */
-        enum class ForwardExecutionRole
-        {
-            MainInference,          ///< User-visible prefill or serial decode.
-            GroupedMTPVerifier,     ///< Main-model verification of draft rows.
-            MTPRequestBatchCondition ///< One live main-model row per request.
-        };
-
-        /**
          * @brief Backend-owned pinned host scratch for compact stochastic outcomes.
          *
          * GPU D2H copies are only truly asynchronous when the host destination is
@@ -3692,9 +3676,12 @@ namespace llaminar2
          * Device position and sequence-length overrides travel together for
          * resident request batches: recurrent stages need both rows to select
          * the correct request-owned live-state bank without observing a host
-         * length mirror. `execution_role` is mandatory because graph shape does
-         * not distinguish prefill, grouped verification, and request-batched
-         * decode.
+         * length mirror. `request_real_lengths` is the immutable logical row
+         * geometry for this transaction. It is deliberately separate from
+         * `state_.sequence_lengths`, whose values are mutable request progress
+         * and therefore cannot safely serve as asynchronous admission input.
+         * `execution_role` is mandatory because graph shape does not distinguish
+         * prefill, grouped verification, and request-batched decode.
          */
         const float *forwardImpl(
             const int *tokens,
@@ -3705,7 +3692,8 @@ namespace llaminar2
             bool force_prefill_phase = false,
             bool force_decode_phase = false,
             const void *position_ids_device_override = nullptr,
-            const int32_t *sequence_lengths_device_override = nullptr);
+            const int32_t *sequence_lengths_device_override = nullptr,
+            std::span<const int> request_real_lengths = {});
 
         size_t localLogitsVocabColumns(const TensorBase *tensor) const;
         size_t localLogitsRowStrideColumns(const TensorBase *tensor) const;
@@ -3714,6 +3702,29 @@ namespace llaminar2
         bool mtpSidecarLogitsAreColumnParallel() const;
         bool allPositionVerifierGraphWritesLocalLogits(int graph_token_count = -1) const;
         bool activeAllPositionLogitsAreColumnParallel(int graph_token_count = -1) const;
+
+        /**
+         * @brief Return an exact preplanned sidecar buffer for grouped verifier logits.
+         *
+         * The draft sidecar has already been consumed before the typed grouped
+         * verifier transaction starts. Its stable logits allocation can therefore
+         * become the verifier graph's output owner when the requested geometry is
+         * identical. The typed role check prevents ordinary prefill or request
+         * batching from borrowing this storage, while exact shape/device checks
+         * make graph-captured pointer identity explicit.
+         *
+         * @param execution_role Semantic role of the current forward transaction.
+         * @param buffer_id Sidecar logits allocation to inspect.
+         * @param rows Required output row count.
+         * @param columns Required output column count.
+         * @return Shared owner of the exact preplanned allocation, or empty.
+         */
+        std::shared_ptr<TensorBase> exactGroupedVerifierLogitsBuffer(
+            ForwardExecutionRole execution_role,
+            BufferId buffer_id,
+            size_t rows,
+            size_t columns) const;
+
         bool usesGraphStableGpuMoERebalance() const;
 
         /**
@@ -3886,6 +3897,12 @@ namespace llaminar2
 
         /** Queue live-state publication waits before any forward graph reads live KV/GDN state. */
         bool prepareLiveStateForForwardGraphExecution(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device) override;
+
+        /** Publish any staged persistent device token row on the consuming graph stream. */
+        bool prepareDeviceTokenInputsForForwardGraphExecution(
             const ForwardInput &input,
             void *execution_stream,
             DeviceId execution_device) override;
@@ -5244,6 +5261,16 @@ namespace llaminar2
         {
             std::unique_ptr<ComputeGraph> graph;
             DeviceGraphExecutor::GraphSegmentCache segment_cache;
+            /**
+             * @brief Immutable physical identity of the graph held by this cache.
+             *
+             * One captured sidecar executable may serve several logical MTP
+             * invocations when they share the same typed role, stable input
+             * slots, shape, and workspace bindings. PerfStats lifecycle records
+             * must remain attached to this physical identity even when the
+             * caller's diagnostic context changes between launches.
+             */
+            std::string capture_perf_context;
             std::vector<IComputeStage *> dynamic_param_stages;
             std::unordered_set<std::string> collective_nodes;
             TensorBase *terminal_hidden = nullptr;
@@ -5316,6 +5343,7 @@ namespace llaminar2
             {
                 segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
                 graph.reset();
+                capture_perf_context.clear();
                 dynamic_param_stages.clear();
                 collective_nodes.clear();
                 terminal_hidden = nullptr;
@@ -6042,6 +6070,16 @@ namespace llaminar2
         void *request_sequence_lengths_dev_ = nullptr; ///< INT32 [batch], immutable real rows admitted before GPU prefill.
         int request_sequence_lengths_capacity_ = 0; ///< Number of request rows reserved in the arena allocation.
         int request_sequence_lengths_active_count_ = 0; ///< Rows populated for the current request-batched prefill.
+        /**
+         * @brief Stable host source for one asynchronous request-length admission.
+         *
+         * `state_.sequence_lengths` advances as soon as graph execution is
+         * submitted, so lending its storage to an asynchronous H2D copy races the
+         * DMA reader. This fixed-capacity row is populated from the explicit
+         * forward transaction and remains unchanged until the next admission,
+         * whose device writer is ordered after the prior graph's reuse event.
+         */
+        std::vector<int32_t> request_sequence_lengths_host_;
         void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 stable compact verifier token row/matrix.
         void *mtp_verifier_stop_tokens_dev_ = nullptr; ///< INT32 fixed-width stop-token controls read inside captured reducers.
         void *mtp_greedy_penalty_policy_dev_ = nullptr; ///< Graph-stable MTPGreedyPenaltyPolicy written on the exact verifier stream.
@@ -6317,6 +6355,8 @@ namespace llaminar2
             std::shared_ptr<void> event;
             DeviceId device = DeviceId::invalid();
             bool valid = false;
+            ForwardExecutionRole execution_role =
+                ForwardExecutionRole::MainInference;
             bool is_decode = false;
             bool all_position_logits = false;
         };
@@ -6759,9 +6799,27 @@ namespace llaminar2
             int workspace_seq_len = 0) override;
 
         /**
+         * @brief Allocate graph workspace with an explicit family lifetime.
+         *
+         * Main prefill graphs reserve row-scaled scratch for the largest serial
+         * participant before capture. Decode, verifier, sidecar, publication,
+         * and catch-up graphs bind exact logical layouts into the same physical
+         * family block. Explicit event handoffs make those layouts mutually
+         * exclusive in time.
+         */
+        bool ensureDeviceWorkspaceAllocated(
+            const ComputeGraph &graph,
+            int workspace_seq_len,
+            WorkspaceGraphFamilyPolicy graph_family_policy) override;
+
+        /**
          * @brief Return the current workspace generation for a device.
          */
         uint64_t workspaceGeneration(DeviceId device) const override;
+        int residentGraphRows() const override
+        {
+            return state_.activation_seq_len;
+        }
 
         /**
          * @brief Called once after the first graph build + workspace allocation.
@@ -7252,6 +7310,8 @@ namespace llaminar2
          *
          * @param tokens Flattened request-major INT32 token rows.
          * @param position_ids Flattened request-major absolute position rows.
+         * @param request_real_lengths Immutable logical token count for every
+         *        physical request row.
          * @param total_tokens Physical number of token/position elements.
          * @param request_count Number of independent request rows.
          * @param padded_seq_len Physical width of each request row.
@@ -7260,6 +7320,7 @@ namespace llaminar2
         bool admitRequestInputsOnDevice(
             const int *tokens,
             const int *position_ids,
+            std::span<const int> request_real_lengths,
             int total_tokens,
             int request_count,
             int padded_seq_len);
