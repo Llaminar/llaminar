@@ -8,10 +8,14 @@ request then waits on that event before overwriting the bank.
 
 This validator keeps that three-edge protocol explicit in the server E2E gate:
 
-1. ``device_input_event_waits`` proves graph readers waited for admission.
-2. ``device_input_reuse_publications`` proves every consumed admission was
+1. ``device_input_reader_admissions`` counts every writer-to-reader ownership
+   transition, whether the writer uploaded a prefill row or generated a serial
+   decode position device-to-device.
+2. ``device_input_event_waits`` separately proves external prompt uploads were
+   consumed through their admission event.
+3. ``device_input_reuse_publications`` proves every reader transaction was
    released by the transitive final reader.
-3. ``device_input_reuse_waits`` proves a later request ordered its overwrite
+4. ``device_input_reuse_waits`` proves a later writer ordered its overwrite
    after the preceding release.
 
 The validator intentionally consumes only PerfStats records. It therefore
@@ -27,6 +31,7 @@ from typing import Any, Mapping, Sequence
 
 _DOMAIN = "request_admission"
 _OWNED_ROWS = "device_owned_input_rows"
+_READER_ADMISSIONS = "device_input_reader_admissions"
 _ADMISSION_WAITS = "device_input_event_waits"
 _REUSE_PUBLICATIONS = "device_input_reuse_publications"
 _REUSE_WAITS = "device_input_reuse_waits"
@@ -38,6 +43,7 @@ class RequestInputDeviceEvidence:
 
     device: str
     owned_rows: float
+    reader_admissions: float
     admission_waits: float
     reuse_publications: float
     reuse_waits: float
@@ -75,6 +81,7 @@ def validate_request_input_lifetime_policy(
     values: dict[str, dict[str, float]] = {}
     interesting = {
         _OWNED_ROWS,
+        _READER_ADMISSIONS,
         _ADMISSION_WAITS,
         _REUSE_PUBLICATIONS,
         _REUSE_WAITS,
@@ -99,6 +106,7 @@ def validate_request_input_lifetime_policy(
         RequestInputDeviceEvidence(
             device=device,
             owned_rows=counters[_OWNED_ROWS],
+            reader_admissions=counters[_READER_ADMISSIONS],
             admission_waits=counters[_ADMISSION_WAITS],
             reuse_publications=counters[_REUSE_PUBLICATIONS],
             reuse_waits=counters[_REUSE_WAITS],
@@ -118,6 +126,8 @@ def validate_request_input_lifetime_policy(
     errors: list[str] = []
     for evidence in active_devices:
         prefix = f"{evidence.device}:"
+        if evidence.reader_admissions <= 0.0:
+            errors.append(f"{prefix} no writer-to-reader admissions")
         if evidence.admission_waits <= 0.0:
             errors.append(f"{prefix} no admission-to-reader event waits")
         if evidence.reuse_publications <= 0.0:
@@ -128,10 +138,10 @@ def validate_request_input_lifetime_policy(
         # Every consumed admission must have exactly one final-reader release.
         # A mismatch means either a request was read without releasing the bank
         # or a release was published without a corresponding admitted request.
-        if evidence.admission_waits != evidence.reuse_publications:
+        if evidence.reader_admissions != evidence.reuse_publications:
             errors.append(
-                f"{prefix} consumed admissions "
-                f"({evidence.admission_waits:g}) != releases "
+                f"{prefix} reader admissions "
+                f"({evidence.reader_admissions:g}) != releases "
                 f"({evidence.reuse_publications:g})"
             )
 

@@ -4229,6 +4229,27 @@ namespace llaminar2::test
             << "The HTTP regression must match the live-state mutation operation emitted by request-boundary cache clears.";
         EXPECT_NE(server_e2e.find("materialized_score = ("), std::string::npos)
             << "The movement gate must distinguish a policy proposal from a published transfer command.";
+        const size_t planned_score = server_e2e.find("planned_score = (");
+        ASSERT_NE(planned_score, std::string::npos);
+        const size_t materialized_score =
+            server_e2e.find("materialized_score = (", planned_score);
+        ASSERT_NE(materialized_score, std::string::npos);
+        const std::string planned_score_body =
+            server_e2e.substr(planned_score, materialized_score - planned_score);
+        EXPECT_NE(
+            planned_score_body.find("device_rebalance_wave_planned_layer_count"),
+            std::string::npos)
+            << "Request-reset diagnostics must use the durable device wave's "
+               "planned-layer publication after the transient planner status "
+               "has advanced to WindowNotReady.";
+        EXPECT_EQ(
+            planned_score_body.find("device_rebalance_wave_command_count"),
+            std::string::npos)
+            << "A materialized command must not satisfy the planning gate.";
+        EXPECT_EQ(
+            planned_score_body.find("device_rebalance_wave_applied_arrivals"),
+            std::string::npos)
+            << "Applied movement must not substitute for independent planning evidence.";
         EXPECT_NE(
             server_e2e.find(
                 "saw a policy proposal but no materialized transfer command/payload"),

@@ -2576,6 +2576,11 @@ if require_moe_rebalance_movement:
         ("device_rebalance_prefill_current_batch_movement_layers",),
         "moe_rebalance",
     )
+    # Request-reset diagnostics run after the transient planner status has
+    # advanced to WindowNotReady for the next window.  The controller's wave
+    # state is the durable device-owned transaction record: a nonzero planned
+    # layer count proves that the planner committed work to a specific wave,
+    # independently of the command and apply counters checked below.
     planned_score = (
         prefill_applied_movement
         +
@@ -2585,6 +2590,7 @@ if require_moe_rebalance_movement:
                 "device_rebalance_dynamic_ownership_swap_accepts",
                 "device_rebalance_llep_weight_transfer_count",
                 "device_rebalance_llep_assignment_span_count",
+                "device_rebalance_wave_planned_layer_count",
                 "replica_arrivals",
                 "new_placement_entries",
             ),

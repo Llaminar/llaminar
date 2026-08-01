@@ -8868,6 +8868,28 @@ namespace llaminar2
                params_.d_model > 0;
     }
 
+    bool MoECanonicalRouteReduceStage::supportsLazyPrefillGraphCapturePreflight() const
+    {
+        if (!supportsWarmupDependentGraphCapture())
+            return false;
+
+        if (params_.device_id.is_cuda())
+            return supportsBackend(ComputeBackendType::GPU_CUDA);
+        if (params_.device_id.is_rocm())
+            return supportsBackend(ComputeBackendType::GPU_ROCM);
+        return false;
+    }
+
+    bool MoECanonicalRouteReduceStage::supportsPaddedPrefillGraphCapturePreflight() const
+    {
+        /*
+         * Every bucket row is reduced independently and overwritten in full.
+         * Unlike KV, GDN, and short-convolution stages, this epilogue owns no
+         * cross-row state whose lifetime would be advanced by padding rows.
+         */
+        return supportsLazyPrefillGraphCapturePreflight();
+    }
+
     StageBufferRequirements
     MoECanonicalRouteReduceStage::getBufferRequirements() const
     {

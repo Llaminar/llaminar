@@ -7451,6 +7451,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         prefill_admission_source.find("device_input_reuse_publications"),
         std::string::npos)
         << "Perfstats must prove that the complete reader chain released the reusable input bank.";
+    EXPECT_NE(
+        prefill_admission_source.find("device_input_reader_admissions"),
+        std::string::npos)
+        << "Every host or device writer must enter one shared, countable reader transaction before release.";
+    EXPECT_EQ(
+        countOccurrences(
+            removeAsciiWhitespace(
+                stripCommentsAndStringLiterals(orchestrator_source)),
+            "reuse.consumers_started=true;"),
+        1u)
+        << "Only beginRequestInputReaderTransaction may transfer the reusable bank to graph readers.";
     EXPECT_EQ(prefill_admission.find("createEvent("),
               std::string::npos)
         << "Request-input event ownership must be preallocated with the arena, never in the hot path.";

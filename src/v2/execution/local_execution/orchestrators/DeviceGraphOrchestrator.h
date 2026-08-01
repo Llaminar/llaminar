@@ -7548,6 +7548,25 @@ namespace llaminar2
             const char *consumer_name);
 
         /**
+         * @brief Begin exactly one reader transaction for the reusable input bank.
+         *
+         * Both host-admitted prefill rows and device-generated serial-decode
+         * positions write persistent request-input storage before a graph reads
+         * it. This method is the single state transition from writer ownership
+         * to active readers for both producer kinds. A second begin before the
+         * transitive final reader publishes reuse readiness is a fatal lifecycle
+         * violation.
+         *
+         * @param admission_kind Stable diagnostic name for the writer path.
+         * @param token_count Physical input rows exposed to the graph.
+         * @param request_count Number of logical request rows.
+         */
+        void beginRequestInputReaderTransaction(
+            const char *admission_kind,
+            int token_count,
+            int request_count);
+
+        /**
          * @brief Publish completion of every request-owned GPU state reset.
          *
          * Failure is fatal because replaying a graph without this dependency

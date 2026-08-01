@@ -1014,8 +1014,13 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 domain="request_admission",
             ),
             counter(
+                "device_input_reader_admissions",
+                value=10.0,
+                domain="request_admission",
+            ),
+            counter(
                 "device_input_reuse_publications",
-                value=4.0,
+                value=10.0,
                 domain="request_admission",
             ),
             counter(
@@ -1043,6 +1048,11 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 domain="request_admission",
             ),
             counter(
+                "device_input_reader_admissions",
+                value=4.0,
+                domain="request_admission",
+            ),
+            counter(
                 "device_input_reuse_publications",
                 value=3.0,
                 domain="request_admission",
@@ -1054,7 +1064,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             ),
         ]
         result = validate_request_input_lifetime_policy(records)
-        self.assertIn("consumed admissions (4) != releases (3)", result.error or "")
+        self.assertIn("reader admissions (4) != releases (3)", result.error or "")
 
     def test_request_input_lifetime_rejects_unexercised_reuse_wait(
         self,
@@ -1067,6 +1077,10 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             ),
             counter(
                 "device_input_event_waits",
+                domain="request_admission",
+            ),
+            counter(
+                "device_input_reader_admissions",
                 domain="request_admission",
             ),
             counter(

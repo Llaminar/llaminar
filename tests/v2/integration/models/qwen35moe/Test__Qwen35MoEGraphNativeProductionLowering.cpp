@@ -743,6 +743,13 @@ namespace llaminar2::test
         EXPECT_EQ(reduce_stage->params().seq_len, kSeqLen);
         EXPECT_EQ(reduce_stage->params().top_k, kTopK);
         EXPECT_EQ(reduce_stage->params().d_model, kDModel);
+        EXPECT_TRUE(reduce_stage->supportsWarmupDependentGraphCapture());
+        EXPECT_TRUE(reduce_stage->supportsLazyPrefillGraphCapturePreflight())
+            << "A cold LocalTP MoE graph must admit the allocation-free canonical "
+               "route reducer so eager warmup can bind its backend kernel wrapper";
+        EXPECT_TRUE(reduce_stage->supportsPaddedPrefillGraphCapturePreflight())
+            << "Canonical route reduction is row-independent and must not reject "
+               "fixed padded prefill buckets";
         EXPECT_EQ(countStagesOfType(graph, ComputeStageType::ALLREDUCE), 1u);
         EXPECT_EQ(
             countStagesOfType(

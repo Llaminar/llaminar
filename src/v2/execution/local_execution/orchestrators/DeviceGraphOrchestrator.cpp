@@ -25654,7 +25654,10 @@ namespace llaminar2
                     "device-owned serial-decode position");
                 return false;
             }
-            reuse.consumers_started = true;
+            beginRequestInputReaderTransaction(
+                "serial_decode_position_snapshot",
+                /*token_count=*/1,
+                /*request_count=*/1);
             PerfStatsCollector::addCounter(
                 "request_admission",
                 "device_serial_decode_position_snapshots",
@@ -34046,6 +34049,8 @@ namespace llaminar2
             return false;
         }
 
+        const int admitted_token_count = ready.token_count;
+        const int admitted_request_count = ready.request_count;
         PerfStatsCollector::addCounter(
             "request_admission",
             "device_input_event_waits",
@@ -34059,8 +34064,54 @@ namespace llaminar2
         ready.producer_stream = nullptr;
         ready.token_count = 0;
         ready.request_count = 0;
-        request_input_reuse_ready_.consumers_started = true;
+        beginRequestInputReaderTransaction(
+            "host_request_admission",
+            admitted_token_count,
+            admitted_request_count);
         return true;
+    }
+
+    void DeviceGraphOrchestrator::beginRequestInputReaderTransaction(
+        const char *admission_kind,
+        int token_count,
+        int request_count)
+    {
+        auto &reuse = request_input_reuse_ready_;
+        if (!state_.device_id.is_gpu() ||
+            !admission_kind ||
+            admission_kind[0] == '\0' ||
+            token_count <= 0 ||
+            request_count <= 0 ||
+            reuse.consumers_started ||
+            reuse.valid)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Request-input reader transaction "
+                "violated the reusable-bank lifecycle"
+                << " device=" << state_.device_id.toString()
+                << " admission="
+                << (admission_kind && admission_kind[0] != '\0'
+                        ? admission_kind
+                        : "unknown")
+                << " tokens=" << token_count
+                << " requests=" << request_count
+                << " consumers_started="
+                << boolTag(reuse.consumers_started)
+                << " prior_release_valid=" << boolTag(reuse.valid));
+            std::terminate();
+        }
+
+        reuse.consumers_started = true;
+        PerfStatsCollector::addCounter(
+            "request_admission",
+            "device_input_reader_admissions",
+            1.0,
+            "prefill",
+            state_.device_id.toString(),
+            {{"admission", admission_kind},
+             {"tokens", std::to_string(token_count)},
+             {"requests", std::to_string(request_count)},
+             {"ordering", "writer_to_reader_event"}});
     }
 
     void DeviceGraphOrchestrator::publishRequestInputReuseReady(

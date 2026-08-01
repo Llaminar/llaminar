@@ -1587,6 +1587,25 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
         bool supportsWarmupDependentGraphCapture() const override;
+        /**
+         * @brief Admit cold exact-shape prefill before the reducer owns its kernel wrapper.
+         *
+         * The reducer's launch geometry depends only on the graph-bound tensor
+         * dimensions. Its first eager warmup constructs the backend wrapper and
+         * launches the same fixed-grid device kernel that capture records on the
+         * following request. No descriptor table, transfer, or host result is
+         * part of this initialization boundary.
+         */
+        bool supportsLazyPrefillGraphCapturePreflight() const override;
+        /**
+         * @brief Admit padded buckets because reduction has no persistent row state.
+         *
+         * Padding contributes only to padding output rows. The reducer neither
+         * advances KV/recurrent state nor reads a host-visible effective length,
+         * so the fixed bucket geometry is graph-stable and semantically isolated
+         * from the real prompt prefix.
+         */
+        bool supportsPaddedPrefillGraphCapturePreflight() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
