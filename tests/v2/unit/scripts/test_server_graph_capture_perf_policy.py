@@ -141,6 +141,26 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         )
         self.assertIn("draft_shadow", result.error or "")
 
+    def test_gpu_host_transfer_policy_rejects_full_host_logits_access(
+        self,
+    ) -> None:
+        """A full-vocabulary host view is forbidden even without D2H in its name."""
+
+        result = validate_gpu_host_transfer_policy(
+            [
+                counter(
+                    "host_logits_access",
+                    domain="sampling",
+                    tags={
+                        "source": "device_graph_logits",
+                        "rows": "1",
+                        "cols": "248320",
+                    },
+                )
+            ]
+        )
+        self.assertIn("host_logits_access", result.error or "")
+
     def test_gpu_host_transfer_policy_fails_closed_for_unknown_d2h(self) -> None:
         """New D2H boundaries require an explicit architectural review."""
 

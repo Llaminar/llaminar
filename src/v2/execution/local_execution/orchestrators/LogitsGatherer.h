@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -20,6 +21,20 @@
 
 namespace llaminar2
 {
+
+    /**
+     * @brief Logical model phase that produced the main logits tensor.
+     *
+     * The phase is deliberately independent of the physical row count. A
+     * one-token request prefill is still prefill, while ordinary M=1 decode is
+     * decode. Keeping this distinction typed prevents gather policy from being
+     * inferred from `seq_len == 1`, which is not a valid lifecycle boundary.
+     */
+    enum class LogitsForwardPhase : uint8_t
+    {
+        Prefill,
+        Decode,
+    };
 
     class TensorBase;
     class IBackend;
@@ -127,7 +142,12 @@ namespace llaminar2
         // Access
         // =========================================================================
 
-        /// Get combined logits data pointer (may be nullptr if not allocated)
+        /**
+         * @brief Get the most recently gathered host logits.
+         *
+         * @return The host buffer only while it contains current gathered data;
+         *         nullptr before the first gather or after invalidate().
+         */
         const float *data() const;
 
         /// Get mutable data pointer for direct writes
@@ -142,6 +162,16 @@ namespace llaminar2
         /// Actual size of the last gather/copy operation
         size_t lastGatheredSize() const { return last_gathered_size_; }
 
+        /**
+         * @brief Invalidate host-visible data before a new forward transaction.
+         *
+         * Allocation lifetime and data lifetime are intentionally separate.
+         * The persistent allocation may be reused, but an old request's logits
+         * must never remain observable while the new device forward is pending
+         * or when host gathering is disabled.
+         */
+        void invalidate() noexcept { last_gathered_size_ = 0; }
+
         // =========================================================================
         // Skip-gather control
         // =========================================================================
@@ -152,12 +182,12 @@ namespace llaminar2
         bool skipPrefill() const { return skip_prefill_; }
 
         /**
-         * @brief Determine if a gather is needed for the given sequence length.
+         * @brief Determine if a gather is enabled for the typed forward phase.
          *
-         * @param seq_len Current sequence length
+         * @param phase Logical phase selected by the forward entry point.
          * @return true if logits need to be gathered
          */
-        bool needsGather(size_t seq_len) const;
+        bool needsGather(LogitsForwardPhase phase) const;
 
     private:
         /// @brief Resolve a backend through the injected test resolver or global BackendManager.

@@ -282,12 +282,11 @@ TEST_F(Test__LogitsGatherer, ZeroVocabProducesEmptyGatherer)
     EXPECT_EQ(g->lastGatheredSize(), 0u);
 }
 
-TEST_F(Test__LogitsGatherer, DataAccessible)
+TEST_F(Test__LogitsGatherer, HostDataIsInvalidUntilGathered)
 {
     auto g = createGatherer();
-    ASSERT_NE(g->data(), nullptr);
+    EXPECT_EQ(g->data(), nullptr);
     ASSERT_NE(g->mutableData(), nullptr);
-    EXPECT_EQ(g->data(), g->mutableData());
 }
 
 TEST_F(Test__LogitsGatherer, DestructorUnpinsWithPinnedDeviceBackend)
@@ -305,7 +304,7 @@ TEST_F(Test__LogitsGatherer, DestructorUnpinsWithPinnedDeviceBackend)
         // Pin via ROCm while a CUDA backend is also available; destruction must
         // unpin through the stored ROCm backend type instead of probing CUDA first.
         g->pinForDevice(DeviceId::rocm(0));
-        buffer_ptr = g->data();
+        buffer_ptr = g->mutableData();
 
         ASSERT_NE(buffer_ptr, nullptr);
         EXPECT_EQ(rocm_backend.pinCount(), 1u);
@@ -355,27 +354,27 @@ TEST_F(Test__LogitsGatherer, SetSkipPrefill)
 TEST_F(Test__LogitsGatherer, NeedsGatherDecode_DefaultTrue)
 {
     auto g = createGatherer();
-    EXPECT_TRUE(g->needsGather(1)); // decode: seq_len=1
+    EXPECT_TRUE(g->needsGather(LogitsForwardPhase::Decode));
 }
 
 TEST_F(Test__LogitsGatherer, NeedsGatherDecode_SkipSetFalse)
 {
     auto g = createGatherer();
     g->setSkipDecode(true);
-    EXPECT_FALSE(g->needsGather(1)); // decode skipped
+    EXPECT_FALSE(g->needsGather(LogitsForwardPhase::Decode));
 }
 
 TEST_F(Test__LogitsGatherer, NeedsGatherPrefill_DefaultTrue)
 {
     auto g = createGatherer();
-    EXPECT_TRUE(g->needsGather(10)); // prefill: seq_len > 1
+    EXPECT_TRUE(g->needsGather(LogitsForwardPhase::Prefill));
 }
 
 TEST_F(Test__LogitsGatherer, NeedsGatherPrefill_SkipSetFalse)
 {
     auto g = createGatherer();
     g->setSkipPrefill(true);
-    EXPECT_FALSE(g->needsGather(10)); // prefill skipped
+    EXPECT_FALSE(g->needsGather(LogitsForwardPhase::Prefill));
 }
 
 TEST_F(Test__LogitsGatherer, NeedsGatherDecodeAndPrefillIndependent)
@@ -383,13 +382,13 @@ TEST_F(Test__LogitsGatherer, NeedsGatherDecodeAndPrefillIndependent)
     auto g = createGatherer();
     g->setSkipDecode(true);
     g->setSkipPrefill(false);
-    EXPECT_FALSE(g->needsGather(1)); // decode skipped
-    EXPECT_TRUE(g->needsGather(10)); // prefill not skipped
+    EXPECT_FALSE(g->needsGather(LogitsForwardPhase::Decode));
+    EXPECT_TRUE(g->needsGather(LogitsForwardPhase::Prefill));
 
     g->setSkipDecode(false);
     g->setSkipPrefill(true);
-    EXPECT_TRUE(g->needsGather(1));   // decode not skipped
-    EXPECT_FALSE(g->needsGather(10)); // prefill skipped
+    EXPECT_TRUE(g->needsGather(LogitsForwardPhase::Decode));
+    EXPECT_FALSE(g->needsGather(LogitsForwardPhase::Prefill));
 }
 
 // =============================================================================
@@ -434,6 +433,31 @@ TEST_F(Test__LogitsGatherer, GatherSingleDevice_PrefillCopiesLogits)
     const float *result = g->data();
     ASSERT_NE(result, nullptr);
     EXPECT_FLOAT_EQ(result[0], 42.0f);
+}
+
+/**
+ * @brief Prove persistent allocation cannot expose data from an older forward.
+ *
+ * The gatherer deliberately retains its allocated buffer for economy, but the
+ * allocation is not evidence that its bytes belong to the active request. A
+ * forward boundary invalidates the publication until a new gather completes.
+ */
+TEST_F(Test__LogitsGatherer, InvalidateRetiresPreviouslyGatheredHostData)
+{
+    auto g = createGatherer();
+    auto runners = makeSingleRunner();
+    auto *mock = static_cast<LogitsGathererMockRunner *>(runners[0].get());
+    mock->fillLogits(7.0f);
+
+    ASSERT_TRUE(g->gather(runners, 1, VOCAB));
+    ASSERT_NE(g->data(), nullptr);
+    ASSERT_EQ(g->lastGatheredSize(), static_cast<size_t>(VOCAB));
+
+    g->invalidate();
+
+    EXPECT_TRUE(g->isAllocated());
+    EXPECT_EQ(g->lastGatheredSize(), 0u);
+    EXPECT_EQ(g->data(), nullptr);
 }
 
 TEST_F(Test__LogitsGatherer, GatherEmptyRunners_ReturnsFalse)

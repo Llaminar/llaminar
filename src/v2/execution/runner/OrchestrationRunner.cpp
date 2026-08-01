@@ -1347,6 +1347,21 @@ namespace llaminar2
             {
                 return false;
             }
+
+            /*
+             * GPU inference owns logits on device for the entire request.
+             * Sampling and speculative publication consume the resident tensor;
+             * only compact response tokens cross to the host. Install this once
+             * at the lifecycle boundary rather than toggling gather behavior per
+             * request, which could expose stale host data between transactions.
+             * Tests that deliberately inspect full logits must explicitly opt
+             * into host observation after initialization.
+             */
+            if (runner_ && runner_->primaryDeviceId().is_gpu())
+            {
+                runner_->setSkipLogitsGatherPrefill(true);
+                runner_->setSkipLogitsGatherDecode(true);
+            }
             if (runner_ &&
                 !runner_->configureMTPRequestStopTokens(stop_tokens_))
             {
@@ -14403,8 +14418,6 @@ namespace llaminar2
         active_sampling_params_ = sampling;
         sampler_ = Sampler(sampling.seed);
 
-        // Enable GPU-side logits skip for decode (GPU sampling avoids full D2H)
-        runner_->setSkipLogitsGatherDecode(true);
         while (static_cast<int>(result.tokens.size()) < max_new_tokens)
         {
             // Use decodeStep() which uses last_token_ internally
@@ -14452,9 +14465,6 @@ namespace llaminar2
                 result.error = last_error_.empty() ? "MoE rebalance delayed publish failed" : last_error_;
             }
         }
-
-        // Restore normal logits gathering after generation
-        runner_->setSkipLogitsGatherDecode(false);
 
         const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
         if (mtp.enabled)

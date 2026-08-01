@@ -79,6 +79,8 @@ def _is_semantic_host_transfer(name: str) -> bool:
     """Recognize operation names that publish GPU data to host code."""
 
     lowered = name.lower()
+    if lowered == "host_logits_access":
+        return True
     return any(
         marker in lowered
         for marker in ("d2h", "host_bridge", "host_materialization")

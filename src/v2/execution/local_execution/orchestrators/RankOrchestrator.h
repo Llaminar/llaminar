@@ -80,6 +80,7 @@ namespace llaminar2
     class IBackend;
     class TensorBase;
     class LogitsGatherer;
+    enum class LogitsForwardPhase : uint8_t;
     class DeviceSampler;
     class IMPIContext;
     class PreparedWeightStore;
@@ -1605,6 +1606,15 @@ namespace llaminar2
         IBackend *(*logits_backend_resolver_)(DeviceId) = nullptr;
         bool skip_logits_gather_decode_ = false;
         bool skip_logits_gather_prefill_ = false;
+
+        /**
+         * @brief Typed phase for the most recently started main forward.
+         *
+         * This is optional until the first forward begins. It is never inferred
+         * by logits() from tensor shape, so a one-token prefill cannot silently
+         * inherit decode's host-observation policy.
+         */
+        std::optional<LogitsForwardPhase> last_logits_forward_phase_;
 
         /// Aggregated executor stats (mutable for lazy computation)
         mutable std::unique_ptr<GraphExecutorStats> aggregated_stats_;

@@ -169,6 +169,7 @@ namespace llaminar2
         size_t seq_len,
         int full_vocab_size)
     {
+        invalidate();
         if (!buffer_ || device_infos.empty())
             return false;
 
@@ -402,6 +403,7 @@ namespace llaminar2
         const std::vector<std::unique_ptr<IInferenceRunner>> &runners,
         size_t seq_len, int full_vocab_size)
     {
+        invalidate();
         if (!buffer_ || runners.empty())
             return false;
 
@@ -481,6 +483,7 @@ namespace llaminar2
         size_t copy_elements_hint,
         int batch_size, int max_seq_len)
     {
+        invalidate();
         const float *stage_logits = stage_runner.logits();
         if (!stage_logits)
         {
@@ -523,7 +526,7 @@ namespace llaminar2
 
     const float *LogitsGatherer::data() const
     {
-        return buffer_ ? buffer_->data() : nullptr;
+        return buffer_ && last_gathered_size_ > 0 ? buffer_->data() : nullptr;
     }
 
     float *LogitsGatherer::mutableData()
@@ -541,9 +544,9 @@ namespace llaminar2
         return buffer_ ? buffer_->numel() : 0;
     }
 
-    bool LogitsGatherer::needsGather(size_t seq_len) const
+    bool LogitsGatherer::needsGather(LogitsForwardPhase phase) const
     {
-        if (seq_len == 1)
+        if (phase == LogitsForwardPhase::Decode)
             return !skip_decode_;
         return !skip_prefill_;
     }

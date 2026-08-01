@@ -7400,6 +7400,109 @@ TEST_F(Test__RankOrchestrator, LogitsGatherSkipPolicyPropagatesToEveryLocalTPChi
     EXPECT_GT(runner1_ptr->set_skip_decode_call_count(), runner1_decode_calls);
 }
 
+/**
+ * @brief Prove host-gather policy follows the typed entry point at M=1.
+ *
+ * A single-row request prefill and a single-row decode have identical tensor
+ * geometry, but they are different lifecycle phases. The former must obey the
+ * prefill device-ownership policy, invalidate any old host aggregate, and fail
+ * an accidental host observation. The subsequent ordinary forward is decode,
+ * so explicitly enabling decode observation must gather fresh shards.
+ */
+TEST_F(Test__RankOrchestrator, OneRowPrefillUsesPrefillHostObservationPolicy)
+{
+    MockDeviceGraphOrchestrator::Config child_config;
+    child_config.vocab_size = 4;
+
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>(child_config);
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_primary_device_id(DeviceId::cuda(0));
+    runner0_ptr->set_mock_logits_local(/*local_vocab=*/2, {1.0f, 2.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>(child_config);
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_primary_device_id(DeviceId::cuda(1));
+    runner1_ptr->set_mock_logits_local(/*local_vocab=*/2, {3.0f, 4.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto model_ctx = llaminar2::test::MockModelContextBuilder()
+                         .usePreset(llaminar2::test::ModelPreset::MINIMAL)
+                         .setVocabSize(4)
+                         .build();
+    auto orchestrator = RankOrchestrator::createForTest(
+        std::move(model_ctx),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    orchestrator->setSkipLogitsGatherPrefill(true);
+    orchestrator->setSkipLogitsGatherDecode(false);
+    runner0_ptr->reset_call_counts();
+    runner1_ptr->reset_call_counts();
+
+    const int32_t token = 17;
+    ASSERT_TRUE(orchestrator->forwardPrefill(&token, 1));
+    EXPECT_EQ(runner0_ptr->get_logits_local_info_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->get_logits_local_info_call_count(), 0u);
+    EXPECT_THROW(static_cast<void>(orchestrator->logits()), std::logic_error);
+
+    ASSERT_TRUE(orchestrator->forward(&token, 1));
+    EXPECT_GT(runner0_ptr->get_logits_local_info_call_count(), 0u);
+    EXPECT_GT(runner1_ptr->get_logits_local_info_call_count(), 0u);
+    const float *fresh_logits = nullptr;
+    EXPECT_NO_THROW(fresh_logits = orchestrator->logits());
+    ASSERT_NE(fresh_logits, nullptr);
+    EXPECT_THAT(
+        std::vector<float>(fresh_logits, fresh_logits + 4),
+        ::testing::ElementsAre(1.0f, 2.0f, 3.0f, 4.0f));
+}
+
+/**
+ * @brief Prove a skipped GPU forward cannot expose the previous host aggregate.
+ */
+TEST_F(Test__RankOrchestrator, DeviceOwnedGPUForwardInvalidatesStaleHostLogits)
+{
+    MockDeviceGraphOrchestrator::Config child_config;
+    child_config.vocab_size = 4;
+
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>(child_config);
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_primary_device_id(DeviceId::cuda(0));
+    runner0_ptr->set_mock_logits_local(/*local_vocab=*/2, {10.0f, 11.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>(child_config);
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_primary_device_id(DeviceId::cuda(1));
+    runner1_ptr->set_mock_logits_local(/*local_vocab=*/2, {12.0f, 13.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto model_ctx = llaminar2::test::MockModelContextBuilder()
+                         .usePreset(llaminar2::test::ModelPreset::MINIMAL)
+                         .setVocabSize(4)
+                         .build();
+    auto orchestrator = RankOrchestrator::createForTest(
+        std::move(model_ctx),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    orchestrator->setSkipLogitsGatherDecode(false);
+    const int32_t token = 23;
+    ASSERT_TRUE(orchestrator->forward(&token, 1));
+    ASSERT_NE(orchestrator->logits(), nullptr);
+
+    orchestrator->setSkipLogitsGatherDecode(true);
+    ASSERT_TRUE(orchestrator->forward(&token, 1));
+
+    EXPECT_THROW(static_cast<void>(orchestrator->logits()), std::logic_error);
+}
+
 TEST_F(Test__RankOrchestrator, DecodeSyncDeferralPolicyPropagatesToEveryLocalTPChild)
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();

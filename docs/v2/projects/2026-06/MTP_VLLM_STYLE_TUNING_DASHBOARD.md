@@ -1,7 +1,7 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Scope: Qwen3.6 dense/MoE MTP on CPU, CUDA, and ROCm. Keep this dashboard under
-6 KB; put implementation detail in project handoffs.
+Scope: Qwen3.6 dense/MoE MTP on CPU, CUDA, and ROCm. Keep this under 6 KB;
+put implementation detail in project handoffs.
 
 RAG: **G** correct and economical, **A** correct but untuned/stale, **R**
 failing or not yet proven. Token equality alone is not verifier parity proof.
@@ -10,9 +10,9 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 | Goal | Completion | Remaining proof |
 |---|---:|---|
-| SingleDevice fully device-resident MTP | 96% | refresh d1 economy and full stochastic matrix |
-| LocalTP fully device-resident MTP | 98% | remote-participant and economy matrix |
-| ExpertParallel fully device-resident MTP | 96% | mirrored-head batching across every EP mode |
+| SingleDevice fully device-resident MTP | 97% | refresh d1 economy and full stochastic matrix |
+| LocalTP fully device-resident MTP | 99% | remote-participant and economy matrix |
+| ExpertParallel fully device-resident MTP | 97% | mirrored-head batching across every EP mode |
 
 - Homogeneous CUDA/ROCm execution is full-graph only. Device parameters select
   serial/grouped and short/long sequence-parallel regimes inside one immutable
@@ -21,13 +21,12 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - GPU KV append, TurboQuant conversion, verifier publication, and compact
   NCCL/RCCL broadcast use planned persistent workspace and explicit
   producer/consumer event ordering. Hot paths contain no allocation, blocking
-  synchronization, or segmented execution. Stochastic sampling still has one
-  known full-distribution D2H seam; removing it is the active residency gate.
-- CUDA/ROCm MoE prefix restore preserves reusable captures and restores the
-  stable-address model-lifetime runtime template through explicit graph-build
+  synchronization, segmented execution, or full-logits host observation.
+- CUDA/ROCm MoE prefix restore preserves captures and the stable-address
+  runtime template through explicit graph-build
   producer streams/events. GPU FFN/MTP graph APIs reject null publication
   streams before device work.
-- Integration-build unit gate: `585/585` green on 2026-07-31; GPU graph
+- Integration-build unit gate: `585/585` green on 2026-08-01; GPU graph
   lowering is registered only in the integration tier.
 
 ## Production Matrix
@@ -45,9 +44,8 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 ## Fresh Correctness Proofs
 
-- CUDA and ROCm all-format grouped attention are serial-row byte exact for
-  every `M=2..16`, D=64/128/256, unequal row lengths, and long-context
-  sequence-parallel boundaries. Stable-graph long-context suites are green.
+- CUDA/ROCm all-format grouped attention is serial-row byte exact for
+  `M=2..16`, D=64/128/256, unequal rows, and long-context boundaries.
 - CPU fused TurboQuant quantization and grouped materialization are byte exact
   against serial rows for both TQ modes, D=64/128/256, `M=1..16`, plain and
   RoPE-on-read.
@@ -63,13 +61,17 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   shutdown, and VRAM release through 2048 generated tokens.
 - Forward topology now consumes a typed `Prefill`/`Decode` phase instead of
   inferring phase from `M`. The focused MTP regression proves a 14-token prompt
-  remains sharded prefill even when dynamic MTP permits 16 verifier rows; the
-  exact CUDA2 LLEP production repro and all `585/585` unit tests are green.
+  remains sharded prefill when dynamic MTP permits 16 verifier rows.
+- GPU logits ownership is persistent across the request. Typed gather policy,
+  publication invalidation, and fatal host-access guards prevent stale host
+  buffers and child-runner fallbacks. CUDA2 LLEP PerfStats show no full-logits
+  D2H; only the final 4-byte sampled token crosses to the host. The canonical
+  E2E policy rejects `host_logits_access` explicitly.
 - CUDA/ROCm SingleDevice forced-token publication is device-owned and
   graph-captured: both Release lanes pass `31/31` and account for all 96
   transactions without a host control scalar.
-- Transfer stress covers 336 slot rotations and 32 cross-stream reset epochs.
-  Source policy forbids eventless publication, GPU sync, hot-path allocation,
+- Transfer stress covers 336 slot rotations and 32 cross-stream reset epochs;
+  source policy forbids eventless publication, GPU sync, hot-path allocation,
   and direct coherence transitions.
 
 ## Kernel Economy
@@ -104,9 +106,8 @@ Matched llama.cpp master comparison, tok/s:
 
 ## Next Gates
 
-1. Remove stochastic sampling's full-distribution D2H, then profile and tune
-   the full CUDA LLEP lane until its economy matches the correctness proof;
-   inventory every kernel, collective, and launch gap.
+1. Profile and tune the full CUDA LLEP lane until its economy matches the
+   correctness proof; inventory every kernel, collective, and launch gap.
 2. Run the remaining full-context CPU matrix, then close remote-participant
    lifetime and mirrored-head request batching for
    every LocalTP and ExpertParallel mode.

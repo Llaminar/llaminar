@@ -2419,6 +2419,16 @@ namespace llaminar2
             return false;
         }
 
+        const LogitsForwardPhase logits_phase =
+            (force_prefill_phase || seq_len != 1)
+                ? LogitsForwardPhase::Prefill
+                : LogitsForwardPhase::Decode;
+        last_logits_forward_phase_ = logits_phase;
+        if (logits_gatherer_)
+        {
+            logits_gatherer_->invalidate();
+        }
+
         // TP timing diagnostic: explicit executor instrumentation only.
         const bool tp_timing = debugEnv().tp_timing;
         const bool tp_profiling = debugEnv().execution.executor_profiling;
@@ -2789,7 +2799,8 @@ namespace llaminar2
         if (all_success)
         {
             // Gather logits from all devices (delegates to LogitsGatherer)
-            bool need_gather = logits_gatherer_ && logits_gatherer_->needsGather(seq_len);
+            const bool need_gather =
+                logits_gatherer_ && logits_gatherer_->needsGather(logits_phase);
 
             if (!need_gather && seq_len > 1)
             {
@@ -2806,7 +2817,10 @@ namespace llaminar2
             // last-token position) written to row 0 of logits_local.  We must
             // gather exactly 1 row; gathering seq_len rows would include
             // uninitialised data in rows 1..seq_len-1.
-            size_t gather_rows = (seq_len > 1) ? 1 : static_cast<size_t>(seq_len);
+            const size_t gather_rows =
+                logits_phase == LogitsForwardPhase::Prefill
+                    ? 1
+                    : static_cast<size_t>(seq_len);
             if (need_gather && !logits_gatherer_->gather(device_runners_, gather_rows, vocab_size()))
             {
                 LOG_ERROR("RankOrchestrator::forwardTP: Failed to gather logits");
@@ -2916,6 +2930,16 @@ namespace llaminar2
         {
             LOG_ERROR("RankOrchestrator::forwardPP: No LocalPPContext available for transfers");
             return false;
+        }
+
+        const LogitsForwardPhase logits_phase =
+            (force_prefill_phase || seq_len != 1)
+                ? LogitsForwardPhase::Prefill
+                : LogitsForwardPhase::Decode;
+        last_logits_forward_phase_ = logits_phase;
+        if (logits_gatherer_)
+        {
+            logits_gatherer_->invalidate();
         }
 
         const size_t num_stages = pp_stage_runners_.size();
@@ -3035,6 +3059,11 @@ namespace llaminar2
         // =====================================================================
         // Copy logits from last stage to combined buffer
         // =====================================================================
+        const bool gather_host_logits =
+            logits_phase == LogitsForwardPhase::Decode
+                ? !skip_logits_gather_decode_
+                : !skip_logits_gather_prefill_;
+        if (gather_host_logits)
         {
             int last_stage = static_cast<int>(num_stages - 1);
             if (last_stage >= 0 && static_cast<size_t>(last_stage) < pp_stage_runners_.size() && pp_stage_runners_[last_stage])
@@ -3499,31 +3528,55 @@ namespace llaminar2
              {"gatherer_allocated",
               (logits_gatherer_ && logits_gatherer_->isAllocated()) ? "true" : "false"}});
 
+        if (primaryDeviceId().is_gpu())
+        {
+            if (!last_logits_forward_phase_.has_value())
+            {
+                throw std::logic_error(
+                    "RankOrchestrator::logits: GPU host logits were requested before a forward transaction");
+            }
+
+            const bool host_observation_disabled =
+                *last_logits_forward_phase_ == LogitsForwardPhase::Decode
+                    ? skip_logits_gather_decode_
+                    : skip_logits_gather_prefill_;
+            if (host_observation_disabled)
+            {
+                throw std::logic_error(
+                    "RankOrchestrator::logits: GPU logits are device-owned for the active forward phase; use the device sampler/result publication API");
+            }
+        }
+
         // For PP mode: return combined logits (copied from final stage)
         if (mode_ == ParallelismMode::PP || mode_ == ParallelismMode::TP_PP)
         {
-            if (logits_gatherer_ && logits_gatherer_->isAllocated())
+            const float *gathered = logits_gatherer_ ? logits_gatherer_->data() : nullptr;
+            if (gathered)
+                return gathered;
+            if (primaryDeviceId().is_gpu())
             {
-                return logits_gatherer_->data();
-            }
-            // Fallback: try to get from final PP stage
-            if (!pp_stage_runners_.empty() && pp_stage_runners_.back())
-            {
-                return pp_stage_runners_.back()->logits();
+                throw std::logic_error(
+                    "RankOrchestrator::logits: the GPU pipeline did not publish current host logits");
             }
             return nullptr;
         }
 
         // For TP mode: return combined logits if available (multi-device)
-        if (logits_gatherer_ && logits_gatherer_->isAllocated() && device_runners_.size() > 1)
+        if (logits_gatherer_ && logits_gatherer_->data() && device_runners_.size() > 1)
         {
             return logits_gatherer_->data();
         }
 
         // For single device, return primary device's logits
-        if (!device_runners_.empty() && device_runners_[0])
+        if (device_runners_.size() == 1 && device_runners_[0])
         {
             return device_runners_[0]->logits();
+        }
+
+        if (primaryDeviceId().is_gpu())
+        {
+            throw std::logic_error(
+                "RankOrchestrator::logits: the active GPU forward did not publish current host logits");
         }
 
         return nullptr;
