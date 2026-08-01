@@ -12,8 +12,8 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 | Goal | Completion | Remaining proof |
 |---|---:|---|
 | SingleDevice fully device-resident MTP | 96% | refresh d1 economy and full stochastic matrix |
-| LocalTP fully device-resident MTP | 97% | remote-participant stochastic/economy matrix |
-| ExpertParallel fully device-resident MTP | 95% | mirrored-head request batching across every EP mode |
+| LocalTP fully device-resident MTP | 98% | remote-participant and economy matrix |
+| ExpertParallel fully device-resident MTP | 96% | mirrored-head batching across every EP mode |
 
 - Homogeneous CUDA/ROCm execution is full-graph only. Device parameters select
   serial/grouped and short/long sequence-parallel regimes inside one immutable
@@ -44,8 +44,8 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 | SingleDevice | CPU | R/R | A/A | refresh paused |
 | SingleDevice | CUDA | A/G | A/R | dense d3 wins; d1/MoE need tuning |
 | SingleDevice | ROCm | A/A | A/A | dense d3 wins; d1/MoE need tuning |
-| LocalTP | CUDA2 | A/A | R/R | resident request batch green; perf pending |
-| LocalTP | ROCm2 | A/A | R/R | resident request batch green; perf pending |
+| LocalTP | CUDA2 | A/A | A/A | Dynamic/LLEP full matrix green; perf pending |
+| LocalTP | ROCm2 | A/A | A/A | Dynamic/LLEP full matrix green; perf pending |
 | LocalTP | ROCm4 | A/R | R/R | full refresh pending |
 | NodeLocalTP | CPU2 | A/A | R/R | dense E2E green; MoE/perf pending |
 | ExpertParallel | GPU+CPU | A/R | G/R | Dynamic/LLEP greedy+prefix green |
@@ -67,20 +67,16 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   launches per cell.
 - CUDA/ROCm GDN and short-conv capture-lifetime matrices cover M=2/3/4 with
   byte-equal continuation and complete live state.
-- Fresh Release CUDA2/ROCm2 LLEP+MTP+RAM-prefix full-context cells pass
-  `22/22` each with strict full-graph PerfStats, 2048 generated tokens, clean
-  shutdown, and complete VRAM release. Dynamic/LLEP long-context and prefix
-  matrices are green.
-- The original CUDA2 LocalTP long-context stochastic prefix+MTP stale-bank
-  reproduction now passes at 590 seconds; matching CUDA2/ROCm2 focused graph
-  lifecycle cells are green.
+- Release CUDA2 and ROCm2 each pass all eight Dynamic/LLEP cells and `166/166`
+  checks: plain, RAM-prefix, greedy MTP d2, and stochastic dynamic MTP d1..15.
+  Strict PerfStats prove full capture, device verification, movement, clean
+  shutdown, and VRAM release through 2048 generated tokens.
 - CUDA/ROCm SingleDevice forced-token publication is device-owned and
-  graph-captured: both Release E2E lanes pass `31/31`, report full capture, and
-  account for all 96 forced-token transactions without a host control scalar.
-- Transfer-state stress covers all 336 slot rotations and 32 cross-stream
-  reset epochs on CUDA/ROCm. Source policies forbid eventless publication,
-  blocking GPU sync, hidden hot-path allocation, and direct coherence
-  transitions.
+  graph-captured: both Release lanes pass `31/31` and account for all 96
+  transactions without a host control scalar.
+- Transfer stress covers 336 slot rotations and 32 cross-stream reset epochs.
+  Source policy forbids eventless publication, GPU sync, hot-path allocation,
+  and direct coherence transitions.
 
 ## Kernel Economy
 
@@ -110,9 +106,10 @@ Matched llama.cpp master comparison, tok/s:
 
 ## Next Gates
 
-1. Run the full-context greedy and stochastic CPU/CUDA/ROCm matrix with strict
-   MTP, prefix, Dynamic/LLEP, collective, and full-graph counters.
-2. Close remote-participant lifetime and mirrored-head request batching for
+1. Profile and tune the full CUDA LLEP lane until its economy matches the
+   correctness proof; inventory every kernel, collective, and launch gap.
+2. Run the remaining full-context CPU matrix, then close remote-participant
+   lifetime and mirrored-head request batching for
    every LocalTP and ExpertParallel mode.
 3. Tune d1 attention/GEMV and MoE grouped FFN until SingleDevice is at least
    llama.cpp economy, preserving byte equality and the device-owned graph.
