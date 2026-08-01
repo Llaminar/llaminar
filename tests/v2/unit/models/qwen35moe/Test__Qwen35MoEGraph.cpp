@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <fstream>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1064,6 +1065,7 @@ TEST(Test__Qwen35MoEGraph, DecodeMirroredEmbeddingSuppressesOnlyDecodeEmbeddingA
     decode_input.position_ids = &decode_position;
     decode_input.seq_len = 1;
     decode_input.batch_size = 1;
+    decode_input.execution_phase = ForwardExecutionPhase::Decode;
     ForwardOutput decode_output;
     ComputeGraph decode_graph = graph_builder.buildFullForwardGraph(decode_input, decode_output);
 
@@ -1080,6 +1082,7 @@ TEST(Test__Qwen35MoEGraph, DecodeMirroredEmbeddingSuppressesOnlyDecodeEmbeddingA
     prefill_input.position_ids = prefill_positions;
     prefill_input.seq_len = 2;
     prefill_input.batch_size = 1;
+    prefill_input.execution_phase = ForwardExecutionPhase::Prefill;
     ForwardOutput prefill_output;
     ComputeGraph prefill_graph = graph_builder.buildFullForwardGraph(prefill_input, prefill_output);
 
@@ -1912,11 +1915,13 @@ TEST(Test__Qwen35MoEGraph, FullForwardGraphActivatesDenseDecodeReplicatedScope)
     GraphConfig config = makeMoEConfig(tp_ctx.get());
     config.n_layers = 1;
     config.total_n_layers = 1;
-    config.max_seq_len = 2;
+    config.max_seq_len = 16;
     config.dense_tp_enabled = true;
     config.dense_tp_decode_replicated = true;
     config.ffn_column_parallel = true;
     config.vocab_local = config.vocab_size;
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 15;
 
     TensorArena arena;
     ModelWeights weights = makeFullForwardModelWeights(arena, config);
@@ -1933,16 +1938,18 @@ TEST(Test__Qwen35MoEGraph, FullForwardGraphActivatesDenseDecodeReplicatedScope)
     TestableQwen35MoEGraph graph_builder(config, nullptr);
     graph_builder.setDecodeReplicatedDenseWeightBindings(decode_bindings);
     graph_builder.setWeights(weights);
-    graph_builder.setBuffers(makeFullForwardModelBuffers(arena, /*tokens=*/2, config));
+    graph_builder.setBuffers(makeFullForwardModelBuffers(arena, /*tokens=*/16, config));
 
-    std::vector<int> token_ids = {0, 1};
-    std::vector<int> position_ids = {0, 1};
+    std::vector<int> token_ids(16, 0);
+    std::vector<int> position_ids(16, 0);
+    std::iota(position_ids.begin(), position_ids.end(), 0);
     ForwardInput decode_input;
     decode_input.token_ids = token_ids.data();
     decode_input.position_ids = position_ids.data();
     decode_input.batch_size = 1;
     decode_input.seq_len = 1;
     decode_input.device = DeviceId::cpu();
+    decode_input.execution_phase = ForwardExecutionPhase::Decode;
     ForwardOutput decode_output;
 
     ComputeGraph decode_graph = graph_builder.buildFullForwardGraph(decode_input, decode_output);
@@ -1951,7 +1958,15 @@ TEST(Test__Qwen35MoEGraph, FullForwardGraphActivatesDenseDecodeReplicatedScope)
         << "Direct full-forward decode graphs must enter the replicated-dense scope before inserting dense TP collectives";
 
     ForwardInput prefill_input = decode_input;
-    prefill_input.seq_len = 2;
+    /*
+     * Fourteen rows deliberately sit inside the configured MTP target-row
+     * capacity of sixteen. The graph must still obey the caller's typed
+     * prefill phase; treating M <= 16 as a verifier previously selected the
+     * replicated GDN projection and published a wider workspace ABI than the
+     * eager prefill-family manifest.
+     */
+    prefill_input.seq_len = 14;
+    prefill_input.execution_phase = ForwardExecutionPhase::Prefill;
     ForwardOutput prefill_output;
 
     ComputeGraph prefill_graph = graph_builder.buildFullForwardGraph(prefill_input, prefill_output);

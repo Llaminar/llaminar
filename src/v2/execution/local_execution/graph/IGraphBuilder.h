@@ -80,6 +80,21 @@ namespace llaminar2
     };
 
     /**
+     * @brief Mathematical phase selected for one concrete forward graph.
+     *
+     * Row count is not a phase discriminator. A short user prompt can have the
+     * same M as a grouped MTP verifier, while request-batched decode can have
+     * M greater than one. Carrying the phase beside @ref ForwardExecutionRole
+     * makes weight layout, collective, recurrent-state, and workspace policy
+     * declarative instead of inferring them from shape.
+     */
+    enum class ForwardExecutionPhase : uint8_t
+    {
+        Prefill, ///< Prompt ingestion using the configured prefill topology.
+        Decode,  ///< Serial or grouped decode-equivalent execution.
+    };
+
+    /**
      * @brief Generic forward pass input
      *
      * Contains all fields needed for forward pass execution including
@@ -133,6 +148,8 @@ namespace llaminar2
         ForwardPositionPolicy position_policy = ForwardPositionPolicy::ExplicitRows;
         ForwardExecutionRole execution_role =
             ForwardExecutionRole::MainInference; ///< Semantic owner of this invocation.
+        ForwardExecutionPhase execution_phase =
+            ForwardExecutionPhase::Prefill; ///< Typed math/topology phase; never inferred from M.
         int batch_size = 1;                ///< Number of sequences
         int seq_len = 0;                   ///< Sequence length per batch
         /**

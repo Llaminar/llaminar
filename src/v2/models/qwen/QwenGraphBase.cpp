@@ -619,6 +619,7 @@ namespace llaminar2
         const bool decode_like =
             config_.dense_tp_enabled &&
             config_.dense_tp_decode_replicated &&
+            forwardPhaseAllowsDecodeTopology() &&
             total_tokens > 0 &&
             total_tokens <= max_decode_like_rows;
         if (!decode_like)
@@ -639,6 +640,7 @@ namespace llaminar2
             : 1;
         return config_.dense_tp_enabled &&
                config_.dense_tp_decode_mirrored_embedding &&
+               forwardPhaseAllowsDecodeTopology() &&
                total_tokens > 0 &&
                total_tokens <= max_decode_like_rows &&
                hasDecodeMirroredEmbeddingWeightSource();
@@ -652,6 +654,7 @@ namespace llaminar2
         const bool decode_like =
             config_.dense_tp_enabled &&
             config_.dense_tp_decode_replicated &&
+            forwardPhaseAllowsDecodeTopology() &&
             total_tokens > 0 &&
             total_tokens <= max_decode_like_rows;
         if (!decode_like)
@@ -663,6 +666,13 @@ namespace llaminar2
                 describeDecodeReplicatedDenseBindingState());
         }
         return true;
+    }
+
+    bool QwenGraphBase::forwardPhaseAllowsDecodeTopology() const noexcept
+    {
+        return !forward_execution_phase_.has_value() ||
+               *forward_execution_phase_ ==
+                   ForwardExecutionPhase::Decode;
     }
 
     bool QwenGraphBase::denseTPAllreduceEnabledForCurrentGraph() const
@@ -771,6 +781,20 @@ namespace llaminar2
         owner_.replicated_attention_state_graph_active_ = previous_attention_;
         owner_.decode_mirrored_embedding_graph_active_ = previous_embedding_;
         owner_.mtp_mirrored_lm_head_graph_active_ = previous_mtp_head_;
+    }
+
+    QwenGraphBase::ForwardExecutionPhaseScope::ForwardExecutionPhaseScope(
+        QwenGraphBase &owner,
+        ForwardExecutionPhase phase)
+        : owner_(owner),
+          previous_(owner.forward_execution_phase_)
+    {
+        owner_.forward_execution_phase_ = phase;
+    }
+
+    QwenGraphBase::ForwardExecutionPhaseScope::~ForwardExecutionPhaseScope()
+    {
+        owner_.forward_execution_phase_ = previous_;
     }
 
     QwenGraphBase::MirroredMTPHeadScope::MirroredMTPHeadScope(
@@ -1366,6 +1390,9 @@ namespace llaminar2
         ForwardOutput &output)
     {
         const int total_tokens = input.batch_size * input.seq_len;
+        ForwardExecutionPhaseScope execution_phase_scope(
+            *this,
+            input.execution_phase);
         DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
 
         /*
@@ -1561,6 +1588,9 @@ namespace llaminar2
         ForwardOutput &output)
     {
         const int total_tokens = input.batch_size * input.seq_len;
+        ForwardExecutionPhaseScope execution_phase_scope(
+            *this,
+            input.execution_phase);
         DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
 
         LOG_DEBUG("[QwenGraphBase] Building full forward graph: "

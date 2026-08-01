@@ -1,7 +1,6 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Scope: Qwen3.6 dense/MoE MTP on CPU, CUDA, and ROCm across SingleDevice,
-LocalTP, NodeLocalTP, LocalPP, and ExpertParallel. Keep this dashboard under
+Scope: Qwen3.6 dense/MoE MTP on CPU, CUDA, and ROCm. Keep this dashboard under
 6 KB; put implementation detail in project handoffs.
 
 RAG: **G** correct and economical, **A** correct but untuned/stale, **R**
@@ -19,17 +18,11 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   serial/grouped and short/long sequence-parallel regimes inside one immutable
   captured launch envelope; attention no longer requests host recapture
   variants.
-- GPU KV append, TurboQuant conversion, verifier publication, sampling, and
-  compact NCCL/RCCL broadcast use planned persistent workspace and explicit
-  producer/consumer event ordering. Hot paths contain no allocation, host
-  transfer, blocking synchronization, or segmented execution.
-- CPU TurboQuant supports production `TQ8-K/TQ4-V` and `TQ8-K/TQ8-V`, D=64,
-  128, and 256, with direct small-work execution and physical-core-parallel
-  grouped execution.
-- Best-effort M1/grouped NativeVNNI policies are installed on all backends.
-  Ordinary prefill remains on the legacy production heuristic.
-- RAM/disk prefix tiers support model-SHA archives, FIFO demotion/overwrite,
-  cold-hit VRAM promotion, restart, and pressure paths.
+- GPU KV append, TurboQuant conversion, verifier publication, and compact
+  NCCL/RCCL broadcast use planned persistent workspace and explicit
+  producer/consumer event ordering. Hot paths contain no allocation, blocking
+  synchronization, or segmented execution. Stochastic sampling still has one
+  known full-distribution D2H seam; removing it is the active residency gate.
 - CUDA/ROCm MoE prefix restore preserves reusable captures and restores the
   stable-address model-lifetime runtime template through explicit graph-build
   producer streams/events. GPU FFN/MTP graph APIs reject null publication
@@ -58,19 +51,20 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - CPU fused TurboQuant quantization and grouped materialization are byte exact
   against serial rows for both TQ modes, D=64/128/256, `M=1..16`, plain and
   RoPE-on-read.
-- Direct CUDA/ROCm TurboQuant cache integration now binds the same persistent
-  workspace ownership contract as production. The symmetric `8/8` matrix is
-  green for TQ4/TQ8, captured request batches, unequal continuation, and
-  incremental dequantization; the corresponding CPU cache/TQ gate is `10/10`.
-- CUDA/ROCm deterministic MoE route planning covers `M=1..4`,
-  `top_k={1,2,4,8,16}`, all 256 expert metadata entries, and 20 repeated exact
-  launches per cell.
+- CUDA/ROCm TurboQuant cache integration is `8/8` green for TQ4/TQ8; the
+  corresponding CPU cache/TQ gate is `10/10`.
+- CUDA/ROCm deterministic MoE route planning covers `M=1..4`, top-k 1..16,
+  all 256 experts, and 20 repeated exact launches per cell.
 - CUDA/ROCm GDN and short-conv capture-lifetime matrices cover M=2/3/4 with
   byte-equal continuation and complete live state.
 - Release CUDA2 and ROCm2 each pass all eight Dynamic/LLEP cells and `166/166`
   checks: plain, RAM-prefix, greedy MTP d2, and stochastic dynamic MTP d1..15.
   Strict PerfStats prove full capture, device verification, movement, clean
   shutdown, and VRAM release through 2048 generated tokens.
+- Forward topology now consumes a typed `Prefill`/`Decode` phase instead of
+  inferring phase from `M`. The focused MTP regression proves a 14-token prompt
+  remains sharded prefill even when dynamic MTP permits 16 verifier rows; the
+  exact CUDA2 LLEP production repro and all `585/585` unit tests are green.
 - CUDA/ROCm SingleDevice forced-token publication is device-owned and
   graph-captured: both Release lanes pass `31/31` and account for all 96
   transactions without a host control scalar.
@@ -94,6 +88,10 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Deterministic MoE route planner: CUDA `3.392 us` versus `22.212 us`
   (`6.55x`), 31 registers and zero spills; ROCm `11.2 us`, 16 VGPR, 33 SGPR,
   1.25 KiB LDS, zero scratch/spills.
+- CUDA2 LLEP stochastic baseline on Qwen3.6-35B: prefill `64.85 tok/s`, decode
+  `24.34 tok/s`; the main verifier graph costs `100.3 ms` per replay and the
+  initial sidecar prelaunch costs `14.1 ms`. Default LLEP selected no movement,
+  so these numbers currently expose overhead without LLEP benefit.
 
 Matched llama.cpp master comparison, tok/s:
 
@@ -106,8 +104,9 @@ Matched llama.cpp master comparison, tok/s:
 
 ## Next Gates
 
-1. Profile and tune the full CUDA LLEP lane until its economy matches the
-   correctness proof; inventory every kernel, collective, and launch gap.
+1. Remove stochastic sampling's full-distribution D2H, then profile and tune
+   the full CUDA LLEP lane until its economy matches the correctness proof;
+   inventory every kernel, collective, and launch gap.
 2. Run the remaining full-context CPU matrix, then close remote-participant
    lifetime and mirrored-head request batching for
    every LocalTP and ExpertParallel mode.

@@ -11886,6 +11886,10 @@ namespace llaminar2
         input.position_offset = state_.positions[0];
         input.token_offset = state_.positions[0];
         input.execution_role = execution_role;
+        input.execution_phase =
+            new_phase == InferencePhase::DECODE
+                ? ForwardExecutionPhase::Decode
+                : ForwardExecutionPhase::Prefill;
         /*
          * The graph builder is the single owner of this transaction.  A full
          * prefix hit may restore portable MoE placement and return terminal
@@ -40898,6 +40902,10 @@ namespace llaminar2
         input.position_ids = position_ids.data();
         input.batch_size = batch_size;
         input.seq_len = seq_len;
+        input.execution_phase =
+            seq_len == 1
+                ? ForwardExecutionPhase::Decode
+                : ForwardExecutionPhase::Prefill;
         input.position_offset = 0;
         input.device = state_.device_id;
         input.kv_cache = state_.kv_cache.get();
@@ -41006,6 +41014,8 @@ namespace llaminar2
                 maximum_prefill_positions.data();
             maximum_prefill_input.seq_len =
                 maximum_prefill_seq_len;
+            maximum_prefill_input.execution_phase =
+                ForwardExecutionPhase::Prefill;
             maximum_prefill_input.real_seq_len = 0;
             maximum_prefill_input.bucket_seq_len = 0;
             if (!append_forward_participant(
@@ -41052,6 +41062,8 @@ namespace llaminar2
             bucket_input.position_ids =
                 bucket_positions.data();
             bucket_input.seq_len = bucket_seq_len;
+            bucket_input.execution_phase =
+                ForwardExecutionPhase::Prefill;
             bucket_input.real_seq_len = bucket_seq_len;
             bucket_input.bucket_seq_len = bucket_seq_len;
             if (!append_forward_participant(
@@ -41135,6 +41147,8 @@ namespace llaminar2
                 mtp_verifier_position_ids_dev_;
             grouped_input.execution_role =
                 ForwardExecutionRole::GroupedMTPVerifier;
+            grouped_input.execution_phase =
+                ForwardExecutionPhase::Decode;
             grouped_input.seq_len = grouped_rows;
             grouped_input.position_offset = 1;
             grouped_input.real_seq_len = 0;
@@ -41236,6 +41250,8 @@ namespace llaminar2
                 logical_state.target_cached_tokens_device;
             condition_input.execution_role =
                 ForwardExecutionRole::MTPCondition;
+            condition_input.execution_phase =
+                ForwardExecutionPhase::Decode;
             condition_input.batch_size =
                 condition_requests;
             condition_input.seq_len = 1;

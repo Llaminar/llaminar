@@ -366,6 +366,7 @@ namespace llaminar2
         bool mtp_mirrored_lm_head_graph_active_ = false;
         bool mtp_kv_cache_only_graph_active_ = false;
         bool prefix_runtime_rehydration_graph_active_ = false;
+        std::optional<ForwardExecutionPhase> forward_execution_phase_;
 
         // =====================================================================
         // Helpers
@@ -422,6 +423,16 @@ namespace llaminar2
         bool usesVocabParallelEmbeddingForCurrentGraph() const;
         int embeddingVocabOffsetForCurrentGraph(DeviceId device) const;
         bool useReplicatedAttentionStateWeights() const;
+
+        /**
+         * @brief Whether the active typed forward may use decode-only layout.
+         *
+         * MTP sidecar builders do not consume ForwardInput and therefore leave
+         * the phase unset; their dedicated sidecar scope retains the existing
+         * compact-row policy. Every ordinary/main-model forward installs an
+         * explicit phase and may select replicated topology only for Decode.
+         */
+        bool forwardPhaseAllowsDecodeTopology() const noexcept;
 
         /**
          * @brief Declarative source for the norm that feeds a final projection.
@@ -562,6 +573,33 @@ namespace llaminar2
             bool previous_attention_;
             bool previous_embedding_;
             bool previous_mtp_head_;
+        };
+
+        /**
+         * @brief Publish the caller's typed forward phase to nested builders.
+         *
+         * Qwen graph construction delegates through full-graph, layer,
+         * attention, and FFN builders. Those builders historically inferred
+         * decode-equivalent policy from M independently, allowing a short
+         * prompt to select replicated decode weights. This scope gives every
+         * nested policy query one immutable phase for the complete build.
+         */
+        class ForwardExecutionPhaseScope
+        {
+        public:
+            ForwardExecutionPhaseScope(
+                QwenGraphBase &owner,
+                ForwardExecutionPhase phase);
+            ~ForwardExecutionPhaseScope();
+
+            ForwardExecutionPhaseScope(
+                const ForwardExecutionPhaseScope &) = delete;
+            ForwardExecutionPhaseScope &operator=(
+                const ForwardExecutionPhaseScope &) = delete;
+
+        private:
+            QwenGraphBase &owner_;
+            std::optional<ForwardExecutionPhase> previous_;
         };
 
         /**
