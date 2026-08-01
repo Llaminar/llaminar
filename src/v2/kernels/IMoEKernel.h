@@ -1152,9 +1152,12 @@ namespace llaminar2
          * This graph-capturable bridge converts those records into
          * ExpertPayloadArrival commands so the existing compact payload
          * movement path can stage/import them. Commands produced here are
-         * logical: `destination_slot` remains invalid until
+         * logical, including prefix-runtime rehydration:
+         * `destination_slot` remains invalid until
          * projectPrefillLeastLoadedDomainCommands() leases physical storage on
          * the destination participant from its complete transfer directory.
+         * Rolling directory indices are graph-lifetime allocator state and
+         * must never be serialized into a RAM/disk prefix checkpoint.
          * It must not rewrite router top-k choices or perform host readback.
          */
         virtual bool materializePrefillLeastLoadedTransferCommands(

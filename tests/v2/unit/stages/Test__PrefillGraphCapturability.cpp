@@ -253,7 +253,8 @@ namespace
             int,
             int,
             MoEDecodeDescriptorSource descriptor_source =
-                MoEDecodeDescriptorSource::RuntimePlacementTable) override
+                MoEDecodeDescriptorSource::RuntimePlacementTable,
+            ITensor * = nullptr) override
         {
             ++fused_runtime_decode_calls;
             last_fused_descriptor_source = descriptor_source;

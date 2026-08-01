@@ -78,22 +78,19 @@ namespace llaminar2::least_loaded_ep
         uint16_t reserved = 0;
     };
 
-    struct LeastLoadedExpertWeightTransfer
+    /**
+     * @brief Logical request to make one expert resident on a participant.
+     *
+     * The record deliberately contains no physical destination-slot identity.
+     * GPU projection leases that graph-lifetime resource from the destination
+     * device's live directory. Sixteen-byte alignment preserves the single
+     * vector load/store used while staging assignment results in shared memory.
+     */
+    struct alignas(16) LeastLoadedExpertWeightTransfer
     {
         uint32_t expert = 0;
         uint32_t source_participant = 0;
         uint32_t destination_participant = 0;
-        /**
-         * Exact destination slot plus one, or zero for ordinary free leasing.
-         *
-         * Current-batch LLEP leaves this zero because physical storage is a
-         * destination-local economy decision. Prefix-runtime rehydration sets
-         * it from the portable checkpoint so the restored transfer directory
-         * is continuation-identical to the checkpointed directory. Plus-one
-         * encoding keeps zero available as the ordinary no-requirement value
-         * while still representing physical slot zero.
-         */
-        uint32_t destination_slot_requirement_plus_one = 0;
     };
 
     struct LeastLoadedExpertAssignmentStatus
@@ -691,8 +688,7 @@ namespace llaminar2::least_loaded_ep
             LeastLoadedExpertWeightTransfer{
                 expert,
                 source_participant,
-                destination_participant,
-                0u};
+                destination_participant};
         return true;
     }
 

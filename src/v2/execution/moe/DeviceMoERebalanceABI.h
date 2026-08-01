@@ -42,17 +42,6 @@ namespace llaminar2::moe_rebalance_abi
     inline constexpr uint32_t kStatusBytes = 648u;
 
     /**
-     * @brief Require destination projection to preserve a published slot index.
-     *
-     * Ordinary LLEP commands describe logical movement and let the destination
-     * lease any economical physical slot. Prefix-runtime rehydration is
-     * stricter: the portable checkpoint records the exact slot topology that
-     * subsequent maintenance waves observed. A command carrying this flag
-     * must therefore lease `destination_slot` exactly or fail the transaction.
-     */
-    inline constexpr uint32_t kPlanFlagExactDestinationSlot = 1u << 0;
-
-    /**
      * @brief Identify payload movement planned from the current routed batch.
      *
      * Prefix-runtime rehydration and steady-state decode maintenance share the

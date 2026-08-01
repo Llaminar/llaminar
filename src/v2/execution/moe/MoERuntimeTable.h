@@ -311,6 +311,14 @@ namespace llaminar2
     {
         int32_t logical_expert_id = -1;
         int32_t owner_participant = -1;
+        /**
+         * Model-lifetime local slot, or -1 for a rolling transfer replica.
+         *
+         * Transfer-directory subscripts are graph-lifetime allocator state,
+         * not portable prefix identity. A cached replica is reconstructed from
+         * logical residency by a destination-local device lease and therefore
+         * never serializes its prior rolling slot here.
+         */
         int32_t local_slot = -1;
         uint32_t flags = 0;
         uint8_t local_compute = 0;
@@ -326,14 +334,15 @@ namespace llaminar2
         uint32_t participant_id = 0;
         uint32_t participant_count = 1;
         /**
-         * @brief Whether exact restore requires rebuilding request-owned payloads.
+         * @brief Whether logical restore requires rebuilding request-owned payloads.
          *
          * The portable record below contains logical placement only. When this
          * flag is set, one or more resident-participant bits name rolling
-         * transfer-slot replicas whose pointer-bearing descriptors deliberately
-         * are not serialized. Restore first publishes immutable model placement
-         * plus a device transfer plan; a dedicated captured graph then recreates
-         * those payloads before any restored-prefix route is assigned.
+         * transfer-slot replicas whose pointer-bearing descriptors and rolling
+         * slot indices deliberately are not serialized. Restore first publishes
+         * immutable model placement plus a device transfer plan; a dedicated
+         * captured graph then recreates those payloads before any restored-prefix
+         * route is assigned.
          */
         uint32_t requires_device_payload_rehydration = 0;
         std::vector<DeviceMoEPortableExpertRuntimeState> experts;
@@ -555,14 +564,14 @@ namespace llaminar2
         /**
          * @brief Resolver used when a portable restore must rebind local expert payloads.
          *
-         * Portable prefix-cache state stores logical placement, local-compute
-         * intent, and stable local slot ids, but deliberately does not embed
-         * pointer-bearing DeviceMoELayerRuntime banks. A runtime that owns a
-         * model-lifetime payload directory may provide this resolver to turn a
-         * saved `(layer, expert, local_slot)` claim back into a live
-         * DeviceMoEExpertDescriptor.
+         * Portable prefix-cache state stores logical placement and local-compute
+         * intent, but deliberately does not embed pointer-bearing
+         * DeviceMoELayerRuntime banks. A runtime that owns model-lifetime local
+         * payloads may provide this resolver to turn a saved static
+         * `(layer, expert, local_slot)` claim back into a live descriptor.
          *
-         * Rolling transfer-slot payloads are never resolver candidates.
+         * Rolling transfer-slot indices are serialized as `-1` and are never
+         * resolver candidates.
          * Portable capture preserves their pointer-free logical residency and
          * restore publishes a device-side rehydration plan from immutable owner
          * weights. Owned or statically mirrored local experts may still bind

@@ -80,8 +80,6 @@ namespace
     constexpr uint32_t kDeviceMoERebalancePlanExpertPayloadArrival = 1u;
     constexpr uint32_t kDeviceMoERebalancePlanResidentExpertAssignment = 2u;
     constexpr uint32_t kDeviceMoERebalancePlanOwnershipTransfer = 3u;
-    constexpr uint32_t kDeviceMoERebalancePlanFlagExactDestinationSlot =
-        llaminar2::moe_rebalance_abi::kPlanFlagExactDestinationSlot;
     constexpr uint32_t kDeviceMoERebalancePlanFlagCurrentBatchLLEP =
         llaminar2::moe_rebalance_abi::kPlanFlagCurrentBatchLLEP;
     constexpr uint32_t kDeviceMoERebalanceAssignmentLeastLoadedResident = 1u;
@@ -6614,56 +6612,6 @@ namespace
     }
 
     /**
-     * @brief Authenticate and lease an exact prefix-checkpoint destination slot.
-     *
-     * Request reset restores the immutable transfer-directory baseline before
-     * prefix rehydration runs. The portable checkpoint then names the exact
-     * physical slot that held each replica. Unlike ordinary current-batch LLEP,
-     * rehydration must not search for another free slot: doing so restores the
-     * same immediate logical placement but changes the starting topology seen
-     * by the next maintenance wave.
-     */
-    __device__ __forceinline__ bool
-    rebalance_lease_exact_prefill_transfer_slot(
-        DeviceMoERebalancePlanEntryView &plan,
-        const DeviceMoELayerRuntimeView *runtime_layers,
-        const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
-        uint32_t local_transfer_slot_count,
-        const DeviceMoERebalanceConfigView &config,
-        const DeviceMoERebalancePlanEntryView *selected_plans,
-        uint32_t selected_plan_count)
-    {
-        const uint32_t slot = plan.destination_slot;
-        if (!runtime_layers ||
-            !local_transfer_slots ||
-            slot >= local_transfer_slot_count ||
-            rebalance_transfer_slot_selected(
-                selected_plans,
-                selected_plan_count,
-                slot,
-                config.participant_id))
-        {
-            return false;
-        }
-
-        const auto &prior = local_transfer_slots[slot];
-        if (!rebalance_transfer_slot_identity_ok(prior, slot, config) ||
-            !rebalance_transfer_slot_generation_retired(
-                prior,
-                slot,
-                runtime_layers,
-                config))
-        {
-            return false;
-        }
-
-        plan.destination_previous_layer = prior.layer;
-        plan.destination_previous_expert = prior.expert;
-        plan.destination_generation = prior.generation;
-        return true;
-    }
-
-    /**
      * @brief Lease physical storage for one projected prefill LLEP arrival.
      *
      * Current-batch materialization owns only logical movement and compact
@@ -7412,20 +7360,15 @@ namespace
                     }
 
                     DeviceMoERebalancePlanEntryView projected = plan;
-                    const bool exact_destination_slot =
-                        (plan.flags &
-                         kDeviceMoERebalancePlanFlagExactDestinationSlot) != 0u;
                     /*
-                     * The gathered command is logical: its destination slot is
-                     * not a physical allocation. Only the destination
-                     * participant can lease stable VRAM because only that
-                     * participant sees the complete local directory and all
-                     * active runtime-bank claims.
+                     * Every gathered command is logical, including portable
+                     * prefix-runtime rehydration. Rolling transfer-directory
+                     * indices are graph-lifetime allocator state and never
+                     * cross the RAM/disk prefix boundary. Only the destination
+                     * participant can lease stable VRAM because only it sees
+                     * the complete local directory and active runtime claims.
                      */
-                    if (!exact_destination_slot ||
-                        projected.destination_participant !=
-                            config.participant_id)
-                        projected.destination_slot = kDeviceMoEInvalidSlot;
+                    projected.destination_slot = kDeviceMoEInvalidSlot;
                     projected.destination_previous_layer =
                         kDeviceMoEInvalidSlot;
                     projected.destination_previous_expert =
@@ -7433,29 +7376,15 @@ namespace
                     projected.destination_generation = 0u;
                     if (projected.destination_participant ==
                             config.participant_id &&
-                        !(exact_destination_slot
-                              ? rebalance_lease_exact_prefill_transfer_slot(
-                                    projected,
-                                    runtime_layers,
-                                    local_transfer_slots,
-                                    local_transfer_slot_count,
-                                    config,
-                                    projected_wave_entries,
-                                    output_count)
-                              : rebalance_lease_prefill_transfer_slot(
-                                    projected,
-                                    runtime_layers,
-                                    local_transfer_slots,
-                                    local_transfer_slot_count,
-                                    config,
-                                    projected_wave_entries,
-                                    output_count)))
+                        !rebalance_lease_prefill_transfer_slot(
+                            projected,
+                            runtime_layers,
+                            local_transfer_slots,
+                            local_transfer_slot_count,
+                            config,
+                            projected_wave_entries,
+                            output_count))
                     {
-                        if (exact_destination_slot)
-                        {
-                            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
-                                "CUDA prefix rehydration could not lease its exact checkpointed transfer slot");
-                        }
                         projected_status.plan_overflow = 1u;
                         projected_status.payload_bucket_overflow = 1u;
                         ++projected_status.capacity_limited_candidates;
@@ -7548,8 +7477,6 @@ namespace
         __shared__ uint32_t shared_transfer_experts[kThreads];
         __shared__ uint32_t shared_transfer_sources[kThreads];
         __shared__ uint32_t shared_transfer_destinations[kThreads];
-        __shared__ uint32_t
-            shared_transfer_destination_slot_requirements[kThreads];
         __shared__ uint32_t shared_transfer_valid[kThreads];
         __shared__ uint32_t shared_transfer_output_indices[kThreads];
         __shared__ uint32_t shared_transfer_payload_slots[kThreads];
@@ -7647,8 +7574,6 @@ namespace
                 shared_transfer_experts[lane] = transfer.expert;
                 shared_transfer_sources[lane] = transfer.source_participant;
                 shared_transfer_destinations[lane] = transfer.destination_participant;
-                shared_transfer_destination_slot_requirements[lane] =
-                    transfer.destination_slot_requirement_plus_one;
             }
             __syncthreads();
 
@@ -7751,19 +7676,7 @@ namespace
                 entry.destination_participant = transfer_destination;
                 entry.source_resident_mask =
                     active_bank.resident_participant_mask[transfer_expert];
-                const uint32_t destination_slot_requirement =
-                    shared_transfer_destination_slot_requirements[transfer_idx];
-                if (destination_slot_requirement != 0u)
-                {
-                    entry.flags |=
-                        kDeviceMoERebalancePlanFlagExactDestinationSlot;
-                    entry.destination_slot =
-                        destination_slot_requirement - 1u;
-                }
-                else
-                {
-                    entry.destination_slot = kDeviceMoEInvalidSlot;
-                }
+                entry.destination_slot = kDeviceMoEInvalidSlot;
                 entry.payload_slot =
                     shared_transfer_payload_slots[transfer_idx];
                 plan_entries[

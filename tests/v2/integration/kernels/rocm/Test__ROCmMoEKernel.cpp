@@ -3185,7 +3185,6 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedMaterializerLeavesPhysicalSlo
         .expert = 3,
         .source_participant = 1,
         .destination_participant = 0,
-        .destination_slot_requirement_plus_one = 0,
     };
     ASSERT_NE(runtime.reserved_ptrs[1], nullptr);
     ASSERT_NE(runtime.reserved_ptrs[2], nullptr);
@@ -3271,36 +3270,6 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedMaterializerLeavesPhysicalSlo
     EXPECT_EQ(plan.destination_participant, 0u);
     EXPECT_EQ(plan.destination_slot, kDeviceMoEInvalidSlot)
         << "physical storage must be leased by destination projection, not logical materialization";
-
-    transfer.destination_slot_requirement_plus_one = 3u;
-    ASSERT_EQ(hipMemcpyAsync(runtime.reserved_ptrs[2],
-                             &transfer,
-                             sizeof(transfer),
-                             hipMemcpyHostToDevice,
-                             stream),
-              hipSuccess);
-    ASSERT_TRUE(gpu_kernel.materializePrefillLeastLoadedTransferCommands(
-        moeLaunchContext(stream),
-        runtime_table.deviceLayerState(0),
-        d_plan,
-        d_plan_count,
-        /*plan_capacity=*/1,
-        d_header,
-        d_status,
-        config,
-        payload_slot_capacity,
-        /*layer_idx=*/0));
-    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-    ASSERT_EQ(hipMemcpy(&plan,
-                        d_plan,
-                        sizeof(plan),
-                        hipMemcpyDeviceToHost),
-              hipSuccess);
-    EXPECT_NE(plan.flags &
-                  moe_rebalance_abi::kPlanFlagExactDestinationSlot,
-              0u);
-    EXPECT_EQ(plan.destination_slot, 2u)
-        << "prefix rehydration must carry its checkpointed physical slot into destination projection";
 
     EXPECT_EQ(hipFree(d_plan), hipSuccess);
     EXPECT_EQ(hipFree(d_plan_count), hipSuccess);
@@ -10344,62 +10313,6 @@ TEST(Test__ROCmMoEKernel, PrefillLLEPProjectionUsesFullPhysicalDirectoryBeyondCo
               kDeviceMoEInvalidSlot);
     EXPECT_EQ(local_plan[1].destination_previous_layer,
               kDeviceMoEInvalidSlot);
-    EXPECT_EQ(status.plan_overflow, 0u);
-    EXPECT_EQ(status.payload_bucket_overflow, 0u);
-    EXPECT_EQ(status.capacity_limited_candidates, 0u);
-    EXPECT_EQ(status.invalid_runtime_layers, 0u);
-
-    /*
-     * A portable prefix checkpoint requires its exact destination slots. Use
-     * the same free directory but reverse the requested order so this second
-     * projection distinguishes exact restore from ordinary first-free leasing.
-     */
-    gathered_plan[participant_id * plan_capacity + 0u].flags =
-        moe_rebalance_abi::kPlanFlagExactDestinationSlot;
-    gathered_plan[participant_id * plan_capacity + 0u].destination_slot = 3u;
-    gathered_plan[participant_id * plan_capacity + 1u].flags =
-        moe_rebalance_abi::kPlanFlagExactDestinationSlot;
-    gathered_plan[participant_id * plan_capacity + 1u].destination_slot = 2u;
-    initial_status = {};
-    ASSERT_EQ(hipMemcpyAsync(d_gathered_plan,
-                             gathered_plan.data(),
-                             sizeof(gathered_plan),
-                             hipMemcpyHostToDevice,
-                             stream),
-              hipSuccess);
-    ASSERT_EQ(hipMemcpyAsync(d_status,
-                             &initial_status,
-                             sizeof(initial_status),
-                             hipMemcpyHostToDevice,
-                             stream),
-              hipSuccess);
-    ASSERT_TRUE(gpu_kernel.projectPrefillLeastLoadedDomainCommands(
-        moeLaunchContext(stream),
-        d_gathered_plan,
-        d_gathered_headers,
-        plan_capacity,
-        d_local_plan,
-        d_local_plan_count,
-        d_local_header,
-        config,
-        d_status,
-        payload_slot_capacity,
-        runtime_table.deviceLayerState(0),
-        d_transfer_slots,
-        transfer_slot_count));
-    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-    ASSERT_EQ(hipMemcpy(local_plan.data(),
-                        d_local_plan,
-                        sizeof(local_plan),
-                        hipMemcpyDeviceToHost),
-              hipSuccess);
-    ASSERT_EQ(hipMemcpy(&status,
-                        d_status,
-                        sizeof(status),
-                        hipMemcpyDeviceToHost),
-              hipSuccess);
-    EXPECT_EQ(local_plan[0].destination_slot, 3u);
-    EXPECT_EQ(local_plan[1].destination_slot, 2u);
     EXPECT_EQ(status.plan_overflow, 0u);
     EXPECT_EQ(status.payload_bucket_overflow, 0u);
     EXPECT_EQ(status.capacity_limited_candidates, 0u);

@@ -3221,11 +3221,19 @@ min_completion_tokens = int(sys.argv[1])
 response_body = sys.argv[2]
 try:
     data = json.loads(response_body)
+    error = data.get("error")
     content = data.get("choices", [{}])[0].get("message", {}).get("content")
     usage = data.get("usage", {})
     prompt_tokens = int(usage.get("prompt_tokens", 0))
     completion_tokens = int(usage.get("completion_tokens", 0))
-    if not isinstance(content, str):
+    if error:
+        if isinstance(error, dict):
+            error_type = error.get("type", "server_error")
+            error_message = error.get("message", repr(error))
+            print(f"FAIL: {error_type}: {error_message}")
+        else:
+            print(f"FAIL: server error: {error}")
+    elif not isinstance(content, str):
         print("FAIL: missing assistant content")
     elif not content.strip():
         print("FAIL: empty assistant content")

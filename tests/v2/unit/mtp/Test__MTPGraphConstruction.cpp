@@ -262,6 +262,7 @@ namespace
         std::unique_ptr<FP32Tensor> moe_expert_indices;
         std::unique_ptr<FP32Tensor> moe_expert_weights;
         std::unique_ptr<FP32Tensor> moe_combined_output;
+        std::unique_ptr<FP32Tensor> moe_canonical_route_contributions;
         std::unique_ptr<FP32Tensor> moe_shared_expert_output;
         std::unique_ptr<FP32Tensor> moe_gate_scratch;
         std::unique_ptr<FP32Tensor> moe_up_scratch;
@@ -296,6 +297,11 @@ namespace
             config.default_device = DeviceId::cpu();
             config.max_seq_len = 16;
             config.layer_types = {"full_attention", "full_attention"};
+            config.gdn.conv_kernel_size = 4;
+            config.gdn.state_size = config.head_dim;
+            config.gdn.inner_size = config.d_model;
+            config.gdn.group_count = config.n_kv_heads;
+            config.gdn.time_step_rank = config.n_heads;
 
             const size_t d = static_cast<size_t>(config.d_model);
             const size_t q_dim = static_cast<size_t>(config.n_heads * config.head_dim);
@@ -361,6 +367,8 @@ namespace
             moe_expert_indices = TestTensorFactory::createFP32({row_capacity, moe_top_k});
             moe_expert_weights = TestTensorFactory::createFP32({row_capacity, moe_top_k});
             moe_combined_output = TestTensorFactory::createFP32({row_capacity, d});
+            moe_canonical_route_contributions =
+                TestTensorFactory::createFP32({row_capacity, moe_top_k * d});
             moe_shared_expert_output = TestTensorFactory::createFP32({row_capacity, d});
             moe_gate_scratch = TestTensorFactory::createFP32({row_capacity, moe_experts});
             moe_up_scratch = TestTensorFactory::createFP32({row_capacity, moe_experts});
@@ -449,6 +457,8 @@ namespace
             out.moe_expert_indices = moe_expert_indices.get();
             out.moe_expert_weights = moe_expert_weights.get();
             out.moe_combined_output = moe_combined_output.get();
+            out.moe_canonical_route_contributions =
+                moe_canonical_route_contributions.get();
             out.moe_shared_expert_output = moe_shared_expert_output.get();
             out.moe_gate_scratch = moe_gate_scratch.get();
             out.moe_up_scratch = moe_up_scratch.get();
@@ -475,6 +485,8 @@ namespace
             buffers.extensions[BufferId::MOE_EXPERT_INDICES] = moe_expert_indices.get();
             buffers.extensions[BufferId::MOE_EXPERT_WEIGHTS] = moe_expert_weights.get();
             buffers.extensions[BufferId::MOE_COMBINED_OUTPUT] = moe_combined_output.get();
+            buffers.extensions[BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS] =
+                moe_canonical_route_contributions.get();
             buffers.extensions[BufferId::MOE_SHARED_EXPERT_OUTPUT] = moe_shared_expert_output.get();
             buffers.extensions[BufferId::MOE_GATE_SCRATCH] = moe_gate_scratch.get();
             buffers.extensions[BufferId::MOE_UP_SCRATCH] = moe_up_scratch.get();
@@ -630,6 +642,11 @@ namespace
             config.kv_cache_precision = KVCachePrecision::FP32;
             config.use_graph_buffer_management = true;
             config.layer_types = {"full_attention"};
+            config.gdn.conv_kernel_size = 4;
+            config.gdn.state_size = config.head_dim;
+            config.gdn.inner_size = config.d_model;
+            config.gdn.group_count = config.n_kv_heads;
+            config.gdn.time_step_rank = config.n_heads;
             config.mtp.enabled = true;
             config.mtp.draft_tokens = 1;
 

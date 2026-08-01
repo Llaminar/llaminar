@@ -830,7 +830,17 @@ TEST(Test__Qwen35MoEGraph, ExpertParallelRoutedExpertOutputAllreducesUnderTP)
     EXPECT_TRUE(hasDependency(graph, "layer0_moe_combine", "layer0_moe_expert_allreduce"));
 }
 
-TEST(Test__Qwen35MoEGraph, LocalTPApportionedOverlayCombinesMoEBranchesBeforeAllreduce)
+/**
+ * @brief Keep LocalTP routed and shared reductions serial-decode equivalent.
+ *
+ * Combining participant-local routed and shared partials before one allreduce
+ * changes the FP32 addition tree from
+ * `reduce(routed) + gate * reduce(shared)` to
+ * `reduce(routed + gate * shared)`. The two expressions are algebraically
+ * equal but not bitwise equal. Grouped MTP therefore retains independent
+ * reductions and combines only their complete results.
+ */
+TEST(Test__Qwen35MoEGraph, LocalTPApportionedOverlayReducesBranchesBeforeCombining)
 {
     auto tp_ctx = std::make_unique<MockLocalTPContext>();
     tp_ctx->setDevices({GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)});
@@ -860,29 +870,33 @@ TEST(Test__Qwen35MoEGraph, LocalTPApportionedOverlayCombinesMoEBranchesBeforeAll
 
     ASSERT_NE(graph.getNode("layer0_moe_expert_ffn_overlay_fast"), nullptr);
     ASSERT_NE(graph.getNode("layer0_shared_expert_gate"), nullptr);
-    ASSERT_NE(graph.getNode("layer0_moe_combined_allreduce"), nullptr);
-
-    EXPECT_EQ(graph.getNode("layer0_moe_expert_overlay_fast_allreduce"), nullptr)
-        << "LocalTP apportioned experts can reduce the routed+shared combined partial once";
-    EXPECT_EQ(graph.getNode("layer0_shared_expert_allreduce"), nullptr)
-        << "Shared expert partial should be gated and combined locally before the TP allreduce";
-    EXPECT_EQ(graph.getNode("layer0_moe_combine"), nullptr)
-        << "The fused shared gate writes the local combined partial directly to ATTN_PROJ";
+    ASSERT_NE(graph.getNode("layer0_moe_expert_overlay_fast_allreduce"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_shared_expert_allreduce"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_moe_combine"), nullptr);
+    EXPECT_EQ(graph.getNode("layer0_moe_combined_allreduce"), nullptr)
+        << "A combined-partial collective would reassociate routed and shared FP32 sums";
 
     EXPECT_TRUE(hasDependency(
-        graph, "layer0_shared_expert_gate", "layer0_moe_expert_ffn_overlay_fast"));
+        graph,
+        "layer0_moe_expert_overlay_fast_allreduce",
+        "layer0_moe_expert_ffn_overlay_fast"));
     EXPECT_TRUE(hasDependency(
-        graph, "layer0_shared_expert_gate", "layer0_shared_expert_ffn"));
+        graph, "layer0_shared_expert_allreduce", "layer0_shared_expert_ffn"));
     EXPECT_TRUE(hasDependency(
-        graph, "layer0_moe_combined_allreduce", "layer0_shared_expert_gate"));
+        graph, "layer0_shared_expert_gate", "layer0_shared_expert_allreduce"));
+    EXPECT_TRUE(hasDependency(
+        graph, "layer0_moe_combine", "layer0_moe_expert_overlay_fast_allreduce"));
+    EXPECT_TRUE(hasDependency(
+        graph, "layer0_moe_combine", "layer0_shared_expert_gate"));
 
     const auto gate_contract = graph.getNode("layer0_shared_expert_gate")->stage->bufferContract();
-    EXPECT_TRUE(contractReads(gate_contract, BufferId::MOE_COMBINED_OUTPUT));
-    EXPECT_TRUE(contractWrites(gate_contract, BufferId::ATTN_PROJ));
+    EXPECT_TRUE(contractReads(gate_contract, BufferId::MOE_SHARED_EXPERT_OUTPUT));
+    EXPECT_TRUE(contractWrites(gate_contract, BufferId::MOE_SHARED_EXPERT_OUTPUT));
 
-    const auto allreduce_contract = graph.getNode("layer0_moe_combined_allreduce")->stage->bufferContract();
-    EXPECT_TRUE(contractReads(allreduce_contract, BufferId::ATTN_PROJ));
-    EXPECT_TRUE(contractWrites(allreduce_contract, BufferId::ATTN_PROJ));
+    const auto combine_contract = graph.getNode("layer0_moe_combine")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(combine_contract, BufferId::MOE_COMBINED_OUTPUT));
+    EXPECT_TRUE(contractReads(combine_contract, BufferId::MOE_SHARED_EXPERT_OUTPUT));
+    EXPECT_TRUE(contractWrites(combine_contract, BufferId::ATTN_PROJ));
 }
 
 TEST(Test__Qwen35MoEGraph, DenseTPDisabledKeepsExpertParticipantAllreduceOnly)
@@ -2013,6 +2027,7 @@ TEST(Test__Qwen35MoEGraph, LocalTPColumnParallelForwardPublishesLocalLogits)
     config.max_seq_len = 2;
     config.dense_tp_enabled = true;
     config.lm_head_column_parallel = true;
+    config.mtp.mirror_full_head_for_local_tp = false;
     config.vocab_local = config.vocab_size / 2;
 
     TensorArena arena;

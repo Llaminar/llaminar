@@ -303,6 +303,12 @@ namespace
         cfg.vocab_size = 32;
         cfg.rms_norm_eps = 1e-6f;
         cfg.default_device = DeviceId::cpu();
+        cfg.layer_types = {"full_attention", "full_attention"};
+        cfg.gdn.conv_kernel_size = 4;
+        cfg.gdn.state_size = cfg.head_dim;
+        cfg.gdn.inner_size = cfg.d_model;
+        cfg.gdn.group_count = cfg.n_kv_heads;
+        cfg.gdn.time_step_rank = cfg.n_heads;
         cfg.moe.num_experts = 8;
         cfg.moe.top_k = 2;
         cfg.moe.intermediate_size = 8;

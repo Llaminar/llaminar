@@ -141,7 +141,7 @@ TEST(Test__MoERebalanceController,
      DevicePlanAbiCarriesAuthenticatedTransferSlotLease)
 {
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
-    EXPECT_EQ(kDeviceMoERebalanceVersion, 8u);
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 9u);
     EXPECT_EQ(
         sizeof(DeviceMoERebalanceConfig),
         moe_rebalance_abi::kConfigBytes);

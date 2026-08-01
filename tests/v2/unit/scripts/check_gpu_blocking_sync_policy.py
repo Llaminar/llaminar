@@ -269,7 +269,6 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp", "CUDAQuantisedGemmKernel::multiply_fused_tensor_impl", "raw_stream", 2),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp", "CUDAQuantisedGemmKernel::multiply_with_fused_swiglu", "raw_stream", 1),
         ("src/v2/kernels/cuda/gemm/CuBLASGemmKernel.cu", "CuBLASGemmKernel::execute_batched_same_a", "raw_stream", 1),
-        ("src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp", "CUDAMoEKernel::executeGroupedPrefillPipeline", "raw_stream", 1),
         ("src/v2/kernels/cuda/ops/CUDAOpsKernels.cpp", "CUDAEmbeddingKernelT::apply_tensor", "raw_stream", 1),
         ("src/v2/kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip", "rocmGDN_chunk_forward_batched_kernel_route", "raw_stream", 2),
         ("src/v2/kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip", "rocmGDN_chunk_forward_effective", "raw_stream", 1),

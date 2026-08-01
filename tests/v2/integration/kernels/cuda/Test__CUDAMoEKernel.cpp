@@ -3297,7 +3297,6 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedMaterializerLeavesPhysicalS
         .expert = 3,
         .source_participant = 1,
         .destination_participant = 0,
-        .destination_slot_requirement_plus_one = 0,
     };
     ASSERT_NE(runtime.reserved_ptrs[1], nullptr);
     ASSERT_NE(runtime.reserved_ptrs[2], nullptr);
@@ -3382,37 +3381,6 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedMaterializerLeavesPhysicalS
     EXPECT_EQ(plan.destination_participant, 0u);
     EXPECT_EQ(plan.destination_slot, llaminar2::kDeviceMoEInvalidSlot)
         << "physical storage must be leased by destination projection, not logical materialization";
-
-    transfer.destination_slot_requirement_plus_one = 3u;
-    ASSERT_EQ(cudaMemcpyAsync(runtime.reserved_ptrs[2],
-                              &transfer,
-                              sizeof(transfer),
-                              cudaMemcpyHostToDevice,
-                              stream_),
-              cudaSuccess);
-    ASSERT_TRUE(cuda_kernel_->materializePrefillLeastLoadedTransferCommands(
-        launchContext(),
-        runtime_table.deviceLayerState(0),
-        d_plan,
-        d_plan_count,
-        /*plan_capacity=*/1,
-        d_header,
-        d_status,
-        config,
-        payload_slot_capacity,
-        /*layer_idx=*/0));
-    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-    ASSERT_EQ(cudaMemcpy(&plan,
-                         d_plan,
-                         sizeof(plan),
-                         cudaMemcpyDeviceToHost),
-              cudaSuccess);
-    EXPECT_NE(plan.flags &
-                  llaminar2::moe_rebalance_abi::
-                      kPlanFlagExactDestinationSlot,
-              0u);
-    EXPECT_EQ(plan.destination_slot, 2u)
-        << "prefix rehydration must carry its checkpointed physical slot into destination projection";
 
     cudaFree(d_plan);
     cudaFree(d_plan_count);
@@ -5678,64 +5646,6 @@ TEST_F(Test__CUDAMoEKernel, PrefillLLEPProjectionUsesFullPhysicalDirectoryBeyond
               llaminar2::kDeviceMoEInvalidSlot);
     EXPECT_EQ(local_plan[1].destination_previous_layer,
               llaminar2::kDeviceMoEInvalidSlot);
-    EXPECT_EQ(status.plan_overflow, 0u);
-    EXPECT_EQ(status.payload_bucket_overflow, 0u);
-    EXPECT_EQ(status.capacity_limited_candidates, 0u);
-    EXPECT_EQ(status.invalid_runtime_layers, 0u);
-
-    /*
-     * Prefix rehydration is stricter than ordinary current-batch movement.
-     * Re-run projection with the same empty slots but reverse the required
-     * physical order. The destination must preserve the checkpoint topology;
-     * choosing the first free slots again would make subsequent maintenance
-     * observe a different directory even though immediate expert math agrees.
-     */
-    gathered_plan[participant_id * plan_capacity + 0u].flags =
-        llaminar2::moe_rebalance_abi::kPlanFlagExactDestinationSlot;
-    gathered_plan[participant_id * plan_capacity + 0u].destination_slot = 3u;
-    gathered_plan[participant_id * plan_capacity + 1u].flags =
-        llaminar2::moe_rebalance_abi::kPlanFlagExactDestinationSlot;
-    gathered_plan[participant_id * plan_capacity + 1u].destination_slot = 2u;
-    initial_status = {};
-    ASSERT_EQ(cudaMemcpyAsync(d_gathered_plan,
-                              gathered_plan.data(),
-                              sizeof(gathered_plan),
-                              cudaMemcpyHostToDevice,
-                              stream_),
-              cudaSuccess);
-    ASSERT_EQ(cudaMemcpyAsync(d_status,
-                              &initial_status,
-                              sizeof(initial_status),
-                              cudaMemcpyHostToDevice,
-                              stream_),
-              cudaSuccess);
-    ASSERT_TRUE(cuda_kernel_->projectPrefillLeastLoadedDomainCommands(
-        launchContext(),
-        d_gathered_plan,
-        d_gathered_headers,
-        plan_capacity,
-        d_local_plan,
-        d_local_plan_count,
-        d_local_header,
-        config,
-        d_status,
-        payload_slot_capacity,
-        runtime_table.deviceLayerState(0),
-        d_transfer_slots,
-        transfer_slot_count));
-    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-    ASSERT_EQ(cudaMemcpy(local_plan.data(),
-                         d_local_plan,
-                         sizeof(local_plan),
-                         cudaMemcpyDeviceToHost),
-              cudaSuccess);
-    ASSERT_EQ(cudaMemcpy(&status,
-                         d_status,
-                         sizeof(status),
-                         cudaMemcpyDeviceToHost),
-              cudaSuccess);
-    EXPECT_EQ(local_plan[0].destination_slot, 3u);
-    EXPECT_EQ(local_plan[1].destination_slot, 2u);
     EXPECT_EQ(status.plan_overflow, 0u);
     EXPECT_EQ(status.payload_bucket_overflow, 0u);
     EXPECT_EQ(status.capacity_limited_candidates, 0u);

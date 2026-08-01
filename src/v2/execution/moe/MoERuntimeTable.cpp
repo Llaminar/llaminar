@@ -520,11 +520,11 @@ namespace llaminar2
         /**
          * @brief Find a payload-ready descriptor in one placement bank.
          *
-         * Portable prefix-cache state records the stable local slot that owned a
-         * local expert at capture time.  When that slot id is known, restore must
-         * not accept another ready descriptor for the same logical expert: doing
-         * so can bind old transfer-slot pointers after the graph has rebuilt its
-         * transfer-slot directory for the restored request.
+         * Portable prefix-cache state records a slot only for model-lifetime
+         * local payloads. When that static slot id is known, restore must not
+         * accept another ready descriptor for the same logical expert. Rolling
+         * transfer-slot replicas use `-1` and are rehydrated by the captured
+         * device transaction instead of entering this lookup.
          */
         bool findReadyDescriptorForExpertInBank(const DeviceMoEPlacementBank &bank,
                                                 uint32_t expert,
@@ -1523,11 +1523,16 @@ namespace llaminar2
             for (int expert = 0; expert < num_experts_; ++expert)
             {
                 const auto &desc = bank.experts[static_cast<size_t>(expert)];
+
                 auto &dst = captured.experts[static_cast<size_t>(expert)];
                 dst.logical_expert_id =
                     desc.logical_expert_id >= 0 ? desc.logical_expert_id : expert;
                 dst.owner_participant = desc.owner_participant;
-                dst.local_slot = desc.local_slot;
+                dst.local_slot = hasMoEExpertFlag(
+                                     desc.flags,
+                                     DeviceMoEExpertFlags::TransferSlot)
+                                     ? -1
+                                     : desc.local_slot;
                 dst.flags = portableMoEExpertFlags(desc.flags);
                 dst.local_compute = bank.local_compute_mask[static_cast<size_t>(expert)] != 0u ? 1u : 0u;
                 dst.replica_role = bank.replica_role[static_cast<size_t>(expert)];
@@ -1600,7 +1605,7 @@ namespace llaminar2
                  *
                  * The cache blob deliberately contains no device pointers. We
                  * therefore restore the model-lifetime bank now and preload the
-                 * exact owner-to-replica edges into the persistent LLEP transfer
+                 * logical owner-to-replica edges into the persistent LLEP transfer
                  * array. A one-shot captured forward graph consumes this array
                  * before it assigns any suffix routes. The H2D below is part of
                  * the explicit RAM/disk prefix import boundary; expert payload
@@ -1689,16 +1694,6 @@ namespace llaminar2
                                                              << expert);
                         return false;
                     }
-                    if (expected_local_compute &&
-                        (initial_mask & local_bit) == 0u &&
-                        saved.local_slot < 0)
-                    {
-                        LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
-                                                             << ": transient portable restore has no exact destination slot for expert "
-                                                             << expert);
-                        return false;
-                    }
-
                     uint32_t arrivals = desired_mask & ~initial_mask;
                     while (arrivals != 0u)
                     {
@@ -1712,11 +1707,7 @@ namespace llaminar2
                                 .source_participant =
                                     static_cast<uint32_t>(
                                         initial_desc.owner_participant),
-                                .destination_participant = destination,
-                                .destination_slot_requirement_plus_one =
-                                    destination == snapshot.participant_id
-                                        ? static_cast<uint32_t>(saved.local_slot) + 1u
-                                        : 0u});
+                                .destination_participant = destination});
                     }
                 }
 

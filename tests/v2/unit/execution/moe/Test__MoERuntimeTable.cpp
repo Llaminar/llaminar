@@ -878,7 +878,8 @@ namespace llaminar2::test
         ASSERT_EQ(snapshot.size(), 1u);
         EXPECT_EQ(snapshot[0].requires_device_payload_rehydration, 1u);
         EXPECT_EQ(snapshot[0].experts[2].local_compute, 1u);
-        EXPECT_EQ(snapshot[0].experts[2].local_slot, 2);
+        EXPECT_EQ(snapshot[0].experts[2].local_slot, -1)
+            << "Portable placement must not serialize rolling transfer-slot identity.";
         EXPECT_EQ(snapshot[0].experts[2].replica_role,
                   static_cast<uint8_t>(DeviceMoEReplicaRole::Replica));
         EXPECT_EQ(snapshot[0].experts[2].resident_participant_mask, 0b11u);
@@ -891,6 +892,104 @@ namespace llaminar2::test
 
         EXPECT_FALSE(table.restorePortableRuntimeState(snapshot))
             << "CPU unit tests must not emulate the captured GPU payload-rehydration transaction.";
+    }
+
+    /**
+     * @brief Canonicalize legal cross-layer reuse of one rolling physical slot.
+     *
+     * Current-batch LLEP layers execute serially and may reuse the same transfer
+     * allocation during non-overlapping intervals. A portable prefix snapshot
+     * must preserve both layers' logical replica placement without treating the
+     * graph-lifetime subscript as a durable identity. Rehydration can then lease
+     * independent live slots for the concurrently restored logical residency.
+     */
+    TEST(Test__MoERuntimeTable, PortableRuntimeStateCanonicalizesCrossLayerRollingSlotReuse)
+    {
+        constexpr int kLayerCount = 2;
+        constexpr int kExpertCount = 4;
+        constexpr int kSharedTransferSlot = 2;
+        MoERuntimeTable table(
+            DeviceId::cpu(),
+            kLayerCount,
+            kExpertCount,
+            /*top_k=*/2);
+
+        auto placement = [=](uint32_t epoch, bool include_replica)
+        {
+            MoEPlacementUpdate update;
+            update.epoch = epoch;
+            update.expert_count = kExpertCount;
+            update.participant_id = 0;
+            update.participant_count = 2;
+            update.experts.resize(kExpertCount);
+            update.local_compute_mask.assign(kExpertCount, 0u);
+            update.replica_role.assign(
+                kExpertCount,
+                static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+            update.resident_participant_mask = {0b01u, 0b01u, 0b10u, 0b10u};
+
+            for (int expert = 0; expert < kExpertCount; ++expert)
+            {
+                const int owner = expert < 2 ? 0 : 1;
+                if (owner == 0)
+                {
+                    update.experts[static_cast<size_t>(expert)] =
+                        expertDesc(expert, owner, expert);
+                    update.local_compute_mask[static_cast<size_t>(expert)] = 1u;
+                    update.replica_role[static_cast<size_t>(expert)] =
+                        static_cast<uint8_t>(DeviceMoEReplicaRole::Primary);
+                }
+                else
+                {
+                    update.experts[static_cast<size_t>(expert)] =
+                        expertOwnerOnlyDesc(expert, owner);
+                }
+            }
+
+            if (include_replica)
+            {
+                constexpr int kReplicatedExpert = 2;
+                update.experts[kReplicatedExpert] = expertDesc(
+                    kReplicatedExpert,
+                    /*owner=*/1,
+                    kSharedTransferSlot,
+                    DeviceMoEExpertFlags::Valid |
+                        DeviceMoEExpertFlags::Resident |
+                        DeviceMoEExpertFlags::LocalCompute |
+                        DeviceMoEExpertFlags::TransferSlot);
+                update.local_compute_mask[kReplicatedExpert] = 1u;
+                update.replica_role[kReplicatedExpert] =
+                    static_cast<uint8_t>(DeviceMoEReplicaRole::Replica);
+                update.resident_participant_mask[kReplicatedExpert] = 0b11u;
+            }
+            return update;
+        };
+
+        for (int layer = 0; layer < kLayerCount; ++layer)
+        {
+            ASSERT_TRUE(table.prepareInactiveBank(
+                layer,
+                placement(/*epoch=*/1, /*include_replica=*/false)));
+            ASSERT_TRUE(table.flipActiveBank(layer, /*epoch=*/1, nullptr));
+            ASSERT_TRUE(table.prepareInactiveBank(
+                layer,
+                placement(/*epoch=*/2, /*include_replica=*/true)));
+            ASSERT_TRUE(table.flipActiveBank(layer, /*epoch=*/2, nullptr));
+        }
+
+        std::vector<DeviceMoEPortableLayerRuntimeState> snapshot;
+        ASSERT_TRUE(table.capturePortableRuntimeState(snapshot));
+        ASSERT_EQ(snapshot.size(), kLayerCount);
+        for (int layer = 0; layer < kLayerCount; ++layer)
+        {
+            const auto &portable_layer = snapshot[static_cast<size_t>(layer)];
+            EXPECT_EQ(portable_layer.requires_device_payload_rehydration, 1u);
+            ASSERT_EQ(portable_layer.experts.size(), kExpertCount);
+            EXPECT_EQ(portable_layer.experts[2].local_compute, 1u);
+            EXPECT_EQ(portable_layer.experts[2].local_slot, -1)
+                << "Layer " << layer
+                << " retained a graph-lifetime rolling slot in portable state.";
+        }
     }
 
     /**
@@ -1124,7 +1223,7 @@ namespace llaminar2::test
         ASSERT_EQ(snapshot.size(), 1u);
         ASSERT_EQ(snapshot[0].requires_device_payload_rehydration, 1u);
         ASSERT_EQ(snapshot[0].experts[2].local_compute, 1u);
-        ASSERT_EQ(snapshot[0].experts[2].local_slot, 2);
+        ASSERT_EQ(snapshot[0].experts[2].local_slot, -1);
 
         MoERuntimeTable destination(DeviceId::cpu(), 1, 4, 2);
         ASSERT_TRUE(destination.prepareInactiveBank(0, initial));

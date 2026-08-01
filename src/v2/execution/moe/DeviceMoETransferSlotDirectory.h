@@ -192,13 +192,13 @@ namespace llaminar2
         /**
          * @brief Materialize the live payload descriptor owned by a transfer slot.
          *
-         * Prefix-cache MoE runtime restore stores the logical expert id and
-         * stable local slot id, while the directory remains the first-class owner
-         * of the VRAM payload buffers.  This method rebuilds a
-         * DeviceMoEExpertDescriptor from the directory's slot allocation without
-         * exposing the directory entry array or requiring a host copy from the
-         * device-side status table.  The caller supplies the logical expert id
-         * because a transfer slot may be reused for different experts over time.
+         * The directory remains the first-class owner of rolling VRAM payload
+         * buffers. This method rebuilds a DeviceMoEExpertDescriptor from one
+         * graph-local slot allocation without exposing the directory entry array
+         * or copying a device-side status table to the host. The caller supplies
+         * the logical expert id because a transfer slot may be reused for
+         * different experts over time. Portable prefix state never persists this
+         * graph-lifetime slot index.
          *
          * @return true when @p slot_index names an allocated slot with ready
          *         gate/up/down NativeVNNI payload descriptors.
