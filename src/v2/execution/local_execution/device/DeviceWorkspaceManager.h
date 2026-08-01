@@ -35,6 +35,59 @@
 namespace llaminar2
 {
     /**
+     * @brief One stable named-buffer placement in a serial graph family.
+     *
+     * The descriptor carries the family-wide maximum capacity for the name.
+     * `offset` is relative to the family's single primary device allocation.
+     */
+    struct SerialWorkspaceBufferPlacement
+    {
+        WorkspaceDescriptor descriptor;
+        size_t offset = 0;
+    };
+
+    /**
+     * @brief Complete pre-capture layout for mutually exclusive GPU graphs.
+     *
+     * Every participant passed to the planner is a clique: all names used by
+     * that graph receive non-overlapping intervals. Names that never coexist
+     * may share physical bytes. Planning the whole family at once avoids the
+     * order-dependent fragmentation produced by laying out prefill first and
+     * trying to insert a large grouped-verifier arena afterward.
+     */
+    struct SerialWorkspaceFamilyPlan
+    {
+        std::vector<SerialWorkspaceBufferPlacement> placements;
+        size_t total_bytes = 0;
+        std::string error;
+
+        /**
+         * @brief Whether planning completed with a valid layout.
+         */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return error.empty();
+        }
+
+        /**
+         * @brief Find one family-wide placement by stable workspace name.
+         *
+         * @param name Workspace ABI name.
+         * @return Placement address metadata, or nullptr when absent.
+         */
+        [[nodiscard]] const SerialWorkspaceBufferPlacement *find(
+            const std::string &name) const noexcept
+        {
+            for (const auto &placement : placements)
+            {
+                if (placement.descriptor.name == name)
+                    return &placement;
+            }
+            return nullptr;
+        }
+    };
+
+    /**
      * @brief Exact identity for one immutable workspace-backed publication.
      *
      * The workspace manager deliberately does not interpret these words. A
@@ -49,6 +102,17 @@ namespace llaminar2
         std::uint64_t word1 = 0;
         std::uint64_t word2 = 0;
         std::uint64_t word3 = 0;
+        /**
+         * @brief Exact variable-width identity words after the fixed prefix.
+         *
+         * Four words are sufficient for ordinary immutable weights, whose
+         * identity is one allocation plus matrix geometry. Descriptor tables
+         * contain one complete device-pointer record per expert and cannot be
+         * represented collision-free by a fixed-size digest. Those producers
+         * append every normalized descriptor field here so registry equality
+         * remains exact rather than trusting a hash collision never to occur.
+         */
+        std::vector<std::uint64_t> identity_words;
 
         friend bool operator==(
             const PersistentWorkspacePublicationKey &left,
@@ -79,6 +143,8 @@ namespace llaminar2
 
     using PersistentWorkspacePublicationFactory =
         std::function<std::shared_ptr<void>(size_t slot)>;
+    using PersistentWorkspacePublicationRewrite =
+        std::function<bool()>;
 
     namespace detail
     {
@@ -222,6 +288,38 @@ namespace llaminar2
         bool allocate(
             const WorkspaceRequirements &requirements,
             size_t minimum_primary_block_bytes = 0);
+
+        /**
+         * @brief Plan stable aliases for a complete serial graph family.
+         *
+         * This pure operation performs no backend work and is suitable for CPU
+         * unit tests. A workspace name is represented once at the largest size
+         * and strictest alignment declared by any participant. Two names may
+         * overlap only when no participant contains both names.
+         *
+         * Placement is deterministic: buffers are considered largest-first,
+         * with stable name ordering for ties, and each receives the earliest
+         * aligned interval that does not overlap an already placed conflict.
+         *
+         * @param participants Complete prefill, decode, grouped-verifier, and
+         *        sidecar requirements that execute serially on one device.
+         * @return A valid complete layout, or a plan carrying a diagnostic in
+         *         `error`.
+         */
+        [[nodiscard]] static SerialWorkspaceFamilyPlan planSerialFamily(
+            const std::vector<WorkspaceRequirements> &participants);
+
+        /**
+         * @brief Allocate and publish a previously planned serial graph family.
+         *
+         * All names and addresses become visible in one operation before any
+         * graph capture. The method never grows, relocates, or repairs the plan.
+         *
+         * @param plan Valid output from @ref planSerialFamily.
+         * @return true when the complete primary block and every named alias
+         *         were allocated, otherwise false.
+         */
+        bool allocateSerialFamily(const SerialWorkspaceFamilyPlan &plan);
 
         /**
          * @brief Add missing or larger named buffers without moving old storage.
@@ -397,6 +495,39 @@ namespace llaminar2
             size_t slot_capacity,
             const PersistentWorkspacePublicationFactory &factory);
 
+        /**
+         * @brief Rewrite and reindex a publication under the registry lock.
+         *
+         * Mutable graph metadata such as a dynamic expert descriptor table
+         * retains its captured device address while its semantic identity
+         * changes. This method excludes concurrent adopters while @p rewrite
+         * enqueues the complete replacement and re-records the publication's
+         * readiness event. It then removes every obsolete key for exactly that
+         * publication and exposes the new key atomically.
+         *
+         * When another live captured address already owns @p new_key, both
+         * publications remain valid but only the existing canonical one stays
+         * discoverable. This publication becomes unindexed until a later unique
+         * identity is installed; no stale key can ever adopt its mutated bytes.
+         *
+         * @param domain Stable logical publication namespace.
+         * @param new_key Exact identity of the replacement bytes.
+         * @param publication Shared publication object being updated.
+         * @param slot Physical slot retained by that publication.
+         * @param slot_capacity Declared capacity of the slot domain.
+         * @param rewrite Setup-only callback that submits the full device write
+         *        and records readiness. It must return false only before any
+         *        device work is submitted; partial submission is process-fatal.
+         * @return True when registry invariants were preserved.
+         */
+        bool rewritePersistentPublication(
+            const std::string &domain,
+            const PersistentWorkspacePublicationKey &new_key,
+            const std::shared_ptr<void> &publication,
+            size_t slot,
+            size_t slot_capacity,
+            const PersistentWorkspacePublicationRewrite &rewrite);
+
         // =========================================================================
         // Metrics
         // =========================================================================
@@ -503,6 +634,17 @@ namespace llaminar2
          */
         bool allocateBuffers(
             const std::vector<const WorkspaceDescriptor *> &buffers,
+            size_t total_size);
+
+        /**
+         * @brief Allocate one block and publish descriptors at explicit offsets.
+         *
+         * @param placements Stable descriptor/offset pairs.
+         * @param total_size Physical primary-block size.
+         * @return true when the complete layout was allocated and published.
+         */
+        bool allocatePlacedBuffers(
+            const std::vector<SerialWorkspaceBufferPlacement> &placements,
             size_t total_size);
 
         /**

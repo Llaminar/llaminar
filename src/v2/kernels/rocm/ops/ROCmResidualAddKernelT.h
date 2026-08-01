@@ -145,7 +145,7 @@ namespace llaminar2
                 ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RESIDUAL_ADD, static_cast<hipStream_t>(gpu_stream_));
                 (void)mpi_ctx;
                 int dev = (device_idx >= 0) ? device_idx : device_idx_;
-                LOG_DEBUG("[ROCmResidualAddKernelT::FP32] Executing on device " << dev);
+                LOG_TRACE("[ROCmResidualAddKernelT::FP32] Executing on device " << dev);
                 return rocmOps_residual_add_fp32(input, residual, output, static_cast<int>(num_elements), dev, gpu_stream_);
             }
 

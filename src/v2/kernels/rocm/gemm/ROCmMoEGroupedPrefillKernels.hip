@@ -1327,10 +1327,13 @@ void moe_grouped_down_partials_ordered_publish_prefill_kernel(
         const int grouped_slot = original_to_grouped[original_slot];
         if (grouped_slot < 0)
             continue;
-        total += grouped_weights[grouped_slot] *
-                 down_partials[
-                     static_cast<size_t>(grouped_slot) * static_cast<size_t>(d_model) +
-                     static_cast<size_t>(n)];
+        const float weighted_route = rocm_native_vnni_weight_route_rn(
+            grouped_weights[grouped_slot],
+            down_partials[
+                static_cast<size_t>(grouped_slot) *
+                    static_cast<size_t>(d_model) +
+                static_cast<size_t>(n)]);
+        total = rocm_native_vnni_accumulate_rn(total, weighted_route);
     }
 
     output[
@@ -1475,11 +1478,127 @@ void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
             swiglu_scales + static_cast<size_t>(grouped_slot) * blocks_per_row;
         const float expert_acc = moe_prefill_dot_desc_range_dispatch(
             desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
-        const float weight = grouped_weights[grouped_slot];
-        total += weight * expert_acc;
+        const float weighted_route = rocm_native_vnni_weight_route_rn(
+            grouped_weights[grouped_slot], expert_acc);
+        total = rocm_native_vnni_accumulate_rn(total, weighted_route);
     }
 
     output[static_cast<size_t>(token) * static_cast<size_t>(N) + static_cast<size_t>(n)] = total;
+}
+
+/**
+ * @brief Publish one weighted grouped down row per original router slot.
+ *
+ * Invalid or participant-remote slots explicitly write zero. The route axis is
+ * preserved through the LocalTP collective and is reduced only afterward by
+ * the canonical router-order epilogue.
+ */
+__global__ __launch_bounds__(64)
+void moe_grouped_down_publish_canonical_routes_prefill_kernel(
+    const int8_t* __restrict__ swiglu_int8,
+    const float* __restrict__ swiglu_scales,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ down_descs,
+    const int* __restrict__ original_to_grouped,
+    const int* __restrict__ original_expert_ids,
+    const float* __restrict__ grouped_weights,
+    float* __restrict__ route_output,
+    int total_slots,
+    int N,
+    int K,
+    int num_experts)
+{
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int original_slot = blockIdx.y;
+    if (original_slot >= total_slots || n >= N)
+        return;
+
+    const size_t output_index =
+        static_cast<size_t>(original_slot) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+    const int grouped_slot = original_to_grouped[original_slot];
+    const int expert_id = original_expert_ids
+                              ? original_expert_ids[original_slot]
+                              : ((num_experts == 1) ? 0 : -1);
+    if (grouped_slot < 0 || expert_id < 0 || expert_id >= num_experts)
+    {
+        route_output[output_index] = 0.0f;
+        return;
+    }
+
+    const int blocks_per_row = K / 32;
+    const DeviceNativeVNNIMatrixDesc desc = down_descs[expert_id];
+    const int8_t* slot_A =
+        swiglu_int8 + static_cast<size_t>(grouped_slot) * K;
+    const float* slot_scales =
+        swiglu_scales + static_cast<size_t>(grouped_slot) * blocks_per_row;
+    const float expert_acc = moe_prefill_dot_desc_range_dispatch(
+        desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
+    route_output[output_index] = rocm_native_vnni_weight_route_rn(
+        grouped_weights[grouped_slot], expert_acc);
+}
+
+/** @brief Scatter expert-tiled down partials into original route slots. */
+__global__ __launch_bounds__(64, 4)
+void moe_grouped_down_partials_canonical_publish_prefill_kernel(
+    const float* __restrict__ down_partials,
+    const int* __restrict__ original_to_grouped,
+    const float* __restrict__ grouped_weights,
+    float* __restrict__ route_output,
+    int total_slots,
+    int d_model)
+{
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int original_slot = blockIdx.y;
+    if (original_slot >= total_slots || n >= d_model)
+        return;
+
+    const int grouped_slot = original_to_grouped[original_slot];
+    const size_t output_index =
+        static_cast<size_t>(original_slot) *
+            static_cast<size_t>(d_model) +
+        static_cast<size_t>(n);
+    route_output[output_index] =
+        grouped_slot < 0
+            ? 0.0f
+            : rocm_native_vnni_weight_route_rn(
+                  grouped_weights[grouped_slot],
+                  down_partials[
+                      static_cast<size_t>(grouped_slot) *
+                          static_cast<size_t>(d_model) +
+                      static_cast<size_t>(n)]);
+}
+
+/** @brief Sum allreduced route slots in serial router order. */
+__global__ __launch_bounds__(256)
+void moe_reduce_canonical_route_contributions_kernel(
+    const float* __restrict__ route_contributions,
+    float* __restrict__ output,
+    int seq_len,
+    int top_k,
+    int d_model)
+{
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int token = blockIdx.y;
+    if (token >= seq_len || n >= d_model)
+        return;
+
+    float sum = 0.0f;
+#pragma unroll 1
+    for (int route = 0; route < top_k; ++route)
+    {
+        const size_t index =
+            (static_cast<size_t>(token) * static_cast<size_t>(top_k) +
+             static_cast<size_t>(route)) *
+                static_cast<size_t>(d_model) +
+            static_cast<size_t>(n);
+        sum = rocm_native_vnni_accumulate_rn(
+            sum, route_contributions[index]);
+    }
+    output[
+        static_cast<size_t>(token) * static_cast<size_t>(d_model) +
+        static_cast<size_t>(n)] = sum;
 }
 
 // ============================================================================
@@ -1658,6 +1777,7 @@ bool rocmMoE_grouped_prefill_pipeline(
     float*        d_scratch_swiglu_scales,// [total_slots, blocks_per_intermediate]
     // Output
     float*        d_output,              // [seq_len, d_model] overwritten in original top-k order
+    float*        d_canonical_route_contributions, // optional [seq_len, top_k, d_model]
     // Dimensions
     int num_experts,
     int d_model,
@@ -1683,10 +1803,12 @@ bool rocmMoE_grouped_prefill_pipeline(
         !d_original_to_grouped || !d_group_weights || !d_group_work_directory ||
         !d_scratch_A_int8 || !d_scratch_scales || !d_scratch_gate ||
         !d_scratch_up || !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales ||
-        !d_output ||
+        (!d_output && !d_canonical_route_contributions) ||
         (!d_original_expert_ids && num_experts != 1))
         return false;
     const int seq_len = total_slots / top_k;
+    const bool canonical_publication =
+        d_canonical_route_contributions != nullptr;
     const bool use_expert_row_tiles = seq_len > 8;
 
     llaminar2::HipDeviceGuard::setDevice(device_id);
@@ -1925,13 +2047,34 @@ bool rocmMoE_grouped_prefill_pipeline(
 
         if (!use_expert_row_tiles)
         {
-            dim3 grid((d_model + TILE_N - 1) / TILE_N, seq_len);
-            hipLaunchKernelGGL(
-                moe_grouped_down_publish_original_token_ordered_prefill_kernel,
-                grid, block, 0, hip_stream,
-                d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs,
-                d_original_to_grouped, d_original_expert_ids, d_group_weights,
-                d_output, seq_len, top_k, d_model, intermediate, num_experts);
+            if (canonical_publication)
+            {
+                dim3 grid((d_model + TILE_N - 1) / TILE_N, total_slots);
+                hipLaunchKernelGGL(
+                    moe_grouped_down_publish_canonical_routes_prefill_kernel,
+                    grid, block, 0, hip_stream,
+                    d_scratch_swiglu_int8,
+                    d_scratch_swiglu_scales,
+                    down_descs,
+                    d_original_to_grouped,
+                    d_original_expert_ids,
+                    d_group_weights,
+                    d_canonical_route_contributions,
+                    total_slots,
+                    d_model,
+                    intermediate,
+                    num_experts);
+            }
+            else
+            {
+                dim3 grid((d_model + TILE_N - 1) / TILE_N, seq_len);
+                hipLaunchKernelGGL(
+                    moe_grouped_down_publish_original_token_ordered_prefill_kernel,
+                    grid, block, 0, hip_stream,
+                    d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs,
+                    d_original_to_grouped, d_original_expert_ids, d_group_weights,
+                    d_output, seq_len, top_k, d_model, intermediate, num_experts);
+            }
         }
         else
         {
@@ -2013,12 +2156,32 @@ bool rocmMoE_grouped_prefill_pipeline(
                 return false;
             }
 
-            dim3 publish_grid((d_model + TILE_N - 1) / TILE_N, seq_len);
-            hipLaunchKernelGGL(
-                moe_grouped_down_partials_ordered_publish_prefill_kernel,
-                publish_grid, block, 0, hip_stream,
-                d_scratch_gate, d_original_to_grouped, d_group_weights,
-                d_output, seq_len, top_k, d_model);
+            if (canonical_publication)
+            {
+                dim3 publish_grid(
+                    (d_model + TILE_N - 1) / TILE_N,
+                    total_slots);
+                hipLaunchKernelGGL(
+                    moe_grouped_down_partials_canonical_publish_prefill_kernel,
+                    publish_grid, block, 0, hip_stream,
+                    d_scratch_gate,
+                    d_original_to_grouped,
+                    d_group_weights,
+                    d_canonical_route_contributions,
+                    total_slots,
+                    d_model);
+            }
+            else
+            {
+                dim3 publish_grid(
+                    (d_model + TILE_N - 1) / TILE_N,
+                    seq_len);
+                hipLaunchKernelGGL(
+                    moe_grouped_down_partials_ordered_publish_prefill_kernel,
+                    publish_grid, block, 0, hip_stream,
+                    d_scratch_gate, d_original_to_grouped, d_group_weights,
+                    d_output, seq_len, top_k, d_model);
+            }
         }
     }
 
@@ -2029,6 +2192,46 @@ bool rocmMoE_grouped_prefill_pipeline(
         return false;
     }
 
+    return true;
+}
+
+bool rocmMoE_reduce_canonical_route_contributions(
+    const float* d_route_contributions,
+    float* d_output,
+    int seq_len,
+    int top_k,
+    int d_model,
+    int device_id,
+    void* stream)
+{
+    if (!d_route_contributions || !d_output || !stream ||
+        seq_len <= 0 || top_k <= 0 || d_model <= 0)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+    constexpr int kThreads = 256;
+    dim3 grid((d_model + kThreads - 1) / kThreads, seq_len);
+    hipLaunchKernelGGL(
+        moe_reduce_canonical_route_contributions_kernel,
+        grid,
+        dim3(kThreads),
+        0,
+        static_cast<hipStream_t>(stream),
+        d_route_contributions,
+        d_output,
+        seq_len,
+        top_k,
+        d_model);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmMoE_reduce_canonical_route_contributions] launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
     return true;
 }
 

@@ -361,6 +361,87 @@ namespace
     }
 
     /**
+     * @brief Match the canonical server's seeded stochastic movement probe.
+     *
+     * The E2E probe is intentionally a narrow one-slot LLEP transaction. Its
+     * first maintenance opportunity occurs after a four-row evidence window
+     * plus one slack row. Those values affect the relative ordering of expert
+     * publication and chained MTP sidecars, so a larger payload or a different
+     * cadence is not a valid reproduction even when prompt length and draft
+     * depth happen to match.
+     *
+     * @param test_case CUDA or ROCm phase-split LLEP fixture to specialize.
+     */
+    void configureCanonicalStochasticServerProbe(
+        MoEPrefixRestoreParityCase &test_case)
+    {
+        ASSERT_TRUE(test_case.moe_rebalance.has_value());
+        auto &rebalance = *test_case.moe_rebalance;
+        rebalance.window_size = 4;
+        rebalance.max_window_size = 4;
+        rebalance.device_maintenance_slack_tokens = 1;
+        rebalance.device_min_maintenance_period_tokens = 4;
+        rebalance.device_initial_maintenance_period_tokens = 5;
+        /*
+         * The canonical prefix-cache cell uses 64-token blocks. LLEP derives
+         * its initial placement evidence from these prefill windows, so the
+         * window is part of the execution policy rather than incidental cache
+         * plumbing. Declare it here once so direct verifier proofs and full
+         * orchestration runners construct the same initial expert layout.
+         */
+        rebalance.prefill_window_tokens = 64;
+
+        auto set_env =
+            [&](const char *name, const char *value)
+        {
+            auto existing = std::find_if(
+                test_case.env_overrides.begin(),
+                test_case.env_overrides.end(),
+                [&](const auto &entry)
+                {
+                    return entry.first == name;
+                });
+            if (existing == test_case.env_overrides.end())
+                test_case.env_overrides.emplace_back(name, value);
+            else
+                existing->second = value;
+        };
+        set_env("LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER", "2");
+        set_env(
+            "LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS",
+            "1");
+        set_env(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS",
+            "1");
+        set_env(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS",
+            "5");
+        set_env(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS",
+            "4");
+        set_env(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS",
+            "1");
+
+        test_case.chat_messages = {
+            {
+                "system",
+                "Write a continuous paragraph of at least sixty-four lowercase "
+                "English words. Do not use punctuation, lists, headings, or an "
+                "early conclusion.",
+            },
+            {
+                "user",
+                "Describe a calm morning while following every length and "
+                "formatting requirement. The private request marker is trial01.",
+            },
+        };
+        test_case.chat_enable_thinking = false;
+        test_case.exact_prompt_tokens = 65;
+        test_case.minimum_prompt_tokens = 65;
+    }
+
+    /**
      * @brief Converts a short hot-only fixture into a real partial-prefix probe.
      *
      * The default hot-only metadata prompt is intentionally tiny so the MTP
@@ -547,6 +628,16 @@ namespace
     }
 
     /**
+     * @brief Builds the exact CUDA server stochastic LLEP reproduction.
+     */
+    MoEPrefixRestoreParityCase cudaOnlyCanonicalStochasticLLEPCase()
+    {
+        auto test_case = cudaOnlyLLEPPhaseSplitCase();
+        configureCanonicalStochasticServerProbe(test_case);
+        return test_case;
+    }
+
+    /**
      * @brief Builds the ROCm dynamic phase-split migration fixture.
      *
      * @return ROCm hot-only expert-overlay case with movement-friendly dynamic rebalance.
@@ -596,6 +687,16 @@ namespace
         configurePhaseSplitMigrationProbe(
             test_case,
             MoERebalanceRuntimeMode::LLEP);
+        return test_case;
+    }
+
+    /**
+     * @brief Builds the exact ROCm server stochastic LLEP reproduction.
+     */
+    MoEPrefixRestoreParityCase rocmOnlyCanonicalStochasticLLEPCase()
+    {
+        auto test_case = rocmOnlyLLEPPhaseSplitCase();
+        configureCanonicalStochasticServerProbe(test_case);
         return test_case;
     }
 
@@ -929,15 +1030,13 @@ namespace
          */
         if (test_case.moe_rebalance->mode == MoERebalanceRuntimeMode::LLEP)
         {
-            expectPerfCounterPositive(
+            expectLLEPAppliedPrefillMovementPositive(
                 records,
-                "moe_rebalance",
-                "device_rebalance_llep_weight_transfer_count",
                 test_case.name + " lifecycle stress");
             expectPerfCounterPositive(
                 records,
                 "moe_rebalance",
-                "device_rebalance_llep_assignment_span_count",
+                "device_rebalance_llep_resident_assignment_calls",
                 test_case.name + " lifecycle stress");
         }
         else
@@ -1097,6 +1196,188 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, GroupedVerifierRowsMatchSerial_CUDA2
 }
 
 /**
+ * @brief Reproduces the production CUDA LLEP verifier at its M=2 response edge.
+ *
+ * The canonical stochastic request reaches cached position 94 with token 40473
+ * and has room for exactly one speculative draft.  The grouped verifier must
+ * therefore execute two main-model rows, `[40473, 321]`, under the same
+ * depth-15 graph capacity and shifted-MTP maintenance used by serving.  The
+ * explicit token path is the seeded serial-decode trajectory; it lets this
+ * focused oracle compare every grouped logits byte with the corresponding
+ * serial row without running a second full stochastic request.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
+     GroupedVerifierM2AtLongPositionMatchesSerial_CUDA2TPLLEPPhaseSplit)
+{
+    const std::vector<int32_t> serial_token_path{
+        1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
+        18255, 279,  12515, 303,   34904, 314,   18016, 321,
+        17676, 1345, 279,   19053, 5820,  310,   7534,  836,
+        21030, 85949, 279,   3594,  557,   40473, 321,   7478,
+    };
+    runMoEMainVerifierGroupedRowsMatchSerialDecode(
+        cudaOnlyCanonicalStochasticLLEPCase(),
+        /*verifier_row_count=*/2,
+        /*serial_setup_token_count=*/29,
+        /*exercise_shifted_row_maintenance=*/true,
+        /*configured_draft_tokens=*/15,
+        /*mirror_shifted_maintenance_in_serial_oracle=*/true,
+        serial_token_path,
+        /*exercise_device_rebalance_maintenance=*/true);
+}
+
+/**
+ * @brief Reproduces the first depth-six CUDA LLEP stochastic transaction.
+ *
+ * The production stochastic lane first grows to six target-verifier rows at
+ * condition token 836. This focused proof restores the exact serial boundary,
+ * executes six rows in one captured verifier graph, and compares every logits
+ * byte with independently restored serial prefixes. Keeping the graph
+ * provisioned for the production depth of fifteen also preserves the real
+ * workspace aliasing and launch geometry while avoiding a full stochastic
+ * request whenever this boundary regresses.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
+     GroupedVerifierM6AtLongPositionMatchesSerial_CUDA2TPLLEPPhaseSplit)
+{
+    const std::vector<int32_t> serial_token_path{
+        1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
+        18255, 279,  12515, 303,   34904, 314,   18016, 321,
+        17676, 1345, 279,   19053, 5820,  310,   7534,  836,
+        21030, 85949, 279,   3594,  557,   40473, 321,   7478,
+    };
+    runMoEMainVerifierGroupedRowsMatchSerialDecode(
+        cudaOnlyCanonicalStochasticLLEPCase(),
+        /*verifier_row_count=*/6,
+        /*serial_setup_token_count=*/23,
+        /*exercise_shifted_row_maintenance=*/true,
+        /*configured_draft_tokens=*/15,
+        /*mirror_shifted_maintenance_in_serial_oracle=*/true,
+        serial_token_path,
+        /*exercise_device_rebalance_maintenance=*/true);
+}
+
+/**
+ * @brief Proves the first grouped verifier after LLEP maintenance is serial exact.
+ *
+ * The canonical stochastic request reaches its third maintenance boundary
+ * after publishing generated token fifteen (`18016`). The following grouped
+ * verifier consumes `321` and `17676`; serial stochastic decode then samples
+ * `430`. Older focused fixtures started after this boundary and accidentally
+ * embedded the divergent grouped token (`1345`) in their explicit setup path,
+ * so they could not expose the production failure. This regression advances
+ * the graph-owned LLEP controller through the exact 5/10/15-token cadence and
+ * compares both post-boundary grouped rows byte-for-byte with serial replay.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
+     GroupedVerifierM2ImmediatelyAfterMaintenanceMatchesSerial_CUDA2TPLLEPPhaseSplit)
+{
+    const std::vector<int32_t> serial_token_path{
+        1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
+        18255, 279,  12515, 303,   34904, 314,   18016, 321,
+        17676, 430,  279,   19053, 5820,  310,   7534,  836,
+        21030, 43776, 279,   3594,  557,   40473, 321,   7478,
+    };
+    runMoEMainVerifierGroupedRowsMatchSerialDecode(
+        cudaOnlyCanonicalStochasticLLEPCase(),
+        /*verifier_row_count=*/2,
+        /*serial_setup_token_count=*/15,
+        /*exercise_shifted_row_maintenance=*/true,
+        /*configured_draft_tokens=*/15,
+        /*mirror_shifted_maintenance_in_serial_oracle=*/true,
+        serial_token_path,
+        /*exercise_device_rebalance_maintenance=*/true);
+}
+
+/**
+ * @brief Proves the pending-condition CUDA LLEP verifier row is serial exact.
+ *
+ * After the preceding partial publication, token 18016 is resident as the next
+ * condition but has not yet been consumed by the main graph. The production
+ * grouped transaction therefore evaluates inputs `[18016, 321, 17676]`; the
+ * historical M=2 oracle began at 321 and skipped this first row. A deliberately
+ * wrong fourth input forces the serial-equivalent device summary to sample
+ * target row two with the production seed; that correction must be token 430.
+ * All four physical rows also remain byte-exact to serial decode.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
+     GroupedVerifierPendingConditionStochasticSummaryMatchesSerial_CUDA2TPLLEPPhaseSplit)
+{
+    const std::vector<int32_t> serial_token_path{
+        1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
+        18255, 279,  12515, 303,   34904, 314,   18016, 321,
+        17676, 1345, 279,   19053, 5820,  310,   7534,  836,
+        21030, 43776, 279,   3594,  557,   40473, 321,   7478,
+    };
+    runMoEMainVerifierGroupedRowsMatchSerialDecode(
+        cudaOnlyCanonicalStochasticLLEPCase(),
+        /*verifier_row_count=*/4,
+        /*serial_setup_token_count=*/14,
+        /*exercise_shifted_row_maintenance=*/true,
+        /*configured_draft_tokens=*/15,
+        /*mirror_shifted_maintenance_in_serial_oracle=*/true,
+        serial_token_path,
+        /*exercise_device_rebalance_maintenance=*/true,
+        /*accepted_grouped_rows_before_verifier=*/0,
+        /*grouped_publication_tokens=*/{},
+        /*stochastic_summary_params=*/
+            qwen36MoEProductionStochasticSamplingParams(),
+        /*expected_stochastic_rejection_token=*/430,
+        /*stochastic_first_token_is_pending=*/true);
+}
+
+/**
+ * @brief Proves accepted publication cannot corrupt the next CUDA LLEP verifier.
+ *
+ * The production failure appears after the base-77 depth-five transaction
+ * evaluates `[34904, 314, 17676, 321, 18016, 11]`, accepts draft `314`, rejects
+ * draft `17676`, and publishes sampled correction `18016`. The publication
+ * commits exactly the condition and accepted-draft recurrent rows; correction
+ * `18016` remains the pending condition for the next transaction. The next
+ * grouped batch must therefore evaluate the actual sidecar proposal row
+ * `[18016, 321, 17676, 11, 321, 279]` from state that is byte-identical to
+ * serial decode. Target comparison row two rejects proposal `11` and samples
+ * correction `430` at position 82.
+ *
+ * The historical regression began one token later with condition `314`. That
+ * exercised the same commit cardinality but not the physical rows that poisoned
+ * the serving path, allowing the full E2E failure to escape focused coverage.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
+     AcceptedPublicationThenGroupedVerifierMatchesSerial_CUDA2TPLLEPPhaseSplit)
+{
+    const std::vector<int32_t> serial_token_path{
+        1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
+        18255, 279,  12515, 303,   34904, 314,   18016, 321,
+        17676, 11,   321,   279,   5820,  310,   7534,  836,
+        21030, 43776, 279,   3594,  557,   40473, 321,   7478,
+    };
+    runMoEMainVerifierGroupedRowsMatchSerialDecode(
+        cudaOnlyCanonicalStochasticLLEPCase(),
+        /*verifier_row_count=*/6,
+        /*serial_setup_token_count=*/12,
+        /*exercise_shifted_row_maintenance=*/true,
+        /*configured_draft_tokens=*/15,
+        /*mirror_shifted_maintenance_in_serial_oracle=*/true,
+        serial_token_path,
+        /*exercise_device_rebalance_maintenance=*/true,
+        /*accepted_grouped_rows_before_verifier=*/2,
+        /*grouped_publication_tokens=*/{
+            34904,
+            314,
+            17676,
+            321,
+            18016,
+            11,
+        },
+        /*stochastic_summary_params=*/
+            qwen36MoEProductionStochasticSamplingParams(),
+        /*expected_stochastic_rejection_token=*/430,
+        /*stochastic_first_token_is_pending=*/true,
+        /*expected_stochastic_accepted_prefix=*/2);
+}
+
+/**
  * @brief Proves CUDA resident publication handles a rejected correction row.
  *
  * The full prefix-cache MTP cell once exposed a mismatch where the grouped
@@ -1125,6 +1406,48 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, DeviceResidentRejectPublicationMatch
         /*verify_device_resident_publication=*/true,
         /*expect_grouped_moe_verifier_prefill=*/false,
         /*force_first_speculative_rejection=*/true);
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @brief Reproduces partial accepted-state publication at production MTP depth.
+ *
+ * The canonical stochastic LLEP failure accepted verifier rows zero and one
+ * from a five-row transaction, then began the next transaction with a recurrent
+ * or KV state that was not serial-row-equivalent.  This focused proof preserves
+ * the production depth-15 workspace, forces rejection at comparison row one,
+ * and checks the complete device-resident publication before continuation.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
+     DeviceResidentPartialAcceptanceM5MatchesSerial_CUDA2TPLLEPPhaseSplit)
+{
+    const std::vector<int32_t> serial_token_path{
+        1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
+        18255, 279,  12515, 303,   34904, 314,   18016, 321,
+        17676, 1345, 279,   19053, 5820,  310,   7534,  836,
+        21030, 85949, 279,   3594,  557,   40473, 321,   7478,
+    };
+    ScopedEnvironmentValues perf_stats_enabled({
+        {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+    });
+    PerfStatsCollector::reset();
+    runMoEMainVerifierAllPositionRowsMatchSerialDecode(
+        cudaOnlyCanonicalStochasticLLEPCase(),
+        /*use_row_indexed_logits=*/true,
+        /*use_skip_gather=*/true,
+        /*verify_compact_device_outcome=*/true,
+        /*use_deferred_verifier_sync=*/true,
+        /*verify_published_state_continuation=*/true,
+        /*verifier_row_count=*/5,
+        /*verify_device_resident_publication=*/true,
+        /*expect_grouped_moe_verifier_prefill=*/false,
+        /*force_first_speculative_rejection=*/false,
+        /*serial_setup_token_count=*/27,
+        /*forced_speculative_rejection_row=*/1,
+        /*configured_draft_tokens=*/15,
+        serial_token_path);
     PerfStatsCollector::reset();
 }
 
@@ -1257,11 +1580,17 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPLLEPPha
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_CUDA2TPLLEPPhaseSplit)
 {
     runMoEStochasticMTPVerifierParity(
-        cudaOnlyLLEPPhaseSplitCase(),
-        3,
+        cudaOnlyCanonicalStochasticLLEPCase(),
+        4,
         false,
-        qwen36MoEStochasticDynamicDepthPolicy(3),
-        true);
+        qwen36MoEProductionStochasticDynamicDepthPolicy(15),
+        true,
+        1,
+        32,
+        5,
+        0,
+        qwen36MoEProductionStochasticSamplingParams(),
+        64);
 }
 
 /**
@@ -1407,6 +1736,56 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, GroupedVerifierRowsMatchSerial_ROCm2
 }
 
 /**
+ * @brief Mirrors the long-position M=2 grouped-verifier proof on ROCm LLEP.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
+     GroupedVerifierM2AtLongPositionMatchesSerial_ROCm2TPLLEPPhaseSplit)
+{
+    const std::vector<int32_t> serial_token_path{
+        1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
+        18255, 279,  12515, 303,   34904, 314,   18016, 321,
+        17676, 1345, 279,   19053, 5820,  310,   7534,  836,
+        21030, 85949, 279,   3594,  557,   40473, 321,   7478,
+    };
+    runMoEMainVerifierGroupedRowsMatchSerialDecode(
+        rocmOnlyCanonicalStochasticLLEPCase(),
+        /*verifier_row_count=*/2,
+        /*serial_setup_token_count=*/29,
+        /*exercise_shifted_row_maintenance=*/true,
+        /*configured_draft_tokens=*/15,
+        /*mirror_shifted_maintenance_in_serial_oracle=*/true,
+        serial_token_path,
+        /*exercise_device_rebalance_maintenance=*/true);
+}
+
+/**
+ * @brief Mirrors the post-movement M=6 CUDA verifier proof on ROCm.
+ *
+ * The canonical stochastic lane first reaches six verifier rows at condition
+ * token 836.  Both backends must prove that graph-owned LLEP placement waves
+ * remain numerically transparent before that grouped row is evaluated.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
+     GroupedVerifierM6AtLongPositionMatchesSerial_ROCm2TPLLEPPhaseSplit)
+{
+    const std::vector<int32_t> serial_token_path{
+        1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
+        18255, 279,  12515, 303,   34904, 314,   18016, 321,
+        17676, 1345, 279,   19053, 5820,  310,   7534,  836,
+        21030, 85949, 279,   3594,  557,   40473, 321,   7478,
+    };
+    runMoEMainVerifierGroupedRowsMatchSerialDecode(
+        rocmOnlyCanonicalStochasticLLEPCase(),
+        /*verifier_row_count=*/6,
+        /*serial_setup_token_count=*/23,
+        /*exercise_shifted_row_maintenance=*/true,
+        /*configured_draft_tokens=*/15,
+        /*mirror_shifted_maintenance_in_serial_oracle=*/true,
+        serial_token_path,
+        /*exercise_device_rebalance_maintenance=*/true);
+}
+
+/**
  * @brief Proves ROCm resident publication handles a rejected correction row.
  *
  * ROCm uses separate grouped MoE kernels and RCCL-backed LocalTP publication.
@@ -1435,6 +1814,46 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, DeviceResidentRejectPublicationMatch
         /*verify_device_resident_publication=*/true,
         /*expect_grouped_moe_verifier_prefill=*/false,
         /*force_first_speculative_rejection=*/true);
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @brief Mirrors the CUDA production-depth partial-acceptance publication proof.
+ *
+ * CUDA and ROCm share publication metadata semantics but own distinct KV and
+ * recurrent kernels.  Exercising the same five-row LLEP transaction on ROCm
+ * prevents a common-code fix from leaving the HIP state handoff unproven.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
+     DeviceResidentPartialAcceptanceM5MatchesSerial_ROCm2TPLLEPPhaseSplit)
+{
+    const std::vector<int32_t> serial_token_path{
+        1719,  6797, 15537, 13569, 888,   279,   11012, 32946,
+        18255, 279,  12515, 303,   34904, 314,   18016, 321,
+        17676, 1345, 279,   19053, 5820,  310,   7534,  836,
+        21030, 85949, 279,   3594,  557,   40473, 321,   7478,
+    };
+    ScopedEnvironmentValues perf_stats_enabled({
+        {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+    });
+    PerfStatsCollector::reset();
+    runMoEMainVerifierAllPositionRowsMatchSerialDecode(
+        rocmOnlyCanonicalStochasticLLEPCase(),
+        /*use_row_indexed_logits=*/true,
+        /*use_skip_gather=*/true,
+        /*verify_compact_device_outcome=*/true,
+        /*use_deferred_verifier_sync=*/true,
+        /*verify_published_state_continuation=*/true,
+        /*verifier_row_count=*/5,
+        /*verify_device_resident_publication=*/true,
+        /*expect_grouped_moe_verifier_prefill=*/false,
+        /*force_first_speculative_rejection=*/false,
+        /*serial_setup_token_count=*/27,
+        /*forced_speculative_rejection_row=*/1,
+        /*configured_draft_tokens=*/15,
+        serial_token_path);
     PerfStatsCollector::reset();
 }
 
@@ -1559,11 +1978,17 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPLLEPPha
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_ROCm2TPLLEPPhaseSplit)
 {
     runMoEStochasticMTPVerifierParity(
-        rocmOnlyLLEPPhaseSplitCase(),
-        3,
+        rocmOnlyCanonicalStochasticLLEPCase(),
+        4,
         false,
-        qwen36MoEStochasticDynamicDepthPolicy(3),
-        true);
+        qwen36MoEProductionStochasticDynamicDepthPolicy(15),
+        true,
+        1,
+        32,
+        5,
+        0,
+        qwen36MoEProductionStochasticSamplingParams(),
+        64);
 }
 
 /**

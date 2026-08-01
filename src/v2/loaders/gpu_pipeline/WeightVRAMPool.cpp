@@ -175,7 +175,7 @@ namespace llaminar2
         plans_[name] = plan;
         weight_order_.push_back(name);
 
-        LOG_DEBUG("Planned weight '" << name << "' N=" << N << " K=" << K
+        LOG_TRACE("Planned weight '" << name << "' N=" << N << " K=" << K
                                      << " payload=" << plan.payload_bytes
                                      << " scales=" << plan.scales_bytes
                                      << " mins=" << plan.mins_bytes
@@ -208,7 +208,7 @@ namespace llaminar2
         plans_[name] = plan;
         weight_order_.push_back(name);
 
-        LOG_DEBUG("Planned raw weight '" << name << "' N=" << N << " K=" << K
+        LOG_TRACE("Planned raw weight '" << name << "' N=" << N << " K=" << K
                                          << " bytes=" << raw_bytes);
     }
 

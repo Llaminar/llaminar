@@ -346,6 +346,20 @@ namespace llaminar2
         float *out_values, int *out_indices,
         float *partial_vals, int *partial_idxs, int partial_capacity,
         int device_idx, void *stream, int output_stride);
+    extern "C" bool rocmOps_apply_mtp_penalties_f32_rows(
+        float *data, int rows, int cols, int row_stride,
+        const int *verifier_input_tokens,
+        const int *generated_token_counts,
+        const MTPGreedyPenaltyPolicy *policy,
+        int device_idx, void *stream);
+    extern "C" bool rocmOps_apply_mtp_branch_penalties_f32_row(
+        float *data, int cols,
+        const int *first_condition_token,
+        const int *prior_draft_tokens,
+        int prior_draft_count,
+        const int *generated_token_counts,
+        const MTPGreedyPenaltyPolicy *policy,
+        int device_idx, void *stream);
     extern "C" bool rocmOps_commit_mtp_greedy_penalty_history(
         const int *output_tokens,
         const int *output_meta,
@@ -618,6 +632,82 @@ namespace llaminar2
             device_id,
             stream,
             output_stride);
+    }
+
+    bool ROCmBackend::enqueueApplyMTPPenaltiesToF32RowsDevice(
+        void *data_device,
+        int rows,
+        int cols,
+        int row_stride,
+        const void *verifier_input_tokens_device,
+        const void *generated_token_counts_device,
+        const void *penalty_policy_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !data_device || rows <= 0 || cols <= 0 || row_stride < cols ||
+            !generated_token_counts_device || !penalty_policy_device ||
+            !stream)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        PerfStatsCollector::ScopedTimer timer(
+            "backend",
+            "rocm_mtp_penalty_logit_rows_device_launch",
+            "decode");
+        return rocmOps_apply_mtp_penalties_f32_rows(
+            static_cast<float *>(data_device),
+            rows,
+            cols,
+            row_stride,
+            static_cast<const int *>(verifier_input_tokens_device),
+            static_cast<const int *>(generated_token_counts_device),
+            static_cast<const MTPGreedyPenaltyPolicy *>(
+                penalty_policy_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueApplyMTPBranchPenaltiesToF32RowDevice(
+        void *data_device,
+        int cols,
+        const void *first_condition_token_device,
+        const void *prior_draft_tokens_device,
+        int prior_draft_count,
+        const void *generated_token_counts_device,
+        const void *penalty_policy_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !data_device || cols <= 0 || !first_condition_token_device ||
+            prior_draft_count < 0 ||
+            (prior_draft_count > 0 && !prior_draft_tokens_device) ||
+            !generated_token_counts_device || !penalty_policy_device ||
+            !stream)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        PerfStatsCollector::ScopedTimer timer(
+            "backend",
+            "rocm_mtp_branch_penalty_logit_row_device_launch",
+            "decode");
+        return rocmOps_apply_mtp_branch_penalties_f32_row(
+            static_cast<float *>(data_device),
+            cols,
+            static_cast<const int *>(first_condition_token_device),
+            static_cast<const int *>(prior_draft_tokens_device),
+            prior_draft_count,
+            static_cast<const int *>(generated_token_counts_device),
+            static_cast<const MTPGreedyPenaltyPolicy *>(
+                penalty_policy_device),
+            device_id,
+            stream);
     }
 
     bool ROCmBackend::enqueueCommitMTPGreedyPenaltyHistoryDevice(
@@ -904,6 +994,8 @@ namespace llaminar2
         int *out_tokens,
         int out_token_capacity,
         int *out_meta,
+        const uint32_t *max_state_commit_rows,
+        int leading_committed_output_count,
         int device_idx,
         void *stream);
     extern "C" bool rocmOps_summarize_speculative_verify_batch_device_first_token(
@@ -919,6 +1011,8 @@ namespace llaminar2
         int *out_tokens,
         int out_token_capacity,
         int *out_meta,
+        const uint32_t *max_state_commit_rows,
+        int leading_committed_output_count,
         int device_idx,
         void *stream);
     extern "C" bool rocmOps_summarize_greedy_speculative_verify_batch(
@@ -932,6 +1026,8 @@ namespace llaminar2
         int *out_tokens,
         int out_token_capacity,
         int *out_meta,
+        const uint32_t *max_state_commit_rows,
+        int leading_committed_output_count,
         int device_idx,
         void *stream);
     extern "C" bool
@@ -943,6 +1039,18 @@ namespace llaminar2
         int *out_tokens,
         int out_token_capacity,
         int *out_meta,
+        const uint32_t *max_state_commit_rows,
+        const MTPGreedyPenaltyPolicy *penalty_policy,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_advance_speculative_commit_boundary(
+        const int *meta,
+        int request_count,
+        int meta_stride,
+        uint32_t *decode_rounds_committed,
+        uint32_t *decode_rounds_until_maintenance,
+        uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
         int device_idx,
         void *stream);
     extern "C" bool rocmOps_derive_speculative_publication_metadata(
@@ -2049,7 +2157,9 @@ namespace llaminar2
         void *stream,
         int out_token_capacity,
         void *out_tokens_device,
-        void *out_meta_device)
+        void *out_meta_device,
+        const void *max_state_commit_rows_device,
+        int leading_committed_output_count)
     {
         using namespace sampling_math;
         if (device_id >= device_count_ || device_id < 0 ||
@@ -2089,6 +2199,8 @@ namespace llaminar2
             static_cast<int *>(out_tokens_device),
             out_token_capacity,
             static_cast<int *>(out_meta_device),
+            static_cast<const uint32_t *>(max_state_commit_rows_device),
+            leading_committed_output_count,
             device_id,
             stream);
     }
@@ -2106,7 +2218,9 @@ namespace llaminar2
         void *stream,
         int out_token_capacity,
         void *out_tokens_device,
-        void *out_meta_device)
+        void *out_meta_device,
+        const void *max_state_commit_rows_device,
+        int leading_committed_output_count)
     {
         using namespace sampling_math;
         if (device_id >= device_count_ || device_id < 0 ||
@@ -2147,6 +2261,8 @@ namespace llaminar2
             static_cast<int *>(out_tokens_device),
             out_token_capacity,
             static_cast<int *>(out_meta_device),
+            static_cast<const uint32_t *>(max_state_commit_rows_device),
+            leading_committed_output_count,
             device_id,
             stream);
     }
@@ -2162,7 +2278,9 @@ namespace llaminar2
         void *stream,
         int out_token_capacity,
         void *out_tokens_device,
-        void *out_meta_device)
+        void *out_meta_device,
+        const void *max_state_commit_rows_device,
+        int leading_committed_output_count)
     {
         using namespace sampling_math;
         if (device_id >= device_count_ || device_id < 0 ||
@@ -2200,6 +2318,8 @@ namespace llaminar2
             static_cast<int *>(out_tokens_device),
             out_token_capacity,
             static_cast<int *>(out_meta_device),
+            static_cast<const uint32_t *>(max_state_commit_rows_device),
+            leading_committed_output_count,
             device_id,
             stream);
     }
@@ -2214,11 +2334,13 @@ namespace llaminar2
             void *stream,
             int out_token_capacity,
             void *out_tokens_device,
-            void *out_meta_device)
+            void *out_meta_device,
+            const void *max_state_commit_rows_device,
+            const void *penalty_policy_device)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !verify_tokens_device || !draft_tokens_device ||
-            !stop_tokens_device || compare_row_count < 0 ||
+            !stop_tokens_device || !penalty_policy_device || compare_row_count < 0 ||
             out_token_capacity < compare_row_count + 1 ||
             !stream || !out_tokens_device || !out_meta_device)
         {
@@ -2234,6 +2356,43 @@ namespace llaminar2
             static_cast<int *>(out_tokens_device),
             out_token_capacity,
             static_cast<int *>(out_meta_device),
+            static_cast<const uint32_t *>(max_state_commit_rows_device),
+            static_cast<const MTPGreedyPenaltyPolicy *>(penalty_policy_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueAdvanceSpeculativeCommitBoundary(
+        const void *meta_device,
+        int request_count,
+        int meta_stride,
+        void *decode_rounds_committed_device,
+        void *decode_rounds_until_maintenance_device,
+        void *maintenance_due_device,
+        void *decode_boundary_advanced_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ || !meta_device ||
+            request_count <= 0 ||
+            meta_stride < sampling_math::kSpeculativeBatchMetaCount ||
+            !decode_rounds_committed_device ||
+            !decode_rounds_until_maintenance_device ||
+            !maintenance_due_device ||
+            !decode_boundary_advanced_device || !stream)
+        {
+            return false;
+        }
+
+        HipDeviceGuard::setDevice(device_id);
+        return rocmOps_advance_speculative_commit_boundary(
+            static_cast<const int *>(meta_device),
+            request_count,
+            meta_stride,
+            static_cast<uint32_t *>(decode_rounds_committed_device),
+            static_cast<uint32_t *>(decode_rounds_until_maintenance_device),
+            static_cast<uint32_t *>(maintenance_due_device),
+            static_cast<uint32_t *>(decode_boundary_advanced_device),
             device_id,
             stream);
     }

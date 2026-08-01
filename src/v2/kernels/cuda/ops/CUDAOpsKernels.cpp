@@ -2216,7 +2216,7 @@ namespace llaminar2
                                   << " stream=" << gpu_stream_);
                         return false;
                     }
-                    LOG_DEBUG("[CUDAEmbeddingKernelT] Device-token embedding validation token="
+                    LOG_TRACE("[CUDAEmbeddingKernelT] Device-token embedding validation token="
                               << token_id << " local_vocab_size=" << local_vocab_size
                               << " vocab_offset=" << vocab_offset
                               << " in_local_range=" << (in_local_range ? 1 : 0));

@@ -173,16 +173,7 @@ namespace
         }
         else if (config.moe_rebalance.mode == MoERebalanceRuntimeMode::LLEP)
         {
-            expectPerfCounterPositive(
-                records,
-                "moe_rebalance",
-                "device_rebalance_llep_assignment_span_count",
-                context);
-            expectPerfCounterPositive(
-                records,
-                "moe_rebalance",
-                "device_rebalance_llep_weight_transfer_count",
-                context);
+            expectLLEPAppliedPrefillMovementPositive(records, context);
             expectPerfCounterPositive(
                 records,
                 "moe_rebalance",

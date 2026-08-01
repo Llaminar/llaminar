@@ -139,7 +139,7 @@ namespace llaminar2
             return false;
         }
 
-        LOG_DEBUG("[RoPEStage] Execute: seq_len=" << seq_len
+        LOG_TRACE("[RoPEStage] Execute: seq_len=" << seq_len
                                                   << " n_heads=" << params_.n_heads
                                                   << " n_kv_heads=" << params_.n_kv_heads
                                                   << " head_dim=" << params_.head_dim

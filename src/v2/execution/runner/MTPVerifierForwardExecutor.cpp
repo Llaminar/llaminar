@@ -72,12 +72,10 @@ namespace llaminar2
              * runner-owned device buffer.
              */
             forward_ok = options.device_token_ids
-                             ? runner.forwardWithDeviceTokenIds(
+                             ? runner.forwardGroupedMTPVerifierWithDeviceTokenIds(
                                    plan.verifier_input_tokens.data(),
                                    options.device_token_ids,
-                                   seq_len,
-                                   DeviceTokenForwardPurpose::
-                                       GroupedMTPVerifier)
+                                   seq_len)
                              : runner.forward(
                                    plan.verifier_input_tokens.data(),
                                    seq_len);

@@ -85,6 +85,45 @@ namespace llaminar2
         }
 
         /**
+         * @brief Prompt query rows must not multiply request-major attention scratch.
+         *
+         * This is the allocator-scale regression for a 4096-row prefill that
+         * previously requested two 256 GiB FP32 K/V conversion buffers. The
+         * compact split-decode bank remains fixed at the complete depth-15 MTP
+         * verifier capacity, while K/V conversion scales only with independent
+         * requests.
+         */
+        TEST(
+            Test__AttentionWorkspaceCardinality,
+            WorkspaceCardinalitySeparatesPromptRowsFromRequests)
+        {
+            constexpr auto decode =
+                attention::planAttentionWorkspaceCardinality(
+                    /*graph_query_rows=*/1,
+                    /*stage_request_count=*/1);
+            constexpr auto maximum_prefill =
+                attention::planAttentionWorkspaceCardinality(
+                    /*graph_query_rows=*/4096,
+                    /*stage_request_count=*/1);
+            constexpr auto batched =
+                attention::planAttentionWorkspaceCardinality(
+                    /*graph_query_rows=*/4096,
+                    /*stage_request_count=*/4);
+
+            EXPECT_EQ(
+                decode.compact_query_rows,
+                attention::kMaxGroupedVerifierAttentionRows);
+            EXPECT_EQ(
+                maximum_prefill.compact_query_rows,
+                decode.compact_query_rows);
+            EXPECT_EQ(maximum_prefill.request_count, 1);
+            EXPECT_EQ(batched.request_count, 4);
+            EXPECT_EQ(
+                batched.compact_query_rows,
+                attention::kMaxGroupedVerifierAttentionRows);
+        }
+
+        /**
          * @brief Mock KV cache for testing dynamic kv_len queries
          *
          * This mock allows us to control what get_cached_tokens() returns

@@ -1161,10 +1161,39 @@ namespace llaminar2
                 outcome.all_drafts_accepted &&
                 !outcome.stopped_on_output &&
                 outcome.bonus_ready_token.has_value();
+            const bool has_commit_boundary_ready =
+                outcome.commit_boundary_clipped &&
+                outcome.commit_boundary_ready_token.has_value();
+            if (outcome.commit_boundary_clipped)
+            {
+                if (outcome.all_drafts_accepted ||
+                    outcome.stopped_on_output ||
+                    outcome.bonus_ready_token.has_value() ||
+                    !has_commit_boundary_ready)
+                {
+                    return fail_request(
+                        "commit-boundary outcome has inconsistent terminal flags");
+                }
+                if (outcome.accepted_verifier_input_prefix <= 0 ||
+                    outcome.accepted_verifier_input_prefix >= outcome.draft_count ||
+                    committed_count != outcome.accepted_verifier_input_prefix)
+                {
+                    return fail_request(
+                        "commit-boundary outcome does not end at an interior committed prefix");
+                }
+            }
+            else if (outcome.commit_boundary_ready_token.has_value())
+            {
+                return fail_request(
+                    "non-boundary outcome carries a commit-boundary ready token");
+            }
             if (outcome.all_drafts_accepted)
             {
-                if (outcome.accepted_verifier_input_prefix != outcome.draft_count)
+                if (!outcome.stopped_on_output &&
+                    outcome.accepted_verifier_input_prefix != outcome.draft_count)
+                {
                     return fail_request("all-accepted outcome must publish every verifier input row");
+                }
                 if (!outcome.stopped_on_output &&
                     !outcome.bonus_ready_token.has_value())
                 {
@@ -1175,6 +1204,14 @@ namespace llaminar2
                 !tokenInVocab(*outcome.bonus_ready_token, outcome.vocab_size))
             {
                 return fail_request("accepted outcome bonus ready token is outside the vocabulary");
+            }
+            if (outcome.commit_boundary_ready_token.has_value() &&
+                !tokenInVocab(
+                    *outcome.commit_boundary_ready_token,
+                    outcome.vocab_size))
+            {
+                return fail_request(
+                    "accepted outcome commit-boundary ready token is outside the vocabulary");
             }
 
             const int valid_sampled_count =
@@ -1196,6 +1233,12 @@ namespace llaminar2
             {
                 return fail_request("accepted outcome state commit count is outside committed prefix");
             }
+            if (outcome.commit_boundary_clipped &&
+                state_commit_count != committed_count)
+            {
+                return fail_request(
+                    "commit-boundary outcome must publish its complete committed prefix");
+            }
 
             const int i = static_cast<int>(request_index);
             const int draft_offset = i * shape.max_draft_tokens;
@@ -1214,8 +1257,11 @@ namespace llaminar2
             batch.token_indices_to_sample[request_index] =
                 valid_sampled_count - 1;
             batch.next_condition_tokens[request_index] =
-                has_bonus_ready ? *outcome.bonus_ready_token
-                                : outcome.committed_output_tokens.back();
+                has_commit_boundary_ready
+                    ? *outcome.commit_boundary_ready_token
+                    : (has_bonus_ready
+                           ? *outcome.bonus_ready_token
+                           : outcome.committed_output_tokens.back());
             batch.all_drafts_accepted_flags[request_index] =
                 outcome.all_drafts_accepted ? 1 : 0;
             batch.stopped_flags[request_index] =

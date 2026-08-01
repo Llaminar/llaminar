@@ -823,7 +823,7 @@ namespace llaminar2
                     use_fp16kv_direct = true;
                     K_fp16_ptr = K->gpu_data_ptr();
                     V_fp16_ptr = V->gpu_data_ptr();
-                    LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] FP16 KV direct path (no conversion)");
+                    LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] FP16 KV direct path (no conversion)");
                 }
                 else if (K->native_type() == TensorType::Q8_1 && seq_len == 1)
                 {
@@ -833,7 +833,7 @@ namespace llaminar2
                     use_q8kv_direct = true;
                     K_q8_ptr = K->gpu_data_ptr();
                     V_q8_ptr = V->gpu_data_ptr();
-                    LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Q8_1 KV fused decode path (no workspace)");
+                    LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Q8_1 KV fused decode path (no workspace)");
                 }
                 else
                 {
@@ -947,7 +947,7 @@ namespace llaminar2
                 mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
             }
 
-            LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] batch=" << batch_size
+            LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] batch=" << batch_size
                                                                                  << " seq_len=" << seq_len << " kv_len=" << kv_len
                                                                                  << " n_heads=" << n_heads << " n_kv_heads=" << n_kv_heads
                                                                                  << " head_dim=" << head_dim << " causal=" << causal);
@@ -1003,7 +1003,7 @@ namespace llaminar2
 
                 if (use_small_fp16kv_decode)
                 {
-                    LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode path"
+                    LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode path"
                               << " rows=" << seq_len
                               << " kv_len=" << kv_len
                               << " n_heads=" << n_heads
@@ -1084,7 +1084,7 @@ namespace llaminar2
                 }
 
                 // PREFILL: FA2 with FP16 KV
-                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] FA2 FP16KV prefill path"
+                LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>] FA2 FP16KV prefill path"
                           << " seq_len=" << seq_len
                           << " kv_len=" << kv_len
                           << " n_heads=" << n_heads
@@ -1516,7 +1516,7 @@ namespace llaminar2
             reqs.buffers.push_back({AttentionWorkspaceBuffers::K_TMP_FP32, kv_convert_bytes, 256, true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::V_TMP_FP32, kv_convert_bytes, 256, true});
 
-            LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>::getWorkspaceRequirements] "
+            LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>::getWorkspaceRequirements] "
                       << "batch=" << batch_size << " n_heads=" << n_heads << " head_dim=" << head_dim
                       << " num_splits=" << num_splits
                       << " max_kv_len=" << max_kv_len
@@ -1536,7 +1536,7 @@ namespace llaminar2
             dynamic_attn_device_valid_ = false;
             if (workspace)
             {
-                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Bound workspace manager");
+                LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>] Bound workspace manager");
             }
             else
             {
@@ -2139,7 +2139,7 @@ namespace llaminar2
             workspace_ = workspace;
             if (workspace)
             {
-                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Bound workspace manager");
+                LOG_TRACE("[CUDAFlashAttentionKernelT<FP16>] Bound workspace manager");
             }
             else
             {
@@ -2431,7 +2431,7 @@ namespace llaminar2
             workspace_ = workspace;
             if (workspace)
             {
-                LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Bound workspace manager");
+                LOG_TRACE("[CUDAFlashAttentionKernelT<BF16>] Bound workspace manager");
             }
             else
             {

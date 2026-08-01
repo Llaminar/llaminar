@@ -46,11 +46,9 @@ namespace llaminar2::routed_expert_assignment
         const AssignmentWorkspace &workspace,
         AssignmentSpan *spans,
         uint32_t span_capacity,
-        AssignmentStatus *status_out) noexcept
+        AssignmentStatus &status) noexcept
     {
-        AssignmentStatus status{};
-        if (status_out)
-            *status_out = status;
+        status = {};
 
         if (expert_loads == nullptr ||
             expert_owner_participants == nullptr ||
@@ -58,8 +56,6 @@ namespace llaminar2::routed_expert_assignment
             config.participant_count == 0u)
         {
             status.invalid_config = 1u;
-            if (status_out)
-                *status_out = status;
             return false;
         }
 
@@ -75,8 +71,6 @@ namespace llaminar2::routed_expert_assignment
             if (owner >= config.participant_count)
             {
                 status.invalid_config = 1u;
-                if (status_out)
-                    *status_out = status;
                 return false;
             }
 
@@ -106,8 +100,6 @@ namespace llaminar2::routed_expert_assignment
                     config.max_non_owner_experts_per_participant,
                     config.participant_count))
             {
-                if (status_out)
-                    *status_out = status;
                 return false;
             }
         }
@@ -128,8 +120,6 @@ namespace llaminar2::routed_expert_assignment
         status.assigned_load_max = status.standard_load_max;
         status.assigned_load_spread = status.standard_load_spread;
 
-        if (status_out)
-            *status_out = status;
         return status.overflow == 0u;
     }
 
@@ -142,7 +132,7 @@ namespace llaminar2::routed_expert_assignment
         uint32_t span_capacity,
         WeightTransfer *transfers,
         uint32_t transfer_capacity,
-        AssignmentStatus *status_out) noexcept
+        AssignmentStatus &status) noexcept
     {
         switch (config.algorithm)
         {
@@ -154,7 +144,7 @@ namespace llaminar2::routed_expert_assignment
                 workspace,
                 spans,
                 span_capacity,
-                status_out);
+                status);
         case Algorithm::LeastLoadedResident:
             return least_loaded_ep::planLeastLoadedExpertAssignment(
                 expert_loads,
@@ -165,13 +155,11 @@ namespace llaminar2::routed_expert_assignment
                 span_capacity,
                 transfers,
                 transfer_capacity,
-                status_out);
+                status);
         }
 
-        AssignmentStatus status{};
+        status = {};
         status.invalid_config = 1u;
-        if (status_out)
-            *status_out = status;
         return false;
     }
 

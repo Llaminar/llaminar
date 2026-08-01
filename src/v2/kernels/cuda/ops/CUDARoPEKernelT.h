@@ -183,7 +183,7 @@ namespace llaminar2
             {
                 (void)mpi_ctx;
 
-                LOG_DEBUG("[CUDARoPEKernelT<FP32>] apply_tensor called: seq_len=" << seq_len
+                LOG_TRACE("[CUDARoPEKernelT<FP32>] apply_tensor called: seq_len=" << seq_len
                                                                                   << " n_heads=" << n_heads << " device_idx=" << device_idx
                                                                                   << " pos_offset=" << pos_offset
                                                                                   << " rotary_dim=" << rotary_dim);

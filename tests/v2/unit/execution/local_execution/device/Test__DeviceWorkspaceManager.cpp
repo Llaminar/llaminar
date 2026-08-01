@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <set>
 #include <cstring>
+#include <map>
 
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "backends/BackendManager.h"
@@ -191,6 +192,122 @@ TEST_F(Test__DeviceWorkspaceManager, AllocateMultipleBuffers)
     EXPECT_EQ(mgr.getBufferSize("buffer_a"), 1024);
     EXPECT_EQ(mgr.getBufferSize("buffer_b"), 2048);
     EXPECT_EQ(mgr.getBufferSize("buffer_c"), 4096);
+}
+
+/**
+ * @brief Joint family planning removes order-dependent insertion fragmentation.
+ *
+ * Incremental placement of the prefill participant below leaves two 300-byte
+ * holes around the common 400-byte interval. The later 600-byte verifier bank
+ * cannot fit either hole even though both complete participants require exactly
+ * 1000 bytes. A pre-capture family plan moves the common interval behind the
+ * mutually exclusive banks and publishes all four stable names at once.
+ */
+TEST_F(
+    Test__DeviceWorkspaceManager,
+    SerialFamilyPlannerOverlaysSplitPrefillAndVerifierIntervals)
+{
+    WorkspaceRequirements prefill;
+    prefill.buffers = {
+        {"prefill_left", 300, 1, true,
+         WorkspaceExecutionRegime::PrefillOnly},
+        {"common", 400, 1, true, WorkspaceExecutionRegime::Any},
+        {"prefill_right", 300, 1, true,
+         WorkspaceExecutionRegime::PrefillOnly},
+    };
+    WorkspaceRequirements verifier;
+    verifier.buffers = {
+        {"common", 400, 1, true, WorkspaceExecutionRegime::Any},
+        {"grouped_kpar", 600, 1, true,
+         WorkspaceExecutionRegime::CompactDecodeOnly},
+    };
+
+    const SerialWorkspaceFamilyPlan plan =
+        DeviceWorkspaceManager::planSerialFamily({prefill, verifier});
+    ASSERT_TRUE(plan.valid()) << plan.error;
+    ASSERT_EQ(plan.total_bytes, 1000u)
+        << "The family should need the common interval plus the larger of the "
+           "mutually exclusive prefill and verifier banks.";
+
+    const auto intervalFor =
+        [&](const char *name) -> std::pair<size_t, size_t>
+    {
+        const auto *placement = plan.find(name);
+        EXPECT_NE(placement, nullptr) << name;
+        if (!placement)
+            return {};
+        return {
+            placement->offset,
+            placement->offset + placement->descriptor.size_bytes};
+    };
+    const auto overlaps =
+        [](const std::pair<size_t, size_t> &lhs,
+           const std::pair<size_t, size_t> &rhs)
+    {
+        return lhs.first < rhs.second && rhs.first < lhs.second;
+    };
+
+    const auto common = intervalFor("common");
+    const auto grouped = intervalFor("grouped_kpar");
+    const auto prefill_left = intervalFor("prefill_left");
+    const auto prefill_right = intervalFor("prefill_right");
+    EXPECT_FALSE(overlaps(common, grouped));
+    EXPECT_FALSE(overlaps(common, prefill_left));
+    EXPECT_FALSE(overlaps(common, prefill_right));
+    EXPECT_FALSE(overlaps(prefill_left, prefill_right));
+    EXPECT_TRUE(
+        overlaps(grouped, prefill_left) ||
+        overlaps(grouped, prefill_right))
+        << "The verifier bank must reuse bytes owned only by prefill.";
+
+    DeviceWorkspaceManager manager(device, plan.total_bytes);
+    ASSERT_TRUE(manager.allocateSerialFamily(plan));
+    EXPECT_EQ(manager.primaryBlockSize(), 1000u);
+    EXPECT_EQ(manager.used(), 1000u);
+    EXPECT_EQ(manager.getBufferSize("grouped_kpar"), 600u);
+    EXPECT_TRUE(manager.bindSerialParticipant(prefill));
+    EXPECT_TRUE(manager.bindSerialParticipant(verifier));
+}
+
+/**
+ * @brief Family planning is deterministic and publishes maximum name capacity.
+ */
+TEST_F(
+    Test__DeviceWorkspaceManager,
+    SerialFamilyPlannerIsOrderIndependentAndPromotesSharedNames)
+{
+    WorkspaceRequirements first;
+    first.buffers = {
+        {"shared", 128, 64, true},
+        {"first_only", 256, 64, true},
+    };
+    WorkspaceRequirements second;
+    second.buffers = {
+        {"second_only", 384, 64, true},
+        {"shared", 512, 64, true},
+    };
+
+    const SerialWorkspaceFamilyPlan forward =
+        DeviceWorkspaceManager::planSerialFamily({first, second});
+    const SerialWorkspaceFamilyPlan reverse =
+        DeviceWorkspaceManager::planSerialFamily({second, first});
+    ASSERT_TRUE(forward.valid()) << forward.error;
+    ASSERT_TRUE(reverse.valid()) << reverse.error;
+    ASSERT_EQ(forward.total_bytes, reverse.total_bytes);
+    ASSERT_EQ(forward.placements.size(), reverse.placements.size());
+
+    for (const auto &placement : forward.placements)
+    {
+        const auto *other =
+            reverse.find(placement.descriptor.name);
+        ASSERT_NE(other, nullptr);
+        EXPECT_EQ(other->offset, placement.offset);
+        EXPECT_EQ(
+            other->descriptor.size_bytes,
+            placement.descriptor.size_bytes);
+    }
+    ASSERT_NE(forward.find("shared"), nullptr);
+    EXPECT_EQ(forward.find("shared")->descriptor.size_bytes, 512u);
 }
 
 TEST_F(Test__DeviceWorkspaceManager, EmitsStructuredMemoryCountersForWorkspaceLayout)
@@ -890,6 +1007,198 @@ TEST_F(Test__DeviceWorkspaceManager, FailedImmutablePublicationRollsBackItsSlot)
     EXPECT_TRUE(retry.created);
     EXPECT_EQ(retry.slot, 0u)
         << "A failed event or conversion setup must not poison the immutable publication namespace";
+}
+
+/**
+ * @brief Variable-width publication identity remains collision-free.
+ *
+ * MoE descriptor tables share matrix geometry across model layers. Their
+ * complete per-expert device-pointer records therefore live in the key's exact
+ * identity tail; a fixed four-word prefix or digest cannot distinguish them
+ * safely.
+ */
+TEST_F(Test__DeviceWorkspaceManager, ImmutablePublicationComparesExactIdentityTail)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    const PersistentWorkspacePublicationKey first_key{
+        .word0 = 256,
+        .word1 = 2048,
+        .word2 = 512,
+        .word3 = 2,
+        .identity_words = {11, 12, 13, 14},
+    };
+    const PersistentWorkspacePublicationKey second_key{
+        .word0 = 256,
+        .word1 = 2048,
+        .word2 = 512,
+        .word3 = 2,
+        .identity_words = {11, 12, 13, 15},
+    };
+
+    const auto first = mgr.getOrCreatePersistentPublication(
+        "exact_descriptor_identity",
+        first_key,
+        /*slot_capacity=*/2,
+        [](size_t slot) -> std::shared_ptr<void>
+        {
+            EXPECT_EQ(slot, 0u);
+            return std::make_shared<int>(11);
+        });
+    ASSERT_TRUE(first);
+    EXPECT_TRUE(first.created);
+
+    const auto adopted = mgr.getOrCreatePersistentPublication(
+        "exact_descriptor_identity",
+        first_key,
+        /*slot_capacity=*/2,
+        [](size_t) -> std::shared_ptr<void>
+        {
+            ADD_FAILURE()
+                << "An exact identity must adopt the existing publication";
+            return {};
+        });
+    ASSERT_TRUE(adopted);
+    EXPECT_FALSE(adopted.created);
+    EXPECT_EQ(adopted.slot, first.slot);
+
+    const auto distinct = mgr.getOrCreatePersistentPublication(
+        "exact_descriptor_identity",
+        second_key,
+        /*slot_capacity=*/2,
+        [](size_t slot) -> std::shared_ptr<void>
+        {
+            EXPECT_EQ(slot, 1u);
+            return std::make_shared<int>(15);
+        });
+    ASSERT_TRUE(distinct);
+    EXPECT_TRUE(distinct.created);
+    EXPECT_NE(distinct.slot, first.slot);
+}
+
+/**
+ * @brief Proves graph-family cardinality cannot consume descriptor capacity.
+ *
+ * Dynamic MTP materializes many graph-local MoE kernel owners for verifier
+ * depths and prefill buckets. Those owners all reference the same immutable
+ * prepared-weight descriptor bytes. Descriptor capacity therefore scales with
+ * unique tables, never with the number of captured graph objects.
+ */
+TEST_F(
+    Test__DeviceWorkspaceManager,
+    ExactDescriptorPublicationDoesNotScaleWithGraphOwnerCount)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    const PersistentWorkspacePublicationKey descriptor_key{
+        .word0 = 256,
+        .word1 = 2048,
+        .word2 = 512,
+        .word3 = 2,
+        .identity_words = {100, 200, 300, 400, 500, 600},
+    };
+
+    constexpr int kGraphOwnerCount = 2048;
+    int factory_calls = 0;
+    std::shared_ptr<void> canonical_publication;
+    for (int graph_owner = 0; graph_owner < kGraphOwnerCount; ++graph_owner)
+    {
+        const auto result = mgr.getOrCreatePersistentPublication(
+            "cuda_moe_grouped_gateup_descriptors",
+            descriptor_key,
+            /*slot_capacity=*/1,
+            [&](size_t slot) -> std::shared_ptr<void>
+            {
+                EXPECT_EQ(slot, 0u);
+                ++factory_calls;
+                return std::make_shared<int>(graph_owner);
+            });
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result.slot, 0u);
+        if (!canonical_publication)
+        {
+            EXPECT_TRUE(result.created);
+            canonical_publication = result.publication;
+        }
+        else
+        {
+            EXPECT_FALSE(result.created);
+            EXPECT_EQ(result.publication, canonical_publication);
+        }
+    }
+
+    EXPECT_EQ(factory_calls, 1)
+        << "Only the first graph owner may publish immutable descriptor bytes";
+}
+
+/**
+ * @brief Ordered mutation removes the obsolete exact identity.
+ *
+ * Dynamic expert descriptors keep their captured address while transfer-slot
+ * contents change. A graph requesting the old descriptor identity afterward
+ * must receive fresh storage, while the replacement identity adopts the
+ * re-recorded publication.
+ */
+TEST_F(Test__DeviceWorkspaceManager, OrderedPublicationWriteReindexesExactIdentity)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    const PersistentWorkspacePublicationKey before{
+        .word0 = 40,
+        .identity_words = {100, 200},
+    };
+    const PersistentWorkspacePublicationKey after{
+        .word0 = 40,
+        .identity_words = {100, 300},
+    };
+
+    const auto original = mgr.getOrCreatePersistentPublication(
+        "dynamic_descriptor_table",
+        before,
+        /*slot_capacity=*/2,
+        [](size_t slot) -> std::shared_ptr<void>
+        {
+            EXPECT_EQ(slot, 0u);
+            return std::make_shared<int>(1);
+        });
+    ASSERT_TRUE(original);
+    int rewrite_calls = 0;
+    ASSERT_TRUE(mgr.rewritePersistentPublication(
+        "dynamic_descriptor_table",
+        after,
+        original.publication,
+        original.slot,
+        /*slot_capacity=*/2,
+        [&]()
+        {
+            ++rewrite_calls;
+            return true;
+        }));
+    EXPECT_EQ(rewrite_calls, 1);
+
+    const auto adopted_after = mgr.getOrCreatePersistentPublication(
+        "dynamic_descriptor_table",
+        after,
+        /*slot_capacity=*/2,
+        [](size_t) -> std::shared_ptr<void>
+        {
+            ADD_FAILURE()
+                << "Replacement identity must adopt the ordered publication";
+            return {};
+        });
+    ASSERT_TRUE(adopted_after);
+    EXPECT_FALSE(adopted_after.created);
+    EXPECT_EQ(adopted_after.publication, original.publication);
+
+    const auto recreated_before = mgr.getOrCreatePersistentPublication(
+        "dynamic_descriptor_table",
+        before,
+        /*slot_capacity=*/2,
+        [](size_t slot) -> std::shared_ptr<void>
+        {
+            EXPECT_EQ(slot, 1u);
+            return std::make_shared<int>(2);
+        });
+    ASSERT_TRUE(recreated_before);
+    EXPECT_TRUE(recreated_before.created);
+    EXPECT_NE(recreated_before.publication, original.publication);
 }
 
 TEST_F(Test__DeviceWorkspaceManager, ReleaseInvalidatesOldMetadataLeaseNamespace)

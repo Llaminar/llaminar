@@ -4960,9 +4960,8 @@ namespace llaminar2::test::parity::qwen36
         if (device.is_gpu())
         {
             ASSERT_TRUE(runner
-                            ->deviceStochasticTargetSampleSlot(
-                                kCatchupTargetSampleSlot,
-                                /*require_ready=*/true)
+                            ->deviceStochasticTargetSampleProducerSlot(
+                                kCatchupTargetSampleSlot)
                             .valid())
                 << "prefix restore must preserve the explicitly verifier-owned "
                    "condition-token event edge";
@@ -5278,11 +5277,11 @@ namespace llaminar2::test::parity::qwen36
                     static_cast<int>(verifier_tokens.size() - 1));
             ASSERT_NE(verifier_tokens_device, nullptr)
                 << "dense GPU grouped verifier must bind its arena-owned token row";
-            grouped_forward_ok = runner->forwardWithDeviceTokenIds(
+            grouped_forward_ok =
+                runner->forwardGroupedMTPVerifierWithDeviceTokenIds(
                 verifier_tokens.data(),
                 verifier_tokens_device,
-                static_cast<int>(verifier_tokens.size()),
-                DeviceTokenForwardPurpose::GroupedMTPVerifier);
+                static_cast<int>(verifier_tokens.size()));
         }
         else
         {

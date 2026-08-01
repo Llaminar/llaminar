@@ -236,6 +236,10 @@ namespace llaminar2
         static std::unique_ptr<IComputeStage> createSharedExpertGate(
             const SharedExpertGateStage::Params &params);
 
+        /** @brief Create the device-only router-ordered LocalTP MoE reducer. */
+        static std::unique_ptr<IComputeStage> createMoECanonicalRouteReduce(
+            const MoECanonicalRouteReduceStage::Params &params);
+
         // =====================================================================
         // GDN (Gated Delta Net) Stages
         // =====================================================================

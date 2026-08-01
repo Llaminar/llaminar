@@ -41,10 +41,10 @@ namespace llaminar2
      * A serial device family includes ordinary prefill/decode, MTP sidecars,
      * grouped verification, accepted-state publication, and decode catch-up on
      * one device. Producer events order every transition between those graphs,
-     * so their graph-local layouts may alias one primary allocation. Buffers
-     * within one participant never alias each other, and buffers whose contents
-     * survive into a concurrently executable graph require
-     * @ref ExclusiveLifetime.
+     * so their graph-local layouts may alias one primary allocation. A
+     * participant whose state survives that transition instead declares
+     * @ref WorkspaceGraphParticipantLifetime::PersistentAcrossParticipants;
+     * its buffers remain disjoint while graph-local siblings still alias.
      */
     enum class WorkspaceGraphFamilyPolicy : uint8_t
     {
@@ -67,6 +67,58 @@ namespace llaminar2
          * intentionally exceptional and must be selected explicitly.
          */
         ExclusiveLifetime,
+    };
+
+    /**
+     * @brief Mathematical execution role of one materialized family graph.
+     *
+     * Row count cannot identify graph semantics: an M=16 prompt is prefill,
+     * while an M=16 speculative continuation is grouped decode. Workspace
+     * descriptors use this role to retain prefill-only or compact-only buffers
+     * without inferring policy from tensor geometry.
+     */
+    enum class WorkspaceGraphParticipantRole : uint8_t
+    {
+        Prefill,                 ///< Prompt rows and prefill-only workspace.
+        Decode,                  ///< Ordinary one-row autoregressive decode.
+        GroupedVerifier,         ///< Compact serial-row-equivalent MTP verification.
+        MTPCondition,            ///< One device-resident main-model row per active request.
+        MoERebalanceMaintenance, ///< Device-owned asynchronous MoE maintenance transaction.
+    };
+
+    /**
+     * @brief Physical lifetime of one graph participant's workspace contents.
+     *
+     * Execution order alone does not prove that a completed graph's storage is
+     * dead. Device MoE maintenance, for example, publishes status and controller
+     * records that remain device-owned until a request epilogue exports them.
+     * This closed enum makes that retained lifetime part of family declaration
+     * instead of relying on buffer names or delayed host behavior.
+     */
+    enum class WorkspaceGraphParticipantLifetime : uint8_t
+    {
+        /**
+         * @brief Every workspace value is dead after the participant handoff.
+         */
+        SerialGraphLocal,
+
+        /**
+         * @brief Workspace contents remain live while other family graphs run.
+         */
+        PersistentAcrossParticipants,
+    };
+
+    /**
+     * @brief Typed non-owning declaration of one exact graph-family member.
+     */
+    struct WorkspaceGraphParticipant
+    {
+        const ComputeGraph *graph = nullptr; ///< Materialized production topology.
+        WorkspaceGraphParticipantRole role =
+            WorkspaceGraphParticipantRole::Decode; ///< Explicit execution semantics.
+        WorkspaceGraphParticipantLifetime lifetime =
+            WorkspaceGraphParticipantLifetime::
+                SerialGraphLocal; ///< Whether this participant may physically alias siblings.
     };
 
     /**
@@ -112,6 +164,45 @@ namespace llaminar2
          * configured MTP depth.
          */
         int serial_family_max_compact_rows = 0;
+        /**
+         * @brief Largest output width owned by a terminal projection in this family.
+         *
+         * A phase-split LocalTP family can capture column-parallel prefill
+         * first and bind a replicated full-vocabulary LM head for decode or
+         * grouped MTP verification later. Those graph participants share
+         * stable workspace names even though their output widths differ.
+         * Advertising the family envelope before the first capture lets the
+         * allocator publish one address with enough capacity for every
+         * participant; changing that address after capture remains forbidden.
+         *
+         * Zero preserves the consumer's own prepared width. A positive value
+         * is an envelope, not an unconditional replacement: callers that
+         * already declare a wider projection keep that wider value.
+         */
+        int serial_family_max_terminal_projection_columns = 0;
+
+        /**
+         * @brief Resolve a participant's terminal projection width.
+         *
+         * This pure helper makes the width-envelope policy independently
+         * testable without constructing a GPU graph or allocating device
+         * memory. The returned zero retains the existing
+         * `IWorkspaceConsumer` convention that the prepared kernel supplies
+         * its own N dimension.
+         *
+         * @param participant_columns Width explicitly declared by the current
+         *        graph participant, or zero to use the prepared kernel width.
+         * @return The widest declared participant/family projection width.
+         */
+        [[nodiscard]] constexpr int resolveTerminalProjectionColumns(
+            int participant_columns) const noexcept
+        {
+            return serial_family_max_terminal_projection_columns >
+                           participant_columns
+                       ? serial_family_max_terminal_projection_columns
+                       : participant_columns;
+        }
+
         int n_heads = 0;
         int head_dim = 0;
         int d_model = 0;
@@ -238,6 +329,46 @@ namespace llaminar2
          */
         bool allocateForGraph(
             const ComputeGraph &graph,
+            const WorkspaceSizingHints &hints,
+            const std::vector<WorkspaceConsumerRequest> &extra_consumers = {},
+            const WorkspaceBudgetConfig &config = WorkspaceBudgetConfig{});
+
+        /**
+         * @brief Allocate one stable workspace for a complete serial graph family.
+         *
+         * GPU graph executables retain the raw addresses returned by
+         * DeviceWorkspaceManager.  Consequently every graph that can run in the
+         * same event-ordered request lifetime must participate in the first
+         * layout decision. This method treats @p primary_graph according to its
+         * explicit mathematical role, including any configured family envelope,
+         * and treats every graph in
+         * @p exact_serial_participants as a distinct exact-shape participant
+         * with an explicit mathematical execution role.
+         *
+         * Distinct participants may reuse physical bytes because their producer
+         * and consumer events serialize execution.  Shared workspace names
+         * nevertheless receive one family-wide capacity and address, so a later
+         * graph capture cannot observe a smaller allocation than it requires.
+         * All participant consumers are bound only after the complete layout has
+         * been allocated successfully.
+         *
+         * @param primary_graph Main forward graph whose sizing policy is
+         *        described by @p hints.
+         * @param primary_role Mathematical role of the primary graph. This may
+         *        not be inferred from M because prompt and verifier M overlap.
+         * @param exact_serial_participants Additional already-materialized
+         *        graph topologies, each queried at its own declared stage shape.
+         * @param hints Model and graph-family sizing policy.
+         * @param extra_consumers Non-graph consumers that share the primary
+         *        participant lifetime.
+         * @param config Workspace budget policy.
+         * @return true when one stable allocation covers and binds every member.
+         */
+        bool allocateForGraphFamily(
+            const ComputeGraph &primary_graph,
+            WorkspaceGraphParticipantRole primary_role,
+            const std::vector<WorkspaceGraphParticipant> &
+                exact_serial_participants,
             const WorkspaceSizingHints &hints,
             const std::vector<WorkspaceConsumerRequest> &extra_consumers = {},
             const WorkspaceBudgetConfig &config = WorkspaceBudgetConfig{});

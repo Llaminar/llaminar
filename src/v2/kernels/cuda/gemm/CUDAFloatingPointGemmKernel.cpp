@@ -198,7 +198,7 @@ namespace llaminar2
 
             cublas_kernel_ = std::make_unique<CuBLASGemmKernel>(cuda_device_id_, cublas_precision);
 
-            LOG_DEBUG("[CUDAFloatingPointGemmKernel] Created (raw ptr) for " << N_ << "x" << K_
+            LOG_TRACE("[CUDAFloatingPointGemmKernel] Created (raw ptr) for " << N_ << "x" << K_
                       << " weights on CUDA device " << cuda_device_id_);
         }
 

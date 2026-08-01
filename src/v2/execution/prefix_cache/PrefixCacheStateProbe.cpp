@@ -204,6 +204,8 @@ namespace llaminar2
             policy.requested_kv_segments = parseRequestedKVSegments();
         policy.hash_gdn_device_state =
             envEnabled("LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE");
+        policy.hash_terminal_state =
+            envEnabled("LLAMINAR_PREFIX_PROBE_HASH_TERMINAL_STATE");
         policy.capture_gdn_values =
             envEnabled("LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES");
         return policy;

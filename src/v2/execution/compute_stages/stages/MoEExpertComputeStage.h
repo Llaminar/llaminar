@@ -57,12 +57,13 @@ namespace llaminar2
      * the current grouped verifier batch exclusively across experts that are
      * already resident.
      *
-     * Grouped verifier rows always use @ref ResidentOnly. Moving an expert
-     * payload for a handful of speculative rows costs far more than executing
-     * those rows on an existing owner or replica, and it would place a payload
-     * collective in every MoE layer of every verifier replay. Long prefill may
-     * select @ref TransferBackedCurrentBatch after its routed-row economy gate
-     * has passed.
+     * Grouped verifier rows always use
+     * @ref LogicalPositionResidentOnly. Moving an expert payload for a
+     * handful of speculative rows costs far more than executing those rows on
+     * an existing owner or replica, and it would place a payload collective in
+     * every MoE layer of every verifier replay. Long prefill may select
+     * @ref TransferBackedCurrentBatch after its routed-row economy gate has
+     * passed.
      */
     enum class PrefillLLEPAssignmentMode : uint8_t
     {
@@ -73,7 +74,7 @@ namespace llaminar2
          * plan. Prefix-runtime rehydration, when requested, is a separate
          * transaction that completes before this assignment begins.
          */
-        ResidentOnly = 0,
+        LogicalPositionResidentOnly = 0,
 
         /**
          * Plan missing arrivals, execute compact payload collectives, publish
@@ -84,6 +85,59 @@ namespace llaminar2
          */
         TransferBackedCurrentBatch = 1,
     };
+
+    /**
+     * @brief Identify why a captured LLEP payload transaction is executing.
+     *
+     * Current-batch movement consumes the routing evidence that selected the
+     * new placement and therefore starts a new histogram window after apply.
+     * Prefix-runtime rehydration has different semantics: it reconstructs
+     * payload bytes for placement and evidence already restored from a
+     * portable prefix snapshot. Erasing that evidence would make the first
+     * maintenance decision after a cache hit differ from uninterrupted
+     * execution.
+     *
+     * The purpose is a required method argument rather than inferred from
+     * pointer identity or mutable runtime state. This keeps graph construction
+     * declarative and makes an ambiguous payload publication unrepresentable.
+     */
+    enum class PrefillLLEPTransferPurpose : uint8_t
+    {
+        CurrentBatchMovement = 0,
+        PrefixRuntimeRehydration = 1,
+    };
+
+    /**
+     * @brief Derive the immutable apply policy for one LLEP transaction.
+     *
+     * @param base_config Graph-owned rebalance policy shared by both captured
+     *                    transaction shapes.
+     * @param purpose     Semantic owner of this transaction.
+     * @return A value copy whose histogram lifecycle matches @p purpose.
+     */
+    [[nodiscard]] inline DeviceMoERebalanceConfig
+    prefillLLEPTransferConfig(
+        const DeviceMoERebalanceConfig &base_config,
+        PrefillLLEPTransferPurpose purpose)
+    {
+        DeviceMoERebalanceConfig result = base_config;
+        const uint32_t reset_histograms =
+            static_cast<uint32_t>(
+                DeviceMoERebalanceFlags::ResetHistogramsAfterApply);
+        switch (purpose)
+        {
+        case PrefillLLEPTransferPurpose::CurrentBatchMovement:
+            result.flags |= reset_histograms;
+            break;
+        case PrefillLLEPTransferPurpose::PrefixRuntimeRehydration:
+            result.flags &= ~reset_histograms;
+            break;
+        default:
+            throw std::invalid_argument(
+                "Unknown prefill LLEP transfer purpose");
+        }
+        return result;
+    }
 
     /**
      * @brief Unified MoE FFN stage (router + expert execution + combine)
@@ -203,6 +257,27 @@ namespace llaminar2
             BufferId routing_weights_buffer_id = BufferId::MOE_EXPERT_WEIGHTS;
             bool force_grouped_verifier_prefill_for_decode = false;
             bool force_decode_equivalent_verifier_prefill = false;
+            /**
+             * @brief Retain this main-verifier layer's routes for later commit.
+             *
+             * Sidecar and main verifier stages both use grouped kernels, but
+             * only the main target graph publishes accepted rows into decode
+             * maintenance history. Keeping this policy explicit prevents a
+             * sidecar from accidentally advertising a deferred publication
+             * transaction merely because it uses grouped execution.
+             */
+            bool defer_grouped_verifier_histogram_publication = false;
+
+            /**
+             * @brief Device-owned absolute position for every grouped row.
+             *
+             * Batch-invariant resident LLEP uses this row to rotate equal-load
+             * participant ties without consulting speculative workload
+             * history. GPU verifier graphs bind the same persistent position
+             * row consumed by RoPE; a null pointer is fatal when resident
+             * assignment is selected.
+             */
+            const int32_t *absolute_position_ids_device = nullptr;
 
             /**
              * @brief Require GPU decode to consume routing tensors on device.
@@ -239,9 +314,21 @@ namespace llaminar2
             // Output
             TensorBase *output = nullptr; ///< Combined output [seq_len, d_model]
 
+            /**
+             * @brief Optional ownership-invariant LocalTP publication target.
+             *
+             * GPU fused decode and grouped-prefill kernels write one weighted
+             * row per original router slot into `[seq_len, top_k, d_model]`.
+             * They do not collapse participant-local routes into @ref output;
+             * a following FP32 collective and canonical reducer own that sum.
+             */
+            TensorBase *canonical_route_contributions = nullptr;
+
             // Buffer IDs for coherence
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
+            BufferId canonical_route_contributions_buffer_id =
+                BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
             bool output_registered_in_arena = true;
 
             // =================================================================
@@ -279,7 +366,7 @@ namespace llaminar2
              * that current-batch expert migration is legal.
              */
             PrefillLLEPAssignmentMode prefill_llep_assignment_mode =
-                PrefillLLEPAssignmentMode::ResidentOnly;
+                PrefillLLEPAssignmentMode::LogicalPositionResidentOnly;
             /**
              * @brief Prepend exact prefix-placement payload reconstruction.
              *
@@ -390,6 +477,10 @@ namespace llaminar2
         PrefillLLEPAssignmentMode prefillLLEPAssignmentModeForTesting() const noexcept
         {
             return params_.prefill_llep_assignment_mode;
+        }
+        const int32_t *absolutePositionIdsDeviceForTesting() const noexcept
+        {
+            return params_.absolute_position_ids_device;
         }
         const std::string &prefillLLEPWorkspaceNameForTesting() const
         {
@@ -691,6 +782,46 @@ namespace llaminar2
         bool hasWorkspace() const override;
         DeviceWorkspaceManager *getWorkspace() const override;
 
+        /**
+         * @brief Return whether this stage owns grouped-verifier route scratch.
+         *
+         * GPU grouped verification must defer persistent routing-history
+         * updates until the accepted-state transaction has produced its
+         * device-resident row counts. The orchestrator uses this predicate to
+         * discover exactly the verifier MoE stages that must participate in
+         * that commit.
+         */
+        [[nodiscard]] bool
+        requiresCommittedGroupedVerifierHistogramPublication() const noexcept
+        {
+            return params_.device_id.is_gpu() &&
+                   params_.defer_grouped_verifier_histogram_publication;
+        }
+
+        /**
+         * @brief Publish accepted grouped-verifier demand on its producer stream.
+         *
+         * This method is called once per layer from the accepted-state
+         * publication transaction. It consumes the route ids and final
+         * participant assignments retained by the verifier graph, combines
+         * them with device-owned accepted prefix counts, and enqueues one
+         * graph-capturable backend commit kernel. No host route or acceptance
+         * data is read.
+         *
+         * @param accepted_state_counts_device Per-request committed row counts.
+         * @param publication_ok_flags_device Per-request metadata validity.
+         * @param request_count Active requests in the verifier graph.
+         * @param rows_per_request Padded physical rows for each request.
+         * @param producer_stream Exact accepted-publication CUDA/HIP stream.
+         * @return true after the backend commit has been enqueued.
+         */
+        bool publishCommittedGroupedVerifierHistograms(
+            const int32_t *accepted_state_counts_device,
+            const int32_t *publication_ok_flags_device,
+            int request_count,
+            int rows_per_request,
+            void *producer_stream);
+
         // Test accessor
         void setMoEKernelForTesting(IMoEKernel *kernel)
         {
@@ -731,17 +862,6 @@ namespace llaminar2
         bool usesFixedTopologyGroupedPrefillForTesting() const
         {
             return canUseFixedTopologyGroupedPrefill();
-        }
-        /**
-         * @brief Report whether grouped verifier routing publishes decode demand.
-         *
-         * This accessor executes no backend work. It exists so unit tests can
-         * prove that the graph's GPU grouped-verifier policy flag reaches the
-         * same publication decision as the CPU decode-equivalent policy flag.
-         */
-        bool publishesGroupedVerifierHistogramsForTesting() const noexcept
-        {
-            return shouldPublishGroupedVerifierHistograms();
         }
         bool hasPublishedFixedTopologyMaskForTesting() const noexcept
         {
@@ -937,21 +1057,6 @@ namespace llaminar2
         bool canUseRuntimePrefillGrouping() const;
         bool canUseFixedTopologyGroupedPrefill() const;
         /**
-         * @brief Decide whether this grouped invocation owns production demand.
-         *
-         * CPU grouped verification enters through
-         * `force_decode_equivalent_verifier_prefill`, while CUDA and ROCm enter
-         * the same economical route through
-         * `force_grouped_verifier_prefill_for_decode`. Both are production
-         * verifier paths and therefore both must update the persistent
-         * device-resident selected/local histograms consumed by maintenance.
-         */
-        bool shouldPublishGroupedVerifierHistograms() const noexcept
-        {
-            return params_.force_decode_equivalent_verifier_prefill ||
-                   params_.force_grouped_verifier_prefill_for_decode;
-        }
-        /**
          * @brief True when verifier rows can use the safe routed+shared composite path.
          *
          * The rejected shortcut treated the shared expert as an extra routed expert
@@ -972,6 +1077,7 @@ namespace llaminar2
             IMoEKernel *kernel,
             DeviceMoERebalanceStatus **transfer_status_out,
             DeviceMoERebalanceApplyStatus **apply_status_out,
+            PrefillLLEPTransferPurpose purpose,
             DeviceMoERebalanceTransferState *transfer_state_override =
                 nullptr) const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
@@ -1437,6 +1543,64 @@ namespace llaminar2
             owned_moe_kernel_.reset();
             moe_kernel_ = kernel;
         }
+    };
+
+    /**
+     * @brief Device-only canonical LocalTP routed-expert reduction.
+     *
+     * Expert placement is intentionally absent from this stage. Each input
+     * slot has already been allreduced independently, so the stage walks
+     * router slots in increasing order and overwrites one routed output row.
+     * Static, Dynamic, LLEP, and prefix-restored placement therefore share one
+     * visible FP32 addition tree without host orchestration.
+     */
+    class MoECanonicalRouteReduceStage final : public IComputeStage
+    {
+    public:
+        /** @brief Immutable graph-bound reducer parameters. */
+        struct Params
+        {
+            STAGE_PARAMS_COMMON_FIELDS;
+
+            TensorBase *canonical_route_contributions = nullptr;
+            TensorBase *output = nullptr;
+            int seq_len = 0;
+            int top_k = 0;
+            int d_model = 0;
+            BufferId canonical_route_contributions_buffer_id =
+                BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
+            BufferId output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
+        };
+
+        explicit MoECanonicalRouteReduceStage(Params params);
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::MOE_CANONICAL_ROUTE_REDUCE;
+        }
+        std::string name() const override
+        {
+            return "moe_canonical_route_reduce";
+        }
+        size_t estimatedFlops() const override;
+        bool supportsBackend(ComputeBackendType backend) const override;
+        bool isGraphCapturable() const override;
+        bool supportsWarmupDependentGraphCapture() const override;
+        StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
+
+        /**
+         * @brief Return immutable graph-bound reducer parameters for diagnostics.
+         * @return Canonical input/output identities and fixed reduction geometry.
+         */
+        [[nodiscard]] const Params &params() const { return params_; }
+
+    private:
+        Params params_;
+        mutable std::unique_ptr<IMoEKernel> owned_moe_kernel_;
+        mutable IMoEKernel *moe_kernel_ = nullptr;
     };
 
 } // namespace llaminar2

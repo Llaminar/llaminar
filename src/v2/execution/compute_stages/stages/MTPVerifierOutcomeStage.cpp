@@ -204,7 +204,9 @@ namespace llaminar2
                          stream,
                          params_.binding.output_token_capacity,
                          params_.binding.output_tokens_device,
-                         params_.binding.output_meta_device))
+                         params_.binding.output_meta_device,
+                         /*max_state_commit_rows_device=*/nullptr,
+                         params_.binding.penalty_policy_device))
             {
                 LOG_ERROR("[MTPVerifierOutcomeStage] Greedy compact outcome reduction failed");
                 return false;

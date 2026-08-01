@@ -54,37 +54,6 @@ namespace llaminar2
     };
 
     /**
-     * @brief Select which persistent decode histograms grouped routing updates.
-     *
-     * Grouped verifier routing has two publication moments. The initial
-     * grouping observes every selected expert, while final grouping observes
-     * only route slots assigned to this participant. Static-owner grouping
-     * performs both updates together. Least-loaded/LLEP grouping records the
-     * selected routes before planning and local assignments after planning, so
-     * its preliminary grouping pass cannot double-count work.
-     *
-     * Ordinary prefill must use `None`: these counters drive decode
-     * maintenance windows and represent grouped verifier work only.
-     */
-    enum class MoEGroupedHistogramUpdate : uint8_t
-    {
-        None = 0,
-        SelectedRoutes = 1u << 0,
-        LocallyAssignedRoutes = 1u << 1,
-        SelectedAndLocallyAssignedRoutes = 3u,
-    };
-
-    /**
-     * @brief Test whether a grouped histogram policy contains one update bit.
-     */
-    constexpr bool hasMoEGroupedHistogramUpdate(
-        MoEGroupedHistogramUpdate policy,
-        MoEGroupedHistogramUpdate update) noexcept
-    {
-        return (static_cast<uint8_t>(policy) & static_cast<uint8_t>(update)) != 0u;
-    }
-
-    /**
      * @brief Immutable host launch metadata for one device-resident MoE call.
      *
      * GPU MoE execution may be captured concurrently by the main graph, an MTP
@@ -334,9 +303,15 @@ namespace llaminar2
             return false;
         }
 
-        /// Decode-only runtime-table routing path. GPU implementations may
-        /// keep top-k results entirely device-resident and optionally fill the
-        /// legacy routing tensors for existing staged consumers.
+        /**
+         * @brief Decode one row into the device-resident runtime route table.
+         *
+         * `absolute_position_ids_device` is the same graph-local position row
+         * consumed by RoPE. GPU implementations require it whenever the active
+         * placement contains a replicated expert: the logical position is the
+         * stable tie-break key that makes serial and grouped route partitions
+         * independent of speculative workload history.
+         */
         virtual bool decodeRouteSelect(
             DeviceMoELayerRuntime *runtime_layer,
             ITensor *hidden, ITensor *gate_weights,
@@ -344,7 +319,8 @@ namespace llaminar2
             bool normalize_weights,
             ITensor *output_indices, ITensor *output_weights,
             bool write_legacy_outputs,
-            bool update_runtime_histogram)
+            bool update_runtime_histogram,
+            const int32_t *absolute_position_ids_device = nullptr)
         {
             (void)runtime_layer;
             (void)hidden;
@@ -357,6 +333,7 @@ namespace llaminar2
             (void)output_weights;
             (void)write_legacy_outputs;
             (void)update_runtime_histogram;
+            (void)absolute_position_ids_device;
             return false;
         }
 
@@ -382,7 +359,8 @@ namespace llaminar2
             DeviceMoERebalanceApplyStatus *rebalance_apply_status,
             DeviceMoERebalanceGraphControllerState *rebalance_controller_state,
             int rebalance_target_layer,
-            uint32_t rebalance_command_buffer_count)
+            uint32_t rebalance_command_buffer_count,
+            const int32_t *absolute_position_ids_device = nullptr)
         {
             (void)runtime_layers;
             (void)runtime_layer;
@@ -406,6 +384,7 @@ namespace llaminar2
             (void)rebalance_controller_state;
             (void)rebalance_target_layer;
             (void)rebalance_command_buffer_count;
+            (void)absolute_position_ids_device;
             return false;
         }
 
@@ -833,7 +812,8 @@ namespace llaminar2
             ITensor *output,
             int d_model,
             int intermediate,
-            const uint8_t *expert_mask = nullptr)
+            const uint8_t *expert_mask = nullptr,
+            ITensor *canonical_route_contributions = nullptr)
         {
             (void)input;
             (void)routing_indices;
@@ -845,6 +825,7 @@ namespace llaminar2
             (void)d_model;
             (void)intermediate;
             (void)expert_mask;
+            (void)canonical_route_contributions;
             return false;
         }
 
@@ -894,7 +875,8 @@ namespace llaminar2
             int d_model,
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source =
-                MoEDecodeDescriptorSource::RuntimePlacementTable)
+                MoEDecodeDescriptorSource::RuntimePlacementTable,
+            ITensor *canonical_route_contributions = nullptr)
         {
             (void)runtime_layer;
             (void)input;
@@ -905,6 +887,38 @@ namespace llaminar2
             (void)d_model;
             (void)intermediate;
             (void)descriptor_source;
+            (void)canonical_route_contributions;
+            return false;
+        }
+
+        /**
+         * @brief Reduce canonical routed-expert slots in router order.
+         *
+         * LocalTP publishes one independently allreduced FP32 row for every
+         * original router slot.  This device-only epilogue is the sole owner of
+         * the observable routed output and performs exactly the serial decode
+         * accumulation `route 0, route 1, ...`.  Backends must overwrite every
+         * output element and must not use floating-point atomics.
+         *
+         * @param canonical_route_contributions FP32 [seq_len, top_k, d_model].
+         * @param output FP32 [seq_len, d_model] overwrite destination.
+         * @param seq_len Number of original token rows.
+         * @param top_k Number of router slots per row.
+         * @param d_model Hidden width.
+         * @return true after publication on the kernel's exact bound stream.
+         */
+        virtual bool reduceCanonicalRouteContributions(
+            ITensor *canonical_route_contributions,
+            ITensor *output,
+            int seq_len,
+            int top_k,
+            int d_model)
+        {
+            (void)canonical_route_contributions;
+            (void)output;
+            (void)seq_len;
+            (void)top_k;
+            (void)d_model;
             return false;
         }
 
@@ -1295,6 +1309,41 @@ namespace llaminar2
         }
 
         /**
+         * @brief Begin a new request lifetime for a persistent rebalance transaction.
+         *
+         * Unlike initializeDeviceRebalanceGraphController(), this operation is
+         * unconditional. It discards the previous request's controller epoch,
+         * active wave, terminal error poison, command headers, layer-window
+         * cursors, plan counts, and diagnostic counters while preserving the
+         * model-lifetime allocations whose addresses are embedded in captured
+         * graph executables. These records form one transaction root and must
+         * never be reset independently.
+         *
+         * The caller must enqueue this operation on the explicit request-reset
+         * stream after joining every producer from the old request and before
+         * publishing the reset-ready event. Implementations must not synchronize,
+         * allocate, transfer state through the host, or use a default stream.
+         */
+        virtual bool resetDeviceRebalanceGraphTransactionForRequest(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoERebalanceGraphControllerState *controller_state,
+            DeviceMoERebalanceCommandBufferHeader *command_headers,
+            DeviceMoERebalanceWaveState *wave_states,
+            uint32_t *plan_counts,
+            uint32_t command_buffer_count,
+            const DeviceMoERebalanceConfig &config)
+        {
+            (void)launch;
+            (void)controller_state;
+            (void)command_headers;
+            (void)wave_states;
+            (void)plan_counts;
+            (void)command_buffer_count;
+            (void)config;
+            return false;
+        }
+
+        /**
          * @brief Publish a completed transfer wave from the transfer stream.
          *
          * This kernel is queued after peer/collective transfer-slot copies and
@@ -1447,11 +1496,15 @@ namespace llaminar2
          * the assignment kernels choose participants. The default returns false
          * so a missing grouped implementation fails loudly.
          *
-         * @param histogram_update Persistent grouped-verifier histogram updates
-         *        fused into the existing cast/count launches. Ordinary prefill
-         *        passes `None`. Static-owner verifier grouping records selected
-         *        and local routes together. Least-loaded grouping records only
-         *        selected routes here and records local routes during regroup.
+         * Grouping is deliberately free of persistent routing-history side
+         * effects. A speculative verifier computes routes for rows that may be
+         * rejected, so it cannot know which rows belong to the serial-visible
+         * timeline. When @p retain_routes_for_deferred_commit is true, the
+         * grouping kernel must copy each final route and participant assignment
+         * into the layer's immutable-address device ledger while those values
+         * are already in-register. Accepted demand is published later by
+         * commitGroupedVerifierHistograms() from device-owned acceptance
+         * metadata. This fused retention must not add a kernel launch.
          */
         virtual bool groupPrefillRoutes(
             DeviceMoELayerRuntime *runtime_layer,
@@ -1459,8 +1512,7 @@ namespace llaminar2
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
             bool filter_to_local_runtime_experts = false,
-            MoEGroupedHistogramUpdate histogram_update =
-                MoEGroupedHistogramUpdate::None)
+            bool retain_routes_for_deferred_commit = false)
         {
             (void)runtime_layer;
             (void)routing_indices;
@@ -1470,7 +1522,7 @@ namespace llaminar2
             (void)num_experts;
             (void)top_k;
             (void)filter_to_local_runtime_experts;
-            (void)histogram_update;
+            (void)retain_routes_for_deferred_commit;
             return false;
         }
 
@@ -1484,43 +1536,120 @@ namespace llaminar2
          * assigned to runtime_layer->participant_id. It must not read route
          * metadata back to host and must be graph-capturable.
          *
-         * @param histogram_update Usually `LocallyAssignedRoutes` for grouped
-         *        verifier execution after LLEP assignment, and `None` for
-         *        ordinary prefill or diagnostic regrouping.
+         * When @p retain_routes_for_deferred_commit is true, the regrouping
+         * kernel must retain the final route and participant assignment in the
+         * per-layer device ledger without launching a separate copy kernel.
+         *
+         * Like initial grouping, regrouping must not mutate persistent decode
+         * history. It may run before the verifier outcome exists and therefore
+         * cannot distinguish committed rows from rejected speculative rows.
          */
         virtual bool regroupPrefillRoutesFromRuntimeAssignments(
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
-            MoEGroupedHistogramUpdate histogram_update =
-                MoEGroupedHistogramUpdate::None)
+            bool retain_routes_for_deferred_commit = false)
         {
             (void)runtime_layer;
             (void)current_tokens;
             (void)max_tokens;
             (void)num_experts;
             (void)top_k;
-            (void)histogram_update;
+            (void)retain_routes_for_deferred_commit;
+            return false;
+        }
+
+        /**
+         * @brief Commit routing demand for serial-visible grouped-verifier rows.
+         *
+         * Grouped MTP verification computes a padded request-major matrix, but
+         * only a device-selected prefix of each request becomes part of the
+         * main-model timeline. This operation reads those accepted prefix
+         * lengths and publishes both global selected-expert demand and
+         * participant-local assigned demand from the per-layer route ledger
+         * retained by @p runtime_layer. Transient route scratch is not a valid
+         * publication source because later layers intentionally reuse it.
+         *
+         * The accepted-state commit is intentionally separate from route
+         * retention in groupPrefillRoutes() and
+         * regroupPrefillRoutesFromRuntimeAssignments(). Grouping runs before
+         * acceptance is known and may only retain immutable route evidence; it
+         * must not mutate routing history. Callers must enqueue this commit on
+         * the exact stream that owns accepted-state publication. The default
+         * hard failure keeps an unimplemented backend from silently losing or
+         * overcounting decode evidence.
+         *
+         * @param launch Explicit producer stream and persistent workspace.
+         * @param runtime_layer Device-resident per-layer routing scratch.
+         * @param accepted_state_counts_device Per-request committed row counts.
+         * @param publication_ok_flags_device Per-request metadata validity flags.
+         * @param request_count Number of active request rows.
+         * @param rows_per_request Physical padded verifier rows per request.
+         * @param total_rows Total physical rows represented by routing scratch.
+         * @param num_experts Number of routed experts in this layer.
+         * @param top_k Number of route slots per physical row.
+         * @return true when the commit kernel was enqueued successfully.
+         */
+        virtual bool commitGroupedVerifierHistograms(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoELayerRuntime *runtime_layer,
+            const int32_t *accepted_state_counts_device,
+            const int32_t *publication_ok_flags_device,
+            int request_count,
+            int rows_per_request,
+            int total_rows,
+            int num_experts,
+            int top_k)
+        {
+            (void)launch;
+            (void)runtime_layer;
+            (void)accepted_state_counts_device;
+            (void)publication_ok_flags_device;
+            (void)request_count;
+            (void)rows_per_request;
+            (void)total_rows;
+            (void)num_experts;
+            (void)top_k;
             return false;
         }
 
         /**
          * @brief Assign prefill routes to least-loaded resident participants.
          *
-         * This is the graph-capturable hot-cache/LLEP bridge: it preserves the
-         * router's selected experts and weights, then rewrites only
-         * DeviceMoELayerRuntime::route_participant_ids. Repeated rows for a
-         * hot expert may be split across resident participants, but candidate
-         * destinations are limited to the active placement bank's
-         * resident_participant_mask for each expert, so this method never
-         * schedules a route to a device that lacks the expert weights and
-         * never performs an implicit weight transfer.
+         * This is the graph-capturable resident-expert bridge used by grouped
+         * MTP verification. It preserves the router's selected experts and
+         * weights, then rewrites only
+         * DeviceMoELayerRuntime::route_participant_ids.
+         *
+         * Every token row reproduces the production serial-decode transaction:
+         * participant loads start at zero, route slots are consumed in router
+         * order, and equal-load resident replicas use the row's absolute
+         * position plus route identity as a deterministic tie key. The same
+         * policy runs in serial decode, so a logical row receives identical
+         * participant ids at every grouped M regardless of rejected work.
+         *
+         * This is a numerical-correctness requirement. Moving one expert
+         * contribution to a different collective participant changes the
+         * floating-point partial-sum grouping before the allreduce and can
+         * change stochastic generation even when every expert kernel is
+         * individually byte exact.
+         *
+         * Candidate destinations are limited to the active placement bank's
+         * resident_participant_mask for each expert. The method therefore
+         * never schedules a route to a device that lacks the expert weights
+         * and never performs an implicit weight transfer. Implementations must
+         * remain allocation-free, host-free, and graph-capturable.
+         *
+         * @param absolute_position_ids_device Device-resident INT32 absolute
+         *        position for every grouped row. This must be the exact
+         *        graph-local row consumed by RoPE and must never be null.
          */
         virtual bool assignPrefillRoutesLeastLoadedResident(
             const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
-            int num_experts, int top_k)
+            int num_experts, int top_k,
+            const int32_t *absolute_position_ids_device)
         {
             (void)launch;
             (void)runtime_layer;
@@ -1528,6 +1657,7 @@ namespace llaminar2
             (void)max_tokens;
             (void)num_experts;
             (void)top_k;
+            (void)absolute_position_ids_device;
             return false;
         }
 
@@ -1746,7 +1876,8 @@ namespace llaminar2
             int gateup_desc_table_id,
             int down_desc_table_id,
             int seq_len, int d_model, int intermediate,
-            int num_experts, int top_k)
+            int num_experts, int top_k,
+            ITensor *canonical_route_contributions = nullptr)
         {
             (void)hidden;
             (void)output;
@@ -1757,6 +1888,7 @@ namespace llaminar2
             (void)intermediate;
             (void)num_experts;
             (void)top_k;
+            (void)canonical_route_contributions;
             return false;
         }
 
@@ -1777,7 +1909,8 @@ namespace llaminar2
             int gateup_desc_table_id,
             int down_desc_table_id,
             int seq_len, int d_model, int intermediate,
-            int num_experts, int top_k)
+            int num_experts, int top_k,
+            ITensor *canonical_route_contributions = nullptr)
         {
             (void)device_runtime_layer;
             (void)runtime_host_layer;
@@ -1790,6 +1923,7 @@ namespace llaminar2
             (void)intermediate;
             (void)num_experts;
             (void)top_k;
+            (void)canonical_route_contributions;
             return false;
         }
 

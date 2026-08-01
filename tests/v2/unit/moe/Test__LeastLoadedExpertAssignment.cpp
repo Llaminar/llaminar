@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 using namespace llaminar2::least_loaded_ep;
@@ -55,7 +56,7 @@ namespace
                 static_cast<uint32_t>(spans.size()),
                 transfers.data(),
                 static_cast<uint32_t>(transfers.size()),
-                &status);
+                status);
         }
 
         bool planWithResidency(const std::vector<uint64_t> &loads,
@@ -76,7 +77,7 @@ namespace
                 static_cast<uint32_t>(spans.size()),
                 transfers.data(),
                 static_cast<uint32_t>(transfers.size()),
-                &status,
+                status,
                 resident_masks.data());
         }
 
@@ -97,7 +98,7 @@ namespace
                 static_cast<uint32_t>(spans.size()),
                 transfers.data(),
                 static_cast<uint32_t>(transfers.size()),
-                &status);
+                status);
         }
 
         bool planTransfersOnly(const std::vector<uint64_t> &loads,
@@ -115,7 +116,7 @@ namespace
                 workspace,
                 transfers.data(),
                 static_cast<uint32_t>(transfers.size()),
-                &status);
+                status);
         }
 
         bool planTransfersOnlyWithResidency(
@@ -135,7 +136,7 @@ namespace
                 workspace,
                 transfers.data(),
                 static_cast<uint32_t>(transfers.size()),
-                &status,
+                status,
                 resident_masks.data());
         }
     };
@@ -276,6 +277,78 @@ TEST(Test__LeastLoadedExpertAssignment, TransferOnlyPlannerMatchesFullPlannerFor
               full.transfers[0].source_participant);
     EXPECT_EQ(transfer_only.transfers[0].destination_participant,
               full.transfers[0].destination_participant);
+}
+
+TEST(Test__LeastLoadedExpertAssignment, CanonicallyPresortedWorkspaceIsByteExact)
+{
+    /*
+     * Seventeen experts deliberately exercises a non-power-of-two codebook.
+     * Repeated loads exercise the logical-expert-id tie break used by both GPU
+     * sorting networks.  The test compares the complete planner products, not
+     * only aggregate counts, so a changed span or transfer order is visible.
+     */
+    const std::vector<uint64_t> loads{
+        31, 31, 7, 19, 0, 19, 3, 11, 11,
+        5, 23, 23, 2, 13, 13, 1, 17};
+    std::vector<uint32_t> owners(loads.size());
+    std::vector<uint32_t> resident_masks(loads.size());
+    for (uint32_t expert = 0; expert < loads.size(); ++expert)
+    {
+        owners[expert] = expert < 12u ? 0u : expert % 4u;
+        resident_masks[expert] = 0x0fu;
+    }
+
+    auto config = configFor(static_cast<uint32_t>(loads.size()), 4u);
+    config.enable_balanced_skip = false;
+    config.max_weight_transfers = 64u;
+
+    PlannerFixture internally_sorted(
+        config.expert_count, config.participant_count, 128u, 64u);
+    ASSERT_TRUE(internally_sorted.planWithResidency(
+        loads, owners, resident_masks, config));
+
+    PlannerFixture presorted(
+        config.expert_count, config.participant_count, 128u, 64u);
+    sortExpertsByLoadDescending(
+        loads.data(), config.expert_count, presorted.sorted.data());
+    LeastLoadedExpertAssignmentWorkspace workspace{
+        presorted.sorted.data(),
+        presorted.pending.data(),
+        presorted.assigned.data()};
+    ASSERT_TRUE(planLeastLoadedExpertAssignment(
+        loads.data(),
+        owners.data(),
+        config,
+        workspace,
+        presorted.spans.data(),
+        static_cast<uint32_t>(presorted.spans.size()),
+        presorted.transfers.data(),
+        static_cast<uint32_t>(presorted.transfers.size()),
+        presorted.status,
+        resident_masks.data(),
+        /*workspace_experts_are_sorted=*/true));
+
+    EXPECT_EQ(presorted.sorted, internally_sorted.sorted);
+    EXPECT_EQ(presorted.pending, internally_sorted.pending);
+    EXPECT_EQ(presorted.assigned, internally_sorted.assigned);
+    EXPECT_EQ(
+        std::memcmp(
+            &presorted.status,
+            &internally_sorted.status,
+            sizeof(presorted.status)),
+        0);
+    EXPECT_EQ(
+        std::memcmp(
+            presorted.spans.data(),
+            internally_sorted.spans.data(),
+            presorted.spans.size() * sizeof(presorted.spans.front())),
+        0);
+    EXPECT_EQ(
+        std::memcmp(
+            presorted.transfers.data(),
+            internally_sorted.transfers.data(),
+            presorted.transfers.size() * sizeof(presorted.transfers.front())),
+        0);
 }
 
 TEST(Test__LeastLoadedExpertAssignment, EmitsNativeAssignmentsWhenBalancedSkipDisabled)
@@ -757,6 +830,58 @@ TEST(Test__LeastLoadedExpertAssignment, ResidentMaskHelpersNormalizeAndSelectLea
     const std::array<uint64_t, 4> participant_loads{9, 2, 7, 2};
     EXPECT_EQ(selectLeastLoadedResidentParticipant(0b1101u, participant_loads.data(), 4, 0), 3u);
     EXPECT_EQ(selectLeastLoadedResidentParticipant(0u, participant_loads.data(), 4, 2), 2u);
+}
+
+/**
+ * @brief Prove the shared selector honors only position-derived tie turns.
+ *
+ * The tie key rotates only exact minimum-load ties and enumerates sparse
+ * resident masks in ascending participant order. A genuinely lighter resident
+ * remains authoritative regardless of the position-derived turn.
+ */
+TEST(Test__LeastLoadedExpertAssignment,
+     BatchInvariantResidentSelectionUsesPositionOnlyForEqualLoadTies)
+{
+    const std::array<int, 4> equal_loads{7, 7, 7, 7};
+    EXPECT_EQ(
+        selectBatchInvariantResidentParticipant(
+            0b1111u, equal_loads.data(), 4, 0, 0),
+        0u);
+    EXPECT_EQ(
+        selectBatchInvariantResidentParticipant(
+            0b1111u, equal_loads.data(), 4, 0, 1),
+        1u);
+    EXPECT_EQ(
+        selectBatchInvariantResidentParticipant(
+            0b0101u, equal_loads.data(), 4, 0, 1),
+        2u)
+        << "tie ordinals must skip non-resident participants";
+    EXPECT_EQ(
+        selectBatchInvariantResidentParticipant(
+            0b0101u, equal_loads.data(), 4, 0, 3),
+        2u)
+        << "tie turns wrap modulo the resident count";
+
+    const std::array<int, 4> unequal_loads{5, 9, 2, 8};
+    EXPECT_EQ(
+        selectBatchInvariantResidentParticipant(
+            0b1111u, unequal_loads.data(), 4, 0, 3),
+        2u)
+        << "tie turns must never override the minimum-load criterion";
+    EXPECT_EQ(
+        selectBatchInvariantResidentParticipant(
+            0u, unequal_loads.data(), 4, 1, 3),
+        1u)
+        << "an empty resident mask must retain the explicit fallback";
+
+    EXPECT_EQ(
+        residentAssignmentTieTurn(42, 7, 3) + 1ULL,
+        residentAssignmentTieTurn(43, 7, 3))
+        << "adjacent committed positions must rotate the tie clock";
+    EXPECT_EQ(
+        residentAssignmentTieTurn(42, 7, 3),
+        residentAssignmentTieTurn(42, 7, 3))
+        << "the route tie key must be a pure semantic function";
 }
 
 TEST(Test__LeastLoadedExpertAssignment, ResidentAssignmentSelectsHighestLoadUnassignedExpert)

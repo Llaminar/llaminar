@@ -1236,23 +1236,39 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MirroredMTPDiagnosticsUseTypedForwardRo
         << "The typed role must travel through both forward input and execution provenance.";
     const auto compact_runner_interface =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(runner_interface));
-    EXPECT_NE(
+    EXPECT_EQ(
         compact_runner_interface.find(
             "enumclassDeviceTokenForwardPurpose:uint8_t"),
-        std::string::npos);
+        std::string::npos)
+        << "A runtime purpose selector would reopen the token-only main-condition path.";
     EXPECT_NE(
         compact_runner_interface.find(
-            "forwardWithDeviceTokenIds("
-            "constint*token_shadow,constvoid*token_ids_device,intseq_len,"
-            "DeviceTokenForwardPurposepurpose)"),
+            "forwardGroupedMTPVerifierWithDeviceTokenIds("
+            "constint*token_shadow,constvoid*token_ids_device,intseq_len)"),
         std::string::npos)
-        << "The public runner API must make condition-versus-verifier purpose mandatory.";
+        << "Device-token-only forwarding must be verifier-specific at compile time.";
     EXPECT_EQ(
         compact_runner_interface.find(
             "forwardWithDeviceTokenIds("
             "constint*token_shadow,constvoid*token_ids_device,intseq_len)"),
         std::string::npos)
-        << "The ambiguous three-argument device-token API must stay retired.";
+        << "The ambiguous device-token API must stay retired.";
+    EXPECT_NE(
+        compact_runner_interface.find(
+            "advanceMTPMainConditionFromDeviceResidentLogicalState("
+            "int32_ttoken_shadow,"
+            "constDeviceResidentLogicalSequenceStateHandle&logical_state,"
+            "intrequest_index=0)"),
+        std::string::npos)
+        << "GPU MTP condition replay must carry token and position ownership in "
+           "one typed logical-state handle.";
+    EXPECT_NE(
+        compact_runner_interface.find(
+            "advanceMTPMainConditionFromDeviceTargetSample("
+            "int32_ttoken_shadow,inttarget_sample_slot)"),
+        std::string::npos)
+        << "A device target token must be composed with its live position before "
+           "main-graph replay.";
     const auto executable_forward_engine =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(forward_engine));
     EXPECT_EQ(
@@ -1311,18 +1327,13 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MirroredMTPDiagnosticsUseTypedForwardRo
 
     const auto single_verifier_forward = sliceBetween(
         orchestrator,
-        "bool DeviceGraphOrchestrator::forwardWithDeviceTokenIds(",
-        "bool DeviceGraphOrchestrator::forwardBatchWithDeviceTokenIds(");
-    EXPECT_NE(
+        "bool DeviceGraphOrchestrator::forwardGroupedMTPVerifierWithDeviceTokenIds(",
+        "advanceMTPMainConditionFromDeviceResidentLogicalState(");
+    EXPECT_EQ(
         single_verifier_forward.find(
-            "DeviceTokenForwardPurpose purpose"),
+            "MTPCondition"),
         std::string::npos)
-        << "A single-request device token row must declare its semantic purpose.";
-    EXPECT_NE(
-        single_verifier_forward.find(
-            "DeviceTokenForwardPurpose::MTPCondition"),
-        std::string::npos)
-        << "The device-token entry point must map condition rows explicitly.";
+        << "A token-only verifier API must have no main-condition branch.";
     EXPECT_NE(
         single_verifier_forward.find(
             "ForwardExecutionRole::GroupedMTPVerifier"),
@@ -1605,24 +1616,22 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoERebalanceMaintenanceAlwaysPublishesD
     EXPECT_NE(executable_fn.find("active_cache.completion_event_in_flight = true;"),
               std::string::npos)
         << "Every launched maintenance wave must remain visible to the next graph consumer.";
-    EXPECT_NE(header.find("completion_event_consumer_wait_pending"),
+    EXPECT_EQ(header.find("completion_event_consumer_wait_pending"),
               std::string::npos)
-        << "Diagnostic export state and production stream-ordering state must remain distinct.";
-    EXPECT_NE(
-        executable_fn.find(
-            "active_cache.completion_event_consumer_wait_pending = true;"),
-        std::string::npos)
-        << "Every launch must publish a production consumer-wait obligation.";
+        << "A shared consumable flag cannot encode multi-stream publication fan-out.";
     EXPECT_NE(
         executable_wait_fn.find(
-            "target_cache.completion_event_consumer_wait_pending = false;"),
+            "DeviceTimelinePoint::MoERebalanceMaintenanceReady"),
         std::string::npos)
-        << "A production graph must retire an already-completed request-boundary event after queuing its wait.";
+        << "The consumer obligation must use the centralized typed timeline point.";
     EXPECT_NE(
-        executable_wait_fn.find(
-            "backend->streamWaitEvent("),
+        executable_wait_fn.find(".to(consumer_role)"),
         std::string::npos)
-        << "The consumer obligation must be fulfilled by a device-side event wait.";
+        << "Each independent graph consumer must declare its semantic role.";
+    EXPECT_NE(
+        executable_wait_fn.find(".enqueuePublishedWait("),
+        std::string::npos)
+        << "The durable publication must lower to a device-side event wait.";
     EXPECT_EQ(
         executable_wait_fn.find("synchronizeStreamChecked("),
         std::string::npos)
@@ -1904,15 +1913,28 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMaintenanceCaptureUsesGraphOwnedColl
         orchestrator_header.find(
             "std::unordered_set<std::string> collective_nodes;"),
         std::string::npos);
+    const auto maintenance_materialization = sliceBetween(
+        orchestrator_source,
+        "bool DeviceGraphOrchestrator::\n"
+        "        materializeDeviceMoERebalanceMaintenanceGraphForFamily()",
+        "bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph()");
+    EXPECT_NE(
+        maintenance_materialization.find(
+            "cache.graph->collectiveNodeNames()"),
+        std::string::npos)
+        << "Collective ownership must be discovered once from the eagerly "
+           "materialized graph family, before any maintenance launch.";
+
     const auto maintenance_launch = sliceBetween(
         orchestrator_source,
         "bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph()",
         "// =====================================================================\n"
         "    // IForwardExecutionHost interface implementations");
-    EXPECT_NE(
-        maintenance_launch.find(
-            "active_cache.graph->collectiveNodeNames()"),
-        std::string::npos);
+    EXPECT_EQ(
+        maintenance_launch.find("collectiveNodeNames()"),
+        std::string::npos)
+        << "The hot launch path must consume the graph-family declaration, "
+           "not rediscover collective ownership.";
     EXPECT_NE(
         maintenance_launch.find(
             "!active_cache.collective_nodes.empty()"),
@@ -1926,6 +1948,38 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMaintenanceCaptureUsesGraphOwnedColl
         std::string::npos)
         << "A phase-split maintenance graph must never suppress its embedded "
            "NCCL/RCCL stages when selecting capture policy.";
+}
+
+/**
+ * @brief Locks MTP metadata planning to complete verifier-row capacity.
+ *
+ * The maximum MTP draft depth does not include the target verifier's bonus row.
+ * Dynamic depth fifteen therefore materializes a sixteen-row graph. Declaring
+ * only the draft depth leaves the strict serial-family preflight four bytes
+ * short when that graph first publishes accepted-state indices.
+ */
+TEST(
+    Test__GpuWorkspaceAllocationPolicy,
+    MTPMetadataFamilyDeclarationIncludesBonusVerifierRow)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+
+    EXPECT_NE(
+        source.find(
+            "metadata_shape.max_draft_tokens,\n"
+            "                std::max(1, mtp_max_verifier_rows_)"),
+        std::string::npos)
+        << "The eager metadata participant must own every configured verifier "
+           "row, including the all-drafts-accepted bonus row.";
+    EXPECT_EQ(
+        source.find(
+            "metadata_shape.max_draft_tokens,\n"
+            "                std::max(1, mtp_max_draft_depth_)"),
+        std::string::npos)
+        << "Draft-only capacity recreates the dynamic-depth-15 64-byte versus "
+           "68-byte state-index mismatch.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBeforeConsumers)
@@ -7437,10 +7491,52 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_NE(main_forward.find(
                   "input.position_ids_device=effective_position_ids_device"),
               std::string::npos);
+    EXPECT_NE(
+        main_forward.find(
+            "effective_position_ids_device=request_position_ids_dev_"),
+        std::string::npos)
+        << "GPU serial decode must capture a stable arena position row.";
+    EXPECT_NE(
+        main_forward.find(
+            "input.materialize_serial_decode_position_from_device_kv=materialize_serial_decode_position_from_device_kv"),
+        std::string::npos)
+        << "The execution prelude must receive explicit typed policy for the "
+           "device-owned serial position snapshot.";
     EXPECT_NE(main_forward.find(
                   "publishRequestInputReuseReady(output.execution.stream,"),
               std::string::npos)
         << "Monolithic prefill must release the request-input bank from its exact final consumer stream.";
+
+    const auto forward_live_state_prelude = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            orchestrator_source,
+            "bool DeviceGraphOrchestrator::prepareLiveStateForForwardGraphExecution(",
+            "const float *DeviceGraphOrchestrator::getAllPositionLogits() const")));
+    EXPECT_NE(
+        forward_live_state_prelude.find(
+            "deviceSequenceCachedTokenCountPtr("),
+        std::string::npos)
+        << "Serial decode positions must derive from authoritative device KV state.";
+    EXPECT_NE(
+        forward_live_state_prelude.find(
+            "enqueuePrepareMTPVerifierPositionIds(live_position_device,"),
+        std::string::npos)
+        << "The scalar decode snapshot must use the backend's device-only "
+           "position materializer.";
+    EXPECT_NE(
+        forward_live_state_prelude.find(
+            "DeviceTimelinePoint::RequestInputReuseReady"),
+        std::string::npos)
+        << "Position-row reuse must be ordered by the declarative event timeline.";
+    EXPECT_EQ(forward_live_state_prelude.find("hostToDevice"),
+              std::string::npos);
+    EXPECT_EQ(forward_live_state_prelude.find("deviceToHost"),
+              std::string::npos);
+    EXPECT_EQ(forward_live_state_prelude.find("synchronizeStream("),
+              std::string::npos);
+    EXPECT_EQ(forward_live_state_prelude.find("synchronizeDevice("),
+              std::string::npos)
+        << "Serial decode position publication must remain fully device ordered.";
 
     const auto chunked_prefill = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
@@ -7560,7 +7656,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
                   "publication_metadata.base_cached_tokens+request.request_id"),
               std::string::npos)
         << "The reducer must bind the D2D pre-verifier KV base snapshot.";
-
     const auto common_reducer_source = sliceBetween(
         orchestrator_source,
         "bool DeviceGraphOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(",
@@ -7614,13 +7709,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPBudgetLimitedDirectEmitUsesCheckpoin
               std::string::npos)
         << "CPU direct emit must retain the checkpoint-derived scalar anchor.";
     EXPECT_NE(compact_direct_emit.find(
-                  "prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(0,0,0,1)"),
+                  "advanceMTPMainConditionFromDeviceTargetSample(first_token,0)"),
               std::string::npos)
-        << "GPU direct emit must materialize the one-row main forward input from the same target slot.";
-    EXPECT_NE(compact_direct_emit.find(
-                  "forwardWithDeviceTokenIds(&first_token,direct_emit_token_device,1,DeviceTokenForwardPurpose::MTPCondition)"),
-              std::string::npos)
-        << "GPU direct emit must advance the main graph from the resident token row.";
+        << "GPU direct emit must publish and consume an inseparable resident "
+           "token/position row.";
+    EXPECT_EQ(
+        compact_direct_emit.find(
+            "forwardWithDeviceTokenIds(&first_token"),
+        std::string::npos)
+        << "Token-only main condition replay must stay retired.";
     EXPECT_EQ(compact_direct_emit.find("currentDecodeTransactionPositionForPlanning("),
               std::string::npos)
         << "This direct-emit block must not read host position for the shifted "
@@ -7652,9 +7749,67 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPConditionForwardPublishesShiftedSide
     ASSERT_NE(forward_pos, std::string::npos);
     EXPECT_LT(commit_pos, forward_pos)
         << "The shifted sidecar row must be committed before the main condition forward.";
+    EXPECT_NE(
+        compact_condition_forward.find(
+            "advanceMTPMainConditionFromDeviceResidentLogicalState("
+            "condition_token,condition_state,0)"),
+        std::string::npos)
+        << "GPU condition replay must consume the current resident token and "
+           "logical-position publication together.";
     EXPECT_NE(condition_forward_body.find("condition_forward_shifted_commits"),
               std::string::npos)
         << "The maintenance path should remain visible in perfstats.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, GPUScalarMTPConditionRequiresPairedResidentTokenAndPosition)
+{
+    const auto orchestrator_source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto resident_advance = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            orchestrator_source,
+            "advanceMTPMainConditionFromDeviceResidentLogicalState(",
+            "advanceMTPMainConditionFromDeviceTargetSample(")));
+    const auto target_advance = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            orchestrator_source,
+            "advanceMTPMainConditionFromDeviceTargetSample(",
+            "bool DeviceGraphOrchestrator::forwardBatchWithDeviceTokenIds(")));
+
+    EXPECT_NE(
+        resident_advance.find(
+            "logical_state.nextConditionTokenDeviceForRequest(request_index)"),
+        std::string::npos);
+    EXPECT_NE(
+        resident_advance.find(
+            "logical_state.targetPositionDeviceForRequest(request_index)"),
+        std::string::npos);
+    EXPECT_NE(
+        resident_advance.find(
+            "logical_state.targetSequenceLengthDeviceForRequest(request_index)"),
+        std::string::npos);
+    EXPECT_NE(
+        resident_advance.find(
+            "forwardImpl(&token_shadow,condition_token_device,1,1,"
+            "ForwardExecutionRole::MTPCondition,false,true,"
+            "condition_position_device,condition_sequence_length_device)"),
+        std::string::npos)
+        << "The captured condition graph must bind the paired mailbox token, "
+           "position, and sequence length.";
+
+    EXPECT_NE(
+        target_advance.find(
+            "publishDeviceResidentLogicalSequenceStateFromTargetSample("
+            "target_sample_slot,live_position_device)"),
+        std::string::npos);
+    EXPECT_NE(
+        target_advance.find(
+            "advanceMTPMainConditionFromDeviceResidentLogicalState("
+            "token_shadow,logical_state,0)"),
+        std::string::npos)
+        << "Target slots must enter the same typed mailbox path rather than a "
+           "token-only replay API.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, DGOResidentPublicationDoesNotMutateKVBeforeLogicalStateIsResident)
@@ -8497,50 +8652,64 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEVerifierRoutingTensorDecodeDoesNotRe
         << "ROCm routing-tensor decode must use the same masked device conversion.";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, GroupedVerifierLogitsReuseOnlyExactPreplannedGpuStorage)
+TEST(Test__GpuWorkspaceAllocationPolicy, TypedMTPLogitsReuseOnlyPreplannedDeviceOutputStorage)
 {
     const auto orchestrator_source =
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     const auto helper_body = sliceBetween(
         orchestrator_source,
-        "DeviceGraphOrchestrator::exactGroupedVerifierLogitsBuffer(",
+        "DeviceGraphOrchestrator::preplannedMTPLogitsBuffer(",
         "void DeviceGraphOrchestrator::releaseBuffers()");
+    const auto initialization_body = sliceBetween(
+        orchestrator_source,
+        "bool DeviceGraphOrchestrator::initializeBuffers(",
+        "bool DeviceGraphOrchestrator::initializeMTPKVCaches(");
     const auto forward_body = sliceBetween(
         orchestrator_source,
         "const float *DeviceGraphOrchestrator::forwardImpl(",
         "bool DeviceGraphOrchestrator::supportsPrefillChunkSchedule(");
     const auto compact_helper =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(helper_body));
+    const auto compact_initialization =
+        removeAsciiWhitespace(
+            stripCommentsAndStringLiterals(initialization_body));
     const auto compact_forward =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(forward_body));
 
     EXPECT_NE(compact_helper.find(
-                  "execution_role!=ForwardExecutionRole::GroupedMTPVerifier||"
-                  "!state_.device_id.is_gpu()"),
+                  "ForwardExecutionRole::GroupedMTPVerifier"),
               std::string::npos)
-        << "Only the typed GPU grouped-verifier transaction may reuse sidecar "
-           "logits storage.";
+        << "Grouped verifier graphs must use the preplanned MTP output owner.";
     EXPECT_NE(compact_helper.find(
-                  "shape.size()!=2||shape[0]!=rows||shape[1]!=columns"),
+                  "ForwardExecutionRole::MTPCondition"),
               std::string::npos)
-        << "Captured verifier outputs must only adopt an exactly matching "
-           "preplanned shape.";
+        << "Live MTP condition graphs must use the same capacity-owned output.";
+    EXPECT_NE(compact_helper.find(
+                  "shape.size()!=2||shape[0]<rows||shape[1]!=columns"),
+              std::string::npos)
+        << "Captured MTP outputs may use any runtime M within the preplanned "
+           "row capacity.";
     EXPECT_NE(compact_helper.find("*device!=state_.device_id"),
               std::string::npos)
         << "Preplanned logits reuse must preserve exact device ownership.";
-    EXPECT_NE(compact_helper.find("!candidate->deviceValid()"),
-              std::string::npos);
+    EXPECT_NE(compact_helper.find("candidate->isMapped()"),
+              std::string::npos)
+        << "GPU MTP graph outputs must never adopt host-visible mapped storage.";
     EXPECT_NE(compact_helper.find("candidate->gpu_data_ptr()==nullptr"),
               std::string::npos);
-    EXPECT_NE(compact_forward.find(
-                  "exactGroupedVerifierLogitsBuffer(execution_role,"
-                  "BufferId::MTP_LOGITS,rows,local_vocab)"),
+    EXPECT_EQ(compact_helper.find("candidate->deviceValid()"),
               std::string::npos)
-        << "Column-parallel grouped verification should reuse its exact local "
-           "sidecar allocation.";
+        << "Unwritten output storage is not required to contain valid input bytes.";
+    EXPECT_NE(compact_initialization.find(
+                  "arena_->allocateDeviceStorage("
+                  "BufferId::MTP_LOGITS,state_.device_id)"),
+              std::string::npos)
+        << "The stable MTP logits pointer must be allocated before graph construction.";
+    EXPECT_NE(compact_forward.find("preplannedMTPLogitsBuffer("),
+              std::string::npos);
     EXPECT_NE(compact_forward.find("BufferId::MTP_LOGITS_GATHERED"),
               std::string::npos)
-        << "Full-vocabulary grouped outputs should reuse an exact gathered "
+        << "Full-vocabulary grouped outputs should reuse a preplanned gathered "
            "sidecar allocation where that policy owns one.";
 }
 
@@ -9077,7 +9246,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEGraphMetadataUsesExplicitWorkspaceOw
     {
         SCOPED_TRACE(backend);
         EXPECT_NE(source->find("acquirePersistentSlot("), std::string::npos)
-            << backend << " grouped descriptors and masks must obtain exclusive "
+            << backend << " mutable fixed-topology masks must obtain exclusive "
                           "workspace slots from the shared manager";
         EXPECT_NE(
             source->find("GroupedExpertMaskLeaseDomain"),
@@ -9098,10 +9267,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEGraphMetadataUsesExplicitWorkspaceOw
         EXPECT_EQ(header->find("source_host_ptr"), std::string::npos)
             << backend << " device router identity must not adopt a host mirror pointer";
         EXPECT_NE(
-            header->find("std::shared_ptr<PersistentWorkspaceSlotLease> workspace_lease"),
+            header->find(
+                "std::shared_ptr<GroupedDescriptorWorkspacePublication>"),
             std::string::npos)
-            << backend << " descriptor tables must retain their leases for the "
-                          "entire graph lifetime";
+            << backend << " descriptor tables must retain their exact shared "
+                          "publication for the entire graph lifetime";
         EXPECT_EQ(
             source->find("next_grouped_down_desc_workspace_slot_"),
             std::string::npos);
@@ -9159,6 +9329,54 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEGraphMetadataUsesExplicitWorkspaceOw
             std::string::npos)
             << backend << " event-record failure occurs after device submission "
                           "and must be process-fatal";
+
+        const auto down_publication = sliceBetween(
+            *source,
+            backend == std::string("CUDA")
+                ? "bool CUDAMoEKernel::publishGroupedDownDescriptorTable("
+                : "bool ROCmMoEKernel::publishGroupedDownDescriptorTable(",
+            backend == std::string("CUDA")
+                ? "bool CUDAMoEKernel::publishGroupedGateUpDescriptorTable("
+                : "bool ROCmMoEKernel::publishGroupedGateUpDescriptorTable(");
+        const auto gateup_publication = sliceBetween(
+            *source,
+            backend == std::string("CUDA")
+                ? "bool CUDAMoEKernel::publishGroupedGateUpDescriptorTable("
+                : "bool ROCmMoEKernel::publishGroupedGateUpDescriptorTable(",
+            backend == std::string("CUDA")
+                ? "bool CUDAMoEKernel::rebindGroupedDescriptorTablesToWorkspace("
+                : "bool ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace(");
+        for (const auto *publication :
+             {&down_publication, &gateup_publication})
+        {
+            const auto executable =
+                stripCommentsAndStringLiterals(*publication);
+            EXPECT_NE(
+                executable.find("getOrCreatePersistentPublication("),
+                std::string::npos)
+                << backend << " graph variants must converge on one exact "
+                              "prepared-weight descriptor publication";
+            EXPECT_EQ(
+                executable.find("acquirePersistentSlot("),
+                std::string::npos)
+                << backend << " descriptor ownership must not scale with "
+                              "prefill buckets or MTP depths";
+            EXPECT_NE(
+                executable.find(
+                    backend == std::string("CUDA")
+                        ? "cudaStreamWaitEvent("
+                        : "hipStreamWaitEvent("),
+                std::string::npos)
+                << backend << " descriptor adoption requires a device event edge";
+            EXPECT_EQ(
+                executable.find("synchronize"),
+                std::string::npos);
+            EXPECT_NE(
+                executable.find("std::terminate();"),
+                std::string::npos)
+                << backend << " a submitted descriptor write without a "
+                              "publishable event must be process-fatal";
+        }
     }
     EXPECT_EQ(
         rocm_source.find("next_router_fp16_gate_workspace_slot_"),
@@ -9282,7 +9500,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEPersistentMetadataOwnershipClosesBef
     expectNeedleBefore(
         cuda_rebind,
         "rejectCudaPersistentMetadataMutationDuringCapture(",
-        "acquirePersistentSlot(",
+        "publishGroupedDownDescriptorTable(",
         "CUDA must reject capture before changing descriptor ownership.");
 
     const auto cuda_down_upload = sliceBetween(
@@ -9292,7 +9510,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEPersistentMetadataOwnershipClosesBef
     expectNeedleBefore(
         cuda_down_upload,
         "rejectCudaPersistentMetadataMutationDuringCapture(",
-        "acquirePersistentSlot(",
+        "publishGroupedDownDescriptorTable(",
         "CUDA down descriptors must be published before capture.");
 
     const auto cuda_gateup_upload = sliceBetween(
@@ -9302,7 +9520,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEPersistentMetadataOwnershipClosesBef
     expectNeedleBefore(
         cuda_gateup_upload,
         "rejectCudaPersistentMetadataMutationDuringCapture(",
-        "acquirePersistentSlot(",
+        "publishGroupedGateUpDescriptorTable(",
         "CUDA gate/up descriptors must be published before capture.");
 
     const auto rocm_rebind = sliceBetween(
@@ -9312,7 +9530,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEPersistentMetadataOwnershipClosesBef
     expectNeedleBefore(
         rocm_rebind,
         "rejectDecodeStagingDuringCapture(",
-        "acquirePersistentSlot(",
+        "publishGroupedDownDescriptorTable(",
         "ROCm must reject capture before changing descriptor ownership.");
 
     const auto rocm_down_upload = sliceBetween(
@@ -9322,7 +9540,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEPersistentMetadataOwnershipClosesBef
     expectNeedleBefore(
         rocm_down_upload,
         "rejectDecodeStagingDuringCapture(",
-        "acquirePersistentSlot(",
+        "publishGroupedDownDescriptorTable(",
         "ROCm down descriptors must be published before capture.");
 
     const auto rocm_gateup_upload = sliceBetween(
@@ -9332,7 +9550,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEPersistentMetadataOwnershipClosesBef
     expectNeedleBefore(
         rocm_gateup_upload,
         "rejectDecodeStagingDuringCapture(",
-        "acquirePersistentSlot(",
+        "publishGroupedGateUpDescriptorTable(",
         "ROCm gate/up descriptors must be published before capture.");
 }
 
@@ -11157,4 +11375,128 @@ TEST(Test__GpuWorkspaceAllocationPolicy, AllPositionGreedyObserversPreserveProdu
               std::string::npos);
     EXPECT_EQ(compact_single.find("clearPendingLogitsStream("),
               std::string::npos);
+}
+
+/**
+ * @brief Eager forward-family declarations must retire their final event edge.
+ *
+ * Each forward graph build publishes device state. Intermediate declaration
+ * edges are consumed before the next participant is built, so this source
+ * contract protects the easy-to-miss terminal edge after the final participant.
+ * Runtime graph construction must begin with unambiguous event ownership.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     ForwardWorkspaceFamilyManifestClosesFinalDeviceStatePublication)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto materialization_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::materializeForwardGraphForShape(",
+        "ReceivedWeightsMap DeviceGraphOrchestrator::transferExpertWeights(");
+    const auto compact =
+        removeAsciiWhitespace(materialization_body);
+
+    const std::string terminal_wait =
+        "waitForPendingGraphBuildDeviceStateReady("
+        "main_graph_build_device_state_ready_,"
+        "publication_stream,"
+        "DeviceTimelineRole::MainForwardGraph,"
+        "\"forward_workspace_family_manifest_complete\")";
+    ASSERT_NE(compact.find(terminal_wait), std::string::npos)
+        << "The manifest must consume its final forward-build publication on "
+           "the exact publication stream";
+
+    expectNeedleBefore(
+        materialization_body,
+        "\"forward_workspace_family_manifest_complete\"",
+        "buildMTPWorkspaceFamilyManifest(",
+        "The forward publication must be retired before another graph-family "
+        "manifest can publish device state");
+}
+
+/**
+ * @brief The eager family manifest must include the live MTP condition graph.
+ *
+ * A condition graph has a role-specific GDN/short-conv namespace and consumes
+ * durable device token, position, and sequence-length rows. Omitting that exact
+ * participant lets first use discover new workspace names after addresses have
+ * already been published to captured sibling graphs.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     ForwardWorkspaceFamilyManifestDeclaresMTPConditionParticipant)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto materialization_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::materializeForwardGraphForShape(",
+        "ReceivedWeightsMap DeviceGraphOrchestrator::transferExpertWeights(");
+    const auto compact =
+        removeAsciiWhitespace(
+            stripCommentsAndStringLiterals(materialization_body));
+
+    EXPECT_NE(
+        compact.find(
+            "builder->setLiveMTPRequestBatchCondition(true)"),
+        std::string::npos);
+    EXPECT_NE(
+        compact.find(
+            "condition_input.token_ids_device="
+            "logical_state.next_condition_tokens_device;"),
+        std::string::npos);
+    EXPECT_NE(
+        compact.find(
+            "condition_input.position_ids_device="
+            "logical_state.target_cached_tokens_device;"),
+        std::string::npos);
+    EXPECT_NE(
+        compact.find(
+            "condition_input.sequence_lengths_device="
+            "logical_state.target_cached_tokens_device;"),
+        std::string::npos);
+    EXPECT_NE(
+        compact.find(
+            "WorkspaceGraphParticipantRole::MTPCondition"),
+        std::string::npos);
+}
+
+/**
+ * @brief Typed GPU MTP logits must resolve preplanned arena storage first.
+ *
+ * The generic all-position diagnostics path may still materialize a
+ * row-specific tensor, but grouped verifier and condition execution must return
+ * from the prepared-owner branch before that allocation site is reachable.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     TypedGPUMTPLogitsCannotReachDynamicTensorAllocation)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto forward_body = sliceBetween(
+        source,
+        "const float *DeviceGraphOrchestrator::forwardImpl(",
+        "bool DeviceGraphOrchestrator::supportsPrefillChunkSchedule(");
+
+    expectNeedleBefore(
+        forward_body,
+        "if (typed_gpu_mtp_logits)",
+        "tensor_factory_->createFP32(",
+        "Typed GPU MTP logits must resolve arena-owned capacity before the "
+        "generic row-specific allocation path");
+    EXPECT_NE(
+        forward_body.find(
+            "auto prepared = preplannedMTPLogitsBuffer("),
+        std::string::npos);
+    EXPECT_NE(
+        forward_body.find(
+            "if (!prepared)"),
+        std::string::npos);
+    EXPECT_NE(
+        forward_body.find(
+            "return prepared;"),
+        std::string::npos);
 }

@@ -125,6 +125,34 @@ namespace llaminar2
                             const char *dtype, DeviceId device);
 
         /**
+         * @brief Register a graph-declared buffer without discarding tensor axes.
+         *
+         * BufferArena stores owned tensors as a two-dimensional matrix because
+         * the kernel-facing tensor classes expose rows and columns. Graph
+         * schemas, however, may declare tensors with any rank. This overload is
+         * the required bridge between those representations: axis zero remains
+         * the row dimension and every trailing axis is flattened into columns.
+         * Consequently, a schema shape of `[R, A, B]` is allocated as
+         * `[R, A * B]` while preserving exactly the same element capacity.
+         *
+         * Keeping this conversion inside BufferArena prevents graph callers
+         * from accidentally copying only `shape[0]` and `shape[1]`, which would
+         * silently under-allocate rank-three publication tensors. Empty shapes,
+         * zero dimensions, and products that cannot fit in `size_t` are invalid
+         * graph contracts and fail immediately before any allocation occurs.
+         *
+         * @param id Unique buffer identifier.
+         * @param descriptor Complete graph buffer descriptor, including shape,
+         *        tensor type, and target device.
+         * @return true on success, false when @p id was already registered.
+         * @throws std::invalid_argument if the descriptor has no dimensions or
+         *         contains a zero-sized dimension.
+         * @throws std::overflow_error if its flattened element count overflows
+         *         `size_t`.
+         */
+        bool registerBuffer(BufferId id, const BufferDescriptor &descriptor);
+
+        /**
          * @brief Register an externally-owned buffer (weights).
          *
          * The arena does NOT own this tensor — it just tracks its coherence

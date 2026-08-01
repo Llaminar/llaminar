@@ -302,6 +302,52 @@ TEST(Test__MTPDepthController, DynamicPromotesOnStableFullAcceptWindows)
     EXPECT_EQ(controller.stats().promotions, 1u);
 }
 
+TEST(Test__MTPDepthController, RequestResetRestoresInitialDepthAndForgetsAdaptiveHistory)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/2,
+        /*cooldown_steps=*/0);
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
+
+    ASSERT_FALSE(
+        controller.recordStep(
+            observation(/*depth=*/1, /*accepted_prefix=*/1))
+            .evaluated);
+    const auto promotion =
+        controller.recordStep(
+            observation(/*depth=*/1, /*accepted_prefix=*/1));
+    ASSERT_TRUE(promotion.changed);
+    ASSERT_EQ(controller.currentDepth(), 2);
+    ASSERT_EQ(controller.stats().promotions, 1u);
+
+    /*
+     * A new request must not inherit either the selected depth or the partial
+     * policy evidence that selected it.  Prefix restore and ordinary prefill
+     * both rely on this exact reset contract.
+     */
+    controller.reset();
+
+    EXPECT_EQ(controller.currentDepth(), 1);
+    EXPECT_EQ(controller.requestedDepthForStep(), 1);
+    EXPECT_EQ(controller.stats().windows, 0u);
+    EXPECT_EQ(controller.stats().updates, 0u);
+    EXPECT_EQ(controller.stats().promotions, 0u);
+    EXPECT_EQ(controller.stats().demotions, 0u);
+    EXPECT_EQ(controller.stats().observe_recommendations, 0u);
+
+    const auto first_new_request_observation =
+        controller.recordStep(
+            observation(/*depth=*/1, /*accepted_prefix=*/1));
+    EXPECT_FALSE(first_new_request_observation.evaluated)
+        << "Reset must discard the preceding request's partial/full window";
+    EXPECT_EQ(controller.currentDepth(), 1);
+}
+
 TEST(Test__MTPDepthController, DynamicPromotesPerfectProbeAfterMinSamples)
 {
     auto config = dynamicConfig(

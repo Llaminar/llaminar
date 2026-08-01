@@ -493,6 +493,8 @@ namespace llaminar2
                 missing("output.moe_expert_indices", output.moe_expert_indices) ||
                 missing("output.moe_expert_weights", output.moe_expert_weights) ||
                 missing("output.moe_combined_output", output.moe_combined_output) ||
+                missing("output.moe_canonical_route_contributions",
+                        output.moe_canonical_route_contributions) ||
                 missing("output.moe_shared_expert_output", output.moe_shared_expert_output) ||
                 missing("output.moe_gate_scratch", output.moe_gate_scratch) ||
                 missing("output.moe_up_scratch", output.moe_up_scratch))
@@ -641,6 +643,8 @@ namespace llaminar2
             mtp_buffers.extensions[BufferId::MOE_EXPERT_INDICES] = output.moe_expert_indices;
             mtp_buffers.extensions[BufferId::MOE_EXPERT_WEIGHTS] = output.moe_expert_weights;
             mtp_buffers.extensions[BufferId::MOE_COMBINED_OUTPUT] = output.moe_combined_output;
+            mtp_buffers.extensions[BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS] =
+                output.moe_canonical_route_contributions;
             mtp_buffers.extensions[BufferId::MOE_SHARED_EXPERT_OUTPUT] = output.moe_shared_expert_output;
             mtp_buffers.extensions[BufferId::MOE_GATE_SCRATCH] = output.moe_gate_scratch;
             mtp_buffers.extensions[BufferId::MOE_UP_SCRATCH] = output.moe_up_scratch;
@@ -708,7 +712,10 @@ namespace llaminar2
             input.seq_len,
             input.batch_size,
             device,
-            input.device_state_publication_stream);
+            input.device_state_publication_stream,
+            /*sequence_lengths_device=*/nullptr,
+            static_cast<const int32_t *>(
+                input.position_ids_device));
         if (ffn.size() == 0)
             return ComputeGraph{};
 
@@ -744,6 +751,8 @@ namespace llaminar2
                           .seq_len = total_tokens,
                           .d_model = config_.d_model,
                           .vocab_size = mtp_final_projection.lm_head_vocab_size,
+                          .serial_equivalent_partition_width =
+                              mtp_final_projection.serial_equivalent_partition_width,
                           .use_prefill_replay_row_offset = false,
                           .compute_all_positions = true,
                           /*
@@ -999,7 +1008,7 @@ namespace llaminar2
             qkv_dim = 2 * key_dim + value_dim;
         }
 
-        LOG_DEBUG("[Qwen35Graph] Building GDN attention for layer " << layer_idx
+        LOG_TRACE("[Qwen35Graph] Building GDN attention for layer " << layer_idx
                                                                     << ": total_tokens=" << total_tokens
                                                                     << " n_k_heads=" << n_k_heads << " (full=" << n_k_heads_full << ")"
                                                                     << " n_v_heads=" << n_v_heads << " (full=" << n_v_heads_full << ")"
@@ -1355,7 +1364,7 @@ namespace llaminar2
                  * state, so an allgather would be both unnecessary and
                  * dimensionally invalid (`full == local`, not `local * degree`).
                  */
-                LOG_DEBUG("[Qwen35Graph] Skipping GDN live-state allgather for layer "
+                LOG_TRACE("[Qwen35Graph] Skipping GDN live-state allgather for layer "
                           << layer_idx
                           << " because prefill state is already full-sized");
             }
@@ -1485,7 +1494,7 @@ namespace llaminar2
 
         graph.setTerminalNode(terminal_node);
 
-        LOG_DEBUG("[Qwen35Graph] GDN attention graph for layer " << layer_idx
+        LOG_TRACE("[Qwen35Graph] GDN attention graph for layer " << layer_idx
                                                                  << " has " << graph.size() << " nodes");
 
         return graph;
@@ -1678,7 +1687,7 @@ namespace llaminar2
         const WeightBinding *wv_binding = layer.wv_binding ? layer.wv_binding : layer_bindings.wv;
         const WeightBinding *wo_binding = layer.wo_binding ? layer.wo_binding : layer_bindings.wo;
 
-        LOG_DEBUG("[Qwen35Graph::buildFAAttentionGraph] layer=" << layer_idx
+        LOG_TRACE("[Qwen35Graph::buildFAAttentionGraph] layer=" << layer_idx
                                                                 << " seq_len=" << seq_len << " batch_size=" << batch_size
                                                                 << " total_tokens=" << total_tokens);
 
@@ -1716,7 +1725,7 @@ namespace llaminar2
                 total_tokens > 1 &&
                 config_.usesMTPGroupedDecodeEquivalentRows();
 
-            LOG_DEBUG("[Qwen35Graph FA] Layer " << layer_idx << " QKV dims: q_n=" << q_n
+            LOG_TRACE("[Qwen35Graph FA] Layer " << layer_idx << " QKV dims: q_n=" << q_n
                                                 << " k_n=" << k_n << " v_n=" << v_n);
 
             // Q GEMM writes to fa_q_raw (oversized: n_heads * head_dim * 2)
@@ -1859,7 +1868,7 @@ namespace llaminar2
 
         graph.setTerminalNode(terminal);
 
-        LOG_DEBUG("[Qwen35Graph] FA attention graph for layer " << layer_idx
+        LOG_TRACE("[Qwen35Graph] FA attention graph for layer " << layer_idx
                                                                 << " has " << graph.size() << " nodes");
 
         return graph;

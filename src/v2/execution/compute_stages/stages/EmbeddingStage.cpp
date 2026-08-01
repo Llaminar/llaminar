@@ -104,7 +104,7 @@ namespace llaminar2
 
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
-        LOG_DEBUG("[EmbeddingStage::getOrCreateKernel] Created "
+        LOG_TRACE("[EmbeddingStage::getOrCreateKernel] Created "
                   << (dev_type == DeviceType::CUDA   ? "CUDA"
                       : dev_type == DeviceType::ROCm ? "ROCm"
                                                      : "CPU")
@@ -125,7 +125,7 @@ namespace llaminar2
 
     bool EmbeddingStage::execute(IDeviceContext *ctx)
     {
-        LOG_DEBUG("[EmbeddingStage] Execute: num_tokens=" << params_.num_tokens
+        LOG_TRACE("[EmbeddingStage] Execute: num_tokens=" << params_.num_tokens
                                                           << " d_model=" << params_.d_model
                                                           << " vocab_size=" << params_.vocab_size);
 

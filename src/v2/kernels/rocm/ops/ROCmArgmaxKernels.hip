@@ -348,6 +348,297 @@ __global__ void rocm_configure_mtp_greedy_penalty_policy_kernel(
 }
 
 /**
+ * @brief Apply durable-history penalties without a verifier prefix.
+ *
+ * This M=1 specialization gives adjacent work-items adjacent vocabulary
+ * entries and excludes every verifier-only branch. Ordinary serial decode
+ * therefore retains a compact VGPR/SGPR footprint and low launch latency.
+ */
+__global__ void rocm_apply_mtp_durable_penalties_f32_rows_kernel(
+    float *__restrict__ data,
+    int rows,
+    int cols,
+    int row_stride,
+    const int *__restrict__ generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy)
+{
+    const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
+    if (request_policy.enabled == 0)
+        return;
+
+    for (int token = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+         token < cols;
+         token += static_cast<int>(blockDim.x * gridDim.x))
+    {
+        const int count = generated_token_counts[token];
+        if (count <= 0)
+            continue;
+
+        float penalty = 0.0f;
+        if (request_policy.presence_penalty != 0.0f)
+            penalty += request_policy.presence_penalty;
+        if (request_policy.frequency_penalty != 0.0f)
+        {
+            penalty += request_policy.frequency_penalty *
+                       static_cast<float>(count);
+        }
+        for (int row = 0; row < rows; ++row)
+        {
+            data[static_cast<size_t>(row) * static_cast<size_t>(row_stride) +
+                 static_cast<size_t>(token)] -= penalty;
+        }
+    }
+}
+
+/**
+ * @brief Apply device-owned serial-decode penalties to verifier logit rows.
+ *
+ * Adjacent work-items own adjacent vocabulary entries, preserving coalesced
+ * accesses on AMD wavefronts. Tokens named anywhere in the verifier branch are
+ * left to sparse row owners in workgroup zero. Every other token has one
+ * durable count shared by all rows, allowing this pass to scan the short
+ * branch once per vocabulary token instead of once per row.
+ *
+ * The two-kernel ownership split removes O(rows^2 * vocabulary) redundant
+ * comparisons while retaining one captured launch. Dense and sparse owners
+ * touch disjoint token addresses, requiring no grid-wide barrier, atomics,
+ * temporary buffers, transfers, or synchronization points.
+ */
+__global__ void rocm_apply_mtp_verifier_penalties_f32_rows_kernel(
+    float *__restrict__ data,
+    int rows,
+    int cols,
+    int row_stride,
+    const int *__restrict__ verifier_input_tokens,
+    const int *__restrict__ generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy)
+{
+    const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
+    if (request_policy.enabled == 0)
+        return;
+
+    const int prefix_begin =
+        request_policy.first_token_already_in_history != 0 ? 1 : 0;
+
+    // Verifier launches reserve workgroup zero for sparse branch-token rows.
+    // The sparse workgroup runs concurrently with dense workgroups and exits;
+    // dense workgroups skip every address the sparse owner can modify.
+    if (blockIdx.x == 0)
+    {
+        for (int row = static_cast<int>(threadIdx.x);
+             row < rows;
+             row += static_cast<int>(blockDim.x))
+        {
+            for (int candidate_index = prefix_begin;
+                 candidate_index < rows;
+                 ++candidate_index)
+            {
+                const int token = verifier_input_tokens[candidate_index];
+                if (token < 0 || token >= cols)
+                    continue;
+
+                bool already_processed = false;
+                for (int earlier = prefix_begin;
+                     earlier < candidate_index;
+                     ++earlier)
+                {
+                    already_processed |=
+                        verifier_input_tokens[earlier] == token;
+                }
+                if (already_processed)
+                    continue;
+
+                int count = generated_token_counts[token];
+                for (int visible = prefix_begin; visible <= row; ++visible)
+                    count += verifier_input_tokens[visible] == token ? 1 : 0;
+                if (count <= 0)
+                    continue;
+
+                float penalty = 0.0f;
+                if (request_policy.presence_penalty != 0.0f)
+                    penalty += request_policy.presence_penalty;
+                if (request_policy.frequency_penalty != 0.0f)
+                {
+                    penalty += request_policy.frequency_penalty *
+                               static_cast<float>(count);
+                }
+                data[static_cast<size_t>(row) *
+                         static_cast<size_t>(row_stride) +
+                     static_cast<size_t>(token)] -= penalty;
+            }
+        }
+        return;
+    }
+
+    const int dense_block = static_cast<int>(blockIdx.x) - 1;
+    const int dense_blocks = static_cast<int>(gridDim.x) - 1;
+    for (int token = dense_block * static_cast<int>(blockDim.x) +
+                     static_cast<int>(threadIdx.x);
+         token < cols;
+         token += static_cast<int>(blockDim.x) * dense_blocks)
+    {
+        bool verifier_branch_token = false;
+        for (int history_index = prefix_begin;
+             history_index < rows;
+             ++history_index)
+        {
+            verifier_branch_token |=
+                verifier_input_tokens[history_index] == token;
+        }
+        if (verifier_branch_token)
+            continue;
+
+        const int count = generated_token_counts[token];
+        if (count <= 0)
+            continue;
+
+        float penalty = 0.0f;
+        if (request_policy.presence_penalty != 0.0f)
+            penalty += request_policy.presence_penalty;
+        if (request_policy.frequency_penalty != 0.0f)
+        {
+            penalty += request_policy.frequency_penalty *
+                       static_cast<float>(count);
+        }
+        for (int row = 0; row < rows; ++row)
+        {
+            data[static_cast<size_t>(row) * static_cast<size_t>(row_stride) +
+                 static_cast<size_t>(token)] -= penalty;
+        }
+    }
+
+}
+
+/** @brief Resolve one token from persistent condition and draft branch rows. */
+__device__ __forceinline__ int rocm_mtp_branch_token_at(
+    int branch_index,
+    int include_first_condition,
+    const int *__restrict__ first_condition_token,
+    const int *__restrict__ prior_draft_tokens)
+{
+    if (include_first_condition != 0 && branch_index == 0)
+        return first_condition_token[0];
+    return prior_draft_tokens[
+        branch_index - (include_first_condition != 0 ? 1 : 0)];
+}
+
+/**
+ * @brief Apply one proposal row's durable and speculative branch penalties.
+ *
+ * Sparse branch tokens belong to block zero; dense durable-only tokens belong
+ * to every later block.  This disjoint ownership preserves serial arithmetic
+ * without atomics, scratch, or a grid-wide synchronization point.
+ */
+__global__ void rocm_apply_mtp_branch_penalties_f32_row_kernel(
+    float *__restrict__ data,
+    int cols,
+    const int *__restrict__ first_condition_token,
+    const int *__restrict__ prior_draft_tokens,
+    int prior_draft_count,
+    const int *__restrict__ generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy)
+{
+    const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
+    if (request_policy.enabled == 0)
+        return;
+
+    const int include_first_condition =
+        request_policy.first_token_already_in_history == 0 ? 1 : 0;
+    const int branch_count = include_first_condition + prior_draft_count;
+
+    if (blockIdx.x == 0)
+    {
+        for (int branch_index = static_cast<int>(threadIdx.x);
+             branch_index < branch_count;
+             branch_index += static_cast<int>(blockDim.x))
+        {
+            const int token = rocm_mtp_branch_token_at(
+                branch_index,
+                include_first_condition,
+                first_condition_token,
+                prior_draft_tokens);
+            if (token < 0 || token >= cols)
+                continue;
+
+            bool already_processed = false;
+            for (int earlier = 0; earlier < branch_index; ++earlier)
+            {
+                already_processed |=
+                    rocm_mtp_branch_token_at(
+                        earlier,
+                        include_first_condition,
+                        first_condition_token,
+                        prior_draft_tokens) == token;
+            }
+            if (already_processed)
+                continue;
+
+            int count = generated_token_counts[token];
+            for (int visible = 0; visible < branch_count; ++visible)
+            {
+                count += rocm_mtp_branch_token_at(
+                             visible,
+                             include_first_condition,
+                             first_condition_token,
+                             prior_draft_tokens) == token
+                             ? 1
+                             : 0;
+            }
+            if (count <= 0)
+                continue;
+
+            float penalty = 0.0f;
+            if (request_policy.presence_penalty != 0.0f)
+                penalty += request_policy.presence_penalty;
+            if (request_policy.frequency_penalty != 0.0f)
+            {
+                penalty += request_policy.frequency_penalty *
+                           static_cast<float>(count);
+            }
+            data[token] -= penalty;
+        }
+        return;
+    }
+
+    const int dense_block = static_cast<int>(blockIdx.x) - 1;
+    const int dense_blocks = static_cast<int>(gridDim.x) - 1;
+    for (int token = dense_block * static_cast<int>(blockDim.x) +
+                     static_cast<int>(threadIdx.x);
+         token < cols;
+         token += dense_blocks * static_cast<int>(blockDim.x))
+    {
+        bool branch_owned = false;
+        for (int branch_index = 0;
+             branch_index < branch_count;
+             ++branch_index)
+        {
+            branch_owned |=
+                rocm_mtp_branch_token_at(
+                    branch_index,
+                    include_first_condition,
+                    first_condition_token,
+                    prior_draft_tokens) == token;
+        }
+        if (branch_owned)
+            continue;
+
+        const int count = generated_token_counts[token];
+        if (count <= 0)
+            continue;
+
+        float penalty = 0.0f;
+        if (request_policy.presence_penalty != 0.0f)
+            penalty += request_policy.presence_penalty;
+        if (request_policy.frequency_penalty != 0.0f)
+        {
+            penalty += request_policy.frequency_penalty *
+                       static_cast<float>(count);
+        }
+        data[token] -= penalty;
+    }
+}
+
+/**
  * @brief Advance the mirrored generated-token histogram after publication.
  */
 __global__ void rocm_commit_mtp_greedy_penalty_history_kernel(
@@ -517,7 +808,7 @@ bool rocmOps_argmax_f32(
         partial_vals, partial_idxs, num_blocks, out_value, out_index);
 
     (void)hipGetLastError();  // Clear stale errors
-    hipError_t err = hipGetLastError();
+    const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
         fprintf(stderr, "ROCm Argmax FP32 (multi-block) launch failed: %s\n",
@@ -703,6 +994,119 @@ bool rocmOps_argmax_f32_batched_rows_mtp_penalties(
         fprintf(
             stderr,
             "ROCm MTP penalty-aware batched argmax launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_apply_mtp_penalties_f32_rows(
+    float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    const int *verifier_input_tokens,
+    const int *generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *policy,
+    int device_idx,
+    void *stream)
+{
+    if (!data || rows <= 0 || cols <= 0 || row_stride < cols ||
+        !generated_token_counts || !policy || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads = 256;
+    int blocks = (cols + threads - 1) / threads;
+    blocks = blocks > 1024 ? 1024 : blocks;
+    if (verifier_input_tokens)
+    {
+        hipLaunchKernelGGL(
+            rocm_apply_mtp_verifier_penalties_f32_rows_kernel,
+            dim3(blocks + 1),
+            dim3(threads),
+            0,
+            static_cast<hipStream_t>(stream),
+            data,
+            rows,
+            cols,
+            row_stride,
+            verifier_input_tokens,
+            generated_token_counts,
+            policy);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            rocm_apply_mtp_durable_penalties_f32_rows_kernel,
+            dim3(blocks),
+            dim3(threads),
+            0,
+            static_cast<hipStream_t>(stream),
+            data,
+            rows,
+            cols,
+            row_stride,
+            generated_token_counts,
+            policy);
+    }
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm MTP penalty row transform launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+
+    return true;
+}
+
+bool rocmOps_apply_mtp_branch_penalties_f32_row(
+    float *data,
+    int cols,
+    const int *first_condition_token,
+    const int *prior_draft_tokens,
+    int prior_draft_count,
+    const int *generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *policy,
+    int device_idx,
+    void *stream)
+{
+    if (!data || cols <= 0 || !first_condition_token ||
+        prior_draft_count < 0 ||
+        (prior_draft_count > 0 && !prior_draft_tokens) ||
+        !generated_token_counts || !policy || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads = 256;
+    int dense_blocks = (cols + threads - 1) / threads;
+    dense_blocks = dense_blocks > 1024 ? 1024 : dense_blocks;
+    hipLaunchKernelGGL(
+        rocm_apply_mtp_branch_penalties_f32_row_kernel,
+        dim3(dense_blocks + 1),
+        dim3(threads),
+        0,
+        static_cast<hipStream_t>(stream),
+        data,
+        cols,
+        first_condition_token,
+        prior_draft_tokens,
+        prior_draft_count,
+        generated_token_counts,
+        policy);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm MTP branch penalty row transform launch failed: %s\n",
             hipGetErrorString(err));
         return false;
     }

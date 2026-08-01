@@ -111,6 +111,17 @@ namespace llaminar2
          */
         const void *position_ids_device = nullptr;
         /**
+         * @brief Materialize scalar serial-decode position from live GPU KV state.
+         *
+         * Ordinary GPU decode binds a stable arena position row into the
+         * captured graph. Immediately before replay, the orchestrator snapshots
+         * the canonical device KV count into that row on the graph stream. This
+         * keeps RoPE, attention, and replicated-expert tie breaking on one
+         * immutable device-owned logical position even when attention advances
+         * the live cache count later in the same graph.
+         */
+        bool materialize_serial_decode_position_from_device_kv = false;
+        /**
          * @brief Semantic representation of this invocation's positions.
          *
          * The default preserves the long-standing public contract that callers
@@ -704,6 +715,9 @@ namespace llaminar2
          *        graph-build publications; `nullptr` is legal only for CPU.
          * @param sequence_lengths_device Optional device-resident real-length
          *        array used by padded grouped execution.
+         * @param absolute_position_ids_device Optional device-resident INT32
+         *        absolute position row shared with RoPE. Grouped resident
+         *        assignment policies that promise M-invariance must require it.
          */
         virtual ComputeGraph buildFFNGraph(
             const LayerWeights &layer,
@@ -713,7 +727,8 @@ namespace llaminar2
             int batch_size,
             DeviceId device,
             void *device_state_publication_stream,
-            const int32_t *sequence_lengths_device = nullptr)
+            const int32_t *sequence_lengths_device = nullptr,
+            const int32_t *absolute_position_ids_device = nullptr)
         {
             (void)layer;
             (void)buffers;
@@ -723,6 +738,7 @@ namespace llaminar2
             (void)device;
             (void)device_state_publication_stream;
             (void)sequence_lengths_device;
+            (void)absolute_position_ids_device;
             return {};
         }
 

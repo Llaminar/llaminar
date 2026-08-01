@@ -513,6 +513,29 @@ namespace llaminar2
             int committed_rows,
             const char *source);
         /**
+         * @brief Publish device MoE maintenance before launching a future MTP consumer.
+         *
+         * Accepted-state publication and the next speculative sidecar use
+         * independent GPU streams.  LLEP maintenance may flip the active
+         * placement bank between those operations, so a sidecar must never be
+         * submitted until the complete decode boundary has published its
+         * maintenance completion event.  This helper is the sole ordering gate
+         * for resident sidecar prelaunches: it enqueues maintenance once for the
+         * current decode step and records that the ordinary outer-loop boundary
+         * must acknowledge, rather than replay, the same transaction.
+         *
+         * Non-device-controller lanes are unchanged because they do not have a
+         * concurrent placement-bank publisher.  A failure is fatal to the
+         * current decode step; launching the consumer against ambiguous expert
+         * ownership is never an allowed fallback.
+         *
+         * @param consumer Human-readable consumer name used in diagnostics.
+         * @return true when no device maintenance is required or its event has
+         *         been published before the future consumer launch.
+         */
+        bool publishDeviceMoEMaintenanceBeforeMTPConsumer(
+            const char *consumer);
+        /**
          * @brief Resolve the scalar sidecar base position for MTP planning.
          *
          * GPU lanes must use the orchestration-owned transaction position
@@ -749,6 +772,16 @@ namespace llaminar2
             prelaunched_mtp_first_sidecar_resident_state_;
         std::optional<SamplingParams>
             prelaunched_mtp_first_sidecar_params_;
+        /**
+         * @brief Whether this decode step already published device MoE maintenance.
+         *
+         * The flag bridges the inner MTP transaction, which must order a
+         * prelaunched sidecar immediately, and the outer generation loop, which
+         * historically owned the decode-boundary callback.  It does not replace
+         * a GPU event or carry data-plane state; it only prevents the host
+         * scheduler from submitting the same maintenance graph twice.
+         */
+        bool device_moe_maintenance_published_in_decode_step_ = false;
         /**
          * @brief Scheduler-owned logical position for the current decode transaction.
          *

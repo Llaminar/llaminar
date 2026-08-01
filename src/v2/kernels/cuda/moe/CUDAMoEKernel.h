@@ -102,7 +102,8 @@ namespace llaminar2
             bool normalize_weights,
             ITensor *output_indices, ITensor *output_weights,
             bool write_legacy_outputs,
-            bool update_runtime_histogram) override;
+            bool update_runtime_histogram,
+            const int32_t *absolute_position_ids_device = nullptr) override;
 
         bool decodeRouteSelectWithReadyRebalanceApply(
             DeviceMoELayerRuntime *runtime_layers,
@@ -122,7 +123,8 @@ namespace llaminar2
             DeviceMoERebalanceApplyStatus *rebalance_apply_status,
             DeviceMoERebalanceGraphControllerState *rebalance_controller_state,
             int rebalance_target_layer,
-            uint32_t rebalance_command_buffer_count) override;
+            uint32_t rebalance_command_buffer_count,
+            const int32_t *absolute_position_ids_device = nullptr) override;
 
         void zeroBuffer(ITensor *tensor, size_t bytes) override;
 
@@ -183,21 +185,31 @@ namespace llaminar2
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
             bool filter_to_local_runtime_experts = false,
-            MoEGroupedHistogramUpdate histogram_update =
-                MoEGroupedHistogramUpdate::None) override;
+            bool retain_routes_for_deferred_commit = false) override;
 
         bool regroupPrefillRoutesFromRuntimeAssignments(
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
-            MoEGroupedHistogramUpdate histogram_update =
-                MoEGroupedHistogramUpdate::None) override;
+            bool retain_routes_for_deferred_commit = false) override;
+
+        bool commitGroupedVerifierHistograms(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoELayerRuntime *runtime_layer,
+            const int32_t *accepted_state_counts_device,
+            const int32_t *publication_ok_flags_device,
+            int request_count,
+            int rows_per_request,
+            int total_rows,
+            int num_experts,
+            int top_k) override;
 
         bool assignPrefillRoutesLeastLoadedResident(
             const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
-            int num_experts, int top_k) override;
+            int num_experts, int top_k,
+            const int32_t *absolute_position_ids_device) override;
 
         bool planPrefillRoutesLeastLoadedCurrentBatch(
             const MoEKernelLaunchContext &launch,
@@ -282,7 +294,8 @@ namespace llaminar2
             int gateup_desc_table_id,
             int down_desc_table_id,
             int seq_len, int d_model, int intermediate,
-            int num_experts, int top_k) override;
+            int num_experts, int top_k,
+            ITensor *canonical_route_contributions = nullptr) override;
 
         bool executeGroupedPrefillPipelineFromRuntime(
             DeviceMoELayerRuntime *device_runtime_layer,
@@ -291,7 +304,8 @@ namespace llaminar2
             int gateup_desc_table_id,
             int down_desc_table_id,
             int seq_len, int d_model, int intermediate,
-            int num_experts, int top_k) override;
+            int num_experts, int top_k,
+            ITensor *canonical_route_contributions = nullptr) override;
 
         /// @brief Execute grouped gate/up decode from a persistent descriptor table and static host ids.
         bool groupedExpertGateUpDecodeFromTable(
@@ -363,7 +377,8 @@ namespace llaminar2
             ITensor *output,
             int d_model,
             int intermediate,
-            const uint8_t *expert_mask = nullptr) override;
+            const uint8_t *expert_mask = nullptr,
+            ITensor *canonical_route_contributions = nullptr) override;
 
         /// @brief Execute graph-capturable grouped SwiGLU/down decode from runtime-table ids and weights.
         bool groupedExpertDownDecodeFromRuntime(
@@ -387,7 +402,15 @@ namespace llaminar2
             int d_model,
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source =
-                MoEDecodeDescriptorSource::RuntimePlacementTable) override;
+                MoEDecodeDescriptorSource::RuntimePlacementTable,
+            ITensor *canonical_route_contributions = nullptr) override;
+
+        bool reduceCanonicalRouteContributions(
+            ITensor *canonical_route_contributions,
+            ITensor *output,
+            int seq_len,
+            int top_k,
+            int d_model) override;
 
         bool runDeviceRebalanceController(
             const MoEKernelLaunchContext &launch,
@@ -527,6 +550,15 @@ namespace llaminar2
             DeviceMoERebalanceGraphControllerState *controller_state,
             const DeviceMoERebalanceConfig &config) override;
 
+        bool resetDeviceRebalanceGraphTransactionForRequest(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoERebalanceGraphControllerState *controller_state,
+            DeviceMoERebalanceCommandBufferHeader *command_headers,
+            DeviceMoERebalanceWaveState *wave_states,
+            uint32_t *plan_counts,
+            uint32_t command_buffer_count,
+            const DeviceMoERebalanceConfig &config) override;
+
         bool publishDeviceRebalanceTransferComplete(
             const MoEKernelLaunchContext &launch,
             DeviceMoERebalanceGraphControllerState *controller_state,
@@ -616,7 +648,8 @@ namespace llaminar2
             const float *device_weights,
             bool use_runtime_descriptors,
             bool allow_router_q8_reuse,
-            const char *counter_source);
+            const char *counter_source,
+            ITensor *canonical_route_contributions);
 
         static constexpr std::size_t kRuntimePointerArrayMaxTopK = 16;
         static constexpr std::size_t kRuntimePointerArrayTableSlots = 1024;
@@ -831,10 +864,27 @@ namespace llaminar2
             int rows,
             int d_model) const noexcept;
 
+        /**
+         * @brief Workspace-owned grouped descriptor bytes and readiness edge.
+         *
+         * Graph-local routed-pipeline kernels retain this shared publication.
+         * Captured arguments therefore keep a stable address while separately
+         * materialized MTP depths and prefill buckets adopt one exact prepared
+         * weight table rather than consuming private descriptor slots.
+         */
+        struct GroupedDescriptorWorkspacePublication
+        {
+            void *ready_event = nullptr;
+            DeviceNativeVNNIMatrixDesc *primary_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *secondary_descs = nullptr;
+            std::size_t workspace_slot = 0;
+        };
+
         struct GroupedDownDescriptorTable
         {
             DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
-            std::shared_ptr<PersistentWorkspaceSlotLease> workspace_lease;
+            std::shared_ptr<GroupedDescriptorWorkspacePublication>
+                workspace_publication;
             std::vector<DeviceNativeVNNIMatrixDesc> host_descs;
             std::size_t workspace_slot = 0;
             int num_experts = 0;
@@ -849,7 +899,8 @@ namespace llaminar2
         {
             DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
             DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
-            std::shared_ptr<PersistentWorkspaceSlotLease> workspace_lease;
+            std::shared_ptr<GroupedDescriptorWorkspacePublication>
+                workspace_publication;
             std::vector<DeviceNativeVNNIMatrixDesc> host_gate_descs;
             std::vector<DeviceNativeVNNIMatrixDesc> host_up_descs;
             std::size_t workspace_slot = 0;
@@ -860,6 +911,24 @@ namespace llaminar2
             uint32_t codebook_mask = 0;
             bool valid = false;
         };
+
+        /**
+         * @brief Publish or adopt one exact down-descriptor table.
+         *
+         * The one-time H2D producer records a readiness event. Every graph-local
+         * adopter waits on that event through its explicit stream, with no host
+         * synchronization and no inference-hot-path allocation.
+         */
+        bool publishGroupedDownDescriptorTable(
+            GroupedDownDescriptorTable &table,
+            const char *context);
+
+        /**
+         * @brief Publish or adopt one exact paired gate/up descriptor table.
+         */
+        bool publishGroupedGateUpDescriptorTable(
+            GroupedGateUpDescriptorTable &table,
+            const char *context);
 
         /**
          * @brief Workspace-owned immutable CUDA router-weight publication.

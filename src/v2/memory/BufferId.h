@@ -74,6 +74,7 @@ namespace llaminar2
         MOE_EXPERT_WEIGHTS,       ///< Top-k routing weights per token
         MOE_EXPERT_OUTPUT,        ///< Scratch for per-expert FFN output
         MOE_COMBINED_OUTPUT,      ///< Final combined expert output
+        MOE_CANONICAL_ROUTE_CONTRIBUTIONS, ///< Route-ordered LocalTP contributions [rows, top_k, d_model]
         MOE_SHARED_EXPERT_OUTPUT, ///< Shared expert FFN output
         MOE_SHARED_GATE_OUTPUT,   ///< Shared expert after sigmoid gating
         MOE_GATE_SCRATCH,         ///< Expert gate projection scratch [seq, intermediate]
@@ -241,6 +242,8 @@ namespace llaminar2
             return "MOE_EXPERT_OUTPUT";
         case BufferId::MOE_COMBINED_OUTPUT:
             return "MOE_COMBINED_OUTPUT";
+        case BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS:
+            return "MOE_CANONICAL_ROUTE_CONTRIBUTIONS";
         case BufferId::MOE_SHARED_EXPERT_OUTPUT:
             return "MOE_SHARED_EXPERT_OUTPUT";
         case BufferId::MOE_SHARED_GATE_OUTPUT:

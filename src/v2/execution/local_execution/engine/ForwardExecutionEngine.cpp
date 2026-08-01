@@ -66,6 +66,50 @@ namespace llaminar2
         }
 
         /**
+         * @brief Map a typed forward invocation onto workspace graph semantics.
+         *
+         * `is_decode` remains relevant for ordinary MainInference because that
+         * public role spans prompt prefill and serial decode. Internal MTP roles
+         * are already exact: a condition is one decode-equivalent row and a
+         * grouped verifier is compact grouped decode regardless of M or position.
+         */
+        WorkspaceGraphParticipantRole workspaceParticipantRole(
+            ForwardExecutionRole execution_role,
+            bool is_decode)
+        {
+            switch (execution_role)
+            {
+            case ForwardExecutionRole::GroupedMTPVerifier:
+                return WorkspaceGraphParticipantRole::GroupedVerifier;
+            case ForwardExecutionRole::MTPCondition:
+                return WorkspaceGraphParticipantRole::MTPCondition;
+            case ForwardExecutionRole::MainInference:
+                return is_decode
+                           ? WorkspaceGraphParticipantRole::Decode
+                           : WorkspaceGraphParticipantRole::Prefill;
+            }
+            throw std::logic_error(
+                "Forward execution has no workspace participant role");
+        }
+
+        /**
+         * @brief Select the physical family policy for one typed participant.
+         *
+         * Only ordinary prefill owns the largest-row envelope. Decode and grouped
+         * verification use exact compact geometry within the already-published
+         * serial family allocation.
+         */
+        WorkspaceGraphFamilyPolicy workspaceFamilyPolicy(
+            WorkspaceGraphParticipantRole role)
+        {
+            return role == WorkspaceGraphParticipantRole::Prefill
+                       ? WorkspaceGraphFamilyPolicy::
+                             SerialDeviceFamilyLargestParticipant
+                       : WorkspaceGraphFamilyPolicy::
+                             SerialDeviceFamilyExactParticipant;
+        }
+
+        /**
          * @brief Publish the ordering owner for one successful forward call.
          *
          * This helper deliberately writes the caller-owned ForwardOutput. The
@@ -1086,7 +1130,21 @@ namespace llaminar2
             input.seq_len > 1 &&
             input.seq_len <= decode_max_seq_len &&
             first_position > 0;
+        /*
+         * Internal MTP roles are decode-equivalent by contract. Their persistent
+         * device token/position rows can legitimately begin at logical position
+         * zero, so history and M heuristics must not decide cache ownership,
+         * graph-capture policy, or producer publication. In particular, a
+         * grouped verifier must enter the decode cache on its first invocation;
+         * accepted-state publication consumes that exact cached graph and stream.
+         */
+        const bool role_is_decode =
+            input.execution_role ==
+                ForwardExecutionRole::GroupedMTPVerifier ||
+            input.execution_role ==
+                ForwardExecutionRole::MTPCondition;
         const bool is_decode =
+            role_is_decode ||
             is_single_token_decode ||
             is_short_continuation_decode ||
             mtp_spec_verifier_decode ||
@@ -1321,6 +1379,26 @@ namespace llaminar2
                                         active_forward_cache &&
                                         active_forward_cache->valid;
 
+        if (live_mtp_request_batch_condition &&
+            debugEnv().runtime_debug.mtp_condition_graph_contract_trace)
+        {
+            LOG_INFO(
+                "[MTPConditionGraphContract] event=cache_decision"
+                << " device=" << effective_input.device.toString()
+                << " result=" << (use_cached_forward ? "hit" : "miss")
+                << " seq_len=" << forward_signature.seq_len
+                << " batch_size=" << forward_signature.batch_size
+                << " device_tokens="
+                << boolTag(forward_signature.uses_device_token_ids)
+                << " device_positions="
+                << boolTag(forward_signature.uses_device_position_ids)
+                << " device_lengths="
+                << boolTag(
+                       forward_signature.uses_device_sequence_lengths)
+                << " placement_epoch="
+                << forward_signature.moe_placement_epoch);
+        }
+
         if (use_cached_forward)
         {
             PerfStatsCollector::addCounter(
@@ -1333,6 +1411,15 @@ namespace llaminar2
             touchBucketedPrefillForwardCache(forward_signature, *active_forward_cache);
             const bool success = executeCacheHit(effective_input, output, *active_forward_cache, host,
                                                  is_decode, start);
+            if (live_mtp_request_batch_condition &&
+                debugEnv().runtime_debug.mtp_condition_graph_contract_trace)
+            {
+                LOG_INFO(
+                    "[MTPConditionGraphContract] event=execution_complete"
+                    << " device=" << effective_input.device.toString()
+                    << " cache=hit"
+                    << " success=" << boolTag(success));
+            }
             if (success)
             {
                 recordLastExecutedForwardGraph(forward_signature, /*cache_hit=*/true);
@@ -1372,6 +1459,15 @@ namespace llaminar2
         const bool success = executeCacheMiss(build_input, output, forward_signature, build_cache,
                                               should_cache_after_build, host, is_decode,
                                               has_unified_pp, start);
+        if (live_mtp_request_batch_condition &&
+            debugEnv().runtime_debug.mtp_condition_graph_contract_trace)
+        {
+            LOG_INFO(
+                "[MTPConditionGraphContract] event=execution_complete"
+                << " device=" << effective_input.device.toString()
+                << " cache=miss"
+                << " success=" << boolTag(success));
+        }
         if (success && build_cache && build_cache->valid)
             recordLastExecutedForwardGraph(forward_signature, /*cache_hit=*/false);
         if (success && !output.execution.valid)
@@ -1578,14 +1674,15 @@ namespace llaminar2
 
             if (!workspace_validated)
             {
+                const WorkspaceGraphParticipantRole workspace_role =
+                    workspaceParticipantRole(
+                        input.execution_role,
+                        is_decode);
                 if (!host.ensureDeviceWorkspaceAllocated(
                         *forward_cache.graph,
                         input.seq_len,
-                        is_decode
-                            ? WorkspaceGraphFamilyPolicy::
-                                  SerialDeviceFamilyExactParticipant
-                            : WorkspaceGraphFamilyPolicy::
-                                  SerialDeviceFamilyLargestParticipant))
+                        workspaceFamilyPolicy(workspace_role),
+                        workspace_role))
                 {
                     LOG_ERROR("[ForwardExecutionEngine] Failed to refresh cached graph workspace for "
                               << input.device.toString() << " seq_len=" << input.seq_len);
@@ -1744,10 +1841,25 @@ namespace llaminar2
             }
         }
 
+        /*
+         * GraphCacheConfig::decode_seq_len is a heuristic boundary for ordinary
+         * continuation traffic. It is not an MTP capacity declaration. Typed MTP
+         * roles have already passed their configured verifier-row validation and
+         * are decode-equivalent for every supported M, including M values above
+         * the legacy four-row threshold. Applying that heuristic here silently
+         * sent grouped verifier M=5..15 through eager execution.
+         */
+        const bool typed_mtp_decode_role =
+            input.execution_role ==
+                ForwardExecutionRole::GroupedMTPVerifier ||
+            input.execution_role ==
+                ForwardExecutionRole::MTPCondition;
         const bool decode_capture_allowed =
             is_decode &&
             input.batch_size <= 1 &&
-            input.seq_len <= std::max(1, config_.cache_config.decode_seq_len);
+            (typed_mtp_decode_role ||
+             input.seq_len <=
+                 std::max(1, config_.cache_config.decode_seq_len));
 
         if (stream_device.is_gpu())
         {
@@ -2040,6 +2152,19 @@ namespace llaminar2
                 capture_policy = host.buildDecodeCapturePolicy(
                     has_collective_nodes,
                     ctx);
+            }
+            if (typed_mtp_decode_role &&
+                input.device.is_gpu() &&
+                !capture_policy.allow_cached_graph_replay)
+            {
+                LOG_ERROR(
+                    "[ForwardExecutionEngine] GPU MTP role requires cached "
+                    "full-graph replay for every validated row count"
+                    << " role="
+                    << static_cast<int>(input.execution_role)
+                    << " seq_len=" << input.seq_len
+                    << " device=" << input.device.toString());
+                return false;
             }
             if (capture_policy.collective_segmented_enabled)
             {
@@ -3193,6 +3318,28 @@ namespace llaminar2
         ComputeGraph graph = build_result.takeGraph();
         auto collective_nodes = graph.collectiveNodeNames();
 
+        if (signature.live_mtp_request_batch_condition &&
+            debugEnv().runtime_debug.mtp_condition_graph_contract_trace)
+        {
+            std::ostringstream manifest;
+            bool first = true;
+            for (const auto &node_name : graph.getExecutionOrder())
+            {
+                if (!collective_nodes.contains(node_name))
+                    continue;
+                if (!first)
+                    manifest << ',';
+                first = false;
+                manifest << node_name;
+            }
+            LOG_INFO(
+                "[MTPConditionGraphContract] event=graph_manifest"
+                << " device=" << effective_input.device.toString()
+                << " stages=" << graph.size()
+                << " collective_count=" << collective_nodes.size()
+                << " collectives=[" << manifest.str() << ']');
+        }
+
         LOG_DEBUG("[ForwardExecutionEngine] Forward graph built with " << graph.size() << " stages");
 
         if (graph.size() == 0)
@@ -3286,14 +3433,15 @@ namespace llaminar2
         // Ensure declared CPU/GPU workspace is allocated for this graph. Cache
         // hits repeat this step because another bucket can grow the shared
         // per-device workspace and leave cached stages bound to old pointers.
+        const WorkspaceGraphParticipantRole workspace_role =
+            workspaceParticipantRole(
+                effective_input.execution_role,
+                is_decode);
         if (!host.ensureDeviceWorkspaceAllocated(
                 graph,
                 effective_input.seq_len,
-                is_decode
-                    ? WorkspaceGraphFamilyPolicy::
-                          SerialDeviceFamilyExactParticipant
-                    : WorkspaceGraphFamilyPolicy::
-                          SerialDeviceFamilyLargestParticipant))
+                workspaceFamilyPolicy(workspace_role),
+                workspace_role))
         {
             LOG_ERROR("[ForwardExecutionEngine] Failed to allocate workspace for forward graph on "
                       << effective_input.device.toString() << " seq_len=" << effective_input.seq_len);

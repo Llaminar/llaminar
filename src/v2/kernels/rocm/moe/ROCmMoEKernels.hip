@@ -17,6 +17,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cfloat>
@@ -24,6 +25,7 @@
 #include "execution/moe/DeviceMoERebalanceABI.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/LeastLoadedExpertAssignment.h"
+#include "execution/moe/DeviceMoERuntimeABI.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
 
 namespace
@@ -46,9 +48,6 @@ namespace
     constexpr uint32_t kDeviceMoEDirectoryFlagLocalCompute = 1u << 2;
     constexpr uint32_t kDeviceMoEDirectoryFlagTransferSlot = 1u << 3;
     constexpr uint32_t kDeviceMoEDirectoryFlagCopyComplete = 1u << 4;
-    // Keep these launch-ABI bits aligned with MoEGroupedHistogramUpdate.
-    constexpr int kGroupedHistogramSelectedRoutes = 1 << 0;
-    constexpr int kGroupedHistogramLocallyAssignedRoutes = 1 << 1;
     constexpr uint32_t kDeviceMoEReplicaRoleNone = 0u;
     constexpr uint32_t kDeviceMoEReplicaRolePrimary = 1u;
     constexpr uint32_t kDeviceMoEReplicaRoleReplica = 2u;
@@ -80,6 +79,10 @@ namespace
     constexpr uint32_t kDeviceMoERebalancePlanExpertPayloadArrival = 1u;
     constexpr uint32_t kDeviceMoERebalancePlanResidentExpertAssignment = 2u;
     constexpr uint32_t kDeviceMoERebalancePlanOwnershipTransfer = 3u;
+    constexpr uint32_t kDeviceMoERebalancePlanFlagExactDestinationSlot =
+        llaminar2::moe_rebalance_abi::kPlanFlagExactDestinationSlot;
+    constexpr uint32_t kDeviceMoERebalancePlanFlagCurrentBatchLLEP =
+        llaminar2::moe_rebalance_abi::kPlanFlagCurrentBatchLLEP;
     constexpr uint32_t kDeviceMoERebalanceAssignmentLeastLoadedResident = 1u;
     constexpr uint32_t kDeviceMoERebalancePhasePlanAssignments = 2u;
     constexpr uint32_t kDeviceMoERebalanceLifecycleIdle = 0u;
@@ -183,6 +186,8 @@ namespace
         int32_t *route_expert_ids;
         float *route_weights;
         int32_t *route_participant_ids;
+        int32_t *deferred_verifier_route_expert_ids;
+        int32_t *deferred_verifier_route_participant_ids;
         int32_t *expert_counts;
         int32_t *expert_offsets;
         int32_t *grouped_token_ids;
@@ -195,9 +200,26 @@ namespace
         uint64_t reserved_u64[4];
         uint32_t prefill_token_capacity;
         uint32_t prefill_route_capacity;
+        uint32_t deferred_verifier_route_capacity;
         uint32_t participant_id;
         uint32_t participant_count;
+        uint32_t current_batch_llep_movement_observed;
     };
+
+    static_assert(
+        sizeof(DeviceMoELayerRuntimeView) ==
+        llaminar2::moe_runtime_abi::kLayerRuntimeBytes);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView,
+                 deferred_verifier_route_expert_ids) ==
+        llaminar2::moe_runtime_abi::kDeferredVerifierExpertIdsOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView, participant_count) ==
+        llaminar2::moe_runtime_abi::kParticipantCountOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView,
+                 current_batch_llep_movement_observed) ==
+        llaminar2::moe_runtime_abi::kCurrentBatchLLEPMovementObservedOffset);
 
     struct DeviceMoERebalanceConfigView
     {
@@ -234,6 +256,8 @@ namespace
         uint32_t routed_assignment_policy;
         uint32_t active_transfer_slot_capacity;
         uint32_t transfer_slot_directory_capacity;
+        uint32_t initial_maintenance_period_tokens;
+        uint32_t maintenance_period_tokens;
     };
     static_assert(
         sizeof(DeviceMoERebalanceConfigView) ==
@@ -312,6 +336,7 @@ namespace
         uint32_t skipped_post_load_spread_ceiling;
         uint32_t payload_source_participant_mask;
         uint32_t payload_destination_participant_mask;
+        uint32_t prefill_current_batch_movement_layers;
         uint64_t payload_edge_mask;
         uint64_t pre_wave_load_total;
         uint64_t pre_wave_load_spread;
@@ -485,6 +510,11 @@ namespace
         uint32_t last_error_missing_destination_expert;
         uint32_t last_error_missing_destination_source;
         uint32_t last_error_local_transfer_slot_count;
+        uint32_t decode_rounds_committed;
+        uint32_t decode_rounds_until_maintenance;
+        uint32_t maintenance_period_rounds;
+        uint32_t maintenance_due;
+        uint32_t decode_boundary_advanced;
         DeviceMoERebalanceWaveProgressView waves[2];
     };
 
@@ -667,6 +697,8 @@ namespace
                config.active_transfer_slot_capacity <=
                    config.transfer_slot_directory_capacity &&
                config.window_size_tokens > 0u &&
+               config.initial_maintenance_period_tokens > 0u &&
+               config.maintenance_period_tokens > 0u &&
                (config.layer_window_count == 0u ||
                 config.layer_window_start < config.num_layers);
     }
@@ -688,7 +720,14 @@ namespace
                state->version == kDeviceMoERebalanceVersion &&
                state->participant_id == config.participant_id &&
                state->participant_count == config.participant_count &&
-               state->wave_count == 2u;
+               state->wave_count == 2u &&
+               ((state->decode_rounds_until_maintenance > 0u &&
+                 state->maintenance_due == 0u) ||
+                (state->decode_rounds_until_maintenance == 0u &&
+                 state->maintenance_due == 1u)) &&
+               state->decode_boundary_advanced <= 1u &&
+               state->maintenance_period_rounds ==
+                   config.maintenance_period_tokens;
     }
 
     __device__ __forceinline__ uint32_t rebalance_active_command_wave_index(
@@ -702,6 +741,57 @@ namespace
         if (!rebalance_graph_controller_state_basic_ok(state, config))
             return 0u;
         return state->active_wave % count;
+    }
+
+    /** Advance one serial-visible decode round on the final routed layer. */
+    __device__ __forceinline__ void
+    advance_rebalance_serial_decode_round(
+        DeviceMoERebalanceGraphControllerStateView *state,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        if (!rebalance_graph_controller_state_basic_ok(state, config) ||
+            state->maintenance_due != 0u ||
+            state->decode_rounds_until_maintenance == 0u)
+        {
+            if (state)
+                state->maintenance_due = 2u;
+            return;
+        }
+
+        ++state->decode_rounds_committed;
+        --state->decode_rounds_until_maintenance;
+        if (state->decode_rounds_until_maintenance == 0u)
+            state->maintenance_due = 1u;
+    }
+
+    /** Consume one due edge and arm the recurring device-owned period. */
+    __device__ __forceinline__ uint32_t
+    consume_rebalance_maintenance_boundary(
+        DeviceMoERebalanceGraphControllerStateView *state,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        if (!rebalance_graph_controller_state_basic_ok(state, config))
+            return 2u;
+        if (state->decode_boundary_advanced != 0u)
+        {
+            state->decode_boundary_advanced = 0u;
+        }
+        else
+        {
+            advance_rebalance_serial_decode_round(state, config);
+        }
+        if (state->maintenance_due == 0u)
+            return 0u;
+        if (state->maintenance_due != 1u ||
+            state->decode_rounds_until_maintenance != 0u)
+        {
+            return 2u;
+        }
+        state->maintenance_due = 0u;
+        state->decode_boundary_advanced = 0u;
+        state->decode_rounds_until_maintenance =
+            state->maintenance_period_rounds;
+        return 1u;
     }
 
     /**
@@ -1069,11 +1159,13 @@ namespace
     /**
      * @brief Cooperatively sort all LLEP experts without leader-lane scratch.
      *
-     * One thread owns each slot in a fixed-size bitonic network.  Every
+     * One thread owns each slot in a power-of-two bitonic network.  Every
      * compare-exchange is integer-only and uses the same load/id ordering as
      * sortExpertsByLoadDescending(), making the resulting assignment plan byte
      * stable while reducing the scalar O(E^2) insertion sort to O(log^2 E)
-     * synchronized compare-exchange rounds.
+     * synchronized compare-exchange rounds.  The network width is rounded up
+     * from the active codebook size instead of always sorting 256 slots; small
+     * codebooks therefore do not pay for irrelevant barriers.
      */
     __device__ __forceinline__ void rebalance_sort_llep_experts_parallel(
         uint32_t *sorted_experts,
@@ -1085,8 +1177,12 @@ namespace
             lane < expert_count ? lane : kDeviceMoEInvalidSlot;
         __syncthreads();
 
+        uint32_t network_width = 1u;
+        while (network_width < expert_count)
+            network_width <<= 1u;
+
         for (uint32_t sequence = 2u;
-             sequence <= static_cast<uint32_t>(kDeviceMoEMaxExperts);
+             sequence <= network_width;
              sequence <<= 1u)
         {
             for (uint32_t stride = sequence >> 1u;
@@ -1094,7 +1190,7 @@ namespace
                  stride >>= 1u)
             {
                 const uint32_t peer = lane ^ stride;
-                if (peer > lane)
+                if (lane < network_width && peer > lane)
                 {
                     const uint32_t first = sorted_experts[lane];
                     const uint32_t second = sorted_experts[peer];
@@ -1379,9 +1475,10 @@ namespace
      * duplicated physical claim. The already-captured controller exports this
      * evidence through its request-boundary status publication.
      */
-    struct RebalanceTransferSlotClaimSummaryView
-    {
-        uint32_t active_claims;
+struct RebalanceTransferSlotClaimSummaryView
+{
+    uint32_t transient_placement_layers;
+    uint32_t active_claims;
         uint32_t unique_claims;
         uint32_t duplicate_claims;
         uint32_t invalid_claims;
@@ -1428,9 +1525,11 @@ namespace
                 continue;
             }
 
-            const DeviceMoEPlacementBankView &bank =
-                runtime.banks[runtime.active_bank];
-            for (uint32_t expert = 0u; expert < config.num_experts; ++expert)
+        const DeviceMoEPlacementBankView &bank =
+            runtime.banks[runtime.active_bank];
+        if (runtime.current_batch_llep_movement_observed != 0u)
+            ++summary.transient_placement_layers;
+        for (uint32_t expert = 0u; expert < config.num_experts; ++expert)
             {
                 const auto &descriptor = bank.experts[expert];
                 const uint32_t flags = descriptor.flags;
@@ -1639,13 +1738,15 @@ namespace
     {
         if (!status)
             return;
-        const auto summary =
-            rebalance_transfer_slot_claim_summary(
-                runtime_layers,
-                config,
-                local_transfer_slots,
-                local_transfer_slot_count);
-        status->prefill_active_transfer_slot_experts = summary.active_claims;
+    const auto summary =
+        rebalance_transfer_slot_claim_summary(
+            runtime_layers,
+            config,
+            local_transfer_slots,
+            local_transfer_slot_count);
+    status->prefill_current_batch_movement_layers =
+        summary.transient_placement_layers;
+    status->prefill_active_transfer_slot_experts = summary.active_claims;
         status->prefill_unique_transfer_slot_claims = summary.unique_claims;
         status->prefill_duplicate_transfer_slot_claims =
             summary.duplicate_claims;
@@ -1760,73 +1861,35 @@ namespace
         return false;
     }
 
-    __device__ __forceinline__ int runtime_nth_resident_participant(
-        uint32_t resident_mask,
-        uint32_t participant_count,
-        int ordinal)
-    {
-        for (int participant = 0; participant < static_cast<int>(participant_count); ++participant)
-        {
-            if ((resident_mask & runtime_participant_bit(participant)) == 0u)
-                continue;
-            if (ordinal == 0)
-                return participant;
-            --ordinal;
-        }
-        return -1;
-    }
-
-    __device__ __forceinline__ uint64_t runtime_same_expert_prior_occurrences(
-        const int *selected_experts,
-        int selected_slot,
-        int expert_id)
-    {
-        uint64_t occurrences = 0;
-        for (int slot = 0; slot < selected_slot; ++slot)
-        {
-            if (selected_experts[slot] == expert_id)
-                ++occurrences;
-        }
-        return occurrences;
-    }
-
     __device__ __forceinline__ int runtime_choose_replicated_participant(
         const DeviceMoELayerRuntimeView *runtime,
         const DeviceMoEPlacementBankView &bank,
-        const int *selected_experts,
         int selected_slot,
         int expert_id,
+        int32_t logical_position,
         const int *load)
     {
         const uint32_t participant_count = runtime->participant_count;
         const uint32_t resident_mask =
             runtime_expert_resident_mask(runtime, bank, expert_id);
-        const int resident_count = runtime_resident_count(resident_mask, participant_count);
-        if (resident_count <= 0)
-            return -1;
-
-        const uint64_t turn =
-            runtime->decode_histogram[expert_id] +
-            runtime_same_expert_prior_occurrences(selected_experts, selected_slot, expert_id);
-        const int preferred =
-            runtime_nth_resident_participant(
-                resident_mask,
-                participant_count,
-                static_cast<int>(turn % static_cast<uint64_t>(resident_count)));
-
-        int best = -1;
-        for (int participant = 0; participant < static_cast<int>(participant_count); ++participant)
-        {
-            if ((resident_mask & runtime_participant_bit(participant)) == 0u)
-                continue;
-            if (best < 0 ||
-                load[participant] < load[best] ||
-                (load[participant] == load[best] && participant == preferred))
-            {
-                best = participant;
-            }
-        }
-        return best;
+        const uint64_t tie_turn =
+            llaminar2::least_loaded_ep::residentAssignmentTieTurn(
+                logical_position,
+                expert_id,
+                selected_slot);
+        const int owner = runtime_expert_owner(bank, expert_id);
+        const uint32_t fallback =
+            owner >= 0 && static_cast<uint32_t>(owner) < participant_count
+                ? static_cast<uint32_t>(owner)
+                : runtime->participant_id;
+        return static_cast<int>(
+            llaminar2::least_loaded_ep::
+                selectBatchInvariantResidentParticipant(
+                    resident_mask,
+                    load,
+                    participant_count,
+                    fallback,
+                    tie_turn));
     }
 
     __device__ __forceinline__ uint64_t runtime_participant_load_spread(
@@ -1853,6 +1916,7 @@ namespace
         const int *selected_experts,
         int num_experts,
         int top_k,
+        int32_t logical_position,
         bool record_balance,
         bool *local_compute_flags)
     {
@@ -1883,6 +1947,11 @@ namespace
                     bank.local_compute_mask[expert_id] != 0u;
             }
             return;
+        }
+        if (logical_position < 0)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "replicated decode routing requires a logical position");
         }
         const bool track_balance =
             record_balance &&
@@ -1966,7 +2035,12 @@ namespace
 
             const int selected_participant =
                 runtime_choose_replicated_participant(
-                    runtime, bank, selected_experts, slot, expert_id, actual_load);
+                    runtime,
+                    bank,
+                    slot,
+                    expert_id,
+                    logical_position,
+                    actual_load);
             if (selected_participant >= 0 &&
                 selected_participant < static_cast<int>(participant_count))
             {
@@ -2013,7 +2087,8 @@ namespace
         float *legacy_indices,
         float *legacy_weights,
         bool write_legacy_outputs,
-        bool update_runtime_histogram)
+        bool update_runtime_histogram,
+        int32_t logical_position)
     {
         const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
         bool local_compute_flags[kDeviceMoEMaxTopK] = {};
@@ -2024,6 +2099,7 @@ namespace
                 selected_ids,
                 num_experts,
                 top_k,
+                logical_position,
                 update_runtime_histogram,
                 local_compute_flags);
         }
@@ -2118,6 +2194,12 @@ namespace
             reinterpret_cast<
                 llaminar2::least_loaded_ep::LeastLoadedExpertWeightTransfer *>(
                 shared_llep_weight_transfer_storage);
+        using LLEPStatus =
+            llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentStatus;
+        __shared__ uint64_t llep_status_storage[
+            (sizeof(LLEPStatus) + sizeof(uint64_t) - 1u) / sizeof(uint64_t)];
+        auto &llep_status =
+            *reinterpret_cast<LLEPStatus *>(llep_status_storage);
         __shared__ uint32_t
             shared_expert_transfer_backed_participant_mask[kDeviceMoEMaxExperts];
         __shared__ uint64_t shared_required_load_spread_improvement;
@@ -2208,6 +2290,28 @@ namespace
             else
             {
                 shared_abort = 1u;
+            }
+
+            if (shared_abort == 0u)
+            {
+                const uint32_t boundary =
+                    consume_rebalance_maintenance_boundary(
+                        controller_state,
+                        config);
+                if (boundary == 0u)
+                {
+                    status->status_code =
+                        kDeviceMoERebalanceStatusWindowNotReady;
+                    status->skipped_not_ready = 1u;
+                    status->skipped_busy_wave = 0u;
+                    shared_abort = 1u;
+                }
+                else if (boundary != 1u)
+                {
+                    status->status_code =
+                        kDeviceMoERebalanceStatusInvalidRuntime;
+                    shared_abort = 1u;
+                }
             }
 
             if (shared_abort == 0u &&
@@ -2848,7 +2952,6 @@ namespace
                 workspace.pending_load = shared_owner_policy_load;
                 workspace.assigned_load = shared_candidate_policy_load;
 
-                llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentStatus llep_status{};
                 const bool planned_llep =
                     llaminar2::least_loaded_ep::planLeastLoadedExpertWeightTransfers(
                         shared_expert_counts,
@@ -2857,7 +2960,7 @@ namespace
                         workspace,
                         shared_llep_weight_transfers,
                         kDeviceMoEMaxExperts,
-                        &llep_status,
+                        llep_status,
                         shared_llep_resident_participant_masks,
                         /*workspace_experts_are_sorted=*/true);
                 if (!planned_llep || llep_status.overflow != 0u)
@@ -4565,6 +4668,28 @@ namespace
                 shared_abort = 1u;
             }
 
+            if (shared_abort == 0u)
+            {
+                const uint32_t boundary =
+                    consume_rebalance_maintenance_boundary(
+                        controller_state,
+                        config);
+                if (boundary == 0u)
+                {
+                    status->status_code =
+                        kDeviceMoERebalanceStatusWindowNotReady;
+                    status->skipped_not_ready = 1u;
+                    status->skipped_busy_wave = 0u;
+                    shared_abort = 1u;
+                }
+                else if (boundary != 1u)
+                {
+                    status->status_code =
+                        kDeviceMoERebalanceStatusInvalidRuntime;
+                    shared_abort = 1u;
+                }
+            }
+
             if (shared_abort == 0u &&
                 rebalance_active_wave_busy_for_new_plan(
                     controller_state,
@@ -5802,12 +5927,7 @@ namespace
         const DeviceMoERebalanceGraphControllerStateView *state,
         const DeviceMoERebalanceConfigView &config)
     {
-        return state &&
-               state->magic == kDeviceMoERebalanceMagic &&
-               state->version == kDeviceMoERebalanceVersion &&
-               state->participant_id == config.participant_id &&
-               state->participant_count == config.participant_count &&
-               state->wave_count == 2u;
+        return rebalance_graph_controller_state_basic_ok(state, config);
     }
 
     __device__ void init_rebalance_graph_controller_state_device(
@@ -5828,6 +5948,12 @@ namespace
         state->last_error_missing_destination_layer = kDeviceMoEInvalidSlot;
         state->last_error_missing_destination_expert = kDeviceMoEInvalidSlot;
         state->last_error_missing_destination_source = kDeviceMoEInvalidSlot;
+        state->decode_rounds_committed = 0u;
+        state->decode_rounds_until_maintenance =
+            config.initial_maintenance_period_tokens;
+        state->maintenance_period_rounds =
+            config.maintenance_period_tokens;
+        state->maintenance_due = 0u;
         for (uint32_t i = 0; i < 2u; ++i)
         {
             auto &wave = state->waves[i];
@@ -5852,6 +5978,45 @@ namespace
         }
         if (!rebalance_graph_controller_state_ok(state, config))
             init_rebalance_graph_controller_state_device(state, config);
+    }
+
+    /**
+     * Start a fresh request without replacing the persistent controller buffer.
+     *
+     * Captured replay uses the preserving initializer above. This unconditional
+     * kernel belongs only to the explicit request-reset stream after all prior
+     * producers have joined it, keeping request lifetime and graph lifetime as
+     * separate, visible transitions.
+     */
+    __global__ void reset_rebalance_graph_transaction_for_request_kernel(
+        DeviceMoERebalanceGraphControllerStateView *state,
+        DeviceMoERebalanceCommandBufferHeaderView *command_headers,
+        DeviceMoERebalanceWaveStateView *wave_states,
+        uint32_t *plan_counts,
+        uint32_t command_buffer_count,
+        DeviceMoERebalanceConfigView config)
+    {
+        if (blockIdx.x != 0 || threadIdx.x != 0 || !state ||
+            !command_headers || !wave_states || !plan_counts)
+            return;
+        if (!rebalance_config_ok(config))
+        {
+            DeviceMoERebalanceGraphControllerStateView zero{};
+            *state = zero;
+            state->last_error_code =
+                kDeviceMoERebalanceStatusInvalidConfig;
+            return;
+        }
+        init_rebalance_graph_controller_state_device(state, config);
+        const uint32_t count =
+            rebalance_command_buffer_count(command_buffer_count);
+        for (uint32_t wave = 0u; wave < count; ++wave)
+        {
+            command_headers[wave] =
+                DeviceMoERebalanceCommandBufferHeaderView{};
+            wave_states[wave] = DeviceMoERebalanceWaveStateView{};
+            plan_counts[wave] = 0u;
+        }
     }
 
     __device__ __forceinline__ uint32_t rebalance_wave_next_layer(
@@ -6758,6 +6923,55 @@ namespace
     }
 
     /**
+     * @brief Authenticate and lease an exact prefix-checkpoint destination slot.
+     *
+     * Prefix restore resets the runtime and transfer directory before this
+     * transaction. Preserving the checkpointed physical slot makes the next
+     * LLEP maintenance wave observe the same directory topology as uninterrupted
+     * decode. Any occupied, malformed, or duplicate exact lease is fatal to the
+     * transaction; rehydration never searches for an alternative slot.
+     */
+    __device__ __forceinline__ bool
+    rebalance_lease_exact_prefill_transfer_slot(
+        DeviceMoERebalancePlanEntryView &plan,
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfigView &config,
+        const DeviceMoERebalancePlanEntryView *selected_plans,
+        uint32_t selected_plan_count)
+    {
+        const uint32_t slot = plan.destination_slot;
+        if (!runtime_layers ||
+            !local_transfer_slots ||
+            slot >= local_transfer_slot_count ||
+            rebalance_transfer_slot_selected(
+                selected_plans,
+                selected_plan_count,
+                slot,
+                config.participant_id))
+        {
+            return false;
+        }
+
+        const auto &prior = local_transfer_slots[slot];
+        if (!rebalance_transfer_slot_identity_ok(prior, slot, config) ||
+            !rebalance_transfer_slot_generation_retired(
+                prior,
+                slot,
+                runtime_layers,
+                config))
+        {
+            return false;
+        }
+
+        plan.destination_previous_layer = prior.layer;
+        plan.destination_previous_expert = prior.expert;
+        plan.destination_generation = prior.generation;
+        return true;
+    }
+
+    /**
      * @brief Lease physical storage for one projected prefill LLEP arrival.
      *
      * Current-batch materialization owns only logical movement and compact
@@ -7503,6 +7717,9 @@ namespace
                     }
 
                     DeviceMoERebalancePlanEntryView projected = plan;
+                    const bool exact_destination_slot =
+                        (plan.flags &
+                         kDeviceMoERebalancePlanFlagExactDestinationSlot) != 0u;
                     /*
                      * The gathered command is logical: its destination slot is
                      * not a physical allocation. Only the destination
@@ -7510,7 +7727,12 @@ namespace
                      * participant sees the complete local directory and all
                      * active runtime-bank claims.
                      */
-                    projected.destination_slot = kDeviceMoEInvalidSlot;
+                    if (!exact_destination_slot ||
+                        projected.destination_participant !=
+                            config.participant_id)
+                    {
+                        projected.destination_slot = kDeviceMoEInvalidSlot;
+                    }
                     projected.destination_previous_layer =
                         kDeviceMoEInvalidSlot;
                     projected.destination_previous_expert =
@@ -7518,15 +7740,29 @@ namespace
                     projected.destination_generation = 0u;
                     if (projected.destination_participant ==
                             config.participant_id &&
-                        !rebalance_lease_prefill_transfer_slot(
-                            projected,
-                            runtime_layers,
-                            local_transfer_slots,
-                            local_transfer_slot_count,
-                            config,
-                            projected_wave_entries,
-                            output_count))
+                        !(exact_destination_slot
+                              ? rebalance_lease_exact_prefill_transfer_slot(
+                                    projected,
+                                    runtime_layers,
+                                    local_transfer_slots,
+                                    local_transfer_slot_count,
+                                    config,
+                                    projected_wave_entries,
+                                    output_count)
+                              : rebalance_lease_prefill_transfer_slot(
+                                    projected,
+                                    runtime_layers,
+                                    local_transfer_slots,
+                                    local_transfer_slot_count,
+                                    config,
+                                    projected_wave_entries,
+                                    output_count)))
                     {
+                        if (exact_destination_slot)
+                        {
+                            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                                "ROCm prefix rehydration could not lease its exact checkpointed transfer slot");
+                        }
                         projected_status.plan_overflow = 1u;
                         projected_status.payload_bucket_overflow = 1u;
                         ++projected_status.capacity_limited_candidates;
@@ -7619,6 +7855,8 @@ namespace
         __shared__ uint32_t shared_transfer_experts[256];
         __shared__ uint32_t shared_transfer_sources[256];
         __shared__ uint32_t shared_transfer_destinations[256];
+        __shared__ uint32_t
+            shared_transfer_destination_slot_requirements[256];
         __shared__ uint32_t shared_transfer_valid[256];
         __shared__ uint32_t shared_transfer_output_indices[256];
         __shared__ uint32_t shared_transfer_payload_slots[256];
@@ -7716,6 +7954,8 @@ namespace
             shared_transfer_experts[lane] = transfer.expert;
             shared_transfer_sources[lane] = transfer.source_participant;
             shared_transfer_destinations[lane] = transfer.destination_participant;
+            shared_transfer_destination_slot_requirements[lane] =
+                transfer.destination_slot_requirement_plus_one;
         }
         __syncthreads();
 
@@ -7811,13 +8051,26 @@ namespace
                 shared_transfer_destinations[transfer_idx];
             DeviceMoERebalancePlanEntryView entry{};
             entry.op = kDeviceMoERebalancePlanExpertPayloadArrival;
+            entry.flags = kDeviceMoERebalancePlanFlagCurrentBatchLLEP;
             entry.layer = layer_idx;
             entry.expert = transfer_expert;
             entry.source_participant = transfer_source;
             entry.destination_participant = transfer_destination;
             entry.source_resident_mask =
                 active_bank.resident_participant_mask[transfer_expert];
-            entry.destination_slot = kDeviceMoEInvalidSlot;
+            const uint32_t destination_slot_requirement =
+                shared_transfer_destination_slot_requirements[transfer_idx];
+            if (destination_slot_requirement != 0u)
+            {
+                entry.flags |=
+                    kDeviceMoERebalancePlanFlagExactDestinationSlot;
+                entry.destination_slot =
+                    destination_slot_requirement - 1u;
+            }
+            else
+            {
+                entry.destination_slot = kDeviceMoEInvalidSlot;
+            }
             entry.payload_slot =
                 shared_transfer_payload_slots[transfer_idx];
             plan_entries[
@@ -9348,8 +9601,8 @@ namespace
                 next.experts[plan.expert] = desc;
                 next.resident_participant_mask[plan.expert] =
                     resident_mask & shared_valid_mask;
-                if (rebalance_plan_requires_payload(plan.op))
-                {
+            if (rebalance_plan_requires_payload(plan.op))
+            {
                     /*
                      * The transfer plan is domain-wide even though only its
                      * destination owns the rolling payload descriptor. Keep a
@@ -9357,8 +9610,13 @@ namespace
                      * bank so portable prefix capture cannot diverge by local
                      * slot ownership.
                      */
-                    next.transient_placement_observed = 1u;
+                next.transient_placement_observed = 1u;
+                if ((plan.flags &
+                     kDeviceMoERebalancePlanFlagCurrentBatchLLEP) != 0u)
+                {
+                    runtime.current_batch_llep_movement_observed = 1u;
                 }
+            }
             }
         }
         __syncthreads();
@@ -9854,8 +10112,15 @@ namespace
             }
             next.experts[plan.expert] = desc;
             next.resident_participant_mask[plan.expert] = resident_mask & valid_mask;
-            if (rebalance_plan_requires_payload(plan.op))
-                next.transient_placement_observed = 1u;
+        if (rebalance_plan_requires_payload(plan.op))
+        {
+            next.transient_placement_observed = 1u;
+            if ((plan.flags &
+                 kDeviceMoERebalancePlanFlagCurrentBatchLLEP) != 0u)
+            {
+                runtime.current_batch_llep_movement_observed = 1u;
+            }
+        }
         }
 
         uint32_t multi_resident = 0u;
@@ -11141,6 +11406,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_kernel(
     bool normalize_weights,
     bool write_legacy_outputs,
     bool update_runtime_histogram,
+    const int32_t *__restrict__ absolute_position_ids,
     const DeviceMoERebalancePlanEntryView *__restrict__ rebalance_plan_entries,
     uint32_t rebalance_plan_capacity,
     DeviceMoERebalanceCommandBufferHeaderView *__restrict__ rebalance_command_header,
@@ -11280,7 +11546,9 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_kernel(
 
         runtime_publish_decode_dispatch(
             runtime, selected_ids, selected_weights, num_experts, top_k,
-            legacy_indices, legacy_weights, write_legacy_outputs, update_runtime_histogram);
+            legacy_indices, legacy_weights, write_legacy_outputs,
+            update_runtime_histogram,
+            absolute_position_ids ? absolute_position_ids[0] : -1);
     }
 }
 
@@ -11294,6 +11562,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
     bool normalize_weights,
     bool write_legacy_outputs,
     bool update_runtime_histogram,
+    const int32_t *__restrict__ absolute_position_ids,
     const DeviceMoERebalancePlanEntryView *__restrict__ rebalance_plan_entries,
     uint32_t rebalance_plan_capacity,
     DeviceMoERebalanceCommandBufferHeaderView *__restrict__ rebalance_command_header,
@@ -11402,7 +11671,9 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
 
         runtime_publish_decode_dispatch(
             runtime, selected_ids, selected_weights, num_experts, top_k,
-            legacy_indices, legacy_weights, write_legacy_outputs, update_runtime_histogram);
+            legacy_indices, legacy_weights, write_legacy_outputs,
+            update_runtime_histogram,
+            absolute_position_ids ? absolute_position_ids[0] : -1);
     }
 }
 
@@ -11544,6 +11815,7 @@ __global__ void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
     bool normalize_weights,
     bool write_legacy_outputs,
     bool update_runtime_histogram,
+    const int32_t *__restrict__ absolute_position_ids,
     const DeviceMoERebalancePlanEntryView *__restrict__ rebalance_plan_entries,
     uint32_t rebalance_plan_capacity,
     DeviceMoERebalanceCommandBufferHeaderView *__restrict__ rebalance_command_header,
@@ -11660,7 +11932,9 @@ __global__ void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
 
         runtime_publish_decode_dispatch(
             runtime, selected_ids, selected_weights, num_experts, top_k,
-            legacy_indices, legacy_weights, write_legacy_outputs, update_runtime_histogram);
+            legacy_indices, legacy_weights, write_legacy_outputs,
+            update_runtime_histogram,
+            absolute_position_ids ? absolute_position_ids[0] : -1);
     }
 }
 
@@ -11681,12 +11955,15 @@ __global__ void rocm_moe_decode_route_select_runtime_kernel(
     float *__restrict__ legacy_weights,           // optional [top_k]
     int num_experts, int top_k,
     bool write_legacy_outputs,
-    bool update_runtime_histogram)
+    bool update_runtime_histogram,
+    const int32_t *__restrict__ absolute_position_ids)
 {
     if (threadIdx.x != 0 || !runtime) return;
     runtime_publish_decode_dispatch(
         runtime, expert_indices, expert_weights, num_experts, top_k,
-        legacy_indices, legacy_weights, write_legacy_outputs, update_runtime_histogram);
+        legacy_indices, legacy_weights, write_legacy_outputs,
+        update_runtime_histogram,
+        absolute_position_ids ? absolute_position_ids[0] : -1);
 }
 
 // =========================================================================
@@ -12725,6 +13002,7 @@ bool hipMoE_softmax_topk_decode_runtime(
     void *rebalance_controller_state,
     int rebalance_target_layer,
     uint32_t rebalance_command_buffer_count,
+    const int32_t *absolute_position_ids,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -12754,6 +13032,7 @@ bool hipMoE_softmax_topk_decode_runtime(
         normalize_weights,
         write_legacy_outputs,
         update_runtime_histogram,
+        absolute_position_ids,
         static_cast<const DeviceMoERebalancePlanEntryView *>(rebalance_plan_entries),
         rebalance_plan_capacity,
         static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(rebalance_command_header),
@@ -12794,6 +13073,7 @@ bool hipMoE_softmax_topk_decode_runtime_wave64(
     void *rebalance_controller_state,
     int rebalance_target_layer,
     uint32_t rebalance_command_buffer_count,
+    const int32_t *absolute_position_ids,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -12823,6 +13103,7 @@ bool hipMoE_softmax_topk_decode_runtime_wave64(
         normalize_weights,
         write_legacy_outputs,
         update_runtime_histogram,
+        absolute_position_ids,
         static_cast<const DeviceMoERebalancePlanEntryView *>(rebalance_plan_entries),
         rebalance_plan_capacity,
         static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(rebalance_command_header),
@@ -12900,6 +13181,7 @@ bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
     void *rebalance_controller_state,
     int rebalance_target_layer,
     uint32_t rebalance_command_buffer_count,
+    const int32_t *absolute_position_ids,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -12929,6 +13211,7 @@ bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
         normalize_weights,
         write_legacy_outputs,
         update_runtime_histogram,
+        absolute_position_ids,
         static_cast<const DeviceMoERebalancePlanEntryView *>(rebalance_plan_entries),
         rebalance_plan_capacity,
         static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(rebalance_command_header),
@@ -12976,7 +13259,8 @@ bool hipMoE_decode_route_select_runtime(
         legacy_indices, legacy_weights,
         num_experts, top_k,
         write_legacy_outputs,
-        update_runtime_histogram);
+        update_runtime_histogram,
+        /*absolute_position_ids=*/nullptr);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -13995,6 +14279,44 @@ bool hipMoE_init_rebalance_graph_controller_state(
     return true;
 }
 
+bool hipMoE_reset_rebalance_graph_transaction_for_request(
+    void *controller_state,
+    void *command_headers,
+    void *wave_states,
+    uint32_t *plan_counts,
+    uint32_t command_buffer_count,
+    const void *config,
+    int device_idx,
+    void *stream)
+{
+    if (!controller_state || !command_headers || !wave_states ||
+        !plan_counts || command_buffer_count == 0u ||
+        command_buffer_count > 2u || !config || !stream)
+        return false;
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+    hipLaunchKernelGGL(reset_rebalance_graph_transaction_for_request_kernel,
+        dim3(1), dim3(1), 0, static_cast<hipStream_t>(stream),
+        static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
+        static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(command_headers),
+        static_cast<DeviceMoERebalanceWaveStateView *>(wave_states),
+        plan_counts,
+        command_buffer_count,
+        cfg);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "HIP MoE reset_rebalance_graph_transaction_for_request kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 bool hipMoE_publish_rebalance_transfer_complete(
     void *controller_state,
     const void *command_header,
@@ -14587,7 +14909,7 @@ __global__ void rocm_moe_prefill_group_cast_count_kernel(
     const float *__restrict__ routing_weights,
     int current_slots, int max_slots, int num_experts,
     int filter_to_local_runtime_experts,
-    int histogram_update_flags)
+    int retain_routes_for_deferred_commit)
 {
     const int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (!runtime || slot >= max_slots) return;
@@ -14601,24 +14923,21 @@ __global__ void rocm_moe_prefill_group_cast_count_kernel(
     {
         expert_id = static_cast<int>(routing_indices[slot]);
         weight = routing_weights[slot];
-        /*
-         * Record global routing demand before StaticOwner filtering. This
-         * integer side effect cannot alter grouped verifier numerical output.
-         */
-        if (expert_id >= 0 &&
-            expert_id < num_experts &&
-            (histogram_update_flags & kGroupedHistogramSelectedRoutes) != 0)
-        {
-            atomicAdd(
-                reinterpret_cast<unsigned long long *>(
-                    &runtime->decode_histogram[expert_id]),
-                1ULL);
-        }
-        if (expert_id < 0 || expert_id >= num_experts ||
-            (filter_to_local_runtime_experts != 0 &&
-             !rocm_moe_prefill_static_local_ready(runtime, expert_id, num_experts)))
+        if (expert_id < 0 || expert_id >= num_experts)
         {
             expert_id = -1;
+            weight = 0.0f;
+        }
+        else if (filter_to_local_runtime_experts != 0 &&
+                 !rocm_moe_prefill_static_local_ready(
+                     runtime,
+                     expert_id,
+                     num_experts))
+        {
+            /*
+             * Keep selected identity for the later accepted-state commit.
+             * participant_id=-1 prevents local grouped execution.
+             */
             weight = 0.0f;
         }
         else
@@ -14630,12 +14949,23 @@ __global__ void rocm_moe_prefill_group_cast_count_kernel(
     runtime->route_expert_ids[slot] = expert_id;
     runtime->route_weights[slot] = weight;
     runtime->route_participant_ids[slot] = participant_id;
+    if (retain_routes_for_deferred_commit != 0 &&
+        slot < current_slots &&
+        runtime->deferred_verifier_route_expert_ids &&
+        runtime->deferred_verifier_route_participant_ids &&
+        runtime->deferred_verifier_route_capacity >=
+            static_cast<uint32_t>(current_slots))
+    {
+        runtime->deferred_verifier_route_expert_ids[slot] = expert_id;
+        runtime->deferred_verifier_route_participant_ids[slot] =
+            participant_id;
+    }
 }
 
 __global__ void rocm_moe_prefill_group_count_assigned_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
     int current_slots, int max_slots, int num_experts,
-    int histogram_update_flags)
+    int retain_routes_for_deferred_commit)
 {
     const int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (!runtime || slot >= max_slots || slot >= current_slots) return;
@@ -14644,22 +14974,83 @@ __global__ void rocm_moe_prefill_group_count_assigned_kernel(
 
     const int expert_id = runtime->route_expert_ids[slot];
     const int participant_id = runtime->route_participant_ids[slot];
+    if (retain_routes_for_deferred_commit != 0 &&
+        runtime->deferred_verifier_route_expert_ids &&
+        runtime->deferred_verifier_route_participant_ids &&
+        runtime->deferred_verifier_route_capacity >=
+            static_cast<uint32_t>(current_slots))
+    {
+        runtime->deferred_verifier_route_expert_ids[slot] = expert_id;
+        runtime->deferred_verifier_route_participant_ids[slot] =
+            participant_id;
+    }
     if (expert_id >= 0 &&
         expert_id < num_experts &&
         participant_id == static_cast<int>(runtime->participant_id))
     {
         atomicAdd(&runtime->expert_counts[expert_id], 1);
-        /*
-         * Assignment is final here. Publish actual local grouped-verifier
-         * compute demand in this existing launch rather than adding a kernel.
-         */
-        if ((histogram_update_flags & kGroupedHistogramLocallyAssignedRoutes) != 0)
-        {
-            atomicAdd(
-                reinterpret_cast<unsigned long long *>(
-                    &runtime->decode_local_histogram[expert_id]),
-                1ULL);
-        }
+    }
+}
+
+/**
+ * @brief Commit accepted grouped-verifier rows to persistent routing history.
+ *
+ * The verifier graph snapshots route ids and final participant assignments in
+ * this layer's persistent ledger before another layer reuses transient route
+ * scratch. Acceptance metadata arrives later on the publication stream. This
+ * kernel joins those two device-owned records and excludes every rejected or
+ * padded row from the maintenance histograms.
+ */
+__global__ void rocm_moe_commit_grouped_verifier_histograms_kernel(
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    const int32_t *__restrict__ accepted_state_counts,
+    const int32_t *__restrict__ publication_ok_flags,
+    int request_count,
+    int rows_per_request,
+    int total_rows,
+    int num_experts,
+    int top_k)
+{
+    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_slots = total_rows * top_k;
+    if (!runtime || slot >= total_slots) return;
+    if (!runtime->deferred_verifier_route_expert_ids ||
+        !runtime->deferred_verifier_route_participant_ids) return;
+    if (runtime->deferred_verifier_route_capacity <
+        static_cast<uint32_t>(total_slots)) return;
+
+    const int token_row = slot / top_k;
+    const int request = token_row / rows_per_request;
+    const int request_row = token_row - request * rows_per_request;
+    if (request < 0 ||
+        request >= request_count ||
+        publication_ok_flags[request] == 0)
+    {
+        return;
+    }
+
+    const int accepted_rows = accepted_state_counts[request];
+    if (accepted_rows < 0 ||
+        accepted_rows > rows_per_request ||
+        request_row >= accepted_rows)
+    {
+        return;
+    }
+
+    const int expert_id = runtime->deferred_verifier_route_expert_ids[slot];
+    if (expert_id < 0 || expert_id >= num_experts) return;
+
+    atomicAdd(
+        reinterpret_cast<unsigned long long *>(
+            &runtime->decode_histogram[expert_id]),
+        1ULL);
+    if (runtime->deferred_verifier_route_participant_ids[slot] ==
+        static_cast<int>(runtime->participant_id))
+    {
+        atomicAdd(
+            reinterpret_cast<unsigned long long *>(
+                &runtime->decode_local_histogram[expert_id]),
+            1ULL);
     }
 }
 
@@ -14757,37 +15148,6 @@ __global__ void rocm_moe_prefill_llep_count_expert_routes_kernel(
         atomicAdd(&runtime->expert_counts[expert_id], 1);
 }
 
-__global__ void rocm_moe_prefill_llep_clear_assignment_kernel(
-    DeviceMoELayerRuntimeView *__restrict__ runtime,
-    int max_slots, int num_experts)
-{
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (!runtime) return;
-
-    if (idx < num_experts && runtime->expert_counts && runtime->expert_offsets)
-    {
-        runtime->expert_counts[idx] = 0;
-        runtime->expert_offsets[idx] = -1;
-    }
-
-    if (idx < max_slots)
-    {
-        if (runtime->grouped_token_ids) runtime->grouped_token_ids[idx] = 0;
-        if (runtime->grouped_route_weights) runtime->grouped_route_weights[idx] = 0.0f;
-    }
-
-    int32_t *split_ends = static_cast<int32_t *>(runtime->reserved_ptrs[0]);
-    const int split_items = num_experts * static_cast<int>(kDeviceMoEMaxParticipants);
-    if (idx < split_items && split_ends)
-        split_ends[idx] = 0;
-
-    if (idx == 0)
-    {
-        runtime->reserved_u64[2] = 0ULL;
-        runtime->reserved_u64[3] = 0ULL;
-    }
-}
-
 __global__ void rocm_moe_prefill_llep_clear_current_batch_plan_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
     int num_experts)
@@ -14810,124 +15170,181 @@ __global__ void rocm_moe_prefill_llep_clear_current_batch_plan_kernel(
     }
 }
 
-__global__ void rocm_moe_prefill_llep_plan_resident_splits_kernel(
+/**
+ * @brief Assign grouped resident routes with serial batch invariance.
+ *
+ * One ROCm lane owns one token row and keeps that row's participant loads in
+ * registers. Route slots are consumed in their original router order.
+ * Equal-load ties use the row's absolute logical position and route identity,
+ * exactly like serial decode. Persistent demand histograms remain maintenance
+ * evidence only, so rejected speculative rows cannot perturb a future
+ * committed row's floating-point partition.
+ *
+ * The launch is allocation-free, atomic-free, transfer-free, and
+ * graph-capturable. Every row is independent, so the GPU executes all rows
+ * concurrently without imposing an artificial M limit.
+ */
+__global__ void rocm_moe_prefill_llep_assign_resident_rows_logical_position_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
+    const int32_t *__restrict__ absolute_position_ids,
     int current_slots, int max_slots,
-    int num_experts)
+    int num_experts, int top_k)
 {
-    if (!runtime || blockIdx.x != 0 || threadIdx.x != 0) return;
-    if (!runtime->route_expert_ids || !runtime->route_participant_ids ||
-        !runtime->expert_counts || !runtime->expert_offsets || !runtime->reserved_ptrs[0]) return;
-    if (runtime->active_bank > 1u ||
-        runtime->participant_count == 0u ||
-        runtime->participant_count > kDeviceMoEMaxParticipants ||
-        current_slots < 0 ||
-        max_slots <= 0 ||
-        current_slots > max_slots ||
-        runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots))
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int current_rows = current_slots / top_k;
+
+    if (!runtime)
     {
+        if (row == 0)
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "resident verifier assignment requires a runtime");
         return;
     }
-    uint64_t participant_load[kDeviceMoEMaxParticipants];
-    for (uint32_t participant = 0; participant < kDeviceMoEMaxParticipants; ++participant)
-        participant_load[participant] = 0ULL;
+
+    if (row == 0)
+    {
+        runtime->reserved_u64[2] = 0ULL;
+        runtime->reserved_u64[3] = 0ULL;
+    }
+
+    const bool runtime_valid =
+        runtime->route_expert_ids &&
+        runtime->route_participant_ids &&
+        absolute_position_ids &&
+        runtime->active_bank <= 1u &&
+        runtime->participant_count > 0u &&
+        runtime->participant_count <= kDeviceMoEMaxParticipants &&
+        current_slots >= 0 &&
+        max_slots > 0 &&
+        current_slots <= max_slots &&
+        runtime->prefill_route_capacity >= static_cast<uint32_t>(max_slots);
+    if (!runtime_valid)
+    {
+        if (row == 0)
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "resident verifier assignment runtime is invalid");
+        return;
+    }
+    if (row >= current_rows)
+        return;
+    const int32_t logical_position = absolute_position_ids[row];
+    if (logical_position < 0)
+    {
+        FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+            "resident verifier logical position is negative");
+    }
 
     const uint32_t participant_count = runtime->participant_count;
-    const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
-    auto *split_ends = static_cast<int32_t *>(runtime->reserved_ptrs[0]);
+    const DeviceMoEPlacementBankView &bank =
+        runtime->banks[runtime->active_bank];
+    const int row_slot_base = row * top_k;
+    int participant_load[kDeviceMoEMaxParticipants] = {};
 
-    for (int order = 0; order < num_experts; ++order)
+    /*
+     * Serial decode's first pass publishes every non-replicated route to its
+     * owner and charges that owner before any replicated route is selected.
+     * Preserve that two-pass ordering even when the single-owner route appears
+     * later in top-k order.
+     */
+    for (int route = 0; route < top_k; ++route)
     {
-        const int best_expert =
-            llaminar2::least_loaded_ep::selectHighestLoadUnassignedExpert(
-                runtime->expert_counts,
-                runtime->expert_offsets,
-                static_cast<uint32_t>(num_experts));
-        if (best_expert < 0)
-            break;
-        const int best_load = runtime->expert_counts[best_expert];
-        runtime->expert_offsets[best_expert] = 0;
-        if (best_load <= 0)
-            continue;
+        const int selected_slot = row_slot_base + route;
+        const int selected_expert =
+            runtime->route_expert_ids[selected_slot];
+        if (selected_expert < 0 || selected_expert >= num_experts)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "resident verifier route expert is out of range");
+        }
+        for (int prior_route = 0; prior_route < route; ++prior_route)
+        {
+            if (runtime->route_expert_ids[
+                    row_slot_base + prior_route] == selected_expert)
+            {
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "resident verifier row contains duplicate experts");
+            }
+        }
 
-        const auto &desc = bank.experts[best_expert];
+        const int owner =
+            bank.experts[selected_expert].owner_participant;
+        if (owner < 0 ||
+            static_cast<uint32_t>(owner) >= participant_count)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "resident verifier route owner is invalid");
+        }
+        const uint32_t resident_mask =
+            runtime_expert_resident_mask(
+                runtime,
+                bank,
+                selected_expert);
+        if ((resident_mask & runtime_participant_bit(owner)) == 0u)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "resident verifier owner payload is not resident");
+        }
+        if (runtime_resident_count(
+                resident_mask,
+                participant_count) == 1)
+        {
+            runtime->route_participant_ids[selected_slot] = owner;
+            ++participant_load[owner];
+        }
+    }
+
+    for (int route = 0; route < top_k; ++route)
+    {
+        const int selected_slot = row_slot_base + route;
+        const int selected_expert =
+            runtime->route_expert_ids[selected_slot];
+        const uint32_t runtime_resident_mask =
+            runtime_expert_resident_mask(
+                runtime,
+                bank,
+                selected_expert);
+        if (runtime_resident_count(
+                runtime_resident_mask,
+                participant_count) == 1)
+        {
+            continue;
+        }
+
+        const auto &desc = bank.experts[selected_expert];
         const int owner = desc.owner_participant;
+        const uint32_t default_participant =
+            (owner >= 0 &&
+             static_cast<uint32_t>(owner) < participant_count)
+                ? static_cast<uint32_t>(owner)
+                : (runtime->participant_id < participant_count
+                       ? runtime->participant_id
+                       : 0u);
         const uint32_t resident_mask =
             llaminar2::least_loaded_ep::normalizeResidentParticipantMask(
-                bank.resident_participant_mask[best_expert],
+                runtime_resident_mask,
                 owner,
                 runtime->participant_id,
                 participant_count);
-        const uint32_t default_participant =
-            (owner >= 0 && static_cast<uint32_t>(owner) < participant_count)
-                ? static_cast<uint32_t>(owner)
-                : (runtime->participant_id < participant_count ? runtime->participant_id : 0u);
+        const uint32_t assigned_participant =
+            llaminar2::least_loaded_ep::
+                selectBatchInvariantResidentParticipant(
+                resident_mask,
+                participant_load,
+                participant_count,
+                default_participant,
+                llaminar2::least_loaded_ep::
+                    residentAssignmentTieTurn(
+                        logical_position,
+                        selected_expert,
+                        route));
+        if (assigned_participant >= participant_count)
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "resident verifier selected an invalid participant");
 
-        uint32_t destination_counts[kDeviceMoEMaxParticipants];
-        for (uint32_t participant = 0; participant < kDeviceMoEMaxParticipants; ++participant)
-            destination_counts[participant] = 0u;
-
-        llaminar2::least_loaded_ep::assignLeastLoadedResidentSplitCounts(
-            static_cast<uint64_t>(best_load),
-            resident_mask,
-            participant_load,
-            participant_count,
-            default_participant,
-            destination_counts);
-
-        int cumulative = 0;
-        const int split_base = best_expert * static_cast<int>(kDeviceMoEMaxParticipants);
-        for (uint32_t participant = 0; participant < kDeviceMoEMaxParticipants; ++participant)
-        {
-            if (participant < participant_count)
-                cumulative += static_cast<int>(destination_counts[participant]);
-            split_ends[split_base + static_cast<int>(participant)] = cumulative;
-        }
+        ++participant_load[assigned_participant];
+        runtime->route_participant_ids[selected_slot] =
+            static_cast<int32_t>(assigned_participant);
     }
-}
-
-__global__ void rocm_moe_prefill_llep_assign_routes_from_splits_kernel(
-    DeviceMoELayerRuntimeView *__restrict__ runtime,
-    int current_slots, int max_slots,
-    int num_experts)
-{
-    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
-    if (!runtime || slot >= current_slots || slot >= max_slots) return;
-    if (!runtime->route_expert_ids || !runtime->route_participant_ids ||
-        !runtime->expert_offsets || !runtime->reserved_ptrs[0]) return;
-    if (runtime->active_bank > 1u ||
-        runtime->participant_count == 0u ||
-        runtime->participant_count > kDeviceMoEMaxParticipants ||
-        runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots))
-    {
-        return;
-    }
-    const int expert_id = runtime->route_expert_ids[slot];
-    if (expert_id < 0 || expert_id >= num_experts)
-        return;
-
-    const uint32_t participant_count = runtime->participant_count;
-    const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
-    const auto &desc = bank.experts[expert_id];
-    const int owner = desc.owner_participant;
-    const uint32_t default_participant =
-        (owner >= 0 && static_cast<uint32_t>(owner) < participant_count)
-            ? static_cast<uint32_t>(owner)
-            : (runtime->participant_id < participant_count ? runtime->participant_id : 0u);
-
-    auto *split_ends = static_cast<int32_t *>(runtime->reserved_ptrs[0]);
-    const int ordinal = atomicAdd(runtime->expert_offsets + expert_id, 1);
-    const int split_base = expert_id * static_cast<int>(kDeviceMoEMaxParticipants);
-    uint32_t assigned_participant = default_participant;
-    for (uint32_t participant = 0; participant < participant_count; ++participant)
-    {
-        if (ordinal < split_ends[split_base + static_cast<int>(participant)])
-        {
-            assigned_participant = participant;
-            break;
-        }
-    }
-    runtime->route_participant_ids[slot] = static_cast<int32_t>(assigned_participant);
 }
 
 __global__ void rocm_moe_prefill_llep_plan_current_batch_kernel(
@@ -14953,6 +15370,12 @@ __global__ void rocm_moe_prefill_llep_plan_current_batch_kernel(
     __shared__ uint32_t sorted_experts[kDeviceMoEMaxExperts];
     __shared__ uint64_t pending_load[kDeviceMoEMaxParticipants];
     __shared__ uint64_t assigned_load[kDeviceMoEMaxParticipants];
+    using PlannerStatus =
+        llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentStatus;
+    __shared__ uint64_t planner_status_storage[
+        (sizeof(PlannerStatus) + sizeof(uint64_t) - 1u) / sizeof(uint64_t)];
+    auto &planner_status =
+        *reinterpret_cast<PlannerStatus *>(planner_status_storage);
 
     if (!runtime) return;
 
@@ -15001,9 +15424,12 @@ __global__ void rocm_moe_prefill_llep_plan_current_batch_kernel(
             bank.resident_participant_mask[expert] &
             runtime_valid_participant_mask(participant_count);
         resident_participant_masks[expert] = resident_mask;
-        sorted_experts[expert] = static_cast<uint32_t>(expert);
     }
-    __syncthreads();
+    rebalance_sort_llep_experts_parallel(
+        sorted_experts,
+        expert_loads,
+        static_cast<uint32_t>(num_experts),
+        static_cast<uint32_t>(lane));
 
     if (lane != 0)
         return;
@@ -15041,7 +15467,6 @@ __global__ void rocm_moe_prefill_llep_plan_current_batch_kernel(
     workspace.pending_load = pending_load;
     workspace.assigned_load = assigned_load;
 
-    llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentStatus status{};
     const bool ok = llaminar2::least_loaded_ep::planLeastLoadedExpertAssignment(
         expert_loads,
         owner_participants,
@@ -15051,12 +15476,13 @@ __global__ void rocm_moe_prefill_llep_plan_current_batch_kernel(
         span_capacity,
         transfers,
         transfer_capacity,
-        &status,
-        resident_participant_masks);
-    if (ok && status.overflow == 0u && status.invalid_config == 0u)
+        planner_status,
+        resident_participant_masks,
+        /*workspace_experts_are_sorted=*/true);
+    if (ok && planner_status.overflow == 0u && planner_status.invalid_config == 0u)
     {
-        runtime->reserved_u64[2] = status.span_count;
-        runtime->reserved_u64[3] = status.weight_transfer_count;
+        runtime->reserved_u64[2] = planner_status.span_count;
+        runtime->reserved_u64[3] = planner_status.weight_transfer_count;
         int32_t *span_bounds = static_cast<int32_t *>(runtime->reserved_ptrs[0]);
         if (span_bounds)
         {
@@ -15065,7 +15491,7 @@ __global__ void rocm_moe_prefill_llep_plan_current_batch_kernel(
                 span_bounds[2 * expert] = -1;
                 span_bounds[2 * expert + 1] = -1;
             }
-            for (uint32_t idx = 0; idx < status.span_count; ++idx)
+            for (uint32_t idx = 0; idx < planner_status.span_count; ++idx)
             {
                 const uint32_t expert = spans[idx].expert;
                 if (expert >= static_cast<uint32_t>(num_experts))
@@ -15886,13 +16312,13 @@ bool hipMoE_group_prefill_routes_runtime(
     void *runtime,
     int current_slots, int max_slots, int num_experts, int top_k,
     int filter_to_local_runtime_experts,
-    int histogram_update_flags,
+    int retain_routes_for_deferred_commit,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
-    if (!runtime || !routing_indices || !routing_weights ||
+    if (!runtime || !routing_indices || !routing_weights || !stream ||
         current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
         num_experts <= 0 || num_experts > kDeviceMoEMaxExperts || top_k <= 0)
     {
@@ -15923,7 +16349,7 @@ bool hipMoE_group_prefill_routes_runtime(
         runtime_view, routing_indices, routing_weights,
         current_slots, max_slots, num_experts,
         filter_to_local_runtime_experts,
-        histogram_update_flags);
+        retain_routes_for_deferred_commit);
 
     err = hipGetLastError();
     if (err != hipSuccess)
@@ -15935,7 +16361,7 @@ bool hipMoE_group_prefill_routes_runtime(
     hipLaunchKernelGGL(rocm_moe_prefill_group_count_assigned_kernel,
         dim3(slot_blocks), dim3(threads), 0, hip_stream,
         runtime_view, current_slots, max_slots, num_experts,
-        histogram_update_flags);
+        /*retain_routes_for_deferred_commit=*/0);
 
     err = hipGetLastError();
     if (err != hipSuccess)
@@ -15972,7 +16398,7 @@ bool hipMoE_group_prefill_routes_runtime(
 bool hipMoE_regroup_prefill_routes_runtime_assignments(
     void *runtime,
     int current_slots, int max_slots, int num_experts, int top_k,
-    int histogram_update_flags,
+    int retain_routes_for_deferred_commit,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -16009,7 +16435,7 @@ bool hipMoE_regroup_prefill_routes_runtime_assignments(
     hipLaunchKernelGGL(rocm_moe_prefill_group_count_assigned_kernel,
         dim3(slot_blocks), dim3(threads), 0, hip_stream,
         runtime_view, current_slots, max_slots, num_experts,
-        histogram_update_flags);
+        retain_routes_for_deferred_commit);
 
     err = hipGetLastError();
     if (err != hipSuccess)
@@ -16043,18 +16469,79 @@ bool hipMoE_regroup_prefill_routes_runtime_assignments(
     return true;
 }
 
+bool hipMoE_commit_grouped_verifier_histograms(
+    void *runtime,
+    const int32_t *accepted_state_counts,
+    const int32_t *publication_ok_flags,
+    int request_count,
+    int rows_per_request,
+    int total_rows,
+    int num_experts,
+    int top_k,
+    int device_idx,
+    void *stream)
+{
+    if (!runtime ||
+        !accepted_state_counts ||
+        !publication_ok_flags ||
+        !stream ||
+        request_count <= 0 ||
+        rows_per_request <= 0 ||
+        total_rows != request_count * rows_per_request ||
+        num_experts <= 0 ||
+        num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 ||
+        top_k > kDeviceMoEMaxTopK)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+    constexpr int threads = 256;
+    const int total_slots = total_rows * top_k;
+    const int blocks = (total_slots + threads - 1) / threads;
+    hipLaunchKernelGGL(
+        rocm_moe_commit_grouped_verifier_histograms_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        static_cast<hipStream_t>(stream),
+        static_cast<DeviceMoELayerRuntimeView *>(runtime),
+        accepted_state_counts,
+        publication_ok_flags,
+        request_count,
+        rows_per_request,
+        total_rows,
+        num_experts,
+        top_k);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "HIP MoE committed grouped-verifier histogram launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 bool hipMoE_assign_prefill_routes_least_loaded_resident(
     void *runtime,
     int current_slots, int max_slots, int num_experts, int top_k,
+    const int32_t *absolute_position_ids,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
-    if (!runtime || !stream ||
+    if (!runtime || !absolute_position_ids || !stream ||
         current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
         num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
-        top_k <= 0 || top_k > kDeviceMoEMaxTopK)
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK || top_k > num_experts ||
+        current_slots % top_k != 0 || max_slots % top_k != 0)
     {
         fprintf(stderr, "HIP MoE assign_prefill_routes_least_loaded_resident invalid arguments\n");
         return false;
@@ -16062,52 +16549,25 @@ bool hipMoE_assign_prefill_routes_least_loaded_resident(
 
     auto *runtime_view = static_cast<DeviceMoELayerRuntimeView *>(runtime);
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-    const int threads = 256;
-    const int clear_items = (max_slots > num_experts) ? max_slots : num_experts;
-    const int clear_blocks = (clear_items + threads - 1) / threads;
-    const int slot_blocks = (max_slots + threads - 1) / threads;
+    constexpr int assignment_threads = 64;
+    const int current_rows = current_slots / top_k;
+    const int assignment_blocks =
+        current_rows > 0
+            ? (current_rows + assignment_threads - 1) / assignment_threads
+            : 1;
+    hipLaunchKernelGGL(
+        rocm_moe_prefill_llep_assign_resident_rows_logical_position_kernel,
+        dim3(assignment_blocks), dim3(assignment_threads), 0, hip_stream,
+        runtime_view,
+        absolute_position_ids,
+        current_slots, max_slots, num_experts, top_k);
 
-    hipLaunchKernelGGL(rocm_moe_prefill_llep_clear_assignment_kernel,
-        dim3(clear_blocks), dim3(threads), 0, hip_stream,
-        runtime_view, max_slots, num_experts);
-
-    hipError_t err = hipGetLastError();
+    const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
-        fprintf(stderr, "HIP MoE prefill LLEP clear kernel launch failed: %s\n", hipGetErrorString(err));
-        return false;
-    }
-
-    hipLaunchKernelGGL(rocm_moe_prefill_llep_count_expert_routes_kernel,
-        dim3(slot_blocks), dim3(threads), 0, hip_stream,
-        runtime_view, current_slots, max_slots, num_experts);
-
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "HIP MoE prefill LLEP count kernel launch failed: %s\n", hipGetErrorString(err));
-        return false;
-    }
-
-    hipLaunchKernelGGL(rocm_moe_prefill_llep_plan_resident_splits_kernel,
-        dim3(1), dim3(1), 0, hip_stream,
-        runtime_view, current_slots, max_slots, num_experts);
-
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "HIP MoE prefill LLEP resident-split planning kernel launch failed: %s\n", hipGetErrorString(err));
-        return false;
-    }
-
-    hipLaunchKernelGGL(rocm_moe_prefill_llep_assign_routes_from_splits_kernel,
-        dim3(slot_blocks), dim3(threads), 0, hip_stream,
-        runtime_view, current_slots, max_slots, num_experts);
-
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "HIP MoE prefill LLEP split assignment kernel launch failed: %s\n", hipGetErrorString(err));
+        fprintf(stderr,
+                "HIP MoE logical-position resident-row assignment kernel launch failed: %s\n",
+                hipGetErrorString(err));
         return false;
     }
 

@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 namespace llaminar2
 {
     namespace attention
@@ -25,6 +27,46 @@ namespace llaminar2
          * production speculative-depth promise.
          */
         inline constexpr int kMaxGroupedVerifierAttentionRows = 16;
+
+        /**
+         * @brief Independent cardinalities used by persistent attention scratch.
+         *
+         * `graph_query_rows` is intentionally absent from this result.
+         * Prompt-prefill M describes queries within each request; it must never
+         * multiply request-major K/V conversion storage. Split-decode scratch
+         * reserves the complete grouped-verifier capacity for every graph
+         * family member so decode capture does not depend on which prompt
+         * shape happened to materialize first.
+         */
+        struct AttentionWorkspaceCardinality
+        {
+            int compact_query_rows = 1; ///< Rows of split-decode partials.
+            int request_count = 1;      ///< Independent request-major K/V banks.
+        };
+
+        /**
+         * @brief Plan attention scratch without conflating prompt M and requests.
+         *
+         * @param graph_query_rows Declared graph M. It is accepted to make the
+         *        discarded axis explicit and regression-testable.
+         * @param stage_request_count Number of independent request sequences.
+         * @return Fixed compact-row capacity plus positive request cardinality.
+         */
+        [[nodiscard]] inline constexpr AttentionWorkspaceCardinality
+        planAttentionWorkspaceCardinality(
+            int graph_query_rows,
+            int stage_request_count) noexcept
+        {
+            (void)graph_query_rows;
+            const int request_count =
+                std::max(1, stage_request_count);
+            return AttentionWorkspaceCardinality{
+                .compact_query_rows = std::max(
+                    kMaxGroupedVerifierAttentionRows,
+                    request_count),
+                .request_count = request_count,
+            };
+        }
 
         /**
          * @brief Row-local dynamic geometry consumed by graph-captured attention.

@@ -456,11 +456,17 @@ namespace llaminar2
          * the TP worker pool so all collective participants enter the verifier
          * graph together.
          */
-        bool forwardWithDeviceTokenIds(
+        bool forwardGroupedMTPVerifierWithDeviceTokenIds(
             const int *token_shadow,
             const void *token_ids_device,
-            int seq_len,
-            DeviceTokenForwardPurpose purpose) override;
+            int seq_len) override;
+        bool advanceMTPMainConditionFromDeviceResidentLogicalState(
+            int32_t token_shadow,
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index = 0) override;
+        bool advanceMTPMainConditionFromDeviceTargetSample(
+            int32_t token_shadow,
+            int target_sample_slot) override;
         bool forwardBatchWithDeviceTokenIds(
             const std::vector<std::vector<int>> &token_batches,
             const void *token_ids_device,
@@ -593,6 +599,32 @@ namespace llaminar2
         */
         DeviceResidentLogicalSequenceStateHandle
         deviceResidentLogicalSequenceState() const override;
+
+        /**
+         * @brief Observe compact next-condition results from the primary child.
+         *
+         * A multi-device rank exposes an opaque aggregate mailbox handle because
+         * its device pointers belong to separate participant-local mailboxes.
+         * The primary mirrored-head participant is the authoritative owner of
+         * response tokens. This method first proves that @p logical_state still
+         * names the current aggregate, then delegates the explicit result-boundary
+         * D2H copy to that participant with its corresponding child handle.
+         *
+         * No observed host value is adopted into rank or child execution state.
+         * Device execution continues to consume the participant-local mailboxes
+         * and their producer events directly.
+         *
+         * @param logical_state Current rank-owned aggregate mailbox identity.
+         * @param request_count Number of leading request rows to observe.
+         * @param out_tokens Host result destination.
+         * @return true only when the aggregate and primary child mailbox are
+         *         current and the compact result copy completes successfully.
+         */
+        bool observeDeviceResidentNextConditionTokens(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_count,
+            int32_t *out_tokens) override;
+
         /**
          * @brief Rebind every child mailbox after a rank-wide diagnostic restore.
          *
@@ -749,6 +781,13 @@ namespace llaminar2
             int row,
             const std::vector<LogitPenalty> &penalties,
             int vocab_size) override;
+        bool applyDeviceOwnedMTPPenaltiesToLogitRows(
+            DeviceLogitsSource source,
+            int row_count,
+            const MTPGreedyPenaltyPolicy &penalty_policy) override;
+        bool applyDeviceOwnedMTPBranchPenaltiesToLogits(
+            int prior_draft_count,
+            const MTPGreedyPenaltyPolicy &penalty_policy) override;
         bool supportsRowLocalAllPositionPenaltyApplication() const override;
         /**
          * @brief Sample compact request-batched prefill rows on every LocalTP child.
@@ -1874,12 +1913,24 @@ namespace llaminar2
                 const DeviceResidentLogicalSequenceStateHandle &)> &child_operation);
 
         /**
+         * @brief Dispatch one scalar main-condition transition to every TP child.
+         *
+         * The callback receives the participant-local runner and index so callers
+         * can select that child's target slot or resident mailbox. The helper owns
+         * worker-pool entry, profiler context propagation, timeout handling, and
+         * exception propagation; it never serializes participants or request state.
+         */
+        bool dispatchLocalTPMTPMainCondition(
+            const char *operation_name,
+            const std::function<bool(IInferenceRunner &, size_t)> &child_operation);
+
+        /**
          * @brief Ask every child to materialize a verifier row from device slots.
          *
          * Entry zero may be a host scalar or a child target sample slot; draft
          * entries always come from staged child draft sample slots.  The return
          * value is the same rank-owned child-pointer bundle consumed by
-         * forwardWithDeviceTokenIds().
+         * forwardGroupedMTPVerifierWithDeviceTokenIds().
          */
         const void *prepareRankVerifierTokenSlotsForLocalTP(
             bool first_token_from_device,
@@ -2017,6 +2068,26 @@ namespace llaminar2
             int expected_request_count,
             const char *lifecycle,
             std::string *error = nullptr);
+
+        /**
+         * @brief Validate the one current mirrored compact verifier outcome.
+         *
+         * Every post-verifier consumer must use this method instead of rebuilding
+         * a partial pointer/flag check.  The validator proves that @p outcome is
+         * the exact primary child handle retained by the latest mirrored LocalTP
+         * reduction and that the complete participant handle set is still live.
+         * This gives shifted-KV commit, state publication, response materialization,
+         * and future consumers one ownership definition and one diagnostic format.
+         *
+         * @param outcome Candidate primary-child compact outcome handle.
+         * @param operation Stable consumer name included in diagnostics.
+         * @param error Optional destination for a complete failed-invariant report.
+         * @return true only for the current, complete mirrored verifier outcome.
+         */
+        bool validateCurrentMirroredLocalTPOutcome(
+            const DeviceSpeculativeOutcomeHandle &outcome,
+            const char *operation,
+            std::string *error = nullptr) const;
 
         /**
          * @brief Publish child-resident outcomes from mirrored LocalTP verification.

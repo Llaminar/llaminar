@@ -1978,7 +1978,7 @@ namespace llaminar2
 
         if (policy.profiling)
         {
-            LOG_DEBUG("[DeviceGraphExecutor] Total execution: " << total_ms << "ms for "
+            LOG_TRACE("[DeviceGraphExecutor] Total execution: " << total_ms << "ms for "
                                                                 << schedule.size() << " stages ("
                                                                 << (total_ms / schedule.size()) << "ms/stage avg)");
 
@@ -2261,7 +2261,7 @@ namespace llaminar2
         {
             auto coh_policy = node.stage->coherencePolicy();
 
-            LOG_DEBUG("[DeviceGraphExecutor] Stage '" << node.name << "' coherencePolicy=" << toString(coh_policy)
+            LOG_TRACE("[DeviceGraphExecutor] Stage '" << node.name << "' coherencePolicy=" << toString(coh_policy)
                                                       << " target_device=" << target_device.to_string()
                                                       << " use_contract=" << use_contract
                                                       << " forced_contract=" << force_contract_coherence);

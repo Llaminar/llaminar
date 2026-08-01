@@ -162,6 +162,12 @@ namespace llaminar2
         return std::make_unique<SharedExpertGateStage>(params);
     }
 
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoECanonicalRouteReduce(
+        const MoECanonicalRouteReduceStage::Params &params)
+    {
+        return std::make_unique<MoECanonicalRouteReduceStage>(params);
+    }
+
     std::unique_ptr<IComputeStage> ComputeStageFactory::createAllreduce(
         const AllreduceStage::Params &params)
     {

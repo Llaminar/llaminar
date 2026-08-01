@@ -960,7 +960,7 @@ namespace llaminar2
                     d_v = dv_mut;
                 }
 
-                LOG_DEBUG("[GDNRecurrenceStage] GPU merged QKV: "
+                LOG_TRACE("[GDNRecurrenceStage] GPU merged QKV: "
                           << params_.seq_len << "x" << (q_src_dim + k_src_dim + v_dim)
                           << " nkh=" << nkh << " n_heads=" << params_.n_heads
                           << " offset=" << params_.global_v_head_offset
@@ -977,7 +977,7 @@ namespace llaminar2
             bool ok;
             if (params_.seq_len == 1)
             {
-                LOG_DEBUG("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
+                LOG_TRACE("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
                                                                             << " Q=" << static_cast<const void *>(d_q)
                                                                             << " K=" << static_cast<const void *>(d_k)
                                                                             << " V=" << static_cast<const void *>(d_v)
@@ -1027,7 +1027,7 @@ namespace llaminar2
                     return false;
                 }
 
-                LOG_DEBUG("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
+                LOG_TRACE("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
                                                                             << " Q=" << static_cast<const void *>(d_q)
                                                                             << " K=" << static_cast<const void *>(d_k)
                                                                             << " V=" << static_cast<const void *>(d_v)
@@ -1102,7 +1102,7 @@ namespace llaminar2
                 return false;
             }
 
-            LOG_DEBUG("[GDNRecurrenceStage] GPU layer=" << params_.layer_idx
+            LOG_TRACE("[GDNRecurrenceStage] GPU layer=" << params_.layer_idx
                                                         << " seq_len=" << params_.seq_len
                                                         << " effective_seq_len=" << effectivePrefillSeqLen()
                                                         << " n_heads=" << params_.n_heads
@@ -1320,7 +1320,7 @@ namespace llaminar2
             k_data = k_deinterleave_.data();
             v_data = v_deinterleave_.data();
 
-            LOG_DEBUG("[GDNRecurrenceStage] Deinterleaved merged QKV: "
+            LOG_TRACE("[GDNRecurrenceStage] Deinterleaved merged QKV: "
                       << T << "x" << qkv_stride << " -> Q(" << T << "x" << q_dst_dim
                       << "), K(" << T << "x" << k_dst_dim << "), V(" << T << "x" << v_dim << ")"
                       << " nkh=" << nkh << " n_heads=" << params_.n_heads
@@ -1404,7 +1404,7 @@ namespace llaminar2
             return false;
         }
 
-        LOG_DEBUG("[GDNRecurrenceStage] layer=" << params_.layer_idx
+        LOG_TRACE("[GDNRecurrenceStage] layer=" << params_.layer_idx
                                                 << " seq_len=" << params_.seq_len
                                                 << " effective_seq_len=" << effectivePrefillSeqLen()
                                                 << " n_heads=" << params_.n_heads

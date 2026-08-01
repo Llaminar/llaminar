@@ -189,7 +189,7 @@ namespace llaminar2
             DeviceId device = DeviceId::rocm(rocm_device_id_);
             hipblas_kernel_ = DeviceKernelCache::getKernel<HipBLASGemmKernel>(device, KernelType::BLAS_GEMM);
 
-            LOG_DEBUG("[ROCmFloatingPointGemmKernel] Created (raw ptr) for " << N_ << "x" << K_
+            LOG_TRACE("[ROCmFloatingPointGemmKernel] Created (raw ptr) for " << N_ << "x" << K_
                       << " weights on ROCm device " << rocm_device_id_
                       << " (using cached hipBLAS kernel)");
         }

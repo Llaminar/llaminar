@@ -776,7 +776,7 @@ namespace llaminar2
                 return false;
             }
 
-            LOG_DEBUG("[ShortConv1dStage] GPU: seq_len=" << params_.seq_len
+            LOG_TRACE("[ShortConv1dStage] GPU: seq_len=" << params_.seq_len
                                                          << " channels=" << params_.channels
                                                          << " effective_seq_len=" << effective_seq_len
                                                          << " kernel=" << params_.kernel_size
@@ -878,7 +878,7 @@ namespace llaminar2
             std::memset(output_data + first_pad, 0, pad_count * sizeof(float));
         }
 
-        LOG_DEBUG("[ShortConv1dStage] Executed: seq_len=" << params_.seq_len
+        LOG_TRACE("[ShortConv1dStage] Executed: seq_len=" << params_.seq_len
                                                           << " effective_seq_len=" << kernel_seq_len
                                                           << " channels=" << params_.channels
                                                           << " kernel=" << params_.kernel_size

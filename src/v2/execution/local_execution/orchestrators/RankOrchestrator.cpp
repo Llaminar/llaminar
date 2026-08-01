@@ -292,6 +292,8 @@ namespace llaminar2
                 meta[kSpecBatchMetaAllSpeculativeAccepted] != 0;
             out->consumed_verifier_rows = meta[kSpecBatchMetaConsumedVerifierRows];
             out->sampled_terminal = meta[kSpecBatchMetaSampledTerminal] != 0;
+            out->commit_boundary_clipped =
+                meta[kSpecBatchMetaCommitBoundaryClipped] != 0;
             return true;
         }
 
@@ -1879,27 +1881,25 @@ namespace llaminar2
         }
     }
 
-    bool RankOrchestrator::forwardWithDeviceTokenIds(
+    bool RankOrchestrator::forwardGroupedMTPVerifierWithDeviceTokenIds(
         const int *token_shadow,
         const void *token_ids_device,
-        int seq_len,
-        DeviceTokenForwardPurpose purpose)
+        int seq_len)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
-            return pp_sidecar->forwardWithDeviceTokenIds(
+            return pp_sidecar->forwardGroupedMTPVerifierWithDeviceTokenIds(
                 token_shadow,
                 token_ids_device,
-                seq_len,
-                purpose);
+                seq_len);
         }
         if (device_runners_.size() == 1 && device_runners_[0])
         {
-            return device_runners_[0]->forwardWithDeviceTokenIds(
+            return device_runners_[0]
+                ->forwardGroupedMTPVerifierWithDeviceTokenIds(
                 token_shadow,
                 token_ids_device,
-                seq_len,
-                purpose);
+                seq_len);
         }
         if (device_runners_.size() < 2 ||
             !token_shadow ||
@@ -1909,7 +1909,8 @@ namespace llaminar2
                 device_runners_.size() ||
             rank_mtp_verifier_child_token_count_ != seq_len)
         {
-            LOG_ERROR("RankOrchestrator::forwardWithDeviceTokenIds: invalid LocalTP device-token input bundle");
+            LOG_ERROR("RankOrchestrator::forwardGroupedMTPVerifierWithDeviceTokenIds: "
+                      "invalid LocalTP device-token input bundle");
             return false;
         }
 
@@ -1918,7 +1919,7 @@ namespace llaminar2
             if (!device_runners_[i] ||
                 !rank_mtp_verifier_child_token_inputs_[i])
             {
-                LOG_ERROR("RankOrchestrator::forwardWithDeviceTokenIds: participant "
+                LOG_ERROR("RankOrchestrator::forwardGroupedMTPVerifierWithDeviceTokenIds: participant "
                           << i << " has no staged device-token input row");
                 return false;
             }
@@ -1947,7 +1948,6 @@ namespace llaminar2
             [this,
              token_shadow,
              seq_len,
-             purpose,
              kernel_phase,
              rocm_phase,
              cuda_phase,
@@ -1973,11 +1973,11 @@ namespace llaminar2
                 }
 
                 const bool ok =
-                    device_runners_[i]->forwardWithDeviceTokenIds(
+                    device_runners_[i]
+                        ->forwardGroupedMTPVerifierWithDeviceTokenIds(
                         token_shadow,
                         rank_mtp_verifier_child_token_inputs_[i],
-                        seq_len,
-                        purpose);
+                        seq_len);
 
                 if (debugEnv().tp_collective_contract_trace)
                 {
@@ -2021,14 +2021,15 @@ namespace llaminar2
         if (worker_timeout && collect_timeout_ms > 0)
         {
             abortAfterTPWorkerTimeout(
-                "forwardWithDeviceTokenIds",
+                "forwardGroupedMTPVerifierWithDeviceTokenIds",
                 collect_timeout_ms,
                 tp_worker_pool_->completedCount(),
                 tp_worker_pool_->numWorkers());
         }
         if (first_exception)
         {
-            LOG_ERROR("RankOrchestrator::forwardWithDeviceTokenIds: Re-throwing primary exception from device "
+            LOG_ERROR("RankOrchestrator::forwardGroupedMTPVerifierWithDeviceTokenIds: "
+                      "Re-throwing primary exception from device "
                       << first_exception_device);
             std::rethrow_exception(first_exception);
         }
@@ -2055,6 +2056,126 @@ namespace llaminar2
             "rank",
             {{"participants", std::to_string(device_runners_.size())},
              {"seq_len", std::to_string(seq_len)}});
+        return true;
+    }
+
+    bool RankOrchestrator::
+        advanceMTPMainConditionFromDeviceResidentLogicalState(
+            int32_t token_shadow,
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar
+                ->advanceMTPMainConditionFromDeviceResidentLogicalState(
+                    token_shadow,
+                    logical_state,
+                    request_index);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]
+                ->advanceMTPMainConditionFromDeviceResidentLogicalState(
+                    token_shadow,
+                    logical_state,
+                    request_index);
+        }
+
+        const DeviceResidentLogicalSequenceStateHandle current_rank_state =
+            deviceResidentLogicalSequenceState();
+        if (!logical_state.valid() ||
+            !current_rank_state.valid() ||
+            !logical_state.sameMailboxAs(current_rank_state) ||
+            !logical_state.coversRequest(request_index) ||
+            rank_resident_child_logical_state_handles_.size() !=
+                device_runners_.size())
+        {
+            LOG_ERROR(
+                "[RankOrchestrator] Resident main-condition advance received a "
+                "stale, foreign, or incomplete LocalTP mailbox");
+            return false;
+        }
+
+        const bool advanced = dispatchLocalTPMTPMainCondition(
+            "advanceMTPMainConditionFromDeviceResidentLogicalState",
+            [this, token_shadow, request_index](
+                IInferenceRunner &child,
+                size_t participant)
+            {
+                return child
+                    .advanceMTPMainConditionFromDeviceResidentLogicalState(
+                        token_shadow,
+                        rank_resident_child_logical_state_handles_[participant],
+                        request_index);
+            });
+        if (!advanced)
+            return false;
+
+        ++current_position_;
+        for (int &length : current_sequence_lengths_)
+            ++length;
+        current_padded_seq_len_ = 1;
+        stats_dirty_ = true;
+        return true;
+    }
+
+    bool RankOrchestrator::advanceMTPMainConditionFromDeviceTargetSample(
+        int32_t token_shadow,
+        int target_sample_slot)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->advanceMTPMainConditionFromDeviceTargetSample(
+                token_shadow,
+                target_sample_slot);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]
+                ->advanceMTPMainConditionFromDeviceTargetSample(
+                    token_shadow,
+                    target_sample_slot);
+        }
+        if (target_sample_slot < 0 ||
+            target_sample_slot >= rank_stochastic_slot_capacity_)
+        {
+            LOG_ERROR(
+                "[RankOrchestrator] Device-target main-condition advance "
+                "received an invalid target slot");
+            return false;
+        }
+
+        const bool advanced = dispatchLocalTPMTPMainCondition(
+            "advanceMTPMainConditionFromDeviceTargetSample",
+            [token_shadow, target_sample_slot](
+                IInferenceRunner &child,
+                size_t)
+            {
+                return child.advanceMTPMainConditionFromDeviceTargetSample(
+                    token_shadow,
+                    target_sample_slot);
+            });
+        if (!advanced)
+            return false;
+
+        std::string adoption_error;
+        if (!adoptMirroredLocalTPResidentLogicalStateMailboxes(
+                /*expected_request_count=*/1,
+                "target_sample_main_condition_advance",
+                &adoption_error))
+        {
+            LOG_ERROR(
+                "[RankOrchestrator] Device-target main-condition advance could "
+                "not adopt child publications: "
+                << adoption_error);
+            return false;
+        }
+        ++current_position_;
+        for (int &length : current_sequence_lengths_)
+            ++length;
+        current_padded_seq_len_ = 1;
+        stats_dirty_ = true;
         return true;
     }
 
@@ -4461,12 +4582,30 @@ namespace llaminar2
                     device_runners_[participant]->primaryDeviceId();
                 ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
                 CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
-                return device_runners_[participant]
+                if (debugEnv().runtime_debug.mtp_condition_graph_contract_trace)
+                {
+                    LOG_INFO(
+                        "[MTPConditionGraphContract] event=participant_enter"
+                        << " participant=" << participant
+                        << " device=" << device_id.toString()
+                        << " requests=" << request_batch);
+                }
+                const bool success = device_runners_[participant]
                     ->advanceMTPRequestBatchConditionOnDevice(
                         rank_resident_child_logical_state_handles_[participant],
                         request_batch,
                         params,
                         stochastic_position_seeds);
+                if (debugEnv().runtime_debug.mtp_condition_graph_contract_trace)
+                {
+                    LOG_INFO(
+                        "[MTPConditionGraphContract] event=participant_leave"
+                        << " participant=" << participant
+                        << " device=" << device_id.toString()
+                        << " requests=" << request_batch
+                        << " success=" << (success ? "true" : "false"));
+                }
+                return success;
             });
 
         bool all_success = true;
@@ -4605,6 +4744,138 @@ namespace llaminar2
                         first_draft_slot,
                         draft_slot_stride);
             });
+    }
+
+    bool RankOrchestrator::dispatchLocalTPMTPMainCondition(
+        const char *operation_name,
+        const std::function<bool(IInferenceRunner &, size_t)> &child_operation)
+    {
+        const std::string operation =
+            operation_name && operation_name[0] != '\0'
+                ? operation_name
+                : "mtp_main_condition";
+        auto fail = [&](const std::string &reason) -> bool
+        {
+            LOG_ERROR("RankOrchestrator::" << operation << ": " << reason);
+            return false;
+        };
+
+        if (!child_operation)
+            return fail("missing participant operation");
+        if (device_runners_.size() < 2)
+            return fail("requires at least two local participants");
+        for (size_t participant = 0;
+             participant < device_runners_.size();
+             ++participant)
+        {
+            if (!device_runners_[participant] ||
+                !device_runners_[participant]->primaryDeviceId().is_gpu())
+            {
+                return fail(
+                    "participant " + std::to_string(participant) +
+                    " is missing or is not GPU-backed");
+            }
+        }
+
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ =
+                std::make_unique<TPWorkerPool>(device_runners_.size());
+            tp_worker_pool_->setFailureCallback([this, operation]()
+                                                {
+                LOG_WARN("[TPWorkerPool] " << operation
+                         << " failure detected - aborting collective backend");
+                if (tp_ctx_)
+                    tp_ctx_->requestAbort(); });
+        }
+
+        const auto kernel_phase = KernelProfiler::getCurrentPhase();
+        const auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        const auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        const auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        const auto executor_phase = GraphExecutorStats::currentPhase();
+        tp_worker_pool_->dispatch(
+            [this,
+             child_operation,
+             kernel_phase,
+             rocm_phase,
+             cuda_phase,
+             kv_phase,
+             executor_phase](size_t participant) -> bool
+            {
+                KernelProfiler::setCurrentPhase(kernel_phase);
+                ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                KVCacheProfiler::setCurrentPhase(kv_phase);
+                GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                const DeviceId device_id =
+                    device_runners_[participant]->primaryDeviceId();
+                ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+                return child_operation(
+                    *device_runners_[participant],
+                    participant);
+            });
+
+        bool all_success = true;
+        bool worker_timeout = false;
+        std::exception_ptr first_exception;
+        size_t first_exception_device = 0;
+        const int collect_timeout_ms = effectiveTPWorkerJoinTimeoutMs();
+        auto results = tp_worker_pool_->collectAll(collect_timeout_ms);
+        for (auto &result : results)
+        {
+            if (!result.completed)
+            {
+                worker_timeout = true;
+                all_success = false;
+                if (tp_ctx_)
+                    tp_ctx_->requestAbort();
+                continue;
+            }
+            if (result.exception)
+            {
+                all_success = false;
+                if (!first_exception)
+                {
+                    first_exception = result.exception;
+                    first_exception_device = result.worker_index;
+                }
+                continue;
+            }
+            if (!result.success)
+                all_success = false;
+        }
+        if (worker_timeout && collect_timeout_ms > 0)
+        {
+            abortAfterTPWorkerTimeout(
+                operation.c_str(),
+                collect_timeout_ms,
+                tp_worker_pool_->completedCount(),
+                tp_worker_pool_->numWorkers());
+        }
+        if (first_exception)
+        {
+            LOG_ERROR(
+                "RankOrchestrator::" << operation
+                << ": rethrowing participant exception from device "
+                << first_exception_device);
+            std::rethrow_exception(first_exception);
+        }
+        if (all_success)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_device_resident_main_condition_advances",
+                1.0,
+                "decode",
+                "rank",
+                {{"operation", operation},
+                 {"participants", std::to_string(device_runners_.size())},
+                 {"input_owner", "participant_device_logical_state"}});
+        }
+        return all_success;
     }
 
     bool RankOrchestrator::dispatchMirroredLocalTPResidentMTPRequestBatch(
@@ -4972,6 +5243,84 @@ namespace llaminar2
         handle.ready_event = &rank_resident_logical_state_ready_event_token_;
         handle.live_state_epoch = rank_resident_logical_state_epoch_;
         return handle;
+    }
+
+    bool RankOrchestrator::observeDeviceResidentNextConditionTokens(
+        const DeviceResidentLogicalSequenceStateHandle &logical_state,
+        int request_count,
+        int32_t *out_tokens)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->observeDeviceResidentNextConditionTokens(
+                logical_state,
+                request_count,
+                out_tokens);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->observeDeviceResidentNextConditionTokens(
+                logical_state,
+                request_count,
+                out_tokens);
+        }
+
+        const DeviceResidentLogicalSequenceStateHandle current_rank_state =
+            deviceResidentLogicalSequenceState();
+        if (request_count <= 0 ||
+            !out_tokens ||
+            !current_rank_state.valid() ||
+            !logical_state.sameMailboxAs(current_rank_state) ||
+            logical_state.request_count < request_count ||
+            rank_resident_child_logical_state_handles_.size() !=
+                device_runners_.size() ||
+            device_runners_.empty() ||
+            !device_runners_[0])
+        {
+            LOG_ERROR(
+                "[RankOrchestrator] Resident next-condition-token observation "
+                "received a stale, foreign, or incomplete aggregate mailbox");
+            return false;
+        }
+
+        const DeviceResidentLogicalSequenceStateHandle &primary_state =
+            rank_resident_child_logical_state_handles_[0];
+        if (!primary_state.valid() ||
+            primary_state.request_count < request_count ||
+            primary_state.device != device_runners_[0]->primaryDeviceId())
+        {
+            LOG_ERROR(
+                "[RankOrchestrator] Resident next-condition-token observation "
+                "has no current primary-child mailbox");
+            return false;
+        }
+
+        /*
+         * Mirrored LocalTP publishes child zero as the authoritative compact
+         * token owner. The host sees only that final result row; every execution
+         * consumer continues to use its own child-local device mailbox.
+         */
+        if (!device_runners_[0]->observeDeviceResidentNextConditionTokens(
+                primary_state,
+                request_count,
+                out_tokens))
+        {
+            LOG_ERROR(
+                "[RankOrchestrator] Primary child could not publish resident "
+                "next-condition-token result rows");
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_resident_next_condition_token_host_observations",
+            1.0,
+            "decode",
+            "rank",
+            {{"requests", std::to_string(request_count)},
+             {"owner", "primary_child"},
+             {"boundary", "host_result"}});
+        return true;
     }
 
     bool RankOrchestrator::
@@ -5544,21 +5893,13 @@ namespace llaminar2
                 allow_speculative_discard);
         }
 
-        const bool mirrored_child_outcome =
-            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy ||
-            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredStochastic;
-        if (!mirrored_child_outcome ||
-            !rank_compact_outcome_valid_ ||
-            !rank_mirrored_child_outcomes_valid_ ||
-            rank_mirrored_child_outcomes_.size() != device_runners_.size() ||
-            !outcome.valid() ||
-            outcome.output_tokens_device !=
-                rank_mirrored_primary_outcome_.output_tokens_device ||
-            outcome.meta_device != rank_mirrored_primary_outcome_.meta_device ||
-            outcome.device != rank_mirrored_primary_outcome_.device ||
-            outcome.request_count != rank_mirrored_primary_outcome_.request_count)
+        std::string outcome_error;
+        if (!validateCurrentMirroredLocalTPOutcome(
+                outcome,
+                "shifted MTP suffix commit",
+                &outcome_error))
         {
-            LOG_ERROR("[RankOrchestrator] Device-outcome shifted MTP commit requires the primary handle from a mirrored LocalTP resident verifier reduction");
+            LOG_ERROR("[RankOrchestrator] " << outcome_error);
             return false;
         }
 
@@ -6105,21 +6446,13 @@ namespace llaminar2
             return nullptr;
         };
 
-        const bool mirrored_child_outcome =
-            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy ||
-            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredStochastic;
-        if (!mirrored_child_outcome ||
-            !rank_compact_outcome_valid_ ||
-            !rank_mirrored_child_outcomes_valid_ ||
-            rank_mirrored_child_outcomes_.size() != device_runners_.size() ||
-            !outcome.valid() ||
-            outcome.output_tokens_device !=
-                rank_mirrored_primary_outcome_.output_tokens_device ||
-            outcome.meta_device != rank_mirrored_primary_outcome_.meta_device ||
-            outcome.device != rank_mirrored_primary_outcome_.device ||
-            outcome.request_count != rank_mirrored_primary_outcome_.request_count)
+        std::string outcome_error;
+        if (!validateCurrentMirroredLocalTPOutcome(
+                outcome,
+                "initial shifted MTP row commit",
+                &outcome_error))
         {
-            LOG_ERROR("[RankOrchestrator] Device-outcome initial shifted MTP commit requires the primary handle from a mirrored LocalTP resident verifier reduction");
+            LOG_ERROR("[RankOrchestrator] " << outcome_error);
             return false;
         }
 
@@ -6670,11 +7003,6 @@ namespace llaminar2
                          out_token ? &primary_shadow : nullptr))
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP main-target argmax failed on primary participant");
-                return false;
-            }
-            if (!consumeUnusedReplicatedMainLogitsPublications(
-                    "sampleGreedyFromMainLogitsToDeviceTargetSlot"))
-            {
                 return false;
             }
             if (!broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
@@ -7254,6 +7582,8 @@ namespace llaminar2
             outcome.consumed_verifier_rows;
         rank_compact_output_meta_[kSpecBatchMetaSampledTerminal] =
             outcome.sampled_terminal ? 1 : 0;
+        rank_compact_output_meta_[kSpecBatchMetaCommitBoundaryClipped] =
+            outcome.commit_boundary_clipped ? 1 : 0;
 
         rank_compact_last_draft_tokens_.assign(
             resolved_draft_tokens.begin(),
@@ -8528,18 +8858,26 @@ namespace llaminar2
 
             child_slots[child] =
                 target_slot
-                    ? runner->deviceStochasticTargetSampleSlot(
-                          slot,
-                          /*require_ready=*/child == 0)
-                    : runner->deviceStochasticDraftSampleSlot(
-                          slot,
-                          /*require_ready=*/child == 0);
+                    ? (child == 0
+                           ? runner->deviceStochasticTargetSampleProducerSlot(
+                                 slot)
+                           : runner
+                                 ->deviceStochasticTargetSampleBroadcastDestinationSlot(
+                                     slot))
+                    : (child == 0
+                           ? runner->deviceStochasticDraftSampleProducerSlot(
+                                 slot)
+                           : runner
+                                 ->deviceStochasticDraftSampleBroadcastDestinationSlot(
+                                     slot));
             if (!child_slots[child].valid())
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP "
                           << slot_name
                           << " slot broadcast could not acquire "
-                          << (child == 0 ? "ready primary" : "destination")
+                          << (child == 0
+                                  ? "ready primary producer"
+                                  : "predecessor-ordered destination")
                           << " slot=" << slot
                           << " for participant " << child);
                 return false;
@@ -10711,28 +11049,110 @@ namespace llaminar2
             });
     }
 
+    bool RankOrchestrator::validateCurrentMirroredLocalTPOutcome(
+        const DeviceSpeculativeOutcomeHandle &outcome,
+        const char *operation,
+        std::string *error) const
+    {
+        const bool mirrored_kind =
+            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy ||
+            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredStochastic;
+        const bool complete_participant_set =
+            rank_mirrored_child_outcomes_.size() == device_runners_.size();
+        const bool primary_valid = rank_mirrored_primary_outcome_.valid();
+        const bool exact_primary_identity =
+            outcome.output_tokens_device ==
+                rank_mirrored_primary_outcome_.output_tokens_device &&
+            outcome.meta_device == rank_mirrored_primary_outcome_.meta_device &&
+            outcome.device == rank_mirrored_primary_outcome_.device &&
+            outcome.request_count ==
+                rank_mirrored_primary_outcome_.request_count &&
+            outcome.output_token_stride ==
+                rank_mirrored_primary_outcome_.output_token_stride &&
+            outcome.meta_stride == rank_mirrored_primary_outcome_.meta_stride &&
+            outcome.stream == rank_mirrored_primary_outcome_.stream &&
+            outcome.response_ready_event.get() ==
+                rank_mirrored_primary_outcome_.response_ready_event.get() &&
+            outcome.response_ready_after_rank_collective ==
+                rank_mirrored_primary_outcome_.response_ready_after_rank_collective &&
+            outcome.mtp_transaction.state.get() ==
+                rank_mirrored_primary_outcome_.mtp_transaction.state.get() &&
+            outcome.mirrored_local_tp_published_in_graph ==
+                rank_mirrored_primary_outcome_.mirrored_local_tp_published_in_graph;
+
+        if (mirrored_kind &&
+            rank_compact_outcome_valid_ &&
+            rank_mirrored_child_outcomes_valid_ &&
+            complete_participant_set &&
+            outcome.valid() &&
+            primary_valid &&
+            exact_primary_identity)
+        {
+            return true;
+        }
+
+        if (error)
+        {
+            std::ostringstream message;
+            message << (operation && operation[0] != '\0'
+                            ? operation
+                            : "mirrored LocalTP outcome consumer")
+                    << " rejected a non-current mirrored verifier outcome: "
+                    << "kind=" << static_cast<int>(rank_compact_outcome_kind_)
+                    << " mirrored_kind=" << mirrored_kind
+                    << " rank_valid=" << rank_compact_outcome_valid_
+                    << " child_set_valid=" << rank_mirrored_child_outcomes_valid_
+                    << " child_handles=" << rank_mirrored_child_outcomes_.size()
+                    << " participants=" << device_runners_.size()
+                    << " candidate_valid=" << outcome.valid()
+                    << " primary_valid=" << primary_valid
+                    << " exact_primary_identity=" << exact_primary_identity
+                    << " candidate_tokens="
+                    << static_cast<const void *>(outcome.output_tokens_device)
+                    << " primary_tokens="
+                    << static_cast<const void *>(
+                           rank_mirrored_primary_outcome_.output_tokens_device)
+                    << " candidate_meta="
+                    << static_cast<const void *>(outcome.meta_device)
+                    << " primary_meta="
+                    << static_cast<const void *>(
+                           rank_mirrored_primary_outcome_.meta_device)
+                    << " candidate_stream=" << outcome.stream
+                    << " primary_stream=" << rank_mirrored_primary_outcome_.stream
+                    << " candidate_ready=" << outcome.response_ready_event.get()
+                    << " primary_ready="
+                    << rank_mirrored_primary_outcome_.response_ready_event.get()
+                    << " candidate_rank_ready="
+                    << outcome.response_ready_after_rank_collective
+                    << " primary_rank_ready="
+                    << rank_mirrored_primary_outcome_
+                           .response_ready_after_rank_collective;
+            *error = message.str();
+        }
+        return false;
+    }
+
     bool RankOrchestrator::copyDeviceSpeculativeOutcomesToHost(
         const DeviceSpeculativeOutcomeHandle &handle,
         DeviceSpeculativeVerifyBatchOutcome *outcomes)
     {
-        const bool mirrored_child_outcome =
-            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy ||
-            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredStochastic;
-        if (mirrored_child_outcome)
+        const bool mirrored_local_tp_domain =
+            pp_stage_runners_.empty() &&
+            device_runners_.size() > 1 &&
+            usesMirroredLocalTPMTPHeadForVerifier();
+        if (mirrored_local_tp_domain)
         {
+            std::string outcome_error;
             if (!outcomes ||
-                !rank_compact_outcome_valid_ ||
-                !rank_mirrored_child_outcomes_valid_ ||
-                rank_mirrored_child_outcomes_.empty() ||
-                !handle.valid() ||
-                handle.output_tokens_device !=
-                    rank_mirrored_primary_outcome_.output_tokens_device ||
-                handle.meta_device !=
-                    rank_mirrored_primary_outcome_.meta_device ||
-                handle.device != rank_mirrored_primary_outcome_.device ||
-                handle.request_count !=
-                    rank_mirrored_primary_outcome_.request_count)
+                !validateCurrentMirroredLocalTPOutcome(
+                    handle,
+                    "response materialization",
+                    &outcome_error))
             {
+                LOG_ERROR("[RankOrchestrator] "
+                          << (outcomes
+                                  ? outcome_error
+                                  : "response materialization received a null outcome destination"));
                 return false;
             }
 
@@ -10741,6 +11161,15 @@ namespace llaminar2
                     rank_mirrored_child_outcomes_.front(),
                     outcomes))
             {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP response materialization failed in primary child after rank ownership validation: device="
+                          << (device_runners_.front()
+                                  ? device_runners_.front()->primaryDeviceId().toString()
+                                  : "missing")
+                          << " request_count=" << handle.request_count
+                          << " output_stride=" << handle.output_token_stride
+                          << " meta_stride=" << handle.meta_stride
+                          << " rank_ready="
+                          << handle.response_ready_after_rank_collective);
                 return false;
             }
 
@@ -10932,28 +11361,17 @@ namespace llaminar2
             return false;
         };
 
-        const bool mirrored_child_outcome =
-            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy ||
-            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredStochastic;
-        if (!mirrored_child_outcome ||
-            !rank_compact_outcome_valid_ ||
-            !rank_mirrored_child_outcomes_valid_ ||
-            rank_mirrored_child_outcomes_.size() != device_runners_.size())
+        std::string outcome_error;
+        if (!validateCurrentMirroredLocalTPOutcome(
+                request.outcome,
+                "mirrored LocalTP state publication",
+                &outcome_error))
         {
-            return fail(
-                "mirrored LocalTP MTP publication has no current child-resident verifier outcomes");
+            return fail(outcome_error);
         }
-        if (!request.valid() ||
-            request.outcome.output_tokens_device !=
-                rank_mirrored_primary_outcome_.output_tokens_device ||
-            request.outcome.meta_device !=
-                rank_mirrored_primary_outcome_.meta_device ||
-            request.outcome.device != rank_mirrored_primary_outcome_.device ||
-            request.outcome.request_count !=
-                rank_mirrored_primary_outcome_.request_count)
+        if (!request.valid())
         {
-            return fail(
-                "mirrored LocalTP MTP publication request does not reference the current primary child verifier outcome");
+            return fail("mirrored LocalTP MTP publication request has invalid capture geometry");
         }
 
         /*
@@ -12116,6 +12534,106 @@ namespace llaminar2
                  ok;
         }
         return ok;
+    }
+
+    bool RankOrchestrator::applyDeviceOwnedMTPPenaltiesToLogitRows(
+        DeviceLogitsSource source,
+        int row_count,
+        const MTPGreedyPenaltyPolicy &penalty_policy)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->applyDeviceOwnedMTPPenaltiesToLogitRows(
+                source,
+                row_count,
+                penalty_policy);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]
+                ->applyDeviceOwnedMTPPenaltiesToLogitRows(
+                    source,
+                    row_count,
+                    penalty_policy);
+        }
+        if (device_runners_.empty() || row_count <= 0)
+            return false;
+
+        if (source == DeviceLogitsSource::Main)
+        {
+            IInferenceRunner *primary = device_runners_[0].get();
+            return primary &&
+                   primary->applyDeviceOwnedMTPPenaltiesToLogitRows(
+                       source,
+                       row_count,
+                       penalty_policy);
+        }
+        if (source != DeviceLogitsSource::AllPosition ||
+            !usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            LOG_ERROR("[RankOrchestrator] Device-owned stochastic verifier penalties require mirrored full-vocabulary LocalTP heads");
+            return false;
+        }
+
+        for (size_t participant = 0;
+             participant < device_runners_.size();
+             ++participant)
+        {
+            IInferenceRunner *child = device_runners_[participant].get();
+            if (!child ||
+                !child->applyDeviceOwnedMTPPenaltiesToLogitRows(
+                    source,
+                    row_count,
+                    penalty_policy))
+            {
+                LOG_ERROR("[RankOrchestrator] Device-owned stochastic verifier penalty transform failed on participant "
+                          << participant);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool RankOrchestrator::applyDeviceOwnedMTPBranchPenaltiesToLogits(
+        int prior_draft_count,
+        const MTPGreedyPenaltyPolicy &penalty_policy)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->applyDeviceOwnedMTPBranchPenaltiesToLogits(
+                prior_draft_count,
+                penalty_policy);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]
+                ->applyDeviceOwnedMTPBranchPenaltiesToLogits(
+                    prior_draft_count,
+                    penalty_policy);
+        }
+        if (device_runners_.empty() || prior_draft_count < 0 ||
+            !usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            LOG_ERROR("[RankOrchestrator] Device-owned MTP branch penalties require mirrored full-vocabulary LocalTP heads");
+            return false;
+        }
+
+        for (size_t participant = 0;
+             participant < device_runners_.size();
+             ++participant)
+        {
+            IInferenceRunner *child = device_runners_[participant].get();
+            if (!child ||
+                !child->applyDeviceOwnedMTPBranchPenaltiesToLogits(
+                    prior_draft_count,
+                    penalty_policy))
+            {
+                LOG_ERROR("[RankOrchestrator] Device-owned MTP branch penalty transform failed on participant "
+                          << participant);
+                return false;
+            }
+        }
+        return true;
     }
 
     bool RankOrchestrator::supportsRowLocalAllPositionPenaltyApplication() const
@@ -13335,6 +13853,42 @@ namespace llaminar2
 
         auto merge_child = [&snapshot](const PrefixRuntimeStateSnapshot &child)
         {
+            constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ull;
+            constexpr uint64_t kFnvPrime = 1099511628211ull;
+            auto fold_terminal_value = [](uint64_t digest, uint64_t value)
+            {
+                for (unsigned byte = 0; byte < sizeof(value); ++byte)
+                {
+                    digest ^= value & 0xffull;
+                    digest *= kFnvPrime;
+                    value >>= 8;
+                }
+                return digest;
+            };
+            auto merge_terminal_hash =
+                [&](bool child_available,
+                    size_t child_bytes,
+                    uint64_t child_hash,
+                    bool *aggregate_available,
+                    size_t *aggregate_bytes,
+                    uint64_t *aggregate_hash)
+            {
+                if (!child_available)
+                    return;
+
+                uint64_t digest =
+                    *aggregate_available
+                        ? *aggregate_hash
+                        : kFnvOffsetBasis;
+                digest = fold_terminal_value(
+                    digest,
+                    static_cast<uint64_t>(child_bytes));
+                digest = fold_terminal_value(digest, child_hash);
+                *aggregate_available = true;
+                *aggregate_bytes += child_bytes;
+                *aggregate_hash = digest;
+            };
+
             snapshot.initialized = snapshot.initialized && child.initialized;
             snapshot.has_hidden = snapshot.has_hidden || child.has_hidden;
             snapshot.has_logits = snapshot.has_logits || child.has_logits;
@@ -13426,6 +13980,26 @@ namespace llaminar2
             snapshot.prefill_chunk_real_tokens += child.prefill_chunk_real_tokens;
             snapshot.prefill_chunk_padded_tokens += child.prefill_chunk_padded_tokens;
             snapshot.prefill_chunk_failures += child.prefill_chunk_failures;
+            /*
+             * LocalTP participants own distinct device buffers even when the
+             * model policy replicates their logical rows.  Fold every child in
+             * stable participant order rather than selecting participant zero;
+             * a one-device restore defect must change the rank-level digest.
+             */
+            merge_terminal_hash(
+                child.terminal_hidden_hash_available,
+                child.terminal_hidden_bytes,
+                child.terminal_hidden_hash,
+                &snapshot.terminal_hidden_hash_available,
+                &snapshot.terminal_hidden_bytes,
+                &snapshot.terminal_hidden_hash);
+            merge_terminal_hash(
+                child.terminal_logits_hash_available,
+                child.terminal_logits_bytes,
+                child.terminal_logits_hash,
+                &snapshot.terminal_logits_hash_available,
+                &snapshot.terminal_logits_bytes,
+                &snapshot.terminal_logits_hash);
             if (snapshot.primary_device.is_cpu() && !child.primary_device.is_cpu())
             {
                 snapshot.primary_device = child.primary_device;

@@ -119,6 +119,38 @@ namespace llaminar2
         }
 
         /**
+         * @brief Ensure workspace for one explicitly typed graph-family participant.
+         *
+         * Graph geometry is not a semantic discriminator. A short prompt and a
+         * grouped verifier can have the same M while selecting different kernels,
+         * recurrent-state banks, and LM-head row policies. Production hosts must
+         * therefore receive the role selected from ForwardInput rather than
+         * reconstructing it from sequence length or decode-history heuristics.
+         *
+         * Lightweight test hosts may retain the three-argument implementation;
+         * this compatibility body deliberately discards only the additional role,
+         * not the graph-family lifetime policy.
+         *
+         * @param graph Materialized graph whose consumers require binding.
+         * @param workspace_seq_len Participant rows per request.
+         * @param graph_family_policy Physical lifetime policy for the family.
+         * @param participant_role Mathematical role of this exact graph.
+         * @return true when all consumers are bound to stable workspace addresses.
+         */
+        virtual bool ensureDeviceWorkspaceAllocated(
+            const ComputeGraph &graph,
+            int workspace_seq_len,
+            WorkspaceGraphFamilyPolicy graph_family_policy,
+            WorkspaceGraphParticipantRole participant_role)
+        {
+            (void)participant_role;
+            return ensureDeviceWorkspaceAllocated(
+                graph,
+                workspace_seq_len,
+                graph_family_policy);
+        }
+
+        /**
          * @brief Return the workspace generation for a device, if the host tracks it.
          *
          * A generation change means raw workspace addresses may have changed.

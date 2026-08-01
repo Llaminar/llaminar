@@ -681,6 +681,27 @@ public:
         return handle;
     }
 
+    bool observeDeviceResidentNextConditionTokens(
+        const DeviceResidentLogicalSequenceStateHandle &logical_state,
+        int request_count,
+        int32_t *out_tokens) override
+    {
+        const DeviceResidentLogicalSequenceStateHandle current =
+            deviceResidentLogicalSequenceState();
+        if (!out_tokens ||
+            request_count <= 0 ||
+            request_count > resident_logical_state_request_count_ ||
+            !logical_state.sameMailboxAs(current))
+        {
+            return false;
+        }
+        std::copy_n(
+            resident_next_condition_tokens_.data(),
+            request_count,
+            out_tokens);
+        return true;
+    }
+
     bool forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
         const DeviceResidentLogicalSequenceStateHandle &logical_state,
         int request_index = 0) override
@@ -1451,14 +1472,33 @@ public:
                    threshold) >= 0;
     }
 
-    DeviceStochasticDraftSampleSlotHandle deviceStochasticDraftSampleSlot(
-        int slot,
-        bool require_ready = false) override
+    DeviceStochasticDraftSampleSlotHandle
+    deviceStochasticDraftSampleProducerSlot(int slot) override
     {
+        ++draft_sample_producer_slot_acquisitions_;
         if (slot < 0 ||
             slot >= static_cast<int>(draft_sample_tokens_.size()) ||
-            (require_ready &&
-             !draft_sample_slot_ready_[static_cast<size_t>(slot)]))
+            !draft_sample_slot_ready_[static_cast<size_t>(slot)])
+        {
+            return {};
+        }
+
+        DeviceStochasticDraftSampleSlotHandle handle;
+        handle.token_device =
+            draft_sample_tokens_.data() + static_cast<size_t>(slot);
+        handle.slot = slot;
+        handle.device = device_id_;
+        handle.stream =
+            draft_sample_stream_tokens_.data() + static_cast<size_t>(slot);
+        return handle;
+    }
+
+    DeviceStochasticDraftSampleSlotHandle
+    deviceStochasticDraftSampleBroadcastDestinationSlot(int slot) override
+    {
+        ++draft_sample_destination_slot_acquisitions_;
+        if (slot < 0 ||
+            slot >= static_cast<int>(draft_sample_tokens_.size()))
         {
             return {};
         }
@@ -1492,14 +1532,33 @@ public:
         return true;
     }
 
-    DeviceStochasticTargetSampleSlotHandle deviceStochasticTargetSampleSlot(
-        int slot,
-        bool require_ready = false) override
+    DeviceStochasticTargetSampleSlotHandle
+    deviceStochasticTargetSampleProducerSlot(int slot) override
     {
+        ++target_sample_producer_slot_acquisitions_;
         if (slot < 0 ||
             slot >= static_cast<int>(target_sample_tokens_.size()) ||
-            (require_ready &&
-             !target_sample_slot_ready_[static_cast<size_t>(slot)]))
+            !target_sample_slot_ready_[static_cast<size_t>(slot)])
+        {
+            return {};
+        }
+
+        DeviceStochasticTargetSampleSlotHandle handle;
+        handle.token_device =
+            target_sample_tokens_.data() + static_cast<size_t>(slot);
+        handle.slot = slot;
+        handle.device = device_id_;
+        handle.stream =
+            target_sample_stream_tokens_.data() + static_cast<size_t>(slot);
+        return handle;
+    }
+
+    DeviceStochasticTargetSampleSlotHandle
+    deviceStochasticTargetSampleBroadcastDestinationSlot(int slot) override
+    {
+        ++target_sample_destination_slot_acquisitions_;
+        if (slot < 0 ||
+            slot >= static_cast<int>(target_sample_tokens_.size()))
         {
             return {};
         }
@@ -2330,6 +2389,22 @@ public:
     {
         return record_target_sample_slot_ready_calls_;
     }
+    size_t draft_sample_producer_slot_acquisition_count() const
+    {
+        return draft_sample_producer_slot_acquisitions_;
+    }
+    size_t draft_sample_destination_slot_acquisition_count() const
+    {
+        return draft_sample_destination_slot_acquisitions_;
+    }
+    size_t target_sample_producer_slot_acquisition_count() const
+    {
+        return target_sample_producer_slot_acquisitions_;
+    }
+    size_t target_sample_destination_slot_acquisition_count() const
+    {
+        return target_sample_destination_slot_acquisitions_;
+    }
     int last_recorded_target_sample_slot() const
     {
         return last_recorded_target_sample_slot_;
@@ -2440,7 +2515,13 @@ public:
         forward_mtp_from_device_draft_calls_ = 0;
         forward_mtp_from_device_target_calls_ = 0;
         record_draft_sample_slot_ready_calls_ = 0;
+        record_target_sample_slot_ready_calls_ = 0;
+        draft_sample_producer_slot_acquisitions_ = 0;
+        draft_sample_destination_slot_acquisitions_ = 0;
+        target_sample_producer_slot_acquisitions_ = 0;
+        target_sample_destination_slot_acquisitions_ = 0;
         last_recorded_draft_sample_slot_ = -1;
+        last_recorded_target_sample_slot_ = -1;
         last_verifier_host_row_tokens_.clear();
         last_staged_draft_tokens_.clear();
         draft_sample_slot_ready_.fill(false);
@@ -2704,6 +2785,10 @@ private:
     int last_recorded_draft_sample_slot_ = -1;
     size_t record_target_sample_slot_ready_calls_ = 0;
     int last_recorded_target_sample_slot_ = -1;
+    size_t draft_sample_producer_slot_acquisitions_ = 0;
+    size_t draft_sample_destination_slot_acquisitions_ = 0;
+    size_t target_sample_producer_slot_acquisitions_ = 0;
+    size_t target_sample_destination_slot_acquisitions_ = 0;
     int last_resident_logical_state_request_index_ = -1;
     float last_stochastic_threshold_ = 0.0f;
     bool last_use_vllm_probability_rejection_ = false;
@@ -6318,6 +6403,14 @@ TEST_F(Test__RankOrchestrator,
     DeviceResidentLogicalSequenceStateHandle resident_state =
         orchestrator->deviceResidentLogicalSequenceState();
     EXPECT_TRUE(resident_state.valid());
+    int32_t observed_next_condition = kMTPSpecDecodeInvalidToken;
+    EXPECT_TRUE(orchestrator->observeDeviceResidentNextConditionTokens(
+        resident_state,
+        /*request_count=*/1,
+        &observed_next_condition));
+    EXPECT_EQ(observed_next_condition, materialized.ready_token)
+        << "The aggregate result boundary must observe the authoritative "
+           "primary-child mailbox without dereferencing the rank marker.";
     EXPECT_TRUE(orchestrator->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
         resident_state,
         /*request_index=*/0))
@@ -6363,6 +6456,12 @@ TEST_F(Test__RankOrchestrator,
             /*request_index=*/0))
         << "A rank mailbox issued before prefix restore must fail closed after "
            "the aggregate epoch advances.";
+    EXPECT_FALSE(orchestrator->observeDeviceResidentNextConditionTokens(
+        resident_state,
+        /*request_count=*/1,
+        &observed_next_condition))
+        << "The result boundary must reject an aggregate mailbox issued before "
+           "prefix replacement.";
 }
 
 TEST_F(Test__RankOrchestrator,
@@ -6598,6 +6697,12 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomeSamplesOnceAndSta
     EXPECT_EQ(runner1_ptr->sample_stochastic_distribution_call_count(), 0u);
     EXPECT_EQ(runner0_ptr->record_target_sample_slot_ready_call_count(), 1u);
     EXPECT_EQ(runner1_ptr->record_target_sample_slot_ready_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->target_sample_producer_slot_acquisition_count(), 1u);
+    EXPECT_EQ(runner0_ptr->target_sample_destination_slot_acquisition_count(), 0u);
+    EXPECT_EQ(runner1_ptr->target_sample_producer_slot_acquisition_count(), 0u);
+    EXPECT_EQ(runner1_ptr->target_sample_destination_slot_acquisition_count(), 1u)
+        << "A peer target broadcast must acquire a main-forward-ordered "
+           "destination instead of an arbitrary operation stream.";
     EXPECT_TRUE(runner0_ptr->target_sample_slot_ready(0));
     EXPECT_TRUE(runner1_ptr->target_sample_slot_ready(0));
     EXPECT_EQ(runner0_ptr->target_sample_token(0), 1);
@@ -6836,6 +6941,12 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredDeferredStochasticDraftBroadcastsP
     EXPECT_EQ(tp_ctx_ptr->collective_sideband_broadcast_count(), 2u);
     EXPECT_EQ(runner0_ptr->record_draft_sample_slot_ready_call_count(), 1u);
     EXPECT_EQ(runner1_ptr->record_draft_sample_slot_ready_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->draft_sample_producer_slot_acquisition_count(), 1u);
+    EXPECT_EQ(runner0_ptr->draft_sample_destination_slot_acquisition_count(), 0u);
+    EXPECT_EQ(runner1_ptr->draft_sample_producer_slot_acquisition_count(), 0u);
+    EXPECT_EQ(runner1_ptr->draft_sample_destination_slot_acquisition_count(), 1u)
+        << "A peer draft broadcast must consume the preceding MTP-sidecar "
+           "publication so the next chained sidecar cannot race MTP_HIDDEN.";
     EXPECT_EQ(runner0_ptr->last_recorded_draft_sample_slot(), 1);
     EXPECT_EQ(runner1_ptr->last_recorded_draft_sample_slot(), 1);
     EXPECT_TRUE(runner0_ptr->draft_sample_slot_ready(1));
@@ -7447,8 +7558,9 @@ TEST_F(Test__RankOrchestrator,
  * The first scalar MTP target is sampled from the preceding main terminal row.
  * Once that row is mirrored, consulting `LOGITS_LOCAL` or staging a host token
  * would revive the obsolete sharded path. This regression requires one child
- * argmax, one NCCL/RCCL target-slot broadcast, and a fresh readiness publication
- * on every participant.
+ * argmax, one NCCL/RCCL target-slot broadcast, an explicitly main-forward-
+ * ordered peer destination, and a fresh readiness publication on every
+ * participant.
  */
 TEST_F(Test__RankOrchestrator,
        MirroredLocalTPGreedyMainTargetSlotBroadcastsPrimaryDeviceSample)
@@ -7494,7 +7606,11 @@ TEST_F(Test__RankOrchestrator,
     EXPECT_EQ(
         runner1_ptr
             ->consume_unused_replicated_main_logits_publication_call_count(),
-        1u);
+        0u)
+        << "The typed destination acquisition owns the peer main-forward "
+           "publication; a separate retirement call would discard that edge.";
+    EXPECT_EQ(runner0_ptr->target_sample_producer_slot_acquisition_count(), 1u);
+    EXPECT_EQ(runner1_ptr->target_sample_destination_slot_acquisition_count(), 1u);
     EXPECT_EQ(runner0_ptr->consume_logits_local_info_call_count(), 0u);
     EXPECT_EQ(runner1_ptr->consume_logits_local_info_call_count(), 0u);
     EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 2u);

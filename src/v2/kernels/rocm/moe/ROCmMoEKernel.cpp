@@ -63,6 +63,85 @@ namespace
     }
 
     /**
+     * @brief Append every semantic descriptor field to an exact identity key.
+     *
+     * Pointer and format fields are normalized individually so immutable
+     * publication equality neither observes C++ padding nor relies on a
+     * collision-prone digest.
+     */
+    void appendGroupedDescriptorIdentity(
+        std::vector<std::uint64_t> &words,
+        const llaminar2::DeviceNativeVNNIMatrixDesc &descriptor)
+    {
+        words.push_back(static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(descriptor.payload)));
+        words.push_back(static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(descriptor.scales)));
+        words.push_back(static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(descriptor.mins)));
+        words.push_back(static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(descriptor.emins)));
+        words.push_back(static_cast<std::uint64_t>(
+            static_cast<std::uint32_t>(descriptor.n)));
+        words.push_back(static_cast<std::uint64_t>(
+            static_cast<std::uint32_t>(descriptor.k)));
+        words.push_back(
+            static_cast<std::uint64_t>(descriptor.blocks_per_row));
+        words.push_back(
+            static_cast<std::uint64_t>(descriptor.codebook_id) |
+            (static_cast<std::uint64_t>(
+                 descriptor.allocation_payload_bytes_per_block)
+             << 8U) |
+            (static_cast<std::uint64_t>(
+                 descriptor.allocation_has_mins)
+             << 16U) |
+            (static_cast<std::uint64_t>(
+                 descriptor.allocation_has_emins)
+             << 24U));
+    }
+
+    /**
+     * @brief Build the exact identity for a down or paired gate/up table.
+     */
+    llaminar2::PersistentWorkspacePublicationKey
+    groupedDescriptorPublicationKey(
+        const llaminar2::DeviceNativeVNNIMatrixDesc *primary,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *secondary,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        llaminar2::PersistentWorkspacePublicationKey key{
+            .word0 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(num_experts)),
+            .word1 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(d_model)),
+            .word2 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(intermediate)),
+            .word3 = secondary ? 2U : 1U,
+        };
+        key.identity_words.reserve(
+            static_cast<std::size_t>(num_experts) *
+            (secondary ? 16U : 8U));
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            appendGroupedDescriptorIdentity(
+                key.identity_words,
+                primary[expert]);
+        }
+        if (secondary)
+        {
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                appendGroupedDescriptorIdentity(
+                    key.identity_words,
+                    secondary[expert]);
+            }
+        }
+        return key;
+    }
+
+    /**
      * @brief Validate the stage-owned stream for a device-resident MoE launch.
      *
      * Rebalance and LLEP primitives use this immutable context rather than the
@@ -444,6 +523,7 @@ extern "C"
         void *rebalance_controller_state,
         int rebalance_target_layer,
         uint32_t rebalance_command_buffer_count,
+        const int32_t *absolute_position_ids,
         int device_idx, void *stream);
 
     bool hipMoE_softmax_topk_decode_runtime_wave64(
@@ -466,6 +546,7 @@ extern "C"
         void *rebalance_controller_state,
         int rebalance_target_layer,
         uint32_t rebalance_command_buffer_count,
+        const int32_t *absolute_position_ids,
         int device_idx, void *stream);
 
     bool hipMoE_softmax_topk_decode_equivalent_rows(
@@ -496,6 +577,7 @@ extern "C"
         void *rebalance_controller_state,
         int rebalance_target_layer,
         uint32_t rebalance_command_buffer_count,
+        const int32_t *absolute_position_ids,
         int device_idx, void *stream);
 
     bool hipMoE_decode_route_select_runtime(
@@ -654,6 +736,16 @@ extern "C"
 
     bool hipMoE_init_rebalance_graph_controller_state(
         void *controller_state,
+        const void *config,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_reset_rebalance_graph_transaction_for_request(
+        void *controller_state,
+        void *command_headers,
+        void *wave_states,
+        uint32_t *plan_counts,
+        uint32_t command_buffer_count,
         const void *config,
         int device_idx,
         void *stream);
@@ -856,18 +948,30 @@ extern "C"
         void *runtime,
         int current_slots, int max_slots, int num_experts, int top_k,
         int filter_to_local_runtime_experts,
-        int histogram_update_flags,
+        int retain_routes_for_deferred_commit,
         int device_idx, void *stream);
 
     bool hipMoE_regroup_prefill_routes_runtime_assignments(
         void *runtime,
         int current_slots, int max_slots, int num_experts, int top_k,
-        int histogram_update_flags,
+        int retain_routes_for_deferred_commit,
+        int device_idx, void *stream);
+
+    bool hipMoE_commit_grouped_verifier_histograms(
+        void *runtime,
+        const int32_t *accepted_state_counts,
+        const int32_t *publication_ok_flags,
+        int request_count,
+        int rows_per_request,
+        int total_rows,
+        int num_experts,
+        int top_k,
         int device_idx, void *stream);
 
     bool hipMoE_assign_prefill_routes_least_loaded_resident(
         void *runtime,
         int current_slots, int max_slots, int num_experts, int top_k,
+        const int32_t *absolute_position_ids,
         int device_idx, void *stream);
 
     bool hipMoE_plan_prefill_routes_least_loaded_current_batch(
@@ -964,6 +1068,7 @@ extern "C"
         int8_t *d_swiglu_int8,
         float *d_swiglu_scales,
         float *d_output,
+        float *d_canonical_route_contributions,
         int num_active,
         int N,
         int K,
@@ -1158,6 +1263,7 @@ extern "C"
         int8_t *d_scratch_swiglu_int8,
         float *d_scratch_swiglu_scales,
         float *d_output,
+        float *d_canonical_route_contributions,
         int num_experts,
         int d_model,
         int intermediate,
@@ -1166,6 +1272,15 @@ extern "C"
         int grouped_indices_are_route_slots,
         uint32_t gateup_codebook_mask,
         uint32_t down_codebook_mask,
+        int device_id,
+        void *stream);
+
+    bool rocmMoE_reduce_canonical_route_contributions(
+        const float *d_route_contributions,
+        float *d_output,
+        int seq_len,
+        int top_k,
+        int d_model,
         int device_id,
         void *stream);
 
@@ -1631,14 +1746,14 @@ namespace llaminar2
         for (auto &table : grouped_down_desc_tables_)
         {
             table.device_descs = nullptr;
-            table.workspace_lease.reset();
+            table.workspace_publication.reset();
             table.workspace_slot = 0;
         }
         for (auto &table : grouped_gateup_desc_tables_)
         {
             table.device_gate_descs = nullptr;
             table.device_up_descs = nullptr;
-            table.workspace_lease.reset();
+            table.workspace_publication.reset();
             table.workspace_slot = 0;
         }
         grouped_gateup_cached_expert_ids_.clear();
@@ -1649,6 +1764,296 @@ namespace llaminar2
         scratch_workspace_bound_ = false;
     }
 
+    bool ROCmMoEKernel::publishGroupedDownDescriptorTable(
+        GroupedDownDescriptorTable &table,
+        const char *context)
+    {
+        if (!workspace_ || !table.valid || table.host_descs.empty() ||
+            table.num_experts <= 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel] "
+                      << (context ? context : "down descriptor publication")
+                      << " requires a bound workspace and complete host table");
+            return false;
+        }
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel] "
+                      << (context ? context : "down descriptor publication")
+                      << " requires an explicit HIP stream");
+            return false;
+        }
+
+        const size_t desc_bytes =
+            static_cast<size_t>(table.num_experts) *
+            sizeof(DeviceNativeVNNIMatrixDesc);
+        const auto publication_result =
+            workspace_->getOrCreatePersistentPublication(
+                kROCmGroupedDownDescriptorLeaseDomain,
+                groupedDescriptorPublicationKey(
+                    table.host_descs.data(),
+                    nullptr,
+                    table.num_experts,
+                    table.d_model,
+                    table.intermediate),
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                [&](std::size_t slot) -> std::shared_ptr<void>
+                {
+                    DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+                    if (!bindGroupedDescriptorTableSlot(
+                            MoEWorkspaceBuffers::
+                                ROCM_GROUPED_DOWN_DESC_TABLES,
+                            slot,
+                            table.num_experts,
+                            &device_descs,
+                            "ROCm grouped down descriptor publication"))
+                    {
+                        return {};
+                    }
+
+                    hipEvent_t ready_event = nullptr;
+                    hipError_t err = hipEventCreateWithFlags(
+                        &ready_event,
+                        hipEventDisableTiming);
+                    if (err != hipSuccess || !ready_event)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel] Failed to create grouped "
+                                  "down descriptor readiness event: "
+                                  << hipGetErrorString(err));
+                        return {};
+                    }
+                    auto publication =
+                        std::shared_ptr<
+                            GroupedDescriptorWorkspacePublication>(
+                            new GroupedDescriptorWorkspacePublication{
+                                .ready_event =
+                                    static_cast<void *>(ready_event),
+                                .primary_descs = device_descs,
+                                .secondary_descs = nullptr,
+                                .workspace_slot = slot,
+                            },
+                            [](GroupedDescriptorWorkspacePublication *value)
+                            {
+                                if (value && value->ready_event)
+                                {
+                                    (void)hipEventDestroy(
+                                        static_cast<hipEvent_t>(
+                                            value->ready_event));
+                                }
+                                delete value;
+                            });
+
+                    err = hipMemcpyAsync(
+                        device_descs,
+                        table.host_descs.data(),
+                        desc_bytes,
+                        hipMemcpyHostToDevice,
+                        stream);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel] Grouped down descriptor "
+                                  "H2D publication failed: "
+                                  << hipGetErrorString(err));
+                        return {};
+                    }
+                    err = hipEventRecord(ready_event, stream);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel] Grouped down descriptor "
+                                  "publication cannot record readiness: "
+                                  << hipGetErrorString(err));
+                        std::terminate();
+                    }
+                    return publication;
+                });
+        if (!publication_result)
+        {
+            LOG_ERROR("[ROCmMoEKernel] Failed to publish grouped down "
+                      "descriptor table");
+            return false;
+        }
+
+        auto publication =
+            std::static_pointer_cast<
+                GroupedDescriptorWorkspacePublication>(
+                publication_result.publication);
+        const hipError_t wait_err = hipStreamWaitEvent(
+            stream,
+            static_cast<hipEvent_t>(publication->ready_event),
+            0);
+        if (wait_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel] Failed to adopt grouped down "
+                      "descriptor publication: "
+                      << hipGetErrorString(wait_err));
+            return false;
+        }
+
+        table.device_descs = publication->primary_descs;
+        table.workspace_publication = std::move(publication);
+        table.workspace_slot = publication_result.slot;
+        return true;
+    }
+
+    bool ROCmMoEKernel::publishGroupedGateUpDescriptorTable(
+        GroupedGateUpDescriptorTable &table,
+        const char *context)
+    {
+        if (!workspace_ || !table.valid ||
+            table.host_gate_descs.empty() ||
+            table.host_up_descs.empty() ||
+            table.num_experts <= 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel] "
+                      << (context ? context : "gate/up descriptor publication")
+                      << " requires a bound workspace and complete host tables");
+            return false;
+        }
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel] "
+                      << (context ? context : "gate/up descriptor publication")
+                      << " requires an explicit HIP stream");
+            return false;
+        }
+
+        const size_t desc_bytes =
+            static_cast<size_t>(table.num_experts) *
+            sizeof(DeviceNativeVNNIMatrixDesc);
+        const auto publication_result =
+            workspace_->getOrCreatePersistentPublication(
+                kROCmGroupedGateUpDescriptorLeaseDomain,
+                groupedDescriptorPublicationKey(
+                    table.host_gate_descs.data(),
+                    table.host_up_descs.data(),
+                    table.num_experts,
+                    table.d_model,
+                    table.intermediate),
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                [&](std::size_t slot) -> std::shared_ptr<void>
+                {
+                    DeviceNativeVNNIMatrixDesc *device_gate_descs =
+                        nullptr;
+                    DeviceNativeVNNIMatrixDesc *device_up_descs =
+                        nullptr;
+                    if (!bindGroupedDescriptorTableSlot(
+                            MoEWorkspaceBuffers::
+                                ROCM_GROUPED_GATE_DESC_TABLES,
+                            slot,
+                            table.num_experts,
+                            &device_gate_descs,
+                            "ROCm grouped gate descriptor publication") ||
+                        !bindGroupedDescriptorTableSlot(
+                            MoEWorkspaceBuffers::
+                                ROCM_GROUPED_UP_DESC_TABLES,
+                            slot,
+                            table.num_experts,
+                            &device_up_descs,
+                            "ROCm grouped up descriptor publication"))
+                    {
+                        return {};
+                    }
+
+                    hipEvent_t ready_event = nullptr;
+                    hipError_t err = hipEventCreateWithFlags(
+                        &ready_event,
+                        hipEventDisableTiming);
+                    if (err != hipSuccess || !ready_event)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel] Failed to create grouped "
+                                  "gate/up descriptor readiness event: "
+                                  << hipGetErrorString(err));
+                        return {};
+                    }
+                    auto publication =
+                        std::shared_ptr<
+                            GroupedDescriptorWorkspacePublication>(
+                            new GroupedDescriptorWorkspacePublication{
+                                .ready_event =
+                                    static_cast<void *>(ready_event),
+                                .primary_descs = device_gate_descs,
+                                .secondary_descs = device_up_descs,
+                                .workspace_slot = slot,
+                            },
+                            [](GroupedDescriptorWorkspacePublication *value)
+                            {
+                                if (value && value->ready_event)
+                                {
+                                    (void)hipEventDestroy(
+                                        static_cast<hipEvent_t>(
+                                            value->ready_event));
+                                }
+                                delete value;
+                            });
+
+                    err = hipMemcpyAsync(
+                        device_gate_descs,
+                        table.host_gate_descs.data(),
+                        desc_bytes,
+                        hipMemcpyHostToDevice,
+                        stream);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel] Grouped gate descriptor "
+                                  "H2D publication failed: "
+                                  << hipGetErrorString(err));
+                        return {};
+                    }
+                    err = hipMemcpyAsync(
+                        device_up_descs,
+                        table.host_up_descs.data(),
+                        desc_bytes,
+                        hipMemcpyHostToDevice,
+                        stream);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel] Grouped up descriptor H2D "
+                                  "publication failed after gate submission: "
+                                  << hipGetErrorString(err));
+                        std::terminate();
+                    }
+                    err = hipEventRecord(ready_event, stream);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel] Grouped gate/up descriptor "
+                                  "publication cannot record readiness: "
+                                  << hipGetErrorString(err));
+                        std::terminate();
+                    }
+                    return publication;
+                });
+        if (!publication_result)
+        {
+            LOG_ERROR("[ROCmMoEKernel] Failed to publish grouped gate/up "
+                      "descriptor table");
+            return false;
+        }
+
+        auto publication =
+            std::static_pointer_cast<
+                GroupedDescriptorWorkspacePublication>(
+                publication_result.publication);
+        const hipError_t wait_err = hipStreamWaitEvent(
+            stream,
+            static_cast<hipEvent_t>(publication->ready_event),
+            0);
+        if (wait_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel] Failed to adopt grouped gate/up "
+                      "descriptor publication: "
+                      << hipGetErrorString(wait_err));
+            return false;
+        }
+
+        table.device_gate_descs = publication->primary_descs;
+        table.device_up_descs = publication->secondary_descs;
+        table.workspace_publication = std::move(publication);
+        table.workspace_slot = publication_result.slot;
+        return true;
+    }
+
     bool ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace(const char *context)
     {
         if (grouped_down_desc_tables_.empty() && grouped_gateup_desc_tables_.empty())
@@ -1657,56 +2062,12 @@ namespace llaminar2
             return false;
         if (!setMoEDevice(device_ordinal_, context ? context : "rebindGroupedDescriptorTablesToWorkspace"))
             return false;
-        hipStream_t stream = static_cast<hipStream_t>(getStream());
-        if (!stream)
-        {
-            LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] explicit HIP stream is required");
-            return false;
-        }
-
         for (auto &table : grouped_down_desc_tables_)
         {
             if (!table.valid || table.host_descs.empty() || table.num_experts <= 0)
                 continue;
-            auto lease = workspace_->acquirePersistentSlot(
-                kROCmGroupedDownDescriptorLeaseDomain,
-                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
-            if (!lease)
-            {
-                LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] "
-                          "failed to lease a down descriptor slot");
-                table.device_descs = nullptr;
+            if (!publishGroupedDownDescriptorTable(table, context))
                 return false;
-            }
-            const std::size_t slot = lease->slot();
-            const size_t desc_bytes =
-                static_cast<size_t>(table.num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
-            DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
-            if (!bindGroupedDescriptorTableSlot(
-                    MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES,
-                    slot,
-                    table.num_experts,
-                    &device_descs,
-                    "ROCm grouped down descriptor table rebind"))
-            {
-                table.device_descs = nullptr;
-                return false;
-            }
-            const hipError_t err = hipMemcpyAsync(device_descs,
-                                                  table.host_descs.data(),
-                                                  desc_bytes,
-                                                  hipMemcpyHostToDevice,
-                                                  stream);
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] down descriptor upload failed: "
-                          << hipGetErrorString(err));
-                table.device_descs = nullptr;
-                return false;
-            }
-            table.device_descs = device_descs;
-            table.workspace_lease = std::move(lease);
-            table.workspace_slot = slot;
         }
 
         for (auto &table : grouped_gateup_desc_tables_)
@@ -1716,62 +2077,8 @@ namespace llaminar2
             {
                 continue;
             }
-            auto lease = workspace_->acquirePersistentSlot(
-                kROCmGroupedGateUpDescriptorLeaseDomain,
-                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
-            if (!lease)
-            {
-                LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] "
-                          "failed to lease a gate/up descriptor slot");
-                table.device_gate_descs = nullptr;
-                table.device_up_descs = nullptr;
+            if (!publishGroupedGateUpDescriptorTable(table, context))
                 return false;
-            }
-            const std::size_t slot = lease->slot();
-            const size_t desc_bytes =
-                static_cast<size_t>(table.num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
-            DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
-            if (!bindGroupedDescriptorTableSlot(
-                    MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES,
-                    slot,
-                    table.num_experts,
-                    &device_gate_descs,
-                    "ROCm grouped gate descriptor table rebind") ||
-                !bindGroupedDescriptorTableSlot(
-                    MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES,
-                    slot,
-                    table.num_experts,
-                    &device_up_descs,
-                    "ROCm grouped up descriptor table rebind"))
-            {
-                table.device_gate_descs = nullptr;
-                table.device_up_descs = nullptr;
-                return false;
-            }
-            hipError_t err = hipMemcpyAsync(device_gate_descs,
-                                            table.host_gate_descs.data(),
-                                            desc_bytes,
-                                            hipMemcpyHostToDevice,
-                                            stream);
-            if (err == hipSuccess)
-                err = hipMemcpyAsync(device_up_descs,
-                                     table.host_up_descs.data(),
-                                     desc_bytes,
-                                     hipMemcpyHostToDevice,
-                                     stream);
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] gate/up descriptor upload failed: "
-                          << hipGetErrorString(err));
-                table.device_gate_descs = nullptr;
-                table.device_up_descs = nullptr;
-                return false;
-            }
-            table.device_gate_descs = device_gate_descs;
-            table.device_up_descs = device_up_descs;
-            table.workspace_lease = std::move(lease);
-            table.workspace_slot = slot;
         }
         return true;
     }
@@ -2195,7 +2502,7 @@ namespace llaminar2
         entry.workspace_slot = publication_result.slot;
         router_q8_gate_cache_.push_back(std::move(entry));
 
-        LOG_DEBUG("[ROCmMoEKernel] Adopted Q8 router gate source_device="
+        LOG_TRACE("[ROCmMoEKernel] Adopted Q8 router gate source_device="
                   << static_cast<const void *>(gate_device_ptr)
                   << " workspace_id=" << cache_key.workspace_id
                   << " slot=" << publication_result.slot
@@ -3798,7 +4105,8 @@ namespace llaminar2
         bool normalize_weights,
         ITensor *output_indices, ITensor *output_weights,
         bool write_legacy_outputs,
-        bool update_runtime_histogram)
+        bool update_runtime_histogram,
+        const int32_t *absolute_position_ids_device)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -3942,6 +4250,7 @@ namespace llaminar2
                 nullptr,
                 -1,
                 1u,
+                absolute_position_ids_device,
                 device_ordinal_,
                 getStream());
             if (!runtime_ready)
@@ -4007,6 +4316,7 @@ namespace llaminar2
                 nullptr,
                 -1,
                 1u,
+                absolute_position_ids_device,
                 device_ordinal_,
                 getStream());
             if (!runtime_ready)
@@ -4037,6 +4347,7 @@ namespace llaminar2
                                   nullptr,
                                   -1,
                                   1u,
+                                  absolute_position_ids_device,
                                   device_ordinal_,
                                   getStream()))
         {
@@ -4072,7 +4383,8 @@ namespace llaminar2
         DeviceMoERebalanceApplyStatus *rebalance_apply_status,
         DeviceMoERebalanceGraphControllerState *rebalance_controller_state,
         int rebalance_target_layer,
-        uint32_t rebalance_command_buffer_count)
+        uint32_t rebalance_command_buffer_count,
+        const int32_t *absolute_position_ids_device)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -4223,6 +4535,7 @@ namespace llaminar2
                 rebalance_controller_state,
                 rebalance_target_layer,
                 rebalance_command_buffer_count,
+                absolute_position_ids_device,
                 device_ordinal_,
                 getStream());
             if (!runtime_ready)
@@ -4288,6 +4601,7 @@ namespace llaminar2
                 rebalance_controller_state,
                 rebalance_target_layer,
                 rebalance_command_buffer_count,
+                absolute_position_ids_device,
                 device_ordinal_,
                 getStream());
             if (!runtime_ready)
@@ -4318,6 +4632,7 @@ namespace llaminar2
                                   rebalance_controller_state,
                                   rebalance_target_layer,
                                   rebalance_command_buffer_count,
+                                  absolute_position_ids_device,
                                   device_ordinal_,
                                   getStream()))
         {
@@ -4913,6 +5228,53 @@ namespace llaminar2
             stream);
     }
 
+    bool ROCmMoEKernel::resetDeviceRebalanceGraphTransactionForRequest(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        DeviceMoERebalanceCommandBufferHeader *command_headers,
+        DeviceMoERebalanceWaveState *wave_states,
+        uint32_t *plan_counts,
+        uint32_t command_buffer_count,
+        const DeviceMoERebalanceConfig &config)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::resetDeviceRebalanceGraphTransactionForRequest] invalid device rebalance config");
+            return false;
+        }
+        if (!controller_state || !command_headers || !wave_states ||
+            !plan_counts || command_buffer_count == 0u ||
+            command_buffer_count > 2u)
+        {
+            LOG_ERROR("[ROCmMoEKernel::resetDeviceRebalanceGraphTransactionForRequest] transaction buffers must be non-null and command-buffer count must be one or two");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(
+            launch,
+            "resetDeviceRebalanceGraphTransactionForRequest");
+        if (!stream)
+            return false;
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+            ROCmKernelType::MOE_ROUTE,
+            static_cast<hipStream_t>(stream));
+        if (!setMoEDevice(
+                device_ordinal_,
+                "resetDeviceRebalanceGraphTransactionForRequest"))
+        {
+            return false;
+        }
+
+        return hipMoE_reset_rebalance_graph_transaction_for_request(
+            controller_state,
+            command_headers,
+            wave_states,
+            plan_counts,
+            command_buffer_count,
+            &config,
+            device_ordinal_,
+            stream);
+    }
+
     bool ROCmMoEKernel::publishDeviceRebalanceTransferComplete(
         const MoEKernelLaunchContext &launch,
         DeviceMoERebalanceGraphControllerState *controller_state,
@@ -5476,51 +5838,13 @@ namespace llaminar2
         table.intermediate = intermediate;
         table.codebook_id = codebook_id;
         table.codebook_mask = codebook_mask;
-
-        if (!workspace_)
-        {
-            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] "
-                      "graph-owned workspace is required before descriptor publication");
-            return -1;
-        }
-        auto lease = workspace_->acquirePersistentSlot(
-            kROCmGroupedDownDescriptorLeaseDomain,
-            MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
-        if (!lease)
-        {
-            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] "
-                      "failed to lease a persistent descriptor slot");
-            return -1;
-        }
-        const std::size_t slot = lease->slot();
-        DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
-        hipError_t err = hipSuccess;
-        if (!bindGroupedDescriptorTableSlot(
-                MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES,
-                slot,
-                num_experts,
-                &device_descs,
-                "ROCm grouped down descriptor tables"))
-        {
-            err = hipErrorInvalidValue;
-        }
-
-        hipStream_t stream = static_cast<hipStream_t>(getStream());
-        if (err == hipSuccess)
-            err = hipMemcpyAsync(device_descs, table.host_descs.data(),
-                                 desc_bytes,
-                                 hipMemcpyHostToDevice, stream);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] H2D descriptor table upload failed: "
-                      << hipGetErrorString(err));
-            return -1;
-        }
-
-        table.device_descs = device_descs;
-        table.workspace_lease = std::move(lease);
-        table.workspace_slot = slot;
         table.valid = true;
+        if (!publishGroupedDownDescriptorTable(
+                table,
+                "upload grouped expert down descriptor table"))
+        {
+            return -1;
+        }
         grouped_down_desc_tables_.push_back(std::move(table));
         return static_cast<int>(grouped_down_desc_tables_.size() - 1);
     }
@@ -5625,63 +5949,13 @@ namespace llaminar2
         table.intermediate = intermediate;
         table.codebook_id = codebook_id;
         table.codebook_mask = codebook_mask;
-
-        if (!workspace_)
-        {
-            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] "
-                      "graph-owned workspace is required before descriptor publication");
-            return -1;
-        }
-        auto lease = workspace_->acquirePersistentSlot(
-            kROCmGroupedGateUpDescriptorLeaseDomain,
-            MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
-        if (!lease)
-        {
-            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] "
-                      "failed to lease a persistent descriptor slot");
-            return -1;
-        }
-        const std::size_t slot = lease->slot();
-        DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
-        hipError_t err = hipSuccess;
-        if (!bindGroupedDescriptorTableSlot(
-                MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES,
-                slot,
-                num_experts,
-                &device_gate_descs,
-                "ROCm grouped gate descriptor tables") ||
-            !bindGroupedDescriptorTableSlot(
-                MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES,
-                slot,
-                num_experts,
-                &device_up_descs,
-                "ROCm grouped up descriptor tables"))
-        {
-            err = hipErrorInvalidValue;
-        }
-
-        hipStream_t stream = static_cast<hipStream_t>(getStream());
-        if (err == hipSuccess)
-            err = hipMemcpyAsync(device_gate_descs, table.host_gate_descs.data(),
-                                 desc_bytes,
-                                 hipMemcpyHostToDevice, stream);
-        if (err == hipSuccess)
-            err = hipMemcpyAsync(device_up_descs, table.host_up_descs.data(),
-                                 desc_bytes,
-                                 hipMemcpyHostToDevice, stream);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] H2D descriptor upload failed: "
-                      << hipGetErrorString(err));
-            return -1;
-        }
-
-        table.device_gate_descs = device_gate_descs;
-        table.device_up_descs = device_up_descs;
-        table.workspace_lease = std::move(lease);
-        table.workspace_slot = slot;
         table.valid = true;
+        if (!publishGroupedGateUpDescriptorTable(
+                table,
+                "upload grouped expert gate/up descriptor tables"))
+        {
+            return -1;
+        }
         grouped_gateup_desc_tables_.push_back(std::move(table));
         return static_cast<int>(grouped_gateup_desc_tables_.size() - 1);
     }
@@ -5710,6 +5984,7 @@ namespace llaminar2
 
         auto &table = grouped_down_desc_tables_[static_cast<size_t>(descriptor_table_id)];
         if (!table.valid || !table.device_descs ||
+            !table.workspace_publication ||
             table.num_experts != num_experts ||
             table.d_model != d_model ||
             table.intermediate != intermediate)
@@ -5745,13 +6020,48 @@ namespace llaminar2
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         const size_t desc_bytes =
             static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
-        hipError_t err = hipMemcpyAsync(table.device_descs, down_descs,
-                                        desc_bytes,
-                                        hipMemcpyHostToDevice, stream);
-        if (err != hipSuccess)
+        if (!workspace_->rewritePersistentPublication(
+                kROCmGroupedDownDescriptorLeaseDomain,
+                groupedDescriptorPublicationKey(
+                    down_descs,
+                    nullptr,
+                    num_experts,
+                    d_model,
+                    intermediate),
+                table.workspace_publication,
+                table.workspace_slot,
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                [&]()
+                {
+                    hipError_t err = hipMemcpyAsync(
+                        table.device_descs,
+                        down_descs,
+                        desc_bytes,
+                        hipMemcpyHostToDevice,
+                        stream);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertDownDescriptorTable] "
+                                  "descriptor refresh failed: "
+                                  << hipGetErrorString(err));
+                        return false;
+                    }
+                    err = hipEventRecord(
+                        static_cast<hipEvent_t>(
+                            table.workspace_publication->ready_event),
+                        stream);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertDownDescriptorTable] "
+                                  "cannot publish refreshed descriptor readiness: "
+                                  << hipGetErrorString(err));
+                        std::terminate();
+                    }
+                    return true;
+                }))
         {
-            LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertDownDescriptorTable] descriptor refresh failed: "
-                      << hipGetErrorString(err));
+            LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertDownDescriptorTable] "
+                      "cannot rewrite refreshed descriptor publication");
             return false;
         }
 
@@ -5783,7 +6093,8 @@ namespace llaminar2
             return false;
 
         auto &table = grouped_gateup_desc_tables_[static_cast<size_t>(descriptor_table_id)];
-        if (!table.valid || !table.device_gate_descs || !table.device_up_descs ||
+        if (!table.valid || !table.device_gate_descs ||
+            !table.device_up_descs || !table.workspace_publication ||
             table.num_experts != num_experts ||
             table.d_model != d_model ||
             table.intermediate != intermediate)
@@ -5831,17 +6142,61 @@ namespace llaminar2
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         const size_t desc_bytes =
             static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
-        hipError_t err = hipMemcpyAsync(table.device_gate_descs, gate_descs,
-                                        desc_bytes,
-                                        hipMemcpyHostToDevice, stream);
-        if (err == hipSuccess)
-            err = hipMemcpyAsync(table.device_up_descs, up_descs,
-                                 desc_bytes,
-                                 hipMemcpyHostToDevice, stream);
-        if (err != hipSuccess)
+        if (!workspace_->rewritePersistentPublication(
+                kROCmGroupedGateUpDescriptorLeaseDomain,
+                groupedDescriptorPublicationKey(
+                    gate_descs,
+                    up_descs,
+                    num_experts,
+                    d_model,
+                    intermediate),
+                table.workspace_publication,
+                table.workspace_slot,
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                [&]()
+                {
+                    hipError_t err = hipMemcpyAsync(
+                        table.device_gate_descs,
+                        gate_descs,
+                        desc_bytes,
+                        hipMemcpyHostToDevice,
+                        stream);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertGateUpDescriptorTables] "
+                                  "gate descriptor refresh failed: "
+                                  << hipGetErrorString(err));
+                        return false;
+                    }
+                    err = hipMemcpyAsync(
+                        table.device_up_descs,
+                        up_descs,
+                        desc_bytes,
+                        hipMemcpyHostToDevice,
+                        stream);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertGateUpDescriptorTables] "
+                                  "up refresh failed after gate submission: "
+                                  << hipGetErrorString(err));
+                        std::terminate();
+                    }
+                    err = hipEventRecord(
+                        static_cast<hipEvent_t>(
+                            table.workspace_publication->ready_event),
+                        stream);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertGateUpDescriptorTables] "
+                                  "cannot publish refreshed descriptor readiness: "
+                                  << hipGetErrorString(err));
+                        std::terminate();
+                    }
+                    return true;
+                }))
         {
-            LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertGateUpDescriptorTables] descriptor refresh failed: "
-                      << hipGetErrorString(err));
+            LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertGateUpDescriptorTables] "
+                      "cannot rewrite refreshed descriptor publication");
             return false;
         }
 
@@ -6375,7 +6730,8 @@ namespace llaminar2
         ITensor *output,
         int d_model,
         int intermediate,
-        const uint8_t *expert_mask)
+        const uint8_t *expert_mask,
+        ITensor *canonical_route_contributions)
     {
         if (!input || !routing_indices || !routing_weights ||
             gateup_descriptor_table_id < 0 || down_descriptor_table_id < 0 ||
@@ -6497,7 +6853,8 @@ namespace llaminar2
             device_routing_weights,
             /*use_runtime_descriptors=*/false,
             /*allow_router_q8_reuse=*/false,
-            "routing");
+            "routing",
+            canonical_route_contributions);
     }
 
     bool ROCmMoEKernel::groupedExpertDecodeFromRuntime(
@@ -6509,7 +6866,8 @@ namespace llaminar2
         ITensor *output,
         int d_model,
         int intermediate,
-        MoEDecodeDescriptorSource descriptor_source)
+        MoEDecodeDescriptorSource descriptor_source,
+        ITensor *canonical_route_contributions)
     {
         if (!runtime_layer)
             return false;
@@ -6529,7 +6887,8 @@ namespace llaminar2
             /*allow_router_q8_reuse=*/true,
             descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable
                 ? "runtime_compact_table"
-                : "runtime_static_table");
+                : "runtime_static_table",
+            canonical_route_contributions);
     }
 
     bool ROCmMoEKernel::groupedExpertDecodeResolved(
@@ -6545,7 +6904,8 @@ namespace llaminar2
         const float *d_weights,
         bool use_runtime_descriptors,
         bool allow_router_q8_reuse,
-        const char *counter_source)
+        const char *counter_source,
+        ITensor *canonical_route_contributions)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_FFN, static_cast<hipStream_t>(getStream()));
 
@@ -6691,9 +7051,32 @@ namespace llaminar2
             TransferEngine::prepareDeviceOutput(output, device, stream);
             d_output = static_cast<float *>(output->gpu_data_ptr());
         }
+        float *d_canonical_route_contributions = nullptr;
+        if (canonical_route_contributions)
+        {
+            d_canonical_route_contributions = static_cast<float *>(
+                canonical_route_contributions->gpu_data_ptr());
+            if (!d_canonical_route_contributions &&
+                rejectDecodeStagingDuringCapture(
+                    "canonical route contribution tensor"))
+            {
+                return false;
+            }
+            if (!d_canonical_route_contributions)
+            {
+                TransferEngine::prepareDeviceOutput(
+                    canonical_route_contributions,
+                    device,
+                    stream);
+                d_canonical_route_contributions = static_cast<float *>(
+                    canonical_route_contributions->gpu_data_ptr());
+            }
+        }
 
         if (!d_hidden || !d_output || !d_expert_ids || !d_weights ||
-            !d_prefill_gate_ || !d_prefill_up_)
+            !d_prefill_gate_ || !d_prefill_up_ ||
+            (canonical_route_contributions &&
+             !d_canonical_route_contributions))
         {
             LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] missing runtime/output device pointer");
             return false;
@@ -6903,6 +7286,7 @@ namespace llaminar2
                       d_grouped_swiglu_int8_,
                       d_grouped_swiglu_scales_,
                       d_output,
+                      d_canonical_route_contributions,
                       top_k,
                       d_model,
                       intermediate,
@@ -6912,7 +7296,12 @@ namespace llaminar2
         if (!down_ok)
             return false;
 
-        markDeviceWritten(output, device, stream);
+        markDeviceWritten(
+            canonical_route_contributions
+                ? canonical_route_contributions
+                : output,
+            device,
+            stream);
         recordGroupedDecodeCounter(
             "rocm_moe_grouped_decode_fused_calls",
             counter_source,
@@ -7014,6 +7403,7 @@ namespace llaminar2
             d_grouped_swiglu_int8_,
             d_grouped_swiglu_scales_,
             d_output,
+            nullptr,
             num_active,
             d_model,
             intermediate,
@@ -7203,6 +7593,7 @@ namespace llaminar2
                                   d_grouped_swiglu_int8_,
                                   d_grouped_swiglu_scales_,
                                   d_output,
+                                  nullptr,
                                   top_k,
                                   d_model,
                                   intermediate,
@@ -7460,7 +7851,7 @@ namespace llaminar2
         int current_tokens, int max_tokens,
         int num_experts, int top_k,
         bool filter_to_local_runtime_experts,
-        MoEGroupedHistogramUpdate histogram_update)
+        bool retain_routes_for_deferred_commit)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -7499,7 +7890,7 @@ namespace llaminar2
             num_experts,
             top_k,
             filter_to_local_runtime_experts ? 1 : 0,
-            static_cast<int>(histogram_update),
+            retain_routes_for_deferred_commit ? 1 : 0,
             device_ordinal_,
             getStream());
     }
@@ -7508,7 +7899,7 @@ namespace llaminar2
         DeviceMoELayerRuntime *runtime_layer,
         int current_tokens, int max_tokens,
         int num_experts, int top_k,
-        MoEGroupedHistogramUpdate histogram_update)
+        bool retain_routes_for_deferred_commit)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -7534,15 +7925,66 @@ namespace llaminar2
             max_tokens * top_k,
             num_experts,
             top_k,
-            static_cast<int>(histogram_update),
+            retain_routes_for_deferred_commit ? 1 : 0,
             device_ordinal_,
             getStream());
+    }
+
+    bool ROCmMoEKernel::commitGroupedVerifierHistograms(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layer,
+        const int32_t *accepted_state_counts_device,
+        const int32_t *publication_ok_flags_device,
+        int request_count,
+        int rows_per_request,
+        int total_rows,
+        int num_experts,
+        int top_k)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch,
+            "commitGroupedVerifierHistograms");
+        if (!stream)
+            return false;
+        if (!runtime_layer ||
+            !accepted_state_counts_device ||
+            !publication_ok_flags_device ||
+            request_count <= 0 ||
+            rows_per_request <= 0 ||
+            total_rows != request_count * rows_per_request ||
+            num_experts <= 0 ||
+            top_k <= 0)
+        {
+            LOG_ERROR(
+                "[ROCmMoEKernel::commitGroupedVerifierHistograms] invalid "
+                "device publication contract");
+            return false;
+        }
+        if (!setMoEDevice(
+                device_ordinal_,
+                "commitGroupedVerifierHistograms"))
+        {
+            return false;
+        }
+
+        return hipMoE_commit_grouped_verifier_histograms(
+            static_cast<void *>(runtime_layer),
+            accepted_state_counts_device,
+            publication_ok_flags_device,
+            request_count,
+            rows_per_request,
+            total_rows,
+            num_experts,
+            top_k,
+            device_ordinal_,
+            stream);
     }
 
     bool ROCmMoEKernel::assignPrefillRoutesLeastLoadedResident(
         const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layer,
-        int current_tokens, int max_tokens, int num_experts, int top_k)
+        int current_tokens, int max_tokens, int num_experts, int top_k,
+        const int32_t *absolute_position_ids_device)
     {
         void *stream = explicitMoELaunchStream(
             launch,
@@ -7553,9 +7995,11 @@ namespace llaminar2
             ROCmKernelType::MOE_ROUTE,
             static_cast<hipStream_t>(stream));
 
-        if (!runtime_layer)
+        if (!runtime_layer || !absolute_position_ids_device)
         {
-            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesLeastLoadedResident] null runtime");
+            LOG_ERROR(
+                "[ROCmMoEKernel::assignPrefillRoutesLeastLoadedResident] "
+                "runtime and device position row must be non-null");
             return false;
         }
         if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
@@ -7575,6 +8019,7 @@ namespace llaminar2
             max_tokens * top_k,
             num_experts,
             top_k,
+            absolute_position_ids_device,
             device_ordinal_,
             stream);
     }
@@ -8548,7 +8993,8 @@ namespace llaminar2
         int gateup_desc_table_id,
         int down_desc_table_id,
         int seq_len, int d_model, int intermediate,
-        int num_experts, int top_k)
+        int num_experts, int top_k,
+        ITensor *canonical_route_contributions)
     {
         if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             num_experts <= 0 || top_k <= 0)
@@ -8612,15 +9058,30 @@ namespace llaminar2
                 device,
                 stream,
                 "output",
-                "executeGroupedPrefillPipeline"))
+                "executeGroupedPrefillPipeline") ||
+            (canonical_route_contributions &&
+             !ensureOutputOnDevice(
+                 canonical_route_contributions,
+                 device,
+                 stream,
+                 "canonical_route_contributions",
+                 "executeGroupedPrefillPipeline")))
         {
             return false;
         }
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        float *d_canonical_route_contributions =
+            canonical_route_contributions
+                ? static_cast<float *>(
+                      canonical_route_contributions->gpu_data_ptr())
+                : nullptr;
 
-        if (isGraphCaptureActive() && (!d_hidden || !d_output))
+        if (isGraphCaptureActive() &&
+            (!d_hidden || !d_output ||
+             (canonical_route_contributions &&
+              !d_canonical_route_contributions)))
         {
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] null device pointers during graph capture");
             return false;
@@ -8670,6 +9131,7 @@ namespace llaminar2
             d_prefill_swiglu_int8_,
             d_prefill_swiglu_scales_,
             d_output,
+            d_canonical_route_contributions,
             num_experts,
             d_model,
             intermediate,
@@ -8701,7 +9163,9 @@ namespace llaminar2
         }
 
         markDeviceWritten(
-            output,
+            canonical_route_contributions
+                ? canonical_route_contributions
+                : output,
             DeviceId::rocm(device_ordinal_),
             getStream());
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
@@ -8765,7 +9229,8 @@ namespace llaminar2
         int gateup_desc_table_id,
         int down_desc_table_id,
         int seq_len, int d_model, int intermediate,
-        int num_experts, int top_k)
+        int num_experts, int top_k,
+        ITensor *canonical_route_contributions)
     {
         if (!device_runtime_layer)
             return false;
@@ -8884,14 +9349,28 @@ namespace llaminar2
                 device,
                 stream,
                 "output",
-                "executeGroupedPrefillPipelineFromRuntime"))
+                "executeGroupedPrefillPipelineFromRuntime") ||
+            (canonical_route_contributions &&
+             !ensureOutputOnDevice(
+                 canonical_route_contributions,
+                 device,
+                 stream,
+                 "canonical_route_contributions",
+                 "executeGroupedPrefillPipelineFromRuntime")))
         {
             return false;
         }
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
-        if (!d_hidden || !d_output)
+        float *d_canonical_route_contributions =
+            canonical_route_contributions
+                ? static_cast<float *>(
+                      canonical_route_contributions->gpu_data_ptr())
+                : nullptr;
+        if (!d_hidden || !d_output ||
+            (canonical_route_contributions &&
+             !d_canonical_route_contributions))
         {
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] null device pointers");
             return false;
@@ -8973,6 +9452,7 @@ namespace llaminar2
             d_prefill_swiglu_int8_,
             d_prefill_swiglu_scales_,
             d_output,
+            d_canonical_route_contributions,
             num_experts,
             d_model,
             intermediate,
@@ -9003,7 +9483,9 @@ namespace llaminar2
         }
 
         markDeviceWritten(
-            output,
+            canonical_route_contributions
+                ? canonical_route_contributions
+                : output,
             DeviceId::rocm(device_ordinal_),
             getStream());
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
@@ -9057,6 +9539,77 @@ namespace llaminar2
                     {"row_tile", common_row_tile},
                     {"grouping", "runtime"}});
         }
+        return true;
+    }
+
+    bool ROCmMoEKernel::reduceCanonicalRouteContributions(
+        ITensor *canonical_route_contributions,
+        ITensor *output,
+        int seq_len,
+        int top_k,
+        int d_model)
+    {
+        if (!canonical_route_contributions || !output ||
+            seq_len <= 0 || top_k <= 0 || d_model <= 0)
+        {
+            return false;
+        }
+        if (!setMoEDevice(
+                device_ordinal_,
+                "reduceCanonicalRouteContributions"))
+        {
+            return false;
+        }
+
+        void *stream = getStream();
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel::reduceCanonicalRouteContributions] "
+                      "an explicit stream is required");
+            return false;
+        }
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        if (!ensureTensorOnDevice(
+                canonical_route_contributions,
+                device,
+                stream,
+                "canonical_route_contributions",
+                "reduceCanonicalRouteContributions") ||
+            !ensureOutputOnDevice(
+                output,
+                device,
+                stream,
+                "output",
+                "reduceCanonicalRouteContributions"))
+        {
+            return false;
+        }
+
+        const float *d_contributions = static_cast<const float *>(
+            canonical_route_contributions->gpu_data_ptr());
+        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        if (!rocmMoE_reduce_canonical_route_contributions(
+                d_contributions,
+                d_output,
+                seq_len,
+                top_k,
+                d_model,
+                device_ordinal_,
+                stream))
+        {
+            return false;
+        }
+
+        markDeviceWritten(output, device, stream);
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "rocm_moe_canonical_route_reduce_calls",
+            1.0,
+            "moe",
+            device.to_string(),
+            {{"seq_len", std::to_string(seq_len)},
+             {"top_k", std::to_string(top_k)},
+             {"d_model", std::to_string(d_model)}});
         return true;
     }
 

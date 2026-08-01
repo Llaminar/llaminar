@@ -61,7 +61,7 @@ namespace llaminar2
         // Create kernel via KernelFactory with automatic type dispatch
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
-        LOG_DEBUG("[RMSNormStage] Execute: seq_len=" << seq_len
+        LOG_TRACE("[RMSNormStage] Execute: seq_len=" << seq_len
                                                      << " hidden_dim=" << hidden_dim
                                                      << " eps=" << params_.eps
                                                      << " tensor_type=" << input_base->dtype_name()

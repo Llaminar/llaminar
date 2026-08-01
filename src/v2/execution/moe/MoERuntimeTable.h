@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "DeviceMoERuntimeABI.h"
 #include "LeastLoadedExpertAssignment.h"
 
 #include "../../backends/DeviceId.h"
@@ -145,6 +146,18 @@ namespace llaminar2
         int32_t *route_expert_ids = nullptr;
         float *route_weights = nullptr;
         int32_t *route_participant_ids = nullptr;
+        /**
+         * Per-layer immutable-address ledger for deferred verifier publication.
+         *
+         * Ordinary route scratch is intentionally shared by all serially
+         * executed MoE layers on one device. The main MTP verifier, however,
+         * publishes accepted routing history only after every layer and draft
+         * sidecar has run. These two arrays retain the final expert and
+         * participant assignment for this specific layer until that later
+         * device-owned publication transaction consumes it.
+         */
+        int32_t *deferred_verifier_route_expert_ids = nullptr;
+        int32_t *deferred_verifier_route_participant_ids = nullptr;
         int32_t *expert_counts = nullptr;
         int32_t *expert_offsets = nullptr;
         // Runtime grouped prefill stores original route-slot ids here
@@ -169,13 +182,50 @@ namespace llaminar2
         uint64_t reserved_u64[4] = {};
         uint32_t prefill_token_capacity = 0;
         uint32_t prefill_route_capacity = 0;
+        uint32_t deferred_verifier_route_capacity = 0;
         uint32_t participant_id = 0;
         uint32_t participant_count = 1;
+        /**
+         * @brief Sticky proof that current-batch LLEP applied a payload move.
+         *
+         * This request/runtime-lifetime marker is deliberately separate from
+         * DeviceMoEPlacementBank::transient_placement_observed. The bank marker
+         * is portable prefix state and may therefore be restored from RAM or
+         * disk before the current request plans any work. Only a transfer plan
+         * explicitly tagged as current-batch LLEP may set this field, which
+         * lets PerfStats prove that the production planner/materializer/apply
+         * path actually ran instead of mistaking prefix rehydration for fresh
+         * movement.
+         */
+        uint32_t current_batch_llep_movement_observed = 0;
     };
 
     static_assert(std::is_trivially_copyable_v<DeviceMoEExpertDescriptor>);
     static_assert(std::is_trivially_copyable_v<DeviceMoEPlacementBank>);
     static_assert(std::is_trivially_copyable_v<DeviceMoELayerRuntime>);
+    static_assert(sizeof(DeviceMoELayerRuntime) ==
+                  moe_runtime_abi::kLayerRuntimeBytes);
+    static_assert(offsetof(DeviceMoELayerRuntime, route_participant_ids) ==
+                  moe_runtime_abi::kRouteParticipantIdsOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntime,
+                 deferred_verifier_route_expert_ids) ==
+        moe_runtime_abi::kDeferredVerifierExpertIdsOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntime,
+                 deferred_verifier_route_participant_ids) ==
+        moe_runtime_abi::kDeferredVerifierParticipantIdsOffset);
+    static_assert(offsetof(DeviceMoELayerRuntime, expert_counts) ==
+                  moe_runtime_abi::kExpertCountsOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntime, deferred_verifier_route_capacity) ==
+        moe_runtime_abi::kDeferredVerifierRouteCapacityOffset);
+    static_assert(offsetof(DeviceMoELayerRuntime, participant_count) ==
+                  moe_runtime_abi::kParticipantCountOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntime,
+                 current_batch_llep_movement_observed) ==
+        moe_runtime_abi::kCurrentBatchLLEPMovementObservedOffset);
 
     /**
      * @brief Count active experts backed by graph-owned transient transfer slots.
@@ -427,6 +477,14 @@ namespace llaminar2
             bool mirror_to_device = false;
             int prefill_token_capacity = 0;
             /**
+             * @brief Rows retained independently for deferred MTP publication.
+             *
+             * A positive value allocates one compact expert/participant route
+             * ledger per layer. It is a model-setup allocation with immutable
+             * addresses, never a hot-path workspace or host mirror.
+             */
+            int deferred_verifier_token_capacity = 0;
+            /**
              * @brief Optional immutable scratch owned by a serial graph domain.
              *
              * When present, every layer in this table binds the same stable
@@ -533,6 +591,8 @@ namespace llaminar2
         {
             return serial_route_scratch_arena_ != nullptr;
         }
+        bool hasDeferredVerifierRouteLedgerCapacity(int layer_idx,
+                                                    int token_count) const;
 
     private:
         DeviceId device_id_;
@@ -541,6 +601,7 @@ namespace llaminar2
         int top_k_ = 0;
         bool mirror_to_device_ = false;
         int prefill_token_capacity_ = 0;
+        int deferred_verifier_token_capacity_ = 0;
         std::vector<DeviceMoELayerRuntime> host_layers_;
         std::vector<DeviceMoELayerRuntime> initial_host_layers_;
         std::vector<DeviceMoELayerRuntime> empty_host_layers_;
@@ -563,6 +624,9 @@ namespace llaminar2
             serial_route_scratch_arena_;
         std::vector<DeviceMoEPrefillRouteScratchBindings>
             prefill_route_scratch_;
+        int32_t *deferred_verifier_route_expert_ids_ = nullptr;
+        int32_t *deferred_verifier_route_participant_ids_ = nullptr;
+        uint32_t deferred_verifier_route_capacity_ = 0;
 
         void validateLayerIndex(int layer_idx) const;
         void validateUpdate(int layer_idx, const MoEPlacementUpdate &update) const;
@@ -578,6 +642,9 @@ namespace llaminar2
         void releaseDeviceMirror() noexcept;
         void allocatePrefillRouteScratchForLayer(int layer_idx, int token_capacity);
         void releasePrefillRouteScratch() noexcept;
+        void allocateDeferredVerifierRouteLedger();
+        void bindDeferredVerifierRouteLedgerToLayers();
+        void releaseDeferredVerifierRouteLedger() noexcept;
         void uploadLayerState(int layer_idx, void *stream);
         void uploadResetTemplatesForLayer(int layer_idx, void *stream);
         void uploadAllLayerStates();

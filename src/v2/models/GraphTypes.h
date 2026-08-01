@@ -173,6 +173,34 @@ namespace llaminar2
         /// Multi-token prediction feature gates and verification mode.
         MTPRuntimeConfig mtp;
 
+        /**
+         * @brief Whether GPU startup must publish the complete forward graph family.
+         *
+         * A GPU workspace address becomes part of the executable ABI once a
+         * graph captures it. Any configuration that can select more than one
+         * forward topology must therefore materialize every topology before the
+         * first request is allowed to capture a graph. MTP contributes grouped
+         * verifier and sidecar graphs. The two phase-split dense policies
+         * contribute a prefill topology backed by sharded weights and a compact
+         * decode topology backed by mirrored or fully replicated weights.
+         *
+         * Keeping this predicate on the declarative graph configuration prevents
+         * factory call sites from accidentally treating MTP as the only source of
+         * shape-dependent GPU graph families. In particular, serial-reference
+         * runners used by MTP parity tests disable MTP while retaining replicated
+         * dense decode, and still require the same eager family publication.
+         *
+         * @return true when graph-family workspace planning must run eagerly.
+         */
+        [[nodiscard]] bool requiresEagerGPUWorkspaceFamilyManifest() const noexcept
+        {
+            const bool phase_split_dense_graphs =
+                dense_tp_enabled &&
+                (dense_tp_decode_replicated ||
+                 dense_tp_decode_mirrored_embedding);
+            return mtp.enabled || phase_split_dense_graphs;
+        }
+
         /// Runtime-only decode verifier mode: compute LM-head logits for every
         /// input row instead of the selected final row.
         bool compute_all_position_logits = false;
@@ -955,6 +983,7 @@ namespace llaminar2
         TensorBase *moe_expert_indices = nullptr;
         TensorBase *moe_expert_weights = nullptr;
         TensorBase *moe_combined_output = nullptr;
+        TensorBase *moe_canonical_route_contributions = nullptr;
         TensorBase *moe_shared_expert_output = nullptr;
         TensorBase *moe_gate_scratch = nullptr;
         TensorBase *moe_up_scratch = nullptr;

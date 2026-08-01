@@ -408,6 +408,10 @@ namespace llaminar2
             // =========================================================================
 
             std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope() override;
+            std::unique_ptr<OutputPartitionEquivalenceScope>
+            beginOutputPartitionEquivalenceScope(
+                int actual_output_columns,
+                int serial_partition_columns) override;
 
             bool canReleaseSourceWeightTensor() const override
             {

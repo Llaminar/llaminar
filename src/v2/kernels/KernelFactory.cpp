@@ -2202,7 +2202,7 @@ namespace llaminar
                 auto reg_it = device_kernel_registry_.find(registry_key);
                 if (reg_it != device_kernel_registry_.end())
                 {
-                    LOG_DEBUG("[KernelFactory][RMSNORM] registry hit dev=" << static_cast<int>(target_device.type)
+                    LOG_TRACE("[KernelFactory][RMSNORM] registry hit dev=" << static_cast<int>(target_device.type)
                                                                            << ":" << target_device.ordinal
                                                                            << " tensor_type=" << static_cast<int>(tensor->native_type())
                                                                            << " kernel=" << reg_it->second.get());
@@ -2214,7 +2214,7 @@ namespace llaminar
                 {
                     auto *raw_ptr = it->second.get();
                     device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
-                    LOG_DEBUG("[KernelFactory][RMSNORM] cache hit dev=" << static_cast<int>(target_device.type)
+                    LOG_TRACE("[KernelFactory][RMSNORM] cache hit dev=" << static_cast<int>(target_device.type)
                                                                         << ":" << target_device.ordinal
                                                                         << " tensor_type=" << static_cast<int>(tensor->native_type())
                                                                         << " kernel=" << static_cast<const void *>(raw_ptr));
@@ -2410,7 +2410,7 @@ namespace llaminar
                 auto reg_it = device_kernel_registry_.find(registry_key);
                 if (reg_it != device_kernel_registry_.end())
                 {
-                    LOG_DEBUG("[KernelFactory][Registry] hit kind=ATTENTION dev=" << static_cast<int>(target_device.type)
+                    LOG_TRACE("[KernelFactory][Registry] hit kind=ATTENTION dev=" << static_cast<int>(target_device.type)
                                                                                   << ":" << target_device.ordinal
                                                                                   << " variant=" << static_cast<int>(tensor->native_type())
                                                                                   << " ptr=" << reg_it->second.get());
@@ -2555,7 +2555,7 @@ namespace llaminar
                     throw std::runtime_error("KernelFactory::createMoEKernel: invalid target device " + target_device.to_string());
                 }
 
-                LOG_DEBUG("[KernelFactory][MOE] create dev=" << static_cast<int>(target_device.type)
+                LOG_TRACE("[KernelFactory][MOE] create dev=" << static_cast<int>(target_device.type)
                                                              << ":" << target_device.ordinal
                                                              << " kernel=" << static_cast<const void *>(kernel.get()));
                 return kernel;

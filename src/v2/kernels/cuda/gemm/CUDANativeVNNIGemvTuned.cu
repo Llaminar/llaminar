@@ -43,10 +43,18 @@
 #include <mutex>
 
 static thread_local int g_cuda_native_vnni_decode_equivalent_m1_config = 0;
+static thread_local int g_cuda_native_vnni_serial_partition_n = 0;
 
 static bool decodeEquivalentM1ConfigActive()
 {
     return g_cuda_native_vnni_decode_equivalent_m1_config != 0;
+}
+
+static int serialEquivalentPolicyN(int actual_n)
+{
+    return g_cuda_native_vnni_serial_partition_n > 0
+               ? g_cuda_native_vnni_serial_partition_n
+               : actual_n;
 }
 
 // =====================================================================
@@ -214,10 +222,11 @@ namespace
         NativeGemvShape &shape,
         GeneratedDispatchTuning &tuning)
     {
+        const int policy_n = serialEquivalentPolicyN(n);
         const CUDAGeneratedDispatchCacheKey key = {
             graph_captured ? 1ULL : 0ULL,
             static_cast<uint64_t>(static_cast<uint32_t>(m)),
-            static_cast<uint64_t>(static_cast<uint32_t>(n)),
+            static_cast<uint64_t>(static_cast<uint32_t>(policy_n)),
             static_cast<uint64_t>(static_cast<uint32_t>(k)),
         };
         using Cache = llaminar2::native_vnni::FixedDispatchCache<
@@ -238,7 +247,7 @@ namespace
 
         CUDAGeneratedDispatchSelection cached{};
         selected = selectGeneratedDispatch<CB>(
-            graph_captured, m, n, k, cached.shape, cached.tuning);
+            graph_captured, m, policy_n, k, cached.shape, cached.tuning);
         cache.insert(key, selected, cached);
         shape = cached.shape;
         tuning = cached.tuning;
@@ -257,10 +266,11 @@ namespace
         int k,
         GeneratedGroupedTuning &tuning)
     {
+        const int policy_n = serialEquivalentPolicyN(n);
         const CUDAGeneratedDispatchCacheKey key = {
             graph_captured ? 1ULL : 0ULL,
             static_cast<uint64_t>(static_cast<uint32_t>(m)),
-            static_cast<uint64_t>(static_cast<uint32_t>(n)),
+            static_cast<uint64_t>(static_cast<uint32_t>(policy_n)),
             static_cast<uint64_t>(static_cast<uint32_t>(k)),
         };
         using Cache = llaminar2::native_vnni::FixedDispatchCache<
@@ -279,7 +289,7 @@ namespace
         }
 
         selected = selectGeneratedGroupedTuning<CB>(
-            graph_captured, m, n, k, cached);
+            graph_captured, m, policy_n, k, cached);
         cache.insert(key, selected, cached);
         tuning = cached;
         return selected;
@@ -3912,4 +3922,14 @@ extern "C" void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int enabled)
 extern "C" int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config()
 {
     return g_cuda_native_vnni_decode_equivalent_m1_config;
+}
+
+extern "C" void cudaNativeVNNIGemvTuned_setSerialPartitionN(int n)
+{
+    g_cuda_native_vnni_serial_partition_n = n;
+}
+
+extern "C" int cudaNativeVNNIGemvTuned_getSerialPartitionN()
+{
+    return g_cuda_native_vnni_serial_partition_n;
 }

@@ -682,6 +682,91 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsGroupedOutcomePublicatio
     EXPECT_EQ(plan.step_plans.steps.front().accepted_state_slot_index, 2);
 }
 
+TEST(Test__MTPSpecStateContract,
+     TransactionDriverPreservesEveryGroupedCommitBoundary)
+{
+    using namespace sampling_math;
+
+    /*
+     * Exercise the complete runtime-M inventory rather than one model depth.
+     * Every interior boundary is a successful serial-visible transaction with
+     * a pending condition token, not a rejection and not a full-batch bonus.
+     */
+    for (int draft_count = 2;
+         draft_count <= kSpeculativeBatchMaxRows;
+         ++draft_count)
+    {
+        MTPDecodeCatchupGreedyRequest request;
+        request.draft_tokens.resize(static_cast<size_t>(draft_count));
+        for (int row = 0; row < draft_count; ++row)
+            request.draft_tokens[static_cast<size_t>(row)] = 1000 + row;
+
+        for (int commit_count = 1;
+             commit_count < draft_count;
+             ++commit_count)
+        {
+            SCOPED_TRACE(::testing::Message()
+                         << "draft_count=" << draft_count
+                         << " commit_count=" << commit_count);
+
+            MTPDeviceRejectionBatchOutcome outcome;
+            outcome.ok = true;
+            outcome.output_token_count = commit_count;
+            for (int row = 0; row < commit_count; ++row)
+            {
+                outcome.output_tokens[static_cast<size_t>(row)] =
+                    request.draft_tokens[static_cast<size_t>(row)];
+            }
+            outcome.accepted_speculative_prefix = commit_count - 1;
+            outcome.target_verifier_state_commit_count = commit_count;
+            outcome.ready_token = 2000 + commit_count;
+            outcome.rejected_verified_token = -1;
+            outcome.stopped_on_output = false;
+            outcome.all_speculative_accepted = false;
+            outcome.consumed_verifier_rows = commit_count - 1;
+            outcome.sampled_terminal = false;
+            outcome.commit_boundary_clipped = true;
+
+            MTPSpecTransactionBatchPlan plan =
+                buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+                    shapeFor(/*requests=*/1, draft_count),
+                    /*request_ids=*/{10},
+                    /*vocab_size=*/10000,
+                    {request},
+                    {outcome},
+                    /*base_cached_tokens=*/{100});
+
+            ASSERT_TRUE(plan.ok) << plan.error;
+            EXPECT_THAT(plan.metadata.valid_sampled_counts,
+                        ElementsAre(commit_count));
+            EXPECT_THAT(plan.metadata.accepted_draft_prefixes,
+                        ElementsAre(commit_count));
+            EXPECT_THAT(plan.metadata.committed_output_counts,
+                        ElementsAre(commit_count));
+            EXPECT_THAT(plan.metadata.target_verifier_state_commit_counts,
+                        ElementsAre(commit_count));
+            EXPECT_THAT(plan.metadata.next_condition_tokens,
+                        ElementsAre(outcome.ready_token));
+            EXPECT_THAT(plan.metadata.all_drafts_accepted_flags,
+                        ElementsAre(0));
+            EXPECT_THAT(plan.metadata.bonus_ready_token_rows,
+                        ElementsAre(kMTPSpecDecodeInvalidToken));
+            EXPECT_THAT(plan.publication_plan.target_cached_tokens,
+                        ElementsAre(100 + commit_count));
+
+            ASSERT_THAT(plan.step_plans.steps, SizeIs(1));
+            const MTPSpecStepPlan &step = plan.step_plans.steps.front();
+            EXPECT_EQ(step.accepted_count, commit_count);
+            EXPECT_EQ(step.next_condition_token, outcome.ready_token);
+            EXPECT_FALSE(step.all_drafts_accepted);
+            EXPECT_FALSE(step.stopped);
+            EXPECT_FALSE(step.requiresCorrectionReplay());
+            EXPECT_EQ(step.bonus_ready_state_slot_index,
+                      kMTPSpecDecodeInvalidToken);
+        }
+    }
+}
+
 TEST(Test__MTPSpecStateContract, TransactionDriverRejectsInvalidDeviceRejectionOutcome)
 {
     MTPDecodeCatchupGreedyRequest request;

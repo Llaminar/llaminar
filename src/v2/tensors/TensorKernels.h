@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace llaminar2
@@ -411,6 +412,53 @@ namespace llaminar2
         {
             virtual ~VerifierKernelModeScope() = default;
         };
+
+        /**
+         * @brief RAII token for replicated-output arithmetic equivalence.
+         *
+         * A replicated projection may launch a full output matrix even though
+         * the serial reference graph computes that matrix as column shards.
+         * Generated GEMM/GEMV policy is allowed to depend on output width, so
+         * those two ownership layouts can otherwise select different K-split
+         * reduction trees and produce different FP32 bytes.  Keeping this token
+         * alive tells a backend to launch the actual output width while choosing
+         * arithmetic geometry from the declared serial partition width.
+         */
+        struct OutputPartitionEquivalenceScope
+        {
+            virtual ~OutputPartitionEquivalenceScope() = default;
+        };
+
+        /**
+         * @brief Require a full-output projection to match serial shard arithmetic.
+         *
+         * @param actual_output_columns Number of columns physically produced by
+         *        this invocation.
+         * @param serial_partition_columns Number of columns produced by one
+         *        partition of the serial reference graph.
+         * @return A scope token that must outlive every affected kernel launch.
+         *
+         * The default implementation accepts only the identity case. Backends
+         * must opt in explicitly when the two widths differ; silently ignoring
+         * the contract would reintroduce topology-dependent logits.
+         */
+        virtual std::unique_ptr<OutputPartitionEquivalenceScope>
+        beginOutputPartitionEquivalenceScope(
+            int actual_output_columns,
+            int serial_partition_columns)
+        {
+            if (actual_output_columns <= 0 || serial_partition_columns <= 0)
+            {
+                throw std::invalid_argument(
+                    "Output-partition equivalence requires positive column counts");
+            }
+            if (actual_output_columns != serial_partition_columns)
+            {
+                throw std::logic_error(
+                    "This GEMM backend does not implement replicated-output serial-partition equivalence");
+            }
+            return nullptr;
+        }
 
         /**
          * @brief Enter a verifier dispatch mode that preserves rowwise decode equivalence.

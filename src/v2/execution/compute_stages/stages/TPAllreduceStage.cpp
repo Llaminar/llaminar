@@ -362,7 +362,7 @@ namespace llaminar2
         // Single-device context - no-op
         if (params_.tp_ctx->degree() == 1)
         {
-            LOG_DEBUG("TPAllreduceStage: single device, no-op");
+            LOG_TRACE("TPAllreduceStage: single device, no-op");
             return true;
         }
 
@@ -373,7 +373,7 @@ namespace llaminar2
             return true;
         }
 
-        LOG_DEBUG("TPAllreduceStage: tensor diagnostics"
+        LOG_TRACE("TPAllreduceStage: tensor diagnostics"
                       << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
                       << " tensor=" << static_cast<void *>(params_.tensor)
                       << " tensor_name=" << (params_.tensor->debugName().empty() ? "(unnamed)" : params_.tensor->debugName())
@@ -397,7 +397,7 @@ namespace llaminar2
 
         // Log scope-aware message
         const char *scope_str = params_.tp_ctx->isLocal() ? "LOCAL" : (params_.tp_ctx->isNodeLocal() ? "NODE_LOCAL" : "GLOBAL");
-        LOG_DEBUG("TPAllreduceStage (" << scope_str << "): all-reduce across " << params_.tp_ctx->degree()
+        LOG_TRACE("TPAllreduceStage (" << scope_str << "): all-reduce across " << params_.tp_ctx->degree()
                                        << " devices using " << collectiveBackendTypeToString(params_.tp_ctx->backend())
                                        << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
                                        << " count=" << effective_count

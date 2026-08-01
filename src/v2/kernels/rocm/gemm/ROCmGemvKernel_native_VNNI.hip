@@ -34,6 +34,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
@@ -45,6 +46,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include "../../../utils/PrefillGraphBucketDefaults.h"
+#include "execution/moe/DeviceMoERuntimeABI.h"
 #include "kernels/common/NativeVNNIDispatchCache.h"
 #include "kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc"
 #include "ROCmNativeVNNIDecodeEquivalentMath.h"
@@ -66,6 +68,7 @@ static std::atomic<int> g_native_vnni_target_waves_override{-1};
  * ROCmQuantisedGemmKernel whenever a grouped projection is emitted.
  */
 static thread_local int g_native_vnni_decode_equivalent_m1_config = 0;
+static thread_local int g_native_vnni_serial_partition_n = 0;
 
 struct NativeVNNIDecodeGeneratedRuntimeConfig
 {
@@ -98,6 +101,10 @@ static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRu
          m > 1)
             ? 1
             : m;
+    const int lookup_n =
+        g_native_vnni_serial_partition_n > 0
+            ? g_native_vnni_serial_partition_n
+            : n;
 
     /*
      * Generated policy is immutable for the process lifetime. Preserve each
@@ -115,7 +122,7 @@ static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRu
     const CacheKey cache_key = {
         static_cast<uint64_t>(codebook_id),
         static_cast<uint64_t>(static_cast<uint32_t>(lookup_m)),
-        static_cast<uint64_t>(static_cast<uint32_t>(n)),
+        static_cast<uint64_t>(static_cast<uint32_t>(lookup_n)),
         static_cast<uint64_t>(static_cast<uint32_t>(k)),
     };
     bool cached_selector_found = false;
@@ -125,7 +132,7 @@ static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRu
 
     llaminar2::rocm::generated::ROCmNativeVNNIDecodeDispatchConfig generated_cfg{};
     if (!llaminar2::rocm::generated::selectROCmNativeVNNIDecodeGenerated(
-            codebook_id, lookup_m, n, k, generated_cfg))
+            codebook_id, lookup_m, lookup_n, k, generated_cfg))
     {
         cache.insert(cache_key, false, cached);
         return cached;
@@ -200,6 +207,16 @@ extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_wav
 extern "C" void rocmGemv_native_vnni_set_decode_equivalent_m1_config(int enabled)
 {
     g_native_vnni_decode_equivalent_m1_config = enabled ? 1 : 0;
+}
+
+extern "C" void rocmGemv_native_vnni_set_serial_partition_n(int n)
+{
+    g_native_vnni_serial_partition_n = n;
+}
+
+extern "C" int rocmGemv_native_vnni_get_serial_partition_n()
+{
+    return g_native_vnni_serial_partition_n;
 }
 
 extern "C" void rocmGemv_native_vnni_reset_tuning_overrides()
@@ -1702,6 +1719,9 @@ struct DeviceMoELayerRuntimeView
     uint64_t router_hot_cache_replicated_selected_expert_slots;
     int32_t *route_expert_ids;
     float *route_weights;
+    int32_t *route_participant_ids;
+    int32_t *deferred_verifier_route_expert_ids;
+    int32_t *deferred_verifier_route_participant_ids;
     int32_t *expert_counts;
     int32_t *expert_offsets;
     int32_t *grouped_token_ids;
@@ -1714,9 +1734,20 @@ struct DeviceMoELayerRuntimeView
     uint64_t reserved_u64[4];
     uint32_t prefill_token_capacity;
     uint32_t prefill_route_capacity;
+    uint32_t deferred_verifier_route_capacity;
     uint32_t participant_id;
     uint32_t participant_count;
 };
+
+static_assert(
+    sizeof(DeviceMoELayerRuntimeView) ==
+    llaminar2::moe_runtime_abi::kLayerRuntimeBytes);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView, route_participant_ids) ==
+    llaminar2::moe_runtime_abi::kRouteParticipantIdsOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView, participant_count) ==
+    llaminar2::moe_runtime_abi::kParticipantCountOffset);
 
 template <NativeVNNIFormat FMT>
 __device__ __forceinline__ bool native_vnni_desc_shape_ok(
@@ -2235,10 +2266,80 @@ __global__ void moe_grouped_native_vnni_down_kernel_t(
             }
         }
 
-        total += route_weights[slot] * expert_acc;
+        const float weighted_route = rocm_native_vnni_weight_route_rn(
+            route_weights[slot], expert_acc);
+        total = rocm_native_vnni_accumulate_rn(total, weighted_route);
     }
 
     output[n] = total;
+}
+
+template <NativeVNNIFormat FMT>
+__device__ __forceinline__ float moe_native_vnni_dot_desc_range(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    int n,
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    int N,
+    int K,
+    int b_start,
+    int b_end);
+
+/**
+ * @brief Publish one weighted ROCm decode row per original router slot.
+ *
+ * Each `(route, column)` lane computes a complete increasing-K NativeVNNI dot
+ * and writes a unique destination. Remote/invalid routes write zero. No route
+ * accumulation or floating-point atomic occurs before the LocalTP collective.
+ */
+template <NativeVNNIFormat FMT>
+__global__ void moe_grouped_native_vnni_down_route_kernel_t(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ descs,
+    const int* __restrict__ expert_ids,
+    const float* __restrict__ route_weights,
+    float* __restrict__ route_output,
+    int num_active,
+    int N,
+    int K)
+{
+    static_assert(NVNNIGroupedMoESupported<FMT>::value,
+                  "Canonical grouped MoE down requires a supported format");
+
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int route = blockIdx.y;
+    if (route >= num_active || n >= N)
+        return;
+
+    const size_t output_index =
+        static_cast<size_t>(route) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+    const int expert_id = expert_ids[route];
+    if (expert_id < 0)
+    {
+        route_output[output_index] = 0.0f;
+        return;
+    }
+
+    const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+    if (!native_vnni_desc_shape_ok<FMT>(desc, N, K))
+    {
+        route_output[output_index] = 0.0f;
+        return;
+    }
+
+    const int blocks_per_row = K / 32;
+    const int8_t* a_slot =
+        A_int8 + static_cast<size_t>(route) * static_cast<size_t>(K);
+    const float* scale_slot =
+        scales_A_blockwise +
+        static_cast<size_t>(route) * static_cast<size_t>(blocks_per_row);
+    const float expert_acc = moe_native_vnni_dot_desc_range<FMT>(
+        desc, n, a_slot, scale_slot, N, K, 0, blocks_per_row);
+    route_output[output_index] = rocm_native_vnni_weight_route_rn(
+        route_weights[route], expert_acc);
 }
 
 template <NativeVNNIFormat FMT>
@@ -2816,7 +2917,9 @@ __global__ void moe_grouped_native_vnni_down_runtime_kernel_t(
         const float* scale_slot = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
         const float expert_acc = moe_native_vnni_dot_desc<FMT>(
             desc, n, a_slot, scale_slot, N, K);
-        total += route_weights[slot] * expert_acc;
+        const float weighted_route = rocm_native_vnni_weight_route_rn(
+            route_weights[slot], expert_acc);
+        total = rocm_native_vnni_accumulate_rn(total, weighted_route);
     }
 
     output[n] = total;
@@ -4448,6 +4551,7 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
     int8_t* d_swiglu_int8,
     float* d_swiglu_scales,
     float* d_output,
+    float* d_canonical_route_contributions,
     int num_active,
     int N,
     int K,
@@ -4458,7 +4562,8 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
     if (!d_gate_ptrs || !d_up_ptrs || !d_desc_table || !d_expert_ids || !d_weights ||
-        !d_swiglu_int8 || !d_swiglu_scales || !d_output ||
+        !d_swiglu_int8 || !d_swiglu_scales ||
+        (!d_output && !d_canonical_route_contributions) ||
         num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
     {
         fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] invalid arguments\n");
@@ -4481,15 +4586,31 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
     }
 
     constexpr int TN = 64;
-    dim3 grid((N + TN - 1) / TN);
+    const bool canonical_publication =
+        d_canonical_route_contributions != nullptr;
+    dim3 grid(
+        (N + TN - 1) / TN,
+        canonical_publication ? num_active : 1);
     dim3 block(TN);
 
-    #define LAUNCH_GROUPED_DOWN_TABLE(FMT_TAG)                                                \
-        hipLaunchKernelGGL(                                                                    \
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<FMT_TAG, true>),            \
-            grid, block, 0, static_cast<hipStream_t>(stream),                                  \
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,            \
-            d_output, num_active, N, K)
+    #define LAUNCH_GROUPED_DOWN_TABLE(FMT_TAG)                                    \
+        do {                                                                       \
+            if (canonical_publication) {                                           \
+                hipLaunchKernelGGL(                                                \
+                    HIP_KERNEL_NAME(                                               \
+                        moe_grouped_native_vnni_down_route_kernel_t<FMT_TAG>),      \
+                    grid, block, 0, static_cast<hipStream_t>(stream),              \
+                    d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids,    \
+                    d_weights, d_canonical_route_contributions, num_active, N, K); \
+            } else {                                                               \
+                hipLaunchKernelGGL(                                                \
+                    HIP_KERNEL_NAME(                                               \
+                        moe_grouped_native_vnni_down_kernel_t<FMT_TAG, true>),      \
+                    grid, block, 0, static_cast<hipStream_t>(stream),              \
+                    d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids,    \
+                    d_weights, d_output, num_active, N, K);                         \
+            }                                                                      \
+        } while (0)
 
     switch (static_cast<NativeVNNIFormat>(codebook_id))
     {

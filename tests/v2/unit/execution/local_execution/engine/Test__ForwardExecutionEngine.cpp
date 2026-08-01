@@ -8,6 +8,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -110,6 +111,11 @@ namespace
         int get_worker_gpu_context_calls = 0;
         int ensure_workspace_calls = 0;
         int last_workspace_seq_len = -1;
+        bool typed_workspace_role_seen = false;
+        WorkspaceGraphFamilyPolicy last_workspace_family_policy =
+            WorkspaceGraphFamilyPolicy::ExclusiveLifetime;
+        WorkspaceGraphParticipantRole last_workspace_participant_role =
+            WorkspaceGraphParticipantRole::Decode;
         int sync_logits_calls = 0;
         TensorBase *last_published_logits = nullptr;
         int pending_all_position_verifier_stream_calls = 0;
@@ -249,6 +255,20 @@ namespace
         {
             ensure_workspace_calls++;
             last_workspace_seq_len = workspace_seq_len;
+            return true;
+        }
+
+        bool ensureDeviceWorkspaceAllocated(
+            const ComputeGraph &,
+            int workspace_seq_len,
+            WorkspaceGraphFamilyPolicy graph_family_policy,
+            WorkspaceGraphParticipantRole participant_role) override
+        {
+            ++ensure_workspace_calls;
+            last_workspace_seq_len = workspace_seq_len;
+            typed_workspace_role_seen = true;
+            last_workspace_family_policy = graph_family_policy;
+            last_workspace_participant_role = participant_role;
             return true;
         }
 
@@ -1735,6 +1755,170 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawPrefillBelowMinSeqBypassesBucket
     EXPECT_EQ(host.last_workspace_seq_len, 35);
     EXPECT_TRUE(engine.cacheEmpty())
         << "Short raw prefill should bypass graph-cache population entirely.";
+}
+
+/**
+ * @brief A grouped verifier remains compact grouped decode even at prompt-like M.
+ *
+ * This reproduces the production failure where an M=5 verifier was classified
+ * through the prefill envelope and queried short-conv scratch at M=4096. The
+ * explicit ForwardExecutionRole is authoritative even when position zero and
+ * sequence geometry make the legacy decode heuristic return false.
+ */
+TEST_F(Test__ForwardExecutionEngine, Execute_GroupedVerifierPublishesExactWorkspaceRole)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+    host.mock_compute_all_position_logits = true;
+
+    const std::vector<int> tokens = {70, 71, 72, 73, 74};
+    const std::vector<int> positions = {0, 1, 2, 3, 4};
+    auto input = makeTestInput(
+        /*seq_len=*/5,
+        /*batch_size=*/1,
+        DeviceId::cpu(),
+        tokens.data(),
+        positions.data());
+    input.execution_role =
+        ForwardExecutionRole::GroupedMTPVerifier;
+
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(input, output, host));
+    ASSERT_TRUE(host.typed_workspace_role_seen);
+    EXPECT_EQ(
+        host.last_workspace_family_policy,
+        WorkspaceGraphFamilyPolicy::
+            SerialDeviceFamilyExactParticipant);
+    EXPECT_EQ(
+        host.last_workspace_participant_role,
+        WorkspaceGraphParticipantRole::GroupedVerifier);
+    EXPECT_EQ(host.last_workspace_seq_len, 5);
+
+    auto verifier_graph =
+        engine.lastAllPositionVerifierForwardGraph();
+    ASSERT_TRUE(verifier_graph.has_value());
+    EXPECT_TRUE(verifier_graph->is_decode);
+    EXPECT_TRUE(verifier_graph->all_position_logits);
+    EXPECT_EQ(verifier_graph->signature.seq_len, 5);
+}
+
+/**
+ * @brief A device-owned request condition has its own exact family role.
+ *
+ * The condition graph is shaped like scalar decode for one request, but its
+ * GDN/short-conv namespace and device-resident sequence rows are distinct.
+ * Treating it as ordinary Decode caused eager family planning to omit those
+ * buffers and made first use fail after graph construction.
+ */
+TEST_F(Test__ForwardExecutionEngine, Execute_MTPConditionPublishesExactWorkspaceRole)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    const std::vector<int> tokens = {70};
+    const std::vector<int> positions = {17};
+    auto input = makeTestInput(
+        /*seq_len=*/1,
+        /*batch_size=*/1,
+        DeviceId::cpu(),
+        tokens.data(),
+        positions.data());
+    input.execution_role =
+        ForwardExecutionRole::MTPCondition;
+
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(input, output, host));
+    ASSERT_TRUE(host.typed_workspace_role_seen);
+    EXPECT_EQ(
+        host.last_workspace_family_policy,
+        WorkspaceGraphFamilyPolicy::
+            SerialDeviceFamilyExactParticipant);
+    EXPECT_EQ(
+        host.last_workspace_participant_role,
+        WorkspaceGraphParticipantRole::MTPCondition);
+    EXPECT_EQ(host.last_workspace_seq_len, 1);
+}
+
+/**
+ * @brief Prove typed grouped verifier roles admit graph capture through M=15.
+ *
+ * The ordinary decode cache retains a four-row heuristic, but MTP depth is
+ * independently configured and validated. This regression catches the old
+ * predicate that classified M=15 as decode while quietly denying it access to
+ * the capture controller on the cache-hit execution.
+ */
+TEST_F(
+    Test__ForwardExecutionEngine,
+    Execute_GPUGroupedVerifierAboveOrdinaryDecodeLimitUsesCapturePolicy)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+    host.mock_compute_all_position_logits = true;
+    host.mock_capture_policy.allow_fast_decode = true;
+    host.mock_capture_policy.allow_cached_graph_replay = true;
+
+    std::array<int, 15> tokens{};
+    std::array<int, 15> positions{};
+    for (int row = 0; row < 15; ++row)
+    {
+        tokens[static_cast<size_t>(row)] = 700 + row;
+        positions[static_cast<size_t>(row)] = 1200 + row;
+    }
+    auto input = makeTestInput(
+        static_cast<int>(tokens.size()),
+        /*batch_size=*/1,
+        DeviceId::cuda(0),
+        tokens.data(),
+        positions.data());
+    input.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(input, output, host));
+    ASSERT_TRUE(engine.execute(input, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+    EXPECT_GT(host.build_decode_policy_calls, 0)
+        << "Typed MTP rows must bypass the ordinary decode_seq_len heuristic.";
+}
+
+/**
+ * @brief A GPU MTP graph must never fall through to eager execution.
+ *
+ * The first invocation builds and warms the exact graph. On reuse, an absent
+ * capture policy is an architectural error: silently executing stages eagerly
+ * would violate device-owned publication and graph-complete PerfStats evidence.
+ */
+TEST_F(
+    Test__ForwardExecutionEngine,
+    Execute_GPUGroupedVerifierFailsClosedWhenGraphReplayIsUnavailable)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+    host.mock_compute_all_position_logits = true;
+
+    std::array<int, 15> tokens{};
+    std::array<int, 15> positions{};
+    auto input = makeTestInput(
+        static_cast<int>(tokens.size()),
+        /*batch_size=*/1,
+        DeviceId::cuda(0),
+        tokens.data(),
+        positions.data());
+    input.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(input, output, host));
+    EXPECT_FALSE(engine.execute(input, output, host));
+    EXPECT_GT(host.build_decode_policy_calls, 0);
 }
 
 TEST_F(Test__ForwardExecutionEngine, Execute_NonExactBucketGpuWithoutGpuGraphs_FallsThrough)

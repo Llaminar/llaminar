@@ -558,6 +558,8 @@ namespace llaminar2::test
         outcome.consumed_verifier_rows =
             meta[kSpecBatchMetaConsumedVerifierRows];
         outcome.sampled_terminal = meta[kSpecBatchMetaSampledTerminal] != 0;
+        outcome.commit_boundary_clipped =
+            meta[kSpecBatchMetaCommitBoundaryClipped] != 0;
 
         MTPDecodeCatchupGreedyResult device_result =
             buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
@@ -578,6 +580,42 @@ namespace llaminar2::test
         EXPECT_EQ(device_result.ready_token, row_result.ready_token);
         EXPECT_EQ(device_result.rejected_verified_token,
                   row_result.rejected_verified_token);
+    }
+
+    TEST(Test__MTPRejectionSampler,
+         BuildsCatchupFromExplicitCommitBoundaryOutcome)
+    {
+        MTPDecodeCatchupGreedyRequest request;
+        request.draft_tokens = {10, 11, 12};
+
+        MTPDeviceRejectionBatchOutcome outcome;
+        outcome.ok = true;
+        outcome.output_tokens[0] = 10;
+        outcome.output_token_count = 1;
+        outcome.accepted_speculative_prefix = 0;
+        outcome.target_verifier_state_commit_count = 1;
+        outcome.ready_token = 11;
+        outcome.rejected_verified_token = -1;
+        outcome.stopped_on_output = false;
+        outcome.all_speculative_accepted = false;
+        outcome.consumed_verifier_rows = 0;
+        outcome.sampled_terminal = false;
+        outcome.commit_boundary_clipped = true;
+
+        MTPDecodeCatchupGreedyResult result =
+            buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
+                request,
+                outcome);
+
+        ASSERT_TRUE(result.ok) << result.error;
+        EXPECT_THAT(result.accepted_tokens, ElementsAre(10));
+        EXPECT_TRUE(result.verifier_tokens.empty());
+        EXPECT_EQ(result.accepted_speculative_prefix, 0);
+        EXPECT_EQ(result.target_verifier_state_commit_count, 1);
+        EXPECT_EQ(result.ready_token, 11);
+        EXPECT_EQ(result.rejected_verified_token, -1);
+        EXPECT_FALSE(result.all_speculative_accepted);
+        EXPECT_FALSE(result.stopped_on_output);
     }
 
     TEST(Test__MTPRejectionSampler, BuildsRejectCatchupWithAcceptedStatePrefix)

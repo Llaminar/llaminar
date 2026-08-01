@@ -231,7 +231,9 @@ namespace llaminar2
      * `accepted_verifier_input_prefix` count includes the first main-model
      * token at verifier row zero; it is therefore one larger than the number of
      * accepted sidecar draft tokens when at least the first output token was
-     * produced.
+     * produced. A commit-boundary ready token is distinct from an all-accepted
+     * bonus: it conditions the next serial-visible transaction but does not add
+     * another committed output or speculative state row to this transaction.
      */
     struct MTPSpecDecodeAcceptedOutcome
     {
@@ -240,10 +242,12 @@ namespace llaminar2
         int draft_count = 0;
         std::vector<int32_t> committed_output_tokens;
         std::optional<int32_t> bonus_ready_token;
+        std::optional<int32_t> commit_boundary_ready_token;
         int accepted_verifier_input_prefix = 0;
         int target_verifier_state_commit_count = -1;
         bool all_drafts_accepted = false;
         bool stopped_on_output = false;
+        bool commit_boundary_clipped = false;
     };
 
     WorkspaceRequirements buildMTPSpecDecodeWorkspaceRequirements(

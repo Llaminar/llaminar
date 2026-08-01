@@ -629,6 +629,55 @@ TEST(Test__MoEKernelOwnership, FactoryCreatesIndependentLaunchState)
            "descriptor-table, or scratch state.";
 }
 
+/**
+ * @brief Prove payload transaction purpose owns histogram lifecycle policy.
+ *
+ * Prefix rehydration and current-batch movement deliberately share a captured
+ * transport implementation. They must not share reset semantics: rehydration
+ * preserves the routing evidence imported with the prefix, while a new
+ * current-batch placement consumes that evidence and starts the next window.
+ */
+TEST(Test__MoEExpertComputeStage,
+     PrefillLLEPTransferPurposeMakesHistogramOwnershipExplicit)
+{
+    DeviceMoERebalanceConfig base;
+    base.flags =
+        static_cast<uint32_t>(DeviceMoERebalanceFlags::HotReplicaCache) |
+        static_cast<uint32_t>(DeviceMoERebalanceFlags::DeferRuntimeApply) |
+        static_cast<uint32_t>(
+            DeviceMoERebalanceFlags::ResetHistogramsAfterApply);
+
+    const auto rehydration = prefillLLEPTransferConfig(
+        base,
+        PrefillLLEPTransferPurpose::PrefixRuntimeRehydration);
+    EXPECT_FALSE(hasDeviceMoERebalanceFlag(
+        rehydration.flags,
+        DeviceMoERebalanceFlags::ResetHistogramsAfterApply));
+    EXPECT_TRUE(hasDeviceMoERebalanceFlag(
+        rehydration.flags,
+        DeviceMoERebalanceFlags::HotReplicaCache));
+    EXPECT_TRUE(hasDeviceMoERebalanceFlag(
+        rehydration.flags,
+        DeviceMoERebalanceFlags::DeferRuntimeApply));
+
+    DeviceMoERebalanceConfig no_reset = base;
+    no_reset.flags &=
+        ~static_cast<uint32_t>(
+            DeviceMoERebalanceFlags::ResetHistogramsAfterApply);
+    const auto current_batch = prefillLLEPTransferConfig(
+        no_reset,
+        PrefillLLEPTransferPurpose::CurrentBatchMovement);
+    EXPECT_TRUE(hasDeviceMoERebalanceFlag(
+        current_batch.flags,
+        DeviceMoERebalanceFlags::ResetHistogramsAfterApply));
+
+    EXPECT_THROW(
+        (void)prefillLLEPTransferConfig(
+            base,
+            static_cast<PrefillLLEPTransferPurpose>(255u)),
+        std::invalid_argument);
+}
+
 // =========================================================================
 // SharedExpertFFNStage Tests
 // =========================================================================
@@ -2232,14 +2281,13 @@ TEST_F(MoEExpertComputeStageTest, FixedTopologyVerifierReplayStillRejectsReplica
     EXPECT_FALSE(stage.usesFixedTopologyGroupedVerifierReplayForTesting());
 }
 
-TEST_F(MoEExpertComputeStageTest, GpuGroupedVerifierPublishesPersistentDeviceHistograms)
+TEST_F(MoEExpertComputeStageTest, GpuGroupedVerifierRequiresAcceptedStateHistogramCommit)
 {
     /*
-     * This is deliberately a unit-only policy test: constructing a stage with a
-     * CUDA identity does not initialize CUDA or launch backend work. The
-     * production Qwen graph sets the grouped flag for CUDA/ROCm and reserves
-     * `force_decode_equivalent_verifier_prefill` for CPU, so checking only the
-     * latter silently disables every GPU histogram update.
+     * Constructing a stage with a CUDA identity does not launch GPU work. This
+     * verifies that the production grouped-verifier flag declares the later
+     * accepted-state commit, while ordinary prefill remains outside that
+     * transaction.
      */
     MoEExpertComputeStage::Params params;
     params.device_id = DeviceId::cuda(0);
@@ -2248,16 +2296,27 @@ TEST_F(MoEExpertComputeStageTest, GpuGroupedVerifierPublishesPersistentDeviceHis
     params.top_k = 2;
     params.force_grouped_verifier_prefill_for_decode = true;
     params.force_decode_equivalent_verifier_prefill = false;
+    params.defer_grouped_verifier_histogram_publication = true;
 
     MoEExpertComputeStage stage(params);
-    EXPECT_TRUE(stage.publishesGroupedVerifierHistogramsForTesting())
-        << "The real CUDA/ROCm grouped-verifier graph flag must publish "
-           "persistent selected and locally-assigned route demand.";
+    EXPECT_TRUE(
+        stage.requiresCommittedGroupedVerifierHistogramPublication())
+        << "The real CUDA/ROCm grouped-verifier graph flag must require "
+           "accepted-state routing-history publication.";
+
+    params.defer_grouped_verifier_histogram_publication = false;
+    MoEExpertComputeStage grouped_sidecar(params);
+    EXPECT_FALSE(
+        grouped_sidecar
+            .requiresCommittedGroupedVerifierHistogramPublication())
+        << "Grouped sidecars must never publish main-model decode history.";
 
     params.force_grouped_verifier_prefill_for_decode = false;
     MoEExpertComputeStage ordinary_prefill(params);
-    EXPECT_FALSE(ordinary_prefill.publishesGroupedVerifierHistogramsForTesting())
-        << "Ordinary prefill is not a decode-demand publication boundary.";
+    EXPECT_FALSE(
+        ordinary_prefill
+            .requiresCommittedGroupedVerifierHistogramPublication())
+        << "Ordinary prefill is not an accepted decode-demand boundary.";
 }
 
 TEST_F(MoEExpertComputeStageTest, SharedExpert_TypeAndName)

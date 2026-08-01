@@ -203,3 +203,37 @@ __device__ __forceinline__ float rocm_native_vnni_commit_iq1_m_delta_correction(
         activation_scale,
         accumulator);
 }
+
+/**
+ * @brief Apply a router weight with one explicit round-to-nearest operation.
+ *
+ * Collective publication stores each weighted route row before reducing it,
+ * while a single-device kernel may reduce the row immediately.  Expressing the
+ * multiplication as an FMA with an exact zero addend gives both forms the same
+ * FP32 rounding boundary and prevents the immediate form from contracting the
+ * multiplication into its following accumulation.
+ *
+ * @param route_weight Router probability for one original top-k slot.
+ * @param expert_value Complete or split-K-reduced expert down value.
+ * @return One independently rounded weighted route contribution.
+ */
+__device__ __forceinline__ float rocm_native_vnni_weight_route_rn(
+    float route_weight,
+    float expert_value)
+{
+    return __fmaf_rn(route_weight, expert_value, 0.0f);
+}
+
+/**
+ * @brief Add one rounded route or K-part contribution without FMA contraction.
+ *
+ * @param accumulator Running FP32 result in canonical traversal order.
+ * @param contribution Previously rounded contribution to append.
+ * @return The round-to-nearest FP32 sum.
+ */
+__device__ __forceinline__ float rocm_native_vnni_accumulate_rn(
+    float accumulator,
+    float contribution)
+{
+    return __fadd_rn(accumulator, contribution);
+}

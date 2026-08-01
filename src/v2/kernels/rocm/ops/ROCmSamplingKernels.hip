@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../common/SamplingMath.h"
 
@@ -3203,7 +3204,9 @@ __global__ void rocm_summarize_speculative_verify_batch_kernel(
     int has_bonus_token,
     int *__restrict__ out_tokens,
     int out_token_capacity,
-    int *__restrict__ out_meta)
+    int *__restrict__ out_meta,
+    const uint32_t *__restrict__ max_state_commit_rows,
+    int leading_committed_output_count)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
@@ -3219,7 +3222,12 @@ __global__ void rocm_summarize_speculative_verify_batch_kernel(
         stop_token7};
     const int ready_token =
         has_bonus_token && bonus_token ? *bonus_token : -1;
-    llaminar2::sampling_math::summarize_speculative_verify_batch(
+    const int commit_budget =
+        max_state_commit_rows && *max_state_commit_rows <
+                                     static_cast<uint32_t>(row_count + 1)
+            ? static_cast<int>(*max_state_commit_rows)
+            : row_count + 1;
+    llaminar2::sampling_math::summarize_speculative_verify_batch_at_commit_boundary(
         first_token,
         verify_tokens,
         verify_accepted,
@@ -3228,9 +3236,12 @@ __global__ void rocm_summarize_speculative_verify_batch_kernel(
         stop_token_count,
         ready_token,
         has_bonus_token,
+        commit_budget,
         out_tokens,
         out_token_capacity,
-        out_meta);
+        out_meta,
+        /*greedy_draft_tokens=*/nullptr,
+        leading_committed_output_count);
 }
 
 /**
@@ -3259,7 +3270,9 @@ __global__ void rocm_summarize_speculative_verify_batch_device_first_token_kerne
     int has_bonus_token,
     int *__restrict__ out_tokens,
     int out_token_capacity,
-    int *__restrict__ out_meta)
+    int *__restrict__ out_meta,
+    const uint32_t *__restrict__ max_state_commit_rows,
+    int leading_committed_output_count)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
@@ -3276,7 +3289,12 @@ __global__ void rocm_summarize_speculative_verify_batch_device_first_token_kerne
     const int ready_token =
         has_bonus_token && bonus_token ? *bonus_token : -1;
     const int sampled_first_token = first_token ? *first_token : -1;
-    llaminar2::sampling_math::summarize_speculative_verify_batch(
+    const int commit_budget =
+        max_state_commit_rows && *max_state_commit_rows <
+                                     static_cast<uint32_t>(row_count + 1)
+            ? static_cast<int>(*max_state_commit_rows)
+            : row_count + 1;
+    llaminar2::sampling_math::summarize_speculative_verify_batch_at_commit_boundary(
         sampled_first_token,
         verify_tokens,
         verify_accepted,
@@ -3285,9 +3303,12 @@ __global__ void rocm_summarize_speculative_verify_batch_device_first_token_kerne
         stop_token_count,
         ready_token,
         has_bonus_token,
+        commit_budget,
         out_tokens,
         out_token_capacity,
-        out_meta);
+        out_meta,
+        /*greedy_draft_tokens=*/nullptr,
+        leading_committed_output_count);
 }
 
 /**
@@ -3313,7 +3334,9 @@ __global__ void rocm_summarize_greedy_speculative_verify_batch_kernel(
     int stop_token_count,
     int *__restrict__ out_tokens,
     int out_token_capacity,
-    int *__restrict__ out_meta)
+    int *__restrict__ out_meta,
+    const uint32_t *__restrict__ max_state_commit_rows,
+    int leading_committed_output_count)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
@@ -3328,16 +3351,23 @@ __global__ void rocm_summarize_greedy_speculative_verify_batch_kernel(
         stop_token6,
         stop_token7};
     const int sampled_first_token = draft_tokens ? draft_tokens[0] : first_token;
-    llaminar2::sampling_math::summarize_greedy_speculative_verify_batch(
+    const int commit_budget =
+        max_state_commit_rows && *max_state_commit_rows <
+                                     static_cast<uint32_t>(compare_row_count + 1)
+            ? static_cast<int>(*max_state_commit_rows)
+            : compare_row_count + 1;
+    llaminar2::sampling_math::summarize_greedy_speculative_verify_batch_at_commit_boundary(
         sampled_first_token,
         verify_tokens,
         draft_tokens,
         compare_row_count,
         stop_tokens,
         stop_token_count,
+        commit_budget,
         out_tokens,
         out_token_capacity,
-        out_meta);
+        out_meta,
+        leading_committed_output_count);
 }
 
 /**
@@ -3351,21 +3381,95 @@ rocm_summarize_greedy_speculative_verify_batch_device_controls_kernel(
     const int *__restrict__ stop_tokens,
     int *__restrict__ out_tokens,
     int out_token_capacity,
-    int *__restrict__ out_meta)
+    int *__restrict__ out_meta,
+    const uint32_t *__restrict__ max_state_commit_rows,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ penalty_policy)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
 
-    llaminar2::sampling_math::summarize_greedy_speculative_verify_batch(
+    const int commit_budget =
+        max_state_commit_rows && *max_state_commit_rows <
+                                     static_cast<uint32_t>(compare_row_count + 1)
+            ? static_cast<int>(*max_state_commit_rows)
+            : compare_row_count + 1;
+    const int leading_committed_output_count =
+        penalty_policy && penalty_policy->first_token_already_in_history != 0
+            ? 1
+            : 0;
+    llaminar2::sampling_math::summarize_greedy_speculative_verify_batch_at_commit_boundary(
         draft_tokens[0],
         verify_tokens,
         draft_tokens,
         compare_row_count,
         stop_tokens,
         llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens,
+        commit_budget,
         out_tokens,
         out_token_capacity,
-        out_meta);
+        out_meta,
+        leading_committed_output_count);
+}
+
+/** @brief Advance the shared decode-round boundary after one request batch. */
+__global__ void rocm_advance_speculative_commit_boundary_kernel(
+    const int *__restrict__ meta,
+    int request_count,
+    int meta_stride,
+    uint32_t *__restrict__ decode_rounds_committed,
+    uint32_t *__restrict__ decode_rounds_until_maintenance,
+    uint32_t *__restrict__ maintenance_due,
+    uint32_t *__restrict__ decode_boundary_advanced)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    if (!meta || request_count <= 0 ||
+        meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
+        !decode_rounds_committed ||
+        !decode_rounds_until_maintenance ||
+        !maintenance_due || !decode_boundary_advanced ||
+        *maintenance_due != 0u || *decode_boundary_advanced != 0u)
+    {
+        if (maintenance_due)
+            *maintenance_due = 2u;
+        return;
+    }
+
+    uint32_t committed_rounds = 0u;
+    for (int request = 0; request < request_count; ++request)
+    {
+        const int *request_meta =
+            meta + static_cast<size_t>(request) * meta_stride;
+        if (request_meta[llaminar2::sampling_math::kSpecBatchMetaOk] == 0)
+        {
+            *maintenance_due = 2u;
+            return;
+        }
+        const int request_commits =
+            llaminar2::sampling_math::speculative_new_commit_count(
+                request_meta[llaminar2::sampling_math::kSpecBatchMetaOutputCount],
+                request_meta[llaminar2::sampling_math::kSpecBatchMetaLeadingCommittedOutputCount]);
+        if (request_commits < 0)
+        {
+            *maintenance_due = 2u;
+            return;
+        }
+        committed_rounds = max(
+            committed_rounds,
+            static_cast<uint32_t>(request_commits));
+    }
+
+    const uint32_t remaining = *decode_rounds_until_maintenance;
+    if (committed_rounds > remaining)
+    {
+        *maintenance_due = 2u;
+        return;
+    }
+    *decode_rounds_committed += committed_rounds;
+    *decode_rounds_until_maintenance = remaining - committed_rounds;
+    if (committed_rounds == remaining)
+        *maintenance_due = 1u;
+    *decode_boundary_advanced = 1u;
 }
 
 /**
@@ -5140,6 +5244,8 @@ bool rocmOps_summarize_speculative_verify_batch(
     int *out_tokens,
     int out_token_capacity,
     int *out_meta,
+    const uint32_t *max_state_commit_rows,
+    int leading_committed_output_count,
     int device_idx,
     void *stream)
 {
@@ -5177,7 +5283,9 @@ bool rocmOps_summarize_speculative_verify_batch(
         has_bonus_token,
         out_tokens,
         out_token_capacity,
-        out_meta);
+        out_meta,
+        max_state_commit_rows,
+        leading_committed_output_count);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -5208,6 +5316,8 @@ bool rocmOps_summarize_speculative_verify_batch_device_first_token(
     int *out_tokens,
     int out_token_capacity,
     int *out_meta,
+    const uint32_t *max_state_commit_rows,
+    int leading_committed_output_count,
     int device_idx,
     void *stream)
 {
@@ -5245,7 +5355,9 @@ bool rocmOps_summarize_speculative_verify_batch_device_first_token(
         has_bonus_token,
         out_tokens,
         out_token_capacity,
-        out_meta);
+        out_meta,
+        max_state_commit_rows,
+        leading_committed_output_count);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -5274,6 +5386,8 @@ bool rocmOps_summarize_greedy_speculative_verify_batch(
     int *out_tokens,
     int out_token_capacity,
     int *out_meta,
+    const uint32_t *max_state_commit_rows,
+    int leading_committed_output_count,
     int device_idx,
     void *stream)
 {
@@ -5308,7 +5422,9 @@ bool rocmOps_summarize_greedy_speculative_verify_batch(
         stop_token_count,
         out_tokens,
         out_token_capacity,
-        out_meta);
+        out_meta,
+        max_state_commit_rows,
+        leading_committed_output_count);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -5328,12 +5444,14 @@ bool rocmOps_summarize_greedy_speculative_verify_batch_device_controls(
     int *out_tokens,
     int out_token_capacity,
     int *out_meta,
+    const uint32_t *max_state_commit_rows,
+    const llaminar2::MTPGreedyPenaltyPolicy *penalty_policy,
     int device_idx,
     void *stream)
 {
     if (compare_row_count < 0 ||
         out_token_capacity < compare_row_count + 1 ||
-        !verify_tokens || !draft_tokens || !stop_tokens ||
+        !verify_tokens || !draft_tokens || !stop_tokens || !penalty_policy ||
         !out_tokens || !out_meta || !stream)
     {
         return false;
@@ -5352,7 +5470,9 @@ bool rocmOps_summarize_greedy_speculative_verify_batch_device_controls(
         stop_tokens,
         out_tokens,
         out_token_capacity,
-        out_meta);
+        out_meta,
+        max_state_commit_rows,
+        penalty_policy);
 
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -5360,6 +5480,52 @@ bool rocmOps_summarize_greedy_speculative_verify_batch_device_controls(
         fprintf(
             stderr,
             "ROCm device-control greedy speculative summary launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_advance_speculative_commit_boundary(
+    const int *meta,
+    int request_count,
+    int meta_stride,
+    uint32_t *decode_rounds_committed,
+    uint32_t *decode_rounds_until_maintenance,
+    uint32_t *maintenance_due,
+    uint32_t *decode_boundary_advanced,
+    int device_idx,
+    void *stream)
+{
+    if (!meta || request_count <= 0 ||
+        meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
+        !decode_rounds_committed ||
+        !decode_rounds_until_maintenance ||
+        !maintenance_due || !decode_boundary_advanced || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_advance_speculative_commit_boundary_kernel,
+        dim3(1),
+        dim3(1),
+        0,
+        static_cast<hipStream_t>(stream),
+        meta,
+        request_count,
+        meta_stride,
+        decode_rounds_committed,
+        decode_rounds_until_maintenance,
+        maintenance_due,
+        decode_boundary_advanced);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm speculative commit-boundary advance launch failed: %s\n",
             hipGetErrorString(err));
         return false;
     }

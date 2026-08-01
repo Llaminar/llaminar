@@ -1939,11 +1939,17 @@ namespace llaminar2
             const int *tokens,
             int seq_len,
             int batch_size = 1);
-        bool forwardWithDeviceTokenIds(
+        bool forwardGroupedMTPVerifierWithDeviceTokenIds(
             const int *token_shadow,
             const void *token_ids_device,
-            int seq_len,
-            DeviceTokenForwardPurpose purpose) override;
+            int seq_len) override;
+        bool advanceMTPMainConditionFromDeviceResidentLogicalState(
+            int32_t token_shadow,
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index = 0) override;
+        bool advanceMTPMainConditionFromDeviceTargetSample(
+            int32_t token_shadow,
+            int target_sample_slot) override;
 
         /**
          * @brief Batched verifier forward from a flat device token buffer.
@@ -2555,6 +2561,13 @@ namespace llaminar2
             int row,
             const std::vector<LogitPenalty> &penalties,
             int vocab_size) override;
+        bool applyDeviceOwnedMTPPenaltiesToLogitRows(
+            DeviceLogitsSource source,
+            int row_count,
+            const MTPGreedyPenaltyPolicy &penalty_policy) override;
+        bool applyDeviceOwnedMTPBranchPenaltiesToLogits(
+            int prior_draft_count,
+            const MTPGreedyPenaltyPolicy &penalty_policy) override;
         bool supportsRowLocalAllPositionPenaltyApplication() const override;
         bool supportsDeviceStochasticMTPVerification() const override;
         bool buildStochasticDistributionOnDevice(
@@ -2595,17 +2608,17 @@ namespace llaminar2
             int vocab_size,
             float threshold) override;
         DeviceStochasticDraftSampleSlotHandle
-        deviceStochasticDraftSampleSlot(
-            int slot,
-            bool require_ready = false) override;
+        deviceStochasticDraftSampleProducerSlot(int slot) override;
+        DeviceStochasticDraftSampleSlotHandle
+        deviceStochasticDraftSampleBroadcastDestinationSlot(int slot) override;
         bool recordStochasticDraftSampleSlotReadyFromDevice(
             int slot,
             void *producer_stream,
             bool verifier_consumer_pending = true) override;
         DeviceStochasticTargetSampleSlotHandle
-        deviceStochasticTargetSampleSlot(
-            int slot,
-            bool require_ready = false) override;
+        deviceStochasticTargetSampleProducerSlot(int slot) override;
+        DeviceStochasticTargetSampleSlotHandle
+        deviceStochasticTargetSampleBroadcastDestinationSlot(int slot) override;
         bool recordStochasticTargetSampleSlotReadyFromDevice(
             int slot,
             void *producer_stream,
@@ -2771,6 +2784,7 @@ namespace llaminar2
                 DrainMaintenanceDiagnostics,
                 JoinPriorProducers,
                 ResetReplaySessions,
+                ResetMaintenanceRequestState,
                 ResetMaintenanceGraph,
                 ClearDeferredPublications,
                 ResetCommittedKVAndGDN,
@@ -2949,6 +2963,8 @@ namespace llaminar2
                     return "join_prior_producers";
                 case Phase::ResetReplaySessions:
                     return "reset_replay_sessions";
+                case Phase::ResetMaintenanceRequestState:
+                    return "reset_maintenance_request_state";
                 case Phase::ResetMaintenanceGraph:
                     return "reset_maintenance_graph";
                 case Phase::ClearDeferredPublications:
@@ -3173,10 +3189,28 @@ namespace llaminar2
                 else
                     cache->resetSessionState();
             }
+            const bool preserves_maintenance_bindings =
+                preserve_replay_safe_graphs || prefix_restore_boundary;
+            if (preserves_maintenance_bindings &&
+                device_moe_rebalance_maintenance_graph_.graph)
+            {
+                reset_transaction.enter(
+                    RequestStateResetTransaction::Phase::
+                        ResetMaintenanceRequestState);
+                if (!device_moe_rebalance_maintenance_graph_
+                         .resetRequestOwnedDeviceTransaction(
+                             reset_transaction.executionStream()))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Device MoE maintenance transaction could not begin a fresh request"
+                              << " reason=" << reset_reason
+                              << " device=" << state_.device_id.toString());
+                    std::terminate();
+                }
+            }
             reset_transaction.enter(
                 RequestStateResetTransaction::Phase::
                     ResetMaintenanceGraph);
-            if (preserve_replay_safe_graphs || prefix_restore_boundary)
+            if (preserves_maintenance_bindings)
             {
                 /*
                  * Both ordinary request reset and prefix restore mutate only
@@ -3211,7 +3245,6 @@ namespace llaminar2
             reset_transaction.enter(
                 RequestStateResetTransaction::Phase::
                     ClearDeferredPublications);
-            device_moe_rebalance_decode_tokens_seen_ = 0;
             mtp_terminal_hidden_row_select_cache_.invalidate();
             mtp_terminal_hidden_rows_select_cache_.invalidate();
             last_pos_offset_ = -1;
@@ -3704,22 +3737,29 @@ namespace llaminar2
         bool activeAllPositionLogitsAreColumnParallel(int graph_token_count = -1) const;
 
         /**
-         * @brief Return an exact preplanned sidecar buffer for grouped verifier logits.
+         * @brief Return the preplanned MTP logits capacity for a typed main graph.
          *
-         * The draft sidecar has already been consumed before the typed grouped
-         * verifier transaction starts. Its stable logits allocation can therefore
-         * become the verifier graph's output owner when the requested geometry is
-         * identical. The typed role check prevents ordinary prefill or request
-         * batching from borrowing this storage, while exact shape/device checks
-         * make graph-captured pointer identity explicit.
+         * The draft sidecar has already been consumed before grouped verifier
+         * or condition execution starts. Its stable maximum-row logits
+         * allocation can therefore become the main graph's output owner without
+         * overlap. The graph and every sampler use the invocation's explicit row
+         * count; the tensor's first dimension is capacity. This keeps one pointer
+         * valid for M-total capture/replay and removes per-row-count allocations
+         * from the GPU hot path.
+         *
+         * This is an output-storage query, not an input-coherence query. The
+         * allocation is intentionally UNINITIALIZED before its producer graph
+         * first runs, so eligibility requires a stable device-local allocation
+         * but does not require deviceValid(). Graph execution publishes device
+         * authority only after the exact producer stream has written the rows.
          *
          * @param execution_role Semantic role of the current forward transaction.
          * @param buffer_id Sidecar logits allocation to inspect.
-         * @param rows Required output row count.
+         * @param rows Minimum required output row capacity.
          * @param columns Required output column count.
-         * @return Shared owner of the exact preplanned allocation, or empty.
+         * @return Shared owner of the preplanned device-local allocation, or empty.
          */
-        std::shared_ptr<TensorBase> exactGroupedVerifierLogitsBuffer(
+        std::shared_ptr<TensorBase> preplannedMTPLogitsBuffer(
             ForwardExecutionRole execution_role,
             BufferId buffer_id,
             size_t rows,
@@ -4549,6 +4589,8 @@ namespace llaminar2
             int threshold_position_offset,
             bool use_vllm_probability_rejection,
             bool serial_sample_equivalent,
+            int leading_committed_output_count,
+            const uint32_t *max_state_commit_rows_device,
             int output_request_slot,
             void *stream_override,
             bool copy_summary_to_host);
@@ -4630,6 +4672,29 @@ namespace llaminar2
         struct DeviceMoERebalanceMaintenanceGraphCache;
 
         /**
+         * @brief Materialize the production MoE maintenance graph before workspace publication.
+         *
+         * Dynamic/LLEP maintenance is a real member of the device graph family,
+         * even though its scheduler launches it only after a decode window closes.
+         * Building and retaining that exact graph during eager family declaration
+         * makes every workspace name, capacity, collective node, and captured
+         * pointer visible before generation one is allocated.
+         *
+         * @return true when maintenance is disabled/inapplicable or the retained
+         *         production graph is complete and ready to join family planning.
+         */
+        bool materializeDeviceMoERebalanceMaintenanceGraphForFamily();
+
+        /**
+         * @brief Resolve the persistent device-owned MoE controller record.
+         *
+         * The returned value is a device address used only as a kernel
+         * argument. The host never dereferences or mirrors the record.
+         */
+        DeviceMoERebalanceGraphControllerState *
+        deviceMoERebalanceControllerStateDevice();
+
+        /**
          * @brief Launch graph-captured device-side MoE maintenance when due.
          *
          * The caller invokes this method only after a decode transaction has
@@ -4650,12 +4715,17 @@ namespace llaminar2
          * controller and transfer work can overlap unrelated device work. Any
          * graph that consumes routing histograms, runtime ownership tables, or
          * transferred expert payloads must nevertheless observe the completed
-         * publication. This method queues a backend event wait on the consumer's
-         * exact execution stream; it never synchronizes the host, copies state
-         * through host memory, or retires diagnostic event ownership.
+         * publication. This method queues a manifest-validated backend event
+         * wait on every consumer's exact execution stream. The completion event
+         * is a durable multi-consumer publication: one MTP sidecar stream can
+         * never consume or retire the ordering edge owed by a main forward
+         * stream, and diagnostic host observation cannot change production
+         * ordering semantics.
          *
          * @param consumer_stream Explicit CUDA/HIP stream that will execute the
          *        consuming graph.
+         * @param consumer_role Typed owner of the consuming graph. The role must
+         *        be admitted by the centralized device execution timeline.
          * @param consumer_name Stable diagnostic name describing the consumer.
          * @return true when no maintenance is pending or all event waits were
          *         queued successfully.
@@ -4666,6 +4736,7 @@ namespace llaminar2
          */
         bool waitForPendingDeviceMoERebalanceMaintenance(
             void *consumer_stream,
+            DeviceTimelineRole consumer_role,
             const char *consumer_name);
 
         struct DeviceMoERebalanceMaintenanceOutcome
@@ -4734,12 +4805,20 @@ namespace llaminar2
             uint32_t runtime_changed_layers = 0;
             uint32_t runtime_applied_arrivals = 0;
             /**
-             * Applied prefill movements observed in the active device runtime.
+             * Runtime layers carrying sticky proof of an applied payload move.
              *
-             * This is final-state evidence collected by the captured
-             * maintenance controller. It remains meaningful when the next
-             * decode-maintenance window is not yet ready because the prefill
-             * publication occurred before that independent scheduling decision.
+             * The marker survives later transfer-slot retirement, so this is
+             * the request-level movement proof. The active-slot fields below
+             * describe terminal storage integrity instead of movement history.
+             */
+            uint32_t prefill_current_batch_movement_layers = 0;
+            /**
+             * Transfer-slot-backed experts still active in the device runtime.
+             *
+             * This is terminal-state storage evidence collected by the
+             * captured maintenance controller. It validates unique physical
+             * slot ownership but may legitimately be zero after a later
+             * maintenance wave retires an earlier prefill placement.
              */
             uint32_t prefill_active_transfer_slot_experts = 0;
             uint32_t prefill_unique_transfer_slot_claims = 0;
@@ -5920,16 +5999,61 @@ namespace llaminar2
              */
             bool completion_event_in_flight = false;
             /**
-             * @brief Whether production graph consumers still owe an event wait.
+             * @brief Whether the current persistent binding owns initialized request state.
              *
-             * Keep this ordering obligation separate from
-             * completion_event_in_flight. Request-reset diagnostics may export
-             * a completed maintenance wave before the next request begins, but
-             * that host observation must not silently erase the device-stream
-             * handoff. The next main/MTP graph consumes this flag by queuing
-             * streamWaitEvent() on its exact execution stream.
+             * The maintenance graph can be materialized after the first request
+             * reset has already crossed its boundary. In that case workspace
+             * addresses exist only after family allocation, so family publication
+             * must initialize the transaction once before any decode/verifier
+             * graph may consume the controller. Subsequent request resets set this
+             * flag through the same typed transaction owner.
              */
-            bool completion_event_consumer_wait_pending = false;
+            bool request_transaction_initialized = false;
+
+            /**
+             * @brief Reset the sole request-owned transaction behind this graph.
+             *
+             * Graph reset and request reset are different lifetimes. The graph
+             * executable, workspace addresses, streams, and events survive a
+             * stable-content boundary, while controller epochs, active waves,
+             * terminal poison, headers, cursors, and plan counts do not.
+             * Discovering ownership from the typed stage makes a missing or
+             * multiply-owned transaction a construction error instead of
+             * silently preserving stale state.
+             *
+             * @param request_reset_stream Stream that already joined every old
+             *        request producer and will later publish reset-ready.
+             * @return true only when exactly one owning stage enqueued its reset.
+             */
+            bool resetRequestOwnedDeviceTransaction(void *request_reset_stream)
+            {
+                if (!graph || !request_reset_stream)
+                    return false;
+
+                std::vector<MoEDeviceRebalanceStage *> transaction_owners;
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    auto *stage =
+                        node && node->stage
+                            ? dynamic_cast<MoEDeviceRebalanceStage *>(
+                                  node->stage.get())
+                            : nullptr;
+                    if (stage && stage->ownsRequestTransactionState())
+                        transaction_owners.push_back(stage);
+                }
+                if (transaction_owners.size() != 1u)
+                {
+                    LOG_ERROR("[DeviceMoERebalanceMaintenanceGraphCache] Stable request reset requires exactly one transaction owner"
+                              << " owners=" << transaction_owners.size());
+                    return false;
+                }
+                const bool reset = transaction_owners.front()
+                                       ->resetRequestTransactionStateOnStream(
+                                           request_reset_stream);
+                request_transaction_initialized = reset;
+                return reset;
+            }
 
             void resetReplayState()
             {
@@ -5956,10 +6080,11 @@ namespace llaminar2
                 /*
                  * The exact boundary epilogue completes and exports maintenance
                  * diagnostics before reaching this replay-preserving reset.
-                 * Retire only diagnostic in-flight state. Deliberately preserve
-                 * completion_event_consumer_wait_pending so the next production
-                 * graph still queues the device-stream handoff; diagnostic host
-                 * observation is not execution ordering.
+                 * Retire only diagnostic in-flight state. The durable completion
+                 * event and launch_count remain published, so every next-request
+                 * production stream still queues its own manifest-validated
+                 * event wait; diagnostic host observation is not execution
+                 * ordering.
                  */
                 completion_event_in_flight = false;
                 if (!graph)
@@ -5983,12 +6108,11 @@ namespace llaminar2
                 last_status_publication_launch_count = 0;
                 completion_event.reset();
                 completion_event_in_flight = false;
-                completion_event_consumer_wait_pending = false;
+                request_transaction_initialized = false;
             }
         };
 
         DeviceMoERebalanceMaintenanceGraphCache device_moe_rebalance_maintenance_graph_;
-        uint64_t device_moe_rebalance_decode_tokens_seen_ = 0;
 
         /// Padded sequence length from last forward_batch() call
         int padded_seq_len_ = 0;
@@ -6813,6 +6937,54 @@ namespace llaminar2
             WorkspaceGraphFamilyPolicy graph_family_policy) override;
 
         /**
+         * @brief Bind one exact graph under its explicit mathematical role.
+         *
+         * The role is supplied by ForwardExecutionEngine from ForwardInput and is
+         * never reconstructed from M, current position, or output mode.
+         */
+        bool ensureDeviceWorkspaceAllocated(
+            const ComputeGraph &graph,
+            int workspace_seq_len,
+            WorkspaceGraphFamilyPolicy graph_family_policy,
+            WorkspaceGraphParticipantRole participant_role) override;
+
+        /**
+         * @brief Allocate the first workspace generation from a complete graph family.
+         *
+         * @param graph Primary forward graph.
+         * @param workspace_seq_len Active primary-graph row count.
+         * @param graph_family_policy Physical lifetime policy.
+         * @param exact_serial_participants Materialized, role-typed prefill,
+         *        MTP, publication, and helper graphs whose exact topology must
+         *        be present before capture.
+         * @return true when every graph consumer is bound to one stable layout.
+         */
+        bool ensureDeviceWorkspaceAllocated(
+            const ComputeGraph &graph,
+            int workspace_seq_len,
+            WorkspaceGraphFamilyPolicy graph_family_policy,
+            WorkspaceGraphParticipantRole primary_role,
+            const std::vector<WorkspaceGraphParticipant> &
+                exact_serial_participants);
+
+        /**
+         * @brief Materialize every GPU MTP workspace topology without executing it.
+         *
+         * The returned graphs are short-lived declarations used by the first
+         * workspace plan. They are built through the same model graph builder
+         * as production sidecars, so new stages and workspace names
+         * automatically join the family instead of requiring byte-count
+         * updates here.
+         *
+         * @pre @p owned_mtp_graphs is empty. Primary-lane declarations have a
+         *      separate owner, so this MTP contributor cannot erase, reorder,
+         *      or replace them.
+         */
+        bool buildMTPWorkspaceFamilyManifest(
+            std::vector<std::unique_ptr<ComputeGraph>> &
+                owned_mtp_graphs);
+
+        /**
          * @brief Return the current workspace generation for a device.
          */
         uint64_t workspaceGeneration(DeviceId device) const override;
@@ -7202,6 +7374,29 @@ namespace llaminar2
          */
         bool prepareDeviceResidentMTPSpecPublicationMetadata(
             const DeviceSpeculativePublicationRequest &request,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Commit accepted MoE verifier routes into maintenance history.
+         *
+         * The all-position verifier graph owns per-layer route ids and final
+         * participant assignments for every physical row. The speculative
+         * outcome owns device-resident accepted prefix counts. This helper
+         * joins those records on the accepted-publication stream and invokes
+         * every grouped MoE stage exactly once before the publication-ready
+         * event is recorded.
+         *
+         * Dense graphs contain no MoE stages and succeed without launching
+         * work. A GPU MoE verifier graph whose MoE stages do not advertise the
+         * committed-publication contract is rejected rather than silently
+         * dropping routing evidence.
+         */
+        bool publishCommittedMoEVerifierHistograms(
+            ComputeGraph &verifier_graph,
+            const MTPSpecDecodeMetadataDevicePointers &publication_metadata,
+            int request_count,
+            int rows_per_request,
+            void *producer_stream,
             std::string *error = nullptr);
 
         /// Drop any stale device logical-state mailbox after request/session mutation.

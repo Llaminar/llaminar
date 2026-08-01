@@ -12,6 +12,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <limits>
 #include "memory/BufferArena.h"
 #include "memory/BufferId.h"
 #include "memory/BufferAccess.h"
@@ -43,6 +44,65 @@ TEST(Test__BufferArena, RegisterBufferRejectsDoubleRegistration)
     EXPECT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu()));
     EXPECT_FALSE(arena.registerBuffer(BufferId::HIDDEN_STATE, 8, 896, "FP32", DeviceId::cpu()));
     EXPECT_EQ(arena.registeredCount(), 1u);
+}
+
+/**
+ * @brief Graph registration must preserve the capacity of every logical axis.
+ *
+ * Canonical MoE publication uses a rank-three `[rows, routes, width]`
+ * descriptor. The arena intentionally exposes matrix tensors to kernels, so it
+ * must flatten the two trailing dimensions rather than dropping `width`.
+ */
+TEST(Test__BufferArena, GraphDescriptorRegistrationFlattensEveryTrailingAxis)
+{
+    BufferArena arena;
+    const BufferDescriptor descriptor = BufferDescriptor::scratch(
+        "moe_canonical_route_contributions",
+        {7, 3, 5},
+        BufferTensorType::FP32);
+
+    ASSERT_TRUE(arena.registerBuffer(
+        BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS,
+        descriptor));
+    EXPECT_EQ(arena.getRows(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS), 7u);
+    EXPECT_EQ(arena.getCols(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS), 15u);
+}
+
+TEST(Test__BufferArena, GraphDescriptorRegistrationPreservesRankOneCapacity)
+{
+    BufferArena arena;
+    const BufferDescriptor descriptor = BufferDescriptor::scratch(
+        "one_dimensional_scratch",
+        {4096},
+        BufferTensorType::FP32);
+
+    ASSERT_TRUE(arena.registerBuffer(BufferId::GEMM_WORKSPACE, descriptor));
+    EXPECT_EQ(arena.getRows(BufferId::GEMM_WORKSPACE), 4096u);
+    EXPECT_EQ(arena.getCols(BufferId::GEMM_WORKSPACE), 1u);
+}
+
+TEST(Test__BufferArena, GraphDescriptorRegistrationRejectsInvalidShapes)
+{
+    BufferArena arena;
+
+    EXPECT_THROW(
+        arena.registerBuffer(
+            BufferId::HIDDEN_STATE,
+            BufferDescriptor::scratch("empty", {}, BufferTensorType::FP32)),
+        std::invalid_argument);
+    EXPECT_THROW(
+        arena.registerBuffer(
+            BufferId::HIDDEN_STATE,
+            BufferDescriptor::scratch("zero", {4, 0, 8}, BufferTensorType::FP32)),
+        std::invalid_argument);
+    EXPECT_THROW(
+        arena.registerBuffer(
+            BufferId::HIDDEN_STATE,
+            BufferDescriptor::scratch(
+                "overflow",
+                {2, std::numeric_limits<size_t>::max()},
+                BufferTensorType::FP32)),
+        std::overflow_error);
 }
 
 TEST(Test__BufferArena, RegisterMultipleBuffers)
@@ -1032,17 +1092,30 @@ TEST(Test__BufferArena, MappedModeKeepsGpuScratchBuffersDeviceLocal)
     BufferArena arena(config);
     ASSERT_TRUE(arena.registerBuffer(BufferId::GDN_ALPHA, 256, 16, "FP32", DeviceId::rocm(0)));
     ASSERT_TRUE(arena.registerBuffer(BufferId::GDN_BETA, 256, 16, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::MTP_LOGITS, 16, 4096, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::MTP_LOGITS_GATHERED, 16, 8192, "FP32", DeviceId::rocm(0)));
 
     ASSERT_TRUE(arena.allocate());
 
     auto *alpha = dynamic_cast<TensorBase *>(arena.getTensor(BufferId::GDN_ALPHA));
     auto *beta = dynamic_cast<TensorBase *>(arena.getTensor(BufferId::GDN_BETA));
+    auto *mtp_logits = dynamic_cast<TensorBase *>(arena.getTensor(BufferId::MTP_LOGITS));
+    auto *mtp_logits_gathered =
+        dynamic_cast<TensorBase *>(arena.getTensor(BufferId::MTP_LOGITS_GATHERED));
     ASSERT_NE(alpha, nullptr);
     ASSERT_NE(beta, nullptr);
+    ASSERT_NE(mtp_logits, nullptr);
+    ASSERT_NE(mtp_logits_gathered, nullptr);
     EXPECT_FALSE(alpha->isMapped());
     EXPECT_FALSE(beta->isMapped());
+    EXPECT_FALSE(mtp_logits->isMapped())
+        << "GPU MTP logits are graph output scratch, never host-visible publication";
+    EXPECT_FALSE(mtp_logits_gathered->isMapped())
+        << "Gathered GPU MTP logits must remain device-owned until explicit result surfacing";
     EXPECT_EQ(alpha->home_device(), DeviceId::rocm(0));
     EXPECT_EQ(beta->home_device(), DeviceId::rocm(0));
+    EXPECT_EQ(mtp_logits->home_device(), DeviceId::rocm(0));
+    EXPECT_EQ(mtp_logits_gathered->home_device(), DeviceId::rocm(0));
 }
 
 TEST(Test__BufferArena, AllocateWithFactoryCreatesBF16)

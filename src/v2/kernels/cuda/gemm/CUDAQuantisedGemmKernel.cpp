@@ -181,6 +181,8 @@ namespace llaminar2
 
             void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int enabled);
             int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config();
+            void cudaNativeVNNIGemvTuned_setSerialPartitionN(int n);
+            int cudaNativeVNNIGemvTuned_getSerialPartitionN();
 
             bool cudaNativeVNNIInitIQGridTables_tuned();
 
@@ -281,6 +283,36 @@ namespace llaminar2
 
         private:
             bool previous_scope_ = false;
+        };
+
+        /**
+         * @brief Bind generated NativeVNNI policy to the serial TP shard width.
+         *
+         * Only generated-policy lookup observes this value. Device pointers,
+         * launch extents, and output strides retain the full replicated width.
+         */
+        class ScopedNativeVNNISerialPartition final
+            : public ITensorGemm::OutputPartitionEquivalenceScope
+        {
+        public:
+            explicit ScopedNativeVNNISerialPartition(int serial_partition_n)
+                : previous_(cudaNativeVNNIGemvTuned_getSerialPartitionN())
+            {
+                cudaNativeVNNIGemvTuned_setSerialPartitionN(serial_partition_n);
+            }
+
+            ~ScopedNativeVNNISerialPartition() override
+            {
+                cudaNativeVNNIGemvTuned_setSerialPartitionN(previous_);
+            }
+
+            ScopedNativeVNNISerialPartition(
+                const ScopedNativeVNNISerialPartition &) = delete;
+            ScopedNativeVNNISerialPartition &operator=(
+                const ScopedNativeVNNISerialPartition &) = delete;
+
+        private:
+            int previous_ = 0;
         };
 
         bool useCanonicalM1Decode()
@@ -1137,7 +1169,7 @@ namespace llaminar2
 
             impl_->owns_weight_memory = true; // Legacy constructor owns weight memory
 
-            LOG_DEBUG("[CUDAQuantisedGemmKernel] Created (legacy) for " << N_ << "x" << K_
+            LOG_TRACE("[CUDAQuantisedGemmKernel] Created (legacy) for " << N_ << "x" << K_
                                                                         << " quantized weights (type=" << static_cast<int>(wt)
                                                                         << ") on CUDA device " << cuda_device_id_);
         }
@@ -1163,7 +1195,7 @@ namespace llaminar2
 
             impl_->owns_weight_memory = false; // Packed cache owns weight memory
 
-            LOG_DEBUG("[CUDAQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
+            LOG_TRACE("[CUDAQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
                                                                             << " INT8 weights on CUDA device " << cuda_device_id_);
         }
 
@@ -1191,7 +1223,7 @@ namespace llaminar2
             impl_->native_blocks_per_row = blocks_per_row;
             impl_->owns_weight_memory = false;
 
-            LOG_DEBUG("[CUDAQuantisedGemmKernel] Created (MoE batch) for " << N_ << "x" << K_
+            LOG_TRACE("[CUDAQuantisedGemmKernel] Created (MoE batch) for " << N_ << "x" << K_
                                                                            << " on CUDA device " << cuda_device_id_);
         }
 
@@ -1441,13 +1473,31 @@ namespace llaminar2
             return std::make_unique<ScopedNativeVNNIDecodeEquivalentDispatch>();
         }
 
+        std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
+        CUDAQuantisedGemmKernel::beginOutputPartitionEquivalenceScope(
+            int actual_output_columns,
+            int serial_partition_columns)
+        {
+            if (actual_output_columns <= 0 ||
+                serial_partition_columns <= 0 ||
+                actual_output_columns != static_cast<int>(N_) ||
+                serial_partition_columns > actual_output_columns ||
+                (actual_output_columns % serial_partition_columns) != 0)
+            {
+                throw std::invalid_argument(
+                    "[CUDAQuantisedGemmKernel] Invalid replicated-output serial partition contract");
+            }
+            return std::make_unique<ScopedNativeVNNISerialPartition>(
+                serial_partition_columns);
+        }
+
         // =====================================================================
         // Weight conversion: Any quantized format → INT8 + scales
         // =====================================================================
 
         void CUDAQuantisedGemmKernel::ensureWeightsConverted()
         {
-            LOG_DEBUG("[CUDAQuantisedGemmKernel::ensureWeightsConverted] Entry: N_=" << N_ << " K_=" << K_
+            LOG_TRACE("[CUDAQuantisedGemmKernel::ensureWeightsConverted] Entry: N_=" << N_ << " K_=" << K_
                                                                                      << " weights_converted_=" << weights_converted_
                                                                                      << " d_native_vnni=" << (impl_ ? (void *)impl_->d_weights_native_vnni : nullptr)
                                                                                      << " d_native_scales=" << (impl_ ? (void *)impl_->d_weights_native_scales : nullptr));
@@ -2269,7 +2319,7 @@ namespace llaminar2
                 // Coherence handled automatically by DeviceGraphExecutor
                 d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
                 // NOTE: Don't log fp32_input->data() here - it triggers D2H transfer!
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input);
+                LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input);
             }
             else
             {
@@ -2288,7 +2338,7 @@ namespace llaminar2
                 explicitSmallMVerifierScopeActive() && m > 1;
             if (explicit_small_m_verifier)
             {
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path M="
+                LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path M="
                           << m << " projections=" << projections.size());
 
                 if (!execution_stream)
@@ -2521,7 +2571,7 @@ namespace llaminar2
                 d_sums_A_blockwise = needs_block_sums
                                          ? static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))
                                          : nullptr;
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise quantizing activations once, m=" << m << " k=" << k);
+                LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise quantizing activations once, m=" << m << " k=" << k);
 
                 // Blockwise quantize activations ONCE (shared across all projections)
                 const bool quantized = d_sums_A_blockwise
@@ -2751,7 +2801,7 @@ namespace llaminar2
                     if (pi >= pool.count)
                         cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.completion[stream_idx]);
 
-                    LOG_DEBUG("[ConcurrentPrefill] Projection " << pi
+                    LOG_TRACE("[ConcurrentPrefill] Projection " << pi
                                                                 << " (" << (proj.name ? proj.name : "?")
                                                                 << ") M=" << m << " N=" << n << " K=" << k
                                                                 << " on stream " << stream_idx);
@@ -2783,7 +2833,7 @@ namespace llaminar2
                 {
                     cudaQuantGemm_streamWaitEvent(execution_stream, pool.completion[si]);
                 }
-                LOG_DEBUG("[ConcurrentPrefill] All " << num_proj << " projections dispatched concurrently");
+                LOG_TRACE("[ConcurrentPrefill] All " << num_proj << " projections dispatched concurrently");
                 publish_projection_outputs();
                 return true;
             }
@@ -2811,7 +2861,7 @@ namespace llaminar2
                 }
 
                 const int n = proj.n;
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                          << " (" << (proj.name ? proj.name : "unnamed") << "): m=" << m << " n=" << n << " k=" << k);
 
                 // Ensure the projection's weights are converted
@@ -2917,7 +2967,7 @@ namespace llaminar2
                         all_success = false;
                         break;
                     }
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                              << " using bias ptr=" << static_cast<const void *>(d_bias));
                 }
 
@@ -3054,7 +3104,7 @@ namespace llaminar2
                     size_t copy_count = std::min(static_cast<size_t>(m) * static_cast<size_t>(n), static_cast<size_t>(8));
                     std::vector<float> h_output(copy_count);
                     cudaQuantGemm_copyDeviceToHost(h_output.data(), d_output, h_output.size(), cuda_device_id_);
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] " << (proj.name ? proj.name : "unnamed")
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] " << (proj.name ? proj.name : "unnamed")
                                                                                   << " output[0:4]=" << h_output[0] << "," << (h_output.size() > 1 ? h_output[1] : 0.f) << ","
                                                                                   << (h_output.size() > 2 ? h_output[2] : 0.f) << "," << (h_output.size() > 3 ? h_output[3] : 0.f));
                 }
@@ -3096,7 +3146,7 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
-            LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] m=" << m << " n=" << n << " k=" << k);
+            LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] m=" << m << " n=" << n << " k=" << k);
 
             validateWorkspace();
 
@@ -3181,7 +3231,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
                               "Complete (grouped small-M decode-equivalent SwiGLU/down)");
                     return true;
                 }
@@ -3227,7 +3277,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (canonical M=1 native GEMV)");
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (canonical M=1 native GEMV)");
                     return true;
                 }
 
@@ -3242,7 +3292,7 @@ namespace llaminar2
                         impl_ ? &impl_->rowmajor : nullptr,
                         d_sums_A_blockwise))
                 {
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (native GEMV)");
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (native GEMV)");
 
                     // Diagnostic: checksum FFN_DOWN output (NativeVNNI path)
                     if (debugEnv().gemm.cuda_fused_gemm_trace)
@@ -3693,7 +3743,7 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
-            LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] m=" << m << " n=" << n << " k=" << k
+            LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] m=" << m << " n=" << n << " k=" << k
                                                                             << " alpha=" << alpha << " beta=" << beta
                                                                             << " d_A=" << static_cast<const void *>(d_A)
                                                                             << " d_C=" << static_cast<void *>(d_C));
@@ -3729,7 +3779,7 @@ namespace llaminar2
                 if (multiply_fp32_to_fp32_small_m_gemv(
                         d_A, d_C, nullptr, m, n, k, alpha, beta))
                 {
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (small-M row-wise native payload GEMV)");
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (small-M row-wise native payload GEMV)");
                     return true;
                 }
 
@@ -3785,7 +3835,7 @@ namespace llaminar2
                             beta,
                             execution_stream))
                     {
-                        LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (canonical M=1 decode GEMV)");
+                        LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (canonical M=1 decode GEMV)");
                         return true;
                     }
 
@@ -3807,7 +3857,7 @@ namespace llaminar2
                         impl_ ? &impl_->rowmajor : nullptr,
                         d_sums_A_blockwise))
                 {
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (native payload GEMV)");
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (native payload GEMV)");
                     return true;
                 }
 
@@ -3855,7 +3905,7 @@ namespace llaminar2
                 multiply_fp32_to_fp32_small_m_gemv(
                     d_A, d_C, d_bias, m, n, k, alpha, beta))
             {
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (small-M row-wise native payload GEMV)");
+                LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (small-M row-wise native payload GEMV)");
                 return true;
             }
 
@@ -3902,7 +3952,7 @@ namespace llaminar2
                             beta,
                             execution_stream))
                     {
-                        LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (canonical M=1 decode GEMV)");
+                        LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (canonical M=1 decode GEMV)");
                         return true;
                     }
 
@@ -3924,7 +3974,7 @@ namespace llaminar2
                         impl_ ? &impl_->rowmajor : nullptr,
                         d_sums_A_blockwise))
                 {
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (native payload GEMV)");
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (native payload GEMV)");
                     return true;
                 }
 
@@ -4131,7 +4181,7 @@ namespace llaminar2
                                                 true,
                                                 WorkspaceExecutionRegime::PrefillOnly});
                     }
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: codebook="
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: codebook="
                               << static_cast<int>(native_codebook_id)
                               << " max_rows=" << m
                               << " splitk_rows=" << prefill_bounds.splitk_rows
@@ -4178,7 +4228,7 @@ namespace llaminar2
                     WorkspaceExecutionRegime::CompactDecodeOnly});
             }
 
-            LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
+            LOG_TRACE("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
                       << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
                       << "scales_a=" << (scales_a_bytes) << "B, "
                       << "scales_a_blockwise=" << (scales_a_blockwise_bytes) << "B, "
@@ -4199,12 +4249,12 @@ namespace llaminar2
             workspace_ = workspace;
             if (workspace)
             {
-                LOG_DEBUG("[CUDAQuantisedGemmKernel] Bound workspace manager at " << (void *)workspace
+                LOG_TRACE("[CUDAQuantisedGemmKernel] Bound workspace manager at " << (void *)workspace
                                                                                   << ", entering managed mode");
             }
             else
             {
-                LOG_DEBUG("[CUDAQuantisedGemmKernel] Unbound workspace, returning to legacy mode");
+                LOG_TRACE("[CUDAQuantisedGemmKernel] Unbound workspace, returning to legacy mode");
             }
         }
 

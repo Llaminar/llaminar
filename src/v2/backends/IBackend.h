@@ -697,6 +697,80 @@ namespace llaminar2
         }
 
         /**
+         * @brief Apply decode-equivalent MTP history penalties in-place.
+         *
+         * The durable generated-token histogram is device-owned request state.
+         * When @p verifier_input_tokens_device is non-null, row `r` additionally
+         * observes the speculative branch tokens `[prefix_begin, r]`, matching
+         * the history visible to serial decode at that verifier row.  A null
+         * verifier-input pointer applies only durable history and is used for
+         * the first target token of the next transaction.
+         *
+         * Implementations must enqueue one graph-capturable operation on the
+         * exact non-null producer stream.  Allocations, copies, atomics, and
+         * synchronization are forbidden.
+         */
+        virtual bool enqueueApplyMTPPenaltiesToF32RowsDevice(
+            void *data_device,
+            int rows,
+            int cols,
+            int row_stride,
+            const void *verifier_input_tokens_device,
+            const void *generated_token_counts_device,
+            const void *penalty_policy_device,
+            int device_id,
+            void *stream)
+        {
+            (void)data_device;
+            (void)rows;
+            (void)cols;
+            (void)row_stride;
+            (void)verifier_input_tokens_device;
+            (void)generated_token_counts_device;
+            (void)penalty_policy_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Apply one MTP proposal row's complete branch history in-place.
+         *
+         * The proposal row observes the durable generated-token histogram, the
+         * first condition token when it is not already durable, and exactly
+         * @p prior_draft_count preceding device-resident draft slots.  This is
+         * the device-owned equivalent of cloning the serial sampler and
+         * recording the current speculative branch before scoring its next
+         * proposal.
+         *
+         * Implementations must preserve the serial presence-then-frequency
+         * arithmetic order and enqueue on the exact non-null producer stream.
+         * Allocations, copies, atomics, and synchronization are forbidden.
+         */
+        virtual bool enqueueApplyMTPBranchPenaltiesToF32RowDevice(
+            void *data_device,
+            int cols,
+            const void *first_condition_token_device,
+            const void *prior_draft_tokens_device,
+            int prior_draft_count,
+            const void *generated_token_counts_device,
+            const void *penalty_policy_device,
+            int device_id,
+            void *stream)
+        {
+            (void)data_device;
+            (void)cols;
+            (void)first_condition_token_device;
+            (void)prior_draft_tokens_device;
+            (void)prior_draft_count;
+            (void)generated_token_counts_device;
+            (void)penalty_policy_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Commit newly emitted compact outcome tokens to device history.
          *
          * This operation runs after compact LocalTP publication so every
@@ -1711,7 +1785,9 @@ namespace llaminar2
             void *stream,
             int out_token_capacity,
             void *out_tokens_device,
-            void *out_meta_device)
+            void *out_meta_device,
+            const void *max_state_commit_rows_device = nullptr,
+            int leading_committed_output_count = 0)
         {
             (void)verify_tokens_device;
             (void)verify_accepted_device;
@@ -1726,6 +1802,8 @@ namespace llaminar2
             (void)out_token_capacity;
             (void)out_tokens_device;
             (void)out_meta_device;
+            (void)max_state_commit_rows_device;
+            (void)leading_committed_output_count;
             return false;
         }
 
@@ -1755,7 +1833,9 @@ namespace llaminar2
             void *stream,
             int out_token_capacity,
             void *out_tokens_device,
-            void *out_meta_device)
+            void *out_meta_device,
+            const void *max_state_commit_rows_device = nullptr,
+            int leading_committed_output_count = 0)
         {
             (void)verify_tokens_device;
             (void)verify_accepted_device;
@@ -1770,6 +1850,8 @@ namespace llaminar2
             (void)out_token_capacity;
             (void)out_tokens_device;
             (void)out_meta_device;
+            (void)max_state_commit_rows_device;
+            (void)leading_committed_output_count;
             return false;
         }
 
@@ -1805,7 +1887,9 @@ namespace llaminar2
             void *stream,
             int out_token_capacity,
             void *out_tokens_device,
-            void *out_meta_device)
+            void *out_meta_device,
+            const void *max_state_commit_rows_device = nullptr,
+            int leading_committed_output_count = 0)
         {
             (void)verify_tokens_device;
             (void)draft_tokens_device;
@@ -1818,6 +1902,8 @@ namespace llaminar2
             (void)out_token_capacity;
             (void)out_tokens_device;
             (void)out_meta_device;
+            (void)max_state_commit_rows_device;
+            (void)leading_committed_output_count;
             return false;
         }
 
@@ -1853,7 +1939,9 @@ namespace llaminar2
             void *stream,
             int out_token_capacity,
             void *out_tokens_device,
-            void *out_meta_device)
+            void *out_meta_device,
+            const void *max_state_commit_rows_device = nullptr,
+            const void *penalty_policy_device = nullptr)
         {
             (void)verify_tokens_device;
             (void)draft_tokens_device;
@@ -1864,6 +1952,42 @@ namespace llaminar2
             (void)out_token_capacity;
             (void)out_tokens_device;
             (void)out_meta_device;
+            (void)max_state_commit_rows_device;
+            (void)penalty_policy_device;
+            return false;
+        }
+
+        /**
+         * @brief Advance one device-owned maintenance clock from batch metadata.
+         *
+         * Every request summary is evaluated against the same remaining round
+         * budget. This graph-capturable reduction advances the global clock by
+         * the largest compact output count in the request batch, matching the
+         * lockstep round semantics of serial batched decode. The mutable
+         * scalar pointers belong to one persistent controller record, and the
+         * final flag prevents maintenance from also applying the ordinary
+         * one-round serial boundary advance.
+         */
+        virtual bool enqueueAdvanceSpeculativeCommitBoundary(
+            const void *meta_device,
+            int request_count,
+            int meta_stride,
+            void *decode_rounds_committed_device,
+            void *decode_rounds_until_maintenance_device,
+            void *maintenance_due_device,
+            void *decode_boundary_advanced_device,
+            int device_id,
+            void *stream)
+        {
+            (void)meta_device;
+            (void)request_count;
+            (void)meta_stride;
+            (void)decode_rounds_committed_device;
+            (void)decode_rounds_until_maintenance_device;
+            (void)maintenance_due_device;
+            (void)decode_boundary_advanced_device;
+            (void)device_id;
+            (void)stream;
             return false;
         }
 

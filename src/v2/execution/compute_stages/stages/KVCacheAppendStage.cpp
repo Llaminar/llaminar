@@ -367,7 +367,7 @@ namespace llaminar2
                 return true;
             }
 
-            LOG_DEBUG("[KVCacheAppendStage] Batched append: batch_size=" << batch_size
+            LOG_TRACE("[KVCacheAppendStage] Batched append: batch_size=" << batch_size
                                                                          << " seq_len=" << seq_len
                                                                          << " kv_dim=" << kv_dim
                                                                          << " layer=" << params_.layer_idx);
@@ -509,7 +509,7 @@ namespace llaminar2
         }
 
         // Single-sequence path (original behavior)
-        LOG_DEBUG("[KVCacheAppendStage] Single-sequence append: " << total_tokens
+        LOG_TRACE("[KVCacheAppendStage] Single-sequence append: " << total_tokens
                                                                   << " tokens to layer " << params_.layer_idx << " seq " << params_.seq_idx);
 
         // Check if tensors match cache precision - if not, need to convert

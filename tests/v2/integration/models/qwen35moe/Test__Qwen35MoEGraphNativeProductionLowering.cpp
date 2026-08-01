@@ -12,6 +12,7 @@
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
+#include "execution/compute_stages/stages/TPAllreduceStage.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "loaders/ModelContext.h"
@@ -484,6 +485,8 @@ namespace llaminar2::test
             buffers.extensions[BufferId::MOE_EXPERT_INDICES] = arena.fp32({kSeqLen, kTopK});
             buffers.extensions[BufferId::MOE_EXPERT_WEIGHTS] = arena.fp32({kSeqLen, kTopK});
             buffers.extensions[BufferId::MOE_COMBINED_OUTPUT] = arena.fp32({kSeqLen, kDModel});
+            buffers.extensions[BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS] =
+                arena.fp32({kSeqLen, kTopK, kDModel});
             buffers.extensions[BufferId::MOE_SHARED_EXPERT_OUTPUT] = arena.fp32({kSeqLen, kDModel});
             buffers.extensions[BufferId::MOE_GATE_SCRATCH] = arena.fp32({kSeqLen, kIntermediate});
             buffers.extensions[BufferId::MOE_UP_SCRATCH] = arena.fp32({kSeqLen, kIntermediate});
@@ -692,9 +695,60 @@ namespace llaminar2::test
         EXPECT_TRUE(expert_node->stage->supportsLazyPrefillGraphCapturePreflight())
             << "The fixed-topology grouped prefill path is the graph-capturable MoE dispatch contract";
 
-        EXPECT_NE(graph.getNode("layer0_moe_expert_overlay_fast_allreduce"), nullptr)
-            << "Graph-local owner subsets must be rejoined through the continuation TP domain";
+        const auto *allreduce_node =
+            graph.getNode("layer0_moe_canonical_routes_allreduce");
+        ASSERT_NE(allreduce_node, nullptr)
+            << "Graph-local owner subsets must publish router-ordered route slots through the continuation TP domain";
+        const auto *allreduce_stage =
+            dynamic_cast<const TPAllreduceStage *>(allreduce_node->stage.get());
+        ASSERT_NE(allreduce_stage, nullptr);
+        EXPECT_EQ(
+            allreduce_stage->getTensor(),
+            buffers.extensions.at(
+                BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS));
+        EXPECT_EQ(
+            allreduce_stage->getCount(),
+            static_cast<size_t>(kSeqLen * kTopK * kDModel));
+        EXPECT_EQ(allreduce_stage->getPrecision(), "fp32");
+        EXPECT_EQ(
+            allreduce_stage->getTensorBufferId(),
+            std::optional<BufferId>{
+                BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS});
+        EXPECT_TRUE(hasDependency(
+            graph,
+            "layer0_moe_canonical_routes_allreduce",
+            "layer0_moe_expert_ffn_overlay_fast"));
+
+        const auto *reduce_node =
+            graph.getNode("layer0_moe_canonical_routes_reduce");
+        ASSERT_NE(reduce_node, nullptr);
+        EXPECT_EQ(
+            reduce_node->stage->type(),
+            ComputeStageType::MOE_CANONICAL_ROUTE_REDUCE);
+        EXPECT_TRUE(hasDependency(
+            graph,
+            "layer0_moe_canonical_routes_reduce",
+            "layer0_moe_canonical_routes_allreduce"));
+        const auto *reduce_stage =
+            dynamic_cast<const MoECanonicalRouteReduceStage *>(
+                reduce_node->stage.get());
+        ASSERT_NE(reduce_stage, nullptr);
+        EXPECT_EQ(
+            reduce_stage->params().canonical_route_contributions,
+            buffers.extensions.at(
+                BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS));
+        EXPECT_EQ(
+            reduce_stage->params().output,
+            buffers.extensions.at(BufferId::MOE_COMBINED_OUTPUT));
+        EXPECT_EQ(reduce_stage->params().seq_len, kSeqLen);
+        EXPECT_EQ(reduce_stage->params().top_k, kTopK);
+        EXPECT_EQ(reduce_stage->params().d_model, kDModel);
         EXPECT_EQ(countStagesOfType(graph, ComputeStageType::ALLREDUCE), 1u);
+        EXPECT_EQ(
+            countStagesOfType(
+                graph,
+                ComputeStageType::MOE_CANONICAL_ROUTE_REDUCE),
+            1u);
     }
 
     /**
@@ -895,9 +949,9 @@ namespace llaminar2::test
      * in every MoE layer for a three-row verifier batch is not an economical
      * grouped implementation. Prefix rehydration has a separate graph-build
      * flag and is therefore unaffected by this current-batch policy assertion.
-     */
+    */
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
-         LocalTPGroupedVerifierUsesResidentOnlyLLEPAssignment)
+         LocalTPGroupedVerifierUsesLogicalPositionResidentLLEPAssignment)
     {
         ScopedDebugEnv env({
             {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
@@ -931,6 +985,18 @@ namespace llaminar2::test
             makeTestingModelContextWithHotDomainExperts(config.n_layers);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
         ScopedDevicePublicationStream publication_stream(DeviceId::rocm(0));
+        INT32Tensor absolute_positions(
+            {static_cast<size_t>(kSeqLen)});
+        for (int row = 0; row < kSeqLen; ++row)
+            absolute_positions.mutable_int32_data()[row] = 1000 + row;
+        ASSERT_TRUE(
+            absolute_positions.ensureOnDevice(
+                DeviceId::rocm(0),
+                publication_stream.get()));
+        const auto *absolute_positions_device =
+            static_cast<const int32_t *>(
+                absolute_positions.gpu_data_ptr());
+        ASSERT_NE(absolute_positions_device, nullptr);
         ComputeGraph graph = graph_builder.buildFFNGraph(
             layer,
             buffers,
@@ -938,7 +1004,9 @@ namespace llaminar2::test
             /*seq_len=*/3,
             kBatchSize,
             DeviceId::rocm(0),
-            publication_stream.get());
+            publication_stream.get(),
+            /*sequence_lengths_device=*/nullptr,
+            absolute_positions_device);
 
         const auto *expert_node =
             graph.getNode("layer0_moe_expert_ffn_overlay_fast");
@@ -955,10 +1023,16 @@ namespace llaminar2::test
         EXPECT_TRUE(expert_stage->hasPrefillLLEPTPContextForTesting());
         EXPECT_EQ(
             expert_stage->prefillLLEPAssignmentModeForTesting(),
-            PrefillLLEPAssignmentMode::ResidentOnly);
+            PrefillLLEPAssignmentMode::
+                LogicalPositionResidentOnly);
         EXPECT_FALSE(expert_stage->hasTransferBackedPrefillLLEPForTesting())
             << "Grouped verifier rows must never execute current-batch expert "
                "payload transport, even when long-prefill full mode is enabled.";
+        EXPECT_EQ(
+            expert_stage->absolutePositionIdsDeviceForTesting(),
+            absolute_positions_device)
+            << "Resident assignment must consume the exact graph-local "
+               "position row shared with RoPE.";
         EXPECT_TRUE(
             expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting());
     }
@@ -1202,7 +1276,9 @@ namespace llaminar2::test
         ASSERT_EQ(allreduces1.size(), 1u);
         EXPECT_EQ(allreduces0, allreduces1)
             << "LocalTP grouped collectives require every participant graph to enter the same stage name";
-        EXPECT_EQ(allreduces0.front(), "layer0_moe_expert_overlay_fast_allreduce");
+        EXPECT_EQ(allreduces0.front(), "layer0_moe_canonical_routes_allreduce");
+        EXPECT_NE(graph0.getNode("layer0_moe_canonical_routes_reduce"), nullptr);
+        EXPECT_NE(graph1.getNode("layer0_moe_canonical_routes_reduce"), nullptr);
 
         const auto *expert_stage0 = expertComputeStage(graph0, "layer0_moe_expert_ffn_overlay_fast");
         const auto *expert_stage1 = expertComputeStage(graph1, "layer0_moe_expert_ffn_overlay_fast");

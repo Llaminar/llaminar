@@ -1061,6 +1061,19 @@ namespace llaminar2
     MoEExpertComputeStage::MoEExpertComputeStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        if (params_.device_id.is_gpu() &&
+            params_.routed_assignment_policy ==
+                RoutedExpertAssignmentPolicy::LeastLoadedResident &&
+            params_.prefill_llep_tp_ctx &&
+            params_.prefill_llep_assignment_mode ==
+                PrefillLLEPAssignmentMode::LogicalPositionResidentOnly &&
+            !params_.absolute_position_ids_device)
+        {
+            throw std::invalid_argument(
+                "[MoEExpertComputeStage] logical-position resident LLEP "
+                "requires the graph-local device position row");
+        }
+
         /*
          * Runtime placement publication indexes these tables by global expert
          * id even when a participant currently owns no experts. Full model
@@ -1670,6 +1683,87 @@ namespace llaminar2
         return kernel;
     }
 
+    bool MoEExpertComputeStage::publishCommittedGroupedVerifierHistograms(
+        const int32_t *accepted_state_counts_device,
+        const int32_t *publication_ok_flags_device,
+        int request_count,
+        int rows_per_request,
+        void *producer_stream)
+    {
+        if (!requiresCommittedGroupedVerifierHistogramPublication())
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Committed grouped-verifier histogram "
+                "publication was requested from a non-verifier GPU stage");
+            return false;
+        }
+        if (!producer_stream ||
+            !accepted_state_counts_device ||
+            !publication_ok_flags_device ||
+            request_count <= 0 ||
+            rows_per_request <= 0 ||
+            params_.seq_len != request_count * rows_per_request)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Invalid committed grouped-verifier "
+                "histogram publication shape"
+                << " layer=" << params_.layer_idx
+                << " request_count=" << request_count
+                << " rows_per_request=" << rows_per_request
+                << " stage_rows=" << params_.seq_len
+                << " stream=" << producer_stream);
+            return false;
+        }
+        if (!moe_runtime_layer_ || !params_.moe_runtime_table)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Committed grouped-verifier histogram "
+                "publication requires an initialized per-layer device route ledger"
+                << " layer=" << params_.layer_idx);
+            return false;
+        }
+
+        IMoEKernel *kernel = ensureMoEKernel();
+        if (!kernel)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Committed grouped-verifier histogram "
+                "publication could not resolve its graph-owned kernel"
+                << " layer=" << params_.layer_idx);
+            return false;
+        }
+
+        const MoEKernelLaunchContext launch{
+            .stream = producer_stream,
+            .workspace = bound_workspace_};
+        if (!kernel->commitGroupedVerifierHistograms(
+                launch,
+                moe_runtime_layer_,
+                accepted_state_counts_device,
+                publication_ok_flags_device,
+                request_count,
+                rows_per_request,
+                params_.seq_len,
+                params_.num_experts,
+                params_.top_k))
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Backend rejected committed "
+                "grouped-verifier histogram publication"
+                << " layer=" << params_.layer_idx);
+            return false;
+        }
+
+        /*
+         * Host-side diagnostic drains are not part of inference, but they
+         * still need to know which stream owns the newest device histogram.
+         * Recording the pointer does not wait on or inspect the stream.
+         */
+        params_.moe_runtime_table->recordDecodeHistogramProducerStream(
+            producer_stream);
+        return true;
+    }
+
     bool MoEExpertComputeStage::waitForPendingGpuDirectTransfers()
     {
         if (pending_gpu_direct_transfers_.empty())
@@ -2011,6 +2105,7 @@ namespace llaminar2
                     rehydration_kernel,
                     &transfer_status,
                     &apply_status,
+                    PrefillLLEPTransferPurpose::PrefixRuntimeRehydration,
                     params_.prefix_runtime_rehydration_transfer_state.get()) ||
                 !transfer_status ||
                 !apply_status)
@@ -2566,7 +2661,8 @@ namespace llaminar2
                 params_.output,
                 d_model,
                 intermediate,
-                descriptor_source);
+                descriptor_source,
+                params_.canonical_route_contributions);
 
             if (!device_routed_done)
             {
@@ -2577,7 +2673,10 @@ namespace llaminar2
 
             if (!isGraphCaptureActive())
                 runtime_grouped_decode_warmed_ = true;
-            gpuExecution().publish(params_.output);
+            gpuExecution().publish(
+                params_.canonical_route_contributions
+                    ? params_.canonical_route_contributions
+                    : params_.output);
             return true;
         }
 
@@ -2677,7 +2776,8 @@ namespace llaminar2
                     params_.output,
                     d_model,
                     intermediate,
-                    device_routing_expert_mask_ptr))
+                    device_routing_expert_mask_ptr,
+                    params_.canonical_route_contributions))
             {
                 LOG_ERROR("[MoEExpertComputeStage] Mandatory fused explicit-routing "
                           "GPU decode failed for layer "
@@ -2690,7 +2790,10 @@ namespace llaminar2
                 return false;
             }
 
-            gpuExecution().publish(params_.output);
+            gpuExecution().publish(
+                params_.canonical_route_contributions
+                    ? params_.canonical_route_contributions
+                    : params_.output);
             return true;
         }
 
@@ -4954,8 +5057,13 @@ namespace llaminar2
             seq_len,
             d_model);
         gpuExecution().publish(combined_shared_output_.get());
-        if (params_.device_id.is_gpu())
-            gpuExecution().publish(params_.output);
+            if (params_.device_id.is_gpu())
+            {
+                gpuExecution().publish(
+                    params_.canonical_route_contributions
+                        ? params_.canonical_route_contributions
+                        : params_.output);
+            }
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -5022,6 +5130,7 @@ namespace llaminar2
         IMoEKernel *kernel,
         DeviceMoERebalanceStatus **transfer_status_out,
         DeviceMoERebalanceApplyStatus **apply_status_out,
+        PrefillLLEPTransferPurpose purpose,
         DeviceMoERebalanceTransferState *transfer_state_override) const
     {
         if (!kernel)
@@ -5056,7 +5165,18 @@ namespace llaminar2
             return false;
         }
 
-        const auto &config = params_.prefill_llep_rebalance_config;
+        /*
+         * These transaction shapes share transport storage, but they do not
+         * share evidence ownership. Rehydration publishes an already-restored
+         * prefix state and must preserve its histogram window. Current-batch
+         * movement consumes that window and starts the next one. Keep the
+         * distinction in this typed policy derivation so every kernel in the
+         * transaction observes one coherent immutable config value.
+         */
+        const DeviceMoERebalanceConfig config =
+            prefillLLEPTransferConfig(
+                params_.prefill_llep_rebalance_config,
+                purpose);
         if (tracePrefillLLEPStatusEnabled())
         {
             LOG_INFO("[MoEExpertComputeStage] prefill LLEP transfer config"
@@ -5554,19 +5674,64 @@ namespace llaminar2
                      << " gateup_desc_table=" << grouped_gateup_desc_table_id_
                      << " down_desc_table=" << grouped_down_desc_table_id_);
         }
+        const bool retain_routes_for_deferred_commit =
+            requiresCommittedGroupedVerifierHistogramPublication();
+        if (retain_routes_for_deferred_commit)
+        {
+            if (!runtime_grouping || !params_.moe_runtime_table ||
+                !moe_runtime_layer_)
+            {
+                LOG_ERROR(
+                    "[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                    "deferred verifier publication requires runtime grouping and "
+                    "a per-layer device route ledger"
+                    << " layer=" << params_.layer_idx);
+                return false;
+            }
+            if (params_.routed_assignment_policy !=
+                    RoutedExpertAssignmentPolicy::StaticOwner &&
+                params_.routed_assignment_policy !=
+                    RoutedExpertAssignmentPolicy::LeastLoadedResident)
+            {
+                LOG_ERROR(
+                    "[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                    "deferred verifier publication has no final-route boundary "
+                    "for assignment policy="
+                    << routedExpertAssignmentPolicyToString(
+                           params_.routed_assignment_policy)
+                    << " layer=" << params_.layer_idx);
+                return false;
+            }
+            const auto &runtime_state =
+                params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+            const uint64_t required_routes =
+                static_cast<uint64_t>(seq_len) *
+                static_cast<uint64_t>(top_k);
+            if (!runtime_state.deferred_verifier_route_expert_ids ||
+                !runtime_state.deferred_verifier_route_participant_ids ||
+                required_routes >
+                    runtime_state.deferred_verifier_route_capacity)
+            {
+                LOG_ERROR(
+                    "[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                    "per-layer deferred verifier route ledger is absent or undersized"
+                    << " layer=" << params_.layer_idx
+                    << " required_routes=" << required_routes
+                    << " capacity="
+                    << runtime_state.deferred_verifier_route_capacity);
+                return false;
+            }
+        }
+
         bool groups_prepared = false;
         if (runtime_grouping)
         {
             const bool filter_runtime_grouping_to_local_experts =
                 params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner;
-            const bool publish_grouped_verifier_histogram =
-                shouldPublishGroupedVerifierHistograms();
-            const MoEGroupedHistogramUpdate initial_histogram_update =
-                !publish_grouped_verifier_histogram
-                    ? MoEGroupedHistogramUpdate::None
-                    : (filter_runtime_grouping_to_local_experts
-                           ? MoEGroupedHistogramUpdate::SelectedAndLocallyAssignedRoutes
-                           : MoEGroupedHistogramUpdate::SelectedRoutes);
+            const bool retain_routes_during_initial_grouping =
+                retain_routes_for_deferred_commit &&
+                params_.routed_assignment_policy ==
+                    RoutedExpertAssignmentPolicy::StaticOwner;
             groups_prepared = kernel->groupPrefillRoutes(
                 moe_runtime_layer_,
                 params_.routing_indices,
@@ -5576,7 +5741,7 @@ namespace llaminar2
                 num_experts,
                 top_k,
                 filter_runtime_grouping_to_local_experts,
-                initial_histogram_update);
+                retain_routes_during_initial_grouping);
             if (groups_prepared &&
                 !trace_runtime_assignment("after_group"))
             {
@@ -5659,30 +5824,31 @@ namespace llaminar2
                     llep_config.enable_balanced_skip =
                         params_.prefill_llep_rebalance_config
                             .llep_enable_balanced_skip != 0u;
+                    /*
+                     * The graph builder has already resolved typed runtime
+                     * configuration against any explicit environment
+                     * overrides. Re-reading DebugEnv here used process-global
+                     * defaults instead of the policy captured by this graph.
+                     * In particular, a test or request that deliberately set a
+                     * zero economy floor still inherited the production
+                     * relative and per-payload floors, causing the device
+                     * planner to select standard EP without any visible
+                     * configuration error. The stage must consume one immutable
+                     * graph-owned policy object from construction through
+                     * capture and replay.
+                     */
                     llep_config.min_spread_improvement =
-                        static_cast<uint64_t>(
-                            std::max(
-                                0,
-                                moe_env
-                                    .device_rebalance_min_load_spread_improvement));
+                        params_.prefill_llep_rebalance_config
+                            .min_load_spread_improvement;
                     llep_config.min_spread_improvement_divisor =
-                        static_cast<uint32_t>(
-                            std::max(
-                                0,
-                                moe_env
-                                    .device_rebalance_min_load_spread_improvement_divisor));
+                        params_.prefill_llep_rebalance_config
+                            .min_load_spread_improvement_divisor;
                     llep_config.min_spread_improvement_per_transfer =
-                        static_cast<uint64_t>(
-                            std::max(
-                                0,
-                                moe_env
-                                    .device_rebalance_min_wave_spread_improvement_per_payload_slot));
+                        params_.prefill_llep_rebalance_config
+                            .min_wave_spread_improvement_per_payload_slot;
                     llep_config.min_foreign_rows_per_transfer =
-                        static_cast<uint64_t>(
-                            std::max(
-                                0,
-                                moe_env
-                                    .device_rebalance_min_foreign_rows_per_transfer));
+                        params_.prefill_llep_rebalance_config
+                            .min_foreign_rows_per_transfer;
                     const uint32_t physical_transfer_slot_capacity =
                         std::min<uint32_t>(
                             params_.prefill_llep_payload_slot_capacity,
@@ -5713,7 +5879,11 @@ namespace llaminar2
 
                     DeviceMoERebalanceStatus *transfer_status = nullptr;
                     DeviceMoERebalanceApplyStatus *apply_status = nullptr;
-                    if (!executeTransferBackedPrefillLLEPMovement(kernel, &transfer_status, &apply_status))
+                    if (!executeTransferBackedPrefillLLEPMovement(
+                            kernel,
+                            &transfer_status,
+                            &apply_status,
+                            PrefillLLEPTransferPurpose::CurrentBatchMovement))
                     {
                         LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
                                   "transfer-backed LLEP movement failed");
@@ -5751,13 +5921,16 @@ namespace llaminar2
                 else
                 {
                     /*
-                     * Resident-only is a first-class assignment policy, not a
-                     * failed transfer plan. In particular, MTP verifier rows
-                     * enter this branch even when the graph also owns compact
-                     * transport resources for a preceding prefix-rehydration
-                     * transaction. The backend planner considers only the
-                     * active bank's resident masks, making a missing-payload
-                     * destination structurally unrepresentable.
+                     * Resident grouped assignment consumes the exact
+                     * device-owned position row used by RoPE. Serial decode
+                     * uses the same logical-position tie key, so speculative
+                     * histogram publication remains useful maintenance
+                     * evidence without changing the numerical partition.
+                     *
+                     * This is a first-class no-transfer LLEP policy. Prefix
+                     * restore may bind transport resources beside it, but no
+                     * host position, row replay, or transfer path participates
+                     * in the assignment.
                      */
                     groups_prepared =
                         kernel->assignPrefillRoutesLeastLoadedResident(
@@ -5766,7 +5939,8 @@ namespace llaminar2
                             seq_len,
                             seq_len,
                             num_experts,
-                            top_k);
+                            top_k,
+                            params_.absolute_position_ids_device);
                     if (groups_prepared)
                     {
                         PerfStatsCollector::addCounter(
@@ -5778,7 +5952,7 @@ namespace llaminar2
                                 : "prefill",
                             params_.device_id.toString(),
                             {{"stage", "moe_expert_grouped_prefill"},
-                             {"assignment", "resident_only"},
+                             {"assignment", "logical_position_resident"},
                              {"current_batch_transport", "none"},
                              {"layer", std::to_string(params_.layer_idx)},
                              {"seq_len", std::to_string(seq_len)},
@@ -5799,9 +5973,7 @@ namespace llaminar2
                     seq_len,
                     num_experts,
                     top_k,
-                    publish_grouped_verifier_histogram
-                        ? MoEGroupedHistogramUpdate::LocallyAssignedRoutes
-                        : MoEGroupedHistogramUpdate::None);
+                    retain_routes_for_deferred_commit);
                 if (groups_prepared &&
                     !trace_runtime_assignment("after_llep_regroup"))
                 {
@@ -5835,6 +6007,19 @@ namespace llaminar2
             return false;
         }
 
+        if (retain_routes_for_deferred_commit)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "moe_grouped_verifier_route_ledger_fused_publications",
+                1.0,
+                "verifier",
+                params_.device_id.toString(),
+                {{"layer", std::to_string(params_.layer_idx)},
+                 {"rows", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)}});
+        }
+
         // Execute the full grouped pipeline (5 kernel launches, zero sync)
         bool pipeline_ok = false;
         if (runtime_grouping)
@@ -5853,7 +6038,8 @@ namespace llaminar2
                 d_model,
                 intermediate,
                 num_experts,
-                top_k);
+                top_k,
+                params_.canonical_route_contributions);
         }
         else
         {
@@ -5862,7 +6048,8 @@ namespace llaminar2
                 grouped_gateup_desc_table_id_,
                 grouped_down_desc_table_id_,
                 seq_len, d_model, intermediate,
-                num_experts, top_k);
+                num_experts, top_k,
+                params_.canonical_route_contributions);
         }
 
         if (!pipeline_ok)
@@ -6564,8 +6751,21 @@ namespace llaminar2
         StageBufferRequirements reqs;
         if (params_.input)
             reqs.addInput("input", params_.input->shape(), toBufferTensorType(params_.input->native_type()));
-        if (params_.output)
-            reqs.addOutput("output", params_.output->shape(), toBufferTensorType(params_.output->native_type()));
+        if (params_.canonical_route_contributions)
+        {
+            reqs.addOutput(
+                "canonical_route_contributions",
+                params_.canonical_route_contributions->shape(),
+                toBufferTensorType(
+                    params_.canonical_route_contributions->native_type()));
+        }
+        else if (params_.output)
+        {
+            reqs.addOutput(
+                "output",
+                params_.output->shape(),
+                toBufferTensorType(params_.output->native_type()));
+        }
         return reqs;
     }
 
@@ -6578,7 +6778,12 @@ namespace llaminar2
         contract.addInput(params_.input_buffer_id);
         contract.addInput(params_.routing_indices_buffer_id);
         contract.addInput(params_.routing_weights_buffer_id);
-        if (params_.output_registered_in_arena)
+        if (params_.canonical_route_contributions)
+        {
+            contract.addOutput(
+                params_.canonical_route_contributions_buffer_id);
+        }
+        else if (params_.output_registered_in_arena)
             contract.addOutput(params_.output_buffer_id);
 
         if (params_.combine_shared_expert_in_verifier)
@@ -6882,7 +7087,7 @@ namespace llaminar2
         }
 
         bound_workspace_ = workspace;
-        LOG_DEBUG("[MoEExpertComputeStage] Bound workspace to "
+        LOG_TRACE("[MoEExpertComputeStage] Bound workspace to "
                   << gate.size() + up.size() + down.size() << " expert GEMM engines");
     }
 
@@ -7947,7 +8152,7 @@ namespace llaminar2
         bound_workspace_ = workspace;
         if (workspace_changed)
             grouped_decode_warmed_ = false;
-        LOG_DEBUG("[SharedExpertFFNStage] Bound workspace to gate/up/down GEMM engines");
+        LOG_TRACE("[SharedExpertFFNStage] Bound workspace to gate/up/down GEMM engines");
     }
 
     void SharedExpertFFNStage::unbindWorkspace()
@@ -8556,6 +8761,163 @@ namespace llaminar2
         if (params_.combined_output)
             info.addOutput("combined_output", params_.combined_output, params_.seq_len, params_.d_model);
         info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("d_model", params_.d_model);
+        return info;
+    }
+
+    // =========================================================================
+    // MoECanonicalRouteReduceStage
+    // =========================================================================
+
+    MoECanonicalRouteReduceStage::MoECanonicalRouteReduceStage(Params params)
+        : IComputeStage(params.device_id),
+          params_(std::move(params))
+    {
+    }
+
+    bool MoECanonicalRouteReduceStage::execute(IDeviceContext *ctx)
+    {
+        if (!ctx ||
+            !params_.canonical_route_contributions ||
+            !params_.output ||
+            params_.seq_len <= 0 ||
+            params_.top_k <= 0 ||
+            params_.d_model <= 0)
+        {
+            LOG_ERROR("[MoECanonicalRouteReduceStage] Invalid execution contract"
+                      << " ctx=" << (ctx != nullptr)
+                      << " contributions="
+                      << (params_.canonical_route_contributions != nullptr)
+                      << " output=" << (params_.output != nullptr)
+                      << " seq_len=" << params_.seq_len
+                      << " top_k=" << params_.top_k
+                      << " d_model=" << params_.d_model);
+            return false;
+        }
+
+        if (!moe_kernel_)
+        {
+            owned_moe_kernel_ = KernelFactory::createMoEKernel(params_.device_id);
+            moe_kernel_ = owned_moe_kernel_.get();
+        }
+        IMoEKernel *kernel = bindStageStream(moe_kernel_);
+        if (!kernel ||
+            !kernel->reduceCanonicalRouteContributions(
+                params_.canonical_route_contributions,
+                params_.output,
+                params_.seq_len,
+                params_.top_k,
+                params_.d_model))
+        {
+            LOG_ERROR("[MoECanonicalRouteReduceStage] Device reducer failed"
+                      << " device=" << params_.device_id.to_string()
+                      << " seq_len=" << params_.seq_len
+                      << " top_k=" << params_.top_k
+                      << " d_model=" << params_.d_model);
+            return false;
+        }
+
+        const StageGPUExecution execution = gpuExecution();
+        execution.publish(params_.output);
+        if (params_.output->needsUpload())
+        {
+            throw std::runtime_error(
+                "MoE canonical route reducer returned a host-authoritative "
+                "output; GPU repair/upload is forbidden");
+        }
+        return true;
+    }
+
+    size_t MoECanonicalRouteReduceStage::estimatedFlops() const
+    {
+        return static_cast<size_t>(params_.seq_len) *
+               static_cast<size_t>(params_.d_model) *
+               static_cast<size_t>(std::max(0, params_.top_k - 1));
+    }
+
+    bool MoECanonicalRouteReduceStage::supportsBackend(
+        ComputeBackendType backend) const
+    {
+        switch (backend)
+        {
+#if defined(HAVE_CUDA)
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
+#if defined(HAVE_ROCM)
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
+        default:
+            return false;
+        }
+    }
+
+    bool MoECanonicalRouteReduceStage::isGraphCapturable() const
+    {
+        return params_.device_id.is_gpu() && moe_kernel_ != nullptr;
+    }
+
+    bool MoECanonicalRouteReduceStage::supportsWarmupDependentGraphCapture() const
+    {
+        return params_.device_id.is_gpu() &&
+               params_.canonical_route_contributions &&
+               params_.output &&
+               params_.seq_len > 0 &&
+               params_.top_k > 0 &&
+               params_.d_model > 0;
+    }
+
+    StageBufferRequirements
+    MoECanonicalRouteReduceStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+        if (params_.canonical_route_contributions)
+        {
+            reqs.addInput(
+                "canonical_route_contributions",
+                params_.canonical_route_contributions->shape(),
+                toBufferTensorType(
+                    params_.canonical_route_contributions->native_type()));
+        }
+        if (params_.output)
+        {
+            reqs.addOutput(
+                "output",
+                params_.output->shape(),
+                toBufferTensorType(params_.output->native_type()));
+        }
+        return reqs;
+    }
+
+    StageBufferContract MoECanonicalRouteReduceStage::bufferContract() const
+    {
+        return StageBufferContract::build()
+            .addInput(params_.canonical_route_contributions_buffer_id)
+            .addOutput(params_.output_buffer_id);
+    }
+
+    StageDumpInfo MoECanonicalRouteReduceStage::buildDumpInfoImpl() const
+    {
+        StageDumpInfo info;
+        if (params_.canonical_route_contributions)
+        {
+            info.addInput(
+                "canonical_route_contributions",
+                params_.canonical_route_contributions,
+                static_cast<size_t>(params_.seq_len * params_.top_k),
+                static_cast<size_t>(params_.d_model));
+        }
+        if (params_.output)
+        {
+            info.addOutput(
+                "output",
+                params_.output,
+                params_.seq_len,
+                params_.d_model);
+        }
+        info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("top_k", params_.top_k);
         info.addScalarInt("d_model", params_.d_model);
         return info;
     }

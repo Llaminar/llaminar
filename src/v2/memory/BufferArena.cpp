@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -107,6 +108,63 @@ namespace llaminar2
         b.home_device = device;
         b.coherence = {}; // UNINITIALIZED
         return true;
+    }
+
+    bool BufferArena::registerBuffer(
+        BufferId id,
+        const BufferDescriptor &descriptor)
+    {
+        if (descriptor.shape.empty())
+        {
+            throw std::invalid_argument(
+                "BufferArena: graph buffer '" + descriptor.name +
+                "' must declare at least one shape dimension");
+        }
+
+        const size_t rows = descriptor.shape.front();
+        if (rows == 0)
+        {
+            throw std::invalid_argument(
+                "BufferArena: graph buffer '" + descriptor.name +
+                "' has a zero-sized row dimension");
+        }
+
+        // A rank-one tensor is represented as [rows, 1]. For rank-two and
+        // higher tensors, flatten every trailing logical axis into columns so
+        // the arena's matrix representation preserves the complete capacity.
+        size_t cols = 1;
+        for (size_t axis = 1; axis < descriptor.shape.size(); ++axis)
+        {
+            const size_t dimension = descriptor.shape[axis];
+            if (dimension == 0)
+            {
+                throw std::invalid_argument(
+                    "BufferArena: graph buffer '" + descriptor.name +
+                    "' has a zero-sized dimension at axis " +
+                    std::to_string(axis));
+            }
+            if (cols > std::numeric_limits<size_t>::max() / dimension)
+            {
+                throw std::overflow_error(
+                    "BufferArena: trailing shape product overflows for graph buffer '" +
+                    descriptor.name + "'");
+            }
+            cols *= dimension;
+        }
+
+        if (rows > std::numeric_limits<size_t>::max() / cols)
+        {
+            throw std::overflow_error(
+                "BufferArena: element count overflows for graph buffer '" +
+                descriptor.name + "'");
+        }
+
+        return registerBuffer(
+            id,
+            rows,
+            cols,
+            bufferTensorTypeToStr(descriptor.tensor_type),
+            descriptor.device);
     }
 
     bool BufferArena::registerExternalBuffer(BufferId id, ITensor *tensor)
@@ -236,8 +294,6 @@ namespace llaminar2
         case BufferId::ALL_POSITION_LOGITS_LOCAL:
         case BufferId::PREFIX_TERMINAL_LOGITS:
         case BufferId::STOCHASTIC_PROCESSED_LOGITS:
-        case BufferId::MTP_LOGITS:
-        case BufferId::MTP_LOGITS_GATHERED:
             return true;
         default:
             return false;

@@ -139,6 +139,8 @@ namespace llaminar2
             return "MOE_SHARED_EXPERT_FFN";
         case ComputeStageType::MOE_SHARED_EXPERT_GATE:
             return "MOE_SHARED_EXPERT_GATE";
+        case ComputeStageType::MOE_CANONICAL_ROUTE_REDUCE:
+            return "MOE_CANONICAL_ROUTE_REDUCE";
         case ComputeStageType::MOE_EXPERT_DISPATCH:
             return "MOE_EXPERT_DISPATCH";
         case ComputeStageType::MOE_SPARSE_DISPATCH:
@@ -626,7 +628,7 @@ namespace llaminar2
         const void *data = tensor ? tensor->raw_data() : nullptr;
         const char *dtype = tensor ? tensor->dtype_name() : "FP32";
 
-        LOG_DEBUG("[StageDumpInfo::addInput] name=" << name
+        LOG_TRACE("[StageDumpInfo::addInput] name=" << name
                                                     << " tensor=" << (tensor ? "non-null" : "null")
                                                     << " native_type=" << (tensor ? static_cast<int>(tensor->native_type()) : -1)
                                                     << " dtype_name=" << dtype);
@@ -639,7 +641,7 @@ namespace llaminar2
             if (q16_tensor)
             {
                 dtype = q16_tensor->dtype_name_with_block_size();
-                LOG_DEBUG("[StageDumpInfo::addInput] Q16_1 detected, block-size dtype=" << dtype);
+                LOG_TRACE("[StageDumpInfo::addInput] Q16_1 detected, block-size dtype=" << dtype);
             }
             else
             {
@@ -649,7 +651,7 @@ namespace llaminar2
 
         // Compute byte size from logical dimensions and dtype
         size_t byte_size = computeByteSizeForDtype(dtype, rows, cols);
-        LOG_DEBUG("[StageDumpInfo::addInput] Final dtype=" << dtype << " byte_size=" << byte_size);
+        LOG_TRACE("[StageDumpInfo::addInput] Final dtype=" << dtype << " byte_size=" << byte_size);
         size_t element_size = (rows > 0 && cols > 0) ? byte_size / (rows * cols) : sizeof(float);
 
         InputBuffer buf{name, data, rows, cols, dtype, element_size, byte_size};

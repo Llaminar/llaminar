@@ -58,6 +58,15 @@ namespace llaminar2
             IMoERuntimeTable *moe_runtime_table = nullptr;
             bool force_grouped_verifier_prefill_for_decode = false;
             /**
+             * @brief Device-owned absolute position row shared with RoPE.
+             *
+             * Runtime decode uses this stable semantic coordinate when
+             * partitioning replicated experts. The pointer is graph-local and
+             * remains stable across capture replay while its contents advance
+             * on the graph's publication stream.
+             */
+            const int32_t *absolute_position_ids_device = nullptr;
+            /**
              * @brief Explicit graph-local owner shared with the routed expert stage.
              *
              * The paired stages are sequential and exchange router-produced Q8

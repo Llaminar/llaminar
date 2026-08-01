@@ -8258,6 +8258,12 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsStochasticClearCach
     MPI_PROCS 1
     TIMEOUT 1200
 )
+add_v2_test(V2_Integration_Qwen36MoEDynamic_CUDA2TP_LongRequestMaintenanceStateLifetime
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36MoEDynamicPrefixMTPPenaltyCUDA2LongRequestsResetDeviceState
+    LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36MoE;Dynamic;ExpertOverlay;CUDA;GPU;LocalTP;LongContext;DeviceResident;GraphCapture;Regression"
+    MPI_PROCS 1
+    TIMEOUT 1200
+)
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmoke
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;Regression"
@@ -13311,7 +13317,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
         add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_StochasticResidentDraws
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
-                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*CUDA
+                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*CUDA:*BatchedTopKTopPDistributionsAreSerialRowByteExactForEveryMTPDepth*CUDA
             LABELS "V2;Integration;Backend;GPU;CUDA;MTP;GroupedVerifierRows;Sampling;Stochastic;BatchInvariant;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
         )
@@ -13331,7 +13337,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
         add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_StochasticResidentDraws
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
-                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*ROCm
+                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*ROCm:*BatchedTopKTopPDistributionsAreSerialRowByteExactForEveryMTPDepth*ROCm
             LABELS "V2;Integration;Backend;GPU;ROCm;MTP;GroupedVerifierRows;Sampling;Stochastic;BatchInvariant;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
         )

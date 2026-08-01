@@ -503,7 +503,7 @@ namespace llaminar2
         }
         else
         {
-            LOG_DEBUG("[GDNProjectionStage] Mixed projection GEMM kernels; trying supported fused subgroups");
+            LOG_TRACE("[GDNProjectionStage] Mixed projection GEMM kernels; trying supported fused subgroups");
 
             std::vector<bool> completed(projections.size(), false);
             auto runFusedSubgroups = [&](bool require_native_compatibility) -> bool
@@ -596,7 +596,7 @@ namespace llaminar2
             return false;
         }
 
-        LOG_DEBUG("[GDNProjectionStage] Executed: M=" << M << " K=" << K
+        LOG_TRACE("[GDNProjectionStage] Executed: M=" << M << " K=" << K
                                                       << " n_qkv=" << params_.n_qkv
                                                       << " n_z=" << params_.n_z
                                                       << " n_a=" << params_.n_a
@@ -823,7 +823,7 @@ namespace llaminar2
             if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm))
             {
                 consumer->bindWorkspace(workspace);
-                LOG_DEBUG("[GDNProjectionStage] Bound workspace to " << name << " kernel");
+                LOG_TRACE("[GDNProjectionStage] Bound workspace to " << name << " kernel");
             }
         };
 

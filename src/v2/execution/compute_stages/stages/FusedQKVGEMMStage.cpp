@@ -120,7 +120,7 @@ namespace llaminar2
     {
         ScopedGemmContext gemm_ctx(GemmContext::ATTN);
 
-        LOG_DEBUG("[FusedQKVGEMMStage] Execute: m=" << params_.m << " k=" << params_.k
+        LOG_TRACE("[FusedQKVGEMMStage] Execute: m=" << params_.m << " k=" << params_.k
                                                     << " n_q=" << params_.n_q << " n_k=" << params_.n_k << " n_v=" << params_.n_v
                                                     << " device=" << params_.device_id.to_string());
 
@@ -175,14 +175,14 @@ namespace llaminar2
             bindStageStream(gemm_k);
         if (gemm_v)
             bindStageStream(gemm_v);
-        LOG_DEBUG("[FusedQKVGEMMStage] device_id=" << params_.device_id.to_string()
+        LOG_TRACE("[FusedQKVGEMMStage] device_id=" << params_.device_id.to_string()
                                                    << " is_gpu=" << gpu_execution);
         bool success = false;
 
         if (gpu_execution)
         {
             // GPU path: Use tensor-aware API - kernel handles device placement
-            LOG_DEBUG("[FusedQKVGEMMStage] Using tensor-aware GPU path");
+            LOG_TRACE("[FusedQKVGEMMStage] Using tensor-aware GPU path");
 
             // Cast ITensor* to TensorBase* for tensor-aware API
             auto *input_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.input));
@@ -222,7 +222,7 @@ namespace llaminar2
 
             if (success)
             {
-                LOG_DEBUG("[FusedQKVGEMMStage] GPU execution complete");
+                LOG_TRACE("[FusedQKVGEMMStage] GPU execution complete");
             }
         }
         else
@@ -283,7 +283,7 @@ namespace llaminar2
             return false;
         }
 
-        LOG_DEBUG("[FusedQKVGEMMStage] Complete");
+        LOG_TRACE("[FusedQKVGEMMStage] Complete");
         return true;
     }
 
@@ -547,17 +547,17 @@ namespace llaminar2
         if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
         {
             consumer_q->bindWorkspace(workspace);
-            LOG_DEBUG("[FusedQKVGEMMStage] Bound workspace to Q kernel");
+            LOG_TRACE("[FusedQKVGEMMStage] Bound workspace to Q kernel");
         }
         if (auto *consumer_k = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_k_))
         {
             consumer_k->bindWorkspace(workspace);
-            LOG_DEBUG("[FusedQKVGEMMStage] Bound workspace to K kernel");
+            LOG_TRACE("[FusedQKVGEMMStage] Bound workspace to K kernel");
         }
         if (auto *consumer_v = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_v_))
         {
             consumer_v->bindWorkspace(workspace);
-            LOG_DEBUG("[FusedQKVGEMMStage] Bound workspace to V kernel");
+            LOG_TRACE("[FusedQKVGEMMStage] Bound workspace to V kernel");
         }
 
         // Store workspace reference for hasWorkspace()/getWorkspace()

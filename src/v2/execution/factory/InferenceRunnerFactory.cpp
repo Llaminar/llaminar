@@ -1195,8 +1195,7 @@ namespace llaminar2
      */
     bool needsLocalTPMirroredMTPHeadWeights(const GraphConfig &graph_config)
     {
-        return graph_config.mtp.enabled &&
-               graph_config.mtp.mirror_full_head_for_local_tp &&
+        return graph_config.mtp.mirror_full_head_for_local_tp &&
                graph_config.lm_head_column_parallel &&
                graph_config.tp_config &&
                graph_config.tp_ctx &&
@@ -2681,12 +2680,20 @@ namespace llaminar2
 
         LOG_DEBUG("[InferenceRunner] DeviceGraphOrchestrator created successfully");
 
-        if (device.is_cpu() && architecture == "qwen35moe" && graph_config.moe.num_experts > 0)
+        const bool eager_cpu_moe_materialization =
+            device.is_cpu() &&
+            architecture == "qwen35moe" &&
+            graph_config.moe.num_experts > 0;
+        const bool eager_gpu_graph_family_materialization =
+            device.is_gpu() &&
+            graph_config.requiresEagerGPUWorkspaceFamilyManifest();
+        if (eager_cpu_moe_materialization ||
+            eager_gpu_graph_family_materialization)
         {
-            ScopedWeightLoadDetailTimer timer("graph.build.eager_moe_expert_materialization");
+            ScopedWeightLoadDetailTimer timer("graph.build.eager_graph_family_materialization");
             if (!orchestrator->materializeForwardGraphForShape(/*seq_len=*/1, config.batch_size))
             {
-                LOG_ERROR("[InferenceRunner] Failed eager Qwen35 MoE expert graph materialization on "
+                LOG_ERROR("[InferenceRunner] Failed eager graph-family materialization on "
                           << device.to_string());
                 return nullptr;
             }
@@ -4393,11 +4400,19 @@ namespace llaminar2
             }
         }
 
-        if (device.is_cpu() && architecture == "qwen35moe" && graph_config.moe.num_experts > 0)
+        const bool eager_cpu_moe_materialization =
+            device.is_cpu() &&
+            architecture == "qwen35moe" &&
+            graph_config.moe.num_experts > 0;
+        const bool eager_gpu_graph_family_materialization =
+            device.is_gpu() &&
+            graph_config.requiresEagerGPUWorkspaceFamilyManifest();
+        if (eager_cpu_moe_materialization ||
+            eager_gpu_graph_family_materialization)
         {
             if (!orchestrator->materializeForwardGraphForShape(/*seq_len=*/1, config.batch_size))
             {
-                LOG_ERROR("[InferenceRunner] Failed eager Qwen35 MoE expert graph materialization on "
+                LOG_ERROR("[InferenceRunner] Failed eager graph-family materialization on "
                           << device.to_string());
                 return nullptr;
             }

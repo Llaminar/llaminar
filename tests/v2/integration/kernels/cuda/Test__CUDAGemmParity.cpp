@@ -106,6 +106,18 @@ extern "C"
 	    bool cudaNativeVNNIInitIQGridTables_tuned();
 	    void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int enabled);
 	    int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config();
+	    void cudaNativeVNNIGemvTuned_setSerialPartitionN(int n);
+	    int cudaNativeVNNIGemvTuned_getSerialPartitionN();
+	    bool cudaNativeVNNIGemvTuned_queryGeneratedDispatch(
+	        uint8_t codebook_id,
+	        int graph_captured,
+	        int m,
+	        int n,
+	        int k,
+	        int *shape_id,
+	        int *tile_n,
+	        int *cpt,
+	        int *exact_kb);
 	    bool cudaQuantGemm_quantizeActivationsBlockwise(
         const float *d_A_fp32,
         int8_t *d_A_int8,
@@ -153,6 +165,31 @@ extern "C"
 
 namespace
 {
+#ifdef HAVE_CUDA
+    class ScopedCudaSerialPartitionPolicy final
+    {
+    public:
+        explicit ScopedCudaSerialPartitionPolicy(int n)
+            : previous_(cudaNativeVNNIGemvTuned_getSerialPartitionN())
+        {
+            cudaNativeVNNIGemvTuned_setSerialPartitionN(n);
+        }
+
+        ~ScopedCudaSerialPartitionPolicy()
+        {
+            cudaNativeVNNIGemvTuned_setSerialPartitionN(previous_);
+        }
+
+        ScopedCudaSerialPartitionPolicy(
+            const ScopedCudaSerialPartitionPolicy &) = delete;
+        ScopedCudaSerialPartitionPolicy &operator=(
+            const ScopedCudaSerialPartitionPolicy &) = delete;
+
+    private:
+        int previous_ = 0;
+    };
+#endif
+
     class ScopedEnv
     {
     public:
@@ -1541,6 +1578,59 @@ namespace
     }
 
 } // namespace
+
+#ifdef HAVE_CUDA
+/**
+ * @test Mirrored Qwen3.6 LM-head dispatch inherits serial LocalTP geometry.
+ *
+ * This checks every generated CUDA launch field, not only exact K partitions:
+ * kernel family, tile width, columns per thread, and reduction partitioning all
+ * influence per-column arithmetic and must follow the serial shard contract.
+ */
+TEST(Test__CUDAGemmParityPolicy,
+     MirroredQwen36IQ3SLMHeadUsesSerialShardArithmeticPolicy)
+{
+    constexpr uint8_t IQ3_S_CODEBOOK = 11;
+    constexpr int FULL_N = 248320;
+    constexpr int SERIAL_PARTITION_N = 124160;
+    constexpr int K = 2048;
+
+    for (const int graph_captured : {0, 1})
+    {
+        std::array<int, 4> serial{};
+        ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryGeneratedDispatch(
+            IQ3_S_CODEBOOK,
+            graph_captured,
+            1,
+            SERIAL_PARTITION_N,
+            K,
+            &serial[0],
+            &serial[1],
+            &serial[2],
+            &serial[3]));
+
+        std::array<int, 4> mirrored{};
+        {
+            ScopedCudaSerialPartitionPolicy serial_partition_scope(
+                SERIAL_PARTITION_N);
+            ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryGeneratedDispatch(
+                IQ3_S_CODEBOOK,
+                graph_captured,
+                1,
+                FULL_N,
+                K,
+                &mirrored[0],
+                &mirrored[1],
+                &mirrored[2],
+                &mirrored[3]));
+        }
+
+        EXPECT_EQ(mirrored, serial)
+            << "graph_captured=" << graph_captured;
+    }
+    EXPECT_EQ(cudaNativeVNNIGemvTuned_getSerialPartitionN(), 0);
+}
+#endif
 
 // ============================================================================
 // Test Fixture

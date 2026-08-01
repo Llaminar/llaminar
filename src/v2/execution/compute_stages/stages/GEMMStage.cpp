@@ -303,7 +303,7 @@ namespace llaminar2
                 return false;
         }
 
-        LOG_DEBUG("[GEMMStage] Execute GEMM: " << params_.m << "x" << effective_n << "x" << params_.k
+        LOG_TRACE("[GEMMStage] Execute GEMM: " << params_.m << "x" << effective_n << "x" << params_.k
                                                << (is_sliced ? " (SLICED)" : "")
                                                << " weight ptr=" << static_cast<const void *>(params_.B)
                                                << " weight shape=[" << (params_.B ? params_.B->shape()[0] : 0) << ","
@@ -354,7 +354,7 @@ namespace llaminar2
             cache_resolved_ = true;
             if (is_sliced)
             {
-                LOG_DEBUG("[GEMMStage] Using prepared sliced kernel for rows [" << params_.output_range.start
+                LOG_TRACE("[GEMMStage] Using prepared sliced kernel for rows [" << params_.output_range.start
                                                                                 << ", " << params_.output_range.end << ")");
             }
         }
@@ -368,7 +368,7 @@ namespace llaminar2
         // Thread GPU stream for graph capture
         bindStageStream(gemm);
 
-        LOG_DEBUG("[GEMMStage] Got kernel ptr=" << static_cast<const void *>(gemm)
+        LOG_TRACE("[GEMMStage] Got kernel ptr=" << static_cast<const void *>(gemm)
                                                 << " for weight ITensor*=" << static_cast<const void *>(params_.B)
                                                 << " TensorBase*=" << static_cast<const void *>(B_base));
 
@@ -395,7 +395,7 @@ namespace llaminar2
                     getWorkspace()))
             {
                 publishStageOutput(C_base);
-                LOG_DEBUG("[GEMMStage] Fused SwiGLU+GEMM completed via ITensorGemm");
+                LOG_TRACE("[GEMMStage] Fused SwiGLU+GEMM completed via ITensorGemm");
                 traceOutput("C", params_.C);
                 return true;
             }
@@ -451,7 +451,7 @@ namespace llaminar2
             auto *A_base = requireTensorBase(params_.A, "input A");
             auto *C_base = asTensorBase(params_.C, "output C");
 
-            LOG_DEBUG("[GEMMStage] Using multiply_tensor for type-aware dispatch: "
+            LOG_TRACE("[GEMMStage] Using multiply_tensor for type-aware dispatch: "
                       << "input_type=" << params_.A->dtype_name()
                       << " output_type=" << params_.C->dtype_name());
             bool success = gemm->multiply_tensor(

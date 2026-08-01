@@ -18,6 +18,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <limits>
+#include <map>
+#include <unordered_map>
 
 namespace llaminar2
 {
@@ -41,6 +44,10 @@ namespace llaminar2
         hash = mixPublicationHash(hash, key.word1);
         hash = mixPublicationHash(hash, key.word2);
         hash = mixPublicationHash(hash, key.word3);
+        for (const std::uint64_t word : key.identity_words)
+        {
+            hash = mixPublicationHash(hash, word);
+        }
         return hash;
     }
 
@@ -135,7 +142,7 @@ namespace llaminar2
         LOG_DEBUG("[DeviceWorkspaceManager] Workspace requirements (" << requirements.buffers.size() << " buffers):");
         for (const auto &buf : requirements.buffers)
         {
-            LOG_DEBUG("[DeviceWorkspaceManager]   - " << buf.name << ": " << (buf.size_bytes / (1024 * 1024)) << " MB"
+            LOG_TRACE("[DeviceWorkspaceManager]   - " << buf.name << ": " << (buf.size_bytes / (1024 * 1024)) << " MB"
                                                       << (buf.required ? " (required)" : " (optional)"));
         }
         LOG_DEBUG("[DeviceWorkspaceManager] Total size needed: " << (total_size / (1024 * 1024)) << " MB, budget: " << (budget_bytes_ / (1024 * 1024)) << " MB");
@@ -203,6 +210,358 @@ namespace llaminar2
             all_buffers.push_back(&buf);
         }
         return allocateBuffers(all_buffers, total_size);
+    }
+
+    SerialWorkspaceFamilyPlan DeviceWorkspaceManager::planSerialFamily(
+        const std::vector<WorkspaceRequirements> &participants)
+    {
+        SerialWorkspaceFamilyPlan plan;
+
+        /*
+         * A sorted map gives every workspace ABI name a deterministic index.
+         * The canonical descriptor records the capacity that must be published
+         * before capture, independent of which participant happened to be
+         * discovered first.
+         */
+        std::map<std::string, WorkspaceDescriptor> canonical_by_name;
+        for (const WorkspaceRequirements &participant : participants)
+        {
+            for (const WorkspaceDescriptor &descriptor : participant.buffers)
+            {
+                if (descriptor.name.empty())
+                {
+                    plan.error =
+                        "Serial workspace family contains an empty buffer name";
+                    return plan;
+                }
+                if (descriptor.alignment == 0 ||
+                    (descriptor.alignment & (descriptor.alignment - 1)) != 0)
+                {
+                    plan.error =
+                        "Serial workspace buffer '" + descriptor.name +
+                        "' has non-power-of-two alignment " +
+                        std::to_string(descriptor.alignment);
+                    return plan;
+                }
+
+                auto [it, inserted] =
+                    canonical_by_name.emplace(descriptor.name, descriptor);
+                if (inserted)
+                    continue;
+
+                WorkspaceDescriptor &canonical = it->second;
+                canonical.size_bytes =
+                    std::max(canonical.size_bytes, descriptor.size_bytes);
+                canonical.alignment =
+                    std::max(canonical.alignment, descriptor.alignment);
+                canonical.required =
+                    canonical.required || descriptor.required;
+                if (canonical.regime != descriptor.regime)
+                    canonical.regime = WorkspaceExecutionRegime::Any;
+            }
+        }
+
+        if (canonical_by_name.empty())
+            return plan;
+
+        std::vector<WorkspaceDescriptor> descriptors;
+        descriptors.reserve(canonical_by_name.size());
+        std::unordered_map<std::string, size_t> index_by_name;
+        index_by_name.reserve(canonical_by_name.size());
+        for (const auto &[name, descriptor] : canonical_by_name)
+        {
+            index_by_name.emplace(name, descriptors.size());
+            descriptors.push_back(descriptor);
+        }
+
+        /*
+         * Each participant is a clique in the interval-conflict graph, but a
+         * shared name may expose a larger family capacity than one participant
+         * actually touches. Record directional live extents for each co-resident
+         * pair: [A][B] is the largest prefix of A used by any participant that
+         * also contains B. This lets a compact-only arena reuse the unused tail
+         * of a large prefill buffer without lying about A's published capacity.
+         *
+         * A dense size matrix is intentional: production families have
+         * hundreds, not millions, of names, and the representation remains
+         * negligible beside model materialization.
+         */
+        const size_t count = descriptors.size();
+        std::vector<std::vector<size_t>> coexistent_live_extents(
+            count,
+            std::vector<size_t>(count, size_t{0}));
+        for (const WorkspaceRequirements &participant : participants)
+        {
+            std::unordered_map<size_t, size_t> live_extent_by_index;
+            live_extent_by_index.reserve(participant.buffers.size());
+            for (const WorkspaceDescriptor &descriptor : participant.buffers)
+            {
+                const size_t index = index_by_name.at(descriptor.name);
+                live_extent_by_index[index] =
+                    std::max(
+                        live_extent_by_index[index],
+                        descriptor.size_bytes);
+            }
+
+            std::vector<std::pair<size_t, size_t>> participant_buffers(
+                live_extent_by_index.begin(),
+                live_extent_by_index.end());
+            for (size_t left = 0; left < participant_buffers.size(); ++left)
+            {
+                for (size_t right = left + 1;
+                     right < participant_buffers.size();
+                     ++right)
+                {
+                    const auto [lhs, lhs_extent] =
+                        participant_buffers[left];
+                    const auto [rhs, rhs_extent] =
+                        participant_buffers[right];
+                    coexistent_live_extents[lhs][rhs] =
+                        std::max(
+                            coexistent_live_extents[lhs][rhs],
+                            lhs_extent);
+                    coexistent_live_extents[rhs][lhs] =
+                        std::max(
+                            coexistent_live_extents[rhs][lhs],
+                            rhs_extent);
+                }
+            }
+        }
+
+        std::vector<size_t> placement_order(count);
+        for (size_t index = 0; index < count; ++index)
+            placement_order[index] = index;
+        std::sort(
+            placement_order.begin(),
+            placement_order.end(),
+            [&](size_t lhs, size_t rhs)
+            {
+                if (descriptors[lhs].size_bytes !=
+                    descriptors[rhs].size_bytes)
+                {
+                    return descriptors[lhs].size_bytes >
+                           descriptors[rhs].size_bytes;
+                }
+                if (descriptors[lhs].alignment !=
+                    descriptors[rhs].alignment)
+                {
+                    return descriptors[lhs].alignment >
+                           descriptors[rhs].alignment;
+                }
+                return descriptors[lhs].name < descriptors[rhs].name;
+            });
+
+        struct ConflictInterval
+        {
+            size_t begin = 0;
+            size_t end = 0;
+            size_t current_live_extent = 0;
+        };
+        std::vector<size_t> offsets(count, 0);
+        std::vector<uint8_t> placed(count, uint8_t{0});
+
+        for (const size_t index : placement_order)
+        {
+            const WorkspaceDescriptor &descriptor = descriptors[index];
+            std::vector<ConflictInterval> forbidden;
+            forbidden.reserve(count);
+            for (size_t other = 0; other < count; ++other)
+            {
+                const size_t current_live_extent =
+                    coexistent_live_extents[index][other];
+                const size_t other_live_extent =
+                    coexistent_live_extents[other][index];
+                if (!placed[other] ||
+                    current_live_extent == 0 ||
+                    other_live_extent == 0)
+                {
+                    continue;
+                }
+                if (other_live_extent >
+                    std::numeric_limits<size_t>::max() - offsets[other])
+                {
+                    plan.error =
+                        "Serial workspace interval overflow for '" +
+                        descriptors[other].name + "'";
+                    return plan;
+                }
+                forbidden.push_back(ConflictInterval{
+                    .begin = offsets[other],
+                    .end = offsets[other] + other_live_extent,
+                    .current_live_extent = current_live_extent,
+                });
+            }
+            std::sort(
+                forbidden.begin(),
+                forbidden.end(),
+                [](const ConflictInterval &lhs,
+                   const ConflictInterval &rhs)
+                {
+                    if (lhs.begin != rhs.begin)
+                        return lhs.begin < rhs.begin;
+                    return lhs.end < rhs.end;
+                });
+
+            size_t candidate = 0;
+            for (const ConflictInterval &interval : forbidden)
+            {
+                candidate = alignUp(candidate, descriptor.alignment);
+                if (candidate <= interval.begin &&
+                    interval.current_live_extent <=
+                        interval.begin - candidate)
+                {
+                    continue;
+                }
+                if (interval.end > candidate)
+                    candidate = interval.end;
+            }
+            candidate = alignUp(candidate, descriptor.alignment);
+            if (descriptor.size_bytes >
+                std::numeric_limits<size_t>::max() - candidate)
+            {
+                plan.error =
+                    "Serial workspace placement overflow for '" +
+                    descriptor.name + "'";
+                return plan;
+            }
+
+            offsets[index] = candidate;
+            placed[index] = uint8_t{1};
+            plan.total_bytes = std::max(
+                plan.total_bytes,
+                candidate + descriptor.size_bytes);
+        }
+
+        plan.placements.reserve(count);
+        for (size_t index = 0; index < count; ++index)
+        {
+            plan.placements.push_back(SerialWorkspaceBufferPlacement{
+                .descriptor = descriptors[index],
+                .offset = offsets[index],
+            });
+        }
+
+        /*
+         * Keep a final independent validation close to the planner. A future
+         * heuristic change must fail here instead of publishing overlapping
+         * addresses to a captured graph.
+         */
+        for (size_t lhs = 0; lhs < count; ++lhs)
+        {
+            for (size_t rhs = lhs + 1; rhs < count; ++rhs)
+            {
+                const size_t lhs_live_extent =
+                    coexistent_live_extents[lhs][rhs];
+                const size_t rhs_live_extent =
+                    coexistent_live_extents[rhs][lhs];
+                if (lhs_live_extent == 0 || rhs_live_extent == 0)
+                    continue;
+                const size_t lhs_end =
+                    offsets[lhs] + lhs_live_extent;
+                const size_t rhs_end =
+                    offsets[rhs] + rhs_live_extent;
+                if (offsets[lhs] < rhs_end && offsets[rhs] < lhs_end)
+                {
+                    plan.error =
+                        "Serial workspace planner overlapped co-resident names '" +
+                        descriptors[lhs].name + "' and '" +
+                        descriptors[rhs].name + "'";
+                    plan.placements.clear();
+                    plan.total_bytes = 0;
+                    return plan;
+                }
+            }
+        }
+
+        return plan;
+    }
+
+    bool DeviceWorkspaceManager::allocateSerialFamily(
+        const SerialWorkspaceFamilyPlan &plan)
+    {
+        if (allocated_)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Cannot allocate a serial family after workspace publication on "
+                      << device_.to_string());
+            return false;
+        }
+        if (!plan.valid())
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Refusing invalid serial workspace family plan on "
+                      << device_.to_string() << ": " << plan.error);
+            return false;
+        }
+        if (plan.total_bytes > budget_bytes_)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Serial workspace family requires "
+                      << plan.total_bytes << " bytes but budget is "
+                      << budget_bytes_ << " bytes on " << device_.to_string());
+            /*
+             * A family-sized budget miss is a declaration defect, not a
+             * recoverable allocation failure. Attribute the largest canonical
+             * names while the complete plan is still available so operators
+             * can identify an accidental M/K multiplier or lifetime-policy
+             * error without enabling millions of per-stage DEBUG messages.
+             */
+            std::vector<const SerialWorkspaceBufferPlacement *>
+                largest_placements;
+            largest_placements.reserve(plan.placements.size());
+            for (const auto &placement : plan.placements)
+                largest_placements.push_back(&placement);
+            std::sort(
+                largest_placements.begin(),
+                largest_placements.end(),
+                [](const SerialWorkspaceBufferPlacement *lhs,
+                   const SerialWorkspaceBufferPlacement *rhs)
+                {
+                    if (lhs->descriptor.size_bytes !=
+                        rhs->descriptor.size_bytes)
+                    {
+                        return lhs->descriptor.size_bytes >
+                               rhs->descriptor.size_bytes;
+                    }
+                    return lhs->descriptor.name <
+                           rhs->descriptor.name;
+                });
+            constexpr size_t kMaximumDiagnosticPlacements = 12;
+            const size_t diagnostic_count = std::min(
+                kMaximumDiagnosticPlacements,
+                largest_placements.size());
+            for (size_t index = 0;
+                 index < diagnostic_count;
+                 ++index)
+            {
+                const auto &placement =
+                    *largest_placements[index];
+                LOG_ERROR("[DeviceWorkspaceManager] Oversized serial-family contributor rank="
+                          << index
+                          << " name="
+                          << placement.descriptor.name
+                          << " bytes="
+                          << placement.descriptor.size_bytes
+                          << " offset="
+                          << placement.offset
+                          << " regime="
+                          << static_cast<int>(
+                                 placement.descriptor.regime)
+                          << " required="
+                          << placement.descriptor.required);
+            }
+            return false;
+        }
+        if (plan.placements.empty())
+        {
+            if (plan.total_bytes != 0)
+            {
+                LOG_ERROR("[DeviceWorkspaceManager] Empty serial workspace family has non-zero physical size on "
+                          << device_.to_string());
+                return false;
+            }
+            allocated_ = true;
+            return true;
+        }
+
+        return allocatePlacedBuffers(plan.placements, plan.total_bytes);
     }
 
     bool DeviceWorkspaceManager::extend(
@@ -530,6 +889,36 @@ namespace llaminar2
         const std::vector<const WorkspaceDescriptor *> &buffers,
         size_t total_size)
     {
+        std::vector<SerialWorkspaceBufferPlacement> placements;
+        placements.reserve(buffers.size());
+        size_t current_offset = 0;
+        for (const WorkspaceDescriptor *buffer : buffers)
+        {
+            current_offset = alignUp(current_offset, buffer->alignment);
+            placements.push_back(SerialWorkspaceBufferPlacement{
+                .descriptor = *buffer,
+                .offset = current_offset,
+            });
+            current_offset += buffer->size_bytes;
+        }
+        const bool allocated =
+            allocatePlacedBuffers(placements, total_size);
+        if (allocated)
+        {
+            /*
+             * The generic allocator may reserve an unmapped tail for legacy
+             * callers. Preserve its historical logical-usage accounting;
+             * allocateSerialFamily owns and reports its complete physical plan.
+             */
+            used_bytes_ = current_offset;
+        }
+        return allocated;
+    }
+
+    bool DeviceWorkspaceManager::allocatePlacedBuffers(
+        const std::vector<SerialWorkspaceBufferPlacement> &placements,
+        size_t total_size)
+    {
         // Get backend for device
         IBackend *backend = getBackendFor(device_);
         if (!backend)
@@ -552,8 +941,13 @@ namespace llaminar2
         if (!device_.is_cpu())
         {
             size_t max_alignment = 1;
-            for (const auto *buf : buffers)
-                max_alignment = std::max(max_alignment, buf->alignment);
+            for (const auto &placement : placements)
+            {
+                max_alignment =
+                    std::max(
+                        max_alignment,
+                        placement.descriptor.alignment);
+            }
             const auto block_addr = reinterpret_cast<std::uintptr_t>(block_);
             if ((block_addr & (max_alignment - 1)) != 0)
             {
@@ -573,10 +967,10 @@ namespace llaminar2
                                                  << " device=" << device_.to_string()
                                                  << " ordinal=" << device_ordinal);
         logVramBomLine(
-            "workspace_block",
-            "device=" + device_.to_string() +
+                "workspace_block",
+                "device=" + device_.to_string() +
                 " manager_id=" + std::to_string(id_) +
-                " buffer_count=" + std::to_string(buffers.size()) +
+                " buffer_count=" + std::to_string(placements.size()) +
                 " budget_bytes=" + std::to_string(budget_bytes_) +
                 " budget_mib=" + vramBomMiB(budget_bytes_) +
                 " " + vramBomBytes(total_size));
@@ -586,33 +980,46 @@ namespace llaminar2
             static_cast<double>(total_size),
             "allocate",
             device_.to_string(),
-            {{"budget_bytes", std::to_string(budget_bytes_)},
-             {"buffer_count", std::to_string(buffers.size())},
+             {{"budget_bytes", std::to_string(budget_bytes_)},
+             {"buffer_count", std::to_string(placements.size())},
              {"bytes", std::to_string(total_size)}});
 
-        // Suballocate buffers at aligned offsets
-        size_t current_offset = 0;
-        for (const auto *buf : buffers)
+        // Publish every planned name at its stable pre-capture offset.
+        for (const auto &placement : placements)
         {
-            current_offset = alignUp(current_offset, buf->alignment);
+            const WorkspaceDescriptor &buffer = placement.descriptor;
+            if (placement.offset > total_size ||
+                buffer.size_bytes > total_size - placement.offset)
+            {
+                LOG_ERROR("[DeviceWorkspaceManager] Workspace placement for '"
+                          << buffer.name << "' exceeds the primary block on "
+                          << device_.to_string());
+                backend->free(block_, device_ordinal);
+                block_ = nullptr;
+                block_size_ = 0;
+                buffers_.clear();
+                used_bytes_ = 0;
+                return false;
+            }
 
             BufferInfo info;
             info.base = block_;
-            info.offset = current_offset;
-            info.size = buf->size_bytes;
-            buffers_[buf->name] = info;
+            info.offset = placement.offset;
+            info.size = buffer.size_bytes;
+            buffers_[buffer.name] = info;
 
-            void *buf_ptr = static_cast<char *>(block_) + current_offset;
+            void *buf_ptr =
+                static_cast<char *>(block_) + placement.offset;
             if (!device_.is_cpu())
             {
                 const auto addr = reinterpret_cast<std::uintptr_t>(buf_ptr);
-                if ((addr & (buf->alignment - 1)) != 0)
+                if ((addr & (buffer.alignment - 1)) != 0)
                 {
-                    LOG_ERROR("[DeviceWorkspaceManager] Workspace buffer '" << buf->name
+                    LOG_ERROR("[DeviceWorkspaceManager] Workspace buffer '" << buffer.name
                                                                             << "' on " << device_.to_string()
-                                                                            << " is not aligned to " << buf->alignment
+                                                                            << " is not aligned to " << buffer.alignment
                                                                             << " bytes (ptr=" << buf_ptr
-                                                                            << ", offset=" << current_offset << ")");
+                                                                            << ", offset=" << placement.offset << ")");
                     backend->free(block_, device_ordinal);
                     block_ = nullptr;
                     block_size_ = 0;
@@ -621,36 +1028,34 @@ namespace llaminar2
                     return false;
                 }
             }
-            LOG_TRACE("[WORKSPACE_SUBALLOC] '" << buf->name << "'"
+            LOG_TRACE("[WORKSPACE_SUBALLOC] '" << buffer.name << "'"
                                                << " ptr=" << buf_ptr
-                                               << " offset=" << current_offset
-                                               << " size=" << buf->size_bytes
+                                               << " offset=" << placement.offset
+                                               << " size=" << buffer.size_bytes
                                                << " device=" << device_.to_string());
             logVramBomLine(
                 "workspace_buffer",
                 "device=" + device_.to_string() +
-                    " manager_id=" + std::to_string(id_) +
-                    " name=" + buf->name +
-                    " required=" + (buf->required ? "true" : "false") +
-                    " alignment=" + std::to_string(buf->alignment) +
-                    " offset_bytes=" + std::to_string(current_offset) +
-                    " " + vramBomBytes(buf->size_bytes));
+                " manager_id=" + std::to_string(id_) +
+                " name=" + buffer.name +
+                " required=" + (buffer.required ? "true" : "false") +
+                " alignment=" + std::to_string(buffer.alignment) +
+                " offset_bytes=" + std::to_string(placement.offset) +
+                " " + vramBomBytes(buffer.size_bytes));
             PerfStatsCollector::addCounter(
                 "memory",
                 "workspace_suballoc_bytes",
-                static_cast<double>(buf->size_bytes),
+                static_cast<double>(buffer.size_bytes),
                 "allocate",
                 device_.to_string(),
-                {{"name", buf->name},
-                 {"required", buf->required ? "true" : "false"},
-                 {"alignment", std::to_string(buf->alignment)},
-                 {"offset_bytes", std::to_string(current_offset)},
-                 {"bytes", std::to_string(buf->size_bytes)}});
-
-            current_offset += buf->size_bytes;
+                {{"name", buffer.name},
+                 {"required", buffer.required ? "true" : "false"},
+                 {"alignment", std::to_string(buffer.alignment)},
+                 {"offset_bytes", std::to_string(placement.offset)},
+                 {"bytes", std::to_string(buffer.size_bytes)}});
         }
 
-        used_bytes_ = current_offset;
+        used_bytes_ = total_size;
         allocated_ = true;
 
         LOG_TRACE("[DeviceWorkspaceManager] Allocated " << buffers_.size() << " buffers, "
@@ -1033,6 +1438,74 @@ namespace llaminar2
             .slot = slot,
             .created = true,
         };
+    }
+
+    bool DeviceWorkspaceManager::rewritePersistentPublication(
+            const std::string &domain,
+            const PersistentWorkspacePublicationKey &new_key,
+            const std::shared_ptr<void> &publication,
+            size_t slot,
+            size_t slot_capacity,
+            const PersistentWorkspacePublicationRewrite &rewrite)
+    {
+        if (domain.empty() || !publication || slot_capacity == 0 ||
+            slot >= slot_capacity || !rewrite)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Ordered publication rewrite "
+                      "requires a valid domain, publication, slot, capacity, "
+                      "and producer");
+            return false;
+        }
+
+        auto registry = persistent_slot_registry_;
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        const auto slots_it = registry->occupied_slots.find(domain);
+        if (slots_it == registry->occupied_slots.end() ||
+            slots_it->second.size() != slot_capacity ||
+            slot >= slots_it->second.size() ||
+            !slots_it->second[slot])
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Ordered publication rewrite "
+                      "does not own its declared slot in domain '"
+                      << domain << "'");
+            return false;
+        }
+
+        auto &publications = registry->immutable_publications[domain];
+        if (!rewrite())
+        {
+            return false;
+        }
+        for (auto it = publications.begin(); it != publications.end();)
+        {
+            if (it->second.publication == publication)
+            {
+                if (it->second.slot != slot)
+                {
+                    LOG_ERROR("[DeviceWorkspaceManager] Ordered publication "
+                              "changed physical slot in domain '" << domain
+                              << "'");
+                    return false;
+                }
+                it = publications.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+
+        const auto canonical = publications.find(new_key);
+        if (canonical == publications.end())
+        {
+            publications.emplace(
+                new_key,
+                detail::PersistentWorkspacePublicationRecord{
+                    .slot = slot,
+                    .publication = publication,
+                });
+        }
+        return true;
     }
 
     // =========================================================================

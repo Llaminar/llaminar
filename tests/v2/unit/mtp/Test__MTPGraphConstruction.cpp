@@ -2571,6 +2571,80 @@ TEST(Test__MTPGraphConstruction, ColumnParallelAllPositionLMHeadUsesVerifierShar
     EXPECT_TRUE(contractWrites(gather_contract, BufferId::ALL_POSITION_LOGITS));
 }
 
+/**
+ * @test Serial LocalTP decode and grouped MTP share one mirrored head policy.
+ *
+ * The MTP-disabled runner is the serial arithmetic oracle used by stochastic
+ * parity tests.  Disabling speculative execution must not silently switch its
+ * terminal projection back to a vocabulary shard: that would compare two
+ * different GEMV geometries and two different sampling implementations rather
+ * than proving grouped decode equivalence.
+ */
+TEST(Test__MTPGraphConstruction,
+     LocalTPSerialDecodeKeepsMirroredFullVocabularyHeadWhenMTPIsDisabled)
+{
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    MockLocalTPContext local_tp;
+    local_tp.setDevices(
+        {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)});
+    local_tp.setBackend(CollectiveBackendType::HOST);
+
+    fixture.config.mtp.enabled = false;
+    fixture.config.mtp.mirror_full_head_for_local_tp = true;
+    fixture.config.lm_head_column_parallel = true;
+    fixture.config.vocab_local = fixture.config.vocab_size / 2;
+    fixture.config.tp_ctx = &local_tp;
+    fixture.config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            /*world_size=*/2,
+            fixture.config.n_heads,
+            fixture.config.n_kv_heads,
+            fixture.config.d_ff,
+            fixture.config.vocab_size));
+
+    QwenStandardGraph graph_builder(fixture.config, fixture.mpi);
+    ModelWeights weights = fixture.modelWeights();
+    graph_builder.setWeights(weights);
+
+    WeightBinding mirrored_final_norm;
+    mirrored_final_norm.tensor = weights.final_norm;
+    WeightBinding mirrored_lm_head;
+    mirrored_lm_head.tensor = weights.lm_head;
+    ModelWeightBindings mirrored_bindings;
+    mirrored_bindings.final_norm = &mirrored_final_norm;
+    mirrored_bindings.lm_head = &mirrored_lm_head;
+    graph_builder.setDecodeReplicatedDenseWeightBindings(mirrored_bindings);
+
+    auto hidden = TestTensorFactory::createFP32(
+        {1, static_cast<size_t>(fixture.config.d_model)});
+    auto logits = TestTensorFactory::createFP32(
+        {1, static_cast<size_t>(fixture.config.vocab_size)});
+    auto logits_local = TestTensorFactory::createFP32(
+        {1, static_cast<size_t>(fixture.config.vocab_local)});
+
+    ComputeGraph graph = graph_builder.buildLMHeadGraph(
+        hidden.get(),
+        logits.get(),
+        /*total_tokens=*/1,
+        DeviceId::cpu(),
+        logits_local.get());
+
+    const auto *lm_head = graph.getNode("lm_head");
+    ASSERT_NE(lm_head, nullptr);
+    ASSERT_NE(lm_head->stage, nullptr);
+    const auto contract = lm_head->stage->bufferContract();
+    EXPECT_TRUE(contractWrites(contract, BufferId::LOGITS));
+    EXPECT_FALSE(contractWrites(contract, BufferId::LOGITS_LOCAL));
+    EXPECT_EQ(graph.getNode("lm_head_allgather"), nullptr);
+
+    const auto *typed_stage =
+        dynamic_cast<const LMHeadStage *>(lm_head->stage.get());
+    ASSERT_NE(typed_stage, nullptr);
+    EXPECT_EQ(
+        typed_stage->serialEquivalentPartitionWidthForTesting(),
+        fixture.config.vocab_local);
+}
+
 TEST(Test__MTPGraphConstruction, PhaseSplitVerifierLMHeadUsesReplicatedFullVocabDecodeBinding)
 {
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);

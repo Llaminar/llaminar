@@ -177,6 +177,10 @@ namespace llaminar2
             {
                 accepted.bonus_ready_token = outcome.ready_token;
             }
+            if (outcome.commit_boundary_clipped)
+            {
+                accepted.commit_boundary_ready_token = outcome.ready_token;
+            }
             accepted.accepted_verifier_input_prefix =
                 std::min(
                     draft_count,
@@ -185,6 +189,8 @@ namespace llaminar2
                 outcome.target_verifier_state_commit_count;
             accepted.all_drafts_accepted = outcome.all_speculative_accepted;
             accepted.stopped_on_output = outcome.stopped_on_output;
+            accepted.commit_boundary_clipped =
+                outcome.commit_boundary_clipped;
             accepted_outcomes.push_back(std::move(accepted));
         }
 

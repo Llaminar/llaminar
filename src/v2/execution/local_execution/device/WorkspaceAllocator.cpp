@@ -154,6 +154,39 @@ namespace llaminar2
         const std::vector<WorkspaceConsumerRequest> &extra_consumers,
         const WorkspaceBudgetConfig &config)
     {
+        return allocateForGraphFamily(
+            graph,
+            /*
+             * The convenience API historically plans the graph as the active
+             * prefill envelope and separately overlays compact requirements.
+             * Production execution uses allocateForGraphFamily() directly with
+             * an explicit role, so retaining this compatibility contract does
+             * not reintroduce role inference into the runtime path.
+             */
+            WorkspaceGraphParticipantRole::Prefill,
+            {},
+            hints,
+            extra_consumers,
+            config);
+    }
+
+    bool WorkspaceAllocator::allocateForGraphFamily(
+        const ComputeGraph &graph,
+        WorkspaceGraphParticipantRole primary_role,
+        const std::vector<WorkspaceGraphParticipant> &
+            exact_serial_participants,
+        const WorkspaceSizingHints &hints,
+        const std::vector<WorkspaceConsumerRequest> &extra_consumers,
+        const WorkspaceBudgetConfig &config)
+    {
+        if (!exact_serial_participants.empty() &&
+            hints.graph_family_policy ==
+                WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
+        {
+            LOG_ERROR("[WorkspaceAllocator] Exact serial graph participants require a serial graph-family policy");
+            return false;
+        }
+
         struct ConsumerBinding
         {
             IWorkspaceConsumer *consumer = nullptr;
@@ -178,27 +211,26 @@ namespace llaminar2
              */
             WorkspaceConsumerShapePolicy shape_policy =
                 WorkspaceConsumerShapePolicy::GraphParticipantRows;
-        };
-
-        /**
-         * @brief Logical participant whose requirements are being assembled.
-         *
-         * The role is explicit because row count is not a lifetime contract:
-         * a short prompt and grouped MTP verification may have the same M while
-         * selecting different production kernels and disjoint scratch arenas.
-         */
-        enum class SerialWorkspaceParticipantRole : uint8_t
-        {
-            PrefillGraph,
-            DecodeGraph,
-            GroupedVerifierGraph,
+            /**
+             * @brief Preserve the stage-declared M for an explicit family graph.
+             */
+            bool exact_serial_shape = false;
+            /**
+             * @brief Explicit mathematical role for exact family graphs.
+             */
+            WorkspaceGraphParticipantRole participant_role =
+                WorkspaceGraphParticipantRole::Decode;
+            /**
+             * @brief Stable graph node or auxiliary role used in fatal diagnostics.
+             */
+            std::string debug_name;
         };
 
         auto requirementsForRows =
             [&hints](
                 const ConsumerBinding &binding,
                 int requested_rows,
-                SerialWorkspaceParticipantRole role) -> WorkspaceRequirements
+                WorkspaceGraphParticipantRole role) -> WorkspaceRequirements
         {
             if (!binding.consumer)
                 return {};
@@ -223,13 +255,17 @@ namespace llaminar2
                     {
                         switch (role)
                         {
-                        case SerialWorkspaceParticipantRole::PrefillGraph:
+                        case WorkspaceGraphParticipantRole::Prefill:
                             return descriptor.regime ==
                                    WorkspaceExecutionRegime::
                                        CompactDecodeOnly;
-                        case SerialWorkspaceParticipantRole::DecodeGraph:
-                        case SerialWorkspaceParticipantRole::
-                            GroupedVerifierGraph:
+                        case WorkspaceGraphParticipantRole::Decode:
+                        case WorkspaceGraphParticipantRole::
+                            GroupedVerifier:
+                        case WorkspaceGraphParticipantRole::
+                            MTPCondition:
+                        case WorkspaceGraphParticipantRole::
+                            MoERebalanceMaintenance:
                             return descriptor.regime ==
                                    WorkspaceExecutionRegime::PrefillOnly;
                         }
@@ -257,15 +293,21 @@ namespace llaminar2
         auto requirementsForGraphBinding =
             [&](const ConsumerBinding &binding) -> WorkspaceRequirements
         {
+            if (binding.exact_serial_shape)
+            {
+                return requirementsForRows(
+                    binding,
+                    binding.m,
+                    binding.participant_role);
+            }
+
             if (hints.graph_family_policy !=
                 WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
             {
                 return requirementsForRows(
                     binding,
                     activeRowsForBinding(binding),
-                    binding.scales_with_serial_family_rows
-                        ? SerialWorkspaceParticipantRole::PrefillGraph
-                        : SerialWorkspaceParticipantRole::DecodeGraph);
+                    binding.participant_role);
             }
 
             /*
@@ -279,12 +321,12 @@ namespace llaminar2
                 combined.merge(requirementsForRows(
                     binding,
                     1,
-                    SerialWorkspaceParticipantRole::DecodeGraph));
+                    WorkspaceGraphParticipantRole::Decode));
             }
             combined.merge(requirementsForRows(
                 binding,
                 binding.m,
-                SerialWorkspaceParticipantRole::PrefillGraph));
+                WorkspaceGraphParticipantRole::Prefill));
             return combined;
         };
 
@@ -342,98 +384,272 @@ namespace llaminar2
             return true;
         };
 
-        std::unordered_map<DeviceId, std::vector<ConsumerBinding>> consumers_by_device;
+        using ConsumerBindings = std::vector<ConsumerBinding>;
+        using ConsumerBindingsByDevice =
+            std::unordered_map<DeviceId, ConsumerBindings>;
 
-        const auto execution_order = graph.getExecutionOrder();
-        for (const auto &node_name : execution_order)
+        ConsumerBindingsByDevice primary_consumers_by_device;
+        /*
+         * External consumers such as KV caches and resident MTP metadata are
+         * invoked by, or remain live across, every forward-family participant.
+         * They are not a separate serial graph and therefore must never alias a
+         * graph-local interval. Keep them distinct from the primary graph so the
+         * planner can merge their family-wide envelope into every participant.
+         */
+        ConsumerBindingsByDevice common_consumers_by_device;
+        /*
+         * Some graph participants finish execution before their device-owned
+         * records become dead. Keep their exact requirements separate so the
+         * planner can add the retained intervals to every serial layout.
+         */
+        ConsumerBindingsByDevice persistent_consumers_by_device;
+        ConsumerBindingsByDevice consumers_by_device;
+        std::unordered_map<DeviceId, std::vector<ConsumerBindings>>
+            exact_participants_by_device;
+
+        auto collectGraphConsumers =
+            [&](const ComputeGraph &participant,
+                const std::string &debug_prefix,
+                bool exact_serial_shape,
+                WorkspaceGraphParticipantRole participant_role,
+                ConsumerBindingsByDevice &destination)
         {
-            const ComputeNode *node = graph.getNode(node_name);
-            if (!node || !node->stage)
+            const auto execution_order = participant.getExecutionOrder();
+            for (const auto &node_name : execution_order)
             {
-                continue;
+                const ComputeNode *node = participant.getNode(node_name);
+                if (!node || !node->stage)
+                {
+                    continue;
+                }
+
+                auto *consumer =
+                    dynamic_cast<IWorkspaceConsumer *>(node->stage.get());
+                if (!consumer)
+                {
+                    continue;
+                }
+
+                DeviceId device = node->device;
+                if ((!device.is_valid() || !device.is_gpu()) &&
+                    node->stage->device().is_valid())
+                {
+                    device = node->stage->device();
+                }
+                if (!device.is_gpu() && node->stage->device().is_gpu())
+                {
+                    device = node->stage->device();
+                }
+                if (!device.is_gpu())
+                {
+                    continue;
+                }
+
+                std::string lowered_name = node_name;
+                std::transform(
+                    lowered_name.begin(),
+                    lowered_name.end(),
+                    lowered_name.begin(),
+                    [](unsigned char c)
+                    { return static_cast<char>(std::tolower(c)); });
+
+                const bool is_embedding =
+                    (lowered_name == "embedding") ||
+                    (lowered_name.find("embed") != std::string::npos);
+                const bool is_attention =
+                    lowered_name.find("attention") != std::string::npos;
+                const bool is_lm_head =
+                    (lowered_name == "lm_head") ||
+                    (lowered_name.find("lm_head") != std::string::npos);
+
+                ConsumerBinding binding;
+                binding.consumer = consumer;
+                binding.exact_serial_shape = exact_serial_shape;
+                binding.participant_role = participant_role;
+                binding.debug_name =
+                    debug_prefix.empty()
+                        ? node_name
+                        : debug_prefix + ":" + node_name;
+
+                if (is_attention)
+                {
+                    /*
+                     * Attention's tensor input is [M, d_model], but its
+                     * workspace axes are [request, head, split, head_dim].
+                     * applyDeclaredStageShape() would therefore mistake
+                     * d_model for head_dim on exact decode participants. That
+                     * produces a false late-capacity miss after phase-split
+                     * prefill even though the original family allocation used
+                     * the correct semantic attention geometry.
+                     *
+                     * Use the declarative model axes for every participant.
+                     * AttentionComputeStage then takes the maximum of these
+                     * hints and its concrete stage-local head geometry, so
+                     * sharded and replicated variants both remain
+                     * authoritative without deriving semantics from a tensor
+                     * layout.
+                     */
+                    binding.m = std::max(1, hints.batch_size);
+                    binding.n = std::max(0, hints.n_heads);
+                    binding.k = std::max(0, hints.head_dim);
+                    binding.scales_with_serial_family_rows = false;
+                }
+                else if (exact_serial_shape)
+                {
+                    /*
+                     * The caller's active row count is authoritative when a
+                     * workspace consumer does not expose a declarative tensor
+                     * shape. Concrete production stages may refine this value
+                     * below, but an abstract/custom consumer must not silently
+                     * collapse an explicitly requested prefill or verifier
+                     * geometry to scalar decode.
+                     */
+                    binding.m = std::max(1, hints.max_seq_len);
+                    binding.n = 0;
+                    binding.k = 0;
+                    (void)applyDeclaredStageShape(*node->stage, binding);
+                    if (is_lm_head)
+                    {
+                        /*
+                         * Terminal projection consumes one selected hidden row
+                         * per request during ordinary prefill. The stage's
+                         * input tensor still spans the full prompt so declared
+                         * buffer M is not its GEMM M. Grouped verification is
+                         * deliberately different: its all-position projection
+                         * consumes every declared verifier row. Keep that
+                         * distinction attached to the typed participant role.
+                         */
+                        if (participant_role !=
+                                WorkspaceGraphParticipantRole::
+                                    GroupedVerifier &&
+                            participant_role !=
+                                WorkspaceGraphParticipantRole::
+                                    MTPCondition)
+                        {
+                            binding.m =
+                                std::max(1, hints.batch_size);
+                        }
+                        binding.n =
+                            hints.resolveTerminalProjectionColumns(
+                                /*participant_columns=*/0);
+                    }
+                }
+                else if (is_lm_head)
+                {
+                    binding.m = std::max(1, hints.batch_size);
+                    /*
+                     * A phase-split LocalTP family can first expose the sharded
+                     * prefill head and later expose a replicated decode/MTP head.
+                     * Query the prepared kernel with the family-wide terminal N
+                     * so shared K-partition/scatter names receive their final
+                     * capacity before any graph executable captures the address.
+                     */
+                    binding.n =
+                        hints.resolveTerminalProjectionColumns(
+                            /*participant_columns=*/0);
+                    binding.k = 0;
+                    binding.scales_with_serial_family_rows = false;
+                }
+                else if (is_embedding)
+                {
+                    binding.m = std::max(1, hints.max_seq_len);
+                    binding.n = std::max(1, hints.vocab_size);
+                    binding.k = std::max(0, hints.d_model);
+                }
+                else
+                {
+                    binding.m = std::max(1, hints.max_seq_len);
+                    binding.n = 0;
+                    binding.k = 0;
+                    (void)applyDeclaredStageShape(*node->stage, binding);
+                }
+
+                destination[device].push_back(std::move(binding));
+            }
+        };
+
+        collectGraphConsumers(
+            graph,
+            "primary",
+            /*exact_serial_shape=*/
+            hints.graph_family_policy ==
+                    WorkspaceGraphFamilyPolicy::
+                        SerialDeviceFamilyExactParticipant &&
+                primary_role !=
+                    WorkspaceGraphParticipantRole::Prefill,
+            primary_role,
+            primary_consumers_by_device);
+        consumers_by_device = primary_consumers_by_device;
+
+        for (size_t participant_index = 0;
+             participant_index < exact_serial_participants.size();
+             ++participant_index)
+        {
+            const WorkspaceGraphParticipant &participant =
+                exact_serial_participants[participant_index];
+            if (!participant.graph)
+            {
+                LOG_ERROR("[WorkspaceAllocator] Serial graph family contains a null participant at index "
+                          << participant_index);
+                return false;
             }
 
-            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(node->stage.get());
-            if (!consumer)
+            ConsumerBindingsByDevice participant_consumers;
+            collectGraphConsumers(
+                *participant.graph,
+                "serial[" + std::to_string(participant_index) + "]",
+                /*exact_serial_shape=*/true,
+                participant.role,
+                participant_consumers);
+            for (auto &[device, bindings] : participant_consumers)
             {
-                continue;
+                if (bindings.empty())
+                    continue;
+                auto &all = consumers_by_device[device];
+                all.insert(all.end(), bindings.begin(), bindings.end());
+                if (participant.lifetime ==
+                    WorkspaceGraphParticipantLifetime::
+                        PersistentAcrossParticipants)
+                {
+                    auto &persistent =
+                        persistent_consumers_by_device[device];
+                    persistent.insert(
+                        persistent.end(),
+                        bindings.begin(),
+                        bindings.end());
+                }
+                else
+                {
+                    exact_participants_by_device[device].push_back(
+                        std::move(bindings));
+                }
             }
-
-            DeviceId device = node->device;
-            if ((!device.is_valid() || !device.is_gpu()) &&
-                node->stage->device().is_valid())
-            {
-                device = node->stage->device();
-            }
-            if (!device.is_gpu() && node->stage->device().is_gpu())
-            {
-                device = node->stage->device();
-            }
-            if (!device.is_gpu())
-            {
-                continue;
-            }
-
-            std::string lowered_name = node_name;
-            std::transform(
-                lowered_name.begin(), lowered_name.end(), lowered_name.begin(),
-                [](unsigned char c)
-                { return static_cast<char>(std::tolower(c)); });
-
-            const bool is_embedding = (lowered_name == "embedding") || (lowered_name.find("embed") != std::string::npos);
-            const bool is_attention = (lowered_name.find("attention") != std::string::npos);
-            const bool is_lm_head = (lowered_name == "lm_head") || (lowered_name.find("lm_head") != std::string::npos);
-
-            ConsumerBinding binding;
-            binding.consumer = consumer;
-
-            if (is_attention)
-            {
-                binding.m = std::max(1, hints.batch_size);
-                binding.n = std::max(0, hints.n_heads);
-                binding.k = std::max(0, hints.head_dim);
-                binding.scales_with_serial_family_rows = false;
-            }
-            else if (is_lm_head)
-            {
-                binding.m = std::max(1, hints.batch_size);
-                binding.n = 0;
-                binding.k = 0;
-                binding.scales_with_serial_family_rows = false;
-            }
-            else if (is_embedding)
-            {
-                binding.m = std::max(1, hints.max_seq_len);
-                binding.n = std::max(1, hints.vocab_size);
-                binding.k = std::max(0, hints.d_model);
-            }
-            else
-            {
-                binding.m = std::max(1, hints.max_seq_len);
-                binding.n = 0;
-                binding.k = 0;
-                (void)applyDeclaredStageShape(*node->stage, binding);
-            }
-
-            consumers_by_device[device].push_back(binding);
         }
 
-        for (const auto &request : extra_consumers)
+        for (size_t request_index = 0;
+             request_index < extra_consumers.size();
+             ++request_index)
         {
+            const auto &request = extra_consumers[request_index];
             if (!request.consumer ||
                 !request.device.is_gpu())
             {
                 continue;
             }
 
-            consumers_by_device[request.device].push_back(ConsumerBinding{
+            ConsumerBinding binding{
                 request.consumer,
                 std::max(1, request.m),
                 request.n,
                 request.k,
                 true,
                 request.shape_policy,
-            });
+                false,
+                WorkspaceGraphParticipantRole::Decode,
+                "auxiliary_consumer_" + std::to_string(request_index),
+            };
+            common_consumers_by_device[request.device].push_back(binding);
+            consumers_by_device[request.device].push_back(std::move(binding));
         }
 
         if (consumers_by_device.empty())
@@ -468,6 +684,25 @@ namespace llaminar2
                         if (!existing->second->hasBuffer(buf.name) ||
                             existing->second->getBufferSize(buf.name) < buf.size_bytes)
                         {
+                            if (hints.graph_family_policy !=
+                                WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
+                            {
+                                LOG_ERROR(
+                                    "[WorkspaceAllocator] Serial family preflight omitted workspace capacity"
+                                    << " node=" << consumer_binding.debug_name
+                                    << " buffer=" << buf.name
+                                    << " requested_bytes=" << buf.size_bytes
+                                    << " published_bytes="
+                                    << existing->second->getBufferSize(buf.name)
+                                    << " declared_m=" << consumer_binding.m
+                                    << " declared_n=" << consumer_binding.n
+                                    << " declared_k=" << consumer_binding.k
+                                    << " active_rows="
+                                    << activeRowsForBinding(
+                                           consumer_binding)
+                                    << " device=" << device.toString());
+                                return false;
+                            }
                             needs_realloc = true;
                             break;
                         }
@@ -491,36 +726,6 @@ namespace llaminar2
                     combined.merge(requirementsForGraphBinding(consumer_binding));
                 }
                 const size_t needed = combined.total_bytes_with_alignment();
-                if (hints.graph_family_policy !=
-                    WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
-                {
-                    logVramBomLine(
-                        "workspace_plan",
-                        "phase=serial_alias_bind device=" +
-                            device.toString() +
-                            " consumers=" +
-                            std::to_string(consumers.size()) +
-                            " buffers=" +
-                            std::to_string(combined.buffers.size()) +
-                            " logical_bytes=" + std::to_string(needed) +
-                            " logical_mib=" + vramBomMiB(needed) +
-                            " primary_block_bytes=" +
-                            std::to_string(existing->second->primaryBlockSize()) +
-                            " physical_growth_bytes=0");
-                    if (!existing->second->bindSerialParticipant(combined))
-                    {
-                        LOG_ERROR("[WorkspaceAllocator] Serial graph-family participant could not bind into the primary workspace on "
-                                  << device.toString());
-                        return false;
-                    }
-                    for (const auto &consumer_binding : consumers)
-                    {
-                        consumer_binding.consumer->bindWorkspace(
-                            existing->second.get());
-                    }
-                    continue;
-                }
-
                 LOG_TRACE("[WorkspaceAllocator] Extending workspace append-only on "
                           << device.toString() << " for "
                           << combined.buffers.size() << " current requirements ("
@@ -572,14 +777,110 @@ namespace llaminar2
                 budget = std::max(budget, model_floor_budget);
             }
 
+            const auto primary_it = primary_consumers_by_device.find(device);
+            const ConsumerBindings empty_primary;
+            const ConsumerBindings &primary_consumers =
+                primary_it == primary_consumers_by_device.end()
+                    ? empty_primary
+                    : primary_it->second;
+            const auto common_it =
+                common_consumers_by_device.find(device);
+            const ConsumerBindings empty_common;
+            const ConsumerBindings &common_consumers =
+                common_it == common_consumers_by_device.end()
+                    ? empty_common
+                    : common_it->second;
+            const auto persistent_it =
+                persistent_consumers_by_device.find(device);
+            const ConsumerBindings empty_persistent;
+            const ConsumerBindings &persistent_consumers =
+                persistent_it ==
+                        persistent_consumers_by_device.end()
+                    ? empty_persistent
+                    : persistent_it->second;
+
             WorkspaceRequirements combined;
-            for (const auto &consumer_binding : consumers)
+            for (const auto &consumer_binding : primary_consumers)
             {
                 combined.merge(requirementsForGraphBinding(consumer_binding));
             }
 
             WorkspaceRequirements decode_participant;
             WorkspaceRequirements compact_participant;
+            WorkspaceRequirements common_requirements;
+            WorkspaceRequirements persistent_requirements;
+            for (const ConsumerBinding &binding : common_consumers)
+            {
+                if (hints.graph_family_policy ==
+                    WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
+                {
+                    common_requirements.merge(
+                        requirementsForGraphBinding(binding));
+                    continue;
+                }
+
+                /*
+                 * A common consumer can expose regime-specific storage too. Its
+                 * physical interval must cover the entire family, so query all
+                 * supported roles and merge their largest capacities before
+                 * adding that interval to every graph participant.
+                 */
+                const int prefill_rows =
+                    hints.serial_family_max_rows > 0
+                        ? hints.serial_family_max_rows
+                        : std::max(1, hints.max_seq_len);
+                common_requirements.merge(requirementsForRows(
+                    binding,
+                    prefill_rows,
+                    WorkspaceGraphParticipantRole::Prefill));
+                common_requirements.merge(requirementsForRows(
+                    binding,
+                    /*requested_rows=*/1,
+                    WorkspaceGraphParticipantRole::Decode));
+                if (hints.serial_family_max_compact_rows > 1)
+                {
+                    common_requirements.merge(requirementsForRows(
+                        binding,
+                        hints.serial_family_max_compact_rows,
+                        WorkspaceGraphParticipantRole::
+                            GroupedVerifier));
+                }
+            }
+            for (const ConsumerBinding &binding :
+                 persistent_consumers)
+            {
+                persistent_requirements.merge(
+                    requirementsForGraphBinding(binding));
+            }
+            combined.merge(common_requirements);
+            combined.merge(persistent_requirements);
+
+            std::vector<WorkspaceRequirements>
+                exact_participant_requirements;
+            if (const auto exact_it =
+                    exact_participants_by_device.find(device);
+                exact_it != exact_participants_by_device.end())
+            {
+                exact_participant_requirements.reserve(
+                    exact_it->second.size());
+                for (const ConsumerBindings &participant_consumers :
+                     exact_it->second)
+                {
+                    WorkspaceRequirements participant_requirements;
+                    for (const ConsumerBinding &binding :
+                         participant_consumers)
+                    {
+                        participant_requirements.merge(
+                            requirementsForGraphBinding(binding));
+                    }
+                    participant_requirements.merge(
+                        common_requirements);
+                    participant_requirements.merge(
+                        persistent_requirements);
+                    exact_participant_requirements.push_back(
+                        std::move(participant_requirements));
+                }
+            }
             if (hints.graph_family_policy !=
                 WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
             {
@@ -589,37 +890,41 @@ namespace llaminar2
                  * the largest participant because device events serialize the
                  * graph roles.
                  */
-                for (const auto &consumer_binding : consumers)
+                for (const auto &consumer_binding : primary_consumers)
                 {
                     decode_participant.merge(
                         requirementsForRows(
                             consumer_binding,
                             1,
-                            SerialWorkspaceParticipantRole::DecodeGraph));
+                            WorkspaceGraphParticipantRole::Decode));
                 }
                 if (hints.serial_family_max_compact_rows > 1)
                 {
-                    for (const auto &consumer_binding : consumers)
+                    for (const auto &consumer_binding : primary_consumers)
                     {
                         compact_participant.merge(
                             requirementsForRows(
                                 consumer_binding,
                                 hints.serial_family_max_compact_rows,
-                                SerialWorkspaceParticipantRole::
-                                    GroupedVerifierGraph));
+                                WorkspaceGraphParticipantRole::
+                                    GroupedVerifier));
                     }
                 }
+                decode_participant.merge(common_requirements);
+                compact_participant.merge(common_requirements);
+                decode_participant.merge(
+                    persistent_requirements);
+                compact_participant.merge(
+                    persistent_requirements);
 
                 /*
-                 * A workspace name is part of the captured pointer ABI. If
-                 * several serial participants use the same name, the first
-                 * published address must have enough capacity for every one of
-                 * them. Promote only the first participant that publishes the
-                 * name to its family-wide capacity. Later participants retain
-                 * their actual live extent, allowing role-exclusive buffers
-                 * to reuse the unused tail while the manager still advertises
-                 * the larger captured capacity. Names absent from a
-                 * participant remain fully role-exclusive.
+                 * A workspace name is part of the captured pointer ABI. The
+                 * family planner publishes the largest capacity requested for
+                 * that name, while every participant descriptor below retains
+                 * its actual live extent. Keeping those two concepts separate
+                 * lets role-exclusive buffers reuse the untouched tail of a
+                 * shared buffer without ever changing its pointer or advertised
+                 * capacity.
                  */
                 struct FamilyBufferCapacity
                 {
@@ -630,11 +935,15 @@ namespace llaminar2
 
                 std::unordered_map<std::string, FamilyBufferCapacity>
                     family_capacities;
-                const std::vector<WorkspaceRequirements *>
-                    serial_participants{
-                        &combined,
-                        &decode_participant,
-                        &compact_participant};
+                std::vector<WorkspaceRequirements *> serial_participants{
+                    &combined,
+                    &decode_participant,
+                    &compact_participant};
+                for (WorkspaceRequirements &participant :
+                     exact_participant_requirements)
+                {
+                    serial_participants.push_back(&participant);
+                }
                 for (const WorkspaceRequirements *participant :
                      serial_participants)
                 {
@@ -656,19 +965,12 @@ namespace llaminar2
 
                 size_t promoted_descriptors = 0;
                 size_t promoted_bytes = 0;
-                std::unordered_set<std::string> published_names;
-                for (WorkspaceRequirements *participant :
+                for (const WorkspaceRequirements *participant :
                      serial_participants)
                 {
-                    for (WorkspaceDescriptor &descriptor :
+                    for (const WorkspaceDescriptor &descriptor :
                          participant->buffers)
                     {
-                        const bool publishes_name =
-                            published_names.insert(
-                                descriptor.name).second;
-                        if (!publishes_name)
-                            continue;
-
                         const FamilyBufferCapacity &capacity =
                             family_capacities.at(descriptor.name);
                         if (descriptor.size_bytes <
@@ -692,12 +994,6 @@ namespace llaminar2
                                     " promoted_bytes=" +
                                     std::to_string(delta));
                         }
-                        descriptor.size_bytes =
-                            capacity.size_bytes;
-                        descriptor.alignment =
-                            capacity.alignment;
-                        descriptor.required =
-                            capacity.required;
                     }
                 }
                 if (promoted_descriptors > 0)
@@ -716,7 +1012,12 @@ namespace llaminar2
 
             if (combined.buffers.empty() &&
                 decode_participant.buffers.empty() &&
-                compact_participant.buffers.empty())
+                compact_participant.buffers.empty() &&
+                std::all_of(
+                    exact_participant_requirements.begin(),
+                    exact_participant_requirements.end(),
+                    [](const WorkspaceRequirements &requirements)
+                    { return requirements.buffers.empty(); }))
             {
                 LOG_DEBUG("[WorkspaceAllocator] No workspace requirements for device "
                           << device.toString());
@@ -733,9 +1034,48 @@ namespace llaminar2
                 decode_participant.total_bytes_with_alignment();
             const size_t compact_needed =
                 compact_participant.total_bytes_with_alignment();
-            const size_t needed = std::max(
+            size_t largest_participant_needed = std::max(
                 active_needed,
                 std::max(decode_needed, compact_needed));
+            for (const WorkspaceRequirements &participant :
+                 exact_participant_requirements)
+            {
+                largest_participant_needed = std::max(
+                    largest_participant_needed,
+                    participant.total_bytes_with_alignment());
+            }
+            size_t needed = largest_participant_needed;
+            SerialWorkspaceFamilyPlan serial_family_plan;
+            if (hints.graph_family_policy !=
+                WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
+            {
+                /*
+                 * Plan every serial participant together before allocating or
+                 * publishing a pointer. The physical requirement may be above
+                 * the largest-participant lower bound when common names split
+                 * the address space, but it is normally far below the union:
+                 * prefill-only and compact-only reduction banks can overlap.
+                 */
+                std::vector<WorkspaceRequirements> serial_requirements{
+                    combined,
+                    decode_participant,
+                    compact_participant};
+                serial_requirements.insert(
+                    serial_requirements.end(),
+                    exact_participant_requirements.begin(),
+                    exact_participant_requirements.end());
+                serial_family_plan =
+                    DeviceWorkspaceManager::planSerialFamily(
+                        serial_requirements);
+                if (!serial_family_plan.valid())
+                {
+                    LOG_ERROR("[WorkspaceAllocator] Failed to plan serial graph family on "
+                              << device.toString() << ": "
+                              << serial_family_plan.error);
+                    return false;
+                }
+                needed = serial_family_plan.total_bytes;
+            }
             if (hints.graph_family_policy ==
                 WorkspaceGraphFamilyPolicy::
                     SerialDeviceFamilyLargestParticipant)
@@ -743,12 +1083,16 @@ namespace llaminar2
                 PerfStatsCollector::addCounter(
                     "memory",
                     "workspace_serial_family_largest_participant_bytes",
-                    static_cast<double>(needed),
+                    static_cast<double>(largest_participant_needed),
                     "materialize",
                     device.to_string(),
                     {{"current_rows", std::to_string(hints.max_seq_len)},
                      {"largest_rows",
                       std::to_string(hints.serial_family_max_rows)},
+                     {"terminal_projection_columns",
+                      std::to_string(
+                          hints
+                              .serial_family_max_terminal_projection_columns)},
                      {"buffer_count",
                       std::to_string(combined.buffers.size())},
                      {"active_logical_bytes",
@@ -757,6 +1101,8 @@ namespace llaminar2
                       std::to_string(decode_needed)},
                      {"compact_logical_bytes",
                       std::to_string(compact_needed)},
+                     {"planned_physical_bytes",
+                      std::to_string(needed)},
                      {"ordering", "serial_graph_family"}});
                 logVramBomLine(
                     "workspace_serial_family_plan",
@@ -765,6 +1111,10 @@ namespace llaminar2
                         std::to_string(hints.max_seq_len) +
                         " largest_rows=" +
                         std::to_string(hints.serial_family_max_rows) +
+                        " terminal_projection_columns=" +
+                        std::to_string(
+                            hints
+                                .serial_family_max_terminal_projection_columns) +
                         " buffers=" +
                         std::to_string(combined.buffers.size()) +
                         " active_logical_bytes=" +
@@ -773,6 +1123,8 @@ namespace llaminar2
                         std::to_string(decode_needed) +
                         " compact_logical_bytes=" +
                         std::to_string(compact_needed) +
+                        " largest_participant_bytes=" +
+                        std::to_string(largest_participant_needed) +
                         " needed_bytes=" + std::to_string(needed) +
                         " needed_mib=" + vramBomMiB(needed) +
                         " ownership=largest_participant" +
@@ -808,7 +1160,12 @@ namespace llaminar2
                     " model_floor_bytes=" + std::to_string(model_floor_budget) +
                     " model_floor_mib=" + vramBomMiB(model_floor_budget));
             logWorkspaceVramTrace(device, "workspace.before_allocate", needed);
-            if (!manager->allocate(combined, needed))
+            const bool allocated =
+                hints.graph_family_policy ==
+                        WorkspaceGraphFamilyPolicy::ExclusiveLifetime
+                    ? manager->allocate(combined, needed)
+                    : manager->allocateSerialFamily(serial_family_plan);
+            if (!allocated)
             {
                 LOG_ERROR("[WorkspaceAllocator] Failed to allocate workspace on "
                           << device.toString()
@@ -830,6 +1187,17 @@ namespace llaminar2
                 LOG_ERROR("[WorkspaceAllocator] Failed to prebind decode serial participant on "
                           << device.toString());
                 return false;
+            }
+            for (const WorkspaceRequirements &participant :
+                 exact_participant_requirements)
+            {
+                if (!participant.buffers.empty() &&
+                    !manager->bindSerialParticipant(participant))
+                {
+                    LOG_ERROR("[WorkspaceAllocator] Failed to prebind exact serial graph participant on "
+                              << device.toString());
+                    return false;
+                }
             }
 
             for (const auto &consumer_binding : consumers)

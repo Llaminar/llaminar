@@ -110,6 +110,14 @@ namespace llaminar2
             schema.layer_buffers.push_back(
                 {"moe_combined_output", {"moe_activation_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_output_scratch", 10, "Combined routed expert FFN output"});
 
+            /*
+             * LocalTP must retain every router slot until after the participant
+             * collective. This buffer deliberately has a separate lifetime
+             * group because it coexists with the reduced routed output.
+             */
+            schema.layer_buffers.push_back(
+                {"moe_canonical_route_contributions", {"moe_activation_rows", "moe_top_k", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_canonical_route_scratch", 10, "Ownership-invariant routed expert contributions in original top-k order"});
+
             // Shared expert output
             schema.layer_buffers.push_back(
                 {"moe_shared_expert_output", {"moe_activation_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_output_scratch", 5, "Shared expert FFN output"});

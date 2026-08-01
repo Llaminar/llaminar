@@ -2567,7 +2567,7 @@ namespace llaminar2
                                 256,
                                 true});
 
-        LOG_DEBUG("[ROCmRingKVCache] Workspace requirements: batch_size="
+        LOG_TRACE("[ROCmRingKVCache] Workspace requirements: batch_size="
                   << bounded_batch_size
                   << " scratch_tokens=" << bounded_scratch_tokens
                   << " CONV_SCRATCH(each)=" << conversion_scratch_bytes);
@@ -2641,7 +2641,7 @@ namespace llaminar2
         converted_batched_k_view_.reset();
         converted_batched_v_view_.reset();
 
-        LOG_DEBUG("[ROCmRingKVCache] Workspace bound: "
+        LOG_TRACE("[ROCmRingKVCache] Workspace bound: "
                   << (workspace ? "yes" : "no"));
     }
 

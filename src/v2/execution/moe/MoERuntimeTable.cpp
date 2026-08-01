@@ -430,6 +430,8 @@ namespace llaminar2
             int32_t *route_expert_ids = nullptr;
             float *route_weights = nullptr;
             int32_t *route_participant_ids = nullptr;
+            int32_t *deferred_verifier_route_expert_ids = nullptr;
+            int32_t *deferred_verifier_route_participant_ids = nullptr;
             int32_t *expert_counts = nullptr;
             int32_t *expert_offsets = nullptr;
             int32_t *grouped_token_ids = nullptr;
@@ -442,6 +444,7 @@ namespace llaminar2
             uint64_t reserved_u64[2] = {};
             uint32_t prefill_token_capacity = 0;
             uint32_t prefill_route_capacity = 0;
+            uint32_t deferred_verifier_route_capacity = 0;
         };
 
         RuntimeScratchBindings captureRuntimeScratchBindings(const DeviceMoELayerRuntime &state) noexcept
@@ -450,6 +453,10 @@ namespace llaminar2
             scratch.route_expert_ids = state.route_expert_ids;
             scratch.route_weights = state.route_weights;
             scratch.route_participant_ids = state.route_participant_ids;
+            scratch.deferred_verifier_route_expert_ids =
+                state.deferred_verifier_route_expert_ids;
+            scratch.deferred_verifier_route_participant_ids =
+                state.deferred_verifier_route_participant_ids;
             scratch.expert_counts = state.expert_counts;
             scratch.expert_offsets = state.expert_offsets;
             scratch.grouped_token_ids = state.grouped_token_ids;
@@ -465,6 +472,8 @@ namespace llaminar2
             scratch.reserved_u64[1] = state.reserved_u64[1];
             scratch.prefill_token_capacity = state.prefill_token_capacity;
             scratch.prefill_route_capacity = state.prefill_route_capacity;
+            scratch.deferred_verifier_route_capacity =
+                state.deferred_verifier_route_capacity;
             return scratch;
         }
 
@@ -474,6 +483,10 @@ namespace llaminar2
             state.route_expert_ids = scratch.route_expert_ids;
             state.route_weights = scratch.route_weights;
             state.route_participant_ids = scratch.route_participant_ids;
+            state.deferred_verifier_route_expert_ids =
+                scratch.deferred_verifier_route_expert_ids;
+            state.deferred_verifier_route_participant_ids =
+                scratch.deferred_verifier_route_participant_ids;
             state.expert_counts = scratch.expert_counts;
             state.expert_offsets = scratch.expert_offsets;
             state.grouped_token_ids = scratch.grouped_token_ids;
@@ -491,6 +504,8 @@ namespace llaminar2
             state.reserved_u64[3] = 0;
             state.prefill_token_capacity = scratch.prefill_token_capacity;
             state.prefill_route_capacity = scratch.prefill_route_capacity;
+            state.deferred_verifier_route_capacity =
+                scratch.deferred_verifier_route_capacity;
         }
 
         void resetPerRequestRuntimeFields(DeviceMoELayerRuntime &state, int num_experts) noexcept
@@ -667,6 +682,8 @@ namespace llaminar2
           top_k_(config.top_k),
           mirror_to_device_(config.mirror_to_device),
           prefill_token_capacity_(config.prefill_token_capacity),
+          deferred_verifier_token_capacity_(
+              config.deferred_verifier_token_capacity),
           serial_route_scratch_arena_(
               std::move(config.serial_route_scratch_arena))
     {
@@ -686,6 +703,15 @@ namespace llaminar2
             throw std::invalid_argument("[MoERuntimeTable] prefill_token_capacity must be non-negative");
         if (prefill_token_capacity_ > 0 && !mirror_to_device_)
             throw std::runtime_error("[MoERuntimeTable] prefill route scratch requires a mirrored GPU runtime table");
+        if (deferred_verifier_token_capacity_ < 0)
+            throw std::invalid_argument(
+                "[MoERuntimeTable] deferred verifier token capacity must be non-negative");
+        if (deferred_verifier_token_capacity_ > 0 && !mirror_to_device_)
+        {
+            throw std::runtime_error(
+                "[MoERuntimeTable] deferred verifier route ledger requires a "
+                "mirrored GPU runtime table");
+        }
         if (serial_route_scratch_arena_)
         {
             if (!mirror_to_device_)
@@ -727,6 +753,7 @@ namespace llaminar2
                  {"ownership", "per_device_serial_graph_domain"}});
         }
         (void)checkedRouteCapacity(prefill_token_capacity_, top_k_);
+        (void)checkedRouteCapacity(deferred_verifier_token_capacity_, top_k_);
 
         host_layers_.resize(static_cast<size_t>(num_layers_));
         for (auto &state : host_layers_)
@@ -738,23 +765,35 @@ namespace llaminar2
 
         if (mirror_to_device_)
         {
-            allocateDeviceMirror();
-            if (serial_route_scratch_arena_)
+            try
             {
-                for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+                allocateDeviceMirror();
+                if (serial_route_scratch_arena_)
                 {
-                    bindPrefillRouteScratchToLayer(
-                        layer_idx,
-                        serial_route_scratch_arena_->bindings_);
+                    for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+                    {
+                        bindPrefillRouteScratchToLayer(
+                            layer_idx,
+                            serial_route_scratch_arena_->bindings_);
+                    }
                 }
+                else if (prefill_token_capacity_ > 0)
+                {
+                    prefill_route_scratch_.resize(host_layers_.size());
+                    for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+                        allocatePrefillRouteScratchForLayer(layer_idx, prefill_token_capacity_);
+                }
+                if (deferred_verifier_token_capacity_ > 0)
+                    allocateDeferredVerifierRouteLedger();
+                uploadAllLayerStates();
             }
-            else if (prefill_token_capacity_ > 0)
+            catch (...)
             {
-                prefill_route_scratch_.resize(host_layers_.size());
-                for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
-                    allocatePrefillRouteScratchForLayer(layer_idx, prefill_token_capacity_);
+                releaseDeferredVerifierRouteLedger();
+                releasePrefillRouteScratch();
+                releaseDeviceMirror();
+                throw;
             }
-            uploadAllLayerStates();
         }
     }
 
@@ -773,6 +812,7 @@ namespace llaminar2
 
     DeviceMoERuntimeTable::~DeviceMoERuntimeTable()
     {
+        releaseDeferredVerifierRouteLedger();
         releasePrefillRouteScratch();
         releaseDeviceMirror();
     }
@@ -826,6 +866,20 @@ namespace llaminar2
                    static_cast<uint64_t>(num_experts_) * static_cast<uint64_t>(kDeviceMoEMaxParticipants) &&
                state.reserved_u64[1] >=
                    static_cast<uint64_t>(num_experts_) * static_cast<uint64_t>(kDeviceMoEMaxParticipants);
+    }
+
+    bool DeviceMoERuntimeTable::hasDeferredVerifierRouteLedgerCapacity(
+        int layer_idx,
+        int token_count) const
+    {
+        validateLayerIndex(layer_idx);
+        if (token_count <= 0)
+            return false;
+        const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+        const uint32_t route_count = checkedRouteCapacity(token_count, top_k_);
+        return state.deferred_verifier_route_capacity >= route_count &&
+               state.deferred_verifier_route_expert_ids &&
+               state.deferred_verifier_route_participant_ids;
     }
 
     void DeviceMoERuntimeTable::recordDecodeHistogramProducerStream(void *stream)
@@ -1635,6 +1689,15 @@ namespace llaminar2
                                                              << expert);
                         return false;
                     }
+                    if (expected_local_compute &&
+                        (initial_mask & local_bit) == 0u &&
+                        saved.local_slot < 0)
+                    {
+                        LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                             << ": transient portable restore has no exact destination slot for expert "
+                                                             << expert);
+                        return false;
+                    }
 
                     uint32_t arrivals = desired_mask & ~initial_mask;
                     while (arrivals != 0u)
@@ -1650,7 +1713,10 @@ namespace llaminar2
                                     static_cast<uint32_t>(
                                         initial_desc.owner_participant),
                                 .destination_participant = destination,
-                                .reserved = 0u});
+                                .destination_slot_requirement_plus_one =
+                                    destination == snapshot.participant_id
+                                        ? static_cast<uint32_t>(saved.local_slot) + 1u
+                                        : 0u});
                     }
                 }
 
@@ -2207,6 +2273,135 @@ namespace llaminar2
                 "[MoERuntimeTable] free prefill");
         }
         prefill_route_scratch_.clear();
+    }
+
+    void DeviceMoERuntimeTable::allocateDeferredVerifierRouteLedger()
+    {
+        if (!mirror_to_device_ || !device_id_.is_gpu())
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] deferred verifier ledger allocation requires "
+                "a mirrored GPU table");
+        }
+        if (deferred_verifier_token_capacity_ <= 0)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] deferred verifier ledger token capacity must "
+                "be positive");
+        }
+
+        deferred_verifier_route_capacity_ =
+            checkedRouteCapacity(deferred_verifier_token_capacity_, top_k_);
+        const size_t route_capacity =
+            static_cast<size_t>(deferred_verifier_route_capacity_);
+        const size_t layer_count = static_cast<size_t>(num_layers_);
+        if (route_capacity >
+            std::numeric_limits<size_t>::max() / layer_count / sizeof(int32_t))
+        {
+            throw std::overflow_error(
+                "[MoERuntimeTable] deferred verifier route ledger size overflow");
+        }
+        const size_t entries = route_capacity * layer_count;
+        const size_t bytes = entries * sizeof(int32_t);
+
+        try
+        {
+            deferred_verifier_route_expert_ids_ = static_cast<int32_t *>(
+                allocateMirror(
+                    device_id_,
+                    bytes,
+                    "[MoERuntimeTable] deferred verifier expert-route ledger allocation"));
+            deferred_verifier_route_participant_ids_ = static_cast<int32_t *>(
+                allocateMirror(
+                    device_id_,
+                    bytes,
+                    "[MoERuntimeTable] deferred verifier participant-route ledger allocation"));
+            bindDeferredVerifierRouteLedgerToLayers();
+        }
+        catch (...)
+        {
+            releaseDeferredVerifierRouteLedger();
+            throw;
+        }
+
+        PerfStatsCollector::addCounter(
+            "memory",
+            "moe_deferred_verifier_route_ledger_allocations",
+            1.0,
+            "model_setup",
+            device_id_.toString(),
+            {{"bytes", std::to_string(bytes * 2)},
+             {"layers", std::to_string(num_layers_)},
+             {"route_capacity_per_layer",
+              std::to_string(deferred_verifier_route_capacity_)},
+             {"ownership", "per_layer_main_verifier"}});
+        logVramBomLine(
+            "moe_deferred_verifier_route_ledger",
+            "device=" + device_id_.toString() +
+                " expert_ids_ptr=" +
+                vramBomPointer(deferred_verifier_route_expert_ids_) +
+                " participant_ids_ptr=" +
+                vramBomPointer(deferred_verifier_route_participant_ids_) +
+                " ownership=per_layer_main_verifier immutable=true layers=" +
+                std::to_string(num_layers_) +
+                " route_capacity_per_layer=" +
+                std::to_string(deferred_verifier_route_capacity_) +
+                " bytes=" + std::to_string(bytes * 2));
+    }
+
+    void DeviceMoERuntimeTable::bindDeferredVerifierRouteLedgerToLayers()
+    {
+        if (!deferred_verifier_route_expert_ids_ ||
+            !deferred_verifier_route_participant_ids_ ||
+            deferred_verifier_route_capacity_ == 0u)
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] cannot bind an incomplete deferred verifier ledger");
+        }
+
+        const size_t route_capacity =
+            static_cast<size_t>(deferred_verifier_route_capacity_);
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        {
+            const size_t offset = static_cast<size_t>(layer_idx) * route_capacity;
+            auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            state.deferred_verifier_route_expert_ids =
+                deferred_verifier_route_expert_ids_ + offset;
+            state.deferred_verifier_route_participant_ids =
+                deferred_verifier_route_participant_ids_ + offset;
+            state.deferred_verifier_route_capacity =
+                deferred_verifier_route_capacity_;
+
+            const auto bindings = captureRuntimeScratchBindings(state);
+            auto &empty = empty_host_layers_[static_cast<size_t>(layer_idx)];
+            resetLayer(empty);
+            restoreRuntimeScratchBindings(empty, bindings);
+            if (initial_layer_captured_[static_cast<size_t>(layer_idx)] != 0u)
+            {
+                restoreRuntimeScratchBindings(
+                    initial_host_layers_[static_cast<size_t>(layer_idx)],
+                    bindings);
+            }
+            else
+            {
+                initial_host_layers_[static_cast<size_t>(layer_idx)] = empty;
+            }
+        }
+    }
+
+    void DeviceMoERuntimeTable::releaseDeferredVerifierRouteLedger() noexcept
+    {
+        freeMirror(
+            device_id_,
+            deferred_verifier_route_participant_ids_,
+            "[MoERuntimeTable] free deferred verifier participant-route ledger");
+        freeMirror(
+            device_id_,
+            deferred_verifier_route_expert_ids_,
+            "[MoERuntimeTable] free deferred verifier expert-route ledger");
+        deferred_verifier_route_participant_ids_ = nullptr;
+        deferred_verifier_route_expert_ids_ = nullptr;
+        deferred_verifier_route_capacity_ = 0u;
     }
 
     void DeviceMoERuntimeTable::allocateDeviceMirror()

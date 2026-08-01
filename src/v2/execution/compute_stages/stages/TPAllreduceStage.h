@@ -199,6 +199,32 @@ namespace llaminar2
         TensorBase *getTensor() const { return params_.tensor; }
 
         /**
+         * @brief Return the explicit collective element count.
+         * @return Number of tensor elements passed to the collective, or zero
+         *         when the full tensor size is selected at execution time.
+         */
+        [[nodiscard]] size_t getCount() const { return params_.count; }
+
+        /**
+         * @brief Return the graph-bound collective precision policy.
+         * @return Empty string for the global policy, otherwise the explicit
+         *         precision name supplied by the graph builder.
+         */
+        [[nodiscard]] const std::string &getPrecision() const
+        {
+            return params_.precision;
+        }
+
+        /**
+         * @brief Return the arena identity of the in-place tensor.
+         * @return Optional BufferId used by declarative coherence handling.
+         */
+        [[nodiscard]] std::optional<BufferId> getTensorBufferId() const
+        {
+            return params_.tensor_buffer_id;
+        }
+
+        /**
          * @brief Update parameters (for stage reuse)
          * @param params New parameters
          */

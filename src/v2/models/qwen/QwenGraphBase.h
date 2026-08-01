@@ -342,7 +342,8 @@ namespace llaminar2
             int batch_size,
             DeviceId device,
             void *device_state_publication_stream,
-            const int32_t *sequence_lengths_device = nullptr) override;
+            const int32_t *sequence_lengths_device = nullptr,
+            const int32_t *absolute_position_ids_device = nullptr) override;
 
     protected:
         // =====================================================================
@@ -478,6 +479,7 @@ namespace llaminar2
             const WeightBinding *lm_head_binding = nullptr;
             TensorBase *lm_head_output = nullptr;
             int lm_head_vocab_size = 0;
+            int serial_equivalent_partition_width = 0;
             bool column_parallel = false;
             bool needs_allgather = false;
         };
@@ -497,6 +499,7 @@ namespace llaminar2
          * @return true when LMHeadStage must bind the primary sharded LM head.
          */
         bool useColumnParallelLMHeadForGraph(TensorBase *logits_local) const;
+        int serialEquivalentLMHeadPartitionWidth(bool column_parallel) const;
 
         /**
          * @brief Decide whether a column-parallel LM head needs an MPI gather.
@@ -729,7 +732,8 @@ namespace llaminar2
             bool is_attention,
             const std::string &stage_name = "",
             std::optional<BufferId> tensor_buffer_id = std::nullopt,
-            std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings = {}) const;
+            std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings = {},
+            std::optional<std::string> precision_override = std::nullopt) const;
 
         // =====================================================================
         // Shared Attention Building Blocks

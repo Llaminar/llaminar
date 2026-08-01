@@ -107,7 +107,7 @@ namespace llaminar2
         TensorType residual_type = params_.residual->native_type();
         TensorType output_type = params_.output->native_type();
 
-        LOG_DEBUG("[ResidualAddStage] Execute: num_elements=" << num_elements
+        LOG_TRACE("[ResidualAddStage] Execute: num_elements=" << num_elements
                                                               << " input_type=" << params_.input->dtype_name()
                                                               << " residual_type=" << params_.residual->dtype_name()
                                                               << " output_type=" << params_.output->dtype_name());

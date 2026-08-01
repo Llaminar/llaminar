@@ -456,8 +456,16 @@ namespace llaminar2
 
     bool QwenGraphBase::localTPMirroredMTPHeadConfigured() const
     {
-        return config_.mtp.enabled &&
-               config_.mtp.mirror_full_head_for_local_tp &&
+        /*
+         * Terminal-head ownership is a graph-layout policy, not a switch that
+         * may change when speculative execution is enabled.  Serial decode is
+         * the arithmetic oracle for grouped MTP, so both lanes must bind the
+         * same full-vocabulary weight and sampling surface.  Tying mirroring to
+         * mtp.enabled made the oracle column-sharded while the verifier was
+         * mirrored, leaving stochastic parity dependent on two different
+         * reduction and sampling implementations.
+         */
+        return config_.mtp.mirror_full_head_for_local_tp &&
                config_.lm_head_column_parallel &&
                config_.tp_ctx != nullptr &&
                config_.tp_ctx->isLocal();
@@ -527,6 +535,7 @@ namespace llaminar2
             .lm_head_binding = nullptr,
             .lm_head_output = nullptr,
             .lm_head_vocab_size = 0,
+            .serial_equivalent_partition_width = 0,
             .column_parallel = false,
             .needs_allgather = false,
         };
@@ -558,6 +567,8 @@ namespace llaminar2
             policy.column_parallel ? config_.vocab_local : config_.vocab_size;
         policy.needs_allgather =
             needsDistributedLMHeadAllGather(policy.column_parallel);
+        policy.serial_equivalent_partition_width =
+            serialEquivalentLMHeadPartitionWidth(policy.column_parallel);
 
         if (policy.column_parallel)
         {
@@ -579,6 +590,25 @@ namespace llaminar2
         policy.lm_head_weight = modelLMHeadForGraph(policy.column_parallel);
         policy.lm_head_binding = modelLMHeadBindingForGraph(policy.column_parallel);
         return policy;
+    }
+
+    int QwenGraphBase::serialEquivalentLMHeadPartitionWidth(
+        bool column_parallel) const
+    {
+        if (column_parallel || !useMirroredMTPHeadWeights())
+            return 0;
+
+        if (config_.vocab_local <= 0 || config_.vocab_size <= 0 ||
+            config_.vocab_local > config_.vocab_size ||
+            (config_.vocab_size % config_.vocab_local) != 0)
+        {
+            throw std::logic_error(
+                "[QwenGraphBase] Mirrored LocalTP LM head requires an equal, positive serial vocabulary partition");
+        }
+
+        return config_.vocab_local == config_.vocab_size
+                   ? 0
+                   : config_.vocab_local;
     }
 
     bool QwenGraphBase::denseDecodeReplicatedActiveForTokens(int total_tokens) const
@@ -1285,6 +1315,21 @@ namespace llaminar2
         row_params.device_id = device;
         row_params.input_buffer_id = input_buffer_id;
         row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROW;
+        /*
+         * Workspace names are graph-family identities, not object-instance
+         * identities. Bucket graphs are rebuilt during eager declaration,
+         * cache warmup, and later exact bucket admission; a construction counter
+         * would give each equivalent row selector a new four-byte allocation
+         * that generation-one preflight could never enumerate. There is exactly
+         * one terminal LM-head row selector in a graph and all family members are
+         * event-serialized, so this semantic key is both unique within a graph
+         * and intentionally shared across captures.
+         */
+        row_params.workspace_buffer_name =
+            std::string(
+                HiddenStateRowSelectStage::
+                    WS_SELECTED_ROW_SCALAR) +
+            "_lm_head_terminal";
 
         graph.addNode("lm_head_row_select",
                       ComputeStageFactory::createHiddenStateRowSelect(row_params),
@@ -1403,7 +1448,8 @@ namespace llaminar2
             layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
             ctx.batch_size, ctx.device,
             ctx.device_state_publication_stream,
-            ctx.sequence_lengths_device);
+            ctx.sequence_lengths_device,
+            static_cast<const int32_t *>(ctx.position_ids_device));
 
         // Merge: attention -> FFN
         std::string attn_last = attn_graph.terminalNode();
@@ -1633,7 +1679,8 @@ namespace llaminar2
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                 input.batch_size, device,
                 input.device_state_publication_stream,
-                input.sequence_lengths_device);
+                input.sequence_lengths_device,
+                static_cast<const int32_t *>(input.position_ids_device));
 
             // Get the terminal node of FFN sub-graph
             std::string ffn_last = ffn_graph.terminalNode();
@@ -1720,6 +1767,8 @@ namespace llaminar2
         lm_params.seq_len = lm_layout.seq_len;
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
+        lm_params.serial_equivalent_partition_width =
+            serialEquivalentLMHeadPartitionWidth(use_column_parallel);
         lm_params.bias_tensor = nullptr; // Qwen2 has no LM head bias
         lm_params.device_id = config_.default_device;
         lm_params.prepared_store = prepared_weight_store_;
@@ -1976,7 +2025,8 @@ namespace llaminar2
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                 input.batch_size, device,
                 input.device_state_publication_stream,
-                input.sequence_lengths_device);
+                input.sequence_lengths_device,
+                static_cast<const int32_t *>(input.position_ids_device));
 
             // Get the terminal node of FFN sub-graph
             std::string ffn_last = ffn_graph.terminalNode();
@@ -2049,6 +2099,8 @@ namespace llaminar2
             lm_params.seq_len = lm_layout.seq_len;
             lm_params.d_model = config_.d_model;
             lm_params.vocab_size = lm_head_vocab_size;
+            lm_params.serial_equivalent_partition_width =
+                serialEquivalentLMHeadPartitionWidth(use_column_parallel);
             lm_params.bias_tensor = nullptr;
             lm_params.device_id = config_.default_device;
             lm_params.prepared_store = prepared_weight_store_;
@@ -2322,7 +2374,9 @@ namespace llaminar2
                     input.batch_size,
                     stage_device,
                     input.device_state_publication_stream,
-                    input.sequence_lengths_device);
+                    input.sequence_lengths_device,
+                    static_cast<const int32_t *>(
+                        input.position_ids_device));
 
                 // Get the terminal node of FFN sub-graph
                 std::string ffn_last = ffn_graph.terminalNode();
@@ -2454,6 +2508,8 @@ namespace llaminar2
                 lm_params.seq_len = lm_layout.seq_len;
                 lm_params.d_model = config_.d_model;
                 lm_params.vocab_size = lm_head_vocab_size;
+                lm_params.serial_equivalent_partition_width =
+                    serialEquivalentLMHeadPartitionWidth(use_column_parallel);
                 lm_params.bias_tensor = nullptr;
                 lm_params.device_id = stage_device;
                 lm_params.prepared_store = prepared_weight_store_;
@@ -2848,6 +2904,8 @@ namespace llaminar2
         lm_params.seq_len = lm_head_seq_len;
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
+        lm_params.serial_equivalent_partition_width =
+            final_projection.serial_equivalent_partition_width;
         lm_params.bias_tensor = nullptr;
         lm_params.device_id = device;
         lm_params.prepared_store = prepared_weight_store_;
@@ -2915,7 +2973,8 @@ namespace llaminar2
         int batch_size,
         DeviceId device,
         void *device_state_publication_stream,
-        const int32_t *sequence_lengths_device)
+        const int32_t *sequence_lengths_device,
+        const int32_t *absolute_position_ids_device)
     {
         if (device.is_gpu() && !device_state_publication_stream)
         {
@@ -2924,6 +2983,7 @@ namespace llaminar2
                 "requires an explicit non-null device-state publication stream");
         }
         (void)sequence_lengths_device;
+        (void)absolute_position_ids_device;
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
         std::string ffn_terminal; // Track the last node for terminalNode()
@@ -3513,12 +3573,13 @@ namespace llaminar2
         bool is_attention,
         const std::string &stage_name,
         std::optional<BufferId> tensor_buffer_id,
-        std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings) const
+        std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings,
+        std::optional<std::string> precision_override) const
     {
         // Unified path: use polymorphic ITPContext for both LOCAL and GLOBAL TP
         if (config_.tp_ctx && config_.tp_ctx->degree() > 1)
         {
-            LOG_DEBUG("[QwenGraphBase] Creating TPAllreduceStage: degree="
+            LOG_TRACE("[QwenGraphBase] Creating TPAllreduceStage: degree="
                       << config_.tp_ctx->degree()
                       << " device_idx=" << config_.tp_device_idx
                       << " count=" << count
@@ -3532,7 +3593,8 @@ namespace llaminar2
             params.tensor = buffer;
             params.count = count;
             params.stage_name = stage_name;
-            params.precision = config_.getAllreducePrecisionForLayer(layer_idx);
+            params.precision = precision_override.value_or(
+                config_.getAllreducePrecisionForLayer(layer_idx));
             params.tensor_buffer_id = tensor_buffer_id;
             params.sideband_device_index = config_.tp_device_idx;
             params.sideband_workspace_bindings = std::move(sideband_workspace_bindings);
@@ -3654,7 +3716,7 @@ namespace llaminar2
         if (!layer.q_norm || !layer.k_norm)
             return false;
 
-        LOG_DEBUG("[QwenGraphBase] Layer using QK norm");
+        LOG_TRACE("[QwenGraphBase] Layer using QK norm");
 
         graph.addNode(prefix + "q_norm",
                       ComputeStageFactory::createQKNorm({

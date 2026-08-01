@@ -17,11 +17,13 @@
 #include "execution/moe/DeviceMoERebalanceABI.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/LeastLoadedExpertAssignment.h"
+#include "execution/moe/DeviceMoERuntimeABI.h"
 #include "utils/DebugEnv.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -47,9 +49,6 @@ namespace
     constexpr uint32_t kDeviceMoEDirectoryFlagLocalCompute = 1u << 2;
     constexpr uint32_t kDeviceMoEDirectoryFlagTransferSlot = 1u << 3;
     constexpr uint32_t kDeviceMoEDirectoryFlagCopyComplete = 1u << 4;
-    // Keep these launch-ABI bits aligned with MoEGroupedHistogramUpdate.
-    constexpr int kGroupedHistogramSelectedRoutes = 1 << 0;
-    constexpr int kGroupedHistogramLocallyAssignedRoutes = 1 << 1;
     constexpr uint32_t kDeviceMoEReplicaRoleNone = 0u;
     constexpr uint32_t kDeviceMoEReplicaRolePrimary = 1u;
     constexpr uint32_t kDeviceMoEReplicaRoleReplica = 2u;
@@ -81,6 +80,10 @@ namespace
     constexpr uint32_t kDeviceMoERebalancePlanExpertPayloadArrival = 1u;
     constexpr uint32_t kDeviceMoERebalancePlanResidentExpertAssignment = 2u;
     constexpr uint32_t kDeviceMoERebalancePlanOwnershipTransfer = 3u;
+    constexpr uint32_t kDeviceMoERebalancePlanFlagExactDestinationSlot =
+        llaminar2::moe_rebalance_abi::kPlanFlagExactDestinationSlot;
+    constexpr uint32_t kDeviceMoERebalancePlanFlagCurrentBatchLLEP =
+        llaminar2::moe_rebalance_abi::kPlanFlagCurrentBatchLLEP;
     constexpr uint32_t kDeviceMoERebalanceAssignmentLeastLoadedResident = 1u;
     constexpr uint32_t kDeviceMoERebalancePhasePlanAssignments = 2u;
     constexpr uint32_t kDeviceMoERebalanceLifecycleIdle = 0u;
@@ -99,6 +102,35 @@ namespace
      */
     constexpr uint32_t kDeviceMoERebalanceErrorPublicationInProgress =
         0xffffffffu;
+
+    /**
+     * @brief Apply one router weight with an explicit FP32 rounding boundary.
+     *
+     * Route publication may either retain each weighted row for a collective or
+     * immediately add it to the final output.  Using the round-to-nearest
+     * intrinsic here prevents the immediate path from contracting the multiply
+     * into the following add while the retained path necessarily rounds at its
+     * global-memory store.
+     */
+    __device__ __forceinline__ float moe_weight_route_rn(
+        float route_weight,
+        float expert_value)
+    {
+        return __fmul_rn(route_weight, expert_value);
+    }
+
+    /**
+     * @brief Add one already-rounded contribution in canonical FP32 order.
+     *
+     * Keeping this operation explicit makes the route and K-part reduction tree
+     * independent of compiler FMA contraction and kernel launch geometry.
+     */
+    __device__ __forceinline__ float moe_accumulate_rn(
+        float accumulator,
+        float contribution)
+    {
+        return __fadd_rn(accumulator, contribution);
+    }
 
     __device__ __forceinline__ bool rebalance_plan_requires_payload(uint32_t op)
     {
@@ -174,6 +206,8 @@ namespace
         int32_t *route_expert_ids;
         float *route_weights;
         int32_t *route_participant_ids;
+        int32_t *deferred_verifier_route_expert_ids;
+        int32_t *deferred_verifier_route_participant_ids;
         int32_t *expert_counts;
         int32_t *expert_offsets;
         int32_t *grouped_token_ids;
@@ -186,9 +220,26 @@ namespace
         uint64_t reserved_u64[4];
         uint32_t prefill_token_capacity;
         uint32_t prefill_route_capacity;
+        uint32_t deferred_verifier_route_capacity;
         uint32_t participant_id;
         uint32_t participant_count;
+        uint32_t current_batch_llep_movement_observed;
     };
+
+    static_assert(
+        sizeof(DeviceMoELayerRuntimeView) ==
+        llaminar2::moe_runtime_abi::kLayerRuntimeBytes);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView,
+                 deferred_verifier_route_expert_ids) ==
+        llaminar2::moe_runtime_abi::kDeferredVerifierExpertIdsOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView, participant_count) ==
+        llaminar2::moe_runtime_abi::kParticipantCountOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView,
+                 current_batch_llep_movement_observed) ==
+        llaminar2::moe_runtime_abi::kCurrentBatchLLEPMovementObservedOffset);
 
     struct DeviceMoERebalanceConfigView
     {
@@ -225,6 +276,8 @@ namespace
         uint32_t routed_assignment_policy;
         uint32_t active_transfer_slot_capacity;
         uint32_t transfer_slot_directory_capacity;
+        uint32_t initial_maintenance_period_tokens;
+        uint32_t maintenance_period_tokens;
     };
     static_assert(
         sizeof(DeviceMoERebalanceConfigView) ==
@@ -303,6 +356,7 @@ namespace
         uint32_t skipped_post_load_spread_ceiling;
         uint32_t payload_source_participant_mask;
         uint32_t payload_destination_participant_mask;
+        uint32_t prefill_current_batch_movement_layers;
         uint64_t payload_edge_mask;
         uint64_t pre_wave_load_total;
         uint64_t pre_wave_load_spread;
@@ -484,6 +538,11 @@ namespace
         uint32_t last_error_missing_destination_expert;
         uint32_t last_error_missing_destination_source;
         uint32_t last_error_local_transfer_slot_count;
+        uint32_t decode_rounds_committed;
+        uint32_t decode_rounds_until_maintenance;
+        uint32_t maintenance_period_rounds;
+        uint32_t maintenance_due;
+        uint32_t decode_boundary_advanced;
         DeviceMoERebalanceWaveProgressView waves[2];
     };
 
@@ -666,6 +725,8 @@ namespace
                config.active_transfer_slot_capacity <=
                    config.transfer_slot_directory_capacity &&
                config.window_size_tokens > 0u &&
+               config.initial_maintenance_period_tokens > 0u &&
+               config.maintenance_period_tokens > 0u &&
                (config.layer_window_count == 0u ||
                 config.layer_window_start < config.num_layers);
     }
@@ -687,7 +748,14 @@ namespace
                state->version == kDeviceMoERebalanceVersion &&
                state->participant_id == config.participant_id &&
                state->participant_count == config.participant_count &&
-               state->wave_count == 2u;
+               state->wave_count == 2u &&
+               ((state->decode_rounds_until_maintenance > 0u &&
+                 state->maintenance_due == 0u) ||
+                (state->decode_rounds_until_maintenance == 0u &&
+                 state->maintenance_due == 1u)) &&
+               state->decode_boundary_advanced <= 1u &&
+               state->maintenance_period_rounds ==
+                   config.maintenance_period_tokens;
     }
 
     __device__ __forceinline__ uint32_t rebalance_active_command_wave_index(
@@ -701,6 +769,57 @@ namespace
         if (!rebalance_graph_controller_state_basic_ok(state, config))
             return 0u;
         return state->active_wave % count;
+    }
+
+    /** Advance one serial-visible decode round on the final routed layer. */
+    __device__ __forceinline__ void
+    advance_rebalance_serial_decode_round(
+        DeviceMoERebalanceGraphControllerStateView *state,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        if (!rebalance_graph_controller_state_basic_ok(state, config) ||
+            state->maintenance_due != 0u ||
+            state->decode_rounds_until_maintenance == 0u)
+        {
+            if (state)
+                state->maintenance_due = 2u;
+            return;
+        }
+
+        ++state->decode_rounds_committed;
+        --state->decode_rounds_until_maintenance;
+        if (state->decode_rounds_until_maintenance == 0u)
+            state->maintenance_due = 1u;
+    }
+
+    /** Consume one due edge and arm the recurring device-owned period. */
+    __device__ __forceinline__ uint32_t
+    consume_rebalance_maintenance_boundary(
+        DeviceMoERebalanceGraphControllerStateView *state,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        if (!rebalance_graph_controller_state_basic_ok(state, config))
+            return 2u;
+        if (state->decode_boundary_advanced != 0u)
+        {
+            state->decode_boundary_advanced = 0u;
+        }
+        else
+        {
+            advance_rebalance_serial_decode_round(state, config);
+        }
+        if (state->maintenance_due == 0u)
+            return 0u;
+        if (state->maintenance_due != 1u ||
+            state->decode_rounds_until_maintenance != 0u)
+        {
+            return 2u;
+        }
+        state->maintenance_due = 0u;
+        state->decode_boundary_advanced = 0u;
+        state->decode_rounds_until_maintenance =
+            state->maintenance_period_rounds;
+        return 1u;
     }
 
     /**
@@ -1255,6 +1374,7 @@ namespace
      */
     struct RebalanceTransferSlotClaimSummaryView
     {
+        uint32_t transient_placement_layers;
         uint32_t active_claims;
         uint32_t unique_claims;
         uint32_t duplicate_claims;
@@ -1304,6 +1424,8 @@ namespace
 
             const DeviceMoEPlacementBankView &bank =
                 runtime.banks[runtime.active_bank];
+            if (runtime.current_batch_llep_movement_observed != 0u)
+                ++summary.transient_placement_layers;
             for (uint32_t expert = 0u; expert < config.num_experts; ++expert)
             {
                 const auto &descriptor = bank.experts[expert];
@@ -1519,6 +1641,8 @@ namespace
                 config,
                 local_transfer_slots,
                 local_transfer_slot_count);
+        status->prefill_current_batch_movement_layers =
+            summary.transient_placement_layers;
         status->prefill_active_transfer_slot_experts = summary.active_claims;
         status->prefill_unique_transfer_slot_claims = summary.unique_claims;
         status->prefill_duplicate_transfer_slot_claims =
@@ -1634,73 +1758,35 @@ namespace
         return false;
     }
 
-    __device__ __forceinline__ int runtime_nth_resident_participant(
-        uint32_t resident_mask,
-        uint32_t participant_count,
-        int ordinal)
-    {
-        for (int participant = 0; participant < static_cast<int>(participant_count); ++participant)
-        {
-            if ((resident_mask & runtime_participant_bit(participant)) == 0u)
-                continue;
-            if (ordinal == 0)
-                return participant;
-            --ordinal;
-        }
-        return -1;
-    }
-
-    __device__ __forceinline__ uint64_t runtime_same_expert_prior_occurrences(
-        const int *selected_experts,
-        int selected_slot,
-        int expert_id)
-    {
-        uint64_t occurrences = 0;
-        for (int slot = 0; slot < selected_slot; ++slot)
-        {
-            if (selected_experts[slot] == expert_id)
-                ++occurrences;
-        }
-        return occurrences;
-    }
-
     __device__ __forceinline__ int runtime_choose_replicated_participant(
         const DeviceMoELayerRuntimeView *runtime,
         const DeviceMoEPlacementBankView &bank,
-        const int *selected_experts,
         int selected_slot,
         int expert_id,
+        int32_t logical_position,
         const int *load)
     {
         const uint32_t participant_count = runtime->participant_count;
         const uint32_t resident_mask =
             runtime_expert_resident_mask(runtime, bank, expert_id);
-        const int resident_count = runtime_resident_count(resident_mask, participant_count);
-        if (resident_count <= 0)
-            return -1;
-
-        const uint64_t turn =
-            runtime->decode_histogram[expert_id] +
-            runtime_same_expert_prior_occurrences(selected_experts, selected_slot, expert_id);
-        const int preferred =
-            runtime_nth_resident_participant(
-                resident_mask,
-                participant_count,
-                static_cast<int>(turn % static_cast<uint64_t>(resident_count)));
-
-        int best = -1;
-        for (int participant = 0; participant < static_cast<int>(participant_count); ++participant)
-        {
-            if ((resident_mask & runtime_participant_bit(participant)) == 0u)
-                continue;
-            if (best < 0 ||
-                load[participant] < load[best] ||
-                (load[participant] == load[best] && participant == preferred))
-            {
-                best = participant;
-            }
-        }
-        return best;
+        const uint64_t tie_turn =
+            llaminar2::least_loaded_ep::residentAssignmentTieTurn(
+                logical_position,
+                expert_id,
+                selected_slot);
+        const int owner = runtime_expert_owner(bank, expert_id);
+        const uint32_t fallback =
+            owner >= 0 && static_cast<uint32_t>(owner) < participant_count
+                ? static_cast<uint32_t>(owner)
+                : runtime->participant_id;
+        return static_cast<int>(
+            llaminar2::least_loaded_ep::
+                selectBatchInvariantResidentParticipant(
+                    resident_mask,
+                    load,
+                    participant_count,
+                    fallback,
+                    tie_turn));
     }
 
     __device__ __forceinline__ uint64_t runtime_participant_load_spread(
@@ -1727,6 +1813,7 @@ namespace
         const int *selected_experts,
         int num_experts,
         int top_k,
+        int32_t logical_position,
         bool record_balance,
         bool *local_compute_flags)
     {
@@ -1757,6 +1844,11 @@ namespace
                     bank.local_compute_mask[expert_id] != 0u;
             }
             return;
+        }
+        if (logical_position < 0)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "replicated decode routing requires a logical position");
         }
         const bool track_balance =
             record_balance &&
@@ -1840,7 +1932,12 @@ namespace
 
             const int selected_participant =
                 runtime_choose_replicated_participant(
-                    runtime, bank, selected_experts, slot, expert_id, actual_load);
+                    runtime,
+                    bank,
+                    slot,
+                    expert_id,
+                    logical_position,
+                    actual_load);
             if (selected_participant >= 0 &&
                 selected_participant < static_cast<int>(participant_count))
             {
@@ -1931,6 +2028,12 @@ namespace
         __shared__ uint32_t shared_source_payload_slot_counts[kDeviceMoEMaxParticipants];
         __shared__ uint32_t
             shared_active_transfer_slot_counts[kDeviceMoEMaxParticipants];
+        using LLEPStatus =
+            llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentStatus;
+        __shared__ uint64_t llep_status_storage[
+            (sizeof(LLEPStatus) + sizeof(uint64_t) - 1u) / sizeof(uint64_t)];
+        auto &llep_status =
+            *reinterpret_cast<LLEPStatus *>(llep_status_storage);
 
         if (leader)
         {
@@ -2007,6 +2110,28 @@ namespace
             else
             {
                 shared_abort = 1u;
+            }
+
+            if (shared_abort == 0u)
+            {
+                const uint32_t boundary =
+                    consume_rebalance_maintenance_boundary(
+                        controller_state,
+                        config);
+                if (boundary == 0u)
+                {
+                    status->status_code =
+                        kDeviceMoERebalanceStatusWindowNotReady;
+                    status->skipped_not_ready = 1u;
+                    status->skipped_busy_wave = 0u;
+                    shared_abort = 1u;
+                }
+                else if (boundary != 1u)
+                {
+                    status->status_code =
+                        kDeviceMoERebalanceStatusInvalidRuntime;
+                    shared_abort = 1u;
+                }
             }
 
             if (shared_abort == 0u &&
@@ -2521,7 +2646,6 @@ namespace
                 workspace.pending_load = shared_owner_policy_load;
                 workspace.assigned_load = shared_candidate_policy_load;
 
-                llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentStatus llep_status{};
                 const bool planned_llep =
                     llaminar2::least_loaded_ep::planLeastLoadedExpertWeightTransfers(
                         shared_expert_counts,
@@ -2530,7 +2654,7 @@ namespace
                         workspace,
                         weight_transfers,
                         kDeviceMoEMaxExperts,
-                        &llep_status,
+                        llep_status,
                         resident_participant_masks);
                 if (!planned_llep || llep_status.overflow != 0u)
                 {
@@ -4238,6 +4362,28 @@ namespace
                 shared_abort = 1u;
             }
 
+            if (shared_abort == 0u)
+            {
+                const uint32_t boundary =
+                    consume_rebalance_maintenance_boundary(
+                        controller_state,
+                        config);
+                if (boundary == 0u)
+                {
+                    status->status_code =
+                        kDeviceMoERebalanceStatusWindowNotReady;
+                    status->skipped_not_ready = 1u;
+                    status->skipped_busy_wave = 0u;
+                    shared_abort = 1u;
+                }
+                else if (boundary != 1u)
+                {
+                    status->status_code =
+                        kDeviceMoERebalanceStatusInvalidRuntime;
+                    shared_abort = 1u;
+                }
+            }
+
             if (shared_abort == 0u &&
                 rebalance_active_wave_busy_for_new_plan(
                     controller_state,
@@ -5470,12 +5616,7 @@ namespace
         const DeviceMoERebalanceGraphControllerStateView *state,
         const DeviceMoERebalanceConfigView &config)
     {
-        return state &&
-               state->magic == kDeviceMoERebalanceMagic &&
-               state->version == kDeviceMoERebalanceVersion &&
-               state->participant_id == config.participant_id &&
-               state->participant_count == config.participant_count &&
-               state->wave_count == 2u;
+        return rebalance_graph_controller_state_basic_ok(state, config);
     }
 
     __device__ void init_rebalance_graph_controller_state_device(
@@ -5496,6 +5637,12 @@ namespace
         state->last_error_missing_destination_layer = kDeviceMoEInvalidSlot;
         state->last_error_missing_destination_expert = kDeviceMoEInvalidSlot;
         state->last_error_missing_destination_source = kDeviceMoEInvalidSlot;
+        state->decode_rounds_committed = 0u;
+        state->decode_rounds_until_maintenance =
+            config.initial_maintenance_period_tokens;
+        state->maintenance_period_rounds =
+            config.maintenance_period_tokens;
+        state->maintenance_due = 0u;
         for (uint32_t i = 0; i < 2u; ++i)
         {
             auto &wave = state->waves[i];
@@ -5520,6 +5667,47 @@ namespace
         }
         if (!rebalance_graph_controller_state_ok(state, config))
             init_rebalance_graph_controller_state_device(state, config);
+    }
+
+    /**
+     * Start a fresh request without replacing the persistent controller buffer.
+     *
+     * The ordinary initializer above is part of captured replay and therefore
+     * must preserve a valid controller. Request teardown has the opposite
+     * contract: all prior producers have already joined the reset stream, so
+     * retaining a valid-looking epoch or wave would leak state into the next
+     * request. Keep the two transitions as different kernels so capture can
+     * never accidentally select reset semantics.
+     */
+    __global__ void reset_rebalance_graph_transaction_for_request_kernel(
+        DeviceMoERebalanceGraphControllerStateView *state,
+        DeviceMoERebalanceCommandBufferHeaderView *command_headers,
+        DeviceMoERebalanceWaveStateView *wave_states,
+        uint32_t *plan_counts,
+        uint32_t command_buffer_count,
+        DeviceMoERebalanceConfigView config)
+    {
+        if (blockIdx.x != 0 || threadIdx.x != 0 || !state ||
+            !command_headers || !wave_states || !plan_counts)
+            return;
+        if (!rebalance_config_ok(config))
+        {
+            DeviceMoERebalanceGraphControllerStateView zero{};
+            *state = zero;
+            state->last_error_code =
+                kDeviceMoERebalanceStatusInvalidConfig;
+            return;
+        }
+        init_rebalance_graph_controller_state_device(state, config);
+        const uint32_t count =
+            rebalance_command_buffer_count(command_buffer_count);
+        for (uint32_t wave = 0u; wave < count; ++wave)
+        {
+            command_headers[wave] =
+                DeviceMoERebalanceCommandBufferHeaderView{};
+            wave_states[wave] = DeviceMoERebalanceWaveStateView{};
+            plan_counts[wave] = 0u;
+        }
     }
 
     __device__ __forceinline__ uint32_t rebalance_wave_next_layer(
@@ -6426,6 +6614,56 @@ namespace
     }
 
     /**
+     * @brief Authenticate and lease an exact prefix-checkpoint destination slot.
+     *
+     * Request reset restores the immutable transfer-directory baseline before
+     * prefix rehydration runs. The portable checkpoint then names the exact
+     * physical slot that held each replica. Unlike ordinary current-batch LLEP,
+     * rehydration must not search for another free slot: doing so restores the
+     * same immediate logical placement but changes the starting topology seen
+     * by the next maintenance wave.
+     */
+    __device__ __forceinline__ bool
+    rebalance_lease_exact_prefill_transfer_slot(
+        DeviceMoERebalancePlanEntryView &plan,
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfigView &config,
+        const DeviceMoERebalancePlanEntryView *selected_plans,
+        uint32_t selected_plan_count)
+    {
+        const uint32_t slot = plan.destination_slot;
+        if (!runtime_layers ||
+            !local_transfer_slots ||
+            slot >= local_transfer_slot_count ||
+            rebalance_transfer_slot_selected(
+                selected_plans,
+                selected_plan_count,
+                slot,
+                config.participant_id))
+        {
+            return false;
+        }
+
+        const auto &prior = local_transfer_slots[slot];
+        if (!rebalance_transfer_slot_identity_ok(prior, slot, config) ||
+            !rebalance_transfer_slot_generation_retired(
+                prior,
+                slot,
+                runtime_layers,
+                config))
+        {
+            return false;
+        }
+
+        plan.destination_previous_layer = prior.layer;
+        plan.destination_previous_expert = prior.expert;
+        plan.destination_generation = prior.generation;
+        return true;
+    }
+
+    /**
      * @brief Lease physical storage for one projected prefill LLEP arrival.
      *
      * Current-batch materialization owns only logical movement and compact
@@ -7174,6 +7412,9 @@ namespace
                     }
 
                     DeviceMoERebalancePlanEntryView projected = plan;
+                    const bool exact_destination_slot =
+                        (plan.flags &
+                         kDeviceMoERebalancePlanFlagExactDestinationSlot) != 0u;
                     /*
                      * The gathered command is logical: its destination slot is
                      * not a physical allocation. Only the destination
@@ -7181,7 +7422,10 @@ namespace
                      * participant sees the complete local directory and all
                      * active runtime-bank claims.
                      */
-                    projected.destination_slot = kDeviceMoEInvalidSlot;
+                    if (!exact_destination_slot ||
+                        projected.destination_participant !=
+                            config.participant_id)
+                        projected.destination_slot = kDeviceMoEInvalidSlot;
                     projected.destination_previous_layer =
                         kDeviceMoEInvalidSlot;
                     projected.destination_previous_expert =
@@ -7189,15 +7433,29 @@ namespace
                     projected.destination_generation = 0u;
                     if (projected.destination_participant ==
                             config.participant_id &&
-                        !rebalance_lease_prefill_transfer_slot(
-                            projected,
-                            runtime_layers,
-                            local_transfer_slots,
-                            local_transfer_slot_count,
-                            config,
-                            projected_wave_entries,
-                            output_count))
+                        !(exact_destination_slot
+                              ? rebalance_lease_exact_prefill_transfer_slot(
+                                    projected,
+                                    runtime_layers,
+                                    local_transfer_slots,
+                                    local_transfer_slot_count,
+                                    config,
+                                    projected_wave_entries,
+                                    output_count)
+                              : rebalance_lease_prefill_transfer_slot(
+                                    projected,
+                                    runtime_layers,
+                                    local_transfer_slots,
+                                    local_transfer_slot_count,
+                                    config,
+                                    projected_wave_entries,
+                                    output_count)))
                     {
+                        if (exact_destination_slot)
+                        {
+                            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                                "CUDA prefix rehydration could not lease its exact checkpointed transfer slot");
+                        }
                         projected_status.plan_overflow = 1u;
                         projected_status.payload_bucket_overflow = 1u;
                         ++projected_status.capacity_limited_candidates;
@@ -7290,6 +7548,8 @@ namespace
         __shared__ uint32_t shared_transfer_experts[kThreads];
         __shared__ uint32_t shared_transfer_sources[kThreads];
         __shared__ uint32_t shared_transfer_destinations[kThreads];
+        __shared__ uint32_t
+            shared_transfer_destination_slot_requirements[kThreads];
         __shared__ uint32_t shared_transfer_valid[kThreads];
         __shared__ uint32_t shared_transfer_output_indices[kThreads];
         __shared__ uint32_t shared_transfer_payload_slots[kThreads];
@@ -7387,6 +7647,8 @@ namespace
                 shared_transfer_experts[lane] = transfer.expert;
                 shared_transfer_sources[lane] = transfer.source_participant;
                 shared_transfer_destinations[lane] = transfer.destination_participant;
+                shared_transfer_destination_slot_requirements[lane] =
+                    transfer.destination_slot_requirement_plus_one;
             }
             __syncthreads();
 
@@ -7482,13 +7744,26 @@ namespace
                     shared_transfer_destinations[transfer_idx];
                 DeviceMoERebalancePlanEntryView entry{};
                 entry.op = kDeviceMoERebalancePlanExpertPayloadArrival;
+                entry.flags = kDeviceMoERebalancePlanFlagCurrentBatchLLEP;
                 entry.layer = layer_idx;
                 entry.expert = transfer_expert;
                 entry.source_participant = transfer_source;
                 entry.destination_participant = transfer_destination;
                 entry.source_resident_mask =
                     active_bank.resident_participant_mask[transfer_expert];
-                entry.destination_slot = kDeviceMoEInvalidSlot;
+                const uint32_t destination_slot_requirement =
+                    shared_transfer_destination_slot_requirements[transfer_idx];
+                if (destination_slot_requirement != 0u)
+                {
+                    entry.flags |=
+                        kDeviceMoERebalancePlanFlagExactDestinationSlot;
+                    entry.destination_slot =
+                        destination_slot_requirement - 1u;
+                }
+                else
+                {
+                    entry.destination_slot = kDeviceMoEInvalidSlot;
+                }
                 entry.payload_slot =
                     shared_transfer_payload_slots[transfer_idx];
                 plan_entries[
@@ -9048,6 +9323,11 @@ namespace
                      * slot ownership.
                      */
                     next.transient_placement_observed = 1u;
+                    if ((plan.flags &
+                         kDeviceMoERebalancePlanFlagCurrentBatchLLEP) != 0u)
+                    {
+                        runtime.current_batch_llep_movement_observed = 1u;
+                    }
                 }
             }
         }
@@ -9543,7 +9823,14 @@ namespace
             next.experts[plan.expert] = desc;
             next.resident_participant_mask[plan.expert] = resident_mask & valid_mask;
             if (rebalance_plan_requires_payload(plan.op))
+            {
                 next.transient_placement_observed = 1u;
+                if ((plan.flags &
+                     kDeviceMoERebalancePlanFlagCurrentBatchLLEP) != 0u)
+                {
+                    runtime.current_batch_llep_movement_observed = 1u;
+                }
+            }
         }
 
         uint32_t multi_resident = 0u;
@@ -10337,6 +10624,7 @@ namespace
         bool normalize_weights,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
+        const int32_t *__restrict__ absolute_position_ids,
         const DeviceMoERebalancePlanEntryView *rebalance_plan_entries,
         uint32_t rebalance_plan_capacity,
         DeviceMoERebalanceCommandBufferHeaderView *rebalance_command_header,
@@ -10422,6 +10710,9 @@ namespace
                     selected,
                     num_experts,
                     top_k,
+                    absolute_position_ids
+                        ? absolute_position_ids[0]
+                        : -1,
                     update_runtime_histogram,
                     local_compute_flags);
             }
@@ -10470,7 +10761,8 @@ namespace
         int num_experts,
         int top_k,
         bool write_legacy_outputs,
-        bool update_runtime_histogram)
+        bool update_runtime_histogram,
+        const int32_t *__restrict__ absolute_position_ids)
     {
         if (threadIdx.x != 0)
             return;
@@ -10484,6 +10776,9 @@ namespace
                 expert_indices,
                 num_experts,
                 top_k,
+                absolute_position_ids
+                    ? absolute_position_ids[0]
+                    : -1,
                 update_runtime_histogram,
                 local_compute_flags);
         }
@@ -11397,7 +11692,7 @@ namespace
         int max_slots,
         int num_experts,
         int filter_to_local_runtime_experts,
-        int histogram_update_flags)
+        int retain_routes_for_deferred_commit)
     {
         const int slot = blockIdx.x * blockDim.x + threadIdx.x;
         if (!runtime || slot >= max_slots)
@@ -11414,26 +11709,22 @@ namespace
         {
             expert_id = static_cast<int>(routing_indices[slot]);
             weight = routing_weights[slot];
-            /*
-             * The selected-route histogram is global routing demand, so record
-             * it before a StaticOwner participant filters non-local experts.
-             * Integer atomic addition cannot perturb router weights or grouped
-             * verifier numerical equivalence.
-             */
-            if (expert_id >= 0 &&
-                expert_id < num_experts &&
-                (histogram_update_flags & kGroupedHistogramSelectedRoutes) != 0)
-            {
-                atomicAdd(
-                    reinterpret_cast<unsigned long long *>(
-                        &runtime->decode_histogram[expert_id]),
-                    1ULL);
-            }
-            if (expert_id < 0 || expert_id >= num_experts ||
-                (filter_to_local_runtime_experts != 0 &&
-                 !prefill_static_local_runtime_ready(runtime, expert_id, num_experts)))
+            if (expert_id < 0 || expert_id >= num_experts)
             {
                 expert_id = -1;
+                weight = 0.0f;
+            }
+            else if (filter_to_local_runtime_experts != 0 &&
+                     !prefill_static_local_runtime_ready(
+                         runtime,
+                         expert_id,
+                         num_experts))
+            {
+                /*
+                 * Preserve the router's selected expert for accepted-history
+                 * publication. An inactive participant id is sufficient to
+                 * exclude this route from local counts and grouped compute.
+                 */
                 weight = 0.0f;
             }
             else
@@ -11445,6 +11736,17 @@ namespace
         runtime->route_expert_ids[slot] = expert_id;
         runtime->route_weights[slot] = weight;
         runtime->route_participant_ids[slot] = participant_id;
+        if (retain_routes_for_deferred_commit != 0 &&
+            slot < current_slots &&
+            runtime->deferred_verifier_route_expert_ids &&
+            runtime->deferred_verifier_route_participant_ids &&
+            runtime->deferred_verifier_route_capacity >=
+                static_cast<uint32_t>(current_slots))
+        {
+            runtime->deferred_verifier_route_expert_ids[slot] = expert_id;
+            runtime->deferred_verifier_route_participant_ids[slot] =
+                participant_id;
+        }
     }
 
     __global__ void prefill_group_count_assigned_runtime_kernel(
@@ -11452,7 +11754,7 @@ namespace
         int current_slots,
         int max_slots,
         int num_experts,
-        int histogram_update_flags)
+        int retain_routes_for_deferred_commit)
     {
         const int slot = blockIdx.x * blockDim.x + threadIdx.x;
         if (!runtime || slot >= max_slots || slot >= current_slots)
@@ -11464,25 +11766,95 @@ namespace
 
         const int expert_id = runtime->route_expert_ids[slot];
         const int participant_id = runtime->route_participant_ids[slot];
+        if (retain_routes_for_deferred_commit != 0 &&
+            runtime->deferred_verifier_route_expert_ids &&
+            runtime->deferred_verifier_route_participant_ids &&
+            runtime->deferred_verifier_route_capacity >=
+                static_cast<uint32_t>(current_slots))
+        {
+            runtime->deferred_verifier_route_expert_ids[slot] = expert_id;
+            runtime->deferred_verifier_route_participant_ids[slot] =
+                participant_id;
+        }
         if (expert_id >= 0 &&
             expert_id < num_experts &&
             participant_id == static_cast<int>(runtime->participant_id))
         {
             atomicAdd(runtime->expert_counts + expert_id, 1);
-            /*
-             * This is the first point where StaticOwner filtering or LLEP
-             * assignment has made the route's actual compute participant
-             * unambiguous. Fuse the persistent local-demand publication into
-             * the existing count launch instead of adding a side kernel.
-             */
-            if ((histogram_update_flags &
-                 kGroupedHistogramLocallyAssignedRoutes) != 0)
-            {
-                atomicAdd(
-                    reinterpret_cast<unsigned long long *>(
-                        &runtime->decode_local_histogram[expert_id]),
-                    1ULL);
-            }
+        }
+    }
+
+    /**
+     * @brief Publish only serial-visible grouped-verifier routing evidence.
+     *
+     * Route ids and participant assignments were produced by the verifier
+     * graph for every padded physical row. Acceptance metadata is produced
+     * later by the stochastic verifier reducer. One thread examines one route
+     * slot and commits it only when its request-local token row falls inside
+     * that request's accepted state prefix.
+     *
+     * The selected and local counters are independent because every
+     * participant observes global route selection, while only the participant
+     * that actually computed the route owns local demand. Unsigned integer
+     * atomics make the result independent of thread execution order.
+     */
+    __global__ void commit_grouped_verifier_histograms_runtime_kernel(
+        DeviceMoELayerRuntimeView *__restrict__ runtime,
+        const int32_t *__restrict__ accepted_state_counts,
+        const int32_t *__restrict__ publication_ok_flags,
+        int request_count,
+        int rows_per_request,
+        int total_rows,
+        int num_experts,
+        int top_k)
+    {
+        const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total_slots = total_rows * top_k;
+        if (!runtime || slot >= total_slots)
+            return;
+        if (!runtime->deferred_verifier_route_expert_ids ||
+            !runtime->deferred_verifier_route_participant_ids)
+            return;
+        if (runtime->deferred_verifier_route_capacity <
+            static_cast<uint32_t>(total_slots))
+        {
+            return;
+        }
+
+        const int token_row = slot / top_k;
+        const int request = token_row / rows_per_request;
+        const int request_row = token_row - request * rows_per_request;
+        if (request < 0 ||
+            request >= request_count ||
+            publication_ok_flags[request] == 0)
+        {
+            return;
+        }
+
+        const int accepted_rows = accepted_state_counts[request];
+        if (accepted_rows < 0 ||
+            accepted_rows > rows_per_request ||
+            request_row >= accepted_rows)
+        {
+            return;
+        }
+
+        const int expert_id =
+            runtime->deferred_verifier_route_expert_ids[slot];
+        if (expert_id < 0 || expert_id >= num_experts)
+            return;
+
+        atomicAdd(
+            reinterpret_cast<unsigned long long *>(
+                &runtime->decode_histogram[expert_id]),
+            1ULL);
+        if (runtime->deferred_verifier_route_participant_ids[slot] ==
+            static_cast<int>(runtime->participant_id))
+        {
+            atomicAdd(
+                reinterpret_cast<unsigned long long *>(
+                    &runtime->decode_local_histogram[expert_id]),
+                1ULL);
         }
     }
 
@@ -11595,41 +11967,6 @@ namespace
             atomicAdd(runtime->expert_counts + expert_id, 1);
     }
 
-    __global__ void prefill_llep_clear_assignment_runtime_kernel(
-        DeviceMoELayerRuntimeView *__restrict__ runtime,
-        int max_slots,
-        int num_experts)
-    {
-        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (!runtime)
-            return;
-
-        if (idx < num_experts && runtime->expert_counts && runtime->expert_offsets)
-        {
-            runtime->expert_counts[idx] = 0;
-            runtime->expert_offsets[idx] = -1;
-        }
-
-        if (idx < max_slots)
-        {
-            if (runtime->grouped_token_ids)
-                runtime->grouped_token_ids[idx] = 0;
-            if (runtime->grouped_route_weights)
-                runtime->grouped_route_weights[idx] = 0.0f;
-        }
-
-        int32_t *split_ends = static_cast<int32_t *>(runtime->reserved_ptrs[0]);
-        const int split_items = num_experts * static_cast<int>(kDeviceMoEMaxParticipants);
-        if (idx < split_items && split_ends)
-            split_ends[idx] = 0;
-
-        if (idx == 0)
-        {
-            runtime->reserved_u64[2] = 0ULL;
-            runtime->reserved_u64[3] = 0ULL;
-        }
-    }
-
     __global__ void prefill_llep_clear_current_batch_plan_runtime_kernel(
         DeviceMoELayerRuntimeView *__restrict__ runtime,
         int num_experts)
@@ -11653,130 +11990,265 @@ namespace
         }
     }
 
-    __global__ void prefill_llep_plan_resident_splits_runtime_kernel(
+    /**
+     * @brief Assign grouped resident routes with serial batch invariance.
+     *
+     * One CUDA lane owns one token row and keeps that row's participant loads
+     * in registers. Route slots are consumed in their original router order.
+     * Equal-load ties use the row's absolute logical position and route
+     * identity, exactly like serial decode. Persistent demand histograms remain
+     * maintenance evidence only, so rejected speculative rows cannot perturb
+     * a future committed row's floating-point partition.
+     *
+     * The launch is allocation-free, atomic-free, transfer-free, and
+     * graph-capturable. Every row is independent, so the GPU executes all rows
+     * concurrently without imposing an artificial M limit.
+     */
+    __global__ void prefill_llep_assign_resident_rows_logical_position_runtime_kernel(
         DeviceMoELayerRuntimeView *__restrict__ runtime,
+        const int32_t *__restrict__ absolute_position_ids,
         int current_slots,
         int max_slots,
-        int num_experts)
+        int num_experts,
+        int top_k)
     {
-        if (!runtime || blockIdx.x != 0 || threadIdx.x != 0)
-            return;
-        if (!runtime->route_expert_ids || !runtime->route_participant_ids ||
-            !runtime->expert_counts || !runtime->expert_offsets || !runtime->reserved_ptrs[0])
-            return;
-        if (runtime->active_bank > 1u ||
-            runtime->participant_count == 0u ||
-            runtime->participant_count > kDeviceMoEMaxParticipants ||
-            current_slots < 0 ||
-            max_slots <= 0 ||
-            current_slots > max_slots ||
-            runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots))
+        const int row = blockIdx.x * blockDim.x + threadIdx.x;
+        const int current_rows = current_slots / top_k;
+
+        if (!runtime)
         {
+            if (row == 0)
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "resident verifier assignment requires a runtime");
             return;
         }
-        uint64_t participant_load[kDeviceMoEMaxParticipants];
-        for (uint32_t participant = 0; participant < kDeviceMoEMaxParticipants; ++participant)
-            participant_load[participant] = 0ULL;
+
+        if (row == 0)
+        {
+            runtime->reserved_u64[2] = 0ULL;
+            runtime->reserved_u64[3] = 0ULL;
+        }
+
+        const bool runtime_valid =
+            runtime->route_expert_ids &&
+            runtime->route_participant_ids &&
+            absolute_position_ids &&
+            runtime->active_bank <= 1u &&
+            runtime->participant_count > 0u &&
+            runtime->participant_count <= kDeviceMoEMaxParticipants &&
+            current_slots >= 0 &&
+            max_slots > 0 &&
+            current_slots <= max_slots &&
+            runtime->prefill_route_capacity >= static_cast<uint32_t>(max_slots);
+        if (!runtime_valid)
+        {
+            if (row == 0)
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "resident verifier assignment runtime is invalid");
+            return;
+        }
+        if (row >= current_rows)
+            return;
+        const int32_t logical_position = absolute_position_ids[row];
+        if (logical_position < 0)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "resident verifier logical position is negative");
+        }
 
         const uint32_t participant_count = runtime->participant_count;
-        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
-        auto *split_ends = static_cast<int32_t *>(runtime->reserved_ptrs[0]);
+        const DeviceMoEPlacementBankView &bank =
+            runtime->banks[runtime->active_bank];
+        const int row_slot_base = row * top_k;
+        int participant_load[kDeviceMoEMaxParticipants] = {};
 
-        for (int order = 0; order < num_experts; ++order)
+        /*
+         * Serial decode's first pass publishes every non-replicated route to
+         * its owner and charges that owner before any replicated route is
+         * selected. Preserve that two-pass ordering even when the single-owner
+         * route appears later in top-k order.
+         */
+        for (int route = 0; route < top_k; ++route)
         {
-            const int best_expert =
-                llaminar2::least_loaded_ep::selectHighestLoadUnassignedExpert(
-                    runtime->expert_counts,
-                    runtime->expert_offsets,
-                    static_cast<uint32_t>(num_experts));
-            if (best_expert < 0)
-                break;
-            const int best_load = runtime->expert_counts[best_expert];
-            runtime->expert_offsets[best_expert] = 0;
-            if (best_load <= 0)
-                continue;
+            const int selected_slot = row_slot_base + route;
+            const int selected_expert =
+                runtime->route_expert_ids[selected_slot];
+            if (selected_expert < 0 || selected_expert >= num_experts)
+            {
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "resident verifier route expert is out of range");
+            }
+            for (int prior_route = 0; prior_route < route; ++prior_route)
+            {
+                if (runtime->route_expert_ids[
+                        row_slot_base + prior_route] == selected_expert)
+                {
+                    FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                        "resident verifier row contains duplicate experts");
+                }
+            }
 
-            const auto &desc = bank.experts[best_expert];
+            const int owner =
+                bank.experts[selected_expert].owner_participant;
+            if (owner < 0 ||
+                static_cast<uint32_t>(owner) >= participant_count)
+            {
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "resident verifier route owner is invalid");
+            }
+            const uint32_t resident_mask =
+                runtime_expert_resident_mask(
+                    runtime,
+                    bank,
+                    selected_expert);
+            if ((resident_mask &
+                 runtime_participant_bit(owner)) == 0u)
+            {
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "resident verifier owner payload is not resident");
+            }
+            if (runtime_resident_count(
+                    resident_mask,
+                    participant_count) == 1)
+            {
+                runtime->route_participant_ids[selected_slot] = owner;
+                ++participant_load[owner];
+            }
+        }
+
+        for (int route = 0; route < top_k; ++route)
+        {
+            const int selected_slot = row_slot_base + route;
+            const int selected_expert =
+                runtime->route_expert_ids[selected_slot];
+            const uint32_t runtime_resident_mask =
+                runtime_expert_resident_mask(
+                    runtime,
+                    bank,
+                    selected_expert);
+            if (runtime_resident_count(
+                    runtime_resident_mask,
+                    participant_count) == 1)
+            {
+                continue;
+            }
+
+            const auto &desc = bank.experts[selected_expert];
             const int owner = desc.owner_participant;
+            const uint32_t default_participant =
+                (owner >= 0 &&
+                 static_cast<uint32_t>(owner) < participant_count)
+                    ? static_cast<uint32_t>(owner)
+                    : (runtime->participant_id < participant_count
+                           ? runtime->participant_id
+                           : 0u);
             const uint32_t resident_mask =
                 llaminar2::least_loaded_ep::normalizeResidentParticipantMask(
-                    bank.resident_participant_mask[best_expert],
+                    runtime_resident_mask,
                     owner,
                     runtime->participant_id,
                     participant_count);
-            const uint32_t default_participant =
-                (owner >= 0 && static_cast<uint32_t>(owner) < participant_count)
-                    ? static_cast<uint32_t>(owner)
-                    : (runtime->participant_id < participant_count ? runtime->participant_id : 0u);
+            const uint32_t assigned_participant =
+                llaminar2::least_loaded_ep::
+                    selectBatchInvariantResidentParticipant(
+                    resident_mask,
+                    participant_load,
+                    participant_count,
+                    default_participant,
+                    llaminar2::least_loaded_ep::
+                        residentAssignmentTieTurn(
+                            logical_position,
+                            selected_expert,
+                            route));
+            if (assigned_participant >= participant_count)
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "resident verifier selected an invalid participant");
 
-            uint32_t destination_counts[kDeviceMoEMaxParticipants];
-            for (uint32_t participant = 0; participant < kDeviceMoEMaxParticipants; ++participant)
-                destination_counts[participant] = 0u;
-
-            llaminar2::least_loaded_ep::assignLeastLoadedResidentSplitCounts(
-                static_cast<uint64_t>(best_load),
-                resident_mask,
-                participant_load,
-                participant_count,
-                default_participant,
-                destination_counts);
-
-            int cumulative = 0;
-            const int split_base = best_expert * static_cast<int>(kDeviceMoEMaxParticipants);
-            for (uint32_t participant = 0; participant < kDeviceMoEMaxParticipants; ++participant)
-            {
-                if (participant < participant_count)
-                    cumulative += static_cast<int>(destination_counts[participant]);
-                split_ends[split_base + static_cast<int>(participant)] = cumulative;
-            }
+            ++participant_load[assigned_participant];
+            runtime->route_participant_ids[selected_slot] =
+                static_cast<int32_t>(assigned_participant);
         }
     }
 
-    __global__ void prefill_llep_assign_routes_from_splits_runtime_kernel(
-        DeviceMoELayerRuntimeView *__restrict__ runtime,
-        int current_slots,
-        int max_slots,
-        int num_experts)
+    /**
+     * @brief Return whether one expert precedes another in canonical LLEP order.
+     *
+     * The shared planner requires descending routed-row count with ascending
+     * logical expert id as its exact tie break.  Invalid padding lanes sort
+     * after every real expert so non-power-of-two codebooks can use the same
+     * deterministic sorting network.
+     */
+    __device__ __forceinline__ bool current_batch_llep_expert_precedes(
+        uint32_t lhs,
+        uint32_t rhs,
+        const uint64_t *expert_loads,
+        uint32_t expert_count)
     {
-        const int slot = blockIdx.x * blockDim.x + threadIdx.x;
-        if (!runtime || slot >= current_slots || slot >= max_slots)
-            return;
-        if (!runtime->route_expert_ids || !runtime->route_participant_ids ||
-            !runtime->expert_offsets || !runtime->reserved_ptrs[0])
-            return;
-        if (runtime->active_bank > 1u ||
-            runtime->participant_count == 0u ||
-            runtime->participant_count > kDeviceMoEMaxParticipants ||
-            runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots))
-        {
-            return;
-        }
-        const int expert_id = runtime->route_expert_ids[slot];
-        if (expert_id < 0 || expert_id >= num_experts)
-            return;
+        const bool lhs_valid = lhs < expert_count;
+        const bool rhs_valid = rhs < expert_count;
+        if (lhs_valid != rhs_valid)
+            return lhs_valid;
+        if (!lhs_valid)
+            return lhs < rhs;
 
-        const uint32_t participant_count = runtime->participant_count;
-        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
-        const auto &desc = bank.experts[expert_id];
-        const int owner = desc.owner_participant;
-        const uint32_t default_participant =
-            (owner >= 0 && static_cast<uint32_t>(owner) < participant_count)
-                ? static_cast<uint32_t>(owner)
-                : (runtime->participant_id < participant_count ? runtime->participant_id : 0u);
+        const uint64_t lhs_load = expert_loads[lhs];
+        const uint64_t rhs_load = expert_loads[rhs];
+        return lhs_load > rhs_load ||
+               (lhs_load == rhs_load && lhs < rhs);
+    }
 
-        auto *split_ends = static_cast<int32_t *>(runtime->reserved_ptrs[0]);
-        const int ordinal = atomicAdd(runtime->expert_offsets + expert_id, 1);
-        const int split_base = expert_id * static_cast<int>(kDeviceMoEMaxParticipants);
-        uint32_t assigned_participant = default_participant;
-        for (uint32_t participant = 0; participant < participant_count; ++participant)
+    /**
+     * @brief Cooperatively construct the canonical expert order in shared memory.
+     *
+     * Each block thread owns one sorting-network slot.  The network width is
+     * the smallest power of two covering the active codebook, which keeps the
+     * four- and eight-expert cases cheap while retaining complete support up
+     * to the 256-expert runtime ABI limit.  Integer comparisons preserve the
+     * planner's byte-exact deterministic ordering.
+     */
+    __device__ __forceinline__ void sort_current_batch_llep_experts_parallel(
+        uint32_t *sorted_experts,
+        const uint64_t *expert_loads,
+        uint32_t expert_count,
+        uint32_t lane)
+    {
+        sorted_experts[lane] =
+            lane < expert_count ? lane : kDeviceMoEInvalidSlot;
+        __syncthreads();
+
+        uint32_t network_width = 1u;
+        while (network_width < expert_count)
+            network_width <<= 1u;
+
+        for (uint32_t sequence = 2u;
+             sequence <= network_width;
+             sequence <<= 1u)
         {
-            if (ordinal < split_ends[split_base + static_cast<int>(participant)])
+            for (uint32_t stride = sequence >> 1u;
+                 stride > 0u;
+                 stride >>= 1u)
             {
-                assigned_participant = participant;
-                break;
+                const uint32_t peer = lane ^ stride;
+                if (lane < network_width && peer > lane)
+                {
+                    const uint32_t first = sorted_experts[lane];
+                    const uint32_t second = sorted_experts[peer];
+                    const bool descending = (lane & sequence) == 0u;
+                    const bool swap =
+                        descending
+                            ? current_batch_llep_expert_precedes(
+                                  second, first, expert_loads, expert_count)
+                            : current_batch_llep_expert_precedes(
+                                  first, second, expert_loads, expert_count);
+                    if (swap)
+                    {
+                        sorted_experts[lane] = second;
+                        sorted_experts[peer] = first;
+                    }
+                }
+                __syncthreads();
             }
         }
-        runtime->route_participant_ids[slot] = static_cast<int32_t>(assigned_participant);
     }
 
     __global__ void prefill_llep_plan_current_batch_runtime_kernel(
@@ -11852,9 +12324,12 @@ namespace
                 bank.resident_participant_mask[expert] &
                 runtime_valid_participant_mask(participant_count);
             resident_participant_masks[expert] = resident_mask;
-            sorted_experts[expert] = static_cast<uint32_t>(expert);
         }
-        __syncthreads();
+        sort_current_batch_llep_experts_parallel(
+            sorted_experts,
+            expert_loads,
+            static_cast<uint32_t>(num_experts),
+            static_cast<uint32_t>(lane));
 
         if (lane != 0)
             return;
@@ -11892,7 +12367,8 @@ namespace
         workspace.pending_load = pending_load;
         workspace.assigned_load = assigned_load;
 
-        llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentStatus status{};
+        llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentStatus
+            planner_status{};
         const bool ok = llaminar2::least_loaded_ep::planLeastLoadedExpertAssignment(
             expert_loads,
             owner_participants,
@@ -11902,12 +12378,13 @@ namespace
             span_capacity,
             transfers,
             transfer_capacity,
-            &status,
-            resident_participant_masks);
-        if (ok && status.overflow == 0u && status.invalid_config == 0u)
+            planner_status,
+            resident_participant_masks,
+            /*workspace_experts_are_sorted=*/true);
+        if (ok && planner_status.overflow == 0u && planner_status.invalid_config == 0u)
         {
-            runtime->reserved_u64[2] = status.span_count;
-            runtime->reserved_u64[3] = status.weight_transfer_count;
+            runtime->reserved_u64[2] = planner_status.span_count;
+            runtime->reserved_u64[3] = planner_status.weight_transfer_count;
             int32_t *span_bounds = static_cast<int32_t *>(runtime->reserved_ptrs[0]);
             if (span_bounds)
             {
@@ -11916,7 +12393,7 @@ namespace
                     span_bounds[2 * expert] = -1;
                     span_bounds[2 * expert + 1] = -1;
                 }
-                for (uint32_t idx = 0; idx < status.span_count; ++idx)
+                for (uint32_t idx = 0; idx < planner_status.span_count; ++idx)
                 {
                     const uint32_t expert = spans[idx].expert;
                     if (expert >= static_cast<uint32_t>(num_experts))
@@ -13971,24 +14448,14 @@ namespace
     }
 
     /**
-     * @brief Split-K scatter kernel for the grouped SwiGLU down projection.
+     * @brief Compute one weighted split-K partial per original router slot.
      *
-     * Each block reduces one K-partition of one output column, summing the
-     * route-weighted partial contributions of all active experts for that
-     * K-range, and writes the partial to a [k_partitions][N] scratch buffer.
-     * A separate reduce kernel sums the partials. The down projection launches
-     * only ceil(N/64) blocks in the serial path (N = d_model), leaving the GPU
-     * heavily under-occupied; multiplying the block count by k_partitions
-     * exposes enough warps to hide the weight-payload global-memory latency.
-     *
-     * The expert sum and the K-partition sum commute because each is a linear
-     * accumulation, so summing experts within a K-range and then summing the
-     * K-ranges yields the same result as the serial full-K expert sum.
-     *
-     * Grid: ((N + 63)/64, k_partitions)   Block: (64)
+     * Unlike the ordinary decode kernel, this launch never sums different
+     * routes.  The route dimension survives the participant collective, which
+     * makes expert ownership irrelevant to the eventual FP32 addition tree.
      */
     template <uint8_t CodebookId>
-    __global__ void grouped_native_vnni_down_kpart_decode_kernel(
+    __global__ void grouped_native_vnni_down_kpart_decode_route_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
         const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
@@ -14004,60 +14471,90 @@ namespace
         constexpr int kTileN = 64;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int k_part = blockIdx.y;
-        if (k_part >= k_partitions || n >= N)
+        const int route = blockIdx.z;
+        if (route >= num_active || k_part >= k_partitions || n >= N)
             return;
 
-        // Linear index into the [k_partitions][N] partials buffer.
         const size_t partial_index =
-            static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
+            (static_cast<size_t>(route) * static_cast<size_t>(k_partitions) +
+             static_cast<size_t>(k_part)) *
+                static_cast<size_t>(N) +
+            static_cast<size_t>(n);
+        const int expert_id = expert_ids[route];
+        if (expert_id < 0 || expert_id >= num_experts)
+        {
+            partials[partial_index] = 0.0f;
+            return;
+        }
 
-        // Evenly split the K-blocks across the partitions; this block owns
-        // [b_start, b_end).
         const int blocks_per_row = K / 32;
-        const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
+        const int blocks_per_part =
+            (blocks_per_row + k_partitions - 1) / k_partitions;
         const int b_start = k_part * blocks_per_part;
-        int b_end = b_start + blocks_per_part;
-        if (b_end > blocks_per_row)
-            b_end = blocks_per_row;
+        const int b_end = min(blocks_per_row, b_start + blocks_per_part);
         if (b_start >= b_end)
         {
             partials[partial_index] = 0.0f;
             return;
         }
 
-        // Accumulate the route-weighted expert contributions for this K-range.
-        float total = 0.0f;
-#pragma unroll 1
-        for (int slot = 0; slot < num_active; ++slot)
-        {
-            const int expert_id = expert_ids[slot];
-            if (expert_id < 0)
-                continue;
-            assert(expert_id < num_experts);
-            if (expert_id >= num_experts)
-                continue;
-
-            const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
-            const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * K;
-            const float *slot_scales = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
-            const float expert_value = native_vnni_dot_desc_range_dispatch<CodebookId>(
+        const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+        const int8_t *slot_A = A_int8 + static_cast<size_t>(route) * K;
+        const float *slot_scales =
+            scales_A_blockwise + static_cast<size_t>(route) * blocks_per_row;
+        const float expert_value =
+            native_vnni_dot_desc_range_dispatch<CodebookId>(
                 desc, n, slot_A, slot_scales, N, K, b_start, b_end);
-            total += route_weights[slot] * expert_value;
+        partials[partial_index] =
+            moe_weight_route_rn(route_weights[route], expert_value);
+    }
+
+    /** @brief Sum split-K partials while preserving the route dimension. */
+    __global__ void grouped_native_vnni_down_kpart_route_reduce_kernel(
+        const float *__restrict__ partials,
+        float *__restrict__ route_output,
+        int num_active,
+        int N,
+        int k_partitions)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int route = blockIdx.y;
+        if (route >= num_active || n >= N)
+            return;
+
+        const size_t base =
+            static_cast<size_t>(route) * static_cast<size_t>(k_partitions) *
+            static_cast<size_t>(N);
+        float sum = 0.0f;
+        for (int k_part = 0; k_part < k_partitions; ++k_part)
+        {
+            sum = moe_accumulate_rn(
+                sum,
+                partials[
+                    base + static_cast<size_t>(k_part) *
+                               static_cast<size_t>(N) +
+                    static_cast<size_t>(n)]);
         }
-        partials[partial_index] = total;
+        route_output[
+            static_cast<size_t>(route) * static_cast<size_t>(N) +
+            static_cast<size_t>(n)] = sum;
     }
 
     /**
-     * @brief Reduce K-partition partials into the final grouped down output.
+     * @brief Reduce route-major split-K scratch directly to one decode row.
      *
-     * Sums the k_partitions partial contributions for each output column n
-     * produced by grouped_native_vnni_down_kpart_decode_kernel.
-     *
-     * Grid: ((N + 63)/64)   Block: (64)
+     * This is the non-collective twin of the persistent route publication
+     * path.  It first reduces K partitions within one route and then reduces
+     * routes in original router order.  The two explicit FP32 loops exactly
+     * match `grouped_native_vnni_down_kpart_route_reduce_kernel` followed by
+     * `reduce_canonical_route_contributions_kernel`, without materializing the
+     * persistent route tensor when no collective needs it.
      */
-    __global__ void grouped_native_vnni_down_kpart_reduce_kernel(
+    __global__ void grouped_native_vnni_down_kpart_routes_reduce_kernel(
         const float *__restrict__ partials,
         float *__restrict__ output,
+        int num_active,
         int N,
         int k_partitions)
     {
@@ -14066,34 +14563,38 @@ namespace
         if (n >= N)
             return;
 
-        float sum = 0.0f;
-        for (int k_part = 0; k_part < k_partitions; ++k_part)
-            sum += partials[static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n)];
-        output[n] = sum;
+        float output_sum = 0.0f;
+#pragma unroll 1
+        for (int route = 0; route < num_active; ++route)
+        {
+            const size_t route_base =
+                static_cast<size_t>(route) *
+                static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
+            float route_sum = 0.0f;
+            for (int k_part = 0; k_part < k_partitions; ++k_part)
+            {
+                route_sum = moe_accumulate_rn(
+                    route_sum,
+                    partials[
+                        route_base + static_cast<size_t>(k_part) *
+                                         static_cast<size_t>(N) +
+                        static_cast<size_t>(n)]);
+            }
+            output_sum = moe_accumulate_rn(output_sum, route_sum);
+        }
+        output[n] = output_sum;
     }
 
     /**
-     * @brief Produce serial-decode-equivalent split-K down partials for grouped verifier rows.
+     * @brief Produce one grouped split-K partial per original route slot.
      *
-     * MTP verifier prefill groups route slots by expert for the gate/up and
-     * SwiGLU work, but the final routed-expert publication must preserve the
-     * one-token decode accumulation order.  Serial CUDA MoE decode reduces each
-     * K partition by walking top-k route slots in original router order, then
-     * sums the K partitions in ascending order.  This kernel performs exactly
-     * that first half for every verifier token row while remaining a grouped,
-     * graph-capturable device kernel.
-     *
-     * Layout:
-     * - original_to_grouped[seq_len * top_k] maps each original route slot to
-     *   its compact grouped slot, or -1 when the slot is inactive.
-     * - original_expert_ids[seq_len * top_k] keeps the original route slot's
-     *   expert id so the ordered publication does not have to infer ownership
-     *   from grouped offsets.
-     * - partials[tile_rows][k_partitions][N] stores one route-weighted partial
-     *   output row for the current fixed-size verifier tile and K partition.
+     * The grouped gate/up rows remain expert-major in scratch, but every block
+     * resolves exactly one original `(token, route)` slot. Invalid or remote
+     * routes explicitly write zero so the following allreduce has a complete,
+     * overwrite-only contribution tensor on every participant.
      */
     template <uint8_t CodebookId>
-    __global__ void grouped_prefill_down_ordered_kpart_scatter_kernel(
+    __global__ void grouped_prefill_down_canonical_kpart_scatter_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
         const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
@@ -14101,9 +14602,8 @@ namespace
         const int *__restrict__ original_expert_ids,
         const float *__restrict__ grouped_weights,
         float *__restrict__ partials,
-        int token_base,
-        int tile_rows,
-        int top_k,
+        int original_slot_base,
+        int tile_route_slots,
         int N,
         int K,
         int num_experts,
@@ -14112,66 +14612,100 @@ namespace
         constexpr int kTileN = 64;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int k_part = blockIdx.y;
-        const int local_token = blockIdx.z;
-        if (local_token >= tile_rows || k_part >= k_partitions || n >= N)
+        const int local_route = blockIdx.z;
+        if (local_route >= tile_route_slots ||
+            k_part >= k_partitions || n >= N)
+        {
             return;
-        const int token = token_base + local_token;
-
-        const int blocks_per_row = K / 32;
-        const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
-        const int b_start = k_part * blocks_per_part;
-        int b_end = b_start + blocks_per_part;
-        if (b_end > blocks_per_row)
-            b_end = blocks_per_row;
+        }
 
         const size_t partial_index =
-            (static_cast<size_t>(local_token) * static_cast<size_t>(k_partitions) +
+            (static_cast<size_t>(local_route) *
+                 static_cast<size_t>(k_partitions) +
              static_cast<size_t>(k_part)) *
                 static_cast<size_t>(N) +
             static_cast<size_t>(n);
+        const int original_slot = original_slot_base + local_route;
+        const int grouped_slot = original_to_grouped[original_slot];
+        const int expert_id = original_expert_ids[original_slot];
+        if (grouped_slot < 0 || expert_id < 0 || expert_id >= num_experts)
+        {
+            partials[partial_index] = 0.0f;
+            return;
+        }
+
+        const int blocks_per_row = K / 32;
+        const int blocks_per_part =
+            (blocks_per_row + k_partitions - 1) / k_partitions;
+        const int b_start = k_part * blocks_per_part;
+        const int b_end = min(blocks_per_row, b_start + blocks_per_part);
         if (b_start >= b_end)
         {
             partials[partial_index] = 0.0f;
             return;
         }
 
-        float total = 0.0f;
-#pragma unroll 1
-        for (int route = 0; route < top_k; ++route)
-        {
-            const int original_slot = token * top_k + route;
-            const int grouped_slot = original_to_grouped[original_slot];
-            if (grouped_slot < 0)
-                continue;
-
-            const int expert_id = original_expert_ids[original_slot];
-            if (expert_id < 0 || expert_id >= num_experts)
-                continue;
-
-            const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
-            const int8_t *slot_A = A_int8 + static_cast<size_t>(grouped_slot) * K;
-            const float *slot_scales =
-                scales_A_blockwise + static_cast<size_t>(grouped_slot) * blocks_per_row;
-            const float expert_value = native_vnni_dot_desc_range_dispatch<CodebookId>(
+        const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+        const int8_t *slot_A =
+            A_int8 + static_cast<size_t>(grouped_slot) * K;
+        const float *slot_scales =
+            scales_A_blockwise +
+            static_cast<size_t>(grouped_slot) * blocks_per_row;
+        const float expert_value =
+            native_vnni_dot_desc_range_dispatch<CodebookId>(
                 desc, n, slot_A, slot_scales, N, K, b_start, b_end);
-            total += grouped_weights[grouped_slot] * expert_value;
+        partials[partial_index] =
+            moe_weight_route_rn(grouped_weights[grouped_slot], expert_value);
+    }
+
+    /** @brief Reduce grouped split-K partials into persistent route slots. */
+    __global__ void grouped_prefill_down_canonical_kpart_reduce_kernel(
+        const float *__restrict__ partials,
+        float *__restrict__ route_output,
+        int original_slot_base,
+        int tile_route_slots,
+        int N,
+        int k_partitions)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int local_route = blockIdx.y;
+        if (local_route >= tile_route_slots || n >= N)
+            return;
+
+        const size_t partial_base =
+            static_cast<size_t>(local_route) *
+            static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
+        float sum = 0.0f;
+        for (int k_part = 0; k_part < k_partitions; ++k_part)
+        {
+            sum = moe_accumulate_rn(
+                sum,
+                partials[
+                    partial_base + static_cast<size_t>(k_part) *
+                                       static_cast<size_t>(N) +
+                    static_cast<size_t>(n)]);
         }
-        partials[partial_index] = total;
+        route_output[
+            static_cast<size_t>(original_slot_base + local_route) *
+                static_cast<size_t>(N) +
+            static_cast<size_t>(n)] = sum;
     }
 
     /**
-     * @brief Finish ordered split-K verifier down publication.
+     * @brief Reduce route-major verifier scratch directly to grouped rows.
      *
-     * The companion scatter kernel already folded the top-k route slots in
-     * serial decode order for each K partition.  This reducer mirrors the
-     * decode split-K final pass by summing partitions from 0..k_partitions-1
-     * and writing the verifier token row directly to the MoE output tensor.
+     * Every local token owns `top_k` consecutive route rows in @p partials.
+     * Reducing K partitions inside each route and routes in router order makes
+     * this direct path byte-identical to persistent route publication followed
+     * by the LocalTP collective epilogue.
      */
-    __global__ void grouped_prefill_down_ordered_kpart_reduce_kernel(
+    __global__ void grouped_prefill_down_canonical_kpart_reduce_direct_kernel(
         const float *__restrict__ partials,
         float *__restrict__ output,
         int token_base,
         int tile_rows,
+        int top_k,
         int N,
         int k_partitions)
     {
@@ -14180,18 +14714,63 @@ namespace
         const int local_token = blockIdx.y;
         if (local_token >= tile_rows || n >= N)
             return;
-        const int token = token_base + local_token;
+
+        float output_sum = 0.0f;
+#pragma unroll 1
+        for (int route = 0; route < top_k; ++route)
+        {
+            const size_t route_base =
+                (static_cast<size_t>(local_token) *
+                     static_cast<size_t>(top_k) +
+                 static_cast<size_t>(route)) *
+                static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
+            float route_sum = 0.0f;
+            for (int k_part = 0; k_part < k_partitions; ++k_part)
+            {
+                route_sum = moe_accumulate_rn(
+                    route_sum,
+                    partials[
+                        route_base + static_cast<size_t>(k_part) *
+                                         static_cast<size_t>(N) +
+                        static_cast<size_t>(n)]);
+            }
+            output_sum = moe_accumulate_rn(output_sum, route_sum);
+        }
+
+        output[
+            static_cast<size_t>(token_base + local_token) *
+                static_cast<size_t>(N) +
+            static_cast<size_t>(n)] = output_sum;
+    }
+
+    /** @brief Canonically sum allreduced route slots in original router order. */
+    __global__ void reduce_canonical_route_contributions_kernel(
+        const float *__restrict__ route_contributions,
+        float *__restrict__ output,
+        int seq_len,
+        int top_k,
+        int d_model)
+    {
+        constexpr int kTileN = 256;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int token = blockIdx.y;
+        if (token >= seq_len || n >= d_model)
+            return;
 
         float sum = 0.0f;
-        const size_t partial_base =
-            static_cast<size_t>(local_token) * static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
-        for (int k_part = 0; k_part < k_partitions; ++k_part)
+#pragma unroll 1
+        for (int route = 0; route < top_k; ++route)
         {
-            sum += partials[partial_base +
-                            static_cast<size_t>(k_part) * static_cast<size_t>(N) +
-                            static_cast<size_t>(n)];
+            const size_t index =
+                (static_cast<size_t>(token) * static_cast<size_t>(top_k) +
+                 static_cast<size_t>(route)) *
+                    static_cast<size_t>(d_model) +
+                static_cast<size_t>(n);
+            sum = moe_accumulate_rn(sum, route_contributions[index]);
         }
-        output[static_cast<size_t>(token) * static_cast<size_t>(N) + static_cast<size_t>(n)] = sum;
+        output[
+            static_cast<size_t>(token) * static_cast<size_t>(d_model) +
+            static_cast<size_t>(n)] = sum;
     }
 
     template <uint8_t CodebookId>
@@ -14268,11 +14847,16 @@ namespace
         constexpr int kTileN = 64;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int k_part = blockIdx.y;
-        if (k_part >= k_partitions || n >= N)
+        const int route = blockIdx.z;
+        if (route >= num_active || k_part >= k_partitions || n >= N)
             return;
 
         const size_t partial_index =
-            static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
+            (static_cast<size_t>(route) *
+                 static_cast<size_t>(k_partitions) +
+             static_cast<size_t>(k_part)) *
+                static_cast<size_t>(N) +
+            static_cast<size_t>(n);
 
         const int blocks_per_row = K / 32;
         const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
@@ -14286,23 +14870,26 @@ namespace
             return;
         }
 
-        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
-        float total = 0.0f;
-#pragma unroll 1
-        for (int slot = 0; slot < num_active; ++slot)
+        const int expert_id = expert_ids[route];
+        if (expert_id < 0 || expert_id >= num_experts)
         {
-            const int expert_id = expert_ids[slot];
-            if (expert_id < 0 || expert_id >= num_experts)
-                continue;
-
-            const DeviceNativeVNNIMatrixDesc desc = bank.experts[expert_id].down;
-            const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * K;
-            const float *slot_scales = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
-            const float expert_value = native_vnni_dot_desc_range_dispatch<CodebookId>(
-                desc, n, slot_A, slot_scales, N, K, b_start, b_end);
-            total += route_weights[slot] * expert_value;
+            partials[partial_index] = 0.0f;
+            return;
         }
-        partials[partial_index] = total;
+
+        const DeviceMoEPlacementBankView &bank =
+            runtime->banks[runtime->active_bank];
+        const DeviceNativeVNNIMatrixDesc desc = bank.experts[expert_id].down;
+        const int8_t *route_A =
+            A_int8 + static_cast<size_t>(route) * static_cast<size_t>(K);
+        const float *route_scales =
+            scales_A_blockwise +
+            static_cast<size_t>(route) * static_cast<size_t>(blocks_per_row);
+        const float expert_value =
+            native_vnni_dot_desc_range_dispatch<CodebookId>(
+                desc, n, route_A, route_scales, N, K, b_start, b_end);
+        partials[partial_index] =
+            moe_weight_route_rn(route_weights[route], expert_value);
     }
 
     int blocksFor(int count)
@@ -14552,6 +15139,7 @@ extern "C"
                                              void *rebalance_controller_state,
                                              int rebalance_target_layer,
                                              uint32_t rebalance_command_buffer_count,
+                                             const int32_t *absolute_position_ids,
                                              int device_idx, void *stream)
     {
         if (!runtime_layer ||
@@ -14570,6 +15158,7 @@ extern "C"
             static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
             legacy_indices, legacy_weights, num_experts, top_k, normalize_weights,
             write_legacy_outputs, update_runtime_histogram,
+            absolute_position_ids,
             static_cast<const DeviceMoERebalancePlanEntryView *>(rebalance_plan_entries),
             rebalance_plan_capacity,
             static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(rebalance_command_header),
@@ -14594,7 +15183,9 @@ extern "C"
         cudaSetDevice(device_idx);
         decode_route_select_runtime_kernel<<<1, kMaxTopK, 0, static_cast<cudaStream_t>(stream)>>>(
             expert_indices, expert_weights, static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),
-            legacy_indices, legacy_weights, num_experts, top_k, write_legacy_outputs, update_runtime_histogram);
+            legacy_indices, legacy_weights, num_experts, top_k,
+            write_legacy_outputs, update_runtime_histogram,
+            /*absolute_position_ids=*/nullptr);
         return finishLaunch("cudaMoE_decode_route_select_runtime");
     }
 
@@ -15119,6 +15710,34 @@ extern "C"
         return finishLaunch("cudaMoE_init_rebalance_graph_controller_state");
     }
 
+    bool cudaMoE_reset_rebalance_graph_transaction_for_request(
+        void *controller_state,
+        void *command_headers,
+        void *wave_states,
+        uint32_t *plan_counts,
+        uint32_t command_buffer_count,
+        const void *config,
+        int device_idx,
+        void *stream)
+    {
+        if (!controller_state || !command_headers || !wave_states ||
+            !plan_counts || command_buffer_count == 0u ||
+            command_buffer_count > 2u || !config || !stream)
+            return false;
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        reset_rebalance_graph_transaction_for_request_kernel<<<
+            1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
+            static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(command_headers),
+            static_cast<DeviceMoERebalanceWaveStateView *>(wave_states),
+            plan_counts,
+            command_buffer_count,
+            cfg);
+        return finishLaunch(
+            "cudaMoE_reset_rebalance_graph_transaction_for_request");
+    }
+
     bool cudaMoE_publish_rebalance_transfer_complete(
         void *controller_state,
         const void *command_header,
@@ -15569,7 +16188,7 @@ extern "C"
         int num_experts,
         int top_k,
         int filter_to_local_runtime_experts,
-        int histogram_update_flags,
+        int retain_routes_for_deferred_commit,
         int device_idx,
         void *stream)
     {
@@ -15594,13 +16213,13 @@ extern "C"
             runtime_view, routing_indices, routing_weights,
             current_slots, max_slots, num_experts,
             filter_to_local_runtime_experts,
-            histogram_update_flags);
+            retain_routes_for_deferred_commit);
         if (!finishGroupedPrefillLaunch("cudaMoE_prefill_group_cast_count_runtime", cuda_stream))
             return false;
 
         prefill_group_count_assigned_runtime_kernel<<<blocksFor(max_slots), kThreads, 0, cuda_stream>>>(
             runtime_view, current_slots, max_slots, num_experts,
-            histogram_update_flags);
+            /*retain_routes_for_deferred_commit=*/0);
         if (!finishGroupedPrefillLaunch("cudaMoE_prefill_group_count_assigned_runtime", cuda_stream))
             return false;
 
@@ -15620,7 +16239,7 @@ extern "C"
         int max_slots,
         int num_experts,
         int top_k,
-        int histogram_update_flags,
+        int retain_routes_for_deferred_commit,
         int device_idx,
         void *stream)
     {
@@ -15643,7 +16262,7 @@ extern "C"
 
         prefill_group_count_assigned_runtime_kernel<<<blocksFor(max_slots), kThreads, 0, cuda_stream>>>(
             runtime_view, current_slots, max_slots, num_experts,
-            histogram_update_flags);
+            retain_routes_for_deferred_commit);
         if (!finishGroupedPrefillLaunch("cudaMoE_prefill_regroup_count_assigned_runtime", cuda_stream))
             return false;
 
@@ -15657,19 +16276,68 @@ extern "C"
         return finishGroupedPrefillLaunch("cudaMoE_prefill_regroup_scatter_runtime", cuda_stream);
     }
 
+    bool cudaMoE_commit_grouped_verifier_histograms(
+        void *runtime,
+        const int32_t *accepted_state_counts,
+        const int32_t *publication_ok_flags,
+        int request_count,
+        int rows_per_request,
+        int total_rows,
+        int num_experts,
+        int top_k,
+        int device_idx,
+        void *stream)
+    {
+        if (!runtime ||
+            !accepted_state_counts ||
+            !publication_ok_flags ||
+            !stream ||
+            request_count <= 0 ||
+            rows_per_request <= 0 ||
+            total_rows != request_count * rows_per_request ||
+            num_experts <= 0 ||
+            num_experts > kDeviceMoEMaxExperts ||
+            top_k <= 0 ||
+            top_k > kMaxTopK)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        const int total_slots = total_rows * top_k;
+        commit_grouped_verifier_histograms_runtime_kernel<<<
+            blocksFor(total_slots),
+            kThreads,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoELayerRuntimeView *>(runtime),
+            accepted_state_counts,
+            publication_ok_flags,
+            request_count,
+            rows_per_request,
+            total_rows,
+            num_experts,
+            top_k);
+        return finishGroupedPrefillLaunch(
+            "cudaMoE_commit_grouped_verifier_histograms",
+            static_cast<cudaStream_t>(stream));
+    }
+
     bool cudaMoE_assign_prefill_routes_least_loaded_resident(
         void *runtime,
         int current_slots,
         int max_slots,
         int num_experts,
         int top_k,
+        const int32_t *absolute_position_ids,
         int device_idx,
         void *stream)
     {
-        if (!runtime || !stream ||
+        if (!runtime || !absolute_position_ids || !stream ||
             current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
-            top_k <= 0 || top_k > kMaxTopK)
+            top_k <= 0 || top_k > kMaxTopK || top_k > num_experts ||
+            current_slots % top_k != 0 || max_slots % top_k != 0)
         {
             return false;
         }
@@ -15678,27 +16346,23 @@ extern "C"
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         auto *runtime_view = static_cast<DeviceMoELayerRuntimeView *>(runtime);
 
-        const int split_items = num_experts * static_cast<int>(kDeviceMoEMaxParticipants);
-        int clear_items = max_slots > num_experts ? max_slots : num_experts;
-        clear_items = clear_items > split_items ? clear_items : split_items;
-        prefill_llep_clear_assignment_runtime_kernel<<<blocksFor(clear_items), kThreads, 0, cuda_stream>>>(
-            runtime_view, max_slots, num_experts);
-        if (!finishGroupedPrefillLaunch("cudaMoE_prefill_llep_clear_runtime", cuda_stream))
-            return false;
-
-        prefill_llep_count_expert_routes_runtime_kernel<<<blocksFor(max_slots), kThreads, 0, cuda_stream>>>(
-            runtime_view, current_slots, max_slots, num_experts);
-        if (!finishGroupedPrefillLaunch("cudaMoE_prefill_llep_count_routes", cuda_stream))
-            return false;
-
-        prefill_llep_plan_resident_splits_runtime_kernel<<<1, 1, 0, cuda_stream>>>(
-            runtime_view, current_slots, max_slots, num_experts);
-        if (!finishGroupedPrefillLaunch("cudaMoE_prefill_llep_plan_resident_splits", cuda_stream))
-            return false;
-
-        prefill_llep_assign_routes_from_splits_runtime_kernel<<<blocksFor(max_slots), kThreads, 0, cuda_stream>>>(
-            runtime_view, current_slots, max_slots, num_experts);
-        return finishGroupedPrefillLaunch("cudaMoE_prefill_llep_assign_routes_from_splits", cuda_stream);
+        constexpr int kAssignmentThreads = 32;
+        const int current_rows = current_slots / top_k;
+        const int assignment_blocks =
+            current_rows > 0
+                ? (current_rows + kAssignmentThreads - 1) / kAssignmentThreads
+                : 1;
+        prefill_llep_assign_resident_rows_logical_position_runtime_kernel
+            <<<assignment_blocks, kAssignmentThreads, 0, cuda_stream>>>(
+                runtime_view,
+                absolute_position_ids,
+                current_slots,
+                max_slots,
+                num_experts,
+                top_k);
+        return finishGroupedPrefillLaunch(
+            "cudaMoE_prefill_llep_assign_resident_rows_logical_position",
+            cuda_stream);
     }
 
     bool cudaMoE_plan_prefill_routes_least_loaded_current_batch(
@@ -16148,6 +16812,7 @@ extern "C"
         float *d_swiglu_scales,
         float *d_down_partials,
         float *d_output,
+        float *d_canonical_route_contributions,
         int num_active,
         int d_model,
         int intermediate,
@@ -16161,7 +16826,8 @@ extern "C"
             (k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
              k_partitions == 16);
         if (!d_gate_ptrs || !d_up_ptrs || !d_desc_table || !d_expert_ids || !d_weights ||
-            !d_swiglu_int8 || !d_swiglu_scales || !d_down_partials || !d_output ||
+            !d_swiglu_int8 || !d_swiglu_scales || !d_down_partials ||
+            (!d_output && !d_canonical_route_contributions) ||
             num_active <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 ||
             (intermediate % 32) != 0 || !valid_k_partitions)
         {
@@ -16181,15 +16847,25 @@ extern "C"
         constexpr int kTileN = 64;
         const int N = d_model;
         const int K = intermediate;
-        dim3 scatter_grid((N + kTileN - 1) / kTileN, k_partitions);
-        dim3 reduce_grid((N + kTileN - 1) / kTileN);
+        const bool canonical_publication =
+            d_canonical_route_contributions != nullptr;
+        dim3 scatter_grid(
+            (N + kTileN - 1) / kTileN,
+            k_partitions,
+            num_active);
+        dim3 route_reduce_grid(
+            (N + kTileN - 1) / kTileN,
+            num_active);
+        dim3 direct_reduce_grid((N + kTileN - 1) / kTileN);
         dim3 block(kTileN);
 
-        // Step 2: scatter — each (n, k_part) block writes a route-weighted partial.
-#define LAUNCH_GROUPED_DOWN_KPART(CB)                                                            \
-    grouped_native_vnni_down_kpart_decode_kernel<CB><<<scatter_grid, block, 0, cuda_stream>>>(   \
-        d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,                   \
-        d_down_partials, num_active, N, K, num_experts, k_partitions)
+        // Step 2: every (route, k_part, n) owner writes one rounded partial.
+#define LAUNCH_GROUPED_DOWN_KPART(CB)                                                      \
+    grouped_native_vnni_down_kpart_decode_route_kernel<CB>                                 \
+        <<<scatter_grid, block, 0, cuda_stream>>>(                                         \
+            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids,                    \
+            d_weights, d_down_partials, num_active, N, K, num_experts,                     \
+            k_partitions)
 
         switch (codebook_id)
         {
@@ -16222,8 +16898,22 @@ extern "C"
             return false;
 
         // Step 3: reduce — sum the k_partitions partials into the final output.
-        grouped_native_vnni_down_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
-            d_down_partials, d_output, N, k_partitions);
+        if (canonical_publication)
+        {
+            grouped_native_vnni_down_kpart_route_reduce_kernel<<<
+                route_reduce_grid, block, 0, cuda_stream>>>(
+                d_down_partials,
+                d_canonical_route_contributions,
+                num_active,
+                N,
+                k_partitions);
+        }
+        else
+        {
+            grouped_native_vnni_down_kpart_routes_reduce_kernel<<<
+                direct_reduce_grid, block, 0, cuda_stream>>>(
+                d_down_partials, d_output, num_active, N, k_partitions);
+        }
 
         return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart reduce");
     }
@@ -16269,7 +16959,10 @@ extern "C"
         constexpr int kTileN = 64;
         const int N = d_model;
         const int K = intermediate;
-        dim3 scatter_grid((N + kTileN - 1) / kTileN, k_partitions);
+        dim3 scatter_grid(
+            (N + kTileN - 1) / kTileN,
+            k_partitions,
+            num_active);
         dim3 reduce_grid((N + kTileN - 1) / kTileN);
         dim3 block(kTileN);
         const auto *runtime = static_cast<const DeviceMoELayerRuntimeView *>(d_runtime_layer);
@@ -16309,8 +17002,9 @@ extern "C"
         if (!finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart scatter"))
             return false;
 
-        grouped_native_vnni_down_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
-            d_down_partials, d_output, N, k_partitions);
+        grouped_native_vnni_down_kpart_routes_reduce_kernel<<<
+            reduce_grid, block, 0, cuda_stream>>>(
+            d_down_partials, d_output, num_active, N, k_partitions);
 
         return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart reduce");
     }
@@ -16340,6 +17034,7 @@ extern "C"
         float *d_down_partials,
         float *d_scratch_down_out,
         float *d_output,
+        float *d_canonical_route_contributions,
         int num_experts,
         int d_model,
         int intermediate,
@@ -16361,7 +17056,8 @@ extern "C"
         if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_down_desc_table ||
             !d_group_counts || !d_group_offsets || !d_group_token_indices || !d_group_weights ||
             !d_scratch_A_int8 || !d_scratch_scales || !d_scratch_gate || !d_scratch_up ||
-            !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales || !d_scratch_down_out || !d_output ||
+            !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales || !d_scratch_down_out ||
+            (!d_output && !d_canonical_route_contributions) ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
             max_tokens_per_expert <= 0 || total_slots <= 0 || top_k <= 0 ||
             active_expert_slots < 0 ||
@@ -16405,6 +17101,8 @@ extern "C"
             return false;
         const int expert_grid = use_active_expert_grid ? active_expert_slots : num_experts;
         const int seq_len = total_slots / top_k;
+        const bool canonical_publication =
+            d_canonical_route_contributions != nullptr;
 
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -16616,17 +17314,27 @@ extern "C"
             for (int token_base = 0; token_base < seq_len; token_base += splitk_tile_rows)
             {
                 const int tile_rows = std::min(splitk_tile_rows, seq_len - token_base);
+                const int tile_route_slots = tile_rows * top_k;
+                const int original_slot_base = token_base * top_k;
                 dim3 scatter_grid(
                     (N + kTileN - 1) / kTileN,
                     down_k_partitions,
+                    tile_route_slots);
+                dim3 route_reduce_grid(
+                    (N + kTileN - 1) / kTileN,
+                    tile_route_slots);
+                dim3 direct_reduce_grid(
+                    (N + kTileN - 1) / kTileN,
                     tile_rows);
-                dim3 reduce_grid((N + kTileN - 1) / kTileN, tile_rows);
 
-#define LAUNCH_GROUPED_DOWN_ORDERED_KPART(CB)                                                     \
-    grouped_prefill_down_ordered_kpart_scatter_kernel<CB><<<scatter_grid, block, 0, cuda_stream>>>( \
-        d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                         \
-        d_original_to_grouped, d_original_expert_ids, d_group_weights,                             \
-        d_down_partials, token_base, tile_rows, top_k, N, K, num_experts, down_k_partitions)
+#define LAUNCH_GROUPED_DOWN_ORDERED_KPART(CB)                                      \
+    grouped_prefill_down_canonical_kpart_scatter_kernel<CB>                         \
+        <<<scatter_grid, block, 0, cuda_stream>>>(                                  \
+            d_scratch_swiglu_int8, d_scratch_swiglu_scales,                         \
+            d_down_desc_table, d_original_to_grouped,                               \
+            d_original_expert_ids, d_group_weights, d_down_partials,                \
+            original_slot_base, tile_route_slots, N, K, num_experts,                \
+            down_k_partitions)
 
                 bool launched_down = false;
 #define LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(CB)                                           \
@@ -16682,10 +17390,24 @@ extern "C"
 #undef LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT
 #undef LAUNCH_GROUPED_DOWN_ORDERED_KPART
 
-                grouped_prefill_down_ordered_kpart_reduce_kernel<<<
-                    reduce_grid, block, 0, cuda_stream>>>(
-                    d_down_partials, d_output, token_base, tile_rows, N,
-                    down_k_partitions);
+                if (canonical_publication)
+                {
+                    grouped_prefill_down_canonical_kpart_reduce_kernel<<<
+                        route_reduce_grid, block, 0, cuda_stream>>>(
+                        d_down_partials,
+                        d_canonical_route_contributions,
+                        original_slot_base,
+                        tile_route_slots,
+                        N,
+                        down_k_partitions);
+                }
+                else
+                {
+                    grouped_prefill_down_canonical_kpart_reduce_direct_kernel<<<
+                        direct_reduce_grid, block, 0, cuda_stream>>>(
+                        d_down_partials, d_output, token_base, tile_rows,
+                        top_k, N, down_k_partitions);
+                }
                 if (!finishGroupedPrefillLaunch(
                         "cudaMoE_grouped_down_ordered_kpart_reduce_prefill",
                         cuda_stream))
@@ -16797,5 +17519,29 @@ extern "C"
         }
 
         return true;
+    }
+
+    bool cudaMoE_reduce_canonical_route_contributions(
+        const float *d_route_contributions,
+        float *d_output,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int device_idx,
+        void *stream)
+    {
+        if (!d_route_contributions || !d_output || !stream ||
+            seq_len <= 0 || top_k <= 0 || d_model <= 0)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int kThreads = 256;
+        dim3 grid((d_model + kThreads - 1) / kThreads, seq_len);
+        reduce_canonical_route_contributions_kernel<<<
+            grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            d_route_contributions, d_output, seq_len, top_k, d_model);
+        return finishLaunch("cudaMoE_reduce_canonical_route_contributions");
     }
 }

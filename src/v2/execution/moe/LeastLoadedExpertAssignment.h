@@ -83,7 +83,17 @@ namespace llaminar2::least_loaded_ep
         uint32_t expert = 0;
         uint32_t source_participant = 0;
         uint32_t destination_participant = 0;
-        uint32_t reserved = 0;
+        /**
+         * Exact destination slot plus one, or zero for ordinary free leasing.
+         *
+         * Current-batch LLEP leaves this zero because physical storage is a
+         * destination-local economy decision. Prefix-runtime rehydration sets
+         * it from the portable checkpoint so the restored transfer directory
+         * is continuation-identical to the checkpointed directory. Plus-one
+         * encoding keeps zero available as the ordinary no-requirement value
+         * while still representing physical slot zero.
+         */
+        uint32_t destination_slot_requirement_plus_one = 0;
     };
 
     struct LeastLoadedExpertAssignmentStatus
@@ -376,6 +386,135 @@ namespace llaminar2::least_loaded_ep
         if (best_participant != kInvalidParticipant)
             return best_participant;
         return fallback_participant < participant_count ? fallback_participant : 0u;
+    }
+
+    /**
+     * @brief Build the batch-invariant tie turn for one logical route.
+     *
+     * Replica placement changes the grouping of floating-point partial sums
+     * before the participant allreduce. Its tie-break key must therefore be a
+     * pure function of committed model semantics, never of how many speculative
+     * rows happened to execute. Adjacent logical positions advance by one so a
+     * repeatedly hot expert still rotates across equally loaded residents.
+     * Expert and route-slot terms decorrelate different routes in the same row.
+     *
+     * @param logical_position Absolute sequence position consumed by RoPE.
+     * @param expert_id Selected global expert id.
+     * @param route_slot Original top-k route slot within the row.
+     */
+    LLAMINAR_LLEP_HD uint64_t residentAssignmentTieTurn(
+        int32_t logical_position,
+        int expert_id,
+        int route_slot) noexcept
+    {
+        const uint64_t position =
+            logical_position >= 0
+                ? static_cast<uint64_t>(
+                      static_cast<uint32_t>(logical_position))
+                : 0ULL;
+        const uint64_t expert =
+            expert_id >= 0
+                ? static_cast<uint64_t>(
+                      static_cast<uint32_t>(expert_id))
+                : 0ULL;
+        const uint64_t slot =
+            route_slot >= 0
+                ? static_cast<uint64_t>(
+                      static_cast<uint32_t>(route_slot))
+                : 0ULL;
+        return position + expert * 131ULL + slot;
+    }
+
+    /**
+     * @brief Select a batch-invariant least-loaded resident participant.
+     *
+     * `tie_turn` affects only participants tied at the minimum row-local load;
+     * a genuinely lighter resident always wins. Resident participants are
+     * enumerated in ascending id order. Serial CUDA/ROCm decode, grouped
+     * CUDA/ROCm verification, and CPU test oracles all call this same primitive
+     * with `residentAssignmentTieTurn()`, so changing verifier M or executing
+     * rejected speculative rows cannot alter a committed row's partition.
+     *
+     * @param resident_mask Resident participants for the selected expert.
+     * @param participant_loads Row-local loads accumulated by earlier top-k
+     *        route slots.
+     * @param participant_count Number of active collective participants.
+     * @param fallback_participant Owner/local fallback used only when the
+     *        placement mask is empty.
+     * @param tie_turn Position-derived ordinal used only for equal-load ties.
+     */
+    LLAMINAR_LLEP_HD uint32_t
+    selectBatchInvariantResidentParticipant(
+        uint32_t resident_mask,
+        const int *participant_loads,
+        uint32_t participant_count,
+        uint32_t fallback_participant,
+        uint64_t tie_turn) noexcept
+    {
+        if (!participant_loads || participant_count == 0u)
+            return 0u;
+
+        resident_mask &= participantMaskLimit(participant_count);
+        if (resident_mask == 0u)
+        {
+            const uint32_t fallback =
+                fallback_participant < participant_count
+                    ? fallback_participant
+                    : 0u;
+            resident_mask = 1u << fallback;
+        }
+
+        uint32_t resident_count = 0u;
+        for (uint32_t participant = 0u;
+             participant < participant_count;
+             ++participant)
+        {
+            if ((resident_mask & (1u << participant)) != 0u)
+                ++resident_count;
+        }
+
+        const uint32_t preferred_ordinal =
+            static_cast<uint32_t>(
+                tie_turn % static_cast<uint64_t>(resident_count));
+        uint32_t preferred_participant = kInvalidParticipant;
+        uint32_t resident_ordinal = 0u;
+        for (uint32_t participant = 0u;
+             participant < participant_count;
+             ++participant)
+        {
+            if ((resident_mask & (1u << participant)) == 0u)
+                continue;
+            if (resident_ordinal == preferred_ordinal)
+            {
+                preferred_participant = participant;
+                break;
+            }
+            ++resident_ordinal;
+        }
+
+        uint32_t best_participant = kInvalidParticipant;
+        int best_load = 0;
+        for (uint32_t participant = 0u;
+             participant < participant_count;
+             ++participant)
+        {
+            if ((resident_mask & (1u << participant)) == 0u)
+                continue;
+            const int load = participant_loads[participant];
+            if (best_participant == kInvalidParticipant ||
+                load < best_load ||
+                (load == best_load &&
+                 participant == preferred_participant))
+            {
+                best_participant = participant;
+                best_load = load;
+            }
+        }
+        if (best_participant != kInvalidParticipant)
+            return best_participant;
+        return fallback_participant < participant_count
+                   ? fallback_participant
+                   : 0u;
     }
 
     LLAMINAR_LLEP_HD void assignLeastLoadedResidentSplitCounts(
@@ -1022,12 +1161,11 @@ namespace llaminar2::least_loaded_ep
         uint32_t span_capacity,
         LeastLoadedExpertWeightTransfer *transfers,
         uint32_t transfer_capacity,
-        LeastLoadedExpertAssignmentStatus *status_out,
-        const uint32_t *expert_resident_participant_masks = nullptr) noexcept
+        LeastLoadedExpertAssignmentStatus &status,
+        const uint32_t *expert_resident_participant_masks = nullptr,
+        bool workspace_experts_are_sorted = false) noexcept
     {
-        LeastLoadedExpertAssignmentStatus status{};
-        if (status_out)
-            *status_out = status;
+        status = {};
 
         if (expert_loads == nullptr ||
             expert_owner_participants == nullptr ||
@@ -1041,8 +1179,6 @@ namespace llaminar2::least_loaded_ep
             config.alpha_denominator == 0u)
         {
             status.invalid_config = 1u;
-            if (status_out)
-                *status_out = status;
             return false;
         }
 
@@ -1058,8 +1194,6 @@ namespace llaminar2::least_loaded_ep
             if (owner >= config.participant_count)
             {
                 status.invalid_config = 1u;
-                if (status_out)
-                    *status_out = status;
                 return false;
             }
             const uint64_t load = expert_loads[expert];
@@ -1089,8 +1223,6 @@ namespace llaminar2::least_loaded_ep
             status.assigned_load_min = status.standard_load_min;
             status.assigned_load_max = status.standard_load_max;
             status.assigned_load_spread = status.standard_load_spread;
-            if (status_out)
-                *status_out = status;
             return true;
         }
 
@@ -1108,10 +1240,20 @@ namespace llaminar2::least_loaded_ep
                        ? config.max_weight_transfers
                        : transfer_capacity);
 
-        sortExpertsByLoadDescending(
-            expert_loads,
-            config.expert_count,
-            workspace.sorted_experts);
+        /*
+         * Device planners can build this canonical ordering cooperatively
+         * before the ordered assignment pass begins.  Keeping that fact in
+         * the shared API prevents a GPU kernel from silently sorting the same
+         * experts again on one lane.  Host callers retain the compact scalar
+         * sort by accepting the default value.
+         */
+        if (!workspace_experts_are_sorted)
+        {
+            sortExpertsByLoadDescending(
+                expert_loads,
+                config.expert_count,
+                workspace.sorted_experts);
+        }
 
         for (uint32_t order = 0; order < config.expert_count; ++order)
         {
@@ -1132,8 +1274,6 @@ namespace llaminar2::least_loaded_ep
             if (expert_resident_participant_masks && resident_mask == 0u)
             {
                 status.invalid_config = 1u;
-                if (status_out)
-                    *status_out = status;
                 return false;
             }
             workspace.pending_load[owner] =
@@ -1163,8 +1303,6 @@ namespace llaminar2::least_loaded_ep
                         config.max_non_owner_experts_per_participant,
                         config.participant_count))
                 {
-                    if (status_out)
-                        *status_out = status;
                     return false;
                 }
                 workspace.assigned_load[owner] += load;
@@ -1191,8 +1329,6 @@ namespace llaminar2::least_loaded_ep
                         config.max_non_owner_experts_per_participant,
                         config.participant_count))
                 {
-                    if (status_out)
-                        *status_out = status;
                     return false;
                 }
                 workspace.assigned_load[owner] += native_available;
@@ -1214,8 +1350,6 @@ namespace llaminar2::least_loaded_ep
                     remaining,
                     route_offset))
             {
-                if (status_out)
-                    *status_out = status;
                 return false;
             }
         }
@@ -1248,8 +1382,6 @@ namespace llaminar2::least_loaded_ep
             status.skipped_insufficient_foreign_rows = 1u;
         }
 
-        if (status_out)
-            *status_out = status;
         return status.overflow == 0u;
     }
 
@@ -1260,13 +1392,11 @@ namespace llaminar2::least_loaded_ep
         const LeastLoadedExpertAssignmentWorkspace &workspace,
         LeastLoadedExpertWeightTransfer *transfers,
         uint32_t transfer_capacity,
-        LeastLoadedExpertAssignmentStatus *status_out,
+        LeastLoadedExpertAssignmentStatus &status,
         const uint32_t *expert_resident_participant_masks = nullptr,
         bool workspace_experts_are_sorted = false) noexcept
     {
-        LeastLoadedExpertAssignmentStatus status{};
-        if (status_out)
-            *status_out = status;
+        status = {};
 
         if (expert_loads == nullptr ||
             expert_owner_participants == nullptr ||
@@ -1280,8 +1410,6 @@ namespace llaminar2::least_loaded_ep
             config.alpha_denominator == 0u)
         {
             status.invalid_config = 1u;
-            if (status_out)
-                *status_out = status;
             return false;
         }
 
@@ -1297,8 +1425,6 @@ namespace llaminar2::least_loaded_ep
             if (owner >= config.participant_count)
             {
                 status.invalid_config = 1u;
-                if (status_out)
-                    *status_out = status;
                 return false;
             }
 
@@ -1329,8 +1455,6 @@ namespace llaminar2::least_loaded_ep
             status.assigned_load_min = status.standard_load_min;
             status.assigned_load_max = status.standard_load_max;
             status.assigned_load_spread = status.standard_load_spread;
-            if (status_out)
-                *status_out = status;
             return true;
         }
 
@@ -1381,8 +1505,6 @@ namespace llaminar2::least_loaded_ep
             if (expert_resident_participant_masks && resident_mask == 0u)
             {
                 status.invalid_config = 1u;
-                if (status_out)
-                    *status_out = status;
                 return false;
             }
             workspace.pending_load[owner] =
@@ -1415,8 +1537,6 @@ namespace llaminar2::least_loaded_ep
                                 config.participant_count),
                             owner))
                     {
-                        if (status_out)
-                            *status_out = status;
                         return false;
                     }
                     status.spilled_rows += load;
@@ -1452,8 +1572,6 @@ namespace llaminar2::least_loaded_ep
                                 config.participant_count),
                             owner))
                     {
-                        if (status_out)
-                            *status_out = status;
                         return false;
                     }
                     status.spilled_rows += native_available;
@@ -1546,8 +1664,6 @@ namespace llaminar2::least_loaded_ep
                                 config.participant_count),
                             best))
                     {
-                        if (status_out)
-                            *status_out = status;
                         return false;
                     }
                     workspace.assigned_load[best] += chunk;
@@ -1595,8 +1711,6 @@ namespace llaminar2::least_loaded_ep
                                 config.participant_count),
                             forced_participant))
                     {
-                        if (status_out)
-                            *status_out = status;
                         return false;
                     }
                     workspace.assigned_load[forced_participant] += remaining;
@@ -1639,8 +1753,6 @@ namespace llaminar2::least_loaded_ep
             status.skipped_insufficient_foreign_rows = 1u;
         }
 
-        if (status_out)
-            *status_out = status;
         return status.overflow == 0u;
     }
 

@@ -529,3 +529,35 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
     EXPECT_NE(explanation.find("depth_window: 8"), std::string::npos);
     EXPECT_NE(explanation.find("require_terminal_hidden_for_full_hit: false"), std::string::npos);
 }
+
+/**
+ * @brief Every shape-dependent GPU forward family requires eager publication.
+ *
+ * The serial stochastic oracle intentionally disables MTP while preserving the
+ * production phase-split dense policy. This matrix locks in that replicated or
+ * mirrored decode topology is independently sufficient to require eager graph
+ * family planning; otherwise sharded prefill can capture a smaller workspace
+ * before compact decode publishes its full-width projection requirements.
+ */
+TEST(Test__PrefixMTPConfig, ShapeDependentGPUForwardPoliciesRequireEagerFamilyManifest)
+{
+    GraphConfig config;
+    config.dense_tp_enabled = true;
+
+    EXPECT_FALSE(config.requiresEagerGPUWorkspaceFamilyManifest());
+
+    config.mtp.enabled = true;
+    EXPECT_TRUE(config.requiresEagerGPUWorkspaceFamilyManifest());
+
+    config.mtp.enabled = false;
+    config.dense_tp_decode_replicated = true;
+    EXPECT_TRUE(config.requiresEagerGPUWorkspaceFamilyManifest());
+
+    config.dense_tp_decode_replicated = false;
+    config.dense_tp_decode_mirrored_embedding = true;
+    EXPECT_TRUE(config.requiresEagerGPUWorkspaceFamilyManifest());
+
+    config.dense_tp_enabled = false;
+    EXPECT_FALSE(config.requiresEagerGPUWorkspaceFamilyManifest())
+        << "A replicated single-device graph has no phase-split TP topology";
+}

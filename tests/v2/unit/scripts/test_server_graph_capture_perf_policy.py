@@ -21,6 +21,9 @@ from graph_capture_perf_policy import (  # noqa: E402
     device_kinds_for_cell,
     validate_graph_capture_policy,
 )
+from gpu_host_transfer_perf_policy import (  # noqa: E402
+    validate_gpu_host_transfer_policy,
+)
 from request_input_lifetime_perf_policy import (  # noqa: E402
     validate_request_input_lifetime_policy,
 )
@@ -75,6 +78,113 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 self.fail(
                     f"embedded Python heredoc {index} is invalid: {error}"
                 )
+
+    def test_gpu_host_transfer_policy_accepts_only_response_materialization(
+        self,
+    ) -> None:
+        """Compact response mailboxes are the normal GPU-to-host boundary."""
+
+        records = [
+            counter(
+                "stochastic_request_batch_summary_d2h_sync",
+                domain="mtp",
+            ),
+            counter(
+                "grouped_outcome_stochastic_device_outcome_host_bridge",
+                domain="mtp",
+                tags={"timing": "post_publication_response_bridge"},
+            ),
+            counter("d2h_bytes", value=4096.0, domain="transfer"),
+        ]
+        result = validate_gpu_host_transfer_policy(records)
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            result.final_response_operations,
+            (
+                "grouped_outcome_stochastic_device_outcome_host_bridge",
+                "stochastic_request_batch_summary_d2h_sync",
+            ),
+        )
+
+    def test_gpu_host_transfer_policy_rejects_draft_proposal_readback(
+        self,
+    ) -> None:
+        """A draft token remains device-owned until target verification."""
+
+        result = validate_gpu_host_transfer_policy(
+            [
+                {
+                    "kind": "timer",
+                    "name": "stochastic_draft_greedy_proposal_d2h_sync",
+                    "domain": "mtp",
+                    "value": 0,
+                    "count": 17,
+                    "total_ns": 1200,
+                    "tags": {"slot": "3"},
+                }
+            ]
+        )
+        self.assertIn("draft_greedy_proposal", result.error or "")
+
+    def test_gpu_host_transfer_policy_rejects_draft_shadow_readback(
+        self,
+    ) -> None:
+        """Diagnostic host shadows cannot enter the production serving path."""
+
+        result = validate_gpu_host_transfer_policy(
+            [
+                counter(
+                    "request_batch_sidecar_device_draft_shadow_d2h_sync",
+                    domain="mtp",
+                )
+            ]
+        )
+        self.assertIn("draft_shadow", result.error or "")
+
+    def test_gpu_host_transfer_policy_fails_closed_for_unknown_d2h(self) -> None:
+        """New D2H boundaries require an explicit architectural review."""
+
+        result = validate_gpu_host_transfer_policy(
+            [counter("new_intermediate_state_d2h", domain="decode")]
+        )
+        self.assertIn("new_intermediate_state_d2h", result.error or "")
+
+    def test_gpu_host_transfer_policy_accepts_explicit_cache_tier_movement(
+        self,
+    ) -> None:
+        """RAM/disk prefix tiers are intentional storage, not host mirrors."""
+
+        result = validate_gpu_host_transfer_policy(
+            [
+                counter(
+                    "prefix_cache_block_d2h",
+                    domain="prefix_cache",
+                    tags={"tier": "ram"},
+                )
+            ]
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            result.prefix_cache_operations,
+            ("prefix_cache_block_d2h",),
+        )
+
+    def test_server_harness_invokes_gpu_host_transfer_policy(self) -> None:
+        """The canonical matrix must invoke the standalone fail-closed gate."""
+
+        harness = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "from gpu_host_transfer_perf_policy import "
+            "validate_gpu_host_transfer_policy",
+            harness,
+        )
+        self.assertIn(
+            "host_transfer_validation = "
+            "validate_gpu_host_transfer_policy(records)",
+            harness,
+        )
 
     def test_qwen36_homogeneous_tp_cells_require_prefill_graph_probe(self) -> None:
         """Same-backend TP must not retain the retired prefill opt-out."""
@@ -249,7 +359,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 ]
                 for mode in ("dynamic", "llep"):
                     label = (
-                        f"qwen36-moe-{mode}-prefix-mtp-greedy-d2-"
+                        f"qwen36-moe-{mode}-prefix-mtp-stochastic-d4to15-"
                         f"{backend}2tp-full"
                     )
                     matching = [
@@ -264,6 +374,12 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     self.assertEqual(cell_backend, "tp")
                     self.assertIn("--prefix-cache", flags)
                     self.assertIn("--mtp", flags)
+                    self.assertIn(
+                        "--mtp-verify-mode speculative-sampling",
+                        flags,
+                    )
+                    self.assertIn("--mtp-depth-policy dynamic", flags)
+                    self.assertIn("--mtp-max-draft-tokens 15", flags)
                     self.assertIn(f"--moe-rebalance {mode}", flags)
                     self.assertNotIn("--tp-devices", flags)
                     self.assertIn(
@@ -281,7 +397,111 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                         "moe-rebalance-movement-probe",
                         options,
                     )
+                    self.assertIn("stochastic-mtp-probe", options)
                     self.assertNotIn("no-long-context", options)
+
+    def test_default_gpu_rebalance_matrix_uses_stochastic_mtp(self) -> None:
+        """The strongest four local-GPU MoE cells exercise production sampling."""
+
+        harness = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text(
+            encoding="utf-8"
+        )
+        rows = [
+            line
+            for line in harness.splitlines()
+            if "SUITES+=" in line
+            and "prefix-mtp-stochastic-d4to15-" in line
+        ]
+        self.assertEqual(len(rows), 4)
+        for backend in ("cuda2tp", "rocm2tp"):
+            for mode in ("dynamic", "llep"):
+                matching = [
+                    row
+                    for row in rows
+                    if f"qwen36-moe-{mode}-prefix-mtp-" in row
+                    and f"-{backend}|" in row
+                ]
+                self.assertEqual(len(matching), 1)
+                row = matching[0]
+                self.assertIn("${S9_STOCHASTIC_MTP_FLAGS}", row)
+                self.assertIn("stochastic-mtp-probe", row)
+
+    def test_stochastic_probe_requires_device_resident_outcome_evidence(
+        self,
+    ) -> None:
+        """The server gate rejects labels that do not execute stochastic GPU MTP."""
+
+        harness = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text(
+            encoding="utf-8"
+        )
+        for marker in (
+            'flag_value("--mtp-verify-mode") != "speculative-sampling"',
+            'flag_value("--mtp-depth-policy") != "dynamic"',
+            'record.get("name") == "stochastic_accept_tests"',
+            'get("device_resident") == "true"',
+            '"stochastic_verify_request_batch_outcomes"',
+            '"stochastic_request_batch_summary_gpu_reducer"',
+            'numeric(record.get("total_ns")) > 0.0',
+            '"stochastic_serial_equivalent_host_verifier_rows"',
+            '"depth_policy_windows"',
+        ):
+            self.assertIn(marker, harness)
+
+    def test_stochastic_probe_can_complete_a_dynamic_depth_window(self) -> None:
+        """The HTTP workload must outlive the four-sample controller window."""
+
+        harness = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text(
+            encoding="utf-8"
+        )
+        probe_start = harness.index("run_stochastic_mtp_probe()")
+        probe_end = harness.index("run_prefill_graph_probe()", probe_start)
+        probe = harness[probe_start:probe_end]
+
+        self.assertIn(
+            "LLAMINAR_E2E_STOCHASTIC_MTP_PROBE_MAX_TOKENS:-64",
+            probe,
+        )
+        self.assertIn(
+            "LLAMINAR_E2E_STOCHASTIC_MTP_PROBE_REPETITIONS:-1",
+            probe,
+        )
+        self.assertIn("at least sixty-four lowercase", probe)
+        self.assertIn("English words", probe)
+        self.assertIn(
+            '"$messages_json" "$probe_max_tokens" '
+            '"false" "false" "stochastic" "12345"',
+            probe,
+        )
+        self.assertIn('printf -v probe_marker "trial%02d"', probe)
+        self.assertIn("probe_iteration <= probe_repetitions", probe)
+        self.assertIn("common_prefix_chars", probe)
+        self.assertIn('"sha256"', probe)
+
+    def test_stochastic_http_probe_runs_only_after_health_publication(
+        self,
+    ) -> None:
+        """HTTP inference must not race model loading and health publication."""
+
+        harness = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text(
+            encoding="utf-8"
+        )
+        runner_start = harness.index("run_backend_tests()")
+        runner_end = harness.index("# ─── Run Test Suites", runner_start)
+        runner = harness[runner_start:runner_end]
+
+        health_wait = runner.index(
+            'if ! wait_for_health "$port" "$server_handle"; then'
+        )
+        health_pass = runner.index(
+            'pass "[${tag}] Server started"',
+            health_wait,
+        )
+        stochastic_probe = runner.index(
+            'run_stochastic_mtp_probe "$tag" "$port"',
+            health_pass,
+        )
+        self.assertLess(health_wait, health_pass)
+        self.assertLess(health_pass, stochastic_probe)
 
     def test_device_kind_parser_covers_all_matrix_domain_syntaxes(self) -> None:
         flags = (

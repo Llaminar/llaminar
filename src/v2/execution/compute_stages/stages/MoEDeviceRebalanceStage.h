@@ -270,6 +270,30 @@ namespace llaminar2
         bool isGraphCapturable() const override;
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
         bool needsGraphLaunchPreparation() const override { return usesTransferSlotApply(); }
+
+        /**
+         * @brief Report whether this stage owns the persistent request transaction.
+         *
+         * A phase-split graph may contain several stages that consume the same
+         * workspace. Exactly the stage that runs planning owns the request
+         * lifetime transition, preventing reset code from resetting one shared
+         * transaction repeatedly merely because several consumers can name it.
+         */
+        bool ownsRequestTransactionState() const noexcept;
+
+        /**
+         * @brief Reset all request-owned transaction contents on an explicit stream.
+         *
+         * Model-lifetime workspace addresses remain stable for captured replay.
+         * The controller, command headers, wave cursors, and plan counts are
+         * reset together in stream order. The operation is asynchronous and
+         * becomes visible through the orchestrator's reset-ready event.
+         *
+         * @param stream Exact request-reset stream; null is a fatal contract error.
+         * @return true when the backend reset kernel was enqueued successfully.
+         */
+        bool resetRequestTransactionStateOnStream(void *stream);
+
         /**
          * @brief Reset this stage's private MoE launch metadata on hard invalidation.
          */

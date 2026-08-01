@@ -2927,12 +2927,12 @@ namespace llaminar2
             {
                 stage->onGraphReplayed();
             }
-            LOG_DEBUG("[DeviceGraphCaptureController] Ran " << segment.replay_callbacks.size()
+            LOG_TRACE("[DeviceGraphCaptureController] Ran " << segment.replay_callbacks.size()
                                                             << " onGraphReplayed() callbacks");
         }
         else
         {
-            LOG_DEBUG("[DeviceGraphCaptureController] SKIPPED " << segment.replay_callbacks.size()
+            LOG_TRACE("[DeviceGraphCaptureController] SKIPPED " << segment.replay_callbacks.size()
                                                                 << " onGraphReplayed() callbacks (capture phase)");
         }
 

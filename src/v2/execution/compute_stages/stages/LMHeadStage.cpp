@@ -74,7 +74,7 @@ namespace llaminar2
     {
         ScopedGemmContext gemm_ctx(GemmContext::LM_HEAD);
 
-        LOG_DEBUG("[LMHeadStage] Execute: seq_len=" << params_.seq_len
+        LOG_TRACE("[LMHeadStage] Execute: seq_len=" << params_.seq_len
                                                     << " d_model=" << params_.d_model
                                                     << " vocab_size=" << params_.vocab_size);
 
@@ -107,20 +107,36 @@ namespace llaminar2
         // Get or create GEMM kernel for LM head weight
         // CRITICAL: Use DeviceId overload (not DeviceType) to ensure correct GPU ordinal
         // Using DeviceType alone would default to ROCm:0 even when running on ROCm:1
-        LOG_DEBUG("[LMHeadStage] Requesting kernel with device_id=" << params_.device_id.toKernelDeviceIndex()
+        LOG_TRACE("[LMHeadStage] Requesting kernel with device_id=" << params_.device_id.toKernelDeviceIndex()
                                                                     << " (is_rocm=" << params_.device_id.is_rocm()
                                                                     << ", rocm_ordinal=" << (params_.device_id.is_rocm() ? params_.device_id.rocm_ordinal() : -1) << ")"
                                                                     << " lm_head_weight=" << (void *)lm_head_weight
                                                                     << " shape=" << lm_head_weight->shape()[0] << "x" << lm_head_weight->shape()[1]);
 
         ITensorGemm *lm_gemm = resolvePreparedKernel("LMHeadStage");
-        LOG_DEBUG("[LMHeadStage] Got kernel=" << (void *)lm_gemm);
+        LOG_TRACE("[LMHeadStage] Got kernel=" << (void *)lm_gemm);
         if (!lm_gemm)
         {
             LOG_ERROR("[LMHeadStage] Failed to get/create LM head GEMM kernel");
             return false;
         }
         bindStageStream(lm_gemm);
+
+        std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
+            output_partition_scope;
+        if (params_.serial_equivalent_partition_width > 0)
+        {
+            if (params_.serial_equivalent_partition_width > params_.vocab_size ||
+                (params_.vocab_size % params_.serial_equivalent_partition_width) != 0)
+            {
+                throw std::logic_error(
+                    "[LMHeadStage] Replicated LM-head width must be an exact multiple of its serial partition width");
+            }
+            output_partition_scope =
+                lm_gemm->beginOutputPartitionEquivalenceScope(
+                    params_.vocab_size,
+                    params_.serial_equivalent_partition_width);
+        }
 
         // LM head: logits = hidden @ lm_head^T + bias
         // hidden: [seq_len, d_model], lm_head: [vocab_size, d_model]
@@ -399,7 +415,7 @@ namespace llaminar2
         }
 
         auto *consumer = dynamic_cast<IWorkspaceConsumer *>(lm_gemm);
-        LOG_DEBUG("[LMHeadStage::getKernelAsWorkspaceConsumer] Returning kernel=" << (void *)lm_gemm
+        LOG_TRACE("[LMHeadStage::getKernelAsWorkspaceConsumer] Returning kernel=" << (void *)lm_gemm
                                                                                   << " as consumer=" << (void *)consumer);
         return consumer;
     }

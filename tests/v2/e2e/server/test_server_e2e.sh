@@ -193,6 +193,9 @@ THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS-16}"
 #                       fail unless PerfStats prove prefix-cache harvest and restore.
 #   moe-rebalance-movement-probe  Fail unless PerfStats prove the MoE rebalance
 #                       path planned and applied or imported at least one expert.
+#   stochastic-mtp-probe  Send a deterministic seeded stochastic request twice
+#                       and fail unless PerfStats prove device-resident batched
+#                       stochastic verification on the configured GPU graph.
 # If the 3rd field is non-numeric, it's treated as extra_flags (max_tokens defaults to 200).
 # Each --suite flag appends to the list. If none given, defaults are used.
 declare -a SUITES=()
@@ -346,6 +349,7 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     S9_MODEL="/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
     S9_PREFIX_FLAGS="${S8_PREFIX_FLAGS} --prefix-cache-moe-policy placement-fingerprint"
     S9_MTP_FLAGS="${S8_MTP_FLAGS}"
+    S9_STOCHASTIC_MTP_FLAGS="--mtp --mtp-draft-tokens 4 --mtp-min-draft-tokens 1 --mtp-initial-draft-tokens 4 --mtp-max-draft-tokens 15 --mtp-depth-policy dynamic --mtp-depth-window 4 --mtp-depth-min-samples 4 --mtp-depth-promote-windows 1 --mtp-verify-mode speculative-sampling"
     # MoE mode is part of the behavioral contract of every matrix cell. Keep
     # static cells explicit because the production CLI default may evolve
     # independently of this regression matrix.
@@ -386,10 +390,10 @@ if [ ${#SUITES[@]} -eq 0 ]; then
             SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
             SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
             SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-stochastic-d4to15-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-stochastic-d4to15-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-stochastic-d4to15-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-stochastic-d4to15-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
         fi
         if [[ "$MOE_REBALANCE_CLEAR_PROBE_E2E" == "1" ]]; then
             SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS} --backend nccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-cuda2tp|no-long-context,prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe")
@@ -1125,6 +1129,11 @@ suite_runs_moe_rebalance_movement_probe() {
     [[ ",${suite_options}," == *",moe-rebalance-movement-probe,"* ]]
 }
 
+suite_runs_stochastic_mtp_probe() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",stochastic-mtp-probe,"* ]]
+}
+
 is_gpu_backend() {
     local backend="$1"
     [[ "$backend" == cuda:* || "$backend" == rocm:* || "$backend" == "tp" || "$backend" == "pp" ]]
@@ -1520,8 +1529,10 @@ make_chat_payload() {
     local max_tokens="$2"
     local enable_thinking="$3"
     local stream="${4:-false}"
+    local sampling_mode="${5:-greedy}"
+    local sampling_seed="${6:-12345}"
 
-    python3 - "$messages_json" "$max_tokens" "$enable_thinking" "$stream" "$THINKING_BUDGET_TOKENS" <<'PY'
+    python3 - "$messages_json" "$max_tokens" "$enable_thinking" "$stream" "$THINKING_BUDGET_TOKENS" "$sampling_mode" "$sampling_seed" <<'PY'
 import json
 import sys
 
@@ -1530,13 +1541,27 @@ max_tokens = int(sys.argv[2])
 enable_thinking = sys.argv[3] == "true"
 stream = sys.argv[4] == "true"
 thinking_budget = int(sys.argv[5]) if sys.argv[5] else -1
+sampling_mode = sys.argv[6]
+sampling_seed = int(sys.argv[7])
 
 payload = {
     "messages": messages,
     "max_tokens": max_tokens,
     "enable_thinking": enable_thinking,
-    "temperature": 0.0,
 }
+if sampling_mode == "stochastic":
+    payload.update(
+        {
+            "temperature": 0.7,
+            "top_k": 20,
+            "top_p": 0.9,
+            "seed": sampling_seed,
+        }
+    )
+elif sampling_mode == "greedy":
+    payload["temperature"] = 0.0
+else:
+    raise ValueError(f"unknown E2E sampling mode: {sampling_mode}")
 if stream:
     payload["stream"] = True
 if enable_thinking and thinking_budget >= 0:
@@ -2052,6 +2077,7 @@ path, backend, extra_flags, long_context_run, suite_options, policy_module_dir =
 sys.path.insert(0, policy_module_dir)
 
 from graph_capture_perf_policy import validate_graph_capture_policy
+from gpu_host_transfer_perf_policy import validate_gpu_host_transfer_policy
 from request_input_lifetime_perf_policy import (
     validate_request_input_lifetime_policy,
 )
@@ -2075,6 +2101,7 @@ require_prefill_capture = (
 require_prefill_replay = "prefill-graph-probe" in suite_option_set
 require_prefix_rebalance_clear = "prefix-cache-rebalance-clear-probe" in suite_option_set
 require_moe_rebalance_movement = "moe-rebalance-movement-probe" in suite_option_set
+require_stochastic_mtp = "stochastic-mtp-probe" in suite_option_set
 expect_decode_replay = (
     is_mtp
     or long_context_run == "true"
@@ -2103,6 +2130,11 @@ if is_gpu:
     request_input_validation = validate_request_input_lifetime_policy(records)
     if request_input_validation.error:
         print(f"FAIL: {request_input_validation.error}")
+        sys.exit(0)
+
+    host_transfer_validation = validate_gpu_host_transfer_policy(records)
+    if host_transfer_validation.error:
+        print(f"FAIL: {host_transfer_validation.error}")
         sys.exit(0)
 
 def has_record(name=None, domain=None, tags=None):
@@ -2293,8 +2325,9 @@ if is_gpu and is_mtp:
     # on a participant. Migrating an entire expert payload for the current
     # verifier batch is both unnecessary and catastrophically expensive at
     # MTP-sized M. Require the production serving graph to publish its typed
-    # resident-only decision so an accidental return to transfer-backed
-    # verifier assignment fails the canonical E2E matrix immediately.
+    # logical-position resident decision so an accidental return to either
+    # position-derived assignment or transfer-backed verifier assignment fails
+    # the canonical E2E matrix immediately.
     if flag_value("--moe-rebalance") == "llep":
         verifier_assignment_records = [
             record
@@ -2304,19 +2337,70 @@ if is_gpu and is_mtp:
             and record.get("phase") == "verifier"
         ]
         if not verifier_assignment_records:
-            print("FAIL: GPU LLEP+MTP case emitted no resident-only verifier assignment evidence")
+            print("FAIL: GPU LLEP+MTP case emitted no logical-position resident verifier assignment evidence")
             sys.exit(0)
         for record in verifier_assignment_records:
             record_tags = record.get("tags") or {}
             if (
-                record_tags.get("assignment") != "resident_only"
+                record_tags.get("assignment") != "logical_position_resident"
                 or record_tags.get("current_batch_transport") != "none"
             ):
                 print(
-                    "FAIL: GPU LLEP+MTP verifier selected a transfer-backed "
-                    f"current-batch assignment: {record_tags}"
+                    "FAIL: GPU LLEP+MTP verifier did not select the "
+                    "logical-position resident assignment with no "
+                    f"current-batch transport: {record_tags}"
                 )
                 sys.exit(0)
+
+if require_stochastic_mtp:
+    if not is_gpu or not is_mtp:
+        print("FAIL: stochastic MTP probe requires a GPU MTP cell")
+        sys.exit(0)
+    if flag_value("--mtp-verify-mode") != "speculative-sampling":
+        print("FAIL: stochastic MTP probe requires --mtp-verify-mode speculative-sampling")
+        sys.exit(0)
+    if flag_value("--mtp-depth-policy") != "dynamic":
+        print("FAIL: stochastic MTP probe requires the production dynamic-depth controller")
+        sys.exit(0)
+    if record_value_sum(("stochastic_accept_tests",), "mtp") <= 0.0:
+        print("FAIL: stochastic MTP probe emitted no stochastic acceptance tests")
+        sys.exit(0)
+    resident_accept_tests = sum(
+        numeric(record.get("value", record.get("count", 0.0)))
+        for record in records
+        if record.get("domain") == "mtp"
+        and record.get("name") == "stochastic_accept_tests"
+        and (record.get("tags") or {}).get("device_resident") == "true"
+    )
+    if resident_accept_tests <= 0.0:
+        print("FAIL: stochastic MTP acceptance did not use the device-resident verifier")
+        sys.exit(0)
+    if record_value_sum(
+        ("stochastic_verify_request_batch_outcomes",),
+        "mtp",
+    ) <= 0.0:
+        print("FAIL: stochastic MTP emitted no request-batched device outcome")
+        sys.exit(0)
+    gpu_reducer_records = [
+        record
+        for record in records
+        if record.get("domain") == "mtp"
+        and record.get("name")
+        == "stochastic_request_batch_summary_gpu_reducer"
+        and numeric(record.get("total_ns")) > 0.0
+    ]
+    if not gpu_reducer_records:
+        print("FAIL: stochastic MTP emitted no GPU compact-outcome reducer evidence")
+        sys.exit(0)
+    if record_value_sum(
+        ("stochastic_serial_equivalent_host_verifier_rows",),
+        "mtp",
+    ) > 0.0:
+        print("FAIL: stochastic GPU MTP entered the retired host verifier")
+        sys.exit(0)
+    if record_value_sum(("depth_policy_windows",), "mtp") <= 0.0:
+        print("FAIL: stochastic dynamic-depth MTP emitted no controller window")
+        sys.exit(0)
 
 if require_prefix_rebalance_clear:
     if not is_gpu:
@@ -2364,6 +2448,7 @@ if require_prefix_rebalance_clear:
     movement_score = (
         record_value_sum(
             (
+                "device_rebalance_prefill_current_batch_movement_layers",
                 "device_rebalance_prefill_active_transfer_slot_experts",
                 "device_rebalance_apply_applied_arrivals",
                 "device_rebalance_transfer_current_applied_arrivals",
@@ -2482,13 +2567,13 @@ if require_moe_rebalance_movement:
                 )
                 sys.exit(0)
 
-    # A live transfer-slot expert is stronger evidence than any intermediate
-    # planner counter: its descriptor is valid, resident, locally executable,
-    # and published in the active runtime bank. Count that final state toward
-    # every phase so prefill movement is proven even when the following short
-    # decode-maintenance window correctly chooses resident-only assignments.
+    # A sticky transient-placement layer is stronger evidence than an
+    # intermediate planner counter and more durable than terminal slot
+    # occupancy. The device sets this marker only after a payload-backed move
+    # is applied, then preserves it across later bank swaps even if maintenance
+    # retires the physical slot. Count that applied history toward every phase.
     prefill_applied_movement = record_value_sum(
-        ("device_rebalance_prefill_active_transfer_slot_experts",),
+        ("device_rebalance_prefill_current_batch_movement_layers",),
         "moe_rebalance",
     )
     planned_score = (
@@ -2802,6 +2887,145 @@ print('ok')
             fi
         fi
     done
+}
+
+run_stochastic_mtp_probe() {
+    local tag="$1"
+    local port="$2"
+    local messages_json probe_max_tokens probe_repetitions
+    probe_max_tokens="${LLAMINAR_E2E_STOCHASTIC_MTP_PROBE_MAX_TOKENS:-64}"
+    probe_repetitions="${LLAMINAR_E2E_STOCHASTIC_MTP_PROBE_REPETITIONS:-1}"
+    if [[ ! "$probe_repetitions" =~ ^[1-9][0-9]*$ ]] ||
+       ((probe_repetitions > 20)); then
+        fail "[${tag}] Stochastic MTP probe repetitions must be an integer from 1 through 20, got '${probe_repetitions}'"
+        return
+    fi
+
+    local payload first_response second_response first_content second_content
+    local probe_iteration probe_marker
+    for ((probe_iteration = 1;
+          probe_iteration <= probe_repetitions;
+          ++probe_iteration)); do
+        # Every iteration uses a distinct fixed-width prompt marker. The first
+        # request therefore inserts a new prefix and the second request restores
+        # that exact prefix, instead of later loop iterations comparing two
+        # already-hot restores of the first prompt.
+        printf -v probe_marker "trial%02d" "$probe_iteration"
+        messages_json=$(python3 - "$probe_marker" <<'PY'
+import json
+import sys
+
+messages = [
+    {
+        "role": "system",
+        "content": (
+            "Write a continuous paragraph of at least sixty-four lowercase "
+            "English words. Do not use punctuation, lists, headings, or an "
+            "early conclusion."
+        ),
+    },
+    {
+        "role": "user",
+        "content": (
+            "Describe a calm morning while following every length and "
+            f"formatting requirement. The private request marker is {sys.argv[1]}."
+        ),
+    },
+]
+print(json.dumps(messages, separators=(",", ":")))
+PY
+)
+
+        payload=$(make_chat_payload \
+            "$messages_json" "$probe_max_tokens" "false" "false" "stochastic" "12345")
+        first_response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null ||
+            echo '{"error":"curl_failed"}')
+        second_response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null ||
+            echo '{"error":"curl_failed"}')
+        first_content=$(printf '%s' "$first_response" | extract_content 2>/dev/null ||
+            echo "PARSE_ERROR")
+        second_content=$(printf '%s' "$second_response" | extract_content 2>/dev/null ||
+            echo "PARSE_ERROR")
+
+        if [[ -z "$first_content" || "$first_content" == "PARSE_ERROR" ||
+              -z "$second_content" || "$second_content" == "PARSE_ERROR" ]]; then
+            fail "[${tag}] Stochastic MTP probe iteration ${probe_iteration}/${probe_repetitions} returned an empty or malformed response"
+            return
+        fi
+        if [[ "$first_content" != "$second_content" ]]; then
+            local mismatch_diagnostics
+            mismatch_diagnostics=$(
+                printf '%s\0%s' "$first_response" "$second_response" |
+                    python3 -c '
+import hashlib
+import json
+import sys
+
+parts = sys.stdin.buffer.read().split(b"\0", 1)
+if len(parts) != 2:
+    print("diagnostic_error=missing_response_separator")
+    raise SystemExit(0)
+
+def summarize(raw):
+    response = json.loads(raw.decode("utf-8"))
+    choice = (response.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    encoded = content.encode("utf-8")
+    usage = response.get("usage") or {}
+    return {
+        "content": content,
+        "bytes": len(encoded),
+        "chars": len(content),
+        "sha256": hashlib.sha256(encoded).hexdigest()[:16],
+        "finish_reason": choice.get("finish_reason"),
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+        "error": response.get("error"),
+    }
+
+try:
+    first = summarize(parts[0])
+    second = summarize(parts[1])
+except Exception as exc:
+    print(f"diagnostic_error={type(exc).__name__}:{exc}")
+    raise SystemExit(0)
+
+first_content = first.pop("content")
+second_content = second.pop("content")
+common = 0
+for lhs, rhs in zip(first_content, second_content):
+    if lhs != rhs:
+        break
+    common += 1
+
+radius = 32
+first_context = first_content[max(0, common - radius):common + radius]
+second_context = second_content[max(0, common - radius):common + radius]
+print("first=" + json.dumps(first, sort_keys=True, ensure_ascii=True))
+print("second=" + json.dumps(second, sort_keys=True, ensure_ascii=True))
+print("mismatch=" + json.dumps({
+    "common_prefix_chars": common,
+    "first_context": first_context,
+    "second_context": second_context,
+}, sort_keys=True, ensure_ascii=True))
+'
+            )
+            fail "[${tag}] Seeded stochastic MTP was not reproducible across prefix restore at iteration ${probe_iteration}/${probe_repetitions}"
+            while IFS= read -r diagnostic_line; do
+                echo -e "  ${BLUE}INFO${NC} [${tag}] Stochastic MTP mismatch iteration ${probe_iteration}/${probe_repetitions} ${diagnostic_line}"
+            done <<<"$mismatch_diagnostics"
+            return
+        fi
+    done
+    pass "[${tag}] Seeded stochastic MTP reproduced the same response across prefix restore for ${probe_repetitions}/${probe_repetitions} unique prefixes"
 }
 
 run_prefill_graph_probe() {
@@ -3213,6 +3437,14 @@ run_backend_tests() {
         pass "[${tag}] GET /health returns ok"
     else
         fail "[${tag}] GET /health unexpected: ${health_response}"
+    fi
+
+    # The stochastic probe is an HTTP production-path check, so it must run
+    # only after the server has crossed its explicit health publication
+    # boundary. Keeping it here also makes its first request the cache producer
+    # and its second same-seed request the unambiguous prefix-restore consumer.
+    if suite_runs_stochastic_mtp_probe "$suite_options"; then
+        run_stochastic_mtp_probe "$tag" "$port"
     fi
 
     # ─── Test 2: Single-turn greedy inference ─────────────────────────

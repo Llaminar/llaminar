@@ -406,7 +406,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        LOG_DEBUG("[AttentionComputeStage::getOrCreateKernel] Created and cached attention kernel for "
+        LOG_TRACE("[AttentionComputeStage::getOrCreateKernel] Created and cached attention kernel for "
                   << params_.Q->dtype_name() << " on " << params_.device_id.to_string());
 
         return kernel;
@@ -441,10 +441,13 @@ namespace llaminar2
          * head dimensions remain authoritative because TP/MoE graph hints can
          * describe a smaller shard than the concrete attention stage.
          */
-        const int workspace_sequence_count = std::max({1, m, params_.batch_size});
-        const int workspace_partial_rows = std::max(
-            workspace_sequence_count,
-            attention::kMaxGroupedVerifierAttentionRows);
+        const attention::AttentionWorkspaceCardinality
+            workspace_cardinality =
+                attention::planAttentionWorkspaceCardinality(
+                    m,
+                    params_.batch_size);
+        const int workspace_partial_rows =
+            workspace_cardinality.compact_query_rows;
         const int workspace_heads = std::max(n, params_.n_heads);
         const int workspace_head_dim = std::max(k, params_.head_dim);
 
@@ -462,7 +465,10 @@ namespace llaminar2
          * four complete 4096-token KV conversion buffers for one request.
          */
         const int workspace_kv_heads = std::max(1, params_.n_kv_heads);
-        const size_t kv_convert_bytes = static_cast<size_t>(workspace_sequence_count) *
+        const size_t kv_convert_bytes =
+                                        static_cast<size_t>(
+                                            workspace_cardinality
+                                                .request_count) *
                                         4096ULL *
                                         static_cast<size_t>(workspace_kv_heads) *
                                         static_cast<size_t>(workspace_head_dim) *
@@ -830,7 +836,7 @@ namespace llaminar2
         const bool is_decode_mode = (mode == AttentionMode::DECODE ||
                                      (params_.seq_len < effective_kv_len && params_.batch_size == 1));
 
-        LOG_DEBUG("[AttentionComputeStage] Execute: batch=" << params_.batch_size
+        LOG_TRACE("[AttentionComputeStage] Execute: batch=" << params_.batch_size
                                                             << " seq_len=" << params_.seq_len
                                                             << " kv_len=" << effective_kv_len
                                                             << " n_heads=" << params_.n_heads
@@ -1009,7 +1015,7 @@ namespace llaminar2
         // Device coherence is now handled automatically by DeviceGraphExecutor at stage boundaries
         // based on the stage's coherencePolicy() (FULL by default)
 
-        LOG_DEBUG("[AttentionComputeStage] Executing kernel: Q_type=" << params_.Q->dtype_name()
+        LOG_TRACE("[AttentionComputeStage] Executing kernel: Q_type=" << params_.Q->dtype_name()
                                                                       << " device=" << params_.device_id.to_string()
                                                                       << " device_idx=" << device_idx);
 
@@ -1260,7 +1266,7 @@ namespace llaminar2
         bool success = false;
         if (cpu_grouped_request_cache)
         {
-            LOG_DEBUG("[AttentionComputeStage] Using grouped CPU request-cache attention"
+            LOG_TRACE("[AttentionComputeStage] Using grouped CPU request-cache attention"
                       << " layer=" << params_.layer_idx
                       << " requests=" << params_.batch_size
                       << " query_rows=" << params_.seq_len);
@@ -1304,7 +1310,7 @@ namespace llaminar2
                 return false;
             }
 
-            LOG_DEBUG("[AttentionComputeStage] Using device-owned grouped GPU request-cache attention"
+            LOG_TRACE("[AttentionComputeStage] Using device-owned grouped GPU request-cache attention"
                       << " layer=" << params_.layer_idx
                       << " requests=" << params_.batch_size
                       << " query_rows=" << logical_seq_len
@@ -1339,7 +1345,7 @@ namespace llaminar2
         }
         else if (small_verifier_decode)
         {
-            LOG_DEBUG("[AttentionComputeStage] Using grouped decode-equivalent verifier attention"
+            LOG_TRACE("[AttentionComputeStage] Using grouped decode-equivalent verifier attention"
                       << " layer=" << params_.layer_idx
                       << " rows=" << params_.seq_len
                       << " effective_kv_len=" << effective_kv_len

@@ -65,6 +65,7 @@ namespace llaminar2
                     .producer = DeviceTimelineRole::MainForwardGraph,
                     .consumers = roles({
                         DeviceTimelineRole::RequestAdmissionTransfer,
+                        DeviceTimelineRole::MainForwardGraph,
                     }),
                 },
                 {

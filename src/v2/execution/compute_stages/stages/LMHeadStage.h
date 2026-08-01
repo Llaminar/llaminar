@@ -53,6 +53,17 @@ namespace llaminar2
             int seq_len = 0;
             int d_model = 0;
             int vocab_size = 0;
+            /**
+             * @brief Serial column-shard width whose arithmetic must be reproduced.
+             *
+             * A mirrored LocalTP MTP head writes the full vocabulary on every
+             * device, but its logits must remain byte-identical to the ordinary
+             * serial graph that projects one vocabulary shard per participant.
+             * Zero means that output ownership and serial arithmetic width are
+             * identical. A positive value activates the backend's explicit
+             * output-partition equivalence contract.
+             */
+            int serial_equivalent_partition_width = 0;
             int effective_last_row_idx = -1;           ///< Dynamic last real token row for padded prefill replay.
             bool use_prefill_replay_row_offset = true; ///< False when input is already a one-row scratch.
             bool compute_all_positions = false;        ///< Compute logits for every input row instead of only the selected row.
@@ -122,6 +133,11 @@ namespace llaminar2
         bool usesDecodeEquivalentVerifierPrefillForTesting() const
         {
             return params_.force_decode_equivalent_verifier_prefill;
+        }
+
+        int serialEquivalentPartitionWidthForTesting() const
+        {
+            return params_.serial_equivalent_partition_width;
         }
 
         /**

@@ -476,6 +476,87 @@ namespace llaminar2
                params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband;
     }
 
+    bool MoEDeviceRebalanceStage::ownsRequestTransactionState() const noexcept
+    {
+        return runsController();
+    }
+
+    bool MoEDeviceRebalanceStage::resetRequestTransactionStateOnStream(void *stream)
+    {
+        if (!ownsRequestTransactionState())
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Request-transaction reset was invoked on a non-owner phase"
+                      << " stage=" << suffixFor(params_.stage_name)
+                      << " phase=" << phaseName(params_.phase));
+            return false;
+        }
+        if (!stream)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Request-transaction reset requires the exact non-null reset stream"
+                      << " stage=" << suffixFor(params_.stage_name));
+            return false;
+        }
+        if (!bound_workspace_)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Request-transaction reset requires bound persistent workspace"
+                      << " stage=" << suffixFor(params_.stage_name));
+            return false;
+        }
+        if (!validateCommon("MoEDeviceRebalanceStage::resetRequestTransactionStateOnStream"))
+            return false;
+
+        auto *controller_state =
+            static_cast<DeviceMoERebalanceGraphControllerState *>(
+                bound_workspace_->getBuffer(controllerStateBufferName()));
+        auto *command_headers =
+            static_cast<DeviceMoERebalanceCommandBufferHeader *>(
+                bound_workspace_->getBuffer(commandHeaderBufferName()));
+        auto *wave_states =
+            static_cast<DeviceMoERebalanceWaveState *>(
+                bound_workspace_->getBuffer(waveStateBufferName()));
+        auto *plan_counts =
+            static_cast<uint32_t *>(
+                bound_workspace_->getBuffer(transferPlanCountBufferName()));
+        if (!controller_state || !command_headers || !wave_states || !plan_counts)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Request-transaction workspace is incomplete"
+                      << " controller=" << static_cast<void *>(controller_state)
+                      << " headers=" << static_cast<void *>(command_headers)
+                      << " waves=" << static_cast<void *>(wave_states)
+                      << " plan_counts=" << static_cast<void *>(plan_counts));
+            return false;
+        }
+
+        if (!owned_moe_kernel_)
+            owned_moe_kernel_ = KernelFactory::createMoEKernel(params_.device_id);
+        if (!owned_moe_kernel_)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Could not create the backend MoE kernel for request reset"
+                      << " device=" << params_.device_id.to_string());
+            return false;
+        }
+
+        const MoEKernelLaunchContext reset_launch{
+            .stream = stream,
+            .workspace = bound_workspace_,
+        };
+        if (!owned_moe_kernel_->resetDeviceRebalanceGraphTransactionForRequest(
+                reset_launch,
+                controller_state,
+                command_headers,
+                wave_states,
+                plan_counts,
+                static_cast<uint32_t>(commandBufferCount()),
+                params_.config))
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Backend rejected the request-transaction reset"
+                      << " device=" << params_.device_id.to_string()
+                      << " stage=" << suffixFor(params_.stage_name));
+            return false;
+        }
+        return true;
+    }
+
     bool MoEDeviceRebalanceStage::runsPlanning() const
     {
         if (params_.phase == DeviceMoERebalanceStagePhase::JoinTransfer)

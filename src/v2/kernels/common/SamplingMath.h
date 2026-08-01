@@ -34,7 +34,7 @@ namespace llaminar2::sampling_math
     constexpr int kSpeculativeBatchMaxOutputTokens =
         kSpeculativeBatchMaxRows + 1;
     constexpr int kSpeculativeBatchMaxStopTokens = 8;
-    constexpr int kSpeculativeBatchMetaCount = 10;
+    constexpr int kSpeculativeBatchMetaCount = 12;
     constexpr float kMaxUnitThreshold = 0.99999994f;
     constexpr uint64_t kInverseSampleDomain = 0xA0761D6478BD642FULL;
     constexpr uint64_t kMTPSpecDrawPurposesPerToken = 8;
@@ -77,8 +77,40 @@ namespace llaminar2::sampling_math
         kSpecBatchMetaStoppedOnOutput = 6,
         kSpecBatchMetaAllSpeculativeAccepted = 7,
         kSpecBatchMetaConsumedVerifierRows = 8,
-        kSpecBatchMetaSampledTerminal = 9
+        kSpecBatchMetaSampledTerminal = 9,
+        kSpecBatchMetaCommitBoundaryClipped = 10,
+        /**
+         * Number of leading compact output rows emitted by an earlier transaction.
+         *
+         * A rejected correction token is returned to the caller immediately, then
+         * carried as row zero of the next verifier transaction so the model can
+         * consume it as the next condition.  The row remains part of the compact
+         * output/state-publication shape, but it must not advance a serial decode
+         * cadence for a second time.
+         */
+        kSpecBatchMetaLeadingCommittedOutputCount = 11
     };
+
+    /**
+     * @brief Convert compact output rows into newly emitted serial decode rounds.
+     *
+     * The compact ABI permits exactly one leading row from an earlier transaction:
+     * the pending rejection-correction condition.  Returning `-1` makes malformed
+     * metadata fatal to device maintenance instead of silently double-counting it.
+     */
+    LLAMINAR_SAMPLING_HD int speculative_new_commit_count(
+        int output_count,
+        int leading_committed_output_count)
+    {
+        if (output_count <= 0 ||
+            leading_committed_output_count < 0 ||
+            leading_committed_output_count > 1 ||
+            leading_committed_output_count > output_count)
+        {
+            return -1;
+        }
+        return output_count - leading_committed_output_count;
+    }
 
     LLAMINAR_SAMPLING_HD uint64_t splitmix64(uint64_t x)
     {
@@ -767,6 +799,128 @@ namespace llaminar2::sampling_math
     }
 
     /**
+     * @brief Reduce verifier rows without crossing a device-owned commit boundary.
+     *
+     * Dynamic MoE placement may change only between serial-visible decode
+     * transactions. A grouped verifier can otherwise accept several rows and
+     * carry execution past the exact token at which serial decode would run a
+     * maintenance wave. This helper shortens the semantic transaction while
+     * preserving the already-computed target samples and their logical
+     * positions.
+     *
+     * If @p max_state_commit_rows is smaller than `row_count + 1`, at most
+     * `max_state_commit_rows - 1` speculative rows are compared. The target
+     * sample in the following verifier row becomes the ready condition token.
+     * For example, a one-row commit budget emits only `first_token` and keeps
+     * `row_tokens[0]` as the next condition. No row is resampled and no host
+     * scalar participates in the decision.
+     *
+     * Rejection and stop-token semantics remain unchanged when either occurs
+     * before the boundary. The ordinary terminal bonus is used only when the
+     * complete declared verifier transaction fits inside the commit budget.
+     *
+     * @param max_state_commit_rows Positive number of verifier input states
+     *        that may become visible before the next device maintenance edge.
+     */
+    LLAMINAR_SAMPLING_HD void
+    summarize_speculative_verify_batch_at_commit_boundary(
+        int first_token,
+        const int *row_tokens,
+        const int *row_accepted,
+        int row_count,
+        const int *stop_tokens,
+        int stop_token_count,
+        int bonus_ready_token,
+        int has_bonus_ready_token,
+        int max_state_commit_rows,
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta,
+        const int *greedy_draft_tokens = nullptr,
+        int leading_committed_output_count = 0)
+    {
+        if (max_state_commit_rows <= 0 ||
+            leading_committed_output_count < 0 ||
+            leading_committed_output_count > 1)
+        {
+            if (out_tokens && out_token_capacity > 0)
+            {
+                for (int i = 0; i < out_token_capacity; ++i)
+                    out_tokens[i] = -1;
+            }
+            if (out_meta)
+            {
+                for (int i = 0; i < kSpeculativeBatchMetaCount; ++i)
+                    out_meta[i] = 0;
+            }
+            return;
+        }
+
+        const int full_commit_rows = row_count + 1;
+        const int physical_commit_budget =
+            max_state_commit_rows >=
+                    full_commit_rows - leading_committed_output_count
+                ? full_commit_rows
+                : max_state_commit_rows + leading_committed_output_count;
+        const int effective_commit_rows =
+            physical_commit_budget < full_commit_rows
+                ? physical_commit_budget
+                : full_commit_rows;
+        const int effective_row_count = effective_commit_rows - 1;
+        const bool stopped_at_commit_boundary =
+            effective_row_count < row_count;
+        const int effective_bonus_ready_token =
+            stopped_at_commit_boundary && row_tokens
+                ? row_tokens[effective_row_count]
+                : bonus_ready_token;
+        const int has_effective_bonus_ready_token =
+            stopped_at_commit_boundary
+                ? (row_tokens && effective_bonus_ready_token >= 0 ? 1 : 0)
+                : has_bonus_ready_token;
+
+        summarize_speculative_verify_batch(
+            first_token,
+            row_tokens,
+            row_accepted,
+            effective_row_count,
+            stop_tokens,
+            stop_token_count,
+            effective_bonus_ready_token,
+            has_effective_bonus_ready_token,
+            out_tokens,
+            out_token_capacity,
+            out_meta,
+            greedy_draft_tokens);
+
+        if (out_meta && out_meta[kSpecBatchMetaOk] != 0)
+        {
+            out_meta[kSpecBatchMetaLeadingCommittedOutputCount] =
+                leading_committed_output_count;
+        }
+
+        /*
+         * A maintenance boundary is a third successful outcome category.  It
+         * is neither a rejection nor acceptance of the complete physical
+         * verifier batch.  The ordinary reducer above intentionally evaluates
+         * only the serial-visible prefix so it can reuse the exact stop and
+         * rejection semantics.  If that entire prefix accepted, reinterpret
+         * its synthetic "bonus" as the already-sampled condition token at the
+         * maintenance edge and make the distinction explicit in the ABI.
+         */
+        if (stopped_at_commit_boundary &&
+            out_meta &&
+            out_meta[kSpecBatchMetaOk] != 0 &&
+            out_meta[kSpecBatchMetaStoppedOnOutput] == 0 &&
+            out_meta[kSpecBatchMetaAllSpeculativeAccepted] != 0 &&
+            out_meta[kSpecBatchMetaSampledTerminal] != 0)
+        {
+            out_meta[kSpecBatchMetaAllSpeculativeAccepted] = 0;
+            out_meta[kSpecBatchMetaSampledTerminal] = 0;
+            out_meta[kSpecBatchMetaCommitBoundaryClipped] = 1;
+        }
+    }
+
+    /**
      * @brief Derive live-state publication rows from compact verifier metadata.
      *
      * The compact stochastic verifier summary intentionally has two different
@@ -863,6 +1017,8 @@ namespace llaminar2::sampling_math
                 request_meta[kSpecBatchMetaReadyToken];
             const bool sampled_terminal =
                 request_meta[kSpecBatchMetaSampledTerminal] != 0;
+            const bool commit_boundary_clipped =
+                request_meta[kSpecBatchMetaCommitBoundaryClipped] != 0;
             const int output_count =
                 request_meta[kSpecBatchMetaOutputCount];
             const bool publication_clipped =
@@ -882,7 +1038,8 @@ namespace llaminar2::sampling_math
                                       static_cast<size_t>(output_token_stride) +
                                   static_cast<size_t>(accepted_state_count)];
             }
-            else if (sampled_terminal && ready_token >= 0)
+            else if ((sampled_terminal || commit_boundary_clipped) &&
+                     ready_token >= 0)
             {
                 *out_next_condition_token = ready_token;
             }
@@ -1154,6 +1311,52 @@ namespace llaminar2::sampling_math
             out_token_capacity,
             out_meta,
             draft_tokens);
+    }
+
+    /**
+     * @brief Greedy companion to the device-owned commit-boundary reducer.
+     *
+     * `verifier_tokens[compare_row_count]` remains the ordinary bonus sample.
+     * When the maintenance boundary is earlier, the shared boundary reducer
+     * instead promotes `verifier_tokens[max_state_commit_rows - 1]` to the
+     * ready condition token without changing its value or logical position.
+     */
+    LLAMINAR_SAMPLING_HD void
+    summarize_greedy_speculative_verify_batch_at_commit_boundary(
+        int first_token,
+        const int *verifier_tokens,
+        const int *draft_tokens,
+        int compare_row_count,
+        const int *stop_tokens,
+        int stop_token_count,
+        int max_state_commit_rows,
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta,
+        int leading_committed_output_count = 0)
+    {
+        if (!verifier_tokens || !draft_tokens || compare_row_count < 0)
+        {
+            if (out_meta)
+                out_meta[kSpecBatchMetaOk] = 0;
+            return;
+        }
+
+        summarize_speculative_verify_batch_at_commit_boundary(
+            first_token,
+            verifier_tokens,
+            /*row_accepted=*/nullptr,
+            compare_row_count,
+            stop_tokens,
+            stop_token_count,
+            verifier_tokens[compare_row_count],
+            /*has_bonus_ready_token=*/1,
+            max_state_commit_rows,
+            out_tokens,
+            out_token_capacity,
+            out_meta,
+            draft_tokens,
+            leading_committed_output_count);
     }
 
 } // namespace llaminar2::sampling_math

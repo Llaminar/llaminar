@@ -466,6 +466,8 @@ namespace llaminar2
 
             void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu);
             void rocmGemv_native_vnni_set_decode_equivalent_m1_config(int enabled);
+            void rocmGemv_native_vnni_set_serial_partition_n(int n);
+            int rocmGemv_native_vnni_get_serial_partition_n();
             bool rocmGemv_native_vnni_query_serial_m1_config(
                 uint8_t codebook_id,
                 int N,
@@ -1146,7 +1148,7 @@ namespace llaminar2
             impl_->owns_weight_memory = true;        // Legacy constructor owns weight memory
             impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
 
-            LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (legacy) for " << N_ << "x" << K_
+            LOG_TRACE("[ROCmQuantisedGemmKernel] Created (legacy) for " << N_ << "x" << K_
                                                                         << " quantized weights (type=" << static_cast<int>(wt)
                                                                         << ") on ROCm device " << rocm_device_id_);
         }
@@ -1173,7 +1175,7 @@ namespace llaminar2
             impl_->owns_weight_memory = false;       // Pre-packed path doesn't own weight memory
             impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
 
-            LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
+            LOG_TRACE("[ROCmQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
                                                                             << " INT8 weights on ROCm device " << rocm_device_id_);
         }
 
@@ -1204,7 +1206,7 @@ namespace llaminar2
             impl_->owns_weight_memory = false;
             impl_->rocm_device_id = rocm_device_id;
 
-            LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (MoE batch device ptrs) for " << N_ << "x" << K_
+            LOG_TRACE("[ROCmQuantisedGemmKernel] Created (MoE batch device ptrs) for " << N_ << "x" << K_
                                                                                        << " on ROCm device " << rocm_device_id_);
         }
 
@@ -1247,10 +1249,55 @@ namespace llaminar2
             bool previous_ = false;
         };
 
+        /**
+         * @brief Bind generated NativeVNNI geometry to the serial TP shard width.
+         */
+        class ScopedNativeVNNISerialPartition final
+            : public ITensorGemm::OutputPartitionEquivalenceScope
+        {
+        public:
+            explicit ScopedNativeVNNISerialPartition(int serial_partition_n)
+                : previous_(rocmGemv_native_vnni_get_serial_partition_n())
+            {
+                rocmGemv_native_vnni_set_serial_partition_n(serial_partition_n);
+            }
+
+            ~ScopedNativeVNNISerialPartition() override
+            {
+                rocmGemv_native_vnni_set_serial_partition_n(previous_);
+            }
+
+            ScopedNativeVNNISerialPartition(
+                const ScopedNativeVNNISerialPartition &) = delete;
+            ScopedNativeVNNISerialPartition &operator=(
+                const ScopedNativeVNNISerialPartition &) = delete;
+
+        private:
+            int previous_ = 0;
+        };
+
         std::unique_ptr<ITensorGemm::VerifierKernelModeScope>
         ROCmQuantisedGemmKernel::beginVerifierDecodeEquivalentScope()
         {
             return std::make_unique<ScopedNativeVNNIDecodeEquivalentDispatch>();
+        }
+
+        std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
+        ROCmQuantisedGemmKernel::beginOutputPartitionEquivalenceScope(
+            int actual_output_columns,
+            int serial_partition_columns)
+        {
+            if (actual_output_columns <= 0 ||
+                serial_partition_columns <= 0 ||
+                actual_output_columns != static_cast<int>(N_) ||
+                serial_partition_columns > actual_output_columns ||
+                (actual_output_columns % serial_partition_columns) != 0)
+            {
+                throw std::invalid_argument(
+                    "[ROCmQuantisedGemmKernel] Invalid replicated-output serial partition contract");
+            }
+            return std::make_unique<ScopedNativeVNNISerialPartition>(
+                serial_partition_columns);
         }
 
         bool ROCmQuantisedGemmKernel::weights_converted() const
@@ -2303,7 +2350,7 @@ namespace llaminar2
             if (activation_row_offset > 0 && d_input != nullptr)
             {
                 d_input += static_cast<size_t>(activation_row_offset) * k;
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Applied activation_row_offset="
+                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Applied activation_row_offset="
                           << activation_row_offset << " (offset " << (static_cast<size_t>(activation_row_offset) * k) << " floats)");
             }
 
@@ -2321,7 +2368,7 @@ namespace llaminar2
             std::chrono::high_resolution_clock::time_point phase_end{};
 
             {
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using GPU-to-GPU path (d_input="
+                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Using GPU-to-GPU path (d_input="
                           << d_input << ", d_output=" << d_output << ")");
 
                 if (!validatePointerDeviceOrLog(
@@ -2417,7 +2464,7 @@ namespace llaminar2
                 const bool gemv_output_is_mapped = C_fp32->isMapped();
                 const bool gemv_output_needs_copyout = gemv_output_is_mapped || beta != 0.0f;
 
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M GEMV verifier path M="
+                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M GEMV verifier path M="
                           << m << " N=" << n << " K=" << k
                           << (d_bias ? " +bias" : ""));
 
@@ -2674,7 +2721,7 @@ namespace llaminar2
                         d_bias = static_cast<const float *>(bias->gpu_data_ptr());
                     }
 
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] GEMV fast path M=1 N=" << n << " K=" << k
+                    LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] GEMV fast path M=1 N=" << n << " K=" << k
                                                                                                  << (d_bias ? " +bias" : ""));
 
                     // INT8 VNNI GEMV (only path — fp16/fp32 modes removed)
@@ -3034,7 +3081,7 @@ namespace llaminar2
                                 cb_id,
                                 rocm_device_id_, gpu_stream_))
                         {
-                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] "
+                            LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] "
                                       "Native-VNNI GEMM succeeded (M="
                                       << m << " N=" << n << " K=" << k
                                       << " codebook=" << static_cast<int>(cb_id)
@@ -3226,7 +3273,7 @@ namespace llaminar2
                     gpu_stream_);
                 d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
                 // NOTE: Don't log fp32_input->data() here - it triggers D2H transfer!
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input);
+                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input);
             }
             else
             {
@@ -3279,7 +3326,7 @@ namespace llaminar2
             }
             bool fused_uses_blockwise_shared_quant = false;
             {
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
+                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
 
                 const bool needs_block_sums =
                     g_rocm_native_vnni_decode_equivalent_scope &&
@@ -3498,7 +3545,7 @@ namespace llaminar2
                         }
 
                         // Dispatch with stream + scratch overrides
-                        LOG_DEBUG("[ConcurrentPrefill] Projection " << pi
+                        LOG_TRACE("[ConcurrentPrefill] Projection " << pi
                                                                     << " (" << (proj.name ? proj.name : "?")
                                                                     << ") M=" << m << " N=" << n << " K=" << k
                                                                     << " on stream " << stream_idx);
@@ -3538,7 +3585,7 @@ namespace llaminar2
                             pool.completion[si], 0);
                     }
 
-                    LOG_DEBUG("[ConcurrentPrefill] All " << num_proj
+                    LOG_TRACE("[ConcurrentPrefill] All " << num_proj
                                                          << " projections dispatched concurrently");
 
                     // Restore workspace and return success
@@ -3763,7 +3810,7 @@ namespace llaminar2
                             pool.completion[si], 0);
                     }
 
-                    LOG_DEBUG("[ConcurrentDecode] All " << num_proj
+                    LOG_TRACE("[ConcurrentDecode] All " << num_proj
                                                         << " projections dispatched concurrently");
 
                     if (ws && ws != saved_workspace)
@@ -3912,7 +3959,7 @@ namespace llaminar2
                     Ns[i] = proj.n;
                     codebooks[i] = codebook;
 
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M batched projection "
+                    LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M batched projection "
                               << i
                               << " name=" << (proj.name ? proj.name : "?")
                               << " kernel=" << static_cast<const void *>(rocm_kernel)
@@ -3991,7 +4038,7 @@ namespace llaminar2
                             }
                         }
 
-                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M batched projection "
+                        LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M batched projection "
                                   << i
                                   << " partial=" << static_cast<const void *>(partials[i])
                                   << " arena=" << GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED
@@ -4238,7 +4285,7 @@ namespace llaminar2
                         }
                     }
 
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Batched native small-M verifier complete"
+                    LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Batched native small-M verifier complete"
                               << " M=" << m << " K=" << k
                               << " projections=" << projections.size());
                     publish_projection_outputs();
@@ -4283,7 +4330,7 @@ namespace llaminar2
                 }
 
                 const int n = proj.n;
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                          << " (" << (proj.name ? proj.name : "unnamed") << "): m=" << m << " n=" << n << " k=" << k);
 
                 // Weights already converted in Step 3 (ensureWeightsConverted loop).
@@ -4354,7 +4401,7 @@ namespace llaminar2
                     DeviceId target_device = DeviceId::rocm(rocm_device_id_);
                     auto current_dev = bias_tensor->current_device();
 
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Proj " << i
+                    LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Proj " << i
                                                                                        << " bias tensor=" << bias_tensor
                                                                                        << " current_dev=" << (current_dev.has_value() ? current_dev->to_string() : "(none)")
                                                                                        << " target_device=" << target_device.to_string()
@@ -4381,7 +4428,7 @@ namespace llaminar2
                         all_success = false;
                         break;
                     }
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                    LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                              << " using bias ptr=" << static_cast<const void *>(d_bias));
                 }
 
@@ -4422,7 +4469,7 @@ namespace llaminar2
                         float *d_native_output = output_needs_copyout ? impl_->d_C_fp32 : d_output;
 
                         // Activations are always pre-quantized above (Step 3)
-                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                        LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                                  << " NATIVE-VNNI GEMV M=1 N=" << n << " K=" << k
                                                                                                  << (d_bias ? " +bias" : ""));
 
@@ -4474,7 +4521,7 @@ namespace llaminar2
                             }
                         }
 
-                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " native-VNNI GEMV complete");
+                        LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " native-VNNI GEMV complete");
                         continue;
                     }
 
@@ -4483,7 +4530,7 @@ namespace llaminar2
                     // (1 batched scatter + 1 batched reduce) instead of 2N individual launches.
                     if (d_vnni && batch_count < 8)
                     {
-                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                        LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                                  << " (" << (proj.name ? proj.name : "unnamed")
                                                                                                  << ") BATCHED SCATTER collect: N=" << n << " K=" << k
                                                                                                  << (d_bias ? " +bias" : ""));
@@ -4499,7 +4546,7 @@ namespace llaminar2
                     // Fallback: single-projection INT8 scatter (batch overflow or no VNNI)
                     if (d_vnni)
                     {
-                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                        LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                                  << " SINGLE INT8 SCATTER M=1 N=" << n << " K=" << k);
                         bool projection_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                             impl_->d_A_int8, d_vnni, d_output,
@@ -4534,7 +4581,7 @@ namespace llaminar2
                         break;
                     }
 
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " GEMV complete");
+                    LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " GEMV complete");
                     continue; // Skip CK path below
                 }
 
@@ -4647,7 +4694,7 @@ namespace llaminar2
 
                     }
 
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                    LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                              << " fused native small-M verifier complete");
                     continue;
                 }
@@ -4682,7 +4729,7 @@ namespace llaminar2
                         }
                     }
 
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                    LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                              << " native prefill complete");
                     continue;
                 }
@@ -4705,7 +4752,7 @@ namespace llaminar2
             // =========================================================================
             if (batch_count > 0 && all_success)
             {
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Dispatching BATCHED INT8 SCATTER: "
+                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Dispatching BATCHED INT8 SCATTER: "
                           << batch_count << " projections, K=" << k);
 
                 bool batched_ok = false;
@@ -4765,7 +4812,7 @@ namespace llaminar2
                 }
                 else
                 {
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Batched INT8 scatter complete: "
+                    LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Batched INT8 scatter complete: "
                               << batch_count << " projections in 2 kernel launches");
                 }
             }
@@ -4925,7 +4972,7 @@ namespace llaminar2
                 256,
                 true});
 
-            LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
+            LOG_TRACE("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
                       << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
                       << "scales_a=" << (scales_a_bytes) << "B, "
                       << "scales_a_blockwise=" << (scales_a_blockwise_bytes) << "B"
@@ -4945,12 +4992,12 @@ namespace llaminar2
             }
             if (workspace)
             {
-                LOG_DEBUG("[ROCmQuantisedGemmKernel] Bound workspace manager at " << (void *)workspace
+                LOG_TRACE("[ROCmQuantisedGemmKernel] Bound workspace manager at " << (void *)workspace
                                                                                   << ", entering managed mode");
             }
             else
             {
-                LOG_DEBUG("[ROCmQuantisedGemmKernel] Unbound workspace, returning to legacy mode");
+                LOG_TRACE("[ROCmQuantisedGemmKernel] Unbound workspace, returning to legacy mode");
             }
         }
 
@@ -6031,7 +6078,7 @@ namespace llaminar2
         {
             (void)requireGPUStream();
 
-            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] m=" << m << " n=" << n << " k=" << k
+            LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] m=" << m << " n=" << n << " k=" << k
                                                                                       << " alpha=" << alpha << " beta=" << beta
                                                                                       << " d_A=" << static_cast<const void *>(d_A)
                                                                                       << " d_C=" << static_cast<void *>(d_C)
@@ -6046,7 +6093,7 @@ namespace llaminar2
                 float *d_s = packed_ ? packed_->d_scales : (impl_ ? impl_->d_scales_B : nullptr);
                 if ((impl_ && impl_->has_native_vnni) || (d_vnni && d_s))
                 {
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] GEMV fast path M=1 +bias");
+                    LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] GEMV fast path M=1 +bias");
 
                     if (!impl_)
                     {
@@ -6240,7 +6287,7 @@ namespace llaminar2
                         cb_id,
                         rocm_device_id_, gpu_stream_))
                 {
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "
+                    LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "
                               "Native-VNNI GEMM succeeded (M="
                               << m << " N=" << n << " K=" << k
                               << " codebook=" << static_cast<int>(cb_id) << " +bias)");

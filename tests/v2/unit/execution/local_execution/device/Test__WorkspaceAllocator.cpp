@@ -274,6 +274,109 @@ namespace
         mutable bool saw_decode_m_ = false;
     };
 
+    /**
+     * @brief Minimal graph stage with caller-defined workspace descriptors.
+     *
+     * The graph-family regressions need two distinct topologies that share one
+     * workspace name at different capacities while also owning graph-local
+     * names.  Keeping this stage declarative makes the test exercise the real
+     * ComputeGraph scan and IWorkspaceConsumer binding path instead of reaching
+     * into allocator internals.
+     */
+    class GraphFamilyWorkspaceStage final
+        : public IComputeStage,
+          public IWorkspaceConsumer
+    {
+    public:
+        GraphFamilyWorkspaceStage(
+            DeviceId device,
+            std::vector<size_t> shape,
+            std::vector<WorkspaceDescriptor> descriptors)
+            : IComputeStage(device),
+              shape_(std::move(shape)),
+              descriptors_(std::move(descriptors))
+        {
+        }
+
+        bool execute(IDeviceContext *) override { return true; }
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::GEMM;
+        }
+        bool supportsBackend(ComputeBackendType) const override
+        {
+            return true;
+        }
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+        StageBufferRequirements getBufferRequirements() const override
+        {
+            StageBufferRequirements requirements;
+            requirements.addInput(
+                "input",
+                shape_,
+                BufferTensorType::FP32);
+            requirements.addOutput(
+                "output",
+                shape_,
+                BufferTensorType::FP32);
+            return requirements;
+        }
+
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m,
+            int n = 0,
+            int k = 0) const override
+        {
+            last_m_ = m;
+            last_n_ = n;
+            last_k_ = k;
+            WorkspaceRequirements requirements;
+            requirements.buffers = descriptors_;
+            return requirements;
+        }
+
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override
+        {
+            bound_workspace_ = workspace;
+            ++bind_calls_;
+        }
+
+        void unbindWorkspace() override
+        {
+            bound_workspace_ = nullptr;
+        }
+
+        bool hasWorkspace() const override
+        {
+            return bound_workspace_ != nullptr;
+        }
+
+        DeviceWorkspaceManager *getWorkspace() const override
+        {
+            return bound_workspace_;
+        }
+
+        DeviceWorkspaceManager *boundWorkspace() const
+        {
+            return bound_workspace_;
+        }
+
+        int bindCalls() const { return bind_calls_; }
+        int lastM() const { return last_m_; }
+        int lastN() const { return last_n_; }
+        int lastK() const { return last_k_; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<WorkspaceDescriptor> descriptors_;
+        DeviceWorkspaceManager *bound_workspace_ = nullptr;
+        int bind_calls_ = 0;
+        mutable int last_m_ = 0;
+        mutable int last_n_ = 0;
+        mutable int last_k_ = 0;
+    };
+
     WorkspaceConsumerRequest requestFor(MockWorkspaceConsumer &consumer, DeviceId device)
     {
         WorkspaceConsumerRequest request;
@@ -285,6 +388,31 @@ namespace
         return request;
     }
 } // namespace
+
+/**
+ * @brief Terminal projection sizing is total across sharded and replicated participants.
+ *
+ * The regression is deliberately device-free. It proves the policy used by
+ * phase-split LocalTP workspace planning without allocating GPU memory in the
+ * unit gate: a full-vocabulary family envelope dominates an earlier sharded
+ * participant, while an independently wider participant is never truncated.
+ */
+TEST(Test__WorkspaceAllocator, TerminalProjectionEnvelopeCoversEverySerialParticipant)
+{
+    WorkspaceSizingHints hints;
+
+    EXPECT_EQ(hints.resolveTerminalProjectionColumns(0), 0)
+        << "No family envelope preserves the prepared kernel's own N";
+    EXPECT_EQ(hints.resolveTerminalProjectionColumns(124160), 124160);
+
+    hints.serial_family_max_terminal_projection_columns = 248320;
+    EXPECT_EQ(hints.resolveTerminalProjectionColumns(0), 248320);
+    EXPECT_EQ(hints.resolveTerminalProjectionColumns(124160), 248320)
+        << "A sharded prefill head must reserve the later replicated width";
+    EXPECT_EQ(hints.resolveTerminalProjectionColumns(248320), 248320);
+    EXPECT_EQ(hints.resolveTerminalProjectionColumns(496640), 496640)
+        << "The family envelope must never truncate a wider participant";
+}
 
 TEST(Test__WorkspaceAllocator, ExtendsExistingWorkspaceWithoutInvalidatingCapturedAddresses)
 {
@@ -587,7 +715,7 @@ TEST(Test__WorkspaceAllocator, SerialGraphRolesAliasPrimaryBlockWithoutPhysicalG
     }
 
     WorkspaceAllocator allocator;
-    ComputeGraph graph;
+    ComputeGraph main_graph;
     auto hints = tinyHints();
     hints.graph_family_policy =
         WorkspaceGraphFamilyPolicy::SerialDeviceFamilyExactParticipant;
@@ -595,14 +723,53 @@ TEST(Test__WorkspaceAllocator, SerialGraphRolesAliasPrimaryBlockWithoutPhysicalG
 
     constexpr size_t kHalfMiB = 512 * 1024;
     constexpr size_t kQuarterMiB = 256 * 1024;
-    MockWorkspaceConsumer main_graph({
-        {"main_projection_scratch", kHalfMiB, 256, true},
-        {"main_attention_scratch", kHalfMiB, 256, true},
-    });
-    ASSERT_TRUE(allocator.allocateForGraph(
-        graph,
+    auto main_stage = std::make_unique<GraphFamilyWorkspaceStage>(
+        *device,
+        std::vector<size_t>{1, 128},
+        std::vector<WorkspaceDescriptor>{
+            {"main_projection_scratch", kHalfMiB, 256, true},
+            {"main_attention_scratch", kHalfMiB, 256, true},
+        });
+    main_graph.addNode(
+        "main_decode",
+        std::move(main_stage),
+        *device);
+
+    ComputeGraph verifier_graph;
+    auto verifier_stage =
+        std::make_unique<GraphFamilyWorkspaceStage>(
+            *device,
+            std::vector<size_t>{16, 128},
+            std::vector<WorkspaceDescriptor>{
+                {"verifier_layer0_state_slots",
+                 kQuarterMiB,
+                 256,
+                 true},
+                {"verifier_layer1_state_slots",
+                 kQuarterMiB,
+                 256,
+                 true},
+                {"verifier_layer2_state_slots",
+                 kQuarterMiB,
+                 256,
+                 true},
+            });
+    auto *verifier_stage_ptr = verifier_stage.get();
+    verifier_graph.addNode(
+        "grouped_verifier",
+        std::move(verifier_stage),
+        *device);
+
+    ASSERT_TRUE(allocator.allocateForGraphFamily(
+        main_graph,
+        WorkspaceGraphParticipantRole::Decode,
+        {WorkspaceGraphParticipant{
+            .graph = &verifier_graph,
+            .role =
+                WorkspaceGraphParticipantRole::GroupedVerifier,
+        }},
         hints,
-        {requestFor(main_graph, *device)},
+        {},
         config));
 
     DeviceWorkspaceManager *workspace =
@@ -612,20 +779,9 @@ TEST(Test__WorkspaceAllocator, SerialGraphRolesAliasPrimaryBlockWithoutPhysicalG
     const uint64_t generation = allocator.deviceGeneration(*device);
     ASSERT_GE(workspace->primaryBlockSize(), 2 * kHalfMiB);
 
-    MockWorkspaceConsumer grouped_verifier({
-        {"verifier_layer0_state_slots", kQuarterMiB, 256, true},
-        {"verifier_layer1_state_slots", kQuarterMiB, 256, true},
-        {"verifier_layer2_state_slots", kQuarterMiB, 256, true},
-    });
-    ASSERT_TRUE(allocator.allocateForGraph(
-        graph,
-        hints,
-        {requestFor(grouped_verifier, *device)},
-        config));
-
     EXPECT_EQ(workspace->used(), physical_bytes);
     EXPECT_EQ(allocator.deviceGeneration(*device), generation);
-    EXPECT_EQ(grouped_verifier.boundWorkspace(), workspace);
+    EXPECT_EQ(verifier_stage_ptr->boundWorkspace(), workspace);
 
     std::vector<std::uintptr_t> verifier_addresses;
     for (const char *name : {
@@ -645,12 +801,13 @@ TEST(Test__WorkspaceAllocator, SerialGraphRolesAliasPrimaryBlockWithoutPhysicalG
         verifier_addresses[2] - verifier_addresses[1],
         kQuarterMiB);
 
-    const auto main_begin = reinterpret_cast<std::uintptr_t>(
+    const auto main_projection = reinterpret_cast<std::uintptr_t>(
         workspace->getBuffer("main_projection_scratch"));
+    const auto main_attention = reinterpret_cast<std::uintptr_t>(
+        workspace->getBuffer("main_attention_scratch"));
+    const auto main_begin = std::min(main_projection, main_attention);
     const auto main_end =
-        reinterpret_cast<std::uintptr_t>(
-            workspace->getBuffer("main_attention_scratch")) +
-        kHalfMiB;
+        std::max(main_projection, main_attention) + kHalfMiB;
     EXPECT_TRUE(std::any_of(
         verifier_addresses.begin(),
         verifier_addresses.end(),
@@ -722,6 +879,64 @@ TEST(Test__WorkspaceAllocator, SerialGraphFamilyRejectsLateGrowthOfPublishedName
         workspace->getBufferSize("shared_projection_scratch"),
         256 * 1024);
     EXPECT_EQ(underplanned_later_graph.boundWorkspace(), nullptr);
+}
+
+/**
+ * @brief A serial family rejects a graph topology omitted from generation one.
+ *
+ * Dynamic MoE maintenance used to introduce its local histogram name only when
+ * the first scheduler window closed. The allocator silently fit that new name
+ * into unused primary bytes, leaving preflight incomplete and making captured
+ * pointer ownership depend on request history. Every serial participant must
+ * now be declared together; discovering even a small new name later is fatal.
+ */
+TEST(Test__WorkspaceAllocator, SerialGraphFamilyRejectsLateUndeclaredName)
+{
+    const auto device = selectAvailableGpuWithMemory();
+    if (!device.has_value())
+    {
+        GTEST_SKIP() << "No GPU with enough free memory for workspace allocation";
+    }
+
+    WorkspaceAllocator allocator;
+    ComputeGraph graph;
+    auto hints = tinyHints();
+    hints.graph_family_policy =
+        WorkspaceGraphFamilyPolicy::
+            SerialDeviceFamilyExactParticipant;
+    const auto config = unitBudgetConfig();
+
+    MockWorkspaceConsumer declared_graph({
+        {"declared_decode_scratch", 256 * 1024, 256, true},
+    });
+    ASSERT_TRUE(allocator.allocateForGraph(
+        graph,
+        hints,
+        {requestFor(declared_graph, *device)},
+        config));
+
+    DeviceWorkspaceManager *workspace =
+        allocator.getDeviceWorkspace(*device);
+    ASSERT_NE(workspace, nullptr);
+    const size_t physical_bytes = workspace->used();
+    const uint64_t generation =
+        allocator.deviceGeneration(*device);
+
+    MockWorkspaceConsumer omitted_maintenance({
+        {"moe_rebalance_local_histogram_test", 8 * 1024, 256, true},
+    });
+    EXPECT_FALSE(allocator.allocateForGraph(
+        graph,
+        hints,
+        {requestFor(omitted_maintenance, *device)},
+        config));
+
+    EXPECT_EQ(workspace->used(), physical_bytes);
+    EXPECT_EQ(allocator.deviceGeneration(*device), generation);
+    EXPECT_FALSE(
+        workspace->hasBuffer(
+            "moe_rebalance_local_histogram_test"));
+    EXPECT_EQ(omitted_maintenance.boundWorkspace(), nullptr);
 }
 
 /**
@@ -1012,6 +1227,599 @@ TEST(Test__WorkspaceAllocator, SharedSerialNameUsesMaximumCapacityAcrossParticip
         << "The first captured address must satisfy the largest participant "
            "that shares this workspace name.";
     EXPECT_EQ(workspace->primaryBlockSize(), size_t{48} * 1024);
+}
+
+/**
+ * @brief Distinct graph topologies are planned together before first capture.
+ *
+ * This reproduces the production MTP failure at allocator scale.  The main
+ * graph first advertised a smaller shared GEMM bank; a later sidecar needed a
+ * larger capacity and introduced sidecar-only control workspace.  A complete
+ * family declaration must publish both names at generation one, retain the
+ * sidecar's exact M/K geometry, and alias mutually exclusive graph-local
+ * storage instead of summing every graph.
+ */
+TEST(Test__WorkspaceAllocator, CompleteSerialGraphFamilyPublishesSidecarTopologyAtGenerationOne)
+{
+    auto device = selectAvailableGpuWithMemory();
+    if (!device)
+    {
+        GTEST_SKIP() << "No CUDA/ROCm GPU with enough free memory for WorkspaceAllocator unit test";
+    }
+
+    constexpr size_t kPrimaryOnlyBytes = 128 * 1024;
+    constexpr size_t kSidecarOnlyBytes = 192 * 1024;
+    constexpr size_t kPrimarySharedBytes = 256 * 1024;
+    constexpr size_t kSidecarSharedBytes = 512 * 1024;
+
+    ComputeGraph primary_graph;
+    auto primary_stage = std::make_unique<GraphFamilyWorkspaceStage>(
+        *device,
+        std::vector<size_t>{4096, 2048},
+        std::vector<WorkspaceDescriptor>{
+            {"shared_gemm_bank", kPrimarySharedBytes, 256, true},
+            {"primary_only_bank", kPrimaryOnlyBytes, 256, true},
+        });
+    auto *primary_stage_ptr = primary_stage.get();
+    primary_graph.addNode(
+        "primary_projection",
+        std::move(primary_stage),
+        *device);
+
+    ComputeGraph sidecar_graph;
+    auto sidecar_stage = std::make_unique<GraphFamilyWorkspaceStage>(
+        *device,
+        std::vector<size_t>{5, 4096},
+        std::vector<WorkspaceDescriptor>{
+            {"shared_gemm_bank", kSidecarSharedBytes, 256, true},
+            {"sidecar_only_bank", kSidecarOnlyBytes, 256, true},
+        });
+    auto *sidecar_stage_ptr = sidecar_stage.get();
+    sidecar_graph.addNode(
+        "mtp_sidecar_projection",
+        std::move(sidecar_stage),
+        *device);
+
+    WorkspaceAllocator allocator;
+    auto hints = tinyHints();
+    hints.max_seq_len = 4096;
+    hints.serial_family_max_rows = 4096;
+    hints.serial_family_max_compact_rows = 16;
+    hints.graph_family_policy =
+        WorkspaceGraphFamilyPolicy::SerialDeviceFamilyLargestParticipant;
+
+    ASSERT_TRUE(allocator.allocateForGraphFamily(
+        primary_graph,
+        WorkspaceGraphParticipantRole::Decode,
+        {WorkspaceGraphParticipant{
+            .graph = &sidecar_graph,
+            .role =
+                WorkspaceGraphParticipantRole::GroupedVerifier,
+        }},
+        hints,
+        {},
+        unitBudgetConfig()));
+
+    DeviceWorkspaceManager *workspace =
+        allocator.getDeviceWorkspace(*device);
+    ASSERT_NE(workspace, nullptr);
+    EXPECT_EQ(allocator.deviceGeneration(*device), 1U);
+    EXPECT_EQ(primary_stage_ptr->boundWorkspace(), workspace);
+    EXPECT_EQ(sidecar_stage_ptr->boundWorkspace(), workspace);
+    EXPECT_EQ(sidecar_stage_ptr->lastM(), 5);
+    EXPECT_EQ(sidecar_stage_ptr->lastK(), 4096);
+    EXPECT_EQ(
+        workspace->getBufferSize("shared_gemm_bank"),
+        kSidecarSharedBytes);
+    EXPECT_TRUE(workspace->hasBuffer("primary_only_bank"));
+    EXPECT_TRUE(workspace->hasBuffer("sidecar_only_bank"));
+
+    /*
+     * The primary graph observes only the first 256 KiB of the shared name, so
+     * its local bank may reuse the canonical shared buffer's otherwise-unused
+     * tail.  The sidecar observes all 512 KiB and therefore places its local
+     * bank after that range.  This directional live-extent rule is why the
+     * complete family still occupies only 512 + 192 KiB.
+     */
+    EXPECT_EQ(
+        workspace->primaryBlockSize(),
+        kSidecarSharedBytes + kSidecarOnlyBytes);
+    const auto shared_begin = reinterpret_cast<std::uintptr_t>(
+        workspace->getBuffer("shared_gemm_bank"));
+    const auto primary_only_begin = reinterpret_cast<std::uintptr_t>(
+        workspace->getBuffer("primary_only_bank"));
+    const auto sidecar_only_begin = reinterpret_cast<std::uintptr_t>(
+        workspace->getBuffer("sidecar_only_bank"));
+    EXPECT_GE(
+        primary_only_begin,
+        shared_begin + kPrimarySharedBytes);
+    EXPECT_GE(
+        sidecar_only_begin,
+        shared_begin + kSidecarSharedBytes);
+}
+
+/**
+ * @brief External workspace remains live beside every serial graph participant.
+ *
+ * KV-cache and resident-metadata consumers are not independent graph roles:
+ * their scratch can be used from prefill, decode, and grouped verification.
+ * This regression prevents the family planner from aliasing an exact graph's
+ * local buffer over a common external buffer merely because the primary graph
+ * happened to be the first participant declared.
+ */
+TEST(Test__WorkspaceAllocator, CommonConsumerDoesNotAliasAnyExactParticipant)
+{
+    const auto device = selectAvailableGpuWithMemory();
+    if (!device.has_value())
+    {
+        GTEST_SKIP() << "No GPU with enough free memory for workspace allocation";
+    }
+
+    constexpr size_t kBufferBytes = 64 * 1024;
+    ComputeGraph primary_graph;
+    primary_graph.addNode(
+        "primary_stage",
+        std::make_unique<GraphFamilyWorkspaceStage>(
+            *device,
+            std::vector<size_t>{1, 64},
+            std::vector<WorkspaceDescriptor>{
+                {"primary_graph_live", kBufferBytes, 256, true},
+            }),
+        *device);
+
+    ComputeGraph exact_prefill_graph;
+    exact_prefill_graph.addNode(
+        "exact_prefill_stage",
+        std::make_unique<GraphFamilyWorkspaceStage>(
+            *device,
+            std::vector<size_t>{64, 64},
+            std::vector<WorkspaceDescriptor>{
+                {"exact_prefill_live", kBufferBytes, 256, true},
+            }),
+        *device);
+
+    MockWorkspaceConsumer common_consumer({
+        {"common_kvcache_live", kBufferBytes, 256, true},
+    });
+    WorkspaceConsumerRequest common_request =
+        requestFor(common_consumer, *device);
+
+    WorkspaceAllocator allocator;
+    auto hints = tinyHints();
+    hints.max_seq_len = 1;
+    hints.serial_family_max_rows = 64;
+    hints.serial_family_max_compact_rows = 16;
+    hints.graph_family_policy =
+        WorkspaceGraphFamilyPolicy::
+            SerialDeviceFamilyLargestParticipant;
+
+    ASSERT_TRUE(allocator.allocateForGraphFamily(
+        primary_graph,
+        WorkspaceGraphParticipantRole::Decode,
+        {WorkspaceGraphParticipant{
+            .graph = &exact_prefill_graph,
+            .role = WorkspaceGraphParticipantRole::Prefill,
+        }},
+        hints,
+        {common_request},
+        unitBudgetConfig()));
+
+    DeviceWorkspaceManager *workspace =
+        allocator.getDeviceWorkspace(*device);
+    ASSERT_NE(workspace, nullptr);
+    ASSERT_EQ(common_consumer.boundWorkspace(), workspace);
+
+    const auto common_begin = reinterpret_cast<std::uintptr_t>(
+        workspace->getBuffer("common_kvcache_live"));
+    const auto common_end = common_begin + kBufferBytes;
+    for (const char *graph_buffer :
+         {"primary_graph_live", "exact_prefill_live"})
+    {
+        const auto graph_begin = reinterpret_cast<std::uintptr_t>(
+            workspace->getBuffer(graph_buffer));
+        const auto graph_end = graph_begin + kBufferBytes;
+        EXPECT_TRUE(
+            graph_end <= common_begin ||
+            common_end <= graph_begin)
+            << graph_buffer
+            << " must not overlap common external-consumer storage";
+    }
+}
+
+/**
+ * @brief Exact attention participants use semantic head geometry.
+ *
+ * Attention consumes a `[rows, d_model]` activation, while split-decode
+ * workspace is indexed by request, head, split, and head dimension. This
+ * regression prevents exact graph-family scans from interpreting the
+ * activation's `d_model` width as `head_dim`, which previously reported a
+ * spurious four-times-larger capacity only when the real decode graph arrived.
+ */
+TEST(Test__WorkspaceAllocator, ExactAttentionUsesHeadDimensionNotActivationWidth)
+{
+    const auto device = selectAvailableGpuWithMemory();
+    if (!device.has_value())
+    {
+        GTEST_SKIP() << "No GPU with enough free memory for workspace allocation";
+    }
+
+    ComputeGraph primary_graph;
+    primary_graph.addNode(
+        "primary_stage",
+        std::make_unique<GraphFamilyWorkspaceStage>(
+            *device,
+            std::vector<size_t>{1, 4096},
+            std::vector<WorkspaceDescriptor>{
+                {"primary_scratch", 4096, 256, true},
+            }),
+        *device);
+
+    auto exact_attention_stage =
+        std::make_unique<GraphFamilyWorkspaceStage>(
+            *device,
+            std::vector<size_t>{1, 4096},
+            std::vector<WorkspaceDescriptor>{
+                {"attention_scratch", 4096, 256, true},
+            });
+    auto *exact_attention = exact_attention_stage.get();
+
+    ComputeGraph exact_decode_graph;
+    exact_decode_graph.addNode(
+        "layer3_attention",
+        std::move(exact_attention_stage),
+        *device);
+
+    WorkspaceAllocator allocator;
+    auto hints = tinyHints();
+    hints.n_heads = 64;
+    hints.head_dim = 128;
+    hints.d_model = 4096;
+    hints.graph_family_policy =
+        WorkspaceGraphFamilyPolicy::
+            SerialDeviceFamilyLargestParticipant;
+
+    ASSERT_TRUE(allocator.allocateForGraphFamily(
+        primary_graph,
+        WorkspaceGraphParticipantRole::Prefill,
+        {WorkspaceGraphParticipant{
+            .graph = &exact_decode_graph,
+            .role = WorkspaceGraphParticipantRole::Decode,
+        }},
+        hints,
+        {},
+        unitBudgetConfig()));
+
+    EXPECT_EQ(exact_attention->lastM(), 1);
+    EXPECT_EQ(exact_attention->lastN(), 64);
+    EXPECT_EQ(exact_attention->lastK(), 128);
+    EXPECT_NE(exact_attention->lastK(), 4096)
+        << "Activation d_model is not an attention workspace axis";
+}
+
+/**
+ * @brief Device-owned maintenance records survive later graph execution.
+ *
+ * The maintenance graph finishes before the next prefill/decode participant,
+ * but its status and controller records remain live until the request epilogue
+ * copies diagnostics to the host. Treating execution completion as storage
+ * death allowed a later prefill to overwrite those records with arbitrary
+ * activations. This regression proves a persistent participant remains disjoint
+ * from every graph-local layout while those local layouts may still alias.
+ */
+TEST(Test__WorkspaceAllocator, PersistentParticipantDoesNotAliasSerialGraphLocalStorage)
+{
+    const auto device = selectAvailableGpuWithMemory();
+    if (!device.has_value())
+    {
+        GTEST_SKIP() << "No GPU with enough free memory for workspace allocation";
+    }
+
+    constexpr size_t kLocalBytes = 64 * 1024;
+    constexpr size_t kPersistentBytes = 32 * 1024;
+
+    ComputeGraph decode_graph;
+    decode_graph.addNode(
+        "decode_stage",
+        std::make_unique<GraphFamilyWorkspaceStage>(
+            *device,
+            std::vector<size_t>{1, 64},
+            std::vector<WorkspaceDescriptor>{
+                {"decode_graph_local", kLocalBytes, 256, true},
+            }),
+        *device);
+
+    ComputeGraph prefill_graph;
+    prefill_graph.addNode(
+        "prefill_stage",
+        std::make_unique<GraphFamilyWorkspaceStage>(
+            *device,
+            std::vector<size_t>{64, 64},
+            std::vector<WorkspaceDescriptor>{
+                {"prefill_graph_local", kLocalBytes, 256, true},
+            }),
+        *device);
+
+    ComputeGraph maintenance_graph;
+    auto maintenance_stage =
+        std::make_unique<GraphFamilyWorkspaceStage>(
+            *device,
+            std::vector<size_t>{1, 1},
+            std::vector<WorkspaceDescriptor>{
+                {"maintenance_status",
+                 kPersistentBytes,
+                 256,
+                 true},
+                {"maintenance_controller_state",
+                 kPersistentBytes,
+                 256,
+                 true},
+            });
+    auto *maintenance_stage_ptr =
+        maintenance_stage.get();
+    maintenance_graph.addNode(
+        "moe_device_rebalance_maintenance",
+        std::move(maintenance_stage),
+        *device);
+
+    WorkspaceAllocator allocator;
+    auto hints = tinyHints();
+    hints.max_seq_len = 1;
+    hints.serial_family_max_rows = 64;
+    hints.graph_family_policy =
+        WorkspaceGraphFamilyPolicy::
+            SerialDeviceFamilyLargestParticipant;
+
+    ASSERT_TRUE(allocator.allocateForGraphFamily(
+        decode_graph,
+        WorkspaceGraphParticipantRole::Decode,
+        {
+            WorkspaceGraphParticipant{
+                .graph = &prefill_graph,
+                .role =
+                    WorkspaceGraphParticipantRole::Prefill,
+            },
+            WorkspaceGraphParticipant{
+                .graph = &maintenance_graph,
+                .role =
+                    WorkspaceGraphParticipantRole::
+                        MoERebalanceMaintenance,
+                .lifetime =
+                    WorkspaceGraphParticipantLifetime::
+                        PersistentAcrossParticipants,
+            },
+        },
+        hints,
+        {},
+        unitBudgetConfig()));
+
+    DeviceWorkspaceManager *workspace =
+        allocator.getDeviceWorkspace(*device);
+    ASSERT_NE(workspace, nullptr);
+    EXPECT_EQ(
+        maintenance_stage_ptr->boundWorkspace(),
+        workspace);
+
+    const auto interval =
+        [&](const char *name, size_t bytes)
+    {
+        const auto begin =
+            reinterpret_cast<std::uintptr_t>(
+                workspace->getBuffer(name));
+        return std::pair{
+            begin,
+            begin + bytes};
+    };
+    const auto overlaps =
+        [](const auto &lhs, const auto &rhs)
+    {
+        return lhs.first < rhs.second &&
+               rhs.first < lhs.second;
+    };
+
+    const auto decode =
+        interval("decode_graph_local", kLocalBytes);
+    const auto prefill =
+        interval("prefill_graph_local", kLocalBytes);
+    const auto status =
+        interval("maintenance_status", kPersistentBytes);
+    const auto controller =
+        interval(
+            "maintenance_controller_state",
+            kPersistentBytes);
+
+    EXPECT_FALSE(overlaps(status, decode));
+    EXPECT_FALSE(overlaps(status, prefill));
+    EXPECT_FALSE(overlaps(controller, decode));
+    EXPECT_FALSE(overlaps(controller, prefill));
+    EXPECT_FALSE(overlaps(status, controller));
+}
+
+/**
+ * @brief Exact M=16 graphs retain their role instead of inferring it from M.
+ *
+ * An ordinary sixteen-token prompt and a depth-fifteen grouped verifier have
+ * identical row geometry but disjoint workspace regimes. This regression
+ * proves the typed participant role, rather than `M > 1`, controls filtering.
+ */
+TEST(Test__WorkspaceAllocator, ExactParticipantRoleDisambiguatesPrefillFromGroupedM)
+{
+    auto device = selectAvailableGpuWithMemory();
+    if (!device)
+    {
+        GTEST_SKIP() << "No CUDA/ROCm GPU with enough free memory for WorkspaceAllocator unit test";
+    }
+
+    ComputeGraph primary_graph;
+    primary_graph.addNode(
+        "primary",
+        std::make_unique<GraphFamilyWorkspaceStage>(
+            *device,
+            std::vector<size_t>{1, 128},
+            std::vector<WorkspaceDescriptor>{
+                {"shared", 4096, 256, true},
+            }),
+        *device);
+
+    ComputeGraph sixteen_row_prefill;
+    sixteen_row_prefill.addNode(
+        "sixteen_row_prefill",
+        std::make_unique<GraphFamilyWorkspaceStage>(
+            *device,
+            std::vector<size_t>{16, 128},
+            std::vector<WorkspaceDescriptor>{
+                {"prefill_only",
+                 8192,
+                 256,
+                 true,
+                 WorkspaceExecutionRegime::PrefillOnly},
+                {"compact_only",
+                 16384,
+                 256,
+                 true,
+                 WorkspaceExecutionRegime::CompactDecodeOnly},
+            }),
+        *device);
+
+    WorkspaceAllocator allocator;
+    auto hints = tinyHints();
+    hints.max_seq_len = 1;
+    hints.serial_family_max_rows = 16;
+    hints.serial_family_max_compact_rows = 16;
+    hints.graph_family_policy =
+        WorkspaceGraphFamilyPolicy::SerialDeviceFamilyExactParticipant;
+
+    ASSERT_TRUE(allocator.allocateForGraphFamily(
+        primary_graph,
+        WorkspaceGraphParticipantRole::Decode,
+        {WorkspaceGraphParticipant{
+            .graph = &sixteen_row_prefill,
+            .role = WorkspaceGraphParticipantRole::Prefill,
+        }},
+        hints,
+        {},
+        unitBudgetConfig()));
+
+    DeviceWorkspaceManager *workspace =
+        allocator.getDeviceWorkspace(*device);
+    ASSERT_NE(workspace, nullptr);
+    EXPECT_TRUE(workspace->hasBuffer("prefill_only"));
+    EXPECT_FALSE(workspace->hasBuffer("compact_only"));
+}
+
+/**
+ * @brief Exact prefill graphs size terminal projection by requests, not tokens.
+ *
+ * The LM-head input tensor spans all 4096 hidden rows even though the graph
+ * selects and projects only one terminal row for each request. Feeding the
+ * tensor's first dimension into GEMM workspace planning creates multi-gigabyte
+ * accumulator banks that no production launch consumes.
+ */
+TEST(Test__WorkspaceAllocator, ExactPrefillTerminalProjectionUsesRequestCardinality)
+{
+    auto device = selectAvailableGpuWithMemory();
+    if (!device)
+    {
+        GTEST_SKIP() << "No CUDA/ROCm GPU with enough free memory for WorkspaceAllocator unit test";
+    }
+
+    ComputeGraph primary_graph;
+    primary_graph.addNode(
+        "primary",
+        std::make_unique<GraphFamilyWorkspaceStage>(
+            *device,
+            std::vector<size_t>{1, 128},
+            std::vector<WorkspaceDescriptor>{
+                {"primary_shared", 4096, 256, true},
+            }),
+        *device);
+
+    ComputeGraph maximum_prefill_graph;
+    auto lm_head = std::make_unique<DeclaredShapeWorkspaceStage>(
+        *device,
+        std::vector<size_t>{4096, 4096},
+        std::vector<size_t>{1, 248320},
+        /*declare_decode_only_buffer=*/false,
+        /*scale_scratch_with_m=*/true);
+    auto *lm_head_ptr = lm_head.get();
+    maximum_prefill_graph.addNode(
+        "lm_head",
+        std::move(lm_head),
+        *device);
+
+    WorkspaceAllocator allocator;
+    auto hints = tinyHints();
+    hints.max_seq_len = 1;
+    hints.batch_size = 1;
+    hints.vocab_size = 248320;
+    hints.serial_family_max_terminal_projection_columns =
+        hints.vocab_size;
+    hints.graph_family_policy =
+        WorkspaceGraphFamilyPolicy::SerialDeviceFamilyExactParticipant;
+
+    ASSERT_TRUE(allocator.allocateForGraphFamily(
+        primary_graph,
+        WorkspaceGraphParticipantRole::Decode,
+        {WorkspaceGraphParticipant{
+            .graph = &maximum_prefill_graph,
+            .role = WorkspaceGraphParticipantRole::Prefill,
+        }},
+        hints,
+        {},
+        unitBudgetConfig()));
+
+    EXPECT_EQ(lm_head_ptr->maxM(), 1);
+    EXPECT_FALSE(lm_head_ptr->sawDeclaredM());
+}
+
+/**
+ * @brief Exact grouped LM-head workspace retains every verifier row.
+ *
+ * Ordinary prefill projects only one terminal row per request, but grouped MTP
+ * verification projects every compact row. Both can have the same numeric M;
+ * this regression proves that role, rather than geometry, selects cardinality.
+ */
+TEST(Test__WorkspaceAllocator, ExactGroupedTerminalProjectionUsesVerifierCardinality)
+{
+    const auto device = selectAvailableGpuWithMemory();
+    if (!device.has_value())
+    {
+        GTEST_SKIP() << "No GPU with enough free memory for workspace allocation";
+    }
+
+    ComputeGraph grouped_graph;
+    auto lm_head = std::make_unique<DeclaredShapeWorkspaceStage>(
+        *device,
+        std::vector<size_t>{15, 4096},
+        std::vector<size_t>{15, 248320},
+        /*declare_decode_only_buffer=*/false,
+        /*scale_scratch_with_m=*/true);
+    auto *lm_head_ptr = lm_head.get();
+    grouped_graph.addNode(
+        "lm_head",
+        std::move(lm_head),
+        *device);
+
+    WorkspaceAllocator allocator;
+    auto hints = tinyHints();
+    hints.max_seq_len = 15;
+    hints.batch_size = 1;
+    hints.vocab_size = 248320;
+    hints.serial_family_max_terminal_projection_columns =
+        hints.vocab_size;
+    hints.graph_family_policy =
+        WorkspaceGraphFamilyPolicy::
+            SerialDeviceFamilyExactParticipant;
+
+    ASSERT_TRUE(allocator.allocateForGraphFamily(
+        grouped_graph,
+        WorkspaceGraphParticipantRole::GroupedVerifier,
+        {},
+        hints,
+        {},
+        unitBudgetConfig()));
+
+    EXPECT_EQ(lm_head_ptr->maxM(), 15);
+    EXPECT_TRUE(lm_head_ptr->sawDeclaredM());
 }
 
 TEST(Test__WorkspaceAllocator, GraphConsumerSkipsCPUWorkspaceForDeclaredStage)

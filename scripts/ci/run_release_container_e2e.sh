@@ -124,7 +124,11 @@ add_qwen36_moe_rebalance_prefix_mtp_suite() {
     local feature_flags
 
     feature_flags="--prefix-cache --prefix-cache-storage ram --prefix-cache-ram-budget-mb 1024 --prefix-cache-terminal-state auto --prefix-cache-moe-policy placement-fingerprint"
-    feature_flags+=" --mtp --mtp-draft-tokens 2 --mtp-depth-policy fixed --mtp-verify-mode greedy"
+    feature_flags+=" --mtp --mtp-draft-tokens 4 --mtp-min-draft-tokens 1"
+    feature_flags+=" --mtp-initial-draft-tokens 4 --mtp-max-draft-tokens 15"
+    feature_flags+=" --mtp-depth-policy dynamic --mtp-depth-window 4"
+    feature_flags+=" --mtp-depth-min-samples 4 --mtp-depth-promote-windows 1"
+    feature_flags+=" --mtp-verify-mode speculative-sampling"
     feature_flags+=" --moe-routed-expert-placement tiered-overlay"
     feature_flags+=" --moe-routed-expert-continuation-domain ${domain_name}"
     feature_flags+=" --moe-routed-expert-base-model-domain ${domain_name}"
@@ -148,7 +152,7 @@ add_qwen36_moe_rebalance_prefix_mtp_suite() {
     feature_flags+=" --moe-device-llep-alpha-numerator 1 --moe-device-llep-alpha-denominator 2"
     feature_flags+=" --moe-device-llep-disable-balanced-skip --moe-release-raw-expert-weights"
 
-    add_suite "${model}|tp|64|${feature_flags}|qwen36-moe-${rebalance_mode}-prefix-mtp-greedy-d2-${accelerator}2tp-full|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe"
+    add_suite "${model}|tp|64|${feature_flags}|qwen36-moe-${rebalance_mode}-prefix-mtp-stochastic-d4to15-${accelerator}2tp-full|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe"
 }
 
 cmd=(

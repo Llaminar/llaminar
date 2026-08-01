@@ -220,7 +220,7 @@ namespace llaminar2
                 seq_len, hidden_dim))
             return false;
 
-        LOG_DEBUG("[FusedResidualNormStage] seq_len=" << seq_len
+        LOG_TRACE("[FusedResidualNormStage] seq_len=" << seq_len
                                                       << " hidden_dim=" << hidden_dim
                                                       << " eps=" << params_.eps);
 

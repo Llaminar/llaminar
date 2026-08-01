@@ -41,6 +41,7 @@
 #include "execution/moe/DecodeExpertHistogram.h"
 #include "execution/moe/DeviceMoERebalanceController.h"
 #include "execution/moe/DeviceMoETransferSlotDirectory.h"
+#include "execution/moe/LeastLoadedExpertAssignment.h"
 #include "execution/moe/MoEExpertWeightService.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
@@ -676,6 +677,40 @@ namespace
 
     private:
         void *ptr_ = nullptr;
+    };
+
+    /**
+     * @brief Own one stream-published logical position for direct router tests.
+     *
+     * Production routing receives this pointer from the graph's device-owned
+     * position row. Standalone kernel tests do not build that graph, so this
+     * helper recreates the same lifetime and ordering contract without using
+     * HIP stream zero or retaining a host-visible position in the hot path.
+     */
+    class HipDevicePosition
+    {
+    public:
+        HipDevicePosition(int32_t position, hipStream_t stream)
+            : storage_(sizeof(position))
+        {
+            EXPECT_NE(stream, nullptr);
+            EXPECT_EQ(
+                hipMemcpyAsync(
+                    storage_.get(),
+                    &position,
+                    sizeof(position),
+                    hipMemcpyHostToDevice,
+                    stream),
+                hipSuccess);
+        }
+
+        [[nodiscard]] const int32_t *get() const noexcept
+        {
+            return static_cast<const int32_t *>(storage_.get());
+        }
+
+    private:
+        HipAllocation storage_;
     };
 
     /**
@@ -1653,7 +1688,21 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillRegroupFiltersRoutesByAssignedParticipan
     std::copy(routing_weights_data, routing_weights_data + total_slots, routing_weights->mutable_data());
     ASSERT_TRUE(routing_indices->ensureOnDevice(device));
     ASSERT_TRUE(routing_weights->ensureOnDevice(device));
-
+    const std::array<int32_t, seq_len> logical_positions{37, 38, 39};
+    int32_t *device_positions = nullptr;
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&device_positions),
+            sizeof(logical_positions)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_positions,
+            logical_positions.data(),
+            sizeof(logical_positions),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
     ASSERT_TRUE(gpu_kernel.groupPrefillRoutes(
         runtime_table.deviceLayerState(0),
         routing_indices.get(),
@@ -1716,14 +1765,14 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillRegroupFiltersRoutesByAssignedParticipan
 }
 
 /**
- * @brief Prove grouped verifier histogram publication is assignment-exact.
+ * @brief Prove accepted grouped-verifier histogram publication is exact.
  *
- * The selected-route and local-assignment counters intentionally publish at
- * different phases. This mirrors the CUDA regression and catches both LLEP
- * preliminary-pass double counting and missing grouped verifier demand across
- * the production MTP depth range.
+ * Grouping and regrouping are speculative and leave persistent history
+ * untouched. The accepted-state commit consumes device row counts only after
+ * participant assignment is final. Sweeping every accepted prefix at several
+ * M values mirrors CUDA and catches rejected-row pollution.
  */
-TEST(Test__ROCmMoEKernel, GroupedVerifierHistogramPublicationIsDepthCompleteAndAssignmentExact)
+TEST(Test__ROCmMoEKernel, GroupedVerifierHistogramCommitIsAcceptedPrefixExact)
 {
     SKIP_IF_NO_ROCM();
 
@@ -1742,11 +1791,19 @@ TEST(Test__ROCmMoEKernel, GroupedVerifierHistogramPublicationIsDepthCompleteAndA
         const int total_slots = seq_len * top_k;
         DeviceMoERuntimeTable::Config runtime_config;
         runtime_config.device_id = device;
-        runtime_config.num_layers = 1;
+        runtime_config.num_layers = 2;
         runtime_config.num_experts = num_experts;
         runtime_config.top_k = top_k;
         runtime_config.mirror_to_device = true;
         runtime_config.prefill_token_capacity = seq_len;
+        runtime_config.deferred_verifier_token_capacity = seq_len;
+        runtime_config.serial_route_scratch_arena =
+            std::make_shared<DeviceMoESerialRouteScratchArena>(
+                DeviceMoESerialRouteScratchArena::Config{
+                    .device_id = device,
+                    .num_experts = num_experts,
+                    .top_k = top_k,
+                    .token_capacity = seq_len});
         MoERuntimeTable runtime_table(runtime_config);
 
         auto runtime_state = runtime_table.hostLayerState(0);
@@ -1764,8 +1821,6 @@ TEST(Test__ROCmMoEKernel, GroupedVerifierHistogramPublicationIsDepthCompleteAndA
         std::vector<float> routing_indices_data(static_cast<size_t>(total_slots));
         std::vector<float> routing_weights_data(static_cast<size_t>(total_slots));
         std::vector<int32_t> participant_assignments(static_cast<size_t>(total_slots));
-        std::array<uint64_t, num_experts> expected_selected{};
-        std::array<uint64_t, num_experts> expected_local{};
         for (int slot = 0; slot < total_slots; ++slot)
         {
             const int expert = slot % num_experts;
@@ -1773,9 +1828,6 @@ TEST(Test__ROCmMoEKernel, GroupedVerifierHistogramPublicationIsDepthCompleteAndA
             routing_weights_data[static_cast<size_t>(slot)] =
                 1.0f / static_cast<float>(top_k);
             participant_assignments[static_cast<size_t>(slot)] = slot & 1;
-            ++expected_selected[static_cast<size_t>(expert)];
-            if (participant_assignments[static_cast<size_t>(slot)] == participant_id)
-                ++expected_local[static_cast<size_t>(expert)];
         }
 
         auto routing_indices =
@@ -1790,6 +1842,21 @@ TEST(Test__ROCmMoEKernel, GroupedVerifierHistogramPublicationIsDepthCompleteAndA
                   routing_weights->mutable_data());
         ASSERT_TRUE(routing_indices->ensureOnDevice(device)) << "M=" << seq_len;
         ASSERT_TRUE(routing_weights->ensureOnDevice(device)) << "M=" << seq_len;
+        auto overwrite_indices =
+            TestTensorFactory::createFP32(
+                {static_cast<size_t>(total_slots), 1});
+        auto overwrite_weights =
+            TestTensorFactory::createFP32(
+                {static_cast<size_t>(total_slots), 1});
+        std::fill_n(overwrite_indices->mutable_data(), total_slots, 3.0f);
+        std::fill_n(
+            overwrite_weights->mutable_data(),
+            total_slots,
+            1.0f / static_cast<float>(top_k));
+        ASSERT_TRUE(overwrite_indices->ensureOnDevice(device))
+            << "M=" << seq_len;
+        ASSERT_TRUE(overwrite_weights->ensureOnDevice(device))
+            << "M=" << seq_len;
 
         ASSERT_TRUE(gpu_kernel.groupPrefillRoutes(
             runtime_table.deviceLayerState(0),
@@ -1800,9 +1867,64 @@ TEST(Test__ROCmMoEKernel, GroupedVerifierHistogramPublicationIsDepthCompleteAndA
             num_experts,
             top_k,
             /*filter_to_local_runtime_experts=*/false,
-            MoEGroupedHistogramUpdate::SelectedRoutes))
+            /*retain_routes_for_deferred_commit=*/true))
             << "M=" << seq_len;
+        ASSERT_TRUE(gpu_kernel.groupPrefillRoutes(
+            runtime_table.deviceLayerState(1),
+            overwrite_indices.get(),
+            overwrite_weights.get(),
+            seq_len,
+            seq_len,
+            num_experts,
+            top_k,
+            /*filter_to_local_runtime_experts=*/false))
+            << "the second layer must overwrite initial shared scratch M="
+            << seq_len;
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        std::vector<int32_t> retained_initial_experts(
+            static_cast<size_t>(total_slots));
+        std::vector<int32_t> retained_initial_participants(
+            static_cast<size_t>(total_slots));
+        ASSERT_EQ(
+            hipMemcpy(
+                retained_initial_experts.data(),
+                runtime_state.deferred_verifier_route_expert_ids,
+                retained_initial_experts.size() * sizeof(int32_t),
+                hipMemcpyDeviceToHost),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpy(
+                retained_initial_participants.data(),
+                runtime_state.deferred_verifier_route_participant_ids,
+                retained_initial_participants.size() * sizeof(int32_t),
+                hipMemcpyDeviceToHost),
+            hipSuccess);
+        for (int slot = 0; slot < total_slots; ++slot)
+        {
+            EXPECT_EQ(
+                retained_initial_experts[static_cast<size_t>(slot)],
+                slot % num_experts)
+                << "initial grouping ledger lost expert identity M="
+                << seq_len << " slot=" << slot;
+            EXPECT_EQ(
+                retained_initial_participants[static_cast<size_t>(slot)],
+                participant_id)
+                << "initial grouping ledger lost participant identity M="
+                << seq_len << " slot=" << slot;
+        }
+
+        ASSERT_TRUE(gpu_kernel.groupPrefillRoutes(
+            runtime_table.deviceLayerState(0),
+            routing_indices.get(),
+            routing_weights.get(),
+            seq_len,
+            seq_len,
+            num_experts,
+            top_k,
+            /*filter_to_local_runtime_experts=*/false))
+            << "restore layer-zero transient routes before regroup M="
+            << seq_len;
 
         DeviceMoELayerRuntime after_initial{};
         ASSERT_EQ(hipMemcpy(
@@ -1813,9 +1935,9 @@ TEST(Test__ROCmMoEKernel, GroupedVerifierHistogramPublicationIsDepthCompleteAndA
                   hipSuccess);
         for (int expert = 0; expert < num_experts; ++expert)
         {
-            EXPECT_EQ(after_initial.decode_histogram[expert],
-                      expected_selected[static_cast<size_t>(expert)])
-                << "M=" << seq_len << " expert=" << expert;
+            EXPECT_EQ(after_initial.decode_histogram[expert], 0u)
+                << "speculative grouping published history before acceptance"
+                << " M=" << seq_len << " expert=" << expert;
             EXPECT_EQ(after_initial.decode_local_histogram[expert], 0u)
                 << "preliminary grouping claimed local work"
                 << " M=" << seq_len << " expert=" << expert;
@@ -1834,49 +1956,112 @@ TEST(Test__ROCmMoEKernel, GroupedVerifierHistogramPublicationIsDepthCompleteAndA
             seq_len,
             num_experts,
             top_k,
-            MoEGroupedHistogramUpdate::LocallyAssignedRoutes))
+            /*retain_routes_for_deferred_commit=*/true))
             << "M=" << seq_len;
-        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-
-        DeviceMoELayerRuntime after_assignment{};
-        ASSERT_EQ(hipMemcpy(
-                      &after_assignment,
-                      runtime_table.deviceLayerState(0),
-                      sizeof(after_assignment),
-                      hipMemcpyDeviceToHost),
-                  hipSuccess);
-        for (int expert = 0; expert < num_experts; ++expert)
-        {
-            EXPECT_EQ(after_assignment.decode_histogram[expert],
-                      expected_selected[static_cast<size_t>(expert)])
-                << "selected routes were counted twice"
-                << " M=" << seq_len << " expert=" << expert;
-            EXPECT_EQ(after_assignment.decode_local_histogram[expert],
-                      expected_local[static_cast<size_t>(expert)])
-                << "M=" << seq_len << " expert=" << expert;
-        }
-
-        ASSERT_TRUE(gpu_kernel.regroupPrefillRoutesFromRuntimeAssignments(
-            runtime_table.deviceLayerState(0),
+        ASSERT_TRUE(gpu_kernel.groupPrefillRoutes(
+            runtime_table.deviceLayerState(1),
+            overwrite_indices.get(),
+            overwrite_weights.get(),
             seq_len,
             seq_len,
             num_experts,
-            top_k))
-            << "M=" << seq_len;
+            top_k,
+            /*filter_to_local_runtime_experts=*/false))
+            << "the second layer must overwrite the shared transient arena M="
+            << seq_len;
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-        DeviceMoELayerRuntime after_diagnostic_regroup{};
-        ASSERT_EQ(hipMemcpy(
-                      &after_diagnostic_regroup,
-                      runtime_table.deviceLayerState(0),
-                      sizeof(after_diagnostic_regroup),
-                      hipMemcpyDeviceToHost),
-                  hipSuccess);
-        for (int expert = 0; expert < num_experts; ++expert)
+
+        HipAllocation accepted_count_device(sizeof(int32_t));
+        HipAllocation publication_ok_device(sizeof(int32_t));
+        const int32_t publication_ok = 1;
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                publication_ok_device.get(),
+                &publication_ok,
+                sizeof(publication_ok),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+
+        for (int accepted_count = 0;
+             accepted_count <= seq_len;
+             ++accepted_count)
         {
-            EXPECT_EQ(after_diagnostic_regroup.decode_histogram[expert],
-                      after_assignment.decode_histogram[expert]);
-            EXPECT_EQ(after_diagnostic_regroup.decode_local_histogram[expert],
-                      after_assignment.decode_local_histogram[expert]);
+            SCOPED_TRACE(
+                "M=" + std::to_string(seq_len) +
+                " accepted=" + std::to_string(accepted_count));
+            ASSERT_EQ(
+                hipMemsetAsync(
+                    runtime_table.deviceLayerState(0)->decode_histogram,
+                    0,
+                    sizeof(uint64_t) * num_experts,
+                    stream),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemsetAsync(
+                    runtime_table.deviceLayerState(0)->decode_local_histogram,
+                    0,
+                    sizeof(uint64_t) * num_experts,
+                    stream),
+                hipSuccess);
+            const int32_t accepted = accepted_count;
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    accepted_count_device.get(),
+                    &accepted,
+                    sizeof(accepted),
+                    hipMemcpyHostToDevice,
+                    stream),
+                hipSuccess);
+
+            ASSERT_TRUE(gpu_kernel.commitGroupedVerifierHistograms(
+                moeLaunchContext(stream),
+                runtime_table.deviceLayerState(0),
+                static_cast<const int32_t *>(
+                    accepted_count_device.get()),
+                static_cast<const int32_t *>(
+                    publication_ok_device.get()),
+                /*request_count=*/1,
+                /*rows_per_request=*/seq_len,
+                /*total_rows=*/seq_len,
+                num_experts,
+                top_k));
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+            std::array<uint64_t, num_experts> expected_selected{};
+            std::array<uint64_t, num_experts> expected_local{};
+            for (int row = 0; row < accepted_count; ++row)
+            {
+                for (int route = 0; route < top_k; ++route)
+                {
+                    const int slot = row * top_k + route;
+                    const int expert = slot % num_experts;
+                    ++expected_selected[static_cast<size_t>(expert)];
+                    if (participant_assignments[static_cast<size_t>(slot)] ==
+                        participant_id)
+                    {
+                        ++expected_local[static_cast<size_t>(expert)];
+                    }
+                }
+            }
+
+            DeviceMoELayerRuntime after_commit{};
+            ASSERT_EQ(
+                hipMemcpy(
+                    &after_commit,
+                    runtime_table.deviceLayerState(0),
+                    sizeof(after_commit),
+                    hipMemcpyDeviceToHost),
+                hipSuccess);
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                EXPECT_EQ(
+                    after_commit.decode_histogram[expert],
+                    expected_selected[static_cast<size_t>(expert)]);
+                EXPECT_EQ(
+                    after_commit.decode_local_histogram[expert],
+                    expected_local[static_cast<size_t>(expert)]);
+            }
         }
     }
 
@@ -1950,8 +2135,35 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillGroupingFiltersStaticOwnerLocalExperts)
         seq_len,
         num_experts,
         top_k,
-        /*filter_to_local_runtime_experts=*/true,
-        MoEGroupedHistogramUpdate::SelectedAndLocallyAssignedRoutes));
+        /*filter_to_local_runtime_experts=*/true));
+    HipAllocation accepted_count_device(sizeof(int32_t));
+    HipAllocation publication_ok_device(sizeof(int32_t));
+    const int32_t accepted_count = seq_len;
+    const int32_t publication_ok = 1;
+    ASSERT_EQ(hipMemcpyAsync(
+                  accepted_count_device.get(),
+                  &accepted_count,
+                  sizeof(accepted_count),
+                  hipMemcpyHostToDevice,
+                  stream),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(
+                  publication_ok_device.get(),
+                  &publication_ok,
+                  sizeof(publication_ok),
+                  hipMemcpyHostToDevice,
+                  stream),
+              hipSuccess);
+    ASSERT_TRUE(gpu_kernel.commitGroupedVerifierHistograms(
+        moeLaunchContext(stream),
+        runtime_table.deviceLayerState(0),
+        static_cast<const int32_t *>(accepted_count_device.get()),
+        static_cast<const int32_t *>(publication_ok_device.get()),
+        /*request_count=*/1,
+        /*rows_per_request=*/seq_len,
+        /*total_rows=*/seq_len,
+        num_experts,
+        top_k));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     DeviceMoELayerRuntime histogram_state{};
@@ -1987,7 +2199,7 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillGroupingFiltersStaticOwnerLocalExperts)
               hipSuccess);
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 
-    EXPECT_EQ(route_experts, (std::array<int32_t, total_slots>{0, -1, 2, -1, 2, -1}));
+    EXPECT_EQ(route_experts, (std::array<int32_t, total_slots>{0, 1, 2, 3, 2, 1}));
     EXPECT_EQ(route_participants, (std::array<int32_t, total_slots>{0, -1, 0, -1, 0, -1}));
     EXPECT_EQ(counts, (std::array<int32_t, num_experts>{1, 0, 2, 0}));
     EXPECT_EQ(offsets, (std::array<int32_t, num_experts>{0, 1, 1, 3}));
@@ -2064,9 +2276,9 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesHot
               hipSuccess);
 
     const float routing_indices_data[total_slots] = {
-        0.0f, 0.0f,
+        0.0f, 2.0f,
         0.0f, 1.0f,
-        2.0f, 2.0f};
+        2.0f, 3.0f};
     const float routing_weights_data[total_slots] = {
         0.50f, 0.25f,
         0.75f, 0.10f,
@@ -2077,6 +2289,16 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesHot
     std::copy(routing_weights_data, routing_weights_data + total_slots, routing_weights->mutable_data());
     ASSERT_TRUE(routing_indices->ensureOnDevice(device));
     ASSERT_TRUE(routing_weights->ensureOnDevice(device));
+
+    const std::array<int32_t, seq_len> positions{37, 38, 39};
+    int32_t *device_positions = nullptr;
+    ASSERT_EQ(hipMalloc(&device_positions, sizeof(positions)), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(device_positions,
+                             positions.data(),
+                             sizeof(positions),
+                             hipMemcpyHostToDevice,
+                             stream),
+              hipSuccess);
 
     ASSERT_TRUE(gpu_kernel.groupPrefillRoutes(
         runtime_table.deviceLayerState(0),
@@ -2092,7 +2314,8 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesHot
         seq_len,
         seq_len,
         num_experts,
-        top_k));
+        top_k,
+        device_positions));
     ASSERT_TRUE(gpu_kernel.regroupPrefillRoutesFromRuntimeAssignments(
         runtime_table.deviceLayerState(0),
         seq_len,
@@ -2121,6 +2344,7 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesHot
     ASSERT_EQ(hipMemcpy(grouped_weights.data(), runtime_state.grouped_route_weights,
                         sizeof(grouped_weights), hipMemcpyDeviceToHost),
               hipSuccess);
+    ASSERT_EQ(hipFree(device_positions), hipSuccess);
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 
     std::array<std::array<int, 2>, num_experts> per_expert_participant_counts{};
@@ -2133,13 +2357,13 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesHot
         ASSERT_NE(bank.resident_participant_mask[expert] & (1u << static_cast<uint32_t>(participant)), 0u);
         ++per_expert_participant_counts[expert][participant];
     }
-    EXPECT_EQ(per_expert_participant_counts[0][0], 2);
+    EXPECT_EQ(per_expert_participant_counts[0][0], 1);
     EXPECT_EQ(per_expert_participant_counts[0][1], 1);
     EXPECT_EQ(per_expert_participant_counts[1][0], 0);
     EXPECT_EQ(per_expert_participant_counts[1][1], 1);
     EXPECT_EQ(per_expert_participant_counts[2][0], 1);
     EXPECT_EQ(per_expert_participant_counts[2][1], 1);
-    EXPECT_EQ(per_expert_participant_counts[3][0], 0);
+    EXPECT_EQ(per_expert_participant_counts[3][0], 1);
     EXPECT_EQ(per_expert_participant_counts[3][1], 0);
 
     EXPECT_EQ(counts, (std::array<int32_t, num_experts>{1, 1, 1, 0}));
@@ -2177,16 +2401,21 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesHot
 }
 
 /**
- * @brief Prove resident-only verifier assignment is captured and M-total.
+ * @brief Prove captured resident LLEP is M-total and serial-row-equivalent.
  *
- * The production MTP graph can choose any runtime verifier depth up to its
- * configured capacity. Every grouped depth must use the same economical
- * resident-only planner, and no depth may manufacture a missing expert payload
- * transfer. M=31 is the canonical deeper sentinel beyond the usual fifteen
- * draft tokens.
+ * A host oracle executes the shared logical-position selector row by row. The
+ * captured GPU path executes the production grouped sequence: publish selected
+ * route demand, assign from the device-owned position row, then publish local
+ * demand.
+ *
+ * Sparse resident masks, two radically different history states, alternating
+ * top-k order, and non-zero positions make histogram coupling and row-index
+ * bugs observable. Every M=1..16 plus M=31 must publish the exact serial
+ * participant id for every route slot, and replaying the same captured graph
+ * after changing only histogram evidence must leave every assignment unchanged.
  */
 TEST(Test__ROCmMoEKernel,
-     RuntimeVerifierResidentAssignmentIsCapturedAndMTotal)
+     RuntimeVerifierResidentAssignmentIsCapturedMTotalAndSerialEquivalent)
 {
     SKIP_IF_NO_ROCM();
 
@@ -2195,7 +2424,7 @@ TEST(Test__ROCmMoEKernel,
     constexpr int top_k = 2;
     constexpr int max_slots = max_m * top_k;
     const std::vector<int> verifier_rows{
-        2, 3, 4, 5, 6, 7, 8, 9, 10,
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
         11, 12, 13, 14, 15, 16, 31};
 
     const DeviceId device = DeviceId::rocm(0);
@@ -2215,22 +2444,39 @@ TEST(Test__ROCmMoEKernel,
 
     DeviceMoELayerRuntime baseline = runtime_table.hostLayerState(0);
     baseline.participant_id = 1;
-    baseline.participant_count = 2;
+    baseline.participant_count = 3;
     auto &bank = baseline.banks[baseline.active_bank];
     bank.expert_count = num_experts;
     const std::array<uint32_t, num_experts> resident_masks{
-        0b11u, 0b10u, 0b11u, 0b01u};
+        0b101u, 0b010u, 0b111u, 0b101u};
+    const std::array<int32_t, num_experts> owner_participants{
+        0, 1, 2, 0};
+    const std::array<uint64_t, num_experts> initial_histogram{
+        11ULL, 4ULL, 7ULL, 3ULL};
     for (int expert = 0; expert < num_experts; ++expert)
     {
         bank.experts[expert].logical_expert_id = expert;
         bank.experts[expert].owner_participant =
-            expert == 1 ? 1 : 0;
+            owner_participants[static_cast<size_t>(expert)];
         bank.experts[expert].flags =
             toMoEExpertFlags(
                 DeviceMoEExpertFlags::Valid |
                 DeviceMoEExpertFlags::Resident);
         bank.resident_participant_mask[expert] =
             resident_masks[static_cast<size_t>(expert)];
+        baseline.decode_histogram[expert] =
+            initial_histogram[static_cast<size_t>(expert)];
+        baseline.decode_local_histogram[expert] = 0ULL;
+    }
+    DeviceMoELayerRuntime perturbed_history = baseline;
+    const std::array<uint64_t, num_experts> alternate_histogram{
+        8191ULL, 2ULL, 65535ULL, 257ULL};
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        perturbed_history.decode_histogram[expert] =
+            alternate_histogram[static_cast<size_t>(expert)];
+        perturbed_history.decode_local_histogram[expert] =
+            alternate_histogram[static_cast<size_t>(num_experts - 1 - expert)];
     }
 
     auto routing_indices =
@@ -2239,15 +2485,100 @@ TEST(Test__ROCmMoEKernel,
     auto routing_weights =
         TestTensorFactory::createFP32(
             {static_cast<size_t>(max_slots), 1});
-    for (int slot = 0; slot < max_slots; ++slot)
+    const std::array<std::array<int, top_k>, 4> route_pattern{{
+        {{0, 2}},
+        {{2, 0}},
+        {{1, 0}},
+        {{2, 3}},
+    }};
+    for (int row = 0; row < max_m; ++row)
     {
-        routing_indices->mutable_data()[slot] =
-            static_cast<float>(slot % num_experts);
-        routing_weights->mutable_data()[slot] =
-            1.0f / static_cast<float>(top_k);
+        const auto &row_routes =
+            route_pattern[static_cast<size_t>(row) % route_pattern.size()];
+        routing_indices->mutable_data()[row * top_k] =
+            static_cast<float>(row_routes[0]);
+        routing_indices->mutable_data()[row * top_k + 1] =
+            static_cast<float>(row_routes[1]);
+        routing_weights->mutable_data()[row * top_k] = 0.5f;
+        routing_weights->mutable_data()[row * top_k + 1] = 0.5f;
     }
     ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
     ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
+    std::array<int32_t, max_m> logical_positions{};
+    for (int row = 0; row < max_m; ++row)
+        logical_positions[static_cast<size_t>(row)] = 73 + row;
+    int32_t *device_positions = nullptr;
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&device_positions),
+            sizeof(logical_positions)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_positions,
+            logical_positions.data(),
+            sizeof(logical_positions),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+    HipAllocation accepted_count_device(sizeof(int32_t));
+    HipAllocation publication_ok_device(sizeof(int32_t));
+    const int32_t publication_ok = 1;
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            publication_ok_device.get(),
+            &publication_ok,
+            sizeof(publication_ok),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+
+    std::array<std::array<int32_t, top_k>, max_m>
+        serial_participants{};
+    for (int row = 0; row < max_m; ++row)
+    {
+        std::array<int, 3> participant_load{};
+        const auto &row_routes =
+            route_pattern[static_cast<size_t>(row) % route_pattern.size()];
+        for (int route = 0; route < top_k; ++route)
+        {
+            const int expert = row_routes[static_cast<size_t>(route)];
+            const uint32_t resident_mask =
+                resident_masks[static_cast<size_t>(expert)];
+            if ((resident_mask & (resident_mask - 1u)) != 0u)
+                continue;
+            const int owner =
+                owner_participants[static_cast<size_t>(expert)];
+            serial_participants[static_cast<size_t>(row)]
+                               [static_cast<size_t>(route)] = owner;
+            ++participant_load[static_cast<size_t>(owner)];
+        }
+        for (int route = 0; route < top_k; ++route)
+        {
+            const int expert = row_routes[static_cast<size_t>(route)];
+            const uint32_t resident_mask =
+                resident_masks[static_cast<size_t>(expert)];
+            if ((resident_mask & (resident_mask - 1u)) == 0u)
+                continue;
+            const uint32_t participant =
+                llaminar2::least_loaded_ep::
+                    selectBatchInvariantResidentParticipant(
+                        resident_mask,
+                        participant_load.data(),
+                        baseline.participant_count,
+                        static_cast<uint32_t>(
+                            owner_participants[static_cast<size_t>(expert)]),
+                        llaminar2::least_loaded_ep::
+                            residentAssignmentTieTurn(
+                                logical_positions[static_cast<size_t>(row)],
+                                expert,
+                                route));
+            serial_participants[static_cast<size_t>(row)]
+                               [static_cast<size_t>(route)] =
+                static_cast<int32_t>(participant);
+            ++participant_load[participant];
+        }
+    }
 
     for (const int m : verifier_rows)
     {
@@ -2257,6 +2588,15 @@ TEST(Test__ROCmMoEKernel,
                 runtime_table.deviceLayerState(0),
                 &baseline,
                 sizeof(baseline),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+        const int32_t accepted_count = m;
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                accepted_count_device.get(),
+                &accepted_count,
+                sizeof(accepted_count),
                 hipMemcpyHostToDevice,
                 stream),
             hipSuccess);
@@ -2274,18 +2614,32 @@ TEST(Test__ROCmMoEKernel,
             m,
             m,
             num_experts,
-            top_k));
+            top_k,
+            /*filter_to_local_runtime_experts=*/false));
         ASSERT_TRUE(kernel.assignPrefillRoutesLeastLoadedResident(
             moeLaunchContext(stream),
             runtime_table.deviceLayerState(0),
             m,
             m,
             num_experts,
-            top_k));
+            top_k,
+            device_positions));
         ASSERT_TRUE(kernel.regroupPrefillRoutesFromRuntimeAssignments(
             runtime_table.deviceLayerState(0),
             m,
             m,
+            num_experts,
+            top_k));
+        ASSERT_TRUE(kernel.commitGroupedVerifierHistograms(
+            moeLaunchContext(stream),
+            runtime_table.deviceLayerState(0),
+            static_cast<const int32_t *>(
+                accepted_count_device.get()),
+            static_cast<const int32_t *>(
+                publication_ok_device.get()),
+            /*request_count=*/1,
+            /*rows_per_request=*/m,
+            /*total_rows=*/m,
             num_experts,
             top_k));
         ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
@@ -2325,24 +2679,82 @@ TEST(Test__ROCmMoEKernel,
                 participants.size() * sizeof(int32_t),
                 hipMemcpyDeviceToHost),
             hipSuccess);
-        for (int slot = 0; slot < m * top_k; ++slot)
+        std::array<uint64_t, num_experts> selected_counts{};
+        std::array<uint64_t, num_experts> local_counts{};
+        for (int row = 0; row < m; ++row)
         {
-            const int expert = slot % num_experts;
-            const int participant =
-                participants[static_cast<size_t>(slot)];
-            ASSERT_GE(participant, 0);
-            ASSERT_LT(participant, 2);
-            EXPECT_NE(
-                resident_masks[static_cast<size_t>(expert)] &
-                    (1u << static_cast<uint32_t>(participant)),
-                0u)
-                << "Resident-only planner selected a missing payload";
+            for (int route = 0; route < top_k; ++route)
+            {
+                const size_t slot =
+                    static_cast<size_t>(row * top_k + route);
+                const int participant = participants[slot];
+                const int expert =
+                    route_pattern[static_cast<size_t>(row) %
+                                  route_pattern.size()]
+                                 [static_cast<size_t>(route)];
+                ASSERT_GE(participant, 0);
+                ASSERT_LT(participant, 3);
+                EXPECT_NE(
+                    resident_masks[static_cast<size_t>(expert)] &
+                        (1u << static_cast<uint32_t>(participant)),
+                    0u)
+                    << "resident planner selected a missing payload";
+                EXPECT_EQ(
+                    participant,
+                    serial_participants[static_cast<size_t>(row)]
+                                       [static_cast<size_t>(route)])
+                    << "participant assignment changed between M=1 and M="
+                    << m << " at row=" << row << " route=" << route;
+                ++selected_counts[static_cast<size_t>(expert)];
+                if (participant ==
+                    static_cast<int>(baseline.participant_id))
+                {
+                    ++local_counts[static_cast<size_t>(expert)];
+                }
+            }
         }
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            EXPECT_EQ(
+                observed.decode_histogram[expert],
+                initial_histogram[static_cast<size_t>(expert)] +
+                    selected_counts[static_cast<size_t>(expert)])
+                << "selected-route history publication disagrees for expert "
+                << expert;
+            EXPECT_EQ(
+                observed.decode_local_histogram[expert],
+                local_counts[static_cast<size_t>(expert)])
+                << "local-route history publication disagrees for expert "
+                << expert;
+        }
+
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                runtime_table.deviceLayerState(0),
+                &perturbed_history,
+                sizeof(perturbed_history),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        std::vector<int32_t> participants_after_history_change(
+            participants.size());
+        ASSERT_EQ(
+            hipMemcpy(
+                participants_after_history_change.data(),
+                baseline.route_participant_ids,
+                participants_after_history_change.size() * sizeof(int32_t),
+                hipMemcpyDeviceToHost),
+            hipSuccess);
+        EXPECT_EQ(participants_after_history_change, participants)
+            << "resident assignment consumed mutable workload history";
 
         ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
         ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
     }
 
+    ASSERT_EQ(hipFree(device_positions), hipSuccess);
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
@@ -2352,7 +2764,10 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedCurrentBatchPlannerMaterializ
 
     const auto device = DeviceId::rocm(0);
     constexpr int seq_len = 8;
-    constexpr int num_experts = 4;
+    // Qwen 3.5/3.6 MoE uses the runtime ABI's full expert codebook.  Keeping
+    // the routed batch intentionally sparse still gives this test a compact,
+    // auditable expected plan while exercising all 256 planner entries.
+    constexpr int num_experts = 256;
     constexpr int top_k = 1;
     constexpr int total_slots = seq_len * top_k;
 
@@ -2532,6 +2947,11 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedCurrentBatchPlannerMaterializ
     EXPECT_EQ(materialized_header.participant_count, 2u);
     EXPECT_EQ(materialized_plan[0].op,
               static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival));
+    EXPECT_NE(
+        materialized_plan[0].flags &
+            moe_rebalance_abi::kPlanFlagCurrentBatchLLEP,
+        0u)
+        << "Current-batch movement must remain distinguishable from prefix rehydration";
     EXPECT_EQ(materialized_plan[0].layer, 0u);
     EXPECT_EQ(materialized_plan[0].expert, 0u);
     EXPECT_EQ(materialized_plan[0].source_participant, 0u);
@@ -2761,11 +3181,11 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedMaterializerLeavesPhysicalSlo
         .forced = 0,
         .reserved = 0,
     };
-    const least_loaded_ep::LeastLoadedExpertWeightTransfer transfer{
+    least_loaded_ep::LeastLoadedExpertWeightTransfer transfer{
         .expert = 3,
         .source_participant = 1,
         .destination_participant = 0,
-        .reserved = 0,
+        .destination_slot_requirement_plus_one = 0,
     };
     ASSERT_NE(runtime.reserved_ptrs[1], nullptr);
     ASSERT_NE(runtime.reserved_ptrs[2], nullptr);
@@ -2851,6 +3271,36 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedMaterializerLeavesPhysicalSlo
     EXPECT_EQ(plan.destination_participant, 0u);
     EXPECT_EQ(plan.destination_slot, kDeviceMoEInvalidSlot)
         << "physical storage must be leased by destination projection, not logical materialization";
+
+    transfer.destination_slot_requirement_plus_one = 3u;
+    ASSERT_EQ(hipMemcpyAsync(runtime.reserved_ptrs[2],
+                             &transfer,
+                             sizeof(transfer),
+                             hipMemcpyHostToDevice,
+                             stream),
+              hipSuccess);
+    ASSERT_TRUE(gpu_kernel.materializePrefillLeastLoadedTransferCommands(
+        moeLaunchContext(stream),
+        runtime_table.deviceLayerState(0),
+        d_plan,
+        d_plan_count,
+        /*plan_capacity=*/1,
+        d_header,
+        d_status,
+        config,
+        payload_slot_capacity,
+        /*layer_idx=*/0));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_EQ(hipMemcpy(&plan,
+                        d_plan,
+                        sizeof(plan),
+                        hipMemcpyDeviceToHost),
+              hipSuccess);
+    EXPECT_NE(plan.flags &
+                  moe_rebalance_abi::kPlanFlagExactDestinationSlot,
+              0u);
+    EXPECT_EQ(plan.destination_slot, 2u)
+        << "prefix rehydration must carry its checkpointed physical slot into destination projection";
 
     EXPECT_EQ(hipFree(d_plan), hipSuccess);
     EXPECT_EQ(hipFree(d_plan_count), hipSuccess);
@@ -4168,6 +4618,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossParti
         /*intermediate=*/8,
         /*num_experts=*/num_experts,
         /*top_k=*/top_k);
+    HipDevicePosition device_position(0, rocmMoETestStream());
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
@@ -4180,21 +4631,21 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossParti
             d_model, num_experts, top_k,
             false,
             output_indices0.get(), output_weights0.get(),
-            true, true));
+            true, true, device_position.get()));
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
             table1->deviceLayerState(0),
             hidden.get(), gate_weights.get(),
             d_model, num_experts, top_k,
             false,
             output_indices1.get(), output_weights1.get(),
-            true, true));
+            true, true, device_position.get()));
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
             table2->deviceLayerState(0),
             hidden.get(), gate_weights.get(),
             d_model, num_experts, top_k,
             false,
             output_indices2.get(), output_weights2.get(),
-            true, true));
+            true, true, device_position.get()));
     }
 
     auto copy_runtime = [&](MoERuntimeTable &table,
@@ -4372,6 +4823,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeRecordsHotCacheBalanceImprovem
         /*intermediate=*/8,
         /*num_experts=*/num_experts,
         /*top_k=*/top_k);
+    HipDevicePosition device_position(0, stream);
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
@@ -4384,21 +4836,21 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeRecordsHotCacheBalanceImprovem
             d_model, num_experts, top_k,
             false,
             output_indices0.get(), output_weights0.get(),
-            true, true));
+            true, true, device_position.get()));
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
             table1->deviceLayerState(0),
             hidden.get(), gate_weights.get(),
             d_model, num_experts, top_k,
             false,
             output_indices1.get(), output_weights1.get(),
-            true, true));
+            true, true, device_position.get()));
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
             table2->deviceLayerState(0),
             hidden.get(), gate_weights.get(),
             d_model, num_experts, top_k,
             false,
             output_indices2.get(), output_weights2.get(),
-            true, true));
+            true, true, device_position.get()));
     }
 
     DeviceMoELayerRuntime runtime0{};
@@ -4721,6 +5173,223 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerPublishesRuntimeBankOnStream)
     EXPECT_EQ(hipFree(d_gathered), hipSuccess);
     EXPECT_EQ(hipFree(d_status), hipSuccess);
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+/**
+ * @brief Prove ROCm request reset replaces every prior transaction record.
+ *
+ * This mirrors the CUDA lifecycle regression and intentionally supplies a
+ * structurally valid controller plus stale command headers, layer cursors, and
+ * plan counts. The preserving replay initializer or a controller-only reset
+ * would leave the transaction poisoned; only the full request reset may pass.
+ */
+TEST(Test__ROCmMoEKernel,
+     DeviceRebalanceRequestResetClearsValidPoisonedTransaction)
+{
+    SKIP_IF_NO_ROCM();
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 4;
+    config.num_experts = 8;
+    config.top_k = 2;
+    config.participant_id = 1;
+    config.participant_count = 2;
+    config.window_size_tokens = 4;
+
+    DeviceMoERebalanceGraphControllerState stale;
+    stale.participant_id = config.participant_id;
+    stale.participant_count = config.participant_count;
+    stale.next_epoch = 37u;
+    stale.active_wave = 1u;
+    stale.maintenance_launches = 91u;
+    stale.decode_apply_polls = 17u;
+    stale.decode_apply_hits = 13u;
+    stale.last_error_code = 77u;
+    stale.last_error_wave_index = 1u;
+    stale.waves[1].epoch = 36u;
+    stale.waves[1].state = static_cast<uint32_t>(
+        DeviceMoERebalanceWaveLifecycle::Error);
+    stale.waves[1].error_code = 77u;
+
+    constexpr uint32_t kCommandBufferCount = 2u;
+    std::array<DeviceMoERebalanceCommandBufferHeader, kCommandBufferCount>
+        stale_headers{};
+    std::array<DeviceMoERebalanceWaveState, kCommandBufferCount>
+        stale_wave_states{};
+    std::array<uint32_t, kCommandBufferCount> stale_plan_counts{11u, 19u};
+    for (uint32_t wave = 0u; wave < kCommandBufferCount; ++wave)
+    {
+        stale_headers[wave].epoch = 30u + wave;
+        stale_headers[wave].command_count = 5u + wave;
+        stale_headers[wave].command_capacity = 20u;
+        stale_headers[wave].participant_id = config.participant_id;
+        stale_headers[wave].participant_count = config.participant_count;
+        stale_wave_states[wave].epoch = 30u + wave;
+        stale_wave_states[wave].next_start_layer = 3u - wave;
+        stale_wave_states[wave].planned_start_layer = 2u;
+        stale_wave_states[wave].planned_layer_count = 2u;
+        stale_wave_states[wave].command_capacity = 20u;
+        stale_wave_states[wave].participant_id = config.participant_id;
+        stale_wave_states[wave].participant_count = config.participant_count;
+    }
+
+    DeviceMoERebalanceGraphControllerState *device_state = nullptr;
+    DeviceMoERebalanceCommandBufferHeader *device_headers = nullptr;
+    DeviceMoERebalanceWaveState *device_wave_states = nullptr;
+    uint32_t *device_plan_counts = nullptr;
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&device_state),
+            sizeof(stale)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&device_headers),
+            sizeof(stale_headers)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&device_wave_states),
+            sizeof(stale_wave_states)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&device_plan_counts),
+            sizeof(stale_plan_counts)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_state,
+            &stale,
+            sizeof(stale),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_headers,
+            stale_headers.data(),
+            sizeof(stale_headers),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_wave_states,
+            stale_wave_states.data(),
+            sizeof(stale_wave_states),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_plan_counts,
+            stale_plan_counts.data(),
+            sizeof(stale_plan_counts),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+
+    ROCmMoEKernel gpu_kernel(0);
+    ASSERT_TRUE(
+        gpu_kernel.resetDeviceRebalanceGraphTransactionForRequest(
+            moeLaunchContext(stream),
+            device_state,
+            device_headers,
+            device_wave_states,
+            device_plan_counts,
+            kCommandBufferCount,
+            config));
+
+    DeviceMoERebalanceGraphControllerState fresh;
+    std::array<DeviceMoERebalanceCommandBufferHeader, kCommandBufferCount>
+        fresh_headers{};
+    std::array<DeviceMoERebalanceWaveState, kCommandBufferCount>
+        fresh_wave_states{};
+    std::array<uint32_t, kCommandBufferCount> fresh_plan_counts{};
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            &fresh,
+            device_state,
+            sizeof(fresh),
+            hipMemcpyDeviceToHost,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            fresh_headers.data(),
+            device_headers,
+            sizeof(fresh_headers),
+            hipMemcpyDeviceToHost,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            fresh_wave_states.data(),
+            device_wave_states,
+            sizeof(fresh_wave_states),
+            hipMemcpyDeviceToHost,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            fresh_plan_counts.data(),
+            device_plan_counts,
+            sizeof(fresh_plan_counts),
+            hipMemcpyDeviceToHost,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    EXPECT_EQ(fresh.magic, kDeviceMoERebalanceMagic);
+    EXPECT_EQ(fresh.version, kDeviceMoERebalanceVersion);
+    EXPECT_EQ(fresh.participant_id, config.participant_id);
+    EXPECT_EQ(fresh.participant_count, config.participant_count);
+    EXPECT_EQ(fresh.next_epoch, 1u);
+    EXPECT_EQ(fresh.active_wave, 0u);
+    EXPECT_EQ(fresh.wave_count, 2u);
+    EXPECT_EQ(fresh.maintenance_launches, 0u);
+    EXPECT_EQ(fresh.decode_apply_polls, 0u);
+    EXPECT_EQ(fresh.decode_apply_hits, 0u);
+    EXPECT_EQ(fresh.last_error_code, 0u);
+    EXPECT_EQ(fresh.last_error_wave_index, kDeviceMoEInvalidSlot);
+    for (const auto &wave : fresh.waves)
+    {
+        EXPECT_EQ(wave.epoch, 0u);
+        EXPECT_EQ(
+            wave.state,
+            static_cast<uint32_t>(
+                DeviceMoERebalanceWaveLifecycle::Idle));
+        EXPECT_EQ(wave.error_code, 0u);
+        EXPECT_EQ(wave.error_participant, kDeviceMoEInvalidSlot);
+    }
+    const auto all_bytes_zero = [](const auto &record) {
+        const auto *bytes =
+            reinterpret_cast<const uint8_t *>(&record);
+        return std::all_of(
+            bytes,
+            bytes + sizeof(record),
+            [](uint8_t value) { return value == 0u; });
+    };
+    for (uint32_t wave = 0u; wave < kCommandBufferCount; ++wave)
+    {
+        EXPECT_TRUE(all_bytes_zero(fresh_headers[wave]))
+            << "command header retained request state for wave " << wave;
+        EXPECT_TRUE(all_bytes_zero(fresh_wave_states[wave]))
+            << "wave cursor retained request state for wave " << wave;
+        EXPECT_EQ(fresh_plan_counts[wave], 0u)
+            << "plan count retained request state for wave " << wave;
+    }
+
+    EXPECT_EQ(hipFree(device_plan_counts), hipSuccess);
+    EXPECT_EQ(hipFree(device_wave_states), hipSuccess);
+    EXPECT_EQ(hipFree(device_headers), hipSuccess);
+    EXPECT_EQ(hipFree(device_state), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
 TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerPlansMissingReplicaArrivals)
@@ -6780,6 +7449,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectWithReadyRebalanceApplyTargetAllRolls
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipSetDevice(0), hipSuccess);
     ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+    HipDevicePosition device_position(0, stream);
 
     DeviceMoERuntimeTable::Config table_config;
     table_config.device_id = device;
@@ -6936,7 +7606,8 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectWithReadyRebalanceApplyTargetAllRolls
         d_apply_status,
         d_controller_state,
         -1,
-        command_buffer_count));
+        command_buffer_count,
+        device_position.get()));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     DeviceMoERebalanceGraphControllerState result_state;
@@ -6977,7 +7648,8 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectWithReadyRebalanceApplyTargetAllRolls
         d_apply_status,
         d_controller_state,
         -1,
-        command_buffer_count));
+        command_buffer_count,
+        device_position.get()));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     ASSERT_EQ(hipMemcpy(&result_state, d_controller_state, sizeof(result_state), hipMemcpyDeviceToHost),
@@ -7009,6 +7681,7 @@ TEST(Test__ROCmMoEKernel, DecodeReadyRebalanceApplyDoesNotAdvanceIncompleteTrans
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipSetDevice(0), hipSuccess);
     ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+    HipDevicePosition device_position(0, stream);
 
     DeviceMoERuntimeTable::Config table_config;
     table_config.device_id = device;
@@ -7165,7 +7838,8 @@ TEST(Test__ROCmMoEKernel, DecodeReadyRebalanceApplyDoesNotAdvanceIncompleteTrans
         d_apply_status,
         d_controller_state,
         -1,
-        command_buffer_count));
+        command_buffer_count,
+        device_position.get()));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     DeviceMoERebalanceApplyStatus apply_status;
@@ -7217,6 +7891,7 @@ TEST(Test__ROCmMoEKernel, DecodeReadyRebalanceApplyUsesOrderedLayerCursor)
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipSetDevice(0), hipSuccess);
     ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+    HipDevicePosition device_position(0, stream);
 
     DeviceMoERuntimeTable::Config table_config;
     table_config.device_id = device;
@@ -7360,7 +8035,8 @@ TEST(Test__ROCmMoEKernel, DecodeReadyRebalanceApplyUsesOrderedLayerCursor)
             d_apply_status,
             d_controller_state,
             target_layer,
-            command_buffer_count));
+            command_buffer_count,
+            device_position.get()));
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     };
 
@@ -9673,6 +10349,62 @@ TEST(Test__ROCmMoEKernel, PrefillLLEPProjectionUsesFullPhysicalDirectoryBeyondCo
     EXPECT_EQ(status.capacity_limited_candidates, 0u);
     EXPECT_EQ(status.invalid_runtime_layers, 0u);
 
+    /*
+     * A portable prefix checkpoint requires its exact destination slots. Use
+     * the same free directory but reverse the requested order so this second
+     * projection distinguishes exact restore from ordinary first-free leasing.
+     */
+    gathered_plan[participant_id * plan_capacity + 0u].flags =
+        moe_rebalance_abi::kPlanFlagExactDestinationSlot;
+    gathered_plan[participant_id * plan_capacity + 0u].destination_slot = 3u;
+    gathered_plan[participant_id * plan_capacity + 1u].flags =
+        moe_rebalance_abi::kPlanFlagExactDestinationSlot;
+    gathered_plan[participant_id * plan_capacity + 1u].destination_slot = 2u;
+    initial_status = {};
+    ASSERT_EQ(hipMemcpyAsync(d_gathered_plan,
+                             gathered_plan.data(),
+                             sizeof(gathered_plan),
+                             hipMemcpyHostToDevice,
+                             stream),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(d_status,
+                             &initial_status,
+                             sizeof(initial_status),
+                             hipMemcpyHostToDevice,
+                             stream),
+              hipSuccess);
+    ASSERT_TRUE(gpu_kernel.projectPrefillLeastLoadedDomainCommands(
+        moeLaunchContext(stream),
+        d_gathered_plan,
+        d_gathered_headers,
+        plan_capacity,
+        d_local_plan,
+        d_local_plan_count,
+        d_local_header,
+        config,
+        d_status,
+        payload_slot_capacity,
+        runtime_table.deviceLayerState(0),
+        d_transfer_slots,
+        transfer_slot_count));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_EQ(hipMemcpy(local_plan.data(),
+                        d_local_plan,
+                        sizeof(local_plan),
+                        hipMemcpyDeviceToHost),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(&status,
+                        d_status,
+                        sizeof(status),
+                        hipMemcpyDeviceToHost),
+              hipSuccess);
+    EXPECT_EQ(local_plan[0].destination_slot, 3u);
+    EXPECT_EQ(local_plan[1].destination_slot, 2u);
+    EXPECT_EQ(status.plan_overflow, 0u);
+    EXPECT_EQ(status.payload_bucket_overflow, 0u);
+    EXPECT_EQ(status.capacity_limited_candidates, 0u);
+    EXPECT_EQ(status.invalid_runtime_layers, 0u);
+
     EXPECT_EQ(hipFree(d_gathered_plan), hipSuccess);
     EXPECT_EQ(hipFree(d_gathered_headers), hipSuccess);
     EXPECT_EQ(hipFree(d_local_plan), hipSuccess);
@@ -9691,6 +10423,7 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipSetDevice(0), hipSuccess);
     ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+    HipDevicePosition device_position(0, stream);
 
     DeviceMoERuntimeTable::Config table_config;
     table_config.device_id = device;
@@ -10012,6 +10745,18 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
     seeded_runtime.router_hot_cache_miss_dispatches = 17;
     seeded_runtime.router_hot_cache_selected_expert_slots = 46;
     seeded_runtime.router_hot_cache_replicated_selected_expert_slots = 12;
+    const std::array<uint64_t, 4> restored_selected_histogram{
+        101u, 103u, 107u, 109u};
+    const std::array<uint64_t, 4> restored_local_histogram{
+        41u, 43u, 47u, 53u};
+    std::copy(
+        restored_selected_histogram.begin(),
+        restored_selected_histogram.end(),
+        seeded_runtime.decode_histogram);
+    std::copy(
+        restored_local_histogram.begin(),
+        restored_local_histogram.end(),
+        seeded_runtime.decode_local_histogram);
     ASSERT_EQ(hipMemcpyAsync(runtime_table.deviceLayerState(0),
                              &seeded_runtime,
                              sizeof(seeded_runtime),
@@ -10019,6 +10764,10 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
                              stream),
               hipSuccess);
 
+    const auto prefix_rehydration_config =
+        prefillLLEPTransferConfig(
+            config,
+            PrefillLLEPTransferPurpose::PrefixRuntimeRehydration);
     ASSERT_TRUE(gpu_kernel.applyDeviceRebalanceArrivals(
         moeLaunchContext(stream),
         runtime_table.deviceLayerState(0),
@@ -10027,7 +10776,7 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
         plan_capacity,
         d_transfer_slots,
         static_cast<uint32_t>(transfer_slots.size()),
-        config,
+        prefix_rehydration_config,
         d_apply_status,
         d_command_header));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
@@ -10067,6 +10816,16 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
     EXPECT_EQ(runtime.router_hot_cache_miss_dispatches, 17u);
     EXPECT_EQ(runtime.router_hot_cache_selected_expert_slots, 46u);
     EXPECT_EQ(runtime.router_hot_cache_replicated_selected_expert_slots, 12u);
+    EXPECT_TRUE(std::equal(
+        restored_selected_histogram.begin(),
+        restored_selected_histogram.end(),
+        runtime.decode_histogram))
+        << "prefix payload rehydration must preserve restored selected-route evidence";
+    EXPECT_TRUE(std::equal(
+        restored_local_histogram.begin(),
+        restored_local_histogram.end(),
+        runtime.decode_local_histogram))
+        << "prefix payload rehydration must preserve restored local-route evidence";
 
     auto hidden = TestTensorFactory::createFP32({1, 4});
     auto gate_weights = TestTensorFactory::createFP32({4, 4});
@@ -10107,7 +10866,8 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
             /*normalize_weights=*/false,
             output_indices.get(), output_weights.get(),
             /*write_legacy_outputs=*/true,
-            /*update_runtime_histogram=*/true));
+            /*update_runtime_histogram=*/true,
+            device_position.get()));
     }
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     ASSERT_EQ(hipMemcpy(&runtime, runtime_table.deviceLayerState(0), sizeof(runtime), hipMemcpyDeviceToHost), hipSuccess);
@@ -10347,7 +11107,8 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
             /*normalize_weights=*/false,
             output_indices.get(), output_weights.get(),
             /*write_legacy_outputs=*/true,
-            /*update_runtime_histogram=*/true));
+            /*update_runtime_histogram=*/true,
+            device_position.get()));
     }
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     ASSERT_EQ(hipMemcpy(&source_runtime_state,
@@ -12082,6 +12843,7 @@ TEST(Test__ROCmMoEKernel,
 
     auto update = makeDynamicOwnershipTransferUpdate(
         /*epoch=*/1u, /*participant_id=*/0u);
+    update.transient_placement_observed = true;
     update.local_compute_mask[0] = 0u;
     update.replica_role[0] =
         static_cast<uint8_t>(DeviceMoEReplicaRole::None);
@@ -12112,6 +12874,15 @@ TEST(Test__ROCmMoEKernel,
     promoted_entry.generation = 1u;
     ASSERT_TRUE(runtime_table.prepareInactiveBank(0, update));
     ASSERT_TRUE(runtime_table.flipActiveBank(0, update.epoch, stream));
+    auto runtime_state = runtime_table.hostLayerState(0);
+    runtime_state.current_batch_llep_movement_observed = 1u;
+    ASSERT_EQ(hipMemcpyAsync(
+                  runtime_table.deviceLayerState(0),
+                  &runtime_state,
+                  sizeof(runtime_state),
+                  hipMemcpyHostToDevice,
+                  stream),
+              hipSuccess);
 
     DeviceMoERebalanceConfig config;
     config.num_layers = 1;
@@ -12123,11 +12894,19 @@ TEST(Test__ROCmMoEKernel,
     config.active_transfer_slot_capacity = 1;
     config.transfer_slot_directory_capacity = 2;
 
+    DeviceMoERebalanceGraphControllerState controller_state;
+    controller_state.participant_id = config.participant_id;
+    controller_state.participant_count = config.participant_count;
+    controller_state.decode_rounds_until_maintenance = 2u;
+    controller_state.maintenance_period_rounds =
+        config.maintenance_period_tokens;
+
     ROCmMoEKernel gpu_kernel(0);
     static_cast<IMoEKernel &>(gpu_kernel).setGPUStream(stream);
     uint64_t *d_local = nullptr;
     uint64_t *d_gathered = nullptr;
     DeviceMoERebalanceStatus *d_status = nullptr;
+    DeviceMoERebalanceGraphControllerState *d_controller_state = nullptr;
     DeviceMoEExpertDirectoryEntry *d_transfer_directory = nullptr;
     ASSERT_EQ(hipMalloc(
                   reinterpret_cast<void **>(&d_local),
@@ -12144,8 +12923,19 @@ TEST(Test__ROCmMoEKernel,
                   sizeof(DeviceMoERebalanceStatus)),
               hipSuccess);
     ASSERT_EQ(hipMalloc(
+                  reinterpret_cast<void **>(&d_controller_state),
+                  sizeof(controller_state)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(
                   reinterpret_cast<void **>(&d_transfer_directory),
                   sizeof(host_transfer_directory)),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(
+                  d_controller_state,
+                  &controller_state,
+                  sizeof(controller_state),
+                  hipMemcpyHostToDevice,
+                  stream),
               hipSuccess);
     ASSERT_EQ(hipMemcpyAsync(
                   d_transfer_directory,
@@ -12188,7 +12978,7 @@ TEST(Test__ROCmMoEKernel,
         /*payload_slot_capacity=*/0u,
         /*command_header=*/nullptr,
         /*wave_state=*/nullptr,
-        /*controller_state=*/nullptr,
+        d_controller_state,
         /*command_buffer_count=*/1u,
         d_transfer_directory,
         static_cast<uint32_t>(host_transfer_directory.size())));
@@ -12223,6 +13013,8 @@ TEST(Test__ROCmMoEKernel,
         static_cast<uint32_t>(
             DeviceMoERebalanceStatusCode::WindowNotReady));
     EXPECT_EQ(status.prefill_active_transfer_slot_experts, 1u);
+    EXPECT_EQ(status.prefill_current_batch_movement_layers, 1u)
+        << "Current-batch movement evidence must survive independently of slot occupancy";
     EXPECT_EQ(status.prefill_unique_transfer_slot_claims, 1u);
     EXPECT_EQ(status.prefill_invalid_transfer_slot_claims, 0u);
     EXPECT_EQ(status.prefill_max_transfer_slot, 1u);
@@ -12237,7 +13029,17 @@ TEST(Test__ROCmMoEKernel,
         runtime_table.deviceLayerState(0),
         d_gathered,
         d_status,
-        config));
+        config,
+        /*plan_entries=*/nullptr,
+        /*plan_count=*/nullptr,
+        /*plan_capacity=*/0u,
+        /*payload_slot_capacity=*/0u,
+        /*command_header=*/nullptr,
+        /*wave_state=*/nullptr,
+        d_controller_state,
+        /*command_buffer_count=*/1u,
+        /*local_transfer_slots=*/nullptr,
+        /*local_transfer_slot_count=*/0u));
     ASSERT_EQ(hipMemcpyAsync(
                   &status,
                   d_status,
@@ -12280,7 +13082,7 @@ TEST(Test__ROCmMoEKernel,
         /*payload_slot_capacity=*/0u,
         /*command_header=*/nullptr,
         /*wave_state=*/nullptr,
-        /*controller_state=*/nullptr,
+        d_controller_state,
         /*command_buffer_count=*/1u,
         d_transfer_directory,
         static_cast<uint32_t>(host_transfer_directory.size())));
@@ -12306,6 +13108,7 @@ TEST(Test__ROCmMoEKernel,
     EXPECT_EQ(hipFree(d_local), hipSuccess);
     EXPECT_EQ(hipFree(d_gathered), hipSuccess);
     EXPECT_EQ(hipFree(d_status), hipSuccess);
+    EXPECT_EQ(hipFree(d_controller_state), hipSuccess);
     EXPECT_EQ(hipFree(d_transfer_directory), hipSuccess);
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
@@ -20863,6 +21666,16 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         auto grouped_output = TestTensorFactory::createFP32(
             {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
         ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream));
+        auto canonical_route_contributions = TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len),
+             static_cast<size_t>(top_k),
+             static_cast<size_t>(d_model)});
+        std::fill_n(
+            canonical_route_contributions->mutable_data(),
+            canonical_route_contributions->numel(),
+            std::numeric_limits<float>::quiet_NaN());
+        ASSERT_TRUE(
+            canonical_route_contributions->ensureOnDevice(device, stream));
         if (masked_local_tp)
         {
             ASSERT_TRUE(moe_kernel.updateGroupedPrefillExpertMask(
@@ -20888,7 +21701,21 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             d_model,
             intermediate,
             num_experts,
-            top_k));
+            top_k,
+            masked_local_tp
+                ? canonical_route_contributions.get()
+                : nullptr));
+        if (masked_local_tp)
+        {
+            ASSERT_TRUE(moe_kernel.reduceCanonicalRouteContributions(
+                canonical_route_contributions.get(),
+                grouped_output.get(),
+                seq_len,
+                top_k,
+                d_model))
+                << format_name << " canonical LocalTP route reduction M="
+                << seq_len;
+        }
         ASSERT_TRUE(grouped_output->ensureOnHost(stream));
 
         expectBitwiseVerifierRowsEqual(
@@ -20977,8 +21804,21 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             {1u, static_cast<size_t>(d_model)});
         auto stage_output = TestTensorFactory::createFP32(
             {1u, static_cast<size_t>(d_model)});
+        auto stage_canonical_route_contributions =
+            TestTensorFactory::createFP32(
+                {1u,
+                 static_cast<size_t>(top_k),
+                 static_cast<size_t>(d_model)});
+        std::fill_n(
+            stage_canonical_route_contributions->mutable_data(),
+            stage_canonical_route_contributions->numel(),
+            std::numeric_limits<float>::quiet_NaN());
         ASSERT_TRUE(direct_output->ensureOnDevice(device, stream));
         ASSERT_TRUE(stage_output->ensureOnDevice(device, stream));
+        ASSERT_TRUE(
+            stage_canonical_route_contributions->ensureOnDevice(
+                device,
+                stream));
         ASSERT_TRUE(moe_kernel.groupedExpertDecodeFromRouting(
             stage_input.get(),
             stage_indices.get(),
@@ -21009,6 +21849,8 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         params.force_decode_equivalent_verifier_prefill = true;
         params.output = stage_output.get();
         params.output_registered_in_arena = false;
+        params.canonical_route_contributions =
+            stage_canonical_route_contributions.get();
         params.prepared_gate_gemm.assign(
             static_cast<size_t>(num_experts), nullptr);
         params.prepared_up_gemm.assign(
@@ -21035,6 +21877,20 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             << format_name
             << " partial-ownership M=1 verifier stage must admit the "
                "mask-aware explicit-routing path";
+
+        MoECanonicalRouteReduceStage::Params reduce_params;
+        reduce_params.device_id = device;
+        reduce_params.canonical_route_contributions =
+            stage_canonical_route_contributions.get();
+        reduce_params.output = stage_output.get();
+        reduce_params.seq_len = 1;
+        reduce_params.top_k = top_k;
+        reduce_params.d_model = d_model;
+        MoECanonicalRouteReduceStage reduce_stage(std::move(reduce_params));
+        reduce_stage.setGPUStream(stream);
+        ASSERT_TRUE(reduce_stage.execute(&context))
+            << format_name
+            << " partial-ownership M=1 canonical route reduction";
         ASSERT_TRUE(direct_output->ensureOnHost(stream));
         ASSERT_TRUE(stage_output->ensureOnHost(stream));
         expectBitwiseVerifierRowsEqual(
@@ -21121,11 +21977,22 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
             auto grouped_output = TestTensorFactory::createFP32(
                 {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+            auto canonical_route_contributions =
+                TestTensorFactory::createFP32(
+                    {static_cast<size_t>(seq_len),
+                     static_cast<size_t>(top_k),
+                     static_cast<size_t>(d_model)});
+            std::fill_n(
+                canonical_route_contributions->mutable_data(),
+                canonical_route_contributions->numel(),
+                std::numeric_limits<float>::quiet_NaN());
             auto runtime_grouped_output = TestTensorFactory::createFP32(
                 {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
             ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
             ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
             ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream));
+            ASSERT_TRUE(
+                canonical_route_contributions->ensureOnDevice(device, stream));
             ASSERT_TRUE(runtime_grouped_output->ensureOnDevice(device, stream));
 
             /*
@@ -21175,7 +22042,22 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 d_model,
                 intermediate,
                 num_experts,
-                top_k));
+                top_k,
+                masked_local_tp
+                    ? canonical_route_contributions.get()
+                    : nullptr));
+            if (masked_local_tp)
+            {
+                ASSERT_TRUE(moe_kernel.reduceCanonicalRouteContributions(
+                    canonical_route_contributions.get(),
+                    grouped_output.get(),
+                    seq_len,
+                    top_k,
+                    d_model))
+                    << format_name
+                    << " production router-Q8 canonical LocalTP reduction M="
+                    << seq_len;
+            }
 
             if (!masked_local_tp)
             {

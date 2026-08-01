@@ -249,6 +249,16 @@ namespace llaminar2
         uint32_t last_error_missing_destination_source = kDeviceMoEInvalidSlot;
         /// Physical destination-slot capacity observed by the failing participant.
         uint32_t last_error_local_transfer_slot_count = 0;
+        /** Total serial-visible decode rounds committed by this request. */
+        uint32_t decode_rounds_committed = 0;
+        /** Decode rounds that may commit before the next maintenance edge. */
+        uint32_t decode_rounds_until_maintenance = 1;
+        /** Recurring device-owned maintenance period after the first edge. */
+        uint32_t maintenance_period_rounds = 1;
+        /** Nonzero exactly when maintenance must run before another decode. */
+        uint32_t maintenance_due = 0;
+        /** Set when compact MTP metadata already advanced this decode boundary. */
+        uint32_t decode_boundary_advanced = 0;
         DeviceMoERebalanceWaveProgress waves[2];
     };
 
@@ -494,6 +504,10 @@ namespace llaminar2
          * `BufferedCapacity::total_slots`.
          */
         uint32_t transfer_slot_directory_capacity = kDeviceMoEMaxExperts;
+        /** First serial-visible decode boundary at which maintenance is due. */
+        uint32_t initial_maintenance_period_tokens = 1;
+        /** Recurring serial-visible decode period after the first boundary. */
+        uint32_t maintenance_period_tokens = 1;
     };
 
     struct DeviceMoERebalanceStatus
@@ -568,6 +582,22 @@ namespace llaminar2
         uint32_t skipped_post_load_spread_ceiling = 0;
         uint32_t payload_source_participant_mask = 0;
         uint32_t payload_destination_participant_mask = 0;
+        /**
+         * @brief Runtime layers that applied current-batch LLEP payload movement.
+         *
+         * This counter is derived from the dedicated device-runtime marker set
+         * only by plan entries carrying `kPlanFlagCurrentBatchLLEP`. Portable
+         * prefix rehydration, decode maintenance, and a transfer slot inherited
+         * from an earlier placement generation cannot satisfy it. Counting the
+         * markers at the existing request boundary therefore proves the real
+         * planner -> materializer -> transfer -> apply path without adding a
+         * per-layer D2H read or host-maintained coherence state.
+         *
+         * This field intentionally occupies the natural four-byte alignment
+         * gap before @ref payload_edge_mask, preserving the status ABI size and
+         * all following member offsets.
+         */
+        uint32_t prefill_current_batch_movement_layers = 0;
         uint64_t payload_edge_mask = 0;
         /**
          * @brief Sum of routed rows represented by every layer before this wave.

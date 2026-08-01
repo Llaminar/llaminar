@@ -69,6 +69,7 @@ namespace llaminar2
         bool stopped_on_output = false;
         bool all_speculative_accepted = true;
         bool sampled_terminal = false;
+        bool commit_boundary_clipped = false;
     };
 
     /**
@@ -93,6 +94,7 @@ namespace llaminar2
         bool all_speculative_accepted = true;
         int consumed_verifier_rows = 0;
         bool sampled_terminal = false;
+        bool commit_boundary_clipped = false;
 
         explicit MTPDeviceRejectionBatchOutcome(
             size_t output_capacity =

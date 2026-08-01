@@ -33,15 +33,13 @@ namespace
             return forward_success;
         }
 
-        bool forwardWithDeviceTokenIds(
+        bool forwardGroupedMTPVerifierWithDeviceTokenIds(
             const int *token_shadow,
             const void *token_ids_device,
-            int seq_len,
-            DeviceTokenForwardPurpose purpose) override
+            int seq_len) override
         {
             ++device_forward_count;
             last_device_token_ids = token_ids_device;
-            last_device_forward_purpose = purpose;
             last_forward_seq_len = seq_len;
             last_forward_tokens.assign(token_shadow, token_shadow + seq_len);
             return device_forward_success &&
@@ -152,8 +150,6 @@ namespace
         int last_forward_seq_len = 0;
         int last_padded_seq_len = 0;
         const void *last_device_token_ids = nullptr;
-        DeviceTokenForwardPurpose last_device_forward_purpose =
-            DeviceTokenForwardPurpose::MTPCondition;
         bool forward_success = true;
         bool device_forward_success = true;
         bool batch_forward_success = true;
@@ -281,9 +277,6 @@ TEST(Test__MTPVerifierForwardExecutor, SingleRequestCanUseDeviceTokenRow)
     EXPECT_EQ(runner.device_forward_count, 1);
     EXPECT_EQ(runner.batch_forward_count, 0);
     EXPECT_EQ(runner.last_device_token_ids, &fake_device_tokens);
-    EXPECT_EQ(
-        runner.last_device_forward_purpose,
-        DeviceTokenForwardPurpose::GroupedMTPVerifier);
     EXPECT_EQ(runner.last_forward_seq_len, 2);
     EXPECT_EQ(runner.last_forward_tokens, (std::vector<int>{17, 19}));
 }

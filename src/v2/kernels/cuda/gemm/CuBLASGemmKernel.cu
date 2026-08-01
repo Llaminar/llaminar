@@ -159,7 +159,7 @@ namespace llaminar2
                     std::to_string(static_cast<int>(lt_err)));
             }
 
-            LOG_DEBUG("[CuBLASGemmKernel] Created on device " << device_id_
+            LOG_TRACE("[CuBLASGemmKernel] Created on device " << device_id_
                                                               << " with precision "
                                                               << static_cast<int>(precision_)
                                                               << " (owns handle)");

@@ -579,7 +579,7 @@ namespace llaminar2
                 return;
             }
 
-            LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Using managed workspace buffers");
+            LOG_TRACE("[ROCmFlashAttentionKernelT<FP32>] Using managed workspace buffers");
         }
 
         void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::freeWorkspace()
@@ -1072,7 +1072,7 @@ namespace llaminar2
                      (kv_native_type == TensorType::Q8_1 && head_dim % 32 == 0)))
                 {
                     use_native_kv = true;
-                    LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Native "
+                    LOG_TRACE("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Native "
                               << K->dtype_name() << " KV path — skipping FP32 conversion");
                 }
                 else
@@ -1130,7 +1130,7 @@ namespace llaminar2
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] batch=" << batch_size
+            LOG_TRACE("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] batch=" << batch_size
                                                                                  << " seq_len=" << seq_len << " kv_len=" << kv_len
                                                                                  << " n_heads=" << n_heads << " n_kv_heads=" << n_kv_heads
                                                                                  << " head_dim=" << head_dim << " causal=" << causal
@@ -1982,7 +1982,7 @@ namespace llaminar2
             reqs.buffers.push_back({AttentionWorkspaceBuffers::K_TMP_FP32, kv_convert_bytes, 256, true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::V_TMP_FP32, kv_convert_bytes, 256, true});
 
-            LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>::getWorkspaceRequirements] "
+            LOG_TRACE("[ROCmFlashAttentionKernelT<FP32>::getWorkspaceRequirements] "
                       << "batch=" << batch_size << " n_heads=" << n_heads << " head_dim=" << head_dim
                       << " num_splits=" << num_splits
                       << " max_kv_len=" << max_kv_len
@@ -2001,7 +2001,7 @@ namespace llaminar2
             dynamic_attn_device_valid_ = false;
             if (workspace)
             {
-                LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Bound workspace manager, entering managed mode");
+                LOG_TRACE("[ROCmFlashAttentionKernelT<FP32>] Bound workspace manager, entering managed mode");
             }
             else
             {

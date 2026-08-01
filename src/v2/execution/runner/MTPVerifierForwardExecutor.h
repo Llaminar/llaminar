@@ -51,7 +51,8 @@ namespace llaminar2
      * and then chooses the matching runner entrypoint:
      *
      * - one request + host tokens -> `forward()`
-     * - one request + device token row -> `forwardWithDeviceTokenIds()`
+     * - one request + device token row ->
+     *   `forwardGroupedMTPVerifierWithDeviceTokenIds()`
      * - multiple requests + host tokens -> `forward_batch()`
      * - multiple requests + device token rows -> `forwardBatchWithDeviceTokenIds()`
      *

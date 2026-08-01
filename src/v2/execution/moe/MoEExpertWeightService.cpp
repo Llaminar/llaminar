@@ -927,7 +927,7 @@ namespace llaminar2
         if (!extract_views(ctx.down_exps, num_experts, "down", ctx.expert_down_views))
             return false;
 
-        LOG_DEBUG("[MoEWeightService] Extracted " << (extract_all ? num_experts : local_count) << "/" << num_experts
+        LOG_TRACE("[MoEWeightService] Extracted " << (extract_all ? num_experts : local_count) << "/" << num_experts
                                                   << " expert 2D views (expert-ID range [" << local_start
                                                   << ", " << local_end << ")"
                                                   << (extract_all ? " extract_all=true" : "") << ")");

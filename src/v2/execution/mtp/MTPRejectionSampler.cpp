@@ -781,6 +781,8 @@ namespace llaminar2
         device_outcome.consumed_verifier_rows =
             outcome.consumed_verifier_rows;
         device_outcome.sampled_terminal = outcome.sampled_terminal;
+        device_outcome.commit_boundary_clipped =
+            outcome.commit_boundary_clipped;
 
         return buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
             request,
@@ -837,6 +839,20 @@ namespace llaminar2
             return stochasticOutcomeFailure(
                 "device stochastic verifier sampled terminal token is invalid");
         }
+        if (device_outcome.commit_boundary_clipped &&
+            (device_outcome.ready_token < 0 ||
+             device_outcome.sampled_terminal ||
+             device_outcome.all_speculative_accepted ||
+             device_outcome.stopped_on_output ||
+             device_outcome.rejected_verified_token >= 0 ||
+             device_outcome.accepted_speculative_prefix !=
+                 device_outcome.consumed_verifier_rows ||
+             device_outcome.consumed_verifier_rows >=
+                 static_cast<int>(request.draft_tokens.size()) - 1))
+        {
+            return stochasticOutcomeFailure(
+                "device stochastic verifier commit-boundary outcome is inconsistent");
+        }
 
         MTPRejectionBatchOutcome result;
         result.ok = true;
@@ -869,6 +885,8 @@ namespace llaminar2
         result.all_speculative_accepted =
             device_outcome.all_speculative_accepted;
         result.sampled_terminal = device_outcome.sampled_terminal;
+        result.commit_boundary_clipped =
+            device_outcome.commit_boundary_clipped;
         return result;
     }
 

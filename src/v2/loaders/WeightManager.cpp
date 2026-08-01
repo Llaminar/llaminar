@@ -2583,7 +2583,7 @@ namespace llaminar2
 
         clone->setDebugName(name + "@" + target_device.to_string());
 
-        LOG_DEBUG("[WeightManager] Cloned tensor for " << target_device.to_string()
+        LOG_TRACE("[WeightManager] Cloned tensor for " << target_device.to_string()
                                                        << ": " << name << " ["
                                                        << original->shape()[0] << "x"
                                                        << (original->shape().size() > 1 ? original->shape()[1] : 1) << "]"
@@ -2592,7 +2592,7 @@ namespace llaminar2
         // Enhanced logging for non-GEMM weights (biases, norms) to debug multi-GPU pointer issues
         if (name.find("bias") != std::string::npos || name.find("norm") != std::string::npos)
         {
-            LOG_DEBUG("[WeightManager] NON-GEMM WEIGHT CLONE: " << name
+            LOG_TRACE("[WeightManager] NON-GEMM WEIGHT CLONE: " << name
                                                                 << " original_ptr=" << static_cast<const void *>(original->raw_data())
                                                                 << " clone_ptr=" << static_cast<const void *>(clone->raw_data())
                                                                 << " target_device=" << target_device.to_string()
@@ -4283,7 +4283,7 @@ namespace llaminar2
                             !include_expert_jobs &&
                             isRoutedExpertBinding(binding))
                         {
-                            LOG_DEBUG("[WeightManager] GPU pipeline: deferring routed expert binding "
+                            LOG_TRACE("[WeightManager] GPU pipeline: deferring routed expert binding "
                                       << binding.identity.canonical_name
                                       << " to explicit MoE expert preparation");
                         }
@@ -6192,7 +6192,7 @@ namespace llaminar2
                     skipped_count++;
                     retained_bytes += tensor_bytes;
                     retained_count++;
-                    LOG_DEBUG("[WeightManager] RETAINED host data for " << key
+                    LOG_TRACE("[WeightManager] RETAINED host data for " << key
                                                                         << " (" << (tensor_bytes / 1024) << " KB)"
                                                                         << " deviceValid=" << ptr->deviceValid()
                                                                         << " hasPreparedDeviceState=" << ptr->hasPreparedDeviceState()
@@ -6733,7 +6733,7 @@ namespace llaminar2
                     fp32_full->data() + slice_start,
                     slice_count * sizeof(float));
 
-        LOG_DEBUG("[WeightManager] Device " << device.to_string()
+        LOG_TRACE("[WeightManager] Device " << device.to_string()
                                             << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
                                             << " column-parallel 1D " << name
                                             << " [" << total_size << "]"
@@ -6805,7 +6805,7 @@ namespace llaminar2
         column_slice.inner_is_presliced = true;
         registerDerivedMetadata(name, result, WeightDerivationKind::RowSlice, column_slice, device);
 
-        LOG_DEBUG("[WeightManager] Device " << device.to_string()
+        LOG_TRACE("[WeightManager] Device " << device.to_string()
                                             << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
                                             << " column-parallel " << name
                                             << " [" << total_rows << ", " << cols << "]"
@@ -6984,7 +6984,7 @@ namespace llaminar2
         fused_slice.inner_is_presliced = true;
         registerDerivedMetadata(name, result, WeightDerivationKind::FusedSubblockConcat, fused_slice, device);
 
-        LOG_DEBUG("[WeightManager] Device " << device.to_string()
+        LOG_TRACE("[WeightManager] Device " << device.to_string()
                                             << " (rank " << rank << "/" << world_size << ")"
                                             << " fused-QKV column-parallel " << name
                                             << " [" << total_rows << ", " << cols << "]"
@@ -7037,7 +7037,7 @@ namespace llaminar2
         row_slice.inner_is_presliced = true;
         registerDerivedMetadata(name, result, WeightDerivationKind::RowSlice, row_slice, device);
 
-        LOG_DEBUG("[WeightManager] Device " << device.to_string()
+        LOG_TRACE("[WeightManager] Device " << device.to_string()
                                             << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
                                             << " row-parallel " << name
                                             << " [" << total_rows << ", " << cols << "]"
@@ -7105,7 +7105,7 @@ namespace llaminar2
         input_slice.inner_is_presliced = true;
         registerDerivedMetadata(name, result, WeightDerivationKind::ColumnSlice, input_slice, device);
 
-        LOG_DEBUG("[WeightManager] Device " << device.to_string()
+        LOG_TRACE("[WeightManager] Device " << device.to_string()
                                             << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
                                             << " input-parallel " << name
                                             << " [" << rows << ", " << total_cols << "]"
@@ -7153,7 +7153,7 @@ namespace llaminar2
                     return it->second;
                 }
 
-                LOG_DEBUG("[WeightManager] Ignoring stale per-device cache entry without TP slice metadata: "
+                LOG_TRACE("[WeightManager] Ignoring stale per-device cache entry without TP slice metadata: "
                           << cache_key << " mode=" << static_cast<int>(mode)
                           << " tensor=" << it->second.get());
                 per_device_cache_.erase(it);
@@ -7229,7 +7229,7 @@ namespace llaminar2
                         device.to_string(),
                         {{"weight_role", toString(inferWeightRole(name))}});
                 }
-                LOG_DEBUG("[WeightManager] Sharing host-resident REPLICATE weight: " << name
+                LOG_TRACE("[WeightManager] Sharing host-resident REPLICATE weight: " << name
                                                                                      << " for " << device.to_string()
                                                                                      << " (" << (result->size_bytes() / (1024 * 1024)) << " MB)");
             }
@@ -7254,7 +7254,7 @@ namespace llaminar2
                 auto embd_dims = loader_.getTensorShape("token_embd.weight");
                 if (embd_dims && embd_dims->size() == 2)
                 {
-                    LOG_DEBUG("[WeightManager] Device " << device.to_string()
+                    LOG_TRACE("[WeightManager] Device " << device.to_string()
                                                         << " output.weight not in GGUF — using tied embedding "
                                                         << "token_embd.weight as column-parallel LM head");
 
@@ -7286,7 +7286,7 @@ namespace llaminar2
                     tied_slice.inner_is_presliced = true;
                     registerDerivedMetadata(name, result, WeightDerivationKind::TiedAlias, tied_slice, device);
 
-                    LOG_DEBUG("[WeightManager] Device " << device.to_string()
+                    LOG_TRACE("[WeightManager] Device " << device.to_string()
                                                         << " tied embedding LM head"
                                                         << " [" << total_rows << ", " << cols << "]"
                                                         << " -> rows [" << row_start << ", " << (row_start + row_count) << ")"
@@ -7400,7 +7400,7 @@ namespace llaminar2
             expert_slice.inner_is_presliced = true;
             registerDerivedMetadata(name, result, WeightDerivationKind::ExpertSlice, expert_slice, device);
 
-            LOG_DEBUG("[WeightManager] Device " << device.to_string()
+            LOG_TRACE("[WeightManager] Device " << device.to_string()
                                                 << " expert-id-apportioned " << name
                                                 << " [" << dims[0] << ", " << dims[1] << ", " << ne2
                                                 << "] -> experts [" << expert_start << ", "

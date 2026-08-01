@@ -64,7 +64,8 @@ namespace llaminar2
             int batch_size,
             DeviceId device,
             void *device_state_publication_stream,
-            const int32_t *sequence_lengths_device = nullptr) override;
+            const int32_t *sequence_lengths_device = nullptr,
+            const int32_t *absolute_position_ids_device = nullptr) override;
 
         ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
             DeviceId device) override;

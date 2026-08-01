@@ -137,6 +137,16 @@ namespace llaminar2
         /// Export and hash every GPU-resident local/full GDN state bank.
         bool hash_gdn_device_state = false;
 
+        /**
+         * @brief Hash the one-row terminal logits and MTP hidden mailboxes.
+         *
+         * These buffers are the bridge from a completed prefill or prefix
+         * restore into the first decode/MTP transaction.  Their hashes are
+         * opt-in because observing GPU-owned bytes requires a diagnostic D2H
+         * result transfer.  Production inference never enables this policy.
+         */
+        bool hash_terminal_state = false;
+
         /// Retain raw CPU-owned GDN values for tolerance-aware diagnostics.
         bool capture_gdn_values = false;
 
@@ -304,6 +314,12 @@ namespace llaminar2
         uint64_t prefill_chunk_real_tokens = 0;
         uint64_t prefill_chunk_padded_tokens = 0;
         uint64_t prefill_chunk_failures = 0;
+        bool terminal_hidden_hash_available = false;
+        size_t terminal_hidden_bytes = 0;
+        uint64_t terminal_hidden_hash = 0;
+        bool terminal_logits_hash_available = false;
+        size_t terminal_logits_bytes = 0;
+        uint64_t terminal_logits_hash = 0;
         PrefixCacheRequestSummary prefix_request;
         MTPRequestSummary mtp_request;
         std::vector<int> positions;

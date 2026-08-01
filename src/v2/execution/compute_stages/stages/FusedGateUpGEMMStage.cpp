@@ -97,7 +97,7 @@ namespace llaminar2
     {
         ScopedGemmContext gemm_ctx(GemmContext::FFN);
 
-        LOG_DEBUG("[FusedGateUpGEMMStage] Execute: m=" << params_.m << " k=" << params_.k
+        LOG_TRACE("[FusedGateUpGEMMStage] Execute: m=" << params_.m << " k=" << params_.k
                                                        << " n_gate=" << params_.n_gate << " n_up=" << params_.n_up);
 
         if (!ctx)
@@ -234,7 +234,7 @@ namespace llaminar2
             }
         }
 
-        LOG_DEBUG("[FusedGateUpGEMMStage] Complete");
+        LOG_TRACE("[FusedGateUpGEMMStage] Complete");
         return true;
     }
 

@@ -1469,7 +1469,7 @@ namespace llaminar2
                     return std::nullopt;
                 }
 
-                LOG_DEBUG("[Qwen35MoEGraph] Device-side MoE rebalance will collect histogram and compact "
+                LOG_TRACE("[Qwen35MoEGraph] Device-side MoE rebalance will collect histogram and compact "
                           "arrival metadata "
                           "with the async maintenance graph on "
                           << destination_device.to_string()
@@ -2359,6 +2359,8 @@ namespace llaminar2
         table_config.top_k = config_.moe.top_k;
         table_config.mirror_to_device = true;
         table_config.prefill_token_capacity = planned_route_rows;
+        table_config.deferred_verifier_token_capacity =
+            key_suffix.empty() && config_.mtp.enabled ? verifier_rows : 0;
         table_config.serial_route_scratch_arena = scratch_it->second;
 
         auto table = std::make_unique<MoERuntimeTable>(table_config);
@@ -2481,6 +2483,8 @@ namespace llaminar2
         config.buffer_name_to_id["moe_expert_indices"] = BufferId::MOE_EXPERT_INDICES;
         config.buffer_name_to_id["moe_expert_weights"] = BufferId::MOE_EXPERT_WEIGHTS;
         config.buffer_name_to_id["moe_combined_output"] = BufferId::MOE_COMBINED_OUTPUT;
+        config.buffer_name_to_id["moe_canonical_route_contributions"] =
+            BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
         config.buffer_name_to_id["moe_shared_expert_output"] = BufferId::MOE_SHARED_EXPERT_OUTPUT;
         config.buffer_name_to_id["moe_gate_scratch"] = BufferId::MOE_GATE_SCRATCH;
         config.buffer_name_to_id["moe_up_scratch"] = BufferId::MOE_UP_SCRATCH;
@@ -2506,7 +2510,8 @@ namespace llaminar2
         int batch_size,
         DeviceId device,
         void *device_state_publication_stream,
-        const int32_t *sequence_lengths_device)
+        const int32_t *sequence_lengths_device,
+        const int32_t *absolute_position_ids_device)
     {
         if (device.is_gpu() && !device_state_publication_stream)
         {
@@ -2526,7 +2531,8 @@ namespace llaminar2
                 batch_size,
                 device,
                 device_state_publication_stream,
-                sequence_lengths_device);
+                sequence_lengths_device,
+                absolute_position_ids_device);
         }
 
         ComputeGraph graph;
@@ -3134,6 +3140,56 @@ namespace llaminar2
                 overlay_plan ? continuationRootParticipant(*overlay_plan) : 0);
             rebalance_config.window_size_tokens = static_cast<uint32_t>(
                 std::max(1, config_.moe.rebalance_config.window_size));
+            const int maintenance_slack =
+                config_.moe.rebalance_config.device_maintenance_slack_tokens >= 0
+                    ? std::max(
+                          0,
+                          config_.moe.rebalance_config
+                              .device_maintenance_slack_tokens)
+                    : std::max(
+                          0,
+                          env.moe_rebalance
+                              .device_rebalance_maintenance_slack_tokens);
+            const int requested_maintenance_period =
+                std::max(
+                    1,
+                    static_cast<int>(rebalance_config.window_size_tokens) +
+                        maintenance_slack);
+            const int configured_minimum_period =
+                config_.moe.rebalance_config
+                            .device_min_maintenance_period_tokens >= 0
+                    ? std::max(
+                          0,
+                          config_.moe.rebalance_config
+                              .device_min_maintenance_period_tokens)
+                    : std::max(
+                          0,
+                          env.moe_rebalance
+                              .device_rebalance_min_maintenance_period_tokens);
+            const int maintenance_period =
+                configured_minimum_period > 0
+                    ? std::max(
+                          requested_maintenance_period,
+                          configured_minimum_period)
+                    : requested_maintenance_period;
+            const int configured_initial_period =
+                config_.moe.rebalance_config
+                            .device_initial_maintenance_period_tokens >= 0
+                    ? std::max(
+                          0,
+                          config_.moe.rebalance_config
+                              .device_initial_maintenance_period_tokens)
+                    : std::max(
+                          0,
+                          env.moe_rebalance
+                              .device_rebalance_initial_maintenance_period_tokens);
+            rebalance_config.maintenance_period_tokens =
+                static_cast<uint32_t>(maintenance_period);
+            rebalance_config.initial_maintenance_period_tokens =
+                static_cast<uint32_t>(
+                    configured_initial_period > 0
+                        ? configured_initial_period
+                        : maintenance_period);
             rebalance_config.max_hot_replicas_per_participant = static_cast<uint32_t>(
                 std::min(hot_replica_cap, config_.moe.num_experts));
             rebalance_config.dynamic_imbalance_threshold_per_mille =
@@ -4319,6 +4375,10 @@ namespace llaminar2
             route_params.moe_runtime_table = moe_runtime_table;
             route_params.force_grouped_verifier_prefill_for_decode =
                 forceGroupedMoEVerifierPrefill(device);
+            route_params.absolute_position_ids_device =
+                device.is_gpu()
+                    ? absolute_position_ids_device
+                    : nullptr;
             route_params.routed_pipeline_kernel_owner =
                 routed_pipeline_kernel_owner;
             route_params.force_decode_equivalent_verifier_prefill =
@@ -4394,6 +4454,10 @@ namespace llaminar2
         // Stage 3: MoE Expert Compute (routed expert SwiGLU FFN)
         // =====================================================================
         TensorBase *moe_output = buffers.get(buffers.idFor(BufferId::MOE_COMBINED_OUTPUT));
+        TensorBase *canonical_route_contributions =
+            buffers.get(
+                buffers.idFor(
+                    BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS));
         TensorBase *shared_output = buffers.get(buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT));
         bool shared_gate_writes_combined_output = false;
         std::string shared_ffn_last; // Track last shared expert stage (empty if no shared expert)
@@ -4420,24 +4484,14 @@ namespace llaminar2
             return config_.tp_ctx && config_.tp_ctx->degree() > 1;
         };
         /*
-         * LocalTP apportioned-overlay decode reduces the routed branch and the
-         * gated shared branch once after they have been locally combined.  MTP
-         * all-position verifier rows must use the same branch topology as
-         * serial decode; otherwise the shared gate can see a full allreduced
-         * shared output while serial decode gates a local partial before the
-         * combined allreduce.  That order difference is numerically visible in
-         * row logits, so keep the combined-allreduce path active for verifier
-         * batches as well as ordinary decode.
+         * LocalTP expert ownership must never shape the FP32 route addition
+         * tree. GPU apportioned paths therefore publish every original route
+         * into an independent slot, allreduce those slots in FP32, and reduce
+         * them in router order on device. The shared expert retains its normal
+         * allreduce-then-gate arithmetic and is combined only after the routed
+         * reducer completes.
          */
-        const bool can_defer_local_tp_moe_allreduce_to_combined =
-            needsMoEParticipantAllreduce() &&
-            needsTPAllreduce() &&
-            has_shared_expert_branch &&
-            layer.shared_expert_gate_inp &&
-            planned_shared_device == device &&
-            moe_output &&
-            buffers.attn_proj;
-        bool deferred_local_tp_moe_allreduce_to_combined = false;
+        bool canonical_local_tp_route_publication = false;
 
         {
             auto makeExpertParams = [&](TensorBase *output,
@@ -4477,8 +4531,14 @@ namespace llaminar2
                     masked_local_tp_apportioned_decode_runtime_table;
                 expert_params.force_grouped_verifier_prefill_for_decode =
                     forceGroupedMoEVerifierPrefill(stage_device);
+                expert_params.defer_grouped_verifier_histogram_publication =
+                    forceGpuSmallMMainVerifierPrefill(stage_device);
                 expert_params.force_decode_equivalent_verifier_prefill =
                     forceDecodeEquivalentMoEVerifier(stage_device);
+                expert_params.absolute_position_ids_device =
+                    stage_device.is_gpu()
+                        ? absolute_position_ids_device
+                        : nullptr;
                 expert_params.my_socket_id = std::max(0, config_.tp_device_idx);
                 expert_params.participant_count =
                     local_tp_ctx && local_tp_ctx->degree() > 0
@@ -4495,7 +4555,8 @@ namespace llaminar2
                         current_batch_llep_transfer_candidate
                             ? PrefillLLEPAssignmentMode::
                                   TransferBackedCurrentBatch
-                            : PrefillLLEPAssignmentMode::ResidentOnly;
+                            : PrefillLLEPAssignmentMode::
+                                  LogicalPositionResidentOnly;
                 }
 
                 if (config_.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned)
@@ -4643,7 +4704,7 @@ namespace llaminar2
                             }
                         }
 
-                        LOG_DEBUG("[Qwen35MoEGraph] Layer " << layer_idx
+                        LOG_TRACE("[Qwen35MoEGraph] Layer " << layer_idx
                                                             << ": populated expert GEMM engines from registry"
                                                             << (domain_scoped ? " domain=" + registry_domain_name : std::string())
                                                             << " complete_layer=" << complete_layer
@@ -4737,7 +4798,8 @@ namespace llaminar2
                         current_batch_llep_transfer_candidate
                             ? PrefillLLEPAssignmentMode::
                                   TransferBackedCurrentBatch
-                            : PrefillLLEPAssignmentMode::ResidentOnly;
+                            : PrefillLLEPAssignmentMode::
+                                  LogicalPositionResidentOnly;
                 }
                 const std::string domain_name = local_tp_fast_tier ? local_tp_fast_tier->domain : std::string{};
                 if (!prepareExpertParams(
@@ -4835,6 +4897,26 @@ namespace llaminar2
                     }
                 }
 
+                canonical_local_tp_route_publication =
+                    needsMoEParticipantAllreduce() &&
+                    needsTPAllreduce() &&
+                    device.is_gpu();
+                if (canonical_local_tp_route_publication)
+                {
+                    if (!canonical_route_contributions)
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE LocalTP canonical route buffer is missing for layer " +
+                            std::to_string(layer_idx) + " on " +
+                            device.to_string());
+                    }
+                    expert_params.canonical_route_contributions =
+                        canonical_route_contributions;
+                    expert_params.canonical_route_contributions_buffer_id =
+                        buffers.idFor(
+                            BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS);
+                }
+
                 graph.addNode(prefix + "moe_expert_ffn_overlay_fast",
                               ComputeStageFactory::createMoEExpertCompute(expert_params),
                               device);
@@ -4850,59 +4932,118 @@ namespace llaminar2
 
                 if (needsMoEParticipantAllreduce())
                 {
-                    if (can_defer_local_tp_moe_allreduce_to_combined)
+                    TensorBase *allreduce_buffer =
+                        canonical_local_tp_route_publication
+                            ? canonical_route_contributions
+                            : moe_output;
+                    const BufferId allreduce_buffer_id =
+                        canonical_local_tp_route_publication
+                            ? buffers.idFor(
+                                  BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS)
+                            : buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+                    const size_t allreduce_count =
+                        static_cast<size_t>(total_tokens) *
+                        static_cast<size_t>(config_.d_model) *
+                        (canonical_local_tp_route_publication
+                             ? static_cast<size_t>(config_.moe.top_k)
+                             : size_t{1});
+                    const std::string ar_name =
+                        canonical_local_tp_route_publication
+                            ? prefix + "moe_canonical_routes_allreduce"
+                            : prefix + "moe_expert_overlay_fast_allreduce";
+                    auto rebalance_sidebands =
+                        takeGraphRebalanceSidebandsForAllreduce();
+                    auto allreduce_stage = createTPAllreduceStage(
+                        allreduce_buffer,
+                        allreduce_count,
+                        device,
+                        layer_idx,
+                        /*is_attention=*/false,
+                        ar_name,
+                        allreduce_buffer_id,
+                        std::move(rebalance_sidebands),
+                        canonical_local_tp_route_publication
+                            ? std::optional<std::string>{"fp32"}
+                            : std::nullopt);
+                    if (!allreduce_stage)
                     {
-                        deferred_local_tp_moe_allreduce_to_combined = true;
+                        throw std::runtime_error(
+                            "Qwen35 MoE graph could not create the required "
+                            "LocalTP routed-expert allreduce for layer " +
+                            std::to_string(layer_idx));
+                    }
+                    graph.addNode(ar_name, std::move(allreduce_stage), device);
+                    /*
+                     * The canonical route collective consumes the expert
+                     * kernel's per-route publication directly.  Keep that
+                     * producer edge explicit even when rebalance state is
+                     * piggybacked on the same collective; the collect-state
+                     * node is an additional producer, not a substitute for
+                     * the tensor producer.  This makes it structurally
+                     * impossible for later rebalance graph changes to let the
+                     * collective race ahead of the route contribution write.
+                     */
+                    graph.addDependency(
+                        ar_name,
+                        prefix + "moe_expert_ffn_overlay_fast");
+                    if (!graph_rebalance_collect_node.empty())
+                    {
+                        graph.addDependency(
+                            ar_name,
+                            graph_rebalance_collect_node);
+                    }
+                    if (graph_rebalance_plan_after_sideband_params.has_value() &&
+                        !graph_rebalance_plan_after_sideband_node.empty())
+                    {
+                        graph.addNode(
+                            graph_rebalance_plan_after_sideband_node,
+                            ComputeStageFactory::createMoEDeviceRebalance(
+                                *graph_rebalance_plan_after_sideband_params),
+                            device);
+                        graph.addDependency(
+                            graph_rebalance_plan_after_sideband_node,
+                            ar_name);
+                        ffn_terminal =
+                            graph_rebalance_plan_after_sideband_node;
+                        graph_rebalance_plan_after_sideband_node.clear();
+                        graph_rebalance_plan_after_sideband_params.reset();
                     }
                     else
                     {
-                        const size_t allreduce_count =
-                            static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
-                        const std::string ar_name = prefix + "moe_expert_overlay_fast_allreduce";
-                        auto rebalance_sidebands = takeGraphRebalanceSidebandsForAllreduce();
-                        auto allreduce_stage = createTPAllreduceStage(
-                            moe_output,
-                            allreduce_count,
-                            device,
-                            layer_idx,
-                            /*is_attention=*/false,
-                            ar_name,
-                            buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
-                            std::move(rebalance_sidebands));
-                        if (allreduce_stage)
-                        {
-                            graph.addNode(ar_name, std::move(allreduce_stage), device);
-                            graph.addDependency(ar_name,
-                                                graph_rebalance_collect_node.empty()
-                                                    ? prefix + "moe_expert_ffn_overlay_fast"
-                                                    : graph_rebalance_collect_node);
-                            if (graph_rebalance_plan_after_sideband_params.has_value() &&
-                                !graph_rebalance_plan_after_sideband_node.empty())
-                            {
-                                graph.addNode(
-                                    graph_rebalance_plan_after_sideband_node,
-                                    ComputeStageFactory::createMoEDeviceRebalance(
-                                        *graph_rebalance_plan_after_sideband_params),
-                                    device);
-                                graph.addDependency(
-                                    graph_rebalance_plan_after_sideband_node,
-                                    ar_name);
-                                ffn_terminal = graph_rebalance_plan_after_sideband_node;
-                                graph_rebalance_plan_after_sideband_node.clear();
-                                graph_rebalance_plan_after_sideband_params.reset();
-                            }
-                            else
-                            {
-                                ffn_terminal = ar_name;
-                            }
-                            maybeAddGraphRebalancePayloadStageAfterSideband(
-                                ar_name,
-                                ffn_terminal);
-                        }
+                        ffn_terminal = ar_name;
+                    }
+                    maybeAddGraphRebalancePayloadStageAfterSideband(
+                        ar_name,
+                        ffn_terminal);
+
+                    if (canonical_local_tp_route_publication)
+                    {
+                        MoECanonicalRouteReduceStage::Params reduce_params;
+                        reduce_params.device_id = device;
+                        reduce_params.canonical_route_contributions =
+                            canonical_route_contributions;
+                        reduce_params.output = moe_output;
+                        reduce_params.seq_len = total_tokens;
+                        reduce_params.top_k = config_.moe.top_k;
+                        reduce_params.d_model = config_.d_model;
+                        reduce_params.canonical_route_contributions_buffer_id =
+                            allreduce_buffer_id;
+                        reduce_params.output_buffer_id =
+                            buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+
+                        const std::string reduce_name =
+                            prefix + "moe_canonical_routes_reduce";
+                        graph.addNode(
+                            reduce_name,
+                            ComputeStageFactory::createMoECanonicalRouteReduce(
+                                reduce_params),
+                            device);
+                        graph.addDependency(reduce_name, ffn_terminal);
+                        ffn_terminal = reduce_name;
                     }
                 }
 
-                LOG_DEBUG("[Qwen35MoEGraph] Layer " << layer_idx
+                LOG_TRACE("[Qwen35MoEGraph] Layer " << layer_idx
                                                     << " using LocalTP expert-ID-apportioned fast path on "
                                                     << device.to_string()
                                                     << " participant=" << local_participant
@@ -5313,7 +5454,8 @@ namespace llaminar2
                         current_batch_llep_transfer_candidate
                             ? PrefillLLEPAssignmentMode::
                                   TransferBackedCurrentBatch
-                            : PrefillLLEPAssignmentMode::ResidentOnly;
+                            : PrefillLLEPAssignmentMode::
+                                  LogicalPositionResidentOnly;
                 }
                 if (!prepareExpertParams(expert_params, device))
                 {
@@ -5458,7 +5600,7 @@ namespace llaminar2
                 const auto &continuation_domain = overlay_runtime_plan->continuationDomain();
                 const auto &shared_domain = overlay_runtime_plan->sharedExpertDomain();
 
-                LOG_DEBUG("[Qwen35MoEGraph] Layer " << layer_idx
+                LOG_TRACE("[Qwen35MoEGraph] Layer " << layer_idx
                                                     << " shared expert uses domain " << shared_domain.name
                                                     << " on " << shared_device.to_string()
                                                     << "; final output returns to continuation domain "
@@ -5584,16 +5726,10 @@ namespace llaminar2
             }
             shared_ffn_last = prefix + "shared_expert_ffn";
 
-            const bool fuse_shared_gate_then_combined_allreduce =
-                deferred_local_tp_moe_allreduce_to_combined &&
-                shared_device == device &&
-                moe_output &&
-                buffers.attn_proj;
-
-            // Allreduce after shared expert down projection (InputParallel sharding),
-            // unless the LocalTP expert-ID-apportioned path will combine routed and
-            // gated shared partials locally and reduce that single combined buffer.
-            if (needsTPAllreduce() && !fuse_shared_gate_then_combined_allreduce)
+            // Input-parallel shared-expert down rows are reduced before the
+            // replicated sigmoid gate, preserving the serial LocalTP branch
+            // arithmetic independently of routed-expert placement.
+            if (needsTPAllreduce())
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
                 std::string ar_name = prefix + "shared_expert_allreduce";
@@ -5625,8 +5761,7 @@ namespace llaminar2
                     !needsTPAllreduce() && shared_device == device &&
                     moe_output && buffers.attn_proj;
                 const bool gate_writes_combined_output =
-                    can_fuse_gate_and_combine ||
-                    fuse_shared_gate_then_combined_allreduce;
+                    can_fuse_gate_and_combine;
 
                 SharedExpertGateStage::Params gate_params;
                 gate_params.device_id = shared_device;
@@ -5657,55 +5792,7 @@ namespace llaminar2
                     shared_gate_writes_combined_output = true;
                 }
                 shared_ffn_last = prefix + "shared_expert_gate";
-                if (fuse_shared_gate_then_combined_allreduce)
-                {
-                    const size_t allreduce_count =
-                        static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
-                    const std::string ar_name = prefix + "moe_combined_allreduce";
-                    auto rebalance_sidebands = takeGraphRebalanceSidebandsForAllreduce();
-                    auto allreduce_stage = createTPAllreduceStage(
-                        buffers.attn_proj,
-                        allreduce_count,
-                        device,
-                        layer_idx,
-                        /*is_attention=*/false,
-                        ar_name,
-                        buffers.idFor(BufferId::ATTN_PROJ),
-                        std::move(rebalance_sidebands));
-                    if (!allreduce_stage)
-                    {
-                        throw std::runtime_error(
-                            "Qwen35 MoE graph failed to create combined MoE TP allreduce for layer " +
-                            std::to_string(layer_idx));
-                    }
-                    graph.addNode(ar_name, std::move(allreduce_stage), device);
-                    graph.addDependency(ar_name, prefix + "shared_expert_gate");
-                    if (!graph_rebalance_collect_node.empty())
-                        graph.addDependency(ar_name, graph_rebalance_collect_node);
-                    if (graph_rebalance_plan_after_sideband_params.has_value() &&
-                        !graph_rebalance_plan_after_sideband_node.empty())
-                    {
-                        graph.addNode(
-                            graph_rebalance_plan_after_sideband_node,
-                            ComputeStageFactory::createMoEDeviceRebalance(
-                                *graph_rebalance_plan_after_sideband_params),
-                            device);
-                        graph.addDependency(
-                            graph_rebalance_plan_after_sideband_node,
-                            ar_name);
-                        ffn_terminal = graph_rebalance_plan_after_sideband_node;
-                        graph_rebalance_plan_after_sideband_node.clear();
-                        graph_rebalance_plan_after_sideband_params.reset();
-                    }
-                    else
-                    {
-                        ffn_terminal = ar_name;
-                    }
-                    maybeAddGraphRebalancePayloadStageAfterSideband(
-                        ar_name,
-                        ffn_terminal);
-                }
-                else if (shared_gate_writes_combined_output)
+                if (shared_gate_writes_combined_output)
                 {
                     ffn_terminal = prefix + "shared_expert_gate";
                 }

@@ -62,6 +62,9 @@ extern "C" void rocmGemv_native_vnni_set_tuning_overrides(
 
 extern "C" void rocmGemv_native_vnni_reset_tuning_overrides();
 
+extern "C" void rocmGemv_native_vnni_set_serial_partition_n(int n);
+extern "C" int rocmGemv_native_vnni_get_serial_partition_n();
+
 extern "C" bool rocmGemv_native_vnni_query_serial_m1_config(
     uint8_t codebook_id,
     int N,
@@ -122,6 +125,29 @@ namespace
             const ScopedROCmNativeVNNITuningOverride &) = delete;
         ScopedROCmNativeVNNITuningOverride &operator=(
             const ScopedROCmNativeVNNITuningOverride &) = delete;
+    };
+
+    class ScopedROCmSerialPartitionPolicy final
+    {
+    public:
+        explicit ScopedROCmSerialPartitionPolicy(int n)
+            : previous_(rocmGemv_native_vnni_get_serial_partition_n())
+        {
+            rocmGemv_native_vnni_set_serial_partition_n(n);
+        }
+
+        ~ScopedROCmSerialPartitionPolicy()
+        {
+            rocmGemv_native_vnni_set_serial_partition_n(previous_);
+        }
+
+        ScopedROCmSerialPartitionPolicy(
+            const ScopedROCmSerialPartitionPolicy &) = delete;
+        ScopedROCmSerialPartitionPolicy &operator=(
+            const ScopedROCmSerialPartitionPolicy &) = delete;
+
+    private:
+        int previous_ = 0;
     };
 #endif
 
@@ -3947,6 +3973,107 @@ TEST(Test__ROCmQuantisedGemmSmallM, ProductionSerialM1RouteTelemetryMatchesResol
                {"kernel.rocm_native_vnni_small_m_launch"}, 20);
 
     PerfStatsCollector::reset();
+}
+
+/**
+ * @test Mirrored Qwen3.6 LM-head dispatch inherits serial LocalTP geometry.
+ *
+ * Qwen3.6-35B-A3B uses a 2048-wide hidden state and an IQ3_S LM head.  Keep
+ * this sentinel on that exact production geometry.  The current learned table
+ * happens to choose the same launch for its full and half-vocabulary widths,
+ * so this case proves the production contract without manufacturing a false
+ * requirement that those two policy entries differ.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM,
+     MirroredQwen36IQ3SLMHeadUsesSerialShardArithmeticPolicy)
+{
+    constexpr uint8_t IQ3_S_CODEBOOK = 11;
+    constexpr int FULL_N = 248320;
+    constexpr int SERIAL_PARTITION_N = 124160;
+    constexpr int K = 2048;
+
+    int serial_kb = 0;
+    int serial_waves = 0;
+    ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config(
+        IQ3_S_CODEBOOK,
+        SERIAL_PARTITION_N,
+        K,
+        &serial_kb,
+        &serial_waves));
+
+    int mirrored_kb = 0;
+    int mirrored_waves = 0;
+    {
+        ScopedROCmSerialPartitionPolicy serial_partition_scope(
+            SERIAL_PARTITION_N);
+        ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config(
+            IQ3_S_CODEBOOK,
+            FULL_N,
+            K,
+            &mirrored_kb,
+            &mirrored_waves));
+    }
+
+    EXPECT_EQ(mirrored_kb, serial_kb);
+    EXPECT_EQ(mirrored_waves, serial_waves);
+    EXPECT_EQ(rocmGemv_native_vnni_get_serial_partition_n(), 0);
+}
+
+/**
+ * @test The serial-partition scope overrides a genuinely distinct policy key.
+ *
+ * This companion uses the Qwen3.6 dense hidden width, where the generated
+ * table currently distinguishes full- and half-vocabulary geometry.  It proves
+ * that the scope changes selector lookup rather than merely restoring a
+ * thread-local integer after an otherwise identical production selection.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM,
+     MirroredLMHeadSerialPartitionOverridesDistinctGeneratedPolicy)
+{
+    constexpr uint8_t IQ3_S_CODEBOOK = 11;
+    constexpr int FULL_N = 248320;
+    constexpr int SERIAL_PARTITION_N = 124160;
+    constexpr int K = 5120;
+
+    int serial_kb = 0;
+    int serial_waves = 0;
+    ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config(
+        IQ3_S_CODEBOOK,
+        SERIAL_PARTITION_N,
+        K,
+        &serial_kb,
+        &serial_waves));
+
+    int unconstrained_kb = 0;
+    int unconstrained_waves = 0;
+    ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config(
+        IQ3_S_CODEBOOK,
+        FULL_N,
+        K,
+        &unconstrained_kb,
+        &unconstrained_waves));
+    ASSERT_TRUE(
+        unconstrained_kb != serial_kb ||
+        unconstrained_waves != serial_waves)
+        << "The distinct-policy sentinel must be updated when generated "
+           "dispatch converges for this geometry";
+
+    int mirrored_kb = 0;
+    int mirrored_waves = 0;
+    {
+        ScopedROCmSerialPartitionPolicy serial_partition_scope(
+            SERIAL_PARTITION_N);
+        ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config(
+            IQ3_S_CODEBOOK,
+            FULL_N,
+            K,
+            &mirrored_kb,
+            &mirrored_waves));
+    }
+
+    EXPECT_EQ(mirrored_kb, serial_kb);
+    EXPECT_EQ(mirrored_waves, serial_waves);
+    EXPECT_EQ(rocmGemv_native_vnni_get_serial_partition_n(), 0);
 }
 
 /**

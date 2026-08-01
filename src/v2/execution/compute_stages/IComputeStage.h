@@ -294,6 +294,7 @@ namespace llaminar2
         MOE_EXPERT_FFN,
         MOE_SHARED_EXPERT_FFN,      ///< Shared expert FFN (distinct from per-expert MOE_EXPERT_FFN)
         MOE_SHARED_EXPERT_GATE,     ///< Shared expert sigmoid gate
+        MOE_CANONICAL_ROUTE_REDUCE, ///< Router-ordered LocalTP contribution reduction
         MOE_EXPERT_DISPATCH,        ///< Routed-row dispatch descriptor builder
         MOE_SPARSE_DISPATCH,        ///< Graph-native sparse MoE payload dispatch
         MOE_LOCAL_EXPERT,           ///< Participant-local sparse MoE expert compute

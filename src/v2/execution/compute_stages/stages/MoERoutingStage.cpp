@@ -742,7 +742,8 @@ namespace llaminar2
                     params_.device_rebalance_apply_layer_idx == -2
                         ? params_.layer_idx
                         : params_.device_rebalance_apply_layer_idx,
-                    params_.device_rebalance_command_buffer_count);
+                    params_.device_rebalance_command_buffer_count,
+                    params_.absolute_position_ids_device);
             }
             else
             {
@@ -759,7 +760,8 @@ namespace llaminar2
                     params_.output_indices,
                     params_.output_weights,
                     /*write_legacy_outputs=*/true,
-                    /*update_runtime_histogram=*/true);
+                    /*update_runtime_histogram=*/true,
+                    params_.absolute_position_ids_device);
             }
 
             if (!routed)

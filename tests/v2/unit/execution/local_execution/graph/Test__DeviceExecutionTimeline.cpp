@@ -120,6 +120,11 @@ namespace llaminar2::test
         EXPECT_TRUE(
             reuse.to(DeviceTimelineRole::RequestAdmissionTransfer)
                 .validForConsumption());
+        EXPECT_TRUE(
+            reuse.to(DeviceTimelineRole::MainForwardGraph)
+                .validForConsumption())
+            << "A device-owned serial-decode position snapshot must wait for "
+               "the previous graph before rewriting the stable position row.";
         EXPECT_FALSE(
             reuse.to(DeviceTimelineRole::MTPSidecarGraph)
                 .validForConsumption())
