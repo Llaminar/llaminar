@@ -70,6 +70,7 @@
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -3245,8 +3246,29 @@ namespace llaminar2
             reset_transaction.enter(
                 RequestStateResetTransaction::Phase::
                     ClearDeferredPublications);
-            mtp_terminal_hidden_row_select_cache_.invalidate();
-            mtp_terminal_hidden_rows_select_cache_.invalidate();
+            /*
+             * Request reset mutates contents behind model-lifetime arena and
+             * workspace addresses. Preserve the terminal-hidden publication
+             * graphs just like the sidecar graphs above; workspace-generation
+             * or tensor-identity changes are the only valid invalidation
+             * boundaries and are handled during graph-family materialization.
+             */
+            mtp_terminal_hidden_row_select_cache_.resetSessionState();
+            mtp_terminal_hidden_rows_select_cache_.resetSessionState();
+            for (auto &cache :
+                 mtp_terminal_hidden_contiguous_rows_select_caches_)
+            {
+                if (cache)
+                    cache->resetSessionState();
+            }
+            for (auto &cache :
+                 mtp_terminal_hidden_device_accepted_rows_select_caches_)
+            {
+                if (cache)
+                    cache->resetSessionState();
+            }
+            mtp_terminal_hidden_request_rows_select_cache_
+                .resetSessionState();
             last_pos_offset_ = -1;
             defer_next_mtp_main_decode_sync_ = false;
             defer_all_position_verifier_sync_ = false;
@@ -3937,6 +3959,12 @@ namespace llaminar2
 
         /** Queue live-state publication waits before any forward graph reads live KV/GDN state. */
         bool prepareLiveStateForForwardGraphExecution(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device) override;
+
+        /** Complete the exact-stream live-state reader transaction begun by the prelude. */
+        bool completeLiveStateForForwardGraphExecution(
             const ForwardInput &input,
             void *execution_stream,
             DeviceId execution_device) override;
@@ -5115,7 +5143,6 @@ namespace llaminar2
             RejectedCorrection,
             PrefixRestore,
             PrefixTruncate,
-            ShiftedMTPKVUpdate,
             SessionReset,
         };
 
@@ -5153,23 +5180,6 @@ namespace llaminar2
          * handoff rule easy to audit.
          */
         void resetMTPSidecarDepth0ReplayState();
-        /**
-         * @brief Advance the replay epoch after shifted MTP KV changes.
-         *
-         * A shifted MTP KV append does not change the main request position,
-         * main KV cache, or recurrent state. It does, however, change the
-         * auxiliary state read by multi-row MTP verifier graphs. Dense and MoE
-         * sidecars own persistent dynamic storage; MoE routing state is also
-         * depth-scoped. The ready event published by the shifted-row producer
-         * is therefore the ordering boundary, and no graph executable is
-         * invalidated.
-         *
-         * The method must not clear deferred all-position verifier state
-         * readiness. Accepted-state publication can legally follow a shifted
-         * KV commit and still must wait on the verifier's row-snapshot event
-         * before restoring GDN/KV/short-conv rows.
-         */
-        void recordShiftedMTPKVReplayStateMutation(const char *operation);
         /**
          * @brief Prepare the shifted MTP KV boundary consumed by one commit.
          *
@@ -5870,8 +5880,13 @@ namespace llaminar2
             int seq_capacity = 0;
             int d_model = 0;
             int selected_row_count = 0;
+            int fixed_contiguous_row_start = 0;
+            int request_row_stride = 0;
+            const int32_t *request_sequence_lengths_device = nullptr;
             std::string row_buffer_name;
-            bool external_row_metadata = false;
+            HiddenStateRowsSelectStage::DeviceRowIndexSource row_index_source =
+                HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                    StageOwnedIndices;
             bool valid = false;
 
             /**
@@ -5905,14 +5920,38 @@ namespace llaminar2
                 seq_capacity = 0;
                 d_model = 0;
                 selected_row_count = 0;
+                fixed_contiguous_row_start = 0;
+                request_row_stride = 0;
+                request_sequence_lengths_device = nullptr;
                 row_buffer_name.clear();
-                external_row_metadata = false;
+                row_index_source =
+                    HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                        StageOwnedIndices;
                 valid = false;
             }
         };
 
         MTPTerminalHiddenRowSelectGraphCache mtp_terminal_hidden_row_select_cache_;
+        /// CPU/direct-fixture arbitrary-row selector. Production GPU paths use one of the typed caches below.
         MTPTerminalHiddenRowsSelectGraphCache mtp_terminal_hidden_rows_select_cache_;
+        /// One immutable row-zero suffix graph per MTP catchup width, materialized before request execution.
+        std::vector<std::unique_ptr<MTPTerminalHiddenRowsSelectGraphCache>>
+            mtp_terminal_hidden_contiguous_rows_select_caches_;
+        /**
+         * @brief Exact-request-count device-indexed accepted-state publication graphs.
+         *
+         * Captured row-selection kernels have immutable launch geometry. Replaying
+         * a maximum-capacity graph for a smaller request batch would consume
+         * inactive accepted-row indices and publish terminal-hidden rows that do
+         * not belong to the transaction. Keep one graph per legal request count
+         * so capture geometry and publication ownership are identical by type.
+         * None of these graphs owns pinned host row metadata.
+         */
+        std::vector<std::unique_ptr<MTPTerminalHiddenRowsSelectGraphCache>>
+            mtp_terminal_hidden_device_accepted_rows_select_caches_;
+        /// Device-length-indexed request-terminal graph for padded request batches.
+        MTPTerminalHiddenRowsSelectGraphCache
+            mtp_terminal_hidden_request_rows_select_cache_;
 
         /**
          * @brief Device-checkpoint bank written by the last successful hidden producer.
@@ -6294,6 +6333,7 @@ namespace llaminar2
         {
             std::shared_ptr<void> event;
             void *producer_stream = nullptr;
+            uint64_t mutation_generation = 0;
             bool valid = false;
         };
 
@@ -6499,6 +6539,19 @@ namespace llaminar2
             std::shared_ptr<void> stop_event;
         };
 
+        /**
+         * @brief Maximum number of GPU streams reading one logical-state publication.
+         *
+         * This bounds stream topology, not MTP depth or request count. Repeated
+         * readers on one stream reuse that stream's completion lane, so
+         * arbitrary work on the same stream still occupies one slot. Sixteen
+         * lanes cover the main, sidecar, sampling, checkpoint, maintenance, and
+         * result streams with growth room while keeping every event allocated
+         * before graph capture. Exhaustion is a fatal topology error.
+         */
+        static constexpr size_t
+            kDeviceResidentLogicalStateReaderStreamCapacity = 16;
+
         std::vector<StochasticSampleReadyState> stochastic_target_sample_ready_;
         std::vector<StochasticSampleReadyState> stochastic_draft_sample_ready_;
         PendingShiftedMTPKVReadyState shifted_mtp_kv_ready_;
@@ -6525,6 +6578,10 @@ namespace llaminar2
             device_resident_mtp_transaction_ready_event_;
         std::shared_ptr<void>
             device_resident_logical_sequence_state_ready_event_;
+        std::array<
+            std::shared_ptr<void>,
+            kDeviceResidentLogicalStateReaderStreamCapacity>
+            device_resident_logical_state_reader_completion_events_;
         std::vector<std::shared_ptr<void>>
             mtp_outcome_response_ready_event_pool_;
         std::vector<PersistentGpuTimingEventPair>
@@ -6815,6 +6872,200 @@ namespace llaminar2
             device_resident_logical_sequence_state_storage_;
 
         /**
+         * @brief Operation that most recently published the resident logical row.
+         *
+         * The arena addresses are intentionally stable across the request lifetime,
+         * so an address alone cannot identify which kernel transaction produced the
+         * values currently protected by the mailbox event.  Keeping provenance as a
+         * closed enum makes diagnostics and lifecycle assertions exhaustive whenever
+         * a new publication path is introduced.
+         */
+        enum class DeviceResidentLogicalStatePublicationKind : uint8_t
+        {
+            RequestBatchConditionAdvance,
+            DiagnosticRestoreRebind,
+            TargetSampleInitialization,
+            AcceptedSpecState,
+            MainBatchSampleInitialization,
+        };
+
+        /// Return the stable diagnostic name for one typed publication operation.
+        static const char *deviceResidentLogicalStatePublicationKindName(
+            DeviceResidentLogicalStatePublicationKind kind);
+
+        /**
+         * @brief Ordered boundaries preserved by the device-only MTP state tracer.
+         *
+         * The tracer is intentionally phase based rather than call-site based.
+         * Each phase answers one ownership question in the publication
+         * transaction: did derivation produce valid rows, did the mailbox expose
+         * those rows, and did either asynchronous graph family change them? A
+         * closed inventory keeps future publication phases from silently
+         * disappearing from failure reports.
+         */
+        enum class DeviceResidentLogicalStateDiagnosticPhase : size_t
+        {
+            PrimaryDerive = 0,
+            MailboxPublished,
+            MaintenanceEntry,
+            MaintenanceExit,
+            SidecarEntry,
+            SidecarExit,
+            ObservationMailboxReady,
+            ObservationPrefixCheckpointJoined,
+            ObservationPublishedHandoffsJoined,
+            ObservationGraphProducersJoined,
+            ObservationMTPTransactionJoined,
+            Count,
+        };
+
+        /** @brief Canonical logical-state rows copied at every diagnostic phase. */
+        enum class DeviceResidentLogicalStateDiagnosticField : size_t
+        {
+            TargetCachedTokens = 0,
+            AcceptedStateCounts,
+            NextConditionTokens,
+            AllDraftsAcceptedFlags,
+            StoppedFlags,
+            PublicationOkFlags,
+            Count,
+        };
+
+        /// Return the stable diagnostic label for one device snapshot phase.
+        static const char *deviceResidentLogicalStateDiagnosticPhaseName(
+            DeviceResidentLogicalStateDiagnosticPhase phase);
+
+        /// Return the stable diagnostic label for one copied logical-state row.
+        static const char *deviceResidentLogicalStateDiagnosticFieldName(
+            DeviceResidentLogicalStateDiagnosticField field);
+
+        /**
+         * @brief Persistent phase-major storage for device-only MTP diagnostics.
+         *
+         * Rows are laid out as `[phase][slot][field][request]`. The allocation is
+         * optional and exists only when
+         * `LLAMINAR_MTP_DEVICE_PHASE_SNAPSHOTS=1` was present at runner
+         * initialization. Snapshotting uses only ordered D2D copies; this owner
+         * never establishes a host mirror or participates in production
+         * dispatch.
+         */
+        struct DeviceResidentLogicalStateDiagnosticStorage
+        {
+            static constexpr size_t kPhaseCount =
+                static_cast<size_t>(
+                    DeviceResidentLogicalStateDiagnosticPhase::Count);
+            static constexpr size_t kFieldCount =
+                static_cast<size_t>(
+                    DeviceResidentLogicalStateDiagnosticField::Count);
+            /**
+             * @brief Unique destinations available to each phase.
+             *
+             * Reusing one destination across asynchronous producer streams
+             * would require a stream wait and could hide the missing edge being
+             * diagnosed. Four thousand monotonic slots cover the focused
+             * transaction reproduction while keeping the optional allocation
+             * small. Exhaustion fails the diagnostic instead of wrapping and
+             * perturbing production ordering.
+             */
+            static constexpr size_t kSlotsPerPhase = 4096;
+            static constexpr size_t kSnapshotRowCount =
+                kPhaseCount * kSlotsPerPhase * kFieldCount;
+
+            /**
+             * @brief Rows reserved for one coherent deep-probe publication.
+             *
+             * Direct tiny D2H operations from the live arena owner are not a
+             * supported observation contract. A deep probe first copies the
+             * complete seven-row publication here on its ordered stream, then
+             * exports this diagnostic allocation at an explicit result boundary.
+             */
+            static constexpr size_t kProbeStagingRowCount =
+                DeviceResidentLogicalSequenceStateStorage::kFieldCount;
+
+            static constexpr size_t kRowCount =
+                kSnapshotRowCount + kProbeStagingRowCount;
+
+            int request_capacity = 0;
+            int32_t *base_device = nullptr;
+
+            /** @brief Bind the phase table to one arena-owned device block. */
+            bool bind(void *base, int capacity)
+            {
+                clear();
+                if (!base || capacity <= 0)
+                    return false;
+                base_device = static_cast<int32_t *>(base);
+                request_capacity = capacity;
+                return true;
+            }
+
+            /** @brief Return true when the allocation covers a request batch. */
+            bool validFor(int request_count) const
+            {
+                return base_device != nullptr &&
+                       request_count > 0 &&
+                       request_count <= request_capacity;
+            }
+
+            /** @brief Resolve one phase/field destination row. */
+            int32_t *row(
+                DeviceResidentLogicalStateDiagnosticPhase phase,
+                size_t slot,
+                DeviceResidentLogicalStateDiagnosticField field) const
+            {
+                if (!base_device)
+                    return nullptr;
+                const size_t phase_index = static_cast<size_t>(phase);
+                const size_t field_index = static_cast<size_t>(field);
+                if (phase_index >= kPhaseCount ||
+                    slot >= kSlotsPerPhase ||
+                    field_index >= kFieldCount)
+                    return nullptr;
+                const size_t row_index =
+                    (phase_index * kSlotsPerPhase + slot) * kFieldCount +
+                    field_index;
+                return base_device +
+                       row_index * static_cast<size_t>(request_capacity);
+            }
+
+            /** @brief First row of the deep-probe staging region. */
+            int32_t *probeStagingBase() const
+            {
+                if (!base_device)
+                    return nullptr;
+                return base_device +
+                       kSnapshotRowCount *
+                           static_cast<size_t>(request_capacity);
+            }
+
+            /** @brief Retire the binding without releasing arena storage. */
+            void clear()
+            {
+                *this = {};
+            }
+        };
+
+        /**
+         * @brief Event and provenance for one reusable diagnostic phase slot.
+         *
+         * Every record names a monotonic destination slot. The event can be
+         * re-recorded without coupling producer streams because no destination
+         * is reused. The latest event and slot are sufficient for the fatal
+         * observer to materialize the newest value.
+         */
+        struct DeviceResidentLogicalStateDiagnosticRecord
+        {
+            std::shared_ptr<void> ready_event;
+            void *producer_stream = nullptr;
+            int request_count = 0;
+            uint64_t live_state_epoch = 0;
+            uint64_t publication_generation = 0;
+            size_t slot = 0;
+            size_t snapshot_count = 0;
+            bool valid = false;
+        };
+
+        /**
          * @brief Event-fenced view of arena-owned logical sequence state.
          *
          * DGO treats target cached tokens as both the next logical position and
@@ -6836,6 +7087,9 @@ namespace llaminar2
             void *producer_stream = nullptr;
             std::shared_ptr<void> ready_event;
             uint64_t live_state_epoch = 0;
+            uint64_t publication_generation = 0;
+            DeviceResidentLogicalStatePublicationKind publication_kind =
+                DeviceResidentLogicalStatePublicationKind::MainBatchSampleInitialization;
 
             bool valid() const
             {
@@ -6878,7 +7132,8 @@ namespace llaminar2
                        handle.stopped_flags_device == stopped_flags_device &&
                        handle.publication_ok_flags_device == publication_ok_flags_device &&
                        handle.stream == producer_stream &&
-                       handle.ready_event == ready_event.get();
+                       handle.ready_event == ready_event.get() &&
+                       handle.publication_generation == publication_generation;
             }
 
             void clear()
@@ -6888,6 +7143,218 @@ namespace llaminar2
         };
         DeviceResidentLogicalSequenceStateMailbox
             device_resident_logical_sequence_state_mailbox_;
+
+        /**
+         * @brief Host admission gate for one reusable device logical-state bank.
+         *
+         * The lock is held only while host code enqueues a reader and records
+         * that reader's completion event. It never spans GPU completion. A
+         * writer takes the exclusive side long enough to close admission and
+         * queue fan-in waits, then the explicit pending-writer state keeps new
+         * readers out until the replacement mailbox event is published.
+         */
+        struct DeviceResidentLogicalStateAdmissionSynchronization
+        {
+            std::shared_mutex admission_mutex;
+            std::mutex reader_completion_mutex;
+        };
+        std::unique_ptr<DeviceResidentLogicalStateAdmissionSynchronization>
+            device_resident_logical_state_admission_sync_ =
+                std::make_unique<
+                    DeviceResidentLogicalStateAdmissionSynchronization>();
+
+        /**
+         * @brief In-flight replacement of the reusable logical-state rows.
+         *
+         * This is a fail-closed transaction. Once active, every reader is
+         * rejected until recordDeviceResidentLogicalSequenceStateMailbox()
+         * publishes the exact replacement stream/event edge. Any abandoned
+         * writer therefore stops inference instead of exposing partially
+         * overwritten rows.
+         */
+        struct PendingDeviceResidentLogicalStateWriter
+        {
+            void *stream = nullptr;
+            uint64_t replaced_publication_generation = 0;
+            const char *writer_name = nullptr;
+
+            bool valid() const
+            {
+                return stream != nullptr;
+            }
+
+            void begin(
+                void *writer_stream,
+                uint64_t replaced_generation,
+                const char *name)
+            {
+                stream = writer_stream;
+                replaced_publication_generation = replaced_generation;
+                writer_name = name;
+            }
+
+            void clear()
+            {
+                *this = {};
+            }
+        } pending_device_resident_logical_state_writer_;
+
+        /**
+         * @brief One preallocated completion lane in a publication read epoch.
+         *
+         * Readers on one stream are already ordered by that stream, so its
+         * newest event record subsumes every earlier read. Readers on different
+         * streams own different events and never wait one another. The
+         * replacement writer performs the only fan-in.
+         */
+        struct DeviceResidentLogicalStateReaderCompletion
+        {
+            void *stream = nullptr;
+            uint64_t publication_generation = 0;
+            uint64_t completion_sequence = 0;
+
+            bool validFor(uint64_t generation) const
+            {
+                return stream != nullptr &&
+                       publication_generation == generation &&
+                       completion_sequence > 0;
+            }
+
+            void clear()
+            {
+                *this = {};
+            }
+        };
+
+        /**
+         * @brief Fan-out/fan-in epoch protecting reusable logical-state rows.
+         *
+         * The immutable publication event is the root of the epoch. Every
+         * asynchronous reader waits only that root and publishes completion to
+         * its own preallocated stream lane. A replacement writer waits the root
+         * plus every occupied reader lane before its first store. The epoch
+         * survives mailbox retirement because clearing a typed handle cannot
+         * cancel device work that is already in flight.
+         */
+        struct DeviceResidentLogicalStateAccessEpoch
+        {
+            void *producer_stream = nullptr;
+            std::shared_ptr<void> publication_ready_event;
+            uint64_t publication_generation = 0;
+            uint64_t access_sequence = 0;
+            size_t reader_stream_count = 0;
+            std::array<
+                DeviceResidentLogicalStateReaderCompletion,
+                kDeviceResidentLogicalStateReaderStreamCapacity>
+                reader_completions{};
+
+            bool valid() const
+            {
+                return producer_stream != nullptr &&
+                       publication_ready_event != nullptr &&
+                       publication_generation > 0 && access_sequence > 0 &&
+                       reader_stream_count <= reader_completions.size();
+            }
+
+            void begin(
+                void *stream,
+                std::shared_ptr<void> ready_event,
+                uint64_t generation)
+            {
+                producer_stream = stream;
+                publication_ready_event = std::move(ready_event);
+                publication_generation = generation;
+                ++access_sequence;
+                reader_stream_count = 0;
+                for (auto &completion : reader_completions)
+                    completion.clear();
+            }
+
+            void clear()
+            {
+                *this = {};
+            }
+        } device_resident_logical_state_access_epoch_;
+
+        /**
+         * @brief Fixed-storage transaction for one forward graph mailbox read.
+         *
+         * The forward prelude and graph launch are separated by engine-owned
+         * dynamic-parameter work, so a lexical DGO read scope cannot span them.
+         * This state carries only the exact stream and publication generation;
+         * it performs no allocation and is cleared only after the engine's
+         * mandatory post-launch completion hook records the stream's reader
+         * completion lane.
+         */
+        struct PendingDeviceResidentLogicalStateForwardRead
+        {
+            void *stream = nullptr;
+            uint64_t publication_generation = 0;
+            std::shared_lock<std::shared_mutex> admission_lock;
+
+            bool valid() const
+            {
+                return stream != nullptr && publication_generation > 0 &&
+                       admission_lock.owns_lock();
+            }
+
+            void clear()
+            {
+                admission_lock = {};
+                stream = nullptr;
+                publication_generation = 0;
+            }
+        } pending_device_resident_logical_state_forward_read_;
+
+        /**
+         * @brief Scope one asynchronous reader of the reusable mailbox rows.
+         *
+         * Construction queues the reader behind the immutable publication-ready
+         * event, never behind another reader. Destruction records completion in
+         * the exact stream's preallocated epoch lane, including early-return
+         * paths. The replacement writer then waits every occupied lane. A
+         * completion-publication failure is fatal because allowing inference to
+         * continue would permit a later writer to race an unknown in-flight
+         * device read.
+         */
+        class DeviceResidentLogicalStateReadScope
+        {
+        public:
+            DeviceResidentLogicalStateReadScope(
+                DeviceGraphOrchestrator &owner,
+                void *stream,
+                const char *consumer_name);
+            ~DeviceResidentLogicalStateReadScope() noexcept;
+
+            DeviceResidentLogicalStateReadScope(
+                const DeviceResidentLogicalStateReadScope &) = delete;
+            DeviceResidentLogicalStateReadScope &operator=(
+                const DeviceResidentLogicalStateReadScope &) = delete;
+            DeviceResidentLogicalStateReadScope(
+                DeviceResidentLogicalStateReadScope &&) = delete;
+            DeviceResidentLogicalStateReadScope &operator=(
+                DeviceResidentLogicalStateReadScope &&) = delete;
+
+            bool ready() const { return ready_; }
+            bool complete() noexcept;
+
+        private:
+            DeviceGraphOrchestrator *owner_ = nullptr;
+            void *stream_ = nullptr;
+            const char *consumer_name_ = nullptr;
+            uint64_t publication_generation_ = 0;
+            std::shared_lock<std::shared_mutex> admission_lock_;
+            bool ready_ = false;
+            bool active_ = false;
+        };
+
+        uint64_t device_resident_logical_state_publication_generation_ = 0;
+        DeviceResidentLogicalStateDiagnosticStorage
+            device_resident_logical_state_diagnostic_storage_;
+        std::array<
+            DeviceResidentLogicalStateDiagnosticRecord,
+            DeviceResidentLogicalStateDiagnosticStorage::kPhaseCount>
+            mutable device_resident_logical_state_diagnostic_records_;
 
         /**
          * @brief Persistent request-session owner for device-resident MTP KV state.
@@ -7111,8 +7578,18 @@ namespace llaminar2
         uint64_t live_state_rejected_corrections_ = 0;
         uint64_t live_state_prefix_restores_ = 0;
         uint64_t live_state_prefix_truncates_ = 0;
-        uint64_t live_state_shifted_mtp_kv_updates_ = 0;
         uint64_t live_state_session_resets_ = 0;
+        /**
+         * @brief Generation of auxiliary shifted-MTP KV publications.
+         *
+         * Shifted sidecar KV is not main live state: appending it changes no
+         * main KV row, request position, recurrent state, terminal hidden row,
+         * or captured graph binding. Its producer event and this generation
+         * therefore form an independent lifecycle domain. Keeping it separate
+         * prevents an auxiliary append from invalidating a still-current
+         * device-resident logical-state mailbox.
+         */
+        uint64_t shifted_mtp_kv_mutation_generation_ = 0;
         LivePrefixMutationReason last_live_state_mutation_reason_ =
             LivePrefixMutationReason::Unknown;
         std::string last_live_state_mutation_operation_;
@@ -7326,6 +7803,51 @@ namespace llaminar2
             int seq_len,
             void *stream = nullptr);
 
+        /**
+         * @brief Materialize all GPU terminal-hidden publication graph objects.
+         *
+         * This runs after the largest-participant workspace family has fixed
+         * arena and workspace addresses. It builds one immutable contiguous
+         * catchup graph for every supported row count plus one fixed-capacity
+         * device-accepted graph. Decode execution treats a missing or stale
+         * cache as fatal instead of allocating or rebuilding in the hot path.
+         */
+        bool materializeMTPTerminalHiddenPublicationGraphs(
+            int request_count,
+            int request_row_stride);
+
+        /**
+         * @brief Build one typed GPU rows-select graph against current bindings.
+         *
+         * @param cache Destination cache whose previous graph is replaced during setup.
+         * @param node_name Stable graph/node diagnostic name.
+         * @param row_index_source Fixed contiguous or external-device source policy.
+         * @param selected_row_count Immutable output row capacity.
+         * @param fixed_contiguous_row_start Immutable first row for fixed-range mode.
+         * @param row_buffer_name Workspace row-index buffer for external mode.
+         */
+        bool materializeMTPTerminalHiddenRowsSelectGraph(
+            MTPTerminalHiddenRowsSelectGraphCache &cache,
+            const char *node_name,
+            HiddenStateRowsSelectStage::DeviceRowIndexSource row_index_source,
+            int selected_row_count,
+            int fixed_contiguous_row_start = 0,
+            const char *row_buffer_name = nullptr,
+            int request_row_stride = 0);
+
+        /**
+         * @brief Publish one terminal row per padded GPU request from resident lengths.
+         *
+         * The graph reads `REQUEST_SEQUENCE_LENGTHS` directly and is materialized
+         * with the matching request-batch geometry before execution. No host
+         * request-length vector or row-index upload participates in refresh.
+         */
+        bool selectMTPTerminalHiddenRowsFromDeviceRequestLengths(
+            int request_count,
+            int request_row_stride,
+            int total_rows,
+            void *stream);
+
         /// Execute a cached graph-native arbitrary hidden-row select into an MTP buffer.
         bool executeMTPHiddenRowsSelect(
             TensorBase *input,
@@ -7491,7 +8013,43 @@ namespace llaminar2
         bool recordDeviceResidentLogicalSequenceStateMailbox(
             int request_count,
             void *producer_stream,
+            DeviceResidentLogicalStatePublicationKind publication_kind,
             std::string *error = nullptr);
+
+        /**
+         * @brief Preserve one event-ordered logical-state phase on the device.
+         *
+         * When the opt-in phase tracer is disabled this is a no-op. Otherwise
+         * the method copies every canonical logical-state row D2D into the
+         * phase table and records the phase's preallocated event. It performs
+         * no allocation, H2D/D2H transfer, event wait on the host, stream
+         * synchronization, or device synchronization.
+         *
+         * @param phase Typed transaction boundary being preserved.
+         * @param producer_stream Exact stream that observes the source rows.
+         * @param request_count Number of valid request entries in each row.
+         * @param publication_generation Publication generation represented by
+         *        the source rows; callers may name the next generation before
+         *        the mailbox object itself is installed.
+         */
+        void snapshotDeviceResidentLogicalStatePhase(
+            DeviceResidentLogicalStateDiagnosticPhase phase,
+            void *producer_stream,
+            int request_count,
+            uint64_t publication_generation) const;
+
+        /**
+         * @brief Materialize device phase history at an already-fatal boundary.
+         *
+         * This is the only host-visible operation in the phase tracer. The
+         * caller has already observed invalid production metadata and is about
+         * to throw; the method joins each phase event onto @p observation_stream,
+         * copies the tiny fixed table once, and returns a compact provenance
+         * string for the fatal error. It is never called during successful
+         * inference.
+         */
+        std::string materializeDeviceResidentLogicalStatePhaseDiagnostics(
+            void *observation_stream) const;
 
         /**
          * @brief Admit one external request into persistent GPU-owned input rows.
@@ -7639,10 +8197,36 @@ namespace llaminar2
             int request_count,
             void *producer_stream);
 
-        /// Queue a stream wait for resident logical-state metadata, if present.
-        bool waitForDeviceResidentLogicalSequenceStateMailbox(
+        /**
+         * @brief Queue a reader behind the current publication producer.
+         *
+         * Reader admission waits only the mailbox's immutable ready event. It
+         * must never wait another reader because read/read overlap is safe and
+         * useful. DeviceResidentLogicalStateReadScope publishes eventual
+         * completion to an independent per-stream lane after its work instead.
+         */
+        bool admitDeviceResidentLogicalSequenceStateRead(
             void *consumer_stream,
-            const char *consumer_name);
+            const char *consumer_name,
+            uint64_t *publication_generation,
+            std::shared_lock<std::shared_mutex> *admission_lock);
+
+        /**
+         * @brief Queue a writer after every reader of the reusable state rows.
+         *
+         * Unlike the mailbox-reader wait, this consults the persistent access
+         * fence even after the typed mailbox has been retired. Writers must
+         * call it before their first store, not immediately before publication.
+         */
+        bool waitForDeviceResidentLogicalSequenceStateRowReuse(
+            void *writer_stream,
+            const char *writer_name);
+
+        /** @brief Publish one reader's final device operation into its epoch lane. */
+        bool recordDeviceResidentLogicalSequenceStateReadCompletion(
+            void *consumer_stream,
+            const char *consumer_name,
+            uint64_t publication_generation);
 
         /**
          * @brief Queue an observation-only wait for resident logical-state metadata.

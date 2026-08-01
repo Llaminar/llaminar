@@ -130,6 +130,7 @@ namespace llaminar2
         bool trace_generated_tokens = false;  ///< Trace streamed/generated token text when LLAMINAR_TRACE_GENERATED_TOKENS is truthy.
         bool moe_grouped_verifier_snapshot_diagnostic = false; ///< Emit grouped MoE verifier routing-row diagnostics.
         bool mtp_publication_diagnostics = false; ///< Emit opt-in device-owned MTP/KV publication diagnostics.
+        bool mtp_device_phase_snapshots = false; ///< Preserve device-only logical-state phase snapshots until a fatal diagnostic boundary.
         bool mtp_condition_graph_contract_trace = false; ///< Trace only the participant/cache/graph lifecycle of resident MTP condition advances.
         bool cuda_gdn_pointer_trace = false;      ///< Emit CUDA GDN grouped-row pointer diagnostics.
         bool allow_numa_bind_fallback = false; ///< Allow requested NUMA bind failures to continue when explicitly enabled.
@@ -160,6 +161,8 @@ namespace llaminar2
                 readTruthy("LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_DIAGNOSTIC");
             mtp_publication_diagnostics =
                 readTruthy("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS");
+            mtp_device_phase_snapshots =
+                readTruthy("LLAMINAR_MTP_DEVICE_PHASE_SNAPSHOTS");
             mtp_condition_graph_contract_trace =
                 readTruthy(
                     "LLAMINAR_MTP_CONDITION_GRAPH_CONTRACT_TRACE");

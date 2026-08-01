@@ -170,6 +170,63 @@ TEST(Test__BufferArena, ArenaBindingsInstallStableBufferDebugNames)
     EXPECT_EQ(owned->debugName(), "MTP_VERIFIER_INPUT_TOKENS");
 }
 
+/**
+ * @brief Address diagnostics must expose real ranges in numeric order.
+ *
+ * Out-of-bounds GPU diagnostics depend on identifying the buffers immediately
+ * below and above a suspect allocation. The formatter is tested independently
+ * of logging so a logger-level change cannot silently remove that evidence.
+ */
+TEST(Test__BufferArena, AllocationAddressMapSortsRealBufferRanges)
+{
+    BufferArena arena;
+    ASSERT_TRUE(arena.registerBuffer(
+        BufferId::REQUEST_POSITION_IDS,
+        1,
+        16,
+        "INT32",
+        DeviceId::cpu()));
+    ASSERT_TRUE(arena.registerBuffer(
+        BufferId::MTP_LOGICAL_SEQUENCE_STATE,
+        7,
+        1,
+        "INT32",
+        DeviceId::cpu()));
+    ASSERT_TRUE(arena.allocate());
+
+    const auto *positions =
+        arena.getTensor(BufferId::REQUEST_POSITION_IDS);
+    const auto *logical_state =
+        arena.getTensor(BufferId::MTP_LOGICAL_SEQUENCE_STATE);
+    ASSERT_NE(positions, nullptr);
+    ASSERT_NE(logical_state, nullptr);
+
+    const uintptr_t positions_address =
+        reinterpret_cast<uintptr_t>(positions->raw_data());
+    const uintptr_t logical_state_address =
+        reinterpret_cast<uintptr_t>(logical_state->raw_data());
+    const std::string map = arena.allocationAddressMap();
+
+    EXPECT_NE(map.find("Allocation address map"), std::string::npos);
+    EXPECT_NE(map.find("device=CPU"), std::string::npos);
+    EXPECT_NE(map.find("name=REQUEST_POSITION_IDS"), std::string::npos);
+    EXPECT_NE(map.find("name=MTP_LOGICAL_SEQUENCE_STATE"),
+              std::string::npos);
+    EXPECT_NE(map.find("range=[0x"), std::string::npos);
+    EXPECT_NE(map.find("ownership=arena"), std::string::npos);
+    EXPECT_NE(map.find("space=host"), std::string::npos);
+    EXPECT_NE(map.find("shape=7x1"), std::string::npos);
+
+    const size_t positions_offset =
+        map.find("name=REQUEST_POSITION_IDS");
+    const size_t logical_state_offset =
+        map.find("name=MTP_LOGICAL_SEQUENCE_STATE");
+    if (positions_address < logical_state_address)
+        EXPECT_LT(positions_offset, logical_state_offset);
+    else
+        EXPECT_LT(logical_state_offset, positions_offset);
+}
+
 TEST(Test__BufferArena, BindExternalBufferRejectsArenaOwnedSlot)
 {
     BufferArena arena;

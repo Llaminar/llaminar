@@ -632,6 +632,33 @@ namespace llaminar2
         struct GraphSegmentCache
         {
             /**
+             * @brief One preallocated asynchronous GPU replay timing interval.
+             *
+             * Timing events are backend resources, so they are created during
+             * graph warmup and retained for the cache lifetime. Replay only
+             * records the two existing events and changes this small host-side
+             * state record; it never allocates, destroys, or synchronizes an
+             * event. A completed interval is reclaimed with a nonblocking event
+             * query before the slot is reused.
+             */
+            struct ReplayGpuTimingSlot
+            {
+                enum class Scope
+                {
+                    TotalReplay,
+                    ReplayUnit
+                };
+
+                void *start_event = nullptr;
+                void *stop_event = nullptr;
+                Scope scope = Scope::TotalReplay;
+                size_t replay_unit_index = 0;
+                bool deferred_final_fence = false;
+                bool started = false;
+                bool pending = false;
+            };
+
+            /**
              * @brief Controls whether reset() keeps the explicit capture stream alive.
              *
              * Preserve is used for recapture/retry state resets where cached stages
@@ -663,6 +690,9 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx_ref = nullptr; ///< GPU context for stream lifecycle (not owned)
             DeviceId capture_device = DeviceId::invalid(); ///< Device used to resolve the stream owner at teardown
             bool capture_context_from_pool = false; ///< True when the stream was created by the pool context
+            std::vector<ReplayGpuTimingSlot> replay_gpu_timing_slots; ///< Fixed event ring allocated before capture
+            std::string replay_gpu_timing_device_name; ///< Stable PerfStats device label for completed slots
+            uint64_t replay_gpu_timing_busy_samples = 0; ///< Replays intentionally not sampled while every slot is in flight
 
             GraphSegmentCache() = default;
             ~GraphSegmentCache()
@@ -685,7 +715,10 @@ namespace llaminar2
                   sync_event(other.sync_event),
                   gpu_ctx_ref(other.gpu_ctx_ref),
                   capture_device(other.capture_device),
-                  capture_context_from_pool(other.capture_context_from_pool)
+                  capture_context_from_pool(other.capture_context_from_pool),
+                  replay_gpu_timing_slots(std::move(other.replay_gpu_timing_slots)),
+                  replay_gpu_timing_device_name(std::move(other.replay_gpu_timing_device_name)),
+                  replay_gpu_timing_busy_samples(other.replay_gpu_timing_busy_samples)
             {
                 other.capture_stream = nullptr;
                 other.sync_event = nullptr;
@@ -695,6 +728,9 @@ namespace llaminar2
                 other.capture_variant_signature = 0;
                 other.variant_recapture_count = 0;
                 other.snapshot_configuration_epoch = 0;
+                other.replay_gpu_timing_slots.clear();
+                other.replay_gpu_timing_device_name.clear();
+                other.replay_gpu_timing_busy_samples = 0;
             }
             GraphSegmentCache &operator=(GraphSegmentCache &&other) noexcept
             {
@@ -715,6 +751,9 @@ namespace llaminar2
                     gpu_ctx_ref = other.gpu_ctx_ref;
                     capture_device = other.capture_device;
                     capture_context_from_pool = other.capture_context_from_pool;
+                    replay_gpu_timing_slots = std::move(other.replay_gpu_timing_slots);
+                    replay_gpu_timing_device_name = std::move(other.replay_gpu_timing_device_name);
+                    replay_gpu_timing_busy_samples = other.replay_gpu_timing_busy_samples;
                     other.capture_stream = nullptr;
                     other.sync_event = nullptr;
                     other.gpu_ctx_ref = nullptr;
@@ -723,6 +762,9 @@ namespace llaminar2
                     other.capture_variant_signature = 0;
                     other.variant_recapture_count = 0;
                     other.snapshot_configuration_epoch = 0;
+                    other.replay_gpu_timing_slots.clear();
+                    other.replay_gpu_timing_device_name.clear();
+                    other.replay_gpu_timing_busy_samples = 0;
                 }
                 return *this;
             }
@@ -737,6 +779,7 @@ namespace llaminar2
                 needs_capture = false;
                 decode_step = 0;
                 capture_variant_signature = 0;
+                destroyReplayGpuTimingEvents();
                 destroySyncEvent();
                 if (stream_policy == StreamResetPolicy::Destroy)
                 {
@@ -788,6 +831,16 @@ namespace llaminar2
 
             /// Destroy the cached sync event if it exists
             void destroySyncEvent();
+
+            /**
+             * @brief Destroy every cache-owned replay timing event after its stream fence.
+             *
+             * reset() calls this only after waitForCaptureStreamFence(), so no
+             * recorded event can still be in flight. Steady-state replay must
+             * never call this method; event ownership remains fixed from warmup
+             * until reset or teardown.
+             */
+            void destroyReplayGpuTimingEvents();
 
             /**
              * @brief Resolve the mandatory owner of a live stream or event.

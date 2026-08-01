@@ -136,6 +136,176 @@ TEST_F(Test__ROCmEventSynchronization, EventRecordAndWait)
 }
 
 /**
+ * @brief Reject capture-time external publication and prove the post-replay handoff.
+ *
+ * IBackend events connect completed replay to consumers outside the DAG. The
+ * backend rejects attempts to turn that handoff into an internal capture node,
+ * then records the event after launch so another stream observes graph writes.
+ */
+TEST_F(Test__ROCmEventSynchronization,
+       CaptureTimePublicationIsRejectedAndPostReplayEventOrdersConsumer)
+{
+    llaminar2::test::ScopedGPUStream producer_stream(DeviceId::rocm(device_id_));
+    llaminar2::test::ScopedGPUStream consumer_stream(DeviceId::rocm(device_id_));
+    const auto producer = static_cast<hipStream_t>(producer_stream.get());
+    const auto consumer = static_cast<hipStream_t>(consumer_stream.get());
+
+    void *event = backend_->createEvent(device_id_);
+    void *device_value = backend_->allocate(sizeof(uint32_t), device_id_);
+    ASSERT_NE(event, nullptr);
+    ASSERT_NE(device_value, nullptr);
+
+    ASSERT_EQ(hipMemsetAsync(device_value, 0, sizeof(uint32_t), producer),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(producer), hipSuccess);
+
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t executable = nullptr;
+    ASSERT_EQ(hipStreamBeginCapture(producer, hipStreamCaptureModeThreadLocal),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(device_value, 0x2a, sizeof(uint32_t), producer),
+              hipSuccess);
+    EXPECT_FALSE(backend_->recordEvent(event, device_id_, producer_stream.get()))
+        << "External publication must not silently disappear into a captured DAG";
+    ASSERT_EQ(hipStreamEndCapture(producer, &graph), hipSuccess);
+    ASSERT_NE(graph, nullptr);
+
+    ASSERT_EQ(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+              hipSuccess);
+    ASSERT_EQ(hipGraphLaunch(executable, producer), hipSuccess);
+    ASSERT_TRUE(backend_->recordEvent(
+        event, device_id_, producer_stream.get()));
+    ASSERT_TRUE(backend_->streamWaitEvent(
+        consumer_stream.get(), event, device_id_));
+
+    uint32_t observed = 0;
+    ASSERT_EQ(hipMemcpyAsync(
+                  &observed,
+                  device_value,
+                  sizeof(observed),
+                  hipMemcpyDeviceToHost,
+                  consumer),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(consumer), hipSuccess);
+    EXPECT_EQ(observed, 0x2a2a2a2au);
+
+    ASSERT_EQ(hipGraphExecDestroy(executable), hipSuccess);
+    ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+    backend_->free(device_value, device_id_);
+    backend_->destroyEvent(event, device_id_);
+}
+
+/**
+ * @brief Prove independent reader completion events fan in before row reuse.
+ *
+ * Device-resident MTP logical state is intentionally single-buffered. A producer
+ * first publishes the rows, independent consumers then read them on their own
+ * streams, and the next producer may overwrite the rows only after every reader
+ * has completed. Each reader publishes an independent preallocated event; the
+ * replacement writer waits both without introducing a reader-to-reader edge.
+ * Both snapshots must retain the old value while the source is replaced.
+ */
+TEST_F(Test__ROCmEventSynchronization,
+       IndependentReaderEventsFanInBeforeReplacementWriter)
+{
+    llaminar2::test::ScopedGPUStream producer_stream(DeviceId::rocm(device_id_));
+    llaminar2::test::ScopedGPUStream reader_a_stream(DeviceId::rocm(device_id_));
+    llaminar2::test::ScopedGPUStream reader_b_stream(DeviceId::rocm(device_id_));
+    llaminar2::test::ScopedGPUStream writer_stream(DeviceId::rocm(device_id_));
+
+    const auto producer = static_cast<hipStream_t>(producer_stream.get());
+    const auto reader_a = static_cast<hipStream_t>(reader_a_stream.get());
+    const auto reader_b = static_cast<hipStream_t>(reader_b_stream.get());
+    const auto writer = static_cast<hipStream_t>(writer_stream.get());
+
+    void *publication_ready = backend_->createEvent(device_id_);
+    void *reader_a_done = backend_->createEvent(device_id_);
+    void *reader_b_done = backend_->createEvent(device_id_);
+    void *source = backend_->allocate(sizeof(uint32_t), device_id_);
+    void *reader_a_snapshot = backend_->allocate(sizeof(uint32_t), device_id_);
+    void *reader_b_snapshot = backend_->allocate(sizeof(uint32_t), device_id_);
+    ASSERT_NE(publication_ready, nullptr);
+    ASSERT_NE(reader_a_done, nullptr);
+    ASSERT_NE(reader_b_done, nullptr);
+    ASSERT_NE(source, nullptr);
+    ASSERT_NE(reader_a_snapshot, nullptr);
+    ASSERT_NE(reader_b_snapshot, nullptr);
+
+    ASSERT_EQ(hipMemsetAsync(source, 0x11, sizeof(uint32_t), producer),
+              hipSuccess);
+    ASSERT_TRUE(backend_->recordEvent(
+        publication_ready, device_id_, producer_stream.get()));
+
+    ASSERT_TRUE(backend_->streamWaitEvent(
+        reader_a_stream.get(), publication_ready, device_id_));
+    ASSERT_TRUE(backend_->streamWaitEvent(
+        reader_b_stream.get(), publication_ready, device_id_));
+    ASSERT_EQ(hipMemcpyAsync(
+                  reader_a_snapshot,
+                  source,
+                  sizeof(uint32_t),
+                  hipMemcpyDeviceToDevice,
+                  reader_a),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(
+                  reader_b_snapshot,
+                  source,
+                  sizeof(uint32_t),
+                  hipMemcpyDeviceToDevice,
+                  reader_b),
+              hipSuccess);
+
+    ASSERT_TRUE(backend_->recordEvent(
+        reader_a_done, device_id_, reader_a_stream.get()));
+    ASSERT_TRUE(backend_->recordEvent(
+        reader_b_done, device_id_, reader_b_stream.get()));
+
+    ASSERT_TRUE(backend_->streamWaitEvent(
+        writer_stream.get(), reader_a_done, device_id_));
+    ASSERT_TRUE(backend_->streamWaitEvent(
+        writer_stream.get(), reader_b_done, device_id_));
+    ASSERT_EQ(hipMemsetAsync(source, 0x22, sizeof(uint32_t), writer),
+              hipSuccess);
+
+    uint32_t observed_source = 0;
+    uint32_t observed_reader_a = 0;
+    uint32_t observed_reader_b = 0;
+    ASSERT_EQ(hipMemcpyAsync(
+                  &observed_source,
+                  source,
+                  sizeof(uint32_t),
+                  hipMemcpyDeviceToHost,
+                  writer),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(
+                  &observed_reader_a,
+                  reader_a_snapshot,
+                  sizeof(uint32_t),
+                  hipMemcpyDeviceToHost,
+                  writer),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(
+                  &observed_reader_b,
+                  reader_b_snapshot,
+                  sizeof(uint32_t),
+                  hipMemcpyDeviceToHost,
+                  writer),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(writer), hipSuccess);
+
+    EXPECT_EQ(observed_reader_a, 0x11111111u);
+    EXPECT_EQ(observed_reader_b, 0x11111111u);
+    EXPECT_EQ(observed_source, 0x22222222u);
+
+    backend_->free(reader_b_snapshot, device_id_);
+    backend_->free(reader_a_snapshot, device_id_);
+    backend_->free(source, device_id_);
+    backend_->destroyEvent(reader_b_done, device_id_);
+    backend_->destroyEvent(reader_a_done, device_id_);
+    backend_->destroyEvent(publication_ready, device_id_);
+}
+
+/**
  * @brief Event waits remain valid when another HIP child is ambient.
  *
  * The ROCm backend restores ambient device state after resource operations, so

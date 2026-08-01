@@ -73,6 +73,12 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 - Transfer stress covers 336 slot rotations and 32 cross-stream reset epochs;
   source policy forbids eventless publication, GPU sync, hot-path allocation,
   and direct coherence transitions.
+- CUDA2 LLEP stochastic MTP with RAM-prefix reuse now survives 20 measured
+  request lifecycles: 100 verifier runs, 100 commits, 100 rollbacks, and zero
+  transaction validation failures. Ordinary GPU state summaries perform no
+  logical-state export; the verifier-summary D2H enqueue/sync/wait counters are
+  all zero. The opt-in deep probe first snapshots D2D into dedicated diagnostic
+  storage and exports only that immutable owner.
 
 ## Kernel Economy
 
@@ -94,6 +100,11 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
   `24.34 tok/s`; the main verifier graph costs `100.3 ms` per replay and the
   initial sidecar prelaunch costs `14.1 ms`. Default LLEP selected no movement,
   so these numbers currently expose overhead without LLEP benefit.
+- The forced-movement CUDA2 LLEP + stochastic dynamic-MTP + RAM-prefix stress
+  lane is correct but deeply uneconomical: `5657.97 tok/s` prefill and only
+  `5.05 tok/s` decode over 20 measured runs. This is the immediate whole-graph
+  Nsight target; correctness fixes must not conceal it with a serial path or
+  disable the production LLEP/MTP/prefix features.
 
 Matched llama.cpp master comparison, tok/s:
 

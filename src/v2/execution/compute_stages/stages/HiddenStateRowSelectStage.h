@@ -47,10 +47,10 @@ namespace llaminar2
     /**
      * @brief Selects the last real prefill row into a stable one-row buffer.
      *
-     * CPU execution performs a direct memcpy. GPU execution uploads the selected
-     * row scalar only while the stage is executed under executor ownership, then
-     * records only a fixed-grid row-copy kernel that reads the graph-workspace
-     * device scalar.
+     * CPU execution performs a direct memcpy. Production GPU execution either
+     * encodes a fixed row in the captured D2D node or derives the terminal row
+     * from a device-resident request length. The legacy dynamic-scalar policy is
+     * retained only for CPU replay and must never create a GPU host mirror.
      */
     class HiddenStateRowSelectStage : public IComputeStage, public IWorkspaceConsumer
     {
@@ -63,10 +63,10 @@ namespace llaminar2
         enum class SelectionPolicy : uint8_t
         {
             /**
-             * @brief Read the row from persistent device workspace.
+             * @brief Mutate the row directly for CPU replay.
              *
-             * Bucketed prefill uses this policy because the real terminal row
-             * can change while the captured bucket geometry remains fixed.
+             * GPU graphs must use FixedDeviceRow or
+             * DeviceResidentRequestLength so row ownership remains on device.
              */
             DynamicDeviceScalar,
 

@@ -2344,6 +2344,28 @@ namespace llaminar2
                 &used_graph_replay);
         }
 
+        /*
+         * Seal any live-state read admitted by the prelude before another
+         * producer can reuse those persistent rows. This call is deliberately
+         * outside the success branch: an executor failure can still follow
+         * asynchronously enqueued GPU work, and that work retains ownership
+         * until its exact stream reaches this event publication.
+         */
+        void *const live_state_completion_stream =
+            success
+                ? forward_cache.outputProducerStream(
+                      is_decode,
+                      used_graph_replay)
+                : dynamic_param_stream;
+        if (!host.completeLiveStateForForwardGraphExecution(
+                input,
+                live_state_completion_stream,
+                stream_device))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Failed to publish cached forward graph live-state read completion");
+            return false;
+        }
+
         auto exec_t1 = std::chrono::high_resolution_clock::now();
 
         if (success && used_graph_replay &&
@@ -3696,6 +3718,20 @@ namespace llaminar2
                           ctx,
                           build_cache->snapshot_manifest)
                     : executor_.execute(graph, ctx);
+
+            /*
+             * Match the pre-execution live-state admission on every outcome.
+             * Even a failed executor may have queued kernels, so skipping this
+             * event edge would let the next mailbox writer race partial work.
+             */
+            if (!host.completeLiveStateForForwardGraphExecution(
+                    effective_input,
+                    execution_stream,
+                    ctx->deviceId()))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Failed to publish cache-miss forward graph live-state read completion");
+                return false;
+            }
         }
 
         DeviceId producer_device = effective_input.device;

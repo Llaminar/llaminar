@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -707,6 +708,150 @@ namespace llaminar2
         }
 
         LOG_TRACE("[BufferArena] " << summary.str());
+        LOG_DEBUG("[BufferArena] " << allocationAddressMap());
+    }
+
+    std::string BufferArena::allocationAddressMap() const
+    {
+        if (!allocated_)
+            return {};
+
+        struct AddressInfo
+        {
+            const char *name = nullptr;
+            size_t rows = 0;
+            size_t cols = 0;
+            const char *dtype = nullptr;
+            size_t bytes = 0;
+            std::string device;
+            const char *address_space = nullptr;
+            const char *ownership = nullptr;
+            int alias_group = -1;
+            uintptr_t begin = 0;
+            uintptr_t end = 0;
+            bool bound = false;
+        };
+
+        std::vector<AddressInfo> infos;
+        infos.reserve(registeredCount());
+        for (size_t i = 0; i < kBufferCount; ++i)
+        {
+            const auto &b = buffers_[i];
+            if (!b.registered)
+                continue;
+
+            ITensor *tensor = b.tensor();
+            const void *address = tensor ? tensor->gpu_data_ptr() : nullptr;
+            const bool device_address = address != nullptr;
+            if (!address && tensor)
+                address = tensor->raw_data();
+
+            std::string device = "CPU";
+            if (auto *base = b.tensorBase())
+            {
+                if (const auto current = base->current_device();
+                    current.has_value())
+                {
+                    device = current->toString();
+                }
+                else if (device_address && b.home_device.is_valid())
+                {
+                    device = b.home_device.toString();
+                }
+            }
+            else if (device_address && b.home_device.is_valid())
+            {
+                device = b.home_device.toString();
+            }
+
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(address);
+            const size_t bytes = tensor ? tensor->size_bytes() : 0;
+            const uintptr_t end =
+                address && bytes <= std::numeric_limits<uintptr_t>::max() - begin
+                    ? begin + bytes
+                    : begin;
+            infos.push_back(AddressInfo{
+                .name = bufferIdName(static_cast<BufferId>(i)),
+                .rows = b.rows,
+                .cols = b.cols,
+                .dtype = b.dtype ? b.dtype : "ext",
+                .bytes = bytes,
+                .device = std::move(device),
+                .address_space = device_address ? "device" : "host",
+                .ownership = b.owned_tensor ? "arena" : "external",
+                .alias_group = b.alias_group,
+                .begin = begin,
+                .end = end,
+                .bound = address != nullptr});
+        }
+
+        std::sort(
+            infos.begin(),
+            infos.end(),
+            [](const AddressInfo &lhs, const AddressInfo &rhs)
+            {
+                if (lhs.device != rhs.device)
+                    return lhs.device < rhs.device;
+                if (lhs.bound != rhs.bound)
+                    return lhs.bound > rhs.bound;
+                if (lhs.begin != rhs.begin)
+                    return lhs.begin < rhs.begin;
+                if (lhs.end != rhs.end)
+                    return lhs.end < rhs.end;
+                return std::strcmp(lhs.name, rhs.name) < 0;
+            });
+
+        std::ostringstream output;
+        output << "Allocation address map (half-open ranges; sorted per device):\n";
+        std::string previous_device;
+        uintptr_t previous_end = 0;
+        bool have_previous = false;
+        for (const auto &info : infos)
+        {
+            if (info.device != previous_device)
+            {
+                previous_device = info.device;
+                previous_end = 0;
+                have_previous = false;
+                output << "  device=" << info.device << '\n';
+            }
+
+            output << "    name=" << info.name
+                   << " ownership=" << info.ownership
+                   << " space=" << info.address_space
+                   << " shape=" << info.rows << 'x' << info.cols
+                   << " dtype=" << info.dtype
+                   << " bytes=" << info.bytes
+                   << " alias_group=" << info.alias_group;
+            if (!info.bound)
+            {
+                output << " range=[unbound] relation=unbound\n";
+                continue;
+            }
+
+            output << " range=[0x" << std::hex << info.begin
+                   << ",0x" << info.end << ')' << std::dec;
+            if (!have_previous)
+            {
+                output << " relation=first";
+            }
+            else if (info.begin < previous_end)
+            {
+                output << " relation=overlap overlap_bytes="
+                       << (previous_end - info.begin);
+            }
+            else
+            {
+                const uintptr_t gap = info.begin - previous_end;
+                output << (gap == 0 ? " relation=adjacent"
+                                    : " relation=gap")
+                       << " gap_bytes=" << gap;
+            }
+            output << '\n';
+            previous_end = std::max(previous_end, info.end);
+            have_previous = true;
+        }
+        return output.str();
     }
 
     // =========================================================================

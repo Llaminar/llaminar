@@ -986,6 +986,7 @@ namespace llaminar2
         int group_active_expert_slots_ = 0;
         int group_slots_cap_ = 0;
         int group_experts_cap_ = 0;
+        bool group_buffers_workspace_bound_ = false;
         int group_expert_mask_cap_ = 0;
         uint64_t group_expert_mask_hash_ = 0;
         int group_expert_mask_num_experts_ = 0;

@@ -2775,7 +2775,7 @@ namespace llaminar2::test
         EXPECT_EQ(stage_source.find("LLAMINAR_MOE_REBALANCE_DEBUG_SYNC"), std::string::npos)
             << "Do not leave crash-localization sync knobs in the production rebalance path.";
         EXPECT_EQ(stage_source.find("transfer_event_backend_->recordEvent"), std::string::npos)
-            << "IBackend::recordEvent intentionally no-ops during capture; use IWorkerGPUContext.";
+            << "The transfer stage must use its worker context so the event belongs to the exact graph-capture stream and device context.";
 
         const fs::path cuda_kernel_path =
             root / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp";

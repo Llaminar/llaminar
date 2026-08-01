@@ -703,6 +703,82 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
 #endif
 }
 
+TEST(Test__CUDAHiddenStateRowSelectStage, CapturedFixedContiguousRowsAreByteExactWithoutMetadata)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    const DeviceId device = DeviceId::cuda(0);
+    constexpr int bucket_seq_len = 8;
+    constexpr int d_model = 32;
+    constexpr int first_row = 2;
+    constexpr int row_count = 3;
+    const std::vector<int> expected_rows{2, 3, 4};
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    auto hidden = makeHiddenStates(bucket_seq_len, d_model, device, stream);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{row_count, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+    ASSERT_TRUE(scratch->allocateOnDevice(device, stream));
+
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = scratch.get();
+    params.seq_len = bucket_seq_len;
+    params.d_model = d_model;
+    params.selected_row_count = row_count;
+    params.selected_row_indices = expected_rows;
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+            FixedContiguousRange;
+    params.fixed_contiguous_row_start = first_row;
+    HiddenStateRowsSelectStage stage(params);
+    stage.setGPUStream(stream);
+
+    ASSERT_TRUE(stage.getWorkspaceRequirements(bucket_seq_len, d_model, 0).buffers.empty());
+    ASSERT_TRUE(stage.execute(nullptr));
+    expectRows(
+        downloadScratchRows(*scratch, row_count, d_model, stream),
+        *hidden,
+        expected_rows,
+        d_model);
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(
+            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+            cudaSuccess);
+        ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(
+        cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+        cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    expectRows(
+        downloadScratchRows(*scratch, row_count, d_model, stream),
+        *hidden,
+        expected_rows,
+        d_model);
+
+    cudaGraphExecDestroy(graph_exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+#endif
+}
+
 TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReplayReadsExternalMetadataRows)
 {
 #ifndef HAVE_CUDA

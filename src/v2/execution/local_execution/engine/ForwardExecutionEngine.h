@@ -404,6 +404,33 @@ namespace llaminar2
         }
 
         /**
+         * @brief Publish completion of the forward graph's live-state reads.
+         *
+         * `prepareLiveStateForForwardGraphExecution()` may admit a GPU graph as
+         * an asynchronous reader of persistent live-state rows. The execution
+         * engine calls this matching hook immediately after the graph launch,
+         * on both success and failure, so the host can append the graph's exact
+         * producer stream to any reusable-row access fence. Implementations
+         * must not synchronize the stream or materialize device state on the
+         * host; this is an event-only producer/consumer handoff.
+         *
+         * @param input Forward invocation whose prelude admitted the read.
+         * @param execution_stream Exact stream on which the graph work ended.
+         * @param execution_device Device that owns @p execution_stream.
+         * @return True when no read was armed or its completion was published.
+         */
+        virtual bool completeLiveStateForForwardGraphExecution(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device)
+        {
+            (void)input;
+            (void)execution_stream;
+            (void)execution_device;
+            return true;
+        }
+
+        /**
          * @brief Publish caller-staged device token rows on the graph stream.
          *
          * Device-token composition is a forward-input concern, not verifier

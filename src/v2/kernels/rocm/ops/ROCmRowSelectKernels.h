@@ -79,6 +79,30 @@ namespace llaminar2::rocm
         int d_model,
         void *stream);
 
+    /**
+     * @brief Copy one graph-immutable contiguous FP32 row range.
+     *
+     * The source offset and byte count are capture-time geometry. No pinned
+     * host row plan or H2D metadata upload is required.
+     *
+     * @param input Device pointer to [seq_len, d_model] FP32 hidden states.
+     * @param output Device pointer to [selected_row_count, d_model] FP32 rows.
+     * @param first_selected_row First immutable source row.
+     * @param selected_row_count Number of contiguous rows copied.
+     * @param seq_len Number of source rows, used for validation.
+     * @param d_model Number of columns per row.
+     * @param stream Explicit non-null HIP stream.
+     * @return true when the contiguous D2D copy was accepted.
+     */
+    bool launchFixedRowsSelectFP32(
+        const float *input,
+        float *output,
+        int first_selected_row,
+        int selected_row_count,
+        int seq_len,
+        int d_model,
+        void *stream);
+
     /** @brief Launch FP32 multi-row select: output[row, :] = input[selected_rows[row], :]. */
     bool launchRowsSelectFP32(
         const float *input,

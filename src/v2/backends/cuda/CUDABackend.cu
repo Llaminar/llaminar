@@ -317,15 +317,28 @@ namespace llaminar2
         cudaEvent_t cuda_event = reinterpret_cast<cudaEvent_t>(event);
         cudaStream_t cuda_stream =
             requireExplicitStream(stream, "CUDABackend::recordEvent");
-        {
-            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-            if (cudaStreamIsCapturing(cuda_stream, &capture_status) == cudaSuccess &&
-                capture_status != cudaStreamCaptureStatusNone)
-            {
-                return true;
-            }
-        }
 
+        /*
+         * IBackend events publish completed graph work to consumers outside the
+         * captured DAG. A cudaEventRecord made during capture becomes an
+         * internal graph node and cannot serve that external publication
+         * contract. Internal graph fork/join edges belong to
+         * IWorkerGPUContext; reject accidental capture-time publication here
+         * instead of silently claiming that an event was recorded.
+         */
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        err = cudaStreamIsCapturing(cuda_stream, &capture_status);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::recordEvent] cudaStreamIsCapturing failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+        if (capture_status != cudaStreamCaptureStatusNone)
+        {
+            LOG_ERROR("[CUDABackend::recordEvent] External event publication is forbidden during graph capture; record it after graph launch");
+            return false;
+        }
         err = cudaEventRecord(cuda_event, cuda_stream);
         if (err != cudaSuccess)
         {

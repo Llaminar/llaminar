@@ -677,6 +677,7 @@ public:
         handle.stream = const_cast<int *>(&resident_stream_token_);
         handle.ready_event = const_cast<int *>(&resident_ready_event_token_);
         handle.live_state_epoch = 1;
+        handle.publication_generation = 1;
         handle.mtp_transaction.state = resident_mtp_transaction_state_;
         return handle;
     }

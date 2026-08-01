@@ -136,6 +136,177 @@ TEST_F(Test__CUDAEventSynchronization, EventRecordAndWait)
 }
 
 /**
+ * @brief Reject capture-time external publication and prove the post-replay handoff.
+ *
+ * IBackend events connect completed graph replay to consumers outside the DAG.
+ * Recording one during capture would create a different, internal event node,
+ * so the API must reject that category error. Once replay is enqueued, the same
+ * event records normally and orders a consumer stream after graph-owned writes.
+ */
+TEST_F(Test__CUDAEventSynchronization,
+       CaptureTimePublicationIsRejectedAndPostReplayEventOrdersConsumer)
+{
+    llaminar2::test::ScopedGPUStream producer_stream(DeviceId::cuda(device_id_));
+    llaminar2::test::ScopedGPUStream consumer_stream(DeviceId::cuda(device_id_));
+    const auto producer = static_cast<cudaStream_t>(producer_stream.get());
+    const auto consumer = static_cast<cudaStream_t>(consumer_stream.get());
+
+    void *event = backend_->createEvent(device_id_);
+    void *device_value = backend_->allocate(sizeof(uint32_t), device_id_);
+    ASSERT_NE(event, nullptr);
+    ASSERT_NE(device_value, nullptr);
+
+    ASSERT_EQ(cudaMemsetAsync(device_value, 0, sizeof(uint32_t), producer),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(producer), cudaSuccess);
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    ASSERT_EQ(cudaStreamBeginCapture(producer, cudaStreamCaptureModeThreadLocal),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(device_value, 0x2a, sizeof(uint32_t), producer),
+              cudaSuccess);
+    EXPECT_FALSE(backend_->recordEvent(event, device_id_, producer_stream.get()))
+        << "External publication must not silently disappear into a captured DAG";
+    ASSERT_EQ(cudaStreamEndCapture(producer, &graph), cudaSuccess);
+    ASSERT_NE(graph, nullptr);
+
+    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+              cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(executable, producer), cudaSuccess);
+    ASSERT_TRUE(backend_->recordEvent(
+        event, device_id_, producer_stream.get()));
+    ASSERT_TRUE(backend_->streamWaitEvent(
+        consumer_stream.get(), event, device_id_));
+
+    uint32_t observed = 0;
+    ASSERT_EQ(cudaMemcpyAsync(
+                  &observed,
+                  device_value,
+                  sizeof(observed),
+                  cudaMemcpyDeviceToHost,
+                  consumer),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(consumer), cudaSuccess);
+    EXPECT_EQ(observed, 0x2a2a2a2au);
+
+    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    backend_->free(device_value, device_id_);
+    backend_->destroyEvent(event, device_id_);
+}
+
+/**
+ * @brief Prove independent reader completion events fan in before row reuse.
+ *
+ * Device-resident MTP logical state is intentionally single-buffered. A producer
+ * first publishes the rows, independent consumers then read them on their own
+ * streams, and the next producer may overwrite the rows only after every reader
+ * has completed. Each reader publishes an independent preallocated event; the
+ * replacement writer waits both without introducing a reader-to-reader edge.
+ * Both snapshots must retain the old value while the source is replaced.
+ */
+TEST_F(Test__CUDAEventSynchronization,
+       IndependentReaderEventsFanInBeforeReplacementWriter)
+{
+    llaminar2::test::ScopedGPUStream producer_stream(DeviceId::cuda(device_id_));
+    llaminar2::test::ScopedGPUStream reader_a_stream(DeviceId::cuda(device_id_));
+    llaminar2::test::ScopedGPUStream reader_b_stream(DeviceId::cuda(device_id_));
+    llaminar2::test::ScopedGPUStream writer_stream(DeviceId::cuda(device_id_));
+
+    const auto producer = static_cast<cudaStream_t>(producer_stream.get());
+    const auto reader_a = static_cast<cudaStream_t>(reader_a_stream.get());
+    const auto reader_b = static_cast<cudaStream_t>(reader_b_stream.get());
+    const auto writer = static_cast<cudaStream_t>(writer_stream.get());
+
+    void *publication_ready = backend_->createEvent(device_id_);
+    void *reader_a_done = backend_->createEvent(device_id_);
+    void *reader_b_done = backend_->createEvent(device_id_);
+    void *source = backend_->allocate(sizeof(uint32_t), device_id_);
+    void *reader_a_snapshot = backend_->allocate(sizeof(uint32_t), device_id_);
+    void *reader_b_snapshot = backend_->allocate(sizeof(uint32_t), device_id_);
+    ASSERT_NE(publication_ready, nullptr);
+    ASSERT_NE(reader_a_done, nullptr);
+    ASSERT_NE(reader_b_done, nullptr);
+    ASSERT_NE(source, nullptr);
+    ASSERT_NE(reader_a_snapshot, nullptr);
+    ASSERT_NE(reader_b_snapshot, nullptr);
+
+    ASSERT_EQ(cudaMemsetAsync(source, 0x11, sizeof(uint32_t), producer),
+              cudaSuccess);
+    ASSERT_TRUE(backend_->recordEvent(
+        publication_ready, device_id_, producer_stream.get()));
+
+    ASSERT_TRUE(backend_->streamWaitEvent(
+        reader_a_stream.get(), publication_ready, device_id_));
+    ASSERT_TRUE(backend_->streamWaitEvent(
+        reader_b_stream.get(), publication_ready, device_id_));
+    ASSERT_EQ(cudaMemcpyAsync(
+                  reader_a_snapshot,
+                  source,
+                  sizeof(uint32_t),
+                  cudaMemcpyDeviceToDevice,
+                  reader_a),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  reader_b_snapshot,
+                  source,
+                  sizeof(uint32_t),
+                  cudaMemcpyDeviceToDevice,
+                  reader_b),
+              cudaSuccess);
+
+    ASSERT_TRUE(backend_->recordEvent(
+        reader_a_done, device_id_, reader_a_stream.get()));
+    ASSERT_TRUE(backend_->recordEvent(
+        reader_b_done, device_id_, reader_b_stream.get()));
+
+    ASSERT_TRUE(backend_->streamWaitEvent(
+        writer_stream.get(), reader_a_done, device_id_));
+    ASSERT_TRUE(backend_->streamWaitEvent(
+        writer_stream.get(), reader_b_done, device_id_));
+    ASSERT_EQ(cudaMemsetAsync(source, 0x22, sizeof(uint32_t), writer),
+              cudaSuccess);
+
+    uint32_t observed_source = 0;
+    uint32_t observed_reader_a = 0;
+    uint32_t observed_reader_b = 0;
+    ASSERT_EQ(cudaMemcpyAsync(
+                  &observed_source,
+                  source,
+                  sizeof(uint32_t),
+                  cudaMemcpyDeviceToHost,
+                  writer),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  &observed_reader_a,
+                  reader_a_snapshot,
+                  sizeof(uint32_t),
+                  cudaMemcpyDeviceToHost,
+                  writer),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  &observed_reader_b,
+                  reader_b_snapshot,
+                  sizeof(uint32_t),
+                  cudaMemcpyDeviceToHost,
+                  writer),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(writer), cudaSuccess);
+
+    EXPECT_EQ(observed_reader_a, 0x11111111u);
+    EXPECT_EQ(observed_reader_b, 0x11111111u);
+    EXPECT_EQ(observed_source, 0x22222222u);
+
+    backend_->free(reader_b_snapshot, device_id_);
+    backend_->free(reader_a_snapshot, device_id_);
+    backend_->free(source, device_id_);
+    backend_->destroyEvent(reader_b_done, device_id_);
+    backend_->destroyEvent(reader_a_done, device_id_);
+    backend_->destroyEvent(publication_ready, device_id_);
+}
+
+/**
  * @brief Event waits select the resource-owning ordinal in multi-device use.
  *
  * RankOrchestrator resets LocalTP children from one host thread.  This test

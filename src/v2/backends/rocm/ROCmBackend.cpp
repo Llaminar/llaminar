@@ -2984,15 +2984,27 @@ namespace llaminar2
         hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
         hipStream_t hip_stream =
             requireExplicitStream(stream, "ROCmBackend::recordEvent");
-        {
-            hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-            if (hipStreamIsCapturing(hip_stream, &capture_status) == hipSuccess &&
-                capture_status != hipStreamCaptureStatusNone)
-            {
-                return true;
-            }
-        }
 
+        /*
+         * IBackend events publish graph completion to consumers outside the
+         * captured DAG. A capture-time hipEventRecord is an internal graph node,
+         * not that external handoff. Internal graph fork/join edges belong to
+         * IWorkerGPUContext, so reject this misuse rather than reporting a
+         * publication that no outside consumer can legally wait on.
+         */
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+        err = hipStreamIsCapturing(hip_stream, &capture_status);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::recordEvent] hipStreamIsCapturing failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+        if (capture_status != hipStreamCaptureStatusNone)
+        {
+            LOG_ERROR("[ROCmBackend::recordEvent] External event publication is forbidden during graph capture; record it after graph launch");
+            return false;
+        }
         err = hipEventRecord(hip_event, hip_stream);
         if (err != hipSuccess)
         {

@@ -194,6 +194,32 @@ namespace llaminar2
         static const char *replayModeName(const DeviceGraphExecutor::GraphSegmentCache &segment_cache);
 
         /**
+         * @brief Allocate the bounded replay-timing event ring before graph capture.
+         *
+         * When GPU stage timing is disabled this is a no-op. When it is enabled,
+         * the complete bounded sampling ring is created here during warmup;
+         * allocation failure is fatal to the selected profiling execution mode.
+         * A burst larger than the ring is counted as unsampled while all slots
+         * are busy; it never changes inference ordering. No replay invocation
+         * may lazily create an event.
+         */
+        static bool prepareReplayGpuTiming(
+            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+            IWorkerGPUContext *gpu_ctx,
+            const std::string &device_name);
+
+        /**
+         * @brief Emit every completed replay interval without waiting on the GPU.
+         *
+         * The method uses queryEventChecked() and leaves incomplete slots owned
+         * by the cache. It never synchronizes an event, stream, or device. A
+         * backend query or elapsed-time failure is a hard profiling failure.
+         */
+        static bool reclaimReplayGpuTimingNonblocking(
+            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+            IWorkerGPUContext *gpu_ctx);
+
+        /**
          * @brief Execute warmup-phase bookkeeping (segment build + state transition).
          */
         static void executeWarmupPhase(

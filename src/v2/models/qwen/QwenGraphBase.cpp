@@ -1326,9 +1326,10 @@ namespace llaminar2
             throw std::runtime_error("Bucketed prefill LM head row-select scratch buffer missing");
         }
 
-        // Initial execution uses the real count available at graph build. Later
-        // cache hits call updatePrefillReplayParams() on the stage, which mutates
-        // the captured pinned scalar before graph replay.
+        // CPU replay owns its selected row directly. GPU replay derives the
+        // row from the request-admission length array already consumed by the
+        // rest of the captured prefill graph; no pinned host scalar may become
+        // a second, independently mutable owner of the same logical length.
         const int initial_real_seq_len = real_seq_len > 0 ? real_seq_len : total_tokens;
         HiddenStateRowSelectStage::Params row_params;
         row_params.input = final_norm_output;
@@ -1339,21 +1340,27 @@ namespace llaminar2
         row_params.device_id = device;
         row_params.input_buffer_id = input_buffer_id;
         row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROW;
-        /*
-         * Workspace names are graph-family identities, not object-instance
-         * identities. Bucket graphs are rebuilt during eager declaration,
-         * cache warmup, and later exact bucket admission; a construction counter
-         * would give each equivalent row selector a new four-byte allocation
-         * that generation-one preflight could never enumerate. There is exactly
-         * one terminal LM-head row selector in a graph and all family members are
-         * event-serialized, so this semantic key is both unique within a graph
-         * and intentionally shared across captures.
-         */
-        row_params.workspace_buffer_name =
-            std::string(
-                HiddenStateRowSelectStage::
-                    WS_SELECTED_ROW_SCALAR) +
-            "_lm_head_terminal";
+        if (device.is_gpu())
+        {
+            if (!request_sequence_lengths_device ||
+                request_row_stride != total_tokens)
+            {
+                throw std::runtime_error(
+                    "Bucketed GPU LM-head row selection requires the exact "
+                    "device-resident request length and padded row stride");
+            }
+            row_params.selection_policy =
+                HiddenStateRowSelectStage::SelectionPolicy::
+                    DeviceResidentRequestLength;
+            row_params.request_sequence_length_device =
+                request_sequence_lengths_device;
+        }
+        else
+        {
+            row_params.selection_policy =
+                HiddenStateRowSelectStage::SelectionPolicy::
+                    DynamicDeviceScalar;
+        }
 
         graph.addNode("lm_head_row_select",
                       ComputeStageFactory::createHiddenStateRowSelect(row_params),

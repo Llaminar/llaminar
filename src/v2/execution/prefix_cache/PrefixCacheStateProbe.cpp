@@ -208,6 +208,9 @@ namespace llaminar2
             envEnabled("LLAMINAR_PREFIX_PROBE_HASH_TERMINAL_STATE");
         policy.capture_gdn_values =
             envEnabled("LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES");
+        policy.capture_device_logical_state =
+            envEnabled(
+                "LLAMINAR_PREFIX_PROBE_CAPTURE_DEVICE_LOGICAL_STATE");
         return policy;
     }
 

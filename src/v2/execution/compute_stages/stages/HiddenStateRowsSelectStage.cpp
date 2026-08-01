@@ -173,11 +173,14 @@ namespace llaminar2
             setGPUStream(stream);
         (void)requireGPUStream();
         if (params_.device_row_index_source ==
-            DeviceRowIndexSource::RequestTerminalLengths)
+                DeviceRowIndexSource::RequestTerminalLengths ||
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::FixedContiguousRange)
         {
             /*
-             * The captured row-copy kernel reads the current request lengths
-             * directly. There is no launch-time host metadata to upload.
+             * Request-terminal mode reads current resident lengths. Fixed-range
+             * mode records an immutable D2D source offset. Neither contract has
+             * launch-time host metadata to upload.
              */
             return true;
         }
@@ -219,6 +222,23 @@ namespace llaminar2
                           << " request_count=" << selected_row_count_
                           << " request_row_stride=" << params_.request_row_stride
                           << " lengths=" << params_.request_sequence_lengths_device);
+                return false;
+            }
+        }
+        if (params_.device_id.is_gpu() &&
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::FixedContiguousRange)
+        {
+            const bool valid_fixed_range =
+                params_.fixed_contiguous_row_start >= 0 &&
+                params_.fixed_contiguous_row_start <=
+                    params_.seq_len - selected_row_count_;
+            if (!valid_fixed_range)
+            {
+                LOG_ERROR("[HiddenStateRowsSelectStage] Fixed contiguous GPU row selection exceeds source geometry: start="
+                          << params_.fixed_contiguous_row_start
+                          << " count=" << selected_row_count_
+                          << " seq_len=" << params_.seq_len);
                 return false;
             }
         }
@@ -461,7 +481,11 @@ namespace llaminar2
         const bool request_terminal_rows =
             params_.device_row_index_source ==
             DeviceRowIndexSource::RequestTerminalLengths;
-        if (!request_terminal_rows && !ensureGpuParamStateInitialized())
+        const bool fixed_contiguous_rows =
+            params_.device_row_index_source ==
+            DeviceRowIndexSource::FixedContiguousRange;
+        if (!request_terminal_rows && !fixed_contiguous_rows &&
+            !ensureGpuParamStateInitialized())
             return false;
 
         const bool graph_managed = params_.input_buffer_id.has_value() && params_.output_buffer_id.has_value();
@@ -489,7 +513,8 @@ namespace llaminar2
             return false;
         }
 
-        if (!request_terminal_rows && !uploadGpuSelectedRows())
+        if (!request_terminal_rows && !fixed_contiguous_rows &&
+            !uploadGpuSelectedRows())
         {
             LOG_ERROR("[HiddenStateRowsSelectStage] Failed to update GPU selected-row array");
             return false;
@@ -509,6 +534,17 @@ namespace llaminar2
                     params_.request_row_stride,
                     params_.d_model,
                     selected_row_count_,
+                    gpuStream());
+            }
+            else if (fixed_contiguous_rows)
+            {
+                launched = cuda::launchFixedRowsSelectFP32(
+                    input_device,
+                    output_device,
+                    params_.fixed_contiguous_row_start,
+                    selected_row_count_,
+                    params_.seq_len,
+                    params_.d_model,
                     gpuStream());
             }
             else
@@ -537,6 +573,17 @@ namespace llaminar2
                     params_.request_row_stride,
                     params_.d_model,
                     selected_row_count_,
+                    gpuStream());
+            }
+            else if (fixed_contiguous_rows)
+            {
+                launched = rocm::launchFixedRowsSelectFP32(
+                    input_device,
+                    output_device,
+                    params_.fixed_contiguous_row_start,
+                    selected_row_count_,
+                    params_.seq_len,
+                    params_.d_model,
                     gpuStream());
             }
             else
@@ -623,6 +670,9 @@ namespace llaminar2
         info.addScalarInt(
             "device_row_index_source",
             static_cast<int>(params_.device_row_index_source));
+        info.addScalarInt(
+            "fixed_contiguous_row_start",
+            params_.fixed_contiguous_row_start);
         info.addScalarInt("request_row_stride", params_.request_row_stride);
         return info;
     }

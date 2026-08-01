@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -309,158 +310,230 @@ namespace llaminar2
             return tags;
         }
 
-        class ReplayGpuEventTimer
+        constexpr size_t kInvalidReplayGpuTimingSlot =
+            std::numeric_limits<size_t>::max();
+
+        /*
+         * Sixteen independent intervals provide a useful sample of a backlogged
+         * replay burst without turning diagnostics into an event-per-token memory
+         * commitment. When all slots are in flight, replay remains untouched and
+         * the cache increments an explicit unsampled count. This is a bounded
+         * profiler sampling policy, never a growth or synchronization policy.
+         */
+        constexpr size_t kDeferredReplayGpuTimingSlotCapacity = 16;
+
+        void emitReplayGpuTiming(
+            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+            const DeviceGraphExecutor::GraphSegmentCache::ReplayGpuTimingSlot &slot,
+            float elapsed_ms)
         {
-        public:
-            ReplayGpuEventTimer(IWorkerGPUContext *gpu_ctx,
-                                void *stream,
-                                std::string name,
-                                std::string phase,
-                                std::string device,
-                                PerfStatsCollector::Tags tags)
-                : gpu_ctx_(gpu_ctx),
-                  stream_(stream),
-                  name_(std::move(name)),
-                  phase_(std::move(phase)),
-                  device_(std::move(device)),
-                  tags_(std::move(tags))
+            const GraphReplayCaptureMode replay_mode =
+                captureModeForCache(segment_cache);
+            const uint64_t elapsed_ns = static_cast<uint64_t>(
+                static_cast<double>(std::max(0.0f, elapsed_ms)) * 1.0e6);
+            const char *sync_scope = slot.deferred_final_fence
+                                         ? "asynchronous_event_reclaimed"
+                                         : "stream_synchronized";
+
+            if (slot.scope ==
+                DeviceGraphExecutor::GraphSegmentCache::ReplayGpuTimingSlot::Scope::TotalReplay)
             {
-                if (!PerfStatsCollector::gpuStageEventTimingEnabled() ||
-                    !gpu_ctx_ ||
-                    !stream_)
+                auto total_tags = replayCacheTags(segment_cache, replay_mode);
+                total_tags.emplace("sync_scope", sync_scope);
+                PerfStatsCollector::recordTimingNs(
+                    "stage_gpu",
+                    "graph_replay.total",
+                    elapsed_ns,
+                    "decode",
+                    segment_cache.replay_gpu_timing_device_name,
+                    graphReplayGpuEventTags(
+                        std::move(total_tags),
+                        "total_replay_gpu_event",
+                        replay_mode));
+
+                /*
+                 * A monolithic replay has one graph unit, so its aggregate and
+                 * unit interval are exactly the same pair of stream events. Do
+                 * not enqueue a duplicate pair merely to emit the second view.
+                 */
+                if (replay_mode == GraphReplayCaptureMode::FullGraph &&
+                    segment_cache.segments.size() == 1)
                 {
-                    return;
-                }
-
-                start_event_ = gpu_ctx_->createEvent();
-                stop_event_ = gpu_ctx_->createEvent();
-                if (!start_event_ || !stop_event_)
-                {
-                    destroyEvents();
-                    return;
-                }
-
-                gpu_ctx_->recordEvent(start_event_, stream_);
-                active_ = true;
-            }
-
-            ~ReplayGpuEventTimer()
-            {
-                destroyEvents();
-            }
-
-            ReplayGpuEventTimer(const ReplayGpuEventTimer &) = delete;
-            ReplayGpuEventTimer &operator=(const ReplayGpuEventTimer &) = delete;
-
-            ReplayGpuEventTimer(ReplayGpuEventTimer &&other) noexcept
-                : gpu_ctx_(other.gpu_ctx_),
-                  stream_(other.stream_),
-                  start_event_(other.start_event_),
-                  stop_event_(other.stop_event_),
-                  active_(other.active_),
-                  stopped_(other.stopped_),
-                  recorded_(other.recorded_),
-                  name_(std::move(other.name_)),
-                  phase_(std::move(other.phase_)),
-                  device_(std::move(other.device_)),
-                  tags_(std::move(other.tags_))
-            {
-                other.gpu_ctx_ = nullptr;
-                other.stream_ = nullptr;
-                other.start_event_ = nullptr;
-                other.stop_event_ = nullptr;
-                other.active_ = false;
-                other.stopped_ = false;
-                other.recorded_ = true;
-            }
-
-            ReplayGpuEventTimer &operator=(ReplayGpuEventTimer &&other) noexcept
-            {
-                if (this != &other)
-                {
-                    destroyEvents();
-                    gpu_ctx_ = other.gpu_ctx_;
-                    stream_ = other.stream_;
-                    start_event_ = other.start_event_;
-                    stop_event_ = other.stop_event_;
-                    active_ = other.active_;
-                    stopped_ = other.stopped_;
-                    recorded_ = other.recorded_;
-                    name_ = std::move(other.name_);
-                    phase_ = std::move(other.phase_);
-                    device_ = std::move(other.device_);
-                    tags_ = std::move(other.tags_);
-
-                    other.gpu_ctx_ = nullptr;
-                    other.stream_ = nullptr;
-                    other.start_event_ = nullptr;
-                    other.stop_event_ = nullptr;
-                    other.active_ = false;
-                    other.stopped_ = false;
-                    other.recorded_ = true;
-                }
-                return *this;
-            }
-
-            bool active() const { return active_; }
-
-            void stop()
-            {
-                if (!active_ || stopped_)
-                    return;
-                gpu_ctx_->recordEvent(stop_event_, stream_);
-                stopped_ = true;
-            }
-
-            void record(bool synchronize_stop_event)
-            {
-                if (!active_ || !stopped_ || recorded_)
-                    return;
-
-                if (synchronize_stop_event)
-                    gpu_ctx_->synchronizeEvent(stop_event_);
-
-                const float elapsed_ms = gpu_ctx_->eventElapsedTime(start_event_, stop_event_);
-                if (elapsed_ms >= 0.0f)
-                {
+                    auto unit_tags = replaySegmentTags(
+                        segment_cache.segments.front(),
+                        segment_cache.perf_context);
+                    unit_tags.emplace("graph_index", "0");
+                    unit_tags.emplace("sync_scope", sync_scope);
                     PerfStatsCollector::recordTimingNs(
                         "stage_gpu",
-                        name_,
-                        static_cast<uint64_t>(static_cast<double>(elapsed_ms) * 1.0e6),
-                        phase_,
-                        device_,
-                        tags_);
+                        replayUnitGpuEventName(replay_mode),
+                        elapsed_ns,
+                        "decode",
+                        segment_cache.replay_gpu_timing_device_name,
+                        graphReplayGpuEventTags(
+                            std::move(unit_tags),
+                            replayUnitTimingScope(replay_mode),
+                            replay_mode));
                 }
-                recorded_ = true;
+                return;
             }
 
-        private:
-            void destroyEvents()
+            if (slot.replay_unit_index >= segment_cache.segments.size())
             {
-                if (gpu_ctx_)
-                {
-                    if (start_event_)
-                        gpu_ctx_->destroyEvent(start_event_);
-                    if (stop_event_)
-                        gpu_ctx_->destroyEvent(stop_event_);
-                }
-                start_event_ = nullptr;
-                stop_event_ = nullptr;
-                active_ = false;
+                throw std::logic_error(
+                    "Replay GPU timing slot refers to a missing replay unit");
             }
 
-            IWorkerGPUContext *gpu_ctx_ = nullptr;
-            void *stream_ = nullptr;
-            void *start_event_ = nullptr;
-            void *stop_event_ = nullptr;
-            bool active_ = false;
-            bool stopped_ = false;
-            bool recorded_ = false;
-            std::string name_;
-            std::string phase_;
-            std::string device_;
-            PerfStatsCollector::Tags tags_;
-        };
+            auto unit_tags = replaySegmentTags(
+                segment_cache.segments[slot.replay_unit_index],
+                segment_cache.perf_context);
+            unit_tags.emplace(
+                replayUnitIndexTagName(replay_mode),
+                std::to_string(slot.replay_unit_index));
+            unit_tags.emplace("sync_scope", sync_scope);
+            PerfStatsCollector::recordTimingNs(
+                "stage_gpu",
+                replayUnitGpuEventName(replay_mode),
+                elapsed_ns,
+                "decode",
+                segment_cache.replay_gpu_timing_device_name,
+                graphReplayGpuEventTags(
+                    std::move(unit_tags),
+                    replayUnitTimingScope(replay_mode),
+                    replay_mode));
+        }
+
+        bool reclaimReplayGpuTimingNonblockingImpl(
+            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+            IWorkerGPUContext *gpu_ctx)
+        {
+            bool reclaimed_any = false;
+            for (auto &slot : segment_cache.replay_gpu_timing_slots)
+            {
+                if (!slot.pending)
+                    continue;
+
+                bool ready = false;
+                if (!gpu_ctx->queryEventChecked(slot.stop_event, ready))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphCaptureController] Failed to query a "
+                        "pending replay GPU timing event");
+                    return false;
+                }
+                if (!ready)
+                    continue;
+
+                const float elapsed_ms = gpu_ctx->eventElapsedTime(
+                    slot.start_event,
+                    slot.stop_event);
+                if (elapsed_ms < 0.0f)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphCaptureController] Failed to read a "
+                        "completed replay GPU timing interval");
+                    return false;
+                }
+
+                emitReplayGpuTiming(segment_cache, slot, elapsed_ms);
+                slot.started = false;
+                slot.pending = false;
+                reclaimed_any = true;
+            }
+
+            if (reclaimed_any &&
+                segment_cache.replay_gpu_timing_busy_samples > 0)
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "replay_gpu_timing_busy_samples",
+                    static_cast<double>(
+                        segment_cache.replay_gpu_timing_busy_samples),
+                    "decode",
+                    segment_cache.replay_gpu_timing_device_name,
+                    {{"context", segment_cache.perf_context},
+                     {"sampling_policy", "bounded_nonblocking"}});
+                segment_cache.replay_gpu_timing_busy_samples = 0;
+            }
+            return true;
+        }
+
+        bool beginReplayGpuTiming(
+            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+            IWorkerGPUContext *gpu_ctx,
+            DeviceGraphExecutor::GraphSegmentCache::ReplayGpuTimingSlot::Scope scope,
+            size_t replay_unit_index,
+            bool deferred_final_fence,
+            size_t &out_slot_index)
+        {
+            out_slot_index = kInvalidReplayGpuTimingSlot;
+            if (!PerfStatsCollector::gpuStageEventTimingEnabled())
+                return true;
+            if (!gpu_ctx || !segment_cache.capture_stream ||
+                segment_cache.replay_gpu_timing_slots.empty())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] GPU replay timing was "
+                    "selected without its warmup-owned event ring");
+                return false;
+            }
+            if (!reclaimReplayGpuTimingNonblockingImpl(segment_cache, gpu_ctx))
+                return false;
+
+            for (size_t index = 0;
+                 index < segment_cache.replay_gpu_timing_slots.size();
+                 ++index)
+            {
+                auto &slot = segment_cache.replay_gpu_timing_slots[index];
+                if (slot.started || slot.pending)
+                    continue;
+
+                slot.scope = scope;
+                slot.replay_unit_index = replay_unit_index;
+                slot.deferred_final_fence = deferred_final_fence;
+                if (!gpu_ctx->recordEventChecked(
+                        slot.start_event,
+                        segment_cache.capture_stream))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphCaptureController] Failed to publish a "
+                        "replay GPU timing start event");
+                    return false;
+                }
+                slot.started = true;
+                out_slot_index = index;
+                return true;
+            }
+
+            ++segment_cache.replay_gpu_timing_busy_samples;
+            return true;
+        }
+
+        bool finishReplayGpuTiming(
+            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+            IWorkerGPUContext *gpu_ctx,
+            size_t slot_index)
+        {
+            if (slot_index == kInvalidReplayGpuTimingSlot)
+                return true;
+            if (!gpu_ctx || slot_index >= segment_cache.replay_gpu_timing_slots.size())
+                return false;
+
+            auto &slot = segment_cache.replay_gpu_timing_slots[slot_index];
+            if (!slot.started || slot.pending)
+                return false;
+            if (!gpu_ctx->recordEventChecked(
+                    slot.stop_event,
+                    segment_cache.capture_stream))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Failed to publish a replay "
+                    "GPU timing stop event");
+                return false;
+            }
+            slot.pending = true;
+            return true;
+        }
     }
 
 
@@ -553,6 +626,87 @@ namespace llaminar2
         const DeviceGraphExecutor::GraphSegmentCache &segment_cache)
     {
         return captureModeTag(captureModeForCache(segment_cache));
+    }
+
+    bool DeviceGraphCaptureController::prepareReplayGpuTiming(
+        DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+        IWorkerGPUContext *gpu_ctx,
+        const std::string &device_name)
+    {
+        if (!PerfStatsCollector::gpuStageEventTimingEnabled())
+            return true;
+        if (!gpu_ctx || !segment_cache.capture_stream ||
+            segment_cache.segments.empty())
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Replay GPU timing preparation "
+                "requires a complete replay plan, context, and capture stream");
+            return false;
+        }
+
+        if (!segment_cache.replay_gpu_timing_slots.empty())
+        {
+            if (segment_cache.replay_gpu_timing_device_name != device_name)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Replay GPU timing ring was "
+                    "prepared for a different device label");
+                return false;
+            }
+            return true;
+        }
+
+        const GraphReplayCaptureMode replay_mode =
+            captureModeForCache(segment_cache);
+        const size_t simultaneous_intervals =
+            replay_mode == GraphReplayCaptureMode::FullGraph
+                ? 1
+                : segment_cache.segments.size() + 1;
+        const size_t slot_capacity = std::max(
+            simultaneous_intervals,
+            replay_mode == GraphReplayCaptureMode::FullGraph
+                ? kDeferredReplayGpuTimingSlotCapacity
+                : simultaneous_intervals);
+
+        segment_cache.replay_gpu_timing_device_name = device_name;
+        segment_cache.replay_gpu_timing_slots.resize(slot_capacity);
+        for (auto &slot : segment_cache.replay_gpu_timing_slots)
+        {
+            slot.start_event = gpu_ctx->createEvent();
+            slot.stop_event = gpu_ctx->createEvent();
+            if (!slot.start_event || !slot.stop_event)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Failed to preallocate the "
+                    "replay GPU timing event ring");
+                segment_cache.destroyReplayGpuTimingEvents();
+                return false;
+            }
+        }
+
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "replay_timing_event_slots_preallocated",
+            static_cast<double>(slot_capacity),
+            "warmup",
+            device_name,
+            {{"context", segment_cache.perf_context},
+             {"replay_mode", captureModeTag(replay_mode)}});
+        return true;
+    }
+
+    bool DeviceGraphCaptureController::reclaimReplayGpuTimingNonblocking(
+        DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+        IWorkerGPUContext *gpu_ctx)
+    {
+        if (!PerfStatsCollector::gpuStageEventTimingEnabled() ||
+            segment_cache.replay_gpu_timing_slots.empty())
+        {
+            return true;
+        }
+        if (!gpu_ctx)
+            return false;
+        return reclaimReplayGpuTimingNonblockingImpl(segment_cache, gpu_ctx);
     }
 
     void DeviceGraphCaptureController::executeWarmupPhase(
@@ -1849,6 +2003,9 @@ namespace llaminar2
             full_graph_capture
                 ? GraphReplayCaptureMode::FullGraph
                 : GraphReplayCaptureMode::Segmented;
+        auto executable_tags = replaySegmentTags(segment, perf_context);
+        executable_tags["backend"] = segment.capture->backendName();
+        executable_tags["type"] = "captured_executable";
         PerfStatsCollector::addCounter(
             "forward_graph",
             full_graph_capture
@@ -1858,10 +2015,48 @@ namespace llaminar2
             "decode",
             ctx->deviceId().toString(),
             graphReplayMetadataTags(
-                {{"backend", segment.capture->backendName()},
-                 {"type", "captured_executable"}},
+                std::move(executable_tags),
                 perf_context,
                 capture_mode));
+
+        /*
+         * Native node count alone cannot explain a changed graph topology: one
+         * logical stage can lower to several CUDA/HIP graph nodes. Publish the
+         * logical stage inventory at the same durable capture boundary so a
+         * performance artifact can identify exactly which stage family grew
+         * without enabling verbose logging or rebuilding under a debugger.
+         */
+        std::map<std::string, size_t> executable_stage_types;
+        for (const auto &stage_name : segment.stage_names)
+        {
+            const auto *node = graph.getNode(stage_name);
+            if (!node || !node->stage)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Captured executable is "
+                    "missing a logical stage while publishing its topology: "
+                    << stage_name);
+                return false;
+            }
+            executable_stage_types[
+                computeStageTypeName(node->stage->type())]++;
+        }
+        for (const auto &[stage_type, count] : executable_stage_types)
+        {
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                full_graph_capture
+                    ? "full_graph_capture_stage_types"
+                    : "segmented_graph_capture_stage_types",
+                static_cast<double>(count),
+                "decode",
+                ctx->deviceId().toString(),
+                graphReplayMetadataTags(
+                    {{"stage_type", stage_type},
+                     {"type", "captured_executable"}},
+                    perf_context,
+                    capture_mode));
+        }
 
         if (has_collective_nodes)
         {
@@ -2634,32 +2829,17 @@ namespace llaminar2
             device_name,
             graphReplayHostTimingTags(std::move(replay_total_tags), "total_replay_host_wall", replay_mode));
 
-        std::vector<ReplayGpuEventTimer> replay_event_timers;
-        replay_event_timers.reserve(segment_cache.segments.size());
-        auto total_replay_event_tags = replayCacheTags(segment_cache, replay_mode);
-        total_replay_event_tags.emplace(
-            "sync_scope",
-            can_defer_final_sync ? "profiling_event_synchronized" : "stream_synchronized");
-        ReplayGpuEventTimer total_replay_event_timer(
-            gpu_ctx,
-            capture_stream,
-            "graph_replay.total",
-            "decode",
-            device_name,
-            graphReplayGpuEventTags(std::move(total_replay_event_tags), "total_replay_gpu_event", replay_mode));
-
-        auto collect_replay_gpu_events = [&](bool synchronize_total_event)
+        size_t total_replay_timing_slot = kInvalidReplayGpuTimingSlot;
+        if (!beginReplayGpuTiming(
+                segment_cache,
+                gpu_ctx,
+                DeviceGraphExecutor::GraphSegmentCache::ReplayGpuTimingSlot::Scope::TotalReplay,
+                /*replay_unit_index=*/0,
+                can_defer_final_sync,
+                total_replay_timing_slot))
         {
-            if (total_replay_event_timer.active())
-            {
-                total_replay_event_timer.stop();
-                total_replay_event_timer.record(synchronize_total_event);
-            }
-            for (auto &timer : replay_event_timers)
-            {
-                timer.record(false);
-            }
-        };
+            return result;
+        }
 
         int seg_idx = 0;
         for (auto &seg : segment_cache.segments)
@@ -2685,18 +2865,22 @@ namespace llaminar2
                 device_name,
                 seg_tags);
 
-            auto event_tags = seg_tags;
-            event_tags.emplace(replayUnitIndexTagName(replay_mode), std::to_string(seg_idx));
-            event_tags.emplace(
-                "sync_scope",
-                can_defer_final_sync ? "profiling_event_synchronized" : "stream_synchronized");
-            replay_event_timers.emplace_back(
-                gpu_ctx,
-                capture_stream,
-                replayUnitGpuEventName(replay_mode),
-                "decode",
-                device_name,
-                graphReplayGpuEventTags(std::move(event_tags), replayUnitTimingScope(replay_mode), replay_mode));
+            size_t replay_unit_timing_slot = kInvalidReplayGpuTimingSlot;
+            if (!full_graph_replay &&
+                !beginReplayGpuTiming(
+                    segment_cache,
+                    gpu_ctx,
+                    DeviceGraphExecutor::GraphSegmentCache::ReplayGpuTimingSlot::Scope::ReplayUnit,
+                    static_cast<size_t>(seg_idx),
+                    can_defer_final_sync,
+                    replay_unit_timing_slot))
+            {
+                (void)finishReplayGpuTiming(
+                    segment_cache,
+                    gpu_ctx,
+                    total_replay_timing_slot);
+                return result;
+            }
 
             const auto segment_t0 = std::chrono::high_resolution_clock::now();
             // Segment execution picks capturable or manual behavior based on
@@ -2740,10 +2924,28 @@ namespace llaminar2
 
             if (!replay_result.success)
             {
+                (void)finishReplayGpuTiming(
+                    segment_cache,
+                    gpu_ctx,
+                    replay_unit_timing_slot);
+                (void)finishReplayGpuTiming(
+                    segment_cache,
+                    gpu_ctx,
+                    total_replay_timing_slot);
                 return result;
             }
 
-            replay_event_timers.back().stop();
+            if (!finishReplayGpuTiming(
+                    segment_cache,
+                    gpu_ctx,
+                    replay_unit_timing_slot))
+            {
+                (void)finishReplayGpuTiming(
+                    segment_cache,
+                    gpu_ctx,
+                    total_replay_timing_slot);
+                return result;
+            }
 
             if (trace_replay)
             {
@@ -2755,8 +2957,13 @@ namespace llaminar2
             seg_idx++;
         }
 
-        if (total_replay_event_timer.active())
-            total_replay_event_timer.stop();
+        if (!finishReplayGpuTiming(
+                segment_cache,
+                gpu_ctx,
+                total_replay_timing_slot))
+        {
+            return result;
+        }
 
         if (trace_replay)
         {
@@ -2781,11 +2988,13 @@ namespace llaminar2
                     device_name,
                     replayCacheTags(segment_cache, replay_mode));
             }
-            // Production MTP sidecar replay can deliberately defer the final
-            // ownership fence. When GPU stage timing is requested, wait only on
-            // the replay stop event here so exported stage_gpu graph-replay
-            // rows are true GPU elapsed time, not host enqueue duration.
-            collect_replay_gpu_events(/*synchronize_total_event=*/true);
+            /*
+             * Timing must preserve the exact same asynchronous graph topology as
+             * an unprofiled launch. Opportunistically retire older completed
+             * slots, but never wait for this replay's stop event on the host.
+             */
+            if (!reclaimReplayGpuTimingNonblocking(segment_cache, gpu_ctx))
+                return result;
             result.success = true;
             return result;
         }
@@ -2820,7 +3029,22 @@ namespace llaminar2
                                                replay_mode));
             }
         }
-        collect_replay_gpu_events(/*synchronize_total_event=*/false);
+        if (!reclaimReplayGpuTimingNonblocking(segment_cache, gpu_ctx))
+            return result;
+        if (PerfStatsCollector::gpuStageEventTimingEnabled() &&
+            std::any_of(
+                segment_cache.replay_gpu_timing_slots.begin(),
+                segment_cache.replay_gpu_timing_slots.end(),
+                [](const auto &slot)
+                {
+                    return slot.pending;
+                }))
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Capture-stream ownership fence "
+                "completed but a replay GPU timing event remained pending");
+            return result;
+        }
         if (trace_replay)
         {
             LOG_DEBUG("[ReplayTrace] " << device_id.toString()

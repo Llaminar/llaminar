@@ -155,6 +155,7 @@ namespace llaminar2
         MTP_GENERATED_TOKEN_COUNTS, ///< Arena-owned generated-token histogram for presence/frequency penalties
         MTP_VERIFIER_POSITION_IDS, ///< Arena-owned INT32 absolute positions expanded from device-owned live KV counts
         MTP_LOGICAL_SEQUENCE_STATE, ///< Arena-owned INT32 published logical-state rows that outlive graph workspace generations
+        MTP_LOGICAL_SEQUENCE_STATE_DIAGNOSTIC_SNAPSHOTS, ///< Opt-in device-only phase history for fatal MTP publication diagnostics
 
         _COUNT ///< Sentinel – must be last
     };
@@ -364,6 +365,8 @@ namespace llaminar2
             return "MTP_VERIFIER_POSITION_IDS";
         case BufferId::MTP_LOGICAL_SEQUENCE_STATE:
             return "MTP_LOGICAL_SEQUENCE_STATE";
+        case BufferId::MTP_LOGICAL_SEQUENCE_STATE_DIAGNOSTIC_SNAPSHOTS:
+            return "MTP_LOGICAL_SEQUENCE_STATE_DIAGNOSTIC_SNAPSHOTS";
         case BufferId::MOE_GATE_SCRATCH:
             return "MOE_GATE_SCRATCH";
         case BufferId::MOE_UP_SCRATCH:

@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -631,4 +632,30 @@ TEST(Test__HiddenStateRowSelectStage, ExternalRowMetadataDoesNotDeclareOrMutateW
     EXPECT_FALSE(stage.setSelectedRowsForReplay({5, 0, 7}))
         << "External metadata mode must not silently update a stale stage-local row list";
     EXPECT_EQ(stage.selectedRowsForTesting(), std::vector<int>({1, 2, 3}));
+}
+
+TEST(Test__HiddenStateRowSelectStage, FixedContiguousGpuRowsHaveNoHostMetadataLifecycle)
+{
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 16;
+    params.d_model = 32;
+    params.selected_row_count = 4;
+    params.selected_row_indices = {3, 4, 5, 6};
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+            FixedContiguousRange;
+    params.fixed_contiguous_row_start = 3;
+    HiddenStateRowsSelectStage stage(params);
+
+    EXPECT_TRUE(stage.getWorkspaceRequirements(16, 32, 0).buffers.empty())
+        << "An immutable contiguous D2D source needs no device row-index workspace.";
+    EXPECT_FALSE(stage.setSelectedRowsForReplay({7, 8, 9, 10}))
+        << "Captured fixed-range geometry must not adopt a host replay plan.";
+    EXPECT_EQ(stage.selectedRowsForTesting(),
+              std::vector<int>({3, 4, 5, 6}));
+    EXPECT_TRUE(stage.prepareGraphLaunch(
+        /*ctx=*/nullptr,
+        reinterpret_cast<void *>(static_cast<uintptr_t>(1))))
+        << "Launch preparation must accept an explicit stream without allocating or uploading metadata.";
 }

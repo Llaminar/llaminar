@@ -17,8 +17,6 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
-#include "../../../utils/DebugEnv.h"
-#include "../../../utils/FNV1a.h"
 #include "../../../utils/Logger.h"
 
 #include <algorithm>
@@ -242,11 +240,6 @@ namespace llaminar2
             {
                 return false;
             }
-            debugLogDeviceIndexedRestoreSamples(
-                "CUDAGatedDeltaNet",
-                live_state,
-                verifier_state_capture_size_,
-                stream);
             return true;
         }
 
@@ -933,94 +926,6 @@ namespace llaminar2
         int speculative_state_work_size_ = 0;
         DeviceWorkspaceManager *workspace_ = nullptr;
         bool device_state_bound_ = false;
-
-        static uint64_t hashFloatBytes(const float *values, size_t count)
-        {
-            return fnv1a64(values, count * sizeof(float));
-        }
-
-        static size_t countNonZeroFloats(const float *values, size_t count)
-        {
-            size_t nonzero = 0;
-            for (size_t i = 0; i < count; ++i)
-            {
-                if (values[i] != 0.0f)
-                    ++nonzero;
-            }
-            return nonzero;
-        }
-
-        static double sumAbsoluteFloats(const float *values, size_t count)
-        {
-            double sum = 0.0;
-            for (size_t i = 0; i < count; ++i)
-                sum += static_cast<double>(std::fabs(values[i]));
-            return sum;
-        }
-
-        void debugLogDeviceIndexedRestoreSamples(
-            const char *component,
-            const float *live_state,
-            int live_state_size,
-            void *stream) const
-        {
-            if (!DebugEnv::isTruthyEnv("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS") ||
-                !stream ||
-                !live_state ||
-                !verifier_state_capture_ ||
-                live_state_size <= 0 ||
-                verifier_state_capture_rows_ <= 0 ||
-                verifier_state_capture_size_ != live_state_size)
-            {
-                return;
-            }
-
-            const int rows_to_copy = std::min(verifier_state_capture_rows_, 4);
-            const size_t row_floats = static_cast<size_t>(live_state_size);
-            const size_t vectors = static_cast<size_t>(rows_to_copy + 1);
-            std::vector<float> host(vectors * row_floats, 0.0f);
-
-            cudaGDN_gpu_memcpy_d2h_async(
-                host.data(),
-                live_state,
-                row_floats,
-                stream);
-            for (int row = 0; row < rows_to_copy; ++row)
-            {
-                const float *src =
-                    verifier_state_capture_ +
-                    static_cast<size_t>(row) *
-                        static_cast<size_t>(verifier_state_capture_size_);
-                cudaGDN_gpu_memcpy_d2h_async(
-                    host.data() + static_cast<size_t>(row + 1) * row_floats,
-                    src,
-                    row_floats,
-                    stream);
-            }
-            cudaGDN_stream_synchronize(stream);
-
-            const auto log_summary =
-                [&](const char *label, const float *values)
-            {
-                LOG_INFO("[MTPPublicationDiagnostics] phase=cuda_gdn_restore_sample"
-                         << " component=" << component
-                         << " kernel=" << static_cast<const void *>(this)
-                         << " label=" << label
-                         << " state_size=" << live_state_size
-                         << " capture_rows=" << verifier_state_capture_rows_
-                         << " hash=" << hashFloatBytes(values, row_floats)
-                         << " nonzero=" << countNonZeroFloats(values, row_floats)
-                         << " sum_abs=" << sumAbsoluteFloats(values, row_floats));
-            };
-
-            log_summary("live_after_restore", host.data());
-            for (int row = 0; row < rows_to_copy; ++row)
-            {
-                const std::string label = "capture_row_" + std::to_string(row);
-                log_summary(label.c_str(),
-                            host.data() + static_cast<size_t>(row + 1) * row_floats);
-            }
-        }
 
         bool hasState(int required_state_size) const
         {

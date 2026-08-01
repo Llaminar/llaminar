@@ -326,7 +326,7 @@ namespace llaminar2
      * logical position, sequence length, next condition token, and validity flag
      * for each request in the active speculative batch.
      *
-     * The pointed-to buffers are owned by the runner's workspace.  They are
+     * The pointed-to buffers are owned by the runner's persistent arena. They are
      * valid only until the runner resets request state or stages a newer
      * speculative publication mailbox.  Consumers must enqueue work on `stream`
      * or explicitly wait on it; nullptr/default streams are not valid.  The
@@ -348,6 +348,8 @@ namespace llaminar2
         void *stream = nullptr;
         void *ready_event = nullptr;
         uint64_t live_state_epoch = 0;
+        /// Monotonic identity of the exact publication protected by ready_event.
+        uint64_t publication_generation = 0;
         /// Child-local shifted-cache transaction consumed by correction sidecars.
         DeviceResidentMTPTransactionLease mtp_transaction;
 
@@ -363,7 +365,8 @@ namespace llaminar2
                    request_count > 0 &&
                    device.is_valid() &&
                    stream != nullptr &&
-                   ready_event != nullptr;
+                   ready_event != nullptr &&
+                   publication_generation > 0;
         }
 
         /**
@@ -386,8 +389,9 @@ namespace llaminar2
          *
          * Phase 10 prelaunch and continuation paths may carry a handle across
          * one served-output boundary.  Matching every stream/event/pointer
-         * field prevents a later request, workspace rebind, or reset from
-         * accidentally reusing an old sidecar replay.
+         * field plus the publication generation prevents a later publication,
+         * workspace rebind, or reset from accidentally reusing an old sidecar
+         * replay after the shared event object has been recorded again.
          */
         bool sameMailboxAs(
             const DeviceResidentLogicalSequenceStateHandle &other) const
@@ -411,6 +415,7 @@ namespace llaminar2
                    stream == other.stream &&
                    ready_event == other.ready_event &&
                    live_state_epoch == other.live_state_epoch &&
+                   publication_generation == other.publication_generation &&
                    mtp_transaction.state == other.mtp_transaction.state;
         }
 

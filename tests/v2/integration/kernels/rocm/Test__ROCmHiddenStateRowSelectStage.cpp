@@ -662,6 +662,82 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
 #endif
 }
 
+TEST(Test__ROCmHiddenStateRowSelectStage, CapturedFixedContiguousRowsAreByteExactWithoutMetadata)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const DeviceId device = DeviceId::rocm(0);
+    constexpr int bucket_seq_len = 8;
+    constexpr int d_model = 32;
+    constexpr int first_row = 2;
+    constexpr int row_count = 3;
+    const std::vector<int> expected_rows{2, 3, 4};
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+    auto hidden = makeHiddenStates(bucket_seq_len, d_model, device, stream);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{row_count, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+    scratch->ensureOnDevice(device, stream);
+
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = scratch.get();
+    params.seq_len = bucket_seq_len;
+    params.d_model = d_model;
+    params.selected_row_count = row_count;
+    params.selected_row_indices = expected_rows;
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+            FixedContiguousRange;
+    params.fixed_contiguous_row_start = first_row;
+    HiddenStateRowsSelectStage stage(params);
+    stage.setGPUStream(stream);
+
+    ASSERT_TRUE(stage.getWorkspaceRequirements(bucket_seq_len, d_model, 0).buffers.empty());
+    ASSERT_TRUE(stage.execute(nullptr));
+    expectRows(
+        downloadScratchRows(*scratch, row_count, d_model, stream),
+        *hidden,
+        expected_rows,
+        d_model);
+
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(
+            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+            hipSuccess);
+        ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(
+        hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+        hipSuccess);
+    ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+    expectRows(
+        downloadScratchRows(*scratch, row_count, d_model, stream),
+        *hidden,
+        expected_rows,
+        d_model);
+
+    EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+    EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
 TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayReadsExternalMetadataRows)
 {
 #ifndef HAVE_ROCM

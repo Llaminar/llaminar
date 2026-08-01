@@ -359,6 +359,45 @@ namespace llaminar2
         sync_event = nullptr;
     }
 
+    void DeviceGraphExecutor::GraphSegmentCache::destroyReplayGpuTimingEvents()
+    {
+        if (replay_gpu_timing_slots.empty())
+        {
+            replay_gpu_timing_device_name.clear();
+            replay_gpu_timing_busy_samples = 0;
+            return;
+        }
+
+        IWorkerGPUContext *ctx =
+            requireLifecycleContext("replay GPU timing event destruction");
+        try
+        {
+            for (auto &slot : replay_gpu_timing_slots)
+            {
+                if (slot.start_event)
+                    ctx->destroyEvent(slot.start_event);
+                if (slot.stop_event)
+                    ctx->destroyEvent(slot.stop_event);
+                slot = {};
+            }
+        }
+        catch (const std::exception &e)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                std::string("replay GPU timing event destruction threw: ") +
+                e.what());
+        }
+        catch (...)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "replay GPU timing event destruction threw an unknown exception");
+        }
+
+        replay_gpu_timing_slots.clear();
+        replay_gpu_timing_device_name.clear();
+        replay_gpu_timing_busy_samples = 0;
+    }
+
     // =========================================================================
     // Single-Graph Capture/Replay
     // =========================================================================
@@ -1104,6 +1143,17 @@ namespace llaminar2
                 return false;
             }
             void *warmup_stream = segment_cache.capture_stream;
+
+            if (!DeviceGraphCaptureController::prepareReplayGpuTiming(
+                    segment_cache,
+                    gpu_ctx,
+                    ctx ? ctx->deviceId().toString() : std::string{}))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] GPU graph warmup could not establish "
+                    "its fixed asynchronous replay timing ring");
+                return false;
+            }
 
             /*
              * Preserve stream order entirely on device. Previous decode work,

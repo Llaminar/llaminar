@@ -5295,6 +5295,7 @@ namespace llaminar2
         handle.stream = &rank_resident_logical_state_stream_token_;
         handle.ready_event = &rank_resident_logical_state_ready_event_token_;
         handle.live_state_epoch = rank_resident_logical_state_epoch_;
+        handle.publication_generation = rank_resident_logical_state_epoch_;
         return handle;
     }
 

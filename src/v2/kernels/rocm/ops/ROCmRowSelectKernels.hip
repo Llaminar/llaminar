@@ -287,6 +287,36 @@ namespace llaminar2::rocm
             reinterpret_cast<hipStream_t>(stream)));
     }
 
+    bool launchFixedRowsSelectFP32(
+        const float *input,
+        float *output,
+        int first_selected_row,
+        int selected_row_count,
+        int seq_len,
+        int d_model,
+        void *stream)
+    {
+        if (!input || !output || !stream || first_selected_row < 0 ||
+            selected_row_count <= 0 || seq_len <= 0 || d_model <= 0 ||
+            first_selected_row > seq_len - selected_row_count)
+        {
+            return false;
+        }
+
+        const size_t source_offset =
+            static_cast<size_t>(first_selected_row) *
+            static_cast<size_t>(d_model);
+        const size_t element_count =
+            static_cast<size_t>(selected_row_count) *
+            static_cast<size_t>(d_model);
+        return ok(hipMemcpyAsync(
+            output,
+            input + source_offset,
+            element_count * sizeof(float),
+            hipMemcpyDeviceToDevice,
+            reinterpret_cast<hipStream_t>(stream)));
+    }
+
     bool launchRowsSelectFP32(
         const float *input,
         float *output,

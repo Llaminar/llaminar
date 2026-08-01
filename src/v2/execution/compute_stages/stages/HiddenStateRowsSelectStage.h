@@ -46,15 +46,19 @@ namespace llaminar2
          * @brief Selects the authoritative source of GPU row indices.
          *
          * The source is part of the graph contract rather than a runtime
-         * fallback. `StageOwnedIndices` is useful for fixed plans and focused
-         * replay tools. `ExternalDeviceIndices` lets a preceding device metadata
-         * kernel publish arbitrary verifier rows. `RequestTerminalLengths`
-         * computes one terminal row per padded request directly in the copy
-         * kernel, preserving full device ownership of request-batched prefill.
+         * fallback. `StageOwnedIndices` is a CPU/direct-fixture policy and is
+         * forbidden for production GPU execution because it requires a pinned
+         * host upload. `FixedContiguousRange` encodes an immutable verifier
+         * suffix directly in a captured D2D node. `ExternalDeviceIndices` lets a
+         * preceding device metadata kernel publish arbitrary verifier rows.
+         * `RequestTerminalLengths` computes one terminal row per padded request
+         * directly in the copy kernel, preserving full device ownership of
+         * request-batched prefill.
          */
         enum class DeviceRowIndexSource
         {
             StageOwnedIndices,
+            FixedContiguousRange,
             ExternalDeviceIndices,
             RequestTerminalLengths,
         };
@@ -74,6 +78,7 @@ namespace llaminar2
             std::optional<BufferId> output_buffer_id;
             DeviceRowIndexSource device_row_index_source =
                 DeviceRowIndexSource::StageOwnedIndices; ///< Authoritative GPU row-index policy.
+            int fixed_contiguous_row_start = 0; ///< First immutable source row for FixedContiguousRange.
             std::string workspace_buffer_name; ///< Stable row-index workspace for stage-owned or external-device plans.
             const int32_t *request_sequence_lengths_device = nullptr; ///< Resident request lengths for RequestTerminalLengths.
             int request_row_stride = 0; ///< Padded source-row stride between requests.

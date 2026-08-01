@@ -409,6 +409,16 @@ function(add_v2_test TEST_NAME)
         "OMPI_MCA_btl_vader_single_copy_mechanism=none"
         "OMPI_MCA_btl_openib_allow_ib=1"
     )
+
+    # Unit tests exercise host-side policy, state machines, and pure kernels.
+    # Physical GPU discovery or context creation belongs in Integration tests:
+    # it makes unit results depend on driver state, consumes shared devices,
+    # and can destabilize otherwise independent processes under a parallel
+    # CTest gate.  Enforce the boundary for every unit executable instead of
+    # relying on individual fixtures to remember the startup guard.
+    if("${ARG_LABELS}" MATCHES "Unit")
+        list(APPEND TEST_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+    endif()
     
     # Add ROCm environment variables for ROCm tests
     # HSA_OVERRIDE_GFX_VERSION=9.0.6 enables gfx906 (MI50/MI60) codepaths on compatible GPUs
@@ -457,6 +467,14 @@ function(add_v2_test TEST_NAME)
     if(ARG_TIMEOUT)
         set_tests_properties(${TEST_NAME} PROPERTIES
             TIMEOUT ${ARG_TIMEOUT}
+        )
+    elseif("${ARG_LABELS}" MATCHES "Unit")
+        # A unit process should never silently consume the gate for ten minutes
+        # or more.  Existing exhaustive CPU policy tests complete inside this
+        # five-minute ceiling; larger hardware/model workloads belong in the
+        # Integration or Performance suites.
+        set_tests_properties(${TEST_NAME} PROPERTIES
+            TIMEOUT 300
         )
     endif()
 endfunction()

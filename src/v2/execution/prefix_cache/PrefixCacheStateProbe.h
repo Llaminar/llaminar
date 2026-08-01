@@ -151,6 +151,18 @@ namespace llaminar2
         bool capture_gdn_values = false;
 
         /**
+         * @brief Materialize canonical GPU logical-position metadata.
+         *
+         * Runtime summaries deliberately leave GPU position and sequence-length
+         * vectors empty: those values are device owned and must not introduce a
+         * hidden D2H merely because logging, benchmark aggregation, or PerfStats
+         * requested a snapshot. Focused integration diagnostics may opt in with
+         * `LLAMINAR_PREFIX_PROBE_CAPTURE_DEVICE_LOGICAL_STATE=1`; callers must
+         * then treat the probe as an explicit host-visible result boundary.
+         */
+        bool capture_device_logical_state = false;
+
+        /**
          * @brief Build the compatibility policy selected by diagnostic env vars.
          *
          * @return Capture policy corresponding to the existing

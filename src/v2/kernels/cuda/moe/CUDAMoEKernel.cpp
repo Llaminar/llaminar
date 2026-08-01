@@ -1534,6 +1534,7 @@ namespace llaminar2
         group_active_expert_slots_ = 0;
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
+        group_buffers_workspace_bound_ = false;
         group_expert_mask_cap_ = 0;
         group_expert_mask_hash_ = 0;
         group_expert_mask_num_experts_ = 0;
@@ -2049,8 +2050,25 @@ namespace llaminar2
 
     bool CUDAMoEKernel::ensureGroupingBufferCapacity(int total_slots, int num_experts)
     {
-        if (total_slots <= group_slots_cap_ && num_experts <= group_experts_cap_)
+        /*
+         * Capacity describes only the shape of the last successful binding.
+         * The CUDA MoE kernel is a per-device singleton shared by sibling graph
+         * stages, so workspace replacement can revoke every pointer without
+         * changing the requested shape. Require the complete binding proof and
+         * every pointer before allowing the fast reuse path. This mirrors the
+         * route-buffer contract and prevents a stale 0xff grouping memset from
+         * targeting an arena range owned by another graph buffer.
+         */
+        if (group_buffers_workspace_bound_ &&
+            d_group_int_indices_ && d_group_token_indices_ &&
+            d_group_original_to_grouped_ && d_group_original_expert_ids_ &&
+            d_group_weights_ && d_group_offsets_ && d_group_counts_ &&
+            d_group_active_expert_ids_ && d_group_write_heads_ &&
+            total_slots <= group_slots_cap_ &&
+            num_experts <= group_experts_cap_)
+        {
             return true;
+        }
 
         void *group_int_indices = nullptr;
         void *group_token_indices = nullptr;
@@ -2094,6 +2112,7 @@ namespace llaminar2
             d_group_write_heads_ = nullptr;
             group_slots_cap_ = 0;
             group_experts_cap_ = 0;
+            group_buffers_workspace_bound_ = false;
             return false;
         }
 
@@ -2108,6 +2127,7 @@ namespace llaminar2
         d_group_write_heads_ = static_cast<int *>(group_write_heads);
         group_slots_cap_ = total_slots;
         group_experts_cap_ = num_experts;
+        group_buffers_workspace_bound_ = true;
         return true;
     }
 
@@ -4763,7 +4783,7 @@ namespace llaminar2
         /*
          * Padded prefill replay deliberately marks bucket-tail routes invalid
          * with expert_id=-1.  The deterministic scatter kernel only writes a
-         * mapping for valid routes, so the ordered down-scatter must start from
+        * mapping for valid routes, so the ordered down-scatter must start from
          * an all-invalid map every request.  Otherwise graph replay can reuse
          * stale slot mappings from the previous real sequence length and write
          * arbitrary expert output into padded rows.

@@ -318,6 +318,15 @@ namespace
         void destroyEvent(void *) override { ++events_destroyed_; }
         void recordEvent(void *, void *) override { ++events_recorded_; }
         void waitEvent(void *, void *) override { ++events_waited_; }
+        bool queryEventChecked(void *event, bool &ready) override
+        {
+            ++event_query_calls_;
+            ready = false;
+            if (!event || !query_event_checked_result_)
+                return false;
+            ready = query_event_ready_;
+            return true;
+        }
         void synchronizeEvent(void *) override { ++events_synchronized_; }
         bool synchronizeEventChecked(void *event) override
         {
@@ -362,10 +371,13 @@ namespace
         int events_destroyed_ = 0;
         int events_recorded_ = 0;
         int events_waited_ = 0;
+        int event_query_calls_ = 0;
         int events_synchronized_ = 0;
         int event_elapsed_queries_ = 0;
         int device_synchronize_calls_ = 0;
         bool synchronize_event_checked_result_ = true;
+        bool query_event_checked_result_ = true;
+        bool query_event_ready_ = true;
         float elapsed_ms_ = 0.25f;
 
     private:
@@ -2224,6 +2236,11 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsRecordFinalCaptureEventFence)
     cache.segments.back().stage_names = {"verifier_graph"};
     cache.segments.back().capture =
         std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    ASSERT_TRUE(DeviceGraphCaptureController::prepareReplayGpuTiming(
+        cache,
+        &gpu_ctx,
+        "ROCm:0"));
+    const int events_created_during_warmup = gpu_ctx.events_created_;
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
@@ -2305,10 +2322,13 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsRecordFinalCaptureEventFence)
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", stage_total_tags), 1u);
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", stage_segment_tags), 1u);
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.final_sync", aggregate_tags), 0u);
-    EXPECT_EQ(gpu_ctx.events_created_, 5);
-    EXPECT_EQ(gpu_ctx.events_recorded_, 5);
-    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 2);
-    EXPECT_EQ(gpu_ctx.events_destroyed_, 4);
+    EXPECT_EQ(events_created_during_warmup, 32);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_warmup + 1)
+        << "Replay timing events must all be allocated during warmup; the only "
+           "new event is the cache's ordinary final ownership fence.";
+    EXPECT_EQ(gpu_ctx.events_recorded_, 3);
+    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 1);
+    EXPECT_EQ(gpu_ctx.events_destroyed_, 0);
 
     PerfStatsCollector::reset();
 }
@@ -2358,11 +2378,15 @@ TEST(Test__GraphSegmentCache, ReplayPhasePreparesGraphLaunchMetadataOnExplicitCa
 
 TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecording)
 {
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
     ComputeGraph graph;
     auto *prep_stage = addFakeGraphLaunchPrepStage(graph, "row_select", DeviceId::rocm(0));
 
     FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "main_verifier";
     ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
@@ -2415,6 +2439,35 @@ TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecor
     EXPECT_EQ(transaction_order[1], "capture_boundary")
         << "External producer events must be joined before the domain-level "
            "capture-begin rendezvous.";
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            records,
+            "full_graph_capture_executable_nodes",
+            {{"attribution", "graph_replay_metadata"},
+             {"backend", "FakeReplay"},
+             {"context", "main_verifier"},
+             {"first_stage", "row_select"},
+             {"graph_capture_scope", "full_graph_capture_plan"},
+             {"last_stage", "row_select"},
+             {"source", "full_graph_capture"},
+             {"stage_count", "1"},
+             {"type", "captured_executable"}}),
+        1.0);
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            records,
+            "full_graph_capture_stage_types",
+            {{"attribution", "graph_replay_metadata"},
+             {"context", "main_verifier"},
+             {"graph_capture_scope", "full_graph_capture_plan"},
+             {"source", "full_graph_capture"},
+             {"stage_type", "COPY"},
+             {"type", "captured_executable"}}),
+        1.0);
+
+    PerfStatsCollector::reset();
 }
 
 /**
@@ -2648,6 +2701,11 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
     cache.segments.back().stage_names = {"captured_decode_graph"};
     cache.segments.back().capture =
         std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    ASSERT_TRUE(DeviceGraphCaptureController::prepareReplayGpuTiming(
+        cache,
+        &gpu_ctx,
+        "CUDA:0"));
+    const int events_created_during_warmup = gpu_ctx.events_created_;
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
 
@@ -2696,15 +2754,16 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
 
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", total_tags), 1u);
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", segment_tags), 1u);
-    EXPECT_EQ(gpu_ctx.events_created_, 5);
-    EXPECT_EQ(gpu_ctx.events_recorded_, 5);
-    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 2);
-    EXPECT_EQ(gpu_ctx.events_destroyed_, 4);
+    EXPECT_EQ(events_created_during_warmup, 32);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_warmup + 1);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 3);
+    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 1);
+    EXPECT_EQ(gpu_ctx.events_destroyed_, 0);
 
     PerfStatsCollector::reset();
 }
 
-TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvents)
+TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseAsynchronousEventReclamation)
 {
     ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
     ScopedEnvVar enable_stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
@@ -2720,6 +2779,12 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
     cache.segments.back().stage_names = {"sidecar_graph"};
     cache.segments.back().capture =
         std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    ASSERT_TRUE(DeviceGraphCaptureController::prepareReplayGpuTiming(
+        cache,
+        &gpu_ctx,
+        "ROCm:0"));
+    const int events_created_during_warmup = gpu_ctx.events_created_;
+    gpu_ctx.query_event_ready_ = false;
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
@@ -2744,7 +2809,16 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
 
     ASSERT_TRUE(result.success);
     EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
-    EXPECT_EQ(gpu_ctx.events_synchronized_, 1);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_warmup)
+        << "Deferred replay must not allocate timing events in the hot path.";
+    EXPECT_TRUE(PerfStatsCollector::snapshot({"stage_gpu"}).empty())
+        << "An incomplete asynchronous timing interval must remain cache-owned.";
+
+    gpu_ctx.query_event_ready_ = true;
+    ASSERT_TRUE(DeviceGraphCaptureController::reclaimReplayGpuTimingNonblocking(
+        cache,
+        &gpu_ctx));
 
     const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
     const PerfStatsCollector::Tags total_tags = {
@@ -2754,7 +2828,7 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
         {"graph_count", "1"},
         {"source", "full_graph_capture"},
         {"stage_count", "1"},
-        {"sync_scope", "profiling_event_synchronized"},
+        {"sync_scope", "asynchronous_event_reclaimed"},
         {"timing_scope", "total_replay_gpu_event"},
         {"type", "capturable"}};
     const PerfStatsCollector::Tags segment_tags = {
@@ -2766,16 +2840,16 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
         {"last_stage", "sidecar_graph"},
         {"source", "full_graph_capture"},
         {"stage_count", "1"},
-        {"sync_scope", "profiling_event_synchronized"},
+        {"sync_scope", "asynchronous_event_reclaimed"},
         {"timing_scope", "graph_replay_gpu_event"},
         {"type", "capturable"}};
 
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", total_tags), 1u);
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", segment_tags), 1u);
-    EXPECT_EQ(gpu_ctx.events_created_, 4);
-    EXPECT_EQ(gpu_ctx.events_recorded_, 4);
-    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 2);
-    EXPECT_EQ(gpu_ctx.events_destroyed_, 4);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_warmup);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 2);
+    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 1);
+    EXPECT_EQ(gpu_ctx.events_destroyed_, 0);
 
     const auto forward_records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags deferred_tags = {
@@ -2788,6 +2862,103 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
                          "full_graph_replay_final_sync_deferred",
                          deferred_tags),
                      1.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, DeferredReplayTimingUsesBoundedNonblockingSamplingUnderBurstLoad)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvVar enable_stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "mtp_shifted_prefill";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"shifted_prefill_graph"};
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    ASSERT_TRUE(DeviceGraphCaptureController::prepareReplayGpuTiming(
+        cache,
+        &gpu_ctx,
+        "CUDA:0"));
+    const int events_created_during_warmup = gpu_ctx.events_created_;
+    gpu_ctx.query_event_ready_ = false;
+
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        nullptr,
+        nullptr,
+        [](ComputeNode &, void *) { return true; },
+        [](ComputeNode &, void *) { return true; },
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+
+    constexpr uint64_t kReplayBurst = 20;
+    for (uint64_t replay = 0; replay < kReplayBurst; ++replay)
+    {
+        const auto result = DeviceGraphCaptureController::executeReplayPhase(
+            graph,
+            cache,
+            &ctx,
+            &gpu_ctx,
+            /*has_collective_nodes=*/false,
+            /*collectives_graph_capturable=*/false,
+            /*current_step=*/replay + 1,
+            hooks,
+            /*force_recapture=*/false,
+            /*defer_final_sync=*/true);
+        ASSERT_TRUE(result.success) << "replay=" << replay;
+    }
+
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_warmup);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(cache.replay_gpu_timing_busy_samples, 4u);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 32)
+        << "Only the sixteen warmup-owned slots may record start/stop pairs.";
+
+    gpu_ctx.query_event_ready_ = true;
+    ASSERT_TRUE(DeviceGraphCaptureController::reclaimReplayGpuTimingNonblocking(
+        cache,
+        &gpu_ctx));
+    EXPECT_EQ(cache.replay_gpu_timing_busy_samples, 0u);
+
+    const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
+    const PerfStatsCollector::Tags total_tags = {
+        {"attribution", "gpu_event"},
+        {"context", "mtp_shifted_prefill"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_count", "1"},
+        {"source", "full_graph_capture"},
+        {"stage_count", "1"},
+        {"sync_scope", "asynchronous_event_reclaimed"},
+        {"timing_scope", "total_replay_gpu_event"},
+        {"type", "capturable"}};
+    EXPECT_EQ(
+        findTimerCount(
+            stage_records,
+            "stage_gpu",
+            "graph_replay.total",
+            total_tags),
+        16u);
+
+    const auto forward_records =
+        PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags sampling_tags = {
+        {"context", "mtp_shifted_prefill"},
+        {"sampling_policy", "bounded_nonblocking"}};
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            forward_records,
+            "replay_gpu_timing_busy_samples",
+            sampling_tags),
+        4.0);
 
     PerfStatsCollector::reset();
 }
@@ -2871,7 +3042,6 @@ TEST(Test__GraphSegmentCache, CapturedCollectiveReplayDefersFinalFenceWithoutOpt
     cache.segments.back().stage_names = {"captured_collective_graph"};
     cache.segments.back().capture =
         std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
-
     llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
@@ -2931,6 +3101,11 @@ TEST(Test__GraphSegmentCache, CapturedCollectiveReplayCanDeferFinalSyncWithOptIn
     cache.segments.back().stage_names = {"captured_collective_graph"};
     cache.segments.back().capture =
         std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    ASSERT_TRUE(DeviceGraphCaptureController::prepareReplayGpuTiming(
+        cache,
+        &gpu_ctx,
+        "ROCm:0"));
+    const int events_created_during_warmup = gpu_ctx.events_created_;
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
@@ -2955,7 +3130,9 @@ TEST(Test__GraphSegmentCache, CapturedCollectiveReplayCanDeferFinalSyncWithOptIn
 
     ASSERT_TRUE(result.success);
     EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
-    EXPECT_EQ(gpu_ctx.events_synchronized_, 1);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_warmup)
+        << "Captured-collective replay must borrow only warmup-owned timing events.";
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags deferred_tags = {

@@ -225,13 +225,28 @@ namespace llaminar2
         bool allocate();
 
         /**
-         * @brief Log a per-buffer allocation summary at TRACE level.
+         * @brief Log the allocation summary and address-sorted memory map.
          *
-         * Shows each buffer's name, shape, dtype, and size. Called after
-         * allocate() to give deep visibility into activation memory usage
-         * without flooding normal DEBUG logs during graph rebuilds.
+         * The compact size summary remains TRACE-only. DEBUG logging adds an
+         * address-sorted map with half-open ranges, gaps or overlaps, device,
+         * ownership, shape, and alias group. The address map makes physical
+         * neighbors visible when diagnosing an out-of-bounds device writer.
          */
         void logAllocationSummary() const;
+
+        /**
+         * @brief Format the current arena allocation map in address order.
+         *
+         * GPU pointers are preferred whenever a tensor owns device storage;
+         * otherwise the host allocation is reported. Address spaces are
+         * grouped by device before sorting because equal virtual addresses on
+         * different GPUs are unrelated. Unbound registrations are retained at
+         * the end of their device group so a missing allocation is visible.
+         *
+         * @return Multi-line diagnostic map, or an empty string before the
+         *         arena has been allocated.
+         */
+        std::string allocationAddressMap() const;
 
         /**
          * @brief Establish storage for an arena buffer during graph construction.
